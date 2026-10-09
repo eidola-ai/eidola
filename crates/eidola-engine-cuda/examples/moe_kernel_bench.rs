@@ -1,6 +1,8 @@
 //! Per-launch device time of the expert path's kernels (the router in every
-//! form, gather, SwiGLU, combine) and the fused-QKV RoPE + KV write against
-//! their single-block reference forms (`engine_ops_reference.cu`), and of the
+//! form, gather, SwiGLU, combine), the fused-QKV RoPE + KV write, the
+//! f32-scale activation quantization (`quant`, of the hidden size) and the
+//! dense SwiGLU (`swiglu/dense`, Flash's dense intermediate) against their
+//! single-block reference forms (`engine_ops_reference.cu`), and of the
 //! placement and both grouped GEMMs (no reference form; zero weights for all
 //! 256 experts), at Flash's shapes on synthetic data, per token count. No
 //! checkpoint needed.
@@ -25,7 +27,7 @@ use cudarc::driver::sys::CUevent_flags;
 use eidola_engine_cuda::bf16;
 use eidola_engine_cuda::engine_ops::psum_rows;
 use eidola_engine_cuda::engine_ops::{
-    EngineOps, QkvArgs, RouterForm, executor_router, router_scores_len,
+    EngineOps, PERMUTE_SCRATCH_WORDS, QkvArgs, RouterForm, executor_router, router_scores_len,
 };
 use eidola_engine_cuda::launch::dptr;
 use eidola_engine_cuda::moe_gemm::{GROUPS, MoeGemm, MoeGemmArgs, MoeProj};
@@ -35,6 +37,8 @@ const HIDDEN: u32 = 4096;
 const EXPERTS: u32 = 256;
 const TOP_K: u32 = 8;
 const INTER: u32 = 2048;
+/// Flash's dense intermediate (layer 0 and the MTP layers).
+const DENSE_INTER: u32 = 16_384;
 /// Tokens of the launch that keeps the device busy while the timed launches
 /// are enqueued (the reference router at this size runs for milliseconds).
 const HEAD_START_TOKENS: u32 = 4096;
@@ -118,6 +122,12 @@ fn main() {
         .unwrap();
     let ref_combine = reference.kernel("eidola_reference_moe_combine").unwrap();
     let ref_qkv = reference.kernel("eidola_reference_qkv_rope_kv").unwrap();
+    let ref_quant = reference
+        .kernel("eidola_reference_quant_fp8_f32scale")
+        .unwrap();
+    let ref_dense_swiglu = reference
+        .kernel("eidola_reference_swiglu_quant_fp8_f32scale")
+        .unwrap();
     let moe =
         MoeGemm::from_module(KernelModule::load(&gpu, &dir, "deepgemm_fp8_fp4_grouped").unwrap())
             .unwrap();
@@ -259,9 +269,14 @@ fn main() {
         }
         let grouped = s.alloc_zeros::<i32>(usize_of(EXPERTS)).unwrap();
         let row_of = s.alloc_zeros::<i32>(usize_of(t * TOP_K)).unwrap();
-        let (pgrouped, prow_of) = (dptr(&grouped, s), dptr(&row_of, s));
+        let permute_scratch = s.alloc_zeros::<u32>(PERMUTE_SCRATCH_WORDS).unwrap();
+        let (pgrouped, prow_of, pscratch) = (
+            dptr(&grouped, s),
+            dptr(&row_of, s),
+            dptr(&permute_scratch, s),
+        );
         let permute = time_us(&gpu, iters, &head_start, &|| unsafe {
-            ops.moe_permute(&gpu, pgrouped, prow_of, pid, t, TOP_K, rows)
+            ops.moe_permute(&gpu, pgrouped, prow_of, pid, pscratch, t, TOP_K, rows)
                 .unwrap();
         });
         report("permute", true, permute, None);
@@ -431,6 +446,54 @@ fn main() {
             eidola_engine_cuda::launch!(gpu, ref_qkv, [t, 1, 1], args).unwrap();
         });
         report("qkv", true, new, Some(old));
+
+        // The dense path's f32-scale quantization of the hidden rows, and its
+        // SwiGLU (gate/up of zeros: the time does not depend on the values).
+        let tp = t.div_ceil(4) * 4;
+        let xq = s.alloc_zeros::<u8>(usize_of(tp * DENSE_INTER)).unwrap();
+        let xsf = s
+            .alloc_zeros::<f32>(usize_of(DENSE_INTER / 128 * tp))
+            .unwrap();
+        let (pxq, pxsf) = (dptr(&xq, s), dptr(&xsf, s));
+        let new = time_us(&gpu, iters, &head_start, &|| unsafe {
+            ops.quant_fp8(&gpu, pxq, pxsf, px, t, HIDDEN, tp).unwrap();
+        });
+        let old = time_us(&gpu, iters, &head_start, &|| unsafe {
+            eidola_engine_cuda::launch!(
+                gpu,
+                ref_quant,
+                [t, HIDDEN / 128, 1],
+                pxq,
+                pxsf,
+                px,
+                HIDDEN,
+                tp
+            )
+            .unwrap();
+        });
+        report("quant", true, new, Some(old));
+        let dgu = s
+            .alloc_zeros::<u16>(usize_of(t) * usize_of(2 * DENSE_INTER))
+            .unwrap();
+        let pdgu = dptr(&dgu, s);
+        let new = time_us(&gpu, iters, &head_start, &|| unsafe {
+            ops.swiglu_quant_f32scale(&gpu, pxq, pxsf, pdgu, t, DENSE_INTER, tp)
+                .unwrap();
+        });
+        let old = time_us(&gpu, iters, &head_start, &|| unsafe {
+            eidola_engine_cuda::launch!(
+                gpu,
+                ref_dense_swiglu,
+                [t, DENSE_INTER / 128, 1],
+                pxq,
+                pxsf,
+                pdgu,
+                DENSE_INTER,
+                tp
+            )
+            .unwrap();
+        });
+        report("swiglu/dense", true, new, Some(old));
     }
     println!();
     for line in json {

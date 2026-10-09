@@ -165,6 +165,9 @@ struct Scratch {
     router_scores: CudaSlice<f32>,
     row_of: CudaSlice<i32>,
     grouped: CudaSlice<i32>,
+    /// The placement's per-block counts between its two launches
+    /// (`engine_ops::PERMUTE_SCRATCH_WORDS`).
+    permute: CudaSlice<u32>,
     ea: CudaSlice<u8>,
     esf: CudaSlice<i32>,
     egu: CudaSlice<u16>,
@@ -219,6 +222,7 @@ pub(crate) struct ScratchSizes {
     gu: usize,
     topk: usize,
     router_scores: usize,
+    permute: usize,
     eah: usize,
     esf: usize,
     egu: usize,
@@ -308,6 +312,11 @@ impl ScratchSizes {
             prod(&[tp, 2, dense_i])?,
             prod(&[max_tokens, top_k])?,
             prod(&[2, max_tokens, experts])?,
+            if experts > 0 {
+                crate::engine_ops::PERMUTE_SCRATCH_WORDS
+            } else {
+                1
+            },
             prod(&[erows, h])?,
             prod(&[h / 512, erows4])?,
             prod(&[erows, 2, inter])?,
@@ -329,6 +338,7 @@ impl ScratchSizes {
             gu,
             topk,
             router_scores,
+            permute,
             eah,
             esf,
             egu,
@@ -350,6 +360,7 @@ impl ScratchSizes {
             gu,
             topk,
             router_scores,
+            permute,
             eah,
             esf,
             egu,
@@ -406,6 +417,7 @@ impl GpuModel {
             gu,
             topk,
             router_scores,
+            permute,
             eah,
             esf,
             egu,
@@ -445,6 +457,7 @@ impl GpuModel {
             router_scores: s.alloc_zeros(router_scores)?,
             row_of: s.alloc_zeros(topk)?,
             grouped: s.alloc_zeros(experts.max(1))?,
+            permute: s.alloc_zeros(permute)?,
             ea: s.alloc_zeros(eah)?,
             esf: s.alloc_zeros(esf)?,
             egu: s.alloc_zeros(egu)?,
@@ -1303,6 +1316,7 @@ unsafe fn layer(
                     dptr(&sc.grouped, &s),
                     dptr(&sc.row_of, &s),
                     dptr(&sc.topk_ids, &s),
+                    dptr(&sc.permute, &s),
                     t32,
                     m.top_k,
                     rows32,
@@ -1602,5 +1616,10 @@ mod tests {
         );
         assert_eq!(moe.router_scores, both.router_scores);
         assert_eq!(dense.router_scores, 1);
+        // The placement's scratch: a count per (expert, block), only with
+        // expert layers.
+        assert_eq!(moe.permute, crate::engine_ops::PERMUTE_SCRATCH_WORDS);
+        assert_eq!(moe.permute, both.permute);
+        assert_eq!(dense.permute, 1);
     }
 }

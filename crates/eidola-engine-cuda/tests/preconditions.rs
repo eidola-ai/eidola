@@ -22,7 +22,27 @@ fn out_of_range_launches_are_refused() {
             ops.quant_fp8(gpu, 0, 0, 0, 8, 128, 4).is_err(),
             "m_pad below rows"
         );
+        assert!(
+            ops.quant_fp8(gpu, 0, 0, 8, 4, 128, 4).is_err(),
+            "rows not 16-byte aligned"
+        );
+        assert!(
+            ops.quant_fp8(gpu, 2, 0, 0, 4, 128, 4).is_err(),
+            "codes not 4-byte aligned"
+        );
         assert!(ops.swiglu_quant_f32scale(gpu, 0, 0, 0, 4, 200, 4).is_err());
+        assert!(
+            ops.swiglu_quant_f32scale(gpu, 0, 0, 0, 4, 128, 4).is_err(),
+            "half a piece"
+        );
+        assert!(
+            ops.swiglu_quant_f32scale(gpu, 0, 0, 8, 4, 256, 4).is_err(),
+            "gate/up rows not 16-byte aligned"
+        );
+        assert!(
+            ops.swiglu_quant_f32scale(gpu, 4, 0, 0, 4, 256, 4).is_err(),
+            "codes not 8-byte aligned"
+        );
         assert!(
             ops.swiglu_quant_ue8m0(gpu, 0, 0, 0, 0, 1, 4, 4, 1000, 4)
                 .is_err(),
@@ -116,8 +136,16 @@ fn out_of_range_launches_are_refused() {
             }
         }
         assert!(
-            ops.moe_permute(gpu, 0, 0, 0, 200, 8, 33_664).is_err(),
+            ops.moe_permute(gpu, 0, 0, 0, 16, 200, 8, 33_664).is_err(),
             "rows below the layout's bound"
+        );
+        assert!(
+            ops.moe_permute(gpu, 0, 0, 0, 8, 1, 8, 1024).is_err(),
+            "scratch not 16-byte aligned"
+        );
+        assert!(
+            ops.moe_permute(gpu, 0, 0, 0, 0, 1, 8, 1024).is_err(),
+            "no scratch"
         );
         assert!(
             ops.moe_combine(gpu, 0, 0, 0, 0, 1, 4096, 0).is_err(),

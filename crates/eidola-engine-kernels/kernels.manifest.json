@@ -115,7 +115,7 @@
     },
     {
       "path": "csrc/engine_ops.cu",
-      "sha256": "aec02c7a65d136d024bc2d01ade89df9270bdef7e2f1a8b97d5854060d0d8494"
+      "sha256": "a4226322b313e3228774fd905c50720f911d7c53504c670a210e1d36642bfa04"
     },
     {
       "path": "csrc/engine_ops_common.cuh",
@@ -123,7 +123,7 @@
     },
     {
       "path": "csrc/engine_ops_reference.cu",
-      "sha256": "89d7aaae868bac02d0e9d6d2f380e7230fe169394d219b64bceb5085b0825395"
+      "sha256": "e1e29a55014c2a73ec105f2eaec4b608fec994c81e5ec3bcc80255bb5fb3a03c"
     },
     {
       "path": "csrc/flashinfer_fa2_sink_paged.cu",
@@ -406,8 +406,8 @@
       "source": "csrc/engine_ops.cu",
       "profile": "own",
       "file": "cubin/engine_ops.sm_100a.cubin",
-      "sha256": "603e02f1f218333d00bdc06166512cd1d5dec08c0c8d718c65c9bb90018699e5",
-      "size": 320432,
+      "sha256": "fb3d0a55d692ea618ac5f9de078cc40974eb3ddb71fbb9fe916dd8908f2fbb37",
+      "size": 340336,
       "entries": [
         {
           "symbol": "eidola_add_bf16",
@@ -448,6 +448,11 @@
           "symbol": "eidola_moe_permute",
           "demangled": "eidola_moe_permute",
           "meta": "eidola_moe_permute_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute_count",
+          "demangled": "eidola_moe_permute_count",
+          "meta": "eidola_moe_permute_count_meta"
         },
         {
           "symbol": "eidola_qkv_rope_kv",
@@ -498,6 +503,7 @@
         "eidola_gather_quant_ue8m0_meta",
         "eidola_gather_rows_bf16_meta",
         "eidola_moe_combine_meta",
+        "eidola_moe_permute_count_meta",
         "eidola_moe_permute_meta",
         "eidola_qkv_rope_kv_meta",
         "eidola_quant_fp8_f32scale_meta",
@@ -516,8 +522,8 @@
       "source": "csrc/engine_ops.cu",
       "profile": "own",
       "file": "cubin/engine_ops.sm_100f.cubin",
-      "sha256": "591f8b4684776ac37cc5ef2f8bab88313e8c3eda1f6d0212923cbb4247b52da8",
-      "size": 320432,
+      "sha256": "419d1d17d84183ab9a7a8a766db735f38fb2ee3ebf6dc1d276aa5530d4f0e4a9",
+      "size": 340336,
       "entries": [
         {
           "symbol": "eidola_add_bf16",
@@ -558,6 +564,11 @@
           "symbol": "eidola_moe_permute",
           "demangled": "eidola_moe_permute",
           "meta": "eidola_moe_permute_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute_count",
+          "demangled": "eidola_moe_permute_count",
+          "meta": "eidola_moe_permute_count_meta"
         },
         {
           "symbol": "eidola_qkv_rope_kv",
@@ -608,6 +619,7 @@
         "eidola_gather_quant_ue8m0_meta",
         "eidola_gather_rows_bf16_meta",
         "eidola_moe_combine_meta",
+        "eidola_moe_permute_count_meta",
         "eidola_moe_permute_meta",
         "eidola_qkv_rope_kv_meta",
         "eidola_quant_fp8_f32scale_meta",
@@ -626,8 +638,8 @@
       "source": "csrc/engine_ops.cu",
       "profile": "own",
       "file": "cubin/engine_ops.sm_103a.cubin",
-      "sha256": "5805a3e890e9228cc04c892ce29242f8e86d6f311e11431098779dfe44426f63",
-      "size": 320432,
+      "sha256": "6a95b6a446103f16dcf3520a2b8fa9694230ea2e63f45b523216c3bb00cb561e",
+      "size": 340336,
       "entries": [
         {
           "symbol": "eidola_add_bf16",
@@ -668,6 +680,11 @@
           "symbol": "eidola_moe_permute",
           "demangled": "eidola_moe_permute",
           "meta": "eidola_moe_permute_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute_count",
+          "demangled": "eidola_moe_permute_count",
+          "meta": "eidola_moe_permute_count_meta"
         },
         {
           "symbol": "eidola_qkv_rope_kv",
@@ -718,6 +735,7 @@
         "eidola_gather_quant_ue8m0_meta",
         "eidola_gather_rows_bf16_meta",
         "eidola_moe_combine_meta",
+        "eidola_moe_permute_count_meta",
         "eidola_moe_permute_meta",
         "eidola_qkv_rope_kv_meta",
         "eidola_quant_fp8_f32scale_meta",
@@ -736,8 +754,8 @@
       "source": "csrc/engine_ops_reference.cu",
       "profile": "own",
       "file": "cubin/engine_ops_reference.sm_100a.cubin",
-      "sha256": "7310946ed44432e3a3b0283d7c76011c52d3587c7eb23fb36bf1127ebf552727",
-      "size": 79744,
+      "sha256": "014df5e4f2ac069b04d36ecc6f4ab94f20dc8163c4865e803d4f61af424ba50f",
+      "size": 98272,
       "entries": [
         {
           "symbol": "eidola_reference_gather_quant_ue8m0",
@@ -755,9 +773,19 @@
           "meta": "eidola_reference_qkv_rope_kv_meta"
         },
         {
+          "symbol": "eidola_reference_quant_fp8_f32scale",
+          "demangled": "eidola_reference_quant_fp8_f32scale",
+          "meta": "eidola_reference_quant_fp8_f32scale_meta"
+        },
+        {
           "symbol": "eidola_reference_router_topk",
           "demangled": "eidola_reference_router_topk",
           "meta": "eidola_reference_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_reference_swiglu_quant_fp8_f32scale_meta"
         },
         {
           "symbol": "eidola_reference_swiglu_quant_fp8_ue8m0",
@@ -769,7 +797,9 @@
         "eidola_reference_gather_quant_ue8m0_meta",
         "eidola_reference_moe_combine_meta",
         "eidola_reference_qkv_rope_kv_meta",
+        "eidola_reference_quant_fp8_f32scale_meta",
         "eidola_reference_router_topk_meta",
+        "eidola_reference_swiglu_quant_fp8_f32scale_meta",
         "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
       ],
       "mma_sass": {}
@@ -780,8 +810,8 @@
       "source": "csrc/engine_ops_reference.cu",
       "profile": "own",
       "file": "cubin/engine_ops_reference.sm_100f.cubin",
-      "sha256": "e1948595d417eb13c7a48a275d81237f59a2f0db5429b41f97dd336fcebb0f69",
-      "size": 79744,
+      "sha256": "2a2bba67df978c1bad584d6a6e09b32e5288ec331a1dc24816a608a0b135f52e",
+      "size": 98272,
       "entries": [
         {
           "symbol": "eidola_reference_gather_quant_ue8m0",
@@ -799,9 +829,19 @@
           "meta": "eidola_reference_qkv_rope_kv_meta"
         },
         {
+          "symbol": "eidola_reference_quant_fp8_f32scale",
+          "demangled": "eidola_reference_quant_fp8_f32scale",
+          "meta": "eidola_reference_quant_fp8_f32scale_meta"
+        },
+        {
           "symbol": "eidola_reference_router_topk",
           "demangled": "eidola_reference_router_topk",
           "meta": "eidola_reference_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_reference_swiglu_quant_fp8_f32scale_meta"
         },
         {
           "symbol": "eidola_reference_swiglu_quant_fp8_ue8m0",
@@ -813,7 +853,9 @@
         "eidola_reference_gather_quant_ue8m0_meta",
         "eidola_reference_moe_combine_meta",
         "eidola_reference_qkv_rope_kv_meta",
+        "eidola_reference_quant_fp8_f32scale_meta",
         "eidola_reference_router_topk_meta",
+        "eidola_reference_swiglu_quant_fp8_f32scale_meta",
         "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
       ],
       "mma_sass": {}
@@ -824,8 +866,8 @@
       "source": "csrc/engine_ops_reference.cu",
       "profile": "own",
       "file": "cubin/engine_ops_reference.sm_103a.cubin",
-      "sha256": "e34f9643f925d4042169bc62944d9df17d4a73c113407140323a593fb5eb9ef8",
-      "size": 79744,
+      "sha256": "84aad29f3fc2acb22336d310445890ec7f46d11117151252e99aea7ce93cf89a",
+      "size": 98272,
       "entries": [
         {
           "symbol": "eidola_reference_gather_quant_ue8m0",
@@ -843,9 +885,19 @@
           "meta": "eidola_reference_qkv_rope_kv_meta"
         },
         {
+          "symbol": "eidola_reference_quant_fp8_f32scale",
+          "demangled": "eidola_reference_quant_fp8_f32scale",
+          "meta": "eidola_reference_quant_fp8_f32scale_meta"
+        },
+        {
           "symbol": "eidola_reference_router_topk",
           "demangled": "eidola_reference_router_topk",
           "meta": "eidola_reference_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_reference_swiglu_quant_fp8_f32scale_meta"
         },
         {
           "symbol": "eidola_reference_swiglu_quant_fp8_ue8m0",
@@ -857,7 +909,9 @@
         "eidola_reference_gather_quant_ue8m0_meta",
         "eidola_reference_moe_combine_meta",
         "eidola_reference_qkv_rope_kv_meta",
+        "eidola_reference_quant_fp8_f32scale_meta",
         "eidola_reference_router_topk_meta",
+        "eidola_reference_swiglu_quant_fp8_f32scale_meta",
         "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
       ],
       "mma_sass": {}
@@ -1155,8 +1209,8 @@
     {
       "name": "engine_ops",
       "file": "fatbin/engine_ops.fatbin",
-      "sha256": "333c45223474c199760936e264912a273c372a334db8fc85156a5a751d3259b7",
-      "size": 641096,
+      "sha256": "c95e83d50ab178ffa47e5921956bc44fd557d2d18ecd1a91da5cbba5d0c1b1fe",
+      "size": 680904,
       "archs": [
         "sm_100a",
         "sm_103a"
@@ -1165,8 +1219,8 @@
     {
       "name": "engine_ops_reference",
       "file": "fatbin/engine_ops_reference.fatbin",
-      "sha256": "2de62fb456375188aa863aaa4347430547c15766530978d977a5cd1e801762c3",
-      "size": 159720,
+      "sha256": "093c78189728b548b88a00a4ce093e6d02f04e958da860da67217996189ab0b4",
+      "size": 196776,
       "archs": [
         "sm_100a",
         "sm_103a"

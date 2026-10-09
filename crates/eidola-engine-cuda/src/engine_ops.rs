@@ -69,6 +69,7 @@ pub struct EngineOps {
     router: Kernel,
     router_scores: Kernel,
     router_select: Kernel,
+    permute_count: Kernel,
     permute: Kernel,
     gather_quant: Kernel,
     combine: Kernel,
@@ -108,6 +109,7 @@ impl EngineOps {
             router: m.kernel("eidola_router_topk")?,
             router_scores: m.kernel("eidola_router_scores")?,
             router_select: m.kernel("eidola_router_select")?,
+            permute_count: m.kernel("eidola_moe_permute_count")?,
             permute: m.kernel("eidola_moe_permute")?,
             gather_quant: m.kernel("eidola_gather_quant_ue8m0")?,
             combine: m.kernel("eidola_moe_combine")?,
@@ -185,14 +187,11 @@ impl EngineOps {
         k: u32,
         m_pad: u32,
     ) -> Result<()> {
-        require(
-            k > 0 && k.is_multiple_of(128) && m_pad >= rows,
-            "quant_fp8: K must be whole 128-wide groups and m_pad cover the rows",
-        )?;
-        if rows == 0 {
+        let grid = quant_grid(rows, k, m_pad, q, x)?;
+        if grid[0] == 0 {
             return Ok(());
         }
-        unsafe { launch!(gpu, self.quant, [rows, k / 128, 1], q, sf, x, k, m_pad) }
+        unsafe { launch!(gpu, self.quant, grid, q, sf, x, k, m_pad) }
     }
 
     pub unsafe fn add_f32(&self, gpu: &Gpu, h: u64, d: u64, n: u64) -> Result<()> {
@@ -237,23 +236,22 @@ impl EngineOps {
         inter: u32,
         m_pad: u32,
     ) -> Result<()> {
-        require(
-            inter > 0 && inter.is_multiple_of(128) && m_pad >= rows,
-            "swiglu (f32 scales): intermediate must be whole 128-wide groups and m_pad cover the rows",
-        )?;
-        if rows == 0 {
+        let launch = swiglu_f32scale_grid(rows, inter, m_pad, q, gu)?;
+        if launch.items == 0 {
             return Ok(());
         }
+        // The kernel walks the items of `launch.rows` rows.
         unsafe {
             launch!(
                 gpu,
                 self.swiglu_f32s,
-                [rows, inter / 128, 1],
+                launch.grid,
                 q,
                 sf,
                 gu,
                 inter,
-                m_pad
+                m_pad,
+                launch.rows
             )
         }
     }
@@ -274,14 +272,7 @@ impl EngineOps {
         inter: u32,
         rows4: u32,
     ) -> Result<()> {
-        require(
-            sfa_layout_ok(rows, rows4),
-            "swiglu (UE8M0): the scale layout must cover the rows",
-        )?;
-        require(
-            gu.is_multiple_of(16) && q.is_multiple_of(8),
-            "swiglu (UE8M0): gate/up rows must be 16-byte and codes 8-byte aligned",
-        )?;
+        swiglu_operands(q, gu, rows, rows4)?;
         let grid = swiglu_grid(tokens, top_k, inter, rows)?;
         if grid[0] == 0 {
             return Ok(());
@@ -420,31 +411,45 @@ impl EngineOps {
     /// Expert-major placement of `tokens × top_k` routed pairs
     /// ([`expert_placement`] is its host form): `row_of` per pair, and the
     /// psum layout's grouped layout, 256 words, every run within
-    /// `rows_bound` rows.
+    /// `rows_bound` rows. `scratch` is [`PERMUTE_SCRATCH_WORDS`] words: above
+    /// one block, `eidola_moe_permute_count` writes every block's counts
+    /// there and `eidola_moe_permute` (the same grid) reads them, so no
+    /// block waits for another; with one block the placement is one launch
+    /// and reads no scratch.
     pub unsafe fn moe_permute(
         &self,
         gpu: &Gpu,
         grouped_layout: u64,
         row_of: u64,
         topk_ids: u64,
+        scratch: u64,
         tokens: u32,
         top_k: u32,
         rows_bound: u32,
     ) -> Result<()> {
-        require(
-            (1..=crate::support::MAX_TOP_K).contains(&(top_k as usize))
-                && rows_bound as usize >= psum_rows(tokens as usize, top_k as usize)
-                && i32::try_from(rows_bound).is_ok(),
-            "permute: at most 8 experts per token; the layout's rows hold every run",
-        )?;
+        let grid = permute_grid(tokens, top_k, rows_bound, scratch)?;
+        if grid[0] > 1 {
+            unsafe {
+                launch!(
+                    gpu,
+                    self.permute_count,
+                    grid,
+                    scratch,
+                    topk_ids,
+                    tokens,
+                    top_k
+                )?;
+            }
+        }
         unsafe {
             launch!(
                 gpu,
                 self.permute,
-                [1, 1, 1],
+                grid,
                 grouped_layout,
                 row_of,
                 topk_ids,
+                scratch,
                 tokens,
                 top_k
             )
@@ -809,6 +814,72 @@ fn routed_pairs(tokens: u32, top_k: u32, rows: u32) -> Result<u32> {
     Ok(pairs)
 }
 
+/// Elements of a row one warp of either SwiGLU kernel covers per item: two
+/// 128-wide groups, 32 lanes of 8 consecutive elements (`kSwigluPiece`).
+pub const SWIGLU_PIECE: u32 = 256;
+
+/// Warps per block of both SwiGLU kernels (`kSwigluWarps`).
+pub const SWIGLU_WARPS: u32 = 4;
+
+/// Most warps one SwiGLU launch runs (`kSwigluMaxWarps`): 8 blocks of
+/// [`SWIGLU_WARPS`] on each of 148 SMs, which such a part holds at once (the
+/// kernels' `__launch_bounds__` keep 8 blocks within an SM's registers), so
+/// every warp starts at once and walks its share of the items.
+pub const SWIGLU_MAX_WARPS: u32 = 148 * 8 * SWIGLU_WARPS;
+
+/// Most items one SwiGLU launch walks: a warp's item index plus the grid's
+/// warps stays within `u32`.
+const SWIGLU_MAX_ITEMS: u32 = i32::MAX as u32;
+
+/// A SwiGLU launch: its grid, the rows (the dense form) or routed pairs
+/// (the expert form) the kernel is given, and the items (row pieces of
+/// [`SWIGLU_PIECE`] elements) its warps walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwigluLaunch {
+    pub grid: [u32; 3],
+    pub rows: u32,
+    pub items: u32,
+}
+
+/// One warp per item up to [`SWIGLU_MAX_WARPS`], whole blocks, over `rows`
+/// rows of `pieces` items.
+fn swiglu_launch(rows: u32, pieces: u32, what: &str) -> Result<SwigluLaunch> {
+    let items = rows
+        .checked_mul(pieces)
+        .filter(|&n| n <= SWIGLU_MAX_ITEMS)
+        .ok_or_else(|| crate::CudaError::new(what))?;
+    Ok(SwigluLaunch {
+        grid: [items.min(SWIGLU_MAX_WARPS).div_ceil(SWIGLU_WARPS), 1, 1],
+        rows,
+        items,
+    })
+}
+
+/// The dense SwiGLU's launch (f32 scales): `rows × inter / SWIGLU_PIECE`
+/// items, the intermediate whole pieces; gate/up rows 16-byte and codes
+/// 8-byte aligned.
+pub fn swiglu_f32scale_grid(
+    rows: u32,
+    inter: u32,
+    m_pad: u32,
+    q: u64,
+    gu: u64,
+) -> Result<SwigluLaunch> {
+    require(
+        inter > 0 && inter.is_multiple_of(SWIGLU_PIECE) && m_pad >= rows,
+        "swiglu (f32 scales): intermediate must be whole 256-wide pieces and m_pad cover the rows",
+    )?;
+    require(
+        gu.is_multiple_of(16) && q.is_multiple_of(8),
+        "swiglu (f32 scales): gate/up rows must be 16-byte and codes 8-byte aligned",
+    )?;
+    swiglu_launch(
+        rows,
+        inter / SWIGLU_PIECE,
+        "swiglu (f32 scales): too many rows for one launch",
+    )
+}
+
 /// Elements of a routed row each `eidola_swiglu_quant_fp8_ue8m0` block
 /// covers: two 512-wide scale words, 128 threads of 8 consecutive elements.
 pub const SWIGLU_WIDTH: u32 = 1024;
@@ -822,6 +893,91 @@ pub fn swiglu_grid(tokens: u32, top_k: u32, inter: u32, rows: u32) -> Result<[u3
     )?;
     let pairs = routed_pairs(tokens, top_k, rows)?;
     Ok([pairs, inter / SWIGLU_WIDTH, 1])
+}
+
+/// The expert SwiGLU's operands: the scale layout covers the rows, gate/up
+/// rows are 16-byte and codes 8-byte aligned.
+pub fn swiglu_operands(q: u64, gu: u64, rows: u32, rows4: u32) -> Result<()> {
+    require(
+        sfa_layout_ok(rows, rows4),
+        "swiglu (UE8M0): the scale layout must cover the rows",
+    )?;
+    require(
+        gu.is_multiple_of(16) && q.is_multiple_of(8),
+        "swiglu (UE8M0): gate/up rows must be 16-byte and codes 8-byte aligned",
+    )
+}
+
+/// Warps per block of `eidola_quant_fp8_f32scale`, one per 128-wide group.
+pub const QUANT_WARPS: u32 = 4;
+
+/// The f32-scale activation quantization's grid: one block per row and
+/// [`QUANT_WARPS`] 128-wide groups of K, which must be whole groups; rows
+/// 16-byte and codes 4-byte aligned, and `m_pad` covering the rows.
+pub fn quant_grid(rows: u32, k: u32, m_pad: u32, q: u64, x: u64) -> Result<[u32; 3]> {
+    require(
+        k > 0 && k.is_multiple_of(128) && m_pad >= rows,
+        "quant_fp8: K must be whole 128-wide groups and m_pad cover the rows",
+    )?;
+    require(
+        x.is_multiple_of(16) && q.is_multiple_of(4),
+        "quant_fp8: rows must be 16-byte and codes 4-byte aligned",
+    )?;
+    require(
+        rows <= MAX_GRID_X,
+        "quant_fp8: too many rows for one launch",
+    )?;
+    let blocks = (k / 128).div_ceil(QUANT_WARPS);
+    require(blocks <= 65_535, "quant_fp8: K too wide for one launch")?;
+    Ok([rows, blocks, 1])
+}
+
+/// Routed pairs per block of `eidola_moe_permute` (`kPermuteChunk`), up to
+/// [`PERMUTE_MAX_BLOCKS`].
+pub const PERMUTE_CHUNK: u32 = 512;
+
+/// Most blocks of `eidola_moe_permute` (`kPermuteMaxBlocks`): the scratch
+/// holds a count per (expert, block), each expert's read in 16-byte loads.
+pub const PERMUTE_MAX_BLOCKS: u32 = 128;
+
+/// Most pairs `eidola_moe_permute` places in one launch of one block (640
+/// tokens of 8). On a B300 the one block costs 8.2 µs at 4,104 pairs and
+/// 14.3 at 8,192, the two-launch form a flat 10.2–10.3 µs from 1,024 pairs
+/// to 8,192: they cross near 5,500 pairs (interpolating the one block
+/// linearly), so the bound sits just below, where one block still wins.
+pub const PERMUTE_ONE_BLOCK_PAIRS: u32 = 5120;
+
+/// Words of `eidola_moe_permute`'s scratch: a count per (expert, block).
+pub const PERMUTE_SCRATCH_WORDS: usize = crate::support::EXPERTS * PERMUTE_MAX_BLOCKS as usize;
+
+/// The placement's grid: one block up to [`PERMUTE_ONE_BLOCK_PAIRS`] (one
+/// launch; it writes the grouped layout even with no pairs), else one block
+/// per [`PERMUTE_CHUNK`] pairs, at most [`PERMUTE_MAX_BLOCKS`] (a count
+/// launch, then the placement).
+/// The layout's rows must hold every run, and the scratch be 16-byte aligned.
+pub fn permute_grid(tokens: u32, top_k: u32, rows_bound: u32, scratch: u64) -> Result<[u32; 3]> {
+    require(
+        (1..=crate::support::MAX_TOP_K).contains(&(top_k as usize)),
+        "permute: 1..=8 experts per token",
+    )?;
+    let pairs = tokens
+        .checked_mul(top_k)
+        .ok_or_else(|| crate::CudaError::new("permute: too many pairs"))?;
+    require(
+        rows_bound as usize >= psum_rows(tokens as usize, top_k as usize)
+            && i32::try_from(rows_bound).is_ok(),
+        "permute: the layout's rows must hold every run",
+    )?;
+    require(
+        scratch != 0 && scratch.is_multiple_of(16),
+        "permute: scratch must be 16-byte aligned",
+    )?;
+    let blocks = if pairs <= PERMUTE_ONE_BLOCK_PAIRS {
+        1
+    } else {
+        pairs.div_ceil(PERMUTE_CHUNK).min(PERMUTE_MAX_BLOCKS)
+    };
+    Ok([blocks, 1, 1])
 }
 
 /// The expert gather's grid: one block per token and 512-wide word of `k`,
@@ -1113,9 +1269,9 @@ mod tests {
         }
     }
 
-    /// The SwiGLU: one block per routed pair and 1024 elements; the gather:
-    /// one block per token and 512-wide word. Neither depends on the
-    /// layout's row count (every pair plus the padding of each expert
+    /// The SwiGLU: a warp per 256-element piece of each routed pair's row;
+    /// the gather: one block per token and 512-wide word. Neither depends on
+    /// the layout's row count (every pair plus the padding of each expert
     /// reached): launches scale with the tokens, not the layout's padding.
     #[test]
     fn expert_row_grids_follow_the_tokens() {
@@ -1147,6 +1303,252 @@ mod tests {
         assert!(gather_grid(1, 8, 512, 8).is_ok());
         assert!(swiglu_grid(1, 8, 512, 8).is_err(), "half a piece");
         assert!(swiglu_grid(1, 8, 1536, 8).is_err(), "not whole pieces");
+    }
+
+    /// The dense SwiGLU launches one warp per item (a 256-element piece of a
+    /// row) in whole blocks of 4 warps up to the most warps a 148-SM part
+    /// holds at once, then the same grid whatever the items: every warp
+    /// walks its share, and every item has a warp, whatever the count.
+    #[test]
+    fn swiglu_launches_a_warp_per_item_up_to_a_resident_grid() {
+        assert_eq!(SWIGLU_MAX_WARPS, 4736);
+        // Rows × 64 items at Flash's 16,384.
+        for (rows, blocks) in [
+            (1u32, 16u32),
+            (4, 64),
+            (73, 1168),
+            (74, SWIGLU_MAX_WARPS / 4),
+            (2048, SWIGLU_MAX_WARPS / 4),
+        ] {
+            let launch = swiglu_f32scale_grid(rows, 16_384, rows, 0, 0).unwrap();
+            assert_eq!(launch.items, rows * 64, "{rows} rows");
+            assert_eq!(launch.rows, rows);
+            assert_eq!(launch.grid, [blocks, 1, 1], "{rows} rows");
+            let warps = launch.grid[0] * SWIGLU_WARPS;
+            assert!(warps >= launch.items.min(SWIGLU_MAX_WARPS));
+            assert!(warps < launch.items.min(SWIGLU_MAX_WARPS) + SWIGLU_WARPS);
+        }
+        // Three items: one block, its last warp idle.
+        let three = swiglu_f32scale_grid(3, 256, 4, 0, 0).unwrap();
+        assert_eq!((three.grid, three.items), ([1, 1, 1], 3));
+        assert_eq!(swiglu_f32scale_grid(0, 256, 0, 0, 0).unwrap().items, 0);
+        // Items past i32 are refused (a warp's next item must not wrap).
+        assert!(swiglu_f32scale_grid(1 << 24, 1 << 15, 1 << 24, 0, 0).is_err());
+        assert!(swiglu_f32scale_grid(1 << 23, 1 << 15, 1 << 23, 0, 0).is_ok());
+    }
+
+    /// The dense SwiGLU and the expert SwiGLU refuse what their kernels
+    /// cannot run: partial pieces, `m_pad` short of the rows, a scale layout
+    /// short of the rows, and gate/up rows or codes off their 16- and 8-byte
+    /// vectors.
+    #[test]
+    fn swiglu_refusals() {
+        let ok = |q, gu| swiglu_f32scale_grid(8, 16_384, 8, q, gu);
+        assert!(ok(0, 0).is_ok());
+        assert!(ok(8, 16).is_ok());
+        assert!(ok(0, 8).is_err(), "gate/up rows off 16 bytes");
+        assert!(ok(4, 0).is_err(), "codes off 8 bytes");
+        assert!(
+            swiglu_f32scale_grid(8, 128, 8, 0, 0).is_err(),
+            "half a piece"
+        );
+        assert!(
+            swiglu_f32scale_grid(8, 384, 8, 0, 0).is_err(),
+            "a piece and a half"
+        );
+        assert!(swiglu_f32scale_grid(8, 0, 8, 0, 0).is_err(), "no pieces");
+        assert!(
+            swiglu_f32scale_grid(8, 256, 7, 0, 0).is_err(),
+            "m_pad below the rows"
+        );
+        assert!(swiglu_operands(0, 0, 8, 8).is_ok());
+        assert!(swiglu_operands(8, 16, 8, 8).is_ok());
+        assert!(
+            swiglu_operands(0, 8, 8, 8).is_err(),
+            "gate/up rows off 16 bytes"
+        );
+        assert!(swiglu_operands(4, 0, 8, 8).is_err(), "codes off 8 bytes");
+        assert!(swiglu_operands(0, 0, 8, 4).is_err(), "rows4 below the rows");
+        assert!(
+            swiglu_operands(0, 0, 8, 10).is_err(),
+            "rows4 not whole words"
+        );
+    }
+
+    /// The f32-scale quantization: one block per row and four 128-wide
+    /// groups, the last block's spare warps idle; refused: partial groups,
+    /// `m_pad` short of the rows, rows off 16 bytes and codes off 4.
+    #[test]
+    fn quant_grid_is_a_warp_per_group() {
+        assert_eq!(quant_grid(7, 4096, 8, 0, 0).unwrap(), [7, 8, 1]);
+        assert_eq!(quant_grid(1, 16_384, 4, 0, 0).unwrap(), [1, 32, 1]);
+        assert_eq!(
+            quant_grid(3, 640, 4, 0, 0).unwrap(),
+            [3, 2, 1],
+            "five groups"
+        );
+        assert_eq!(quant_grid(3, 128, 4, 0, 0).unwrap(), [3, 1, 1]);
+        assert_eq!(quant_grid(0, 4096, 0, 0, 0).unwrap(), [0, 8, 1]);
+        assert!(quant_grid(1, 4096, 4, 4, 16).is_ok());
+        assert!(quant_grid(1, 200, 4, 0, 0).is_err(), "partial group");
+        assert!(quant_grid(1, 0, 4, 0, 0).is_err(), "no groups");
+        assert!(quant_grid(8, 128, 4, 0, 0).is_err(), "m_pad below the rows");
+        assert!(quant_grid(1, 128, 4, 0, 8).is_err(), "rows off 16 bytes");
+        assert!(quant_grid(1, 128, 4, 2, 0).is_err(), "codes off 4 bytes");
+        assert!(
+            quant_grid(1, 128 * 4 * 65_536, 4, 0, 0).is_err(),
+            "too wide"
+        );
+    }
+
+    /// The placement: one block per 512 pairs, at least one and at most 128;
+    /// refused: top_k outside 1..=8, a layout short of the worst placement,
+    /// and a missing or misaligned scratch.
+    #[test]
+    fn permute_grid_follows_the_pairs() {
+        let scratch = 256;
+        for (tokens, blocks) in [
+            (0u32, 1u32),
+            (1, 1),
+            (64, 1),
+            (65, 1),
+            (513, 1),
+            (640, 1),
+            (641, 11),
+            (2048, 32),
+            (8192, 128),
+            (8193, 128),
+            (32_768, 128),
+        ] {
+            let rows = u32::try_from(psum_rows(tokens as usize, 8)).unwrap();
+            assert_eq!(
+                permute_grid(tokens, 8, rows, scratch).unwrap(),
+                [blocks, 1, 1],
+                "{tokens} tokens"
+            );
+        }
+        let rows = |t: u32| u32::try_from(psum_rows(t as usize, 8)).unwrap();
+        assert!(
+            permute_grid(200, 8, rows(200) - 1, scratch).is_err(),
+            "rows"
+        );
+        assert!(permute_grid(1, 0, rows(1), scratch).is_err(), "top_k 0");
+        assert!(permute_grid(1, 9, rows(1), scratch).is_err(), "top_k 9");
+        assert!(permute_grid(1, 8, rows(1), 0).is_err(), "no scratch");
+        assert!(
+            permute_grid(1, 8, rows(1), 8).is_err(),
+            "scratch off 16 bytes"
+        );
+        assert!(
+            permute_grid(1, 8, u32::MAX, scratch).is_err(),
+            "rows past i32"
+        );
+        assert!(permute_grid(u32::MAX / 8 + 1, 8, u32::MAX, scratch).is_err());
+        assert_eq!(PERMUTE_SCRATCH_WORDS, 256 * 128);
+    }
+
+    /// `eidola_moe_permute`'s arithmetic on the host, for `blocks` blocks:
+    /// each block's run and each warp's eighth of it as the kernel cuts
+    /// them, per-(warp, expert) counts, each block's first row inside each
+    /// expert's run from the counts of the blocks before it, and the pairs
+    /// walked in order inside each warp.
+    fn permute_emulated(ids: &[i32], blocks: usize) -> (Vec<i32>, Vec<i32>) {
+        const WARPS: usize = 8;
+        let n = ids.len();
+        let expert = |id: i32| usize::try_from(id).ok().filter(|&e| e < 256);
+        let run = n.div_ceil(blocks);
+        let cut = |b: usize| {
+            let lo = (b * run).min(n);
+            (lo, (lo + run).min(n))
+        };
+        let warp_cut = |b: usize, w: usize| {
+            let (blo, bhi) = cut(b);
+            let seg = (bhi - blo).div_ceil(WARPS);
+            let lo = (blo + w * seg).min(bhi);
+            (lo, (lo + seg).min(bhi))
+        };
+        // counts[b][w][e]
+        let mut counts = vec![vec![vec![0usize; 256]; WARPS]; blocks];
+        for (b, block) in counts.iter_mut().enumerate() {
+            for (w, warp) in block.iter_mut().enumerate() {
+                let (lo, hi) = warp_cut(b, w);
+                for &id in &ids[lo..hi] {
+                    if let Some(e) = expert(id) {
+                        warp[e] += 1;
+                    }
+                }
+            }
+        }
+        // before[b][e]: expert e's pairs in the blocks before b.
+        let mut before = vec![vec![0usize; 256]; blocks + 1];
+        for b in 0..blocks {
+            for e in 0..256 {
+                before[b + 1][e] = before[b][e] + counts[b].iter().map(|w| w[e]).sum::<usize>();
+            }
+        }
+        let mut grouped = vec![0i32; 256];
+        let mut starts = vec![0usize; 256];
+        let mut start = 0;
+        for e in 0..256 {
+            let total = before[blocks][e];
+            starts[e] = start;
+            grouped[e] = i32::try_from(start + total).unwrap();
+            start += total.div_ceil(128) * 128;
+        }
+        let mut row_of = vec![-1i32; n];
+        for b in 0..blocks {
+            for w in 0..WARPS {
+                let mut next: Vec<usize> = (0..256)
+                    .map(|e| {
+                        starts[e]
+                            + before[b][e]
+                            + counts[b][..w].iter().map(|x| x[e]).sum::<usize>()
+                    })
+                    .collect();
+                let (lo, hi) = warp_cut(b, w);
+                for i in lo..hi {
+                    if let Some(e) = expert(ids[i]) {
+                        row_of[i] = i32::try_from(next[e]).unwrap();
+                        next[e] += 1;
+                    }
+                }
+            }
+        }
+        (row_of, grouped)
+    }
+
+    /// The kernel's block and warp cuts with the counts of the blocks before
+    /// each are the host placement, word for word, at every grid the host
+    /// picks and at block counts that leave short and empty runs.
+    #[test]
+    fn permute_blocks_place_as_the_host_does() {
+        for (tokens, spread) in [
+            (1usize, 256usize),
+            (64, 256),
+            (65, 256),
+            (129, 9),
+            (513, 256),
+            (2048, 12),
+            (8193, 256),
+        ] {
+            let ids = ids(tokens as u64 * 7 + spread as u64, tokens, 8, spread);
+            let mut stray = ids.clone();
+            for i in (0..stray.len()).step_by(37) {
+                stray[i] = if i % 2 == 0 { -1 } else { 256 };
+            }
+            let rows = u32::try_from(psum_rows(tokens, 8)).unwrap();
+            let grid = permute_grid(u32::try_from(tokens).unwrap(), 8, rows, 16).unwrap()[0];
+            for ids in [&ids, &stray] {
+                let want = expert_placement(ids);
+                for blocks in [grid as usize, 1, 2, 3, 128] {
+                    assert_eq!(
+                        permute_emulated(ids, blocks),
+                        want,
+                        "{tokens} tokens over {spread}, {blocks} blocks"
+                    );
+                }
+            }
+        }
     }
 
     /// DeepGEMM's psum scheduler (`sched::Scheduler::get_next_block` for
