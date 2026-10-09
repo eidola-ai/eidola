@@ -1,4 +1,4 @@
-//! The expert path's router (both forms), gather, SwiGLU and combine kernels
+//! The expert path's router (every form), gather, SwiGLU and combine kernels
 //! against their single-block reference forms (`engine_ops_reference.cu`, the
 //! numerics they must keep) bit for bit, and the router against the model
 //! crate's routing, on every image this device runs, from one token to a full
@@ -9,8 +9,9 @@ mod common;
 use common::{Lcg, setup};
 use eidola_engine_cuda::bf16;
 use eidola_engine_cuda::engine_ops::{
-    COMBINE_WIDTH, EngineOps, ROUTER_CLUSTER, ROUTER_THREADS, ROUTER_TILED_THREADS, RouterForm,
-    expert_placement, psum_rows,
+    COMBINE_WIDTH, EngineOps, ROUTER_CLUSTER, ROUTER_SCORES_SMEM, ROUTER_SCORES_THREADS,
+    ROUTER_SELECT_WARPS, ROUTER_THREADS, ROUTER_TILED_THREADS, RouterForm, expert_placement,
+    psum_rows, router_scores_len,
 };
 use eidola_engine_cuda::launch::dptr;
 use eidola_engine_cuda::{Gpu, ImageArch, Kernel};
@@ -26,8 +27,8 @@ const INTER: usize = 2048;
 /// past a block of rows), 513 (which leaves the tiled router a one-token last
 /// tile), and a full prefill step.
 const TOKENS: [usize; 9] = [1, 2, 7, 64, 128, 129, 513, 2048, 8192];
-/// Both router forms, whatever the token count.
-const FORMS: [RouterForm; 2] = [RouterForm::PerToken, RouterForm::Tiled];
+/// Every router form, whatever the token count.
+const FORMS: [RouterForm; 3] = [RouterForm::PerToken, RouterForm::Tiled, RouterForm::Split];
 
 fn u32_of(x: usize) -> u32 {
     u32::try_from(x).unwrap()
@@ -106,10 +107,29 @@ fn run_router(
     case: &RouterCase,
     tokens: usize,
 ) -> ((Vec<i32>, Vec<u32>), (Vec<i32>, Vec<u32>)) {
+    run_router_experts(gpu, ops, form, reference, case, tokens, EXPERTS)
+}
+
+/// [`run_router`] over the first `experts` of the case's experts. The split
+/// form's scratch starts as NaN, so a score it selects over without writing
+/// shows.
+#[allow(clippy::type_complexity)]
+fn run_router_experts(
+    gpu: &Gpu,
+    ops: &EngineOps,
+    form: RouterForm,
+    reference: &Reference,
+    case: &RouterCase,
+    tokens: usize,
+    experts: usize,
+) -> ((Vec<i32>, Vec<u32>), (Vec<i32>, Vec<u32>)) {
     let s = gpu.stream();
     let x = s.clone_htod(&case.x).unwrap();
     let w = s.clone_htod(&case.w).unwrap();
     let bias = s.clone_htod(&case.bias).unwrap();
+    let scores = s
+        .clone_htod(&vec![f32::NAN; router_scores_len(tokens, experts).unwrap()])
+        .unwrap();
     let mut out = Vec::new();
     for new in [true, false] {
         let ids = s.alloc_zeros::<i32>(tokens * TOP_K).unwrap();
@@ -121,12 +141,13 @@ fn run_router(
                     form,
                     dptr(&ids, s),
                     dptr(&wts, s),
+                    dptr(&scores, s),
                     dptr(&x, s),
                     dptr(&w, s),
                     dptr(&bias, s),
                     u32_of(tokens),
                     u32_of(HIDDEN),
-                    u32_of(EXPERTS),
+                    u32_of(experts),
                     u32_of(TOP_K),
                     1.0f32,
                 )
@@ -142,7 +163,7 @@ fn run_router(
                     dptr(&w, s),
                     dptr(&bias, s),
                     u32_of(HIDDEN),
-                    u32_of(EXPERTS),
+                    u32_of(experts),
                     u32_of(TOP_K),
                     1.0f32
                 )
@@ -176,6 +197,14 @@ fn router_launch_contract() {
         assert_eq!(meta.block, [ROUTER_TILED_THREADS, 1, 1], "{arch:?}");
         assert_eq!(meta.cluster, [ROUTER_CLUSTER, 1, 1], "{arch:?}");
         assert_eq!(meta.dynamic_smem_bytes, 0, "{arch:?}");
+        let meta = *m.kernel("eidola_router_scores").unwrap().meta();
+        assert_eq!(meta.block, [ROUTER_SCORES_THREADS, 1, 1], "{arch:?}");
+        assert_eq!(meta.cluster, [1, 1, 1], "{arch:?}");
+        assert_eq!(meta.dynamic_smem_bytes, ROUTER_SCORES_SMEM, "{arch:?}");
+        let meta = *m.kernel("eidola_router_select").unwrap().meta();
+        assert_eq!(meta.block, [ROUTER_SELECT_WARPS * 32, 1, 1], "{arch:?}");
+        assert_eq!(meta.cluster, [1, 1, 1], "{arch:?}");
+        assert_eq!(meta.dynamic_smem_bytes, 0, "{arch:?}");
         let meta = *m.kernel("eidola_moe_combine").unwrap().meta();
         assert_eq!(meta.block, [COMBINE_WIDTH / 8, 1, 1], "{arch:?}");
         assert_eq!(meta.cluster, [1, 1, 1], "{arch:?}");
@@ -188,7 +217,7 @@ fn router_launch_contract() {
 }
 
 /// Same expert ids in the same order and the same weights, bit for bit,
-/// ties included, at every token count, in both forms.
+/// ties included, at every token count, in every form.
 #[test]
 fn router_matches_reference_bit_for_bit() {
     let Some(su) = setup() else { return };
@@ -233,8 +262,41 @@ fn router_matches_reference_bit_for_bit() {
     }
 }
 
+/// Fewer experts than the kernels' widest (a partial last expert block of
+/// the split form, and lanes holding no expert in its selection): the same
+/// ids and weights as the reference, bit for bit, in every form.
+#[test]
+fn router_partial_experts_match_reference() {
+    let Some(su) = setup() else { return };
+    let gpu = &su.gpu;
+    for &arch in &su.archs {
+        let ops = EngineOps::from_module(su.module("engine_ops", arch)).unwrap();
+        let reference = Reference::load(&su, arch);
+        for experts in [200, 250] {
+            for tokens in [1, 9, 64, 513] {
+                let mut rng = Lcg(0xe0 ^ (experts * 31 + tokens) as u64);
+                let case = router_case(&mut rng, tokens);
+                for form in FORMS {
+                    let (new, old) =
+                        run_router_experts(gpu, &ops, form, &reference, &case, tokens, experts);
+                    assert_eq!(
+                        new, old,
+                        "{arch:?} {form:?} {experts} experts, {tokens} tokens"
+                    );
+                    assert!(
+                        new.0
+                            .iter()
+                            .all(|&e| usize::try_from(e).is_ok_and(|e| e < experts)),
+                        "{arch:?} {form:?} {experts} experts, {tokens} tokens: an id out of range"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// NaN choices select exactly as the reference's scan does: a NaN at the
-/// lowest untaken expert is taken, one elsewhere never wins. Both forms, at
+/// lowest untaken expert is taken, one elsewhere never wins. Every form, at
 /// every token count, with NaN logits too (a NaN in a token's row makes every
 /// one of its scores NaN).
 #[test]

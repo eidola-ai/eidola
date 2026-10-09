@@ -1,5 +1,5 @@
-//! Per-launch device time of the expert path's kernels (the router in both
-//! forms, gather, SwiGLU, combine) and the fused-QKV RoPE + KV write against
+//! Per-launch device time of the expert path's kernels (the router in every
+//! form, gather, SwiGLU, combine) and the fused-QKV RoPE + KV write against
 //! their single-block reference forms (`engine_ops_reference.cu`), and of the
 //! placement and both grouped GEMMs (no reference form; zero weights for all
 //! 256 experts), at Flash's shapes on synthetic data, per token count. No
@@ -13,9 +13,10 @@
 //! long-running launch, so the device runs them back to back whatever the
 //! host's launch rate, and divides the time between two events around them.
 //! The expert layout is the executor's for that token count, placed from the
-//! router's own selection. The router is timed in both forms at every token count (`router/token`,
-//! `router/tiled`), with the form the executor picks marked `*`: the data
-//! `ROUTER_PER_TOKEN_MAX` is chosen from. `qkv` is a sliding layer's (two KV
+//! router's own selection. The router is timed in every form at every token
+//! count (`router/token`, `router/tiled`, `router/split`, the last both of its
+//! launches), with the form the executor runs marked `*`: the data
+//! `EXECUTOR_ROUTER` is chosen from. `qkv` is a sliding layer's (two KV
 //! heads per chunk). Prints a table and one JSON line per kernel and token
 //! count (`{"kernel", "tokens", "new_us", "reference_us", "executor"}`;
 //! `reference_us` is null for a kernel without a reference form).
@@ -23,7 +24,9 @@
 use cudarc::driver::sys::CUevent_flags;
 use eidola_engine_cuda::bf16;
 use eidola_engine_cuda::engine_ops::psum_rows;
-use eidola_engine_cuda::engine_ops::{EngineOps, QkvArgs, RouterForm};
+use eidola_engine_cuda::engine_ops::{
+    EXECUTOR_ROUTER, EngineOps, QkvArgs, RouterForm, router_scores_len,
+};
 use eidola_engine_cuda::launch::dptr;
 use eidola_engine_cuda::moe_gemm::{GROUPS, MoeGemm, MoeGemmArgs, MoeProj};
 use eidola_engine_cuda::{Gpu, KernelDir, KernelModule};
@@ -150,9 +153,13 @@ fn main() {
     let dbias = s.clone_htod(&bias).unwrap();
     let ids = s.alloc_zeros::<i32>(usize_of(max_tokens * TOP_K)).unwrap();
     let wts = s.alloc_zeros::<f32>(usize_of(max_tokens * TOP_K)).unwrap();
-    let (pid, pw, px, prw, pb) = (
+    let scores = s
+        .alloc_zeros::<f32>(router_scores_len(usize_of(max_tokens), usize_of(EXPERTS)).unwrap())
+        .unwrap();
+    let (pid, pw, psc, px, prw, pb) = (
         dptr(&ids, s),
         dptr(&wts, s),
+        dptr(&scores, s),
         dptr(&dx, s),
         dptr(&dw, s),
         dptr(&dbias, s),
@@ -201,17 +208,18 @@ fn main() {
             ));
         };
 
-        // Router, both forms.
+        // Router, every form.
         let router = |form: RouterForm| {
             time_us(&gpu, iters, &head_start, &|| unsafe {
                 ops.router_topk_form(
-                    &gpu, form, pid, pw, px, prw, pb, t, HIDDEN, EXPERTS, TOP_K, 1.0,
+                    &gpu, form, pid, pw, psc, px, prw, pb, t, HIDDEN, EXPERTS, TOP_K, 1.0,
                 )
                 .unwrap();
             })
         };
         let per_token = router(RouterForm::PerToken);
         let tiled = router(RouterForm::Tiled);
+        let split = router(RouterForm::Split);
         let old = time_us(&gpu, iters, &head_start, &|| unsafe {
             eidola_engine_cuda::launch!(
                 gpu,
@@ -229,7 +237,7 @@ fn main() {
             )
             .unwrap();
         });
-        let chosen = RouterForm::for_tokens(t);
+        let chosen = EXECUTOR_ROUTER;
         report(
             "router/token",
             chosen == RouterForm::PerToken,
@@ -242,11 +250,19 @@ fn main() {
             tiled,
             Some(old),
         );
+        report(
+            "router/split",
+            chosen == RouterForm::Split,
+            split,
+            Some(old),
+        );
 
         // The layout from this selection.
         unsafe {
-            ops.router_topk(&gpu, pid, pw, px, prw, pb, t, HIDDEN, EXPERTS, TOP_K, 1.0)
-                .unwrap();
+            ops.router_topk(
+                &gpu, pid, pw, psc, px, prw, pb, t, HIDDEN, EXPERTS, TOP_K, 1.0,
+            )
+            .unwrap();
         }
         let grouped = s.alloc_zeros::<i32>(usize_of(EXPERTS)).unwrap();
         let row_of = s.alloc_zeros::<i32>(usize_of(t * TOP_K)).unwrap();
