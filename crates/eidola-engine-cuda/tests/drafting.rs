@@ -26,15 +26,20 @@
 //!   through prefix hits (the drafter resuming from boundary taps) and
 //!   preemption.
 //!
-//! Prints acceptance per depth; run with `--nocapture`.
+//! Prints acceptance per depth, conditional on the width each row drafted
+//! (`common/draft_tally.rs`, the definition `examples/eval.rs` reports); run
+//! with `--nocapture`.
 
 mod common;
+#[path = "common/draft_tally.rs"]
+mod draft_tally;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use common::setup;
+use draft_tally::Tallying;
 use eidola_engine::engine::{CacheScope, Engine, Event, FinishReason, Request, SchedulerConfig};
 use eidola_engine::executor::{Executor, SeqEntry, StepInput, TableUpdate};
 use eidola_engine::kv::CachePolicy;
@@ -324,28 +329,39 @@ fn setup_fits_without_a_device() {
 
 /// Runs an engine over `workload`, submitting each request at its step.
 struct Run<E: Executor> {
-    eng: Engine<E>,
+    eng: Engine<Tallying<E>>,
     step: u64,
     pending: Vec<Job>,
     outputs: HashMap<u64, Vec<u32>>,
     finished: HashMap<u64, FinishReason>,
     cached: HashMap<u64, u32>,
-    /// Tokens produced per drafted row and step: `1 + accepted drafts`.
-    produced: Vec<usize>,
 }
 
 impl<E: Executor> Run<E> {
     fn new(ex: E, chunk: u32, speculative: bool, mut pending: Vec<Job>) -> Run<E> {
         pending.reverse();
         Run {
-            eng: Engine::new(ex, sched(chunk, speculative)).expect("a valid configuration"),
+            eng: Engine::new(Tallying::new(ex), sched(chunk, speculative))
+                .expect("a valid configuration"),
             step: 0,
             pending,
             outputs: HashMap::new(),
             finished: HashMap::new(),
             cached: HashMap::new(),
-            produced: Vec::new(),
         }
+    }
+
+    /// The executor under the tally.
+    fn ex(&self) -> &E {
+        self.eng.executor().inner()
+    }
+
+    /// Conditional acceptance per depth (`draft_tally`), checked against
+    /// the engine's own accepted/drafted totals.
+    fn acceptance(&self) -> Vec<f64> {
+        let (t, s) = (self.eng.executor().tally(), self.eng.stats());
+        assert_eq!((t.accepted_total, t.drafted_total), (s.accepted, s.drafted));
+        t.rates()
     }
 
     fn done(&self) -> bool {
@@ -362,9 +378,6 @@ impl<E: Executor> Run<E> {
         self.step += 1;
         for e in &events {
             self.outputs.entry(e.id).or_default().extend(&e.tokens);
-            if !e.tokens.is_empty() {
-                self.produced.push(e.tokens.len());
-            }
             if let Some(f) = e.finish {
                 assert!(self.finished.insert(e.id, f).is_none(), "finished twice");
                 self.cached.insert(e.id, e.cached_prompt_tokens);
@@ -386,7 +399,7 @@ impl Run<CudaExecutor> {
         for (g, b) in kv.free_block_set() {
             if !pending.contains(&(g, b)) {
                 assert!(
-                    self.eng.executor().block_is_zero(g, b).unwrap(),
+                    self.ex().block_is_zero(g, b).unwrap(),
                     "free block {g}/{b} holds data with no zero pending"
                 );
                 checked += 1;
@@ -452,17 +465,6 @@ fn prompts_of(w: &[Job]) -> HashMap<u64, (Vec<u32>, SamplingParams)> {
         .collect()
 }
 
-/// Acceptance per depth from the tokens each drafted row produced per step:
-/// draft `i` was accepted in a step that produced more than `i` tokens.
-fn acceptance(produced: &[usize], depths: usize) -> Vec<f64> {
-    (1..=depths)
-        .map(|i| {
-            let reached = produced.iter().filter(|&&n| n >= i).count().max(1);
-            produced.iter().filter(|&&n| n > i).count() as f64 / reached as f64
-        })
-        .collect()
-}
-
 #[test]
 fn drafted_steps_match_the_cpu_executor() {
     let Some(env) = env() else { return };
@@ -485,8 +487,8 @@ fn drafted_steps_match_the_cpu_executor() {
             let ge = if g.done() { Vec::new() } else { g.step() };
             let ce = if c.done() { Vec::new() } else { c.step() };
             zero_checks += g.check_kv();
-            let gd = g.eng.executor().take_drafts();
-            let cr = c.eng.executor().take_records();
+            let gd = g.ex().take_drafts();
+            let cr = c.ex().take_records();
             if lockstep {
                 assert_eq!(gd.len(), cr.len(), "D {depths}: lockstep steps' rows");
                 for (gr, crr) in gd.iter().zip(&cr) {
@@ -543,8 +545,8 @@ fn drafted_steps_match_the_cpu_executor() {
             gs.drafted,
             cs.accepted,
             cs.drafted,
-            acceptance(&g.produced, depths as usize),
-            acceptance(&c.produced, depths as usize),
+            g.acceptance(),
+            c.acceptance(),
         );
     }
 }
@@ -660,7 +662,7 @@ fn greedy_drafting_never_changes_greedy_output() {
             "D {depths}: {same}/{} requests identical drafted and undrafted; near-tie divergences \
              (request, token, gap): {ties:?}; acceptance per depth {:?}",
             greedy_only.len(),
-            acceptance(&drafted.produced, depths as usize)
+            drafted.acceptance()
         );
     }
 }
@@ -695,7 +697,7 @@ fn seeded_drafting_is_reproducible() {
             "seeded, D 3: accepted {}/{} drafts, acceptance per depth {:?}",
             s.accepted,
             s.drafted,
-            acceptance(&r.produced, 3)
+            r.acceptance()
         );
         check_outputs(&prompts_of(&seeded), &r.outputs);
         runs.push(r.outputs);
@@ -898,12 +900,9 @@ fn graphs_and_eager_agree_with_drafting() {
             r.step();
             r.check_kv();
         }
-        println!("graphs {graphs:?}: {:?}", r.eng.executor().decode_stats());
+        println!("graphs {graphs:?}: {:?}", r.ex().decode_stats());
         if graphs == CudaGraphs::On {
-            assert!(
-                r.eng.executor().decode_stats().replayed > 0,
-                "some steps replayed"
-            );
+            assert!(r.ex().decode_stats().replayed > 0, "some steps replayed");
         }
         outs.push(r.outputs);
     }

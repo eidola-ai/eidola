@@ -39,10 +39,11 @@
 //! undrafted run's but for near-ties) and prints the acceptance of each draft
 //! depth over the prompts, conditional: draft `d` accepted among the rows
 //! that drafted at least `d` tokens in a step and had their first `d - 1`
-//! accepted. Rows are counted from what the executor was asked to draft, so a
-//! row that drafted nothing (a prefill, a step narrowed to width 0) or fewer
-//! than `d` tokens (narrowed by the serving core to stay in the masked expert
-//! layout) is outside depth `d`'s denominator, not a rejection there. A second
+//! accepted (`tests/common/draft_tally.rs`, shared with `tests/drafting.rs`).
+//! Rows are counted from what the executor was asked to draft, so a row that
+//! drafted nothing (a prefill, a step narrowed to width 0) or fewer than `d`
+//! tokens (narrowed by the serving core to stay in the masked expert layout)
+//! is outside depth `d`'s denominator, not a rejection there. A second
 //! line gives each depth's counts and the width distribution of sampled
 //! decode rows (with sampled prefill rows apart), so narrowing is visible; the
 //! first line's totals are the engine's own accepted/drafted.
@@ -54,12 +55,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use eidola_engine::engine::{CacheScope, Engine, Request, SchedulerConfig};
-use eidola_engine::executor::{
-    Executor, ExecutorError, SeqEntry, StepInput, StepOutput, TableUpdate,
-};
+use eidola_engine::executor::{Executor, SeqEntry, StepInput, TableUpdate};
 use eidola_engine::kv::CachePolicy;
 use eidola_engine::sampling::SamplingParams;
-use eidola_engine::spec::{Bucket, ModelSpec};
+use eidola_engine::spec::Bucket;
 use eidola_engine_chat::json::Json;
 use eidola_engine_chat::tool_call::parse_complete;
 use eidola_engine_chat::{ChatInput, ChatTemplate, MimoTokenizer, RenderOptions, ToolSchemas};
@@ -68,6 +67,10 @@ use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, CudaGraphs, Gpu, KvBl
 use eidola_engine_model::safetensors::WeightSet;
 use eidola_engine_model::{ForwardOptions, LoadOptions, LogitsAt, ModelWeights, ReferenceModel};
 use serde_json::{Value, json};
+
+#[path = "../tests/common/draft_tally.rs"]
+mod draft_tally;
+use draft_tally::Tallying;
 
 const TOP: usize = 20;
 
@@ -183,10 +186,7 @@ fn render(model: &str, tasks: &str, out: &str) {
 fn generate(kernels: &str, model: &str, prompts: &str, out: &str, max_new: u32, depths: u32) {
     let tok = MimoTokenizer::from_model_dir(Path::new(model)).unwrap();
     let (ex, _) = executor(kernels, model, 2048, 64, depths);
-    let ex = Tallying {
-        inner: ex,
-        tally: std::cell::RefCell::new(DraftTally::new(depths as usize)),
-    };
+    let ex = Tallying::new(ex);
     let sched = SchedulerConfig {
         max_batched_tokens: 2048,
         max_seqs: 64,
@@ -246,7 +246,7 @@ fn generate(kernels: &str, model: &str, prompts: &str, out: &str, max_new: u32, 
     if depths > 0 {
         let s = eng.stats();
         let rate = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 };
-        let t = eng.executor().tally.borrow();
+        let t = eng.executor().tally();
         assert_eq!(
             (t.accepted_total, t.drafted_total),
             (s.accepted, s.drafted),
@@ -290,91 +290,6 @@ fn generate(kernels: &str, model: &str, prompts: &str, out: &str, max_new: u32, 
         .map(|i| json!({"id": index[&i], "output_ids": outputs.get(&i).cloned().unwrap_or_default(), "finish": finish[&i]}))
         .collect();
     write_jsonl(out, &out_rows);
-}
-
-/// Per-row drafting outcomes of every step, tallied from what the executor
-/// was asked to draft and what it produced (before the engine cuts a row at
-/// EOS, so the totals are the engine's `Stats::drafted` and `accepted`).
-#[derive(Debug, Default, PartialEq)]
-struct DraftTally {
-    /// Sampled decode rows (one host token) by draft width, `0 ..= k`.
-    widths: Vec<u64>,
-    /// Sampled rows with more than one host token (prefill ends): never drafted.
-    prefill: u64,
-    /// Per depth `d` (index `d - 1`): rows that drafted at least `d` tokens
-    /// and had their first `d - 1` accepted.
-    reached: Vec<u64>,
-    /// Per depth `d`: those of `reached` whose draft `d` was accepted.
-    accepted: Vec<u64>,
-    /// Drafts proposed and accepted, over every drafting row.
-    drafted_total: u64,
-    accepted_total: u64,
-}
-
-impl DraftTally {
-    fn new(depths: usize) -> Self {
-        Self {
-            widths: vec![0; depths + 1],
-            reached: vec![0; depths],
-            accepted: vec![0; depths],
-            ..Self::default()
-        }
-    }
-
-    /// One row of a step: its entry, and the tokens it produced.
-    fn record(&mut self, e: &SeqEntry, produced: usize) {
-        if !e.sample {
-            return;
-        }
-        if e.num_tokens > 1 {
-            self.prefill += 1;
-            return;
-        }
-        let width = e.num_drafts as usize;
-        self.widths[width] += 1;
-        let accepted = produced.saturating_sub(1);
-        self.drafted_total += width as u64;
-        self.accepted_total += accepted as u64;
-        for d in 1..=width {
-            if accepted < d - 1 {
-                break;
-            }
-            self.reached[d - 1] += 1;
-            if accepted >= d {
-                self.accepted[d - 1] += 1;
-            }
-        }
-    }
-
-    /// Conditional acceptance of each depth (0 where no row reached it).
-    fn rates(&self) -> Vec<f64> {
-        self.reached
-            .iter()
-            .zip(&self.accepted)
-            .map(|(&r, &a)| if r == 0 { 0.0 } else { a as f64 / r as f64 })
-            .collect()
-    }
-}
-
-/// An executor that tallies every step's drafting rows (`DraftTally`).
-struct Tallying<E> {
-    inner: E,
-    tally: std::cell::RefCell<DraftTally>,
-}
-
-impl<E: Executor> Executor for Tallying<E> {
-    fn spec(&self) -> &ModelSpec {
-        self.inner.spec()
-    }
-
-    fn execute(&mut self, step: &StepInput) -> Result<StepOutput, ExecutorError> {
-        let out = self.inner.execute(step)?;
-        let tally = self.tally.get_mut();
-        for (i, e) in step.seqs.iter().enumerate() {
-            tally.record(e, out.num_tokens[i] as usize);
-        }
-        Ok(out)
-    }
 }
 
 /// Log-probabilities of one logit row over its first `n` ids.
@@ -1152,43 +1067,5 @@ mod tests {
     fn ids_must_be_unique() {
         let r = json!({"id": "p", "top": [[[0, 0.0]]]});
         compare_rows(&[r.clone(), r.clone()], &[r.clone(), r], None, None);
-    }
-
-    fn row(num_tokens: u32, num_drafts: u32, sample: bool) -> SeqEntry {
-        SeqEntry {
-            slot: 0,
-            token_start: 0,
-            num_tokens,
-            context_len: 16,
-            num_drafts,
-            sample,
-            sampling: SamplingParams::greedy(),
-        }
-    }
-
-    /// Depth `d`'s denominator is the rows that drafted at least `d` tokens
-    /// and had the first `d - 1` accepted: rows that drafted nothing, or were
-    /// narrowed below `d`, are not rejections at `d`.
-    #[test]
-    fn acceptance_is_conditional_on_the_drafted_width() {
-        let mut t = DraftTally::new(3);
-        // Full width: all accepted, two accepted, none accepted.
-        t.record(&row(1, 3, true), 4);
-        t.record(&row(1, 3, true), 3);
-        t.record(&row(1, 3, true), 1);
-        // Narrowed to width 1 (accepted) and width 0, a prefill end, and a
-        // prefill chunk that does not sample.
-        t.record(&row(1, 1, true), 2);
-        t.record(&row(1, 0, true), 1);
-        t.record(&row(64, 0, true), 1);
-        t.record(&row(64, 0, false), 0);
-        assert_eq!(t.widths, vec![1, 1, 0, 3]);
-        assert_eq!(t.prefill, 1);
-        assert_eq!(t.reached, vec![4, 2, 2]);
-        assert_eq!(t.accepted, vec![3, 2, 1]);
-        assert_eq!((t.accepted_total, t.drafted_total), (6, 10));
-        assert_eq!(t.rates(), vec![0.75, 1.0, 0.5]);
-        // No row reached a depth: 0, not NaN.
-        assert_eq!(DraftTally::new(2).rates(), vec![0.0, 0.0]);
     }
 }
