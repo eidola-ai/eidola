@@ -71,7 +71,7 @@
 use eidola_engine::sampling::{SamplingParams, Stream};
 use eidola_engine::spec::AttentionKind;
 
-use crate::attention::AttnRequest;
+use crate::attention::{AttnRequest, PassShape, Reduction};
 use crate::sampler::SampleRow;
 
 /// Which of the target's hidden states every MTP depth conditions on.
@@ -230,6 +230,12 @@ pub(crate) struct PlanCtx {
     pub cap_rows: u32,
     /// Blocks of the longest sequence (a global request's page bound).
     pub max_blocks: u32,
+    /// The longest sequence (a split's chunks per row, in a graph's
+    /// reservation).
+    pub max_model_len: u32,
+    /// Rows of split attention's partial scratch: the most one pass of an
+    /// eager step's global work list writes.
+    pub partial_rows: u32,
     /// A graph step: every row position `p ..= p + k` stores a tap or a
     /// write-only row, so the copy counts do not depend on block alignment.
     pub graph: bool,
@@ -438,23 +444,31 @@ pub(crate) fn plan(rows: &[Row], ctx: &PlanCtx, kv: &dyn KvMap) -> Plan {
     push_copy(&mut ops, Width::Hidden, items);
 
     // The drafter's KV request for one row's run of queries at `first ..=
-    // last` of depth `depth`: one-position pages from the first position its
-    // first query sees (and depth `depth` has, `depth + 1` on) to `last`.
+    // last` of depth `depth`: one-position pages from the anchor at or below
+    // the first position its first query sees, depth `depth`'s first
+    // position (`depth + 1`, where it has KV) plus a multiple of the KV tile,
+    // to `last`, those before that position masked.
     let mtp_request = |row: &Row, depth: u32, q_start: u32, first: u32, last: u32| {
         let window = AttentionKind::Sliding {
             window: ctx.drafter_window,
         };
         let lo = window.first_visible(first).max(depth + 1);
+        let start = mtp_reduction(depth).kv_start(lo, 1);
         AttnRequest {
             q_start,
             qo_len: last - first + 1,
-            pages: (lo..=last)
-                .map(|x| kv.drafter_row(row.slot, x, false))
+            pages: (start..lo)
+                .map(|_| crate::attention::MASKED_PAGE)
+                .chain((lo..=last).map(|x| kv.drafter_row(row.slot, x, false)))
                 .collect(),
-            kv_len: last - lo + 1,
+            kv_start: start,
+            kv_len: last - start + 1,
         }
     };
-    let mtp_page_bound = ctx.drafter_window - 1 + d_count + 1;
+    // The pages a graph step's run lists (at most `D + 1` queries); an eager
+    // step's arrays are exactly as long as they are.
+    let mtp_page_bound =
+        mtp_reduction(0).max_pages(Some(ctx.drafter_window), d_count + 1, 1, u32::MAX);
 
     // 2. Draft: depth i at p and the chain positions p + 1 ..= p + i (i < k),
     // every row anchored at or before c - 1 = p - 1, so its target state is
@@ -593,25 +607,32 @@ pub(crate) fn plan(rows: &[Row], ctx: &PlanCtx, kv: &dyn KvMap) -> Plan {
             }
         }
         for (g, group) in ctx.targets.iter().enumerate() {
-            let first_page = group.attention.first_visible(c) / bs;
+            let first = group.attention.first_visible(c);
+            let kv_start = Reduction::target(group.attention).kv_start(first, bs);
+            let mut pages: Vec<u32> = (kv_start / bs..first / bs)
+                .map(|_| crate::attention::MASKED_PAGE)
+                .collect();
+            pages.extend(kv.pages(row.slot, g, first / bs..=last / bs));
             requests[g].push(AttnRequest {
                 q_start,
                 qo_len: last - c + 1,
-                pages: kv.pages(row.slot, g, first_page..=last / bs),
-                kv_len: last + 1 - first_page * bs,
+                pages,
+                kv_start,
+                kv_len: last + 1 - kv_start,
             });
         }
     }
-    // A row of one host token and at most `D` drafts sees at most `W - 1 +
-    // D + 1` positions of a window `W`; every block for global attention.
+    // A row of one host token and at most `D` drafts: from the anchor below
+    // its window of `W` through `p + D`; every block for global attention.
     let page_bounds = ctx
         .targets
         .iter()
-        .map(|g| match g.attention {
-            AttentionKind::Full => ctx.max_blocks,
-            AttentionKind::Sliding { window } => {
-                ((window - 1 + d_count).div_ceil(bs) + 1).min(ctx.max_blocks)
-            }
+        .map(|g| {
+            let window = match g.attention {
+                AttentionKind::Full => None,
+                AttentionKind::Sliding { window } => Some(window),
+            };
+            Reduction::target(g.attention).max_pages(window, d_count + 1, bs, ctx.max_blocks)
         })
         .collect();
     ops.push(Op::Copy {
@@ -826,6 +847,12 @@ pub(crate) fn plan(rows: &[Row], ctx: &PlanCtx, kv: &dyn KvMap) -> Plan {
     }
 }
 
+/// MTP depth `depth`'s reduction: anchored at its first position, `depth + 1`
+/// (it has no KV below it).
+pub(crate) fn mtp_reduction(depth: u32) -> Reduction {
+    Reduction::Anchored { origin: depth + 1 }
+}
+
 /// A copy op, unless it has no items. Hidden-width copies with no items
 /// are left out (a graph step's shape still matches, since its counts do
 /// not vary); token copies are kept, so a forward's token array is always
@@ -867,18 +894,24 @@ pub(crate) struct Array {
     pub align: usize,
 }
 
-/// One attention work list, by array index.
+/// One pass of an attention work list, by array index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PlanSpec {
-    pub tile: u32,
-    pub page_size: u32,
-    pub group_size: u32,
-    pub work_items: u32,
-    pub num_requests: u32,
-    /// q_indptr, indices, indptr, last_page_len, request, query-tile and
-    /// KV-tile indices.
-    pub arrays: [usize; 7],
+pub(crate) struct PassSpec {
+    pub shape: PassShape,
+    /// The first query row the pass's merge writes (split).
+    pub out_row: u32,
+    /// The pass's arrays (see [`PASS_ARRAYS`]).
+    pub arrays: [usize; PASS_ARRAYS],
 }
+
+/// A pass's arrays, in order: `q_indptr`, `indices`, `indptr`,
+/// `last_page_len`, request, query-tile and KV-tile indices, `o_indptr`, the
+/// merge's `indptr`, and the one-word work-item count.
+pub(crate) const PASS_ARRAYS: usize = 10;
+
+/// One attention work list: its passes (one, but for an eager step's split
+/// whose partial rows outgrow the scratch).
+pub(crate) type PlanSpec = Vec<PassSpec>;
 
 /// One launch, its per-step values named by array index (see [`Launch`]
 /// for the same with table offsets).
@@ -940,7 +973,6 @@ pub(crate) struct Built {
 /// The arrays and launches of `plan` (attention work lists made, and
 /// checked, by [`HostPlan::new`]).
 pub(crate) fn build(plan: &Plan, ctx: &PlanCtx) -> crate::Result<Built> {
-    use crate::attention::HostPlan;
     let mut arrays: Vec<Array> = Vec::new();
     let push = |arrays: &mut Vec<Array>, data: HostArray, page_cap: Option<usize>, align: usize| {
         arrays.push(Array {
@@ -956,34 +988,98 @@ pub(crate) fn build(plan: &Plan, ctx: &PlanCtx) -> crate::Result<Built> {
                 requests: &[AttnRequest],
                 group_size: u32,
                 page_size: u32,
-                page_bound: u32|
+                page_bound: u32,
+                reduction: Reduction|
      -> crate::Result<PlanSpec> {
-        let h = HostPlan::new(requests, group_size, page_size)?;
-        let w = |v: &[i32]| {
+        use crate::attention::{HostPlan, PassCaps};
+        let words = |v: &[i32]| {
             HostArray::Words(
                 v.iter()
                     .map(|&x| u32::try_from(x).expect("HostPlan indices are non-negative"))
                     .collect(),
             )
         };
-        let cap = requests.len() * page_bound as usize;
-        let a = [
-            push(arrays, w(&h.q_indptr), None, 1),
-            push(arrays, w(&h.indices), Some(cap), 1),
-            push(arrays, w(&h.indptr), None, 1),
-            push(arrays, w(&h.last_page_len), None, 1),
-            push(arrays, w(&h.request_indices), None, 1),
-            push(arrays, w(&h.qo_tile_indices), None, 1),
-            push(arrays, w(&h.kv_tile_indices), None, 1),
-        ];
-        Ok(PlanSpec {
-            tile: h.tile(),
-            page_size,
-            group_size,
-            work_items: n32(h.work_items())?,
-            num_requests: n32(h.num_requests())?,
-            arrays: a,
-        })
+        let queries = requests.first().map_or(1, |r| r.qo_len);
+        if ctx.graph && requests.iter().all(|r| r.qo_len == queries) {
+            // A graph step: the rung's reservation, padded to it, so the
+            // launch shape and every array's length are the rung's (a step
+            // whose rows are not uniform keeps exact arrays, and so another
+            // launch list than any rung's).
+            let caps = PassCaps::new(
+                reduction,
+                n32(requests.len())?,
+                queries,
+                group_size,
+                page_size,
+                page_bound,
+                ctx.max_model_len,
+            )?;
+            let h = HostPlan::new(
+                requests,
+                group_size,
+                page_size,
+                reduction,
+                caps.shape.partial_rows,
+            )?;
+            let p = h.padded(&caps)?;
+            let w = |v: &[u32]| HostArray::Words(v.to_vec());
+            let a = [
+                push(arrays, w(&p.q_indptr), None, 1),
+                push(arrays, w(&p.indices), Some(caps.pages as usize), 1),
+                push(arrays, w(&p.indptr), None, 1),
+                push(arrays, w(&p.last_page_len), None, 1),
+                push(
+                    arrays,
+                    w(&p.request_indices),
+                    Some(caps.work_items as usize),
+                    1,
+                ),
+                push(
+                    arrays,
+                    w(&p.qo_tile_indices),
+                    Some(caps.work_items as usize),
+                    1,
+                ),
+                push(
+                    arrays,
+                    w(&p.kv_tile_indices),
+                    Some(caps.work_items as usize),
+                    1,
+                ),
+                push(arrays, w(&p.o_indptr), None, 1),
+                push(arrays, w(&p.merge_indptr), None, 1),
+                push(arrays, w(&[p.work_items]), None, 1),
+            ];
+            return Ok(vec![PassSpec {
+                shape: caps.shape,
+                out_row: 0,
+                arrays: a,
+            }]);
+        }
+        let h = HostPlan::new(requests, group_size, page_size, reduction, ctx.partial_rows)?;
+        h.passes()
+            .iter()
+            .map(|pass| {
+                let shape = pass.shape(&h)?;
+                let a = [
+                    push(arrays, words(&pass.q_indptr), None, 1),
+                    push(arrays, words(&pass.indices), None, 1),
+                    push(arrays, words(&pass.indptr), None, 1),
+                    push(arrays, words(&pass.last_page_len), None, 1),
+                    push(arrays, words(&pass.request_indices), None, 1),
+                    push(arrays, words(&pass.qo_tile_indices), None, 1),
+                    push(arrays, words(&pass.kv_tile_indices), None, 1),
+                    push(arrays, words(&pass.o_indptr), None, 1),
+                    push(arrays, words(&pass.merge_indptr), None, 1),
+                    push(arrays, HostArray::Words(vec![shape.grid]), None, 1),
+                ];
+                Ok(PassSpec {
+                    shape,
+                    out_row: pass.q_rows.start,
+                    arrays: a,
+                })
+            })
+            .collect()
     };
     let sample_words = |rows: &[SampleRow]| {
         HostArray::Words(
@@ -1035,6 +1131,7 @@ pub(crate) fn build(plan: &Plan, ctx: &PlanCtx) -> crate::Result<Built> {
                         ctx.drafter_group_size,
                         1,
                         *page_bound,
+                        mtp_reduction(*depth),
                     )?,
                     logit_rows: push(&mut arrays, words(logit_rows), None, 1),
                     num_logit_rows: n32(logit_rows.len())?,
@@ -1066,6 +1163,7 @@ pub(crate) fn build(plan: &Plan, ctx: &PlanCtx) -> crate::Result<Built> {
                         group.group_size,
                         ctx.block_size,
                         page_bounds[g],
+                        Reduction::target(group.attention),
                     )?);
                 }
                 Spec::Target {
@@ -1114,8 +1212,8 @@ pub(crate) fn build(plan: &Plan, ctx: &PlanCtx) -> crate::Result<Built> {
 }
 
 /// Where everything sits in the step table, in 32-bit words: the draft
-/// lanes (`depths × cap_rows`, written by the sampler), one zero word
-/// (FlashInfer's KV chunk size, read only when splitting KV), then every
+/// lanes (`depths × cap_rows`, written by the sampler), one word holding
+/// FlashInfer's KV chunk size ([`crate::attention::SPLIT_KEYS`]), then every
 /// array in order, each at its alignment, with room for its reservation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Layout {
@@ -1177,6 +1275,7 @@ pub(crate) fn pack(built: &Built, layout: &Layout, ctx: &PlanCtx) -> crate::Resu
         ));
     }
     let mut w = vec![0u32; layout.words];
+    w[layout.kv_chunk] = crate::attention::SPLIT_KEYS;
     for (i, (a, &(at, cap))) in built.arrays.iter().zip(&layout.arrays).enumerate() {
         if a.data.len() > cap {
             return Err(crate::CudaError::new(format!(
@@ -1214,16 +1313,13 @@ pub(crate) fn pack(built: &Built, layout: &Layout, ctx: &PlanCtx) -> crate::Resu
     Ok(w)
 }
 
-/// One attention work list as a launch reads it: its shape, and table
-/// offsets of its arrays.
+/// One pass of an attention work list as a launch reads it: its shape, and
+/// table offsets of its arrays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PlanAt {
-    pub tile: u32,
-    pub page_size: u32,
-    pub group_size: u32,
-    pub work_items: u32,
-    pub num_requests: u32,
-    pub arrays: [usize; 7],
+pub(crate) struct PassAt {
+    pub shape: PassShape,
+    pub out_row: u32,
+    pub arrays: [usize; PASS_ARRAYS],
 }
 
 /// One launch with its per-step values as table offsets (words): what a
@@ -1242,7 +1338,7 @@ pub(crate) enum Launch {
         positions: usize,
         kv_block: Vec<usize>,
         kv_slot: Vec<usize>,
-        plans: Vec<PlanAt>,
+        plans: Vec<Vec<PassAt>>,
         logit_rows: usize,
         num_logit_rows: u32,
         final_norm: bool,
@@ -1253,7 +1349,7 @@ pub(crate) enum Launch {
         token_ids: usize,
         positions: usize,
         kv_rows: usize,
-        plan: PlanAt,
+        plan: Vec<PassAt>,
         logit_rows: usize,
         num_logit_rows: u32,
     },
@@ -1276,13 +1372,14 @@ pub(crate) enum Launch {
 /// `built`'s launches over `layout`.
 pub(crate) fn launches(built: &Built, layout: &Layout) -> Vec<Launch> {
     let at = |i: usize| layout.arrays[i].0;
-    let plan = |p: &PlanSpec| PlanAt {
-        tile: p.tile,
-        page_size: p.page_size,
-        group_size: p.group_size,
-        work_items: p.work_items,
-        num_requests: p.num_requests,
-        arrays: p.arrays.map(at),
+    let plan = |p: &PlanSpec| -> Vec<PassAt> {
+        p.iter()
+            .map(|pass| PassAt {
+                shape: pass.shape,
+                out_row: pass.out_row,
+                arrays: pass.arrays.map(at),
+            })
+            .collect()
     };
     built
         .specs
@@ -1522,12 +1619,9 @@ pub(crate) unsafe fn run(
     let hidden = a.model.config().hidden_size;
     let n = u64::from(a.sampleable);
     let probs = dptr(&a.bufs.probs, &s);
-    let view = |p: &PlanAt| PlanView {
-        tile: p.tile,
-        page_size: p.page_size,
-        group_size: p.group_size,
-        work_items: p.work_items,
-        num_requests: p.num_requests,
+    let view = |p: &PassAt| PlanView {
+        shape: p.shape,
+        out_row: p.out_row,
         q_indptr: word(p.arrays[0]),
         indices: word(p.arrays[1]),
         indptr: word(p.arrays[2]),
@@ -1535,6 +1629,9 @@ pub(crate) unsafe fn run(
         request_indices: word(p.arrays[4]),
         qo_tile_indices: word(p.arrays[5]),
         kv_tile_indices: word(p.arrays[6]),
+        o_indptr: word(p.arrays[7]),
+        merge_indptr: word(p.arrays[8]),
+        work_items: word(p.arrays[9]),
         kv_chunk_size: word(layout.kv_chunk),
     };
     for l in launches {
@@ -1604,7 +1701,7 @@ pub(crate) unsafe fn run(
                     positions: word(*positions),
                     kv_block: kv_block.iter().map(|&o| word(o)).collect(),
                     kv_slot: kv_slot.iter().map(|&o| word(o)).collect(),
-                    plans: plans.iter().map(view).collect(),
+                    plans: plans.iter().map(|p| p.iter().map(view).collect()).collect(),
                     logit_rows: word(*logit_rows),
                     num_logit_rows: *num_logit_rows as usize,
                     final_norm: *final_norm,
@@ -1628,12 +1725,17 @@ pub(crate) unsafe fn run(
                 logit_rows,
                 num_logit_rows,
             } => {
+                let [pass] = plan.as_slice() else {
+                    return Err(crate::CudaError::new(
+                        "drafted step: an MTP work list is one pass",
+                    ));
+                };
                 let src = MtpIndirect {
                     tokens: *tokens as usize,
                     token_ids: word(*token_ids),
                     positions: word(*positions),
                     kv_rows: word(*kv_rows),
-                    plan: view(plan),
+                    plan: view(pass),
                     logit_rows: word(*logit_rows),
                     num_logit_rows: *num_logit_rows as usize,
                     status,
@@ -1828,7 +1930,12 @@ pub(crate) fn check_plan(
                     {
                         return bad(format!("group {g}: KV target block {b} offset {o}"));
                     }
-                    if let Some(&b) = reqs.iter().flat_map(|r| &r.pages).find(|&&b| !ok(b)) {
+                    // A page is a block of the pool, or the masked page.
+                    if let Some(&b) = reqs
+                        .iter()
+                        .flat_map(|r| &r.pages)
+                        .find(|&&b| !ok(b) && b != crate::attention::MASKED_PAGE)
+                    {
                         return bad(format!("group {g}: page {b}"));
                     }
                 }
@@ -1847,11 +1954,14 @@ pub(crate) fn check_plan(
                 let rows = geom.pool_rows();
                 let bs = geom.block_size as usize;
                 let ok = |r: u32| (r as usize) >= bs && (r as usize) < rows;
-                if let Some(r) = kv_rows
-                    .iter()
-                    .chain(requests.iter().flat_map(|r| &r.pages))
-                    .find(|&&r| !ok(r))
-                {
+                // KV rows are the pool's; a page is one, or the masked page
+                // (the null block's first row).
+                if let Some(r) = kv_rows.iter().find(|&&r| !ok(r)).or_else(|| {
+                    requests
+                        .iter()
+                        .flat_map(|r| &r.pages)
+                        .find(|&&r| !ok(r) && r != crate::attention::MASKED_PAGE)
+                }) {
                     return bad(format!("drafter row {r}"));
                 }
                 if !logit_rows.is_empty() {
@@ -2139,7 +2249,7 @@ mod tests {
         fn block(&self, slot: Option<u32>, group: usize, logical: u32) -> u32 {
             match slot {
                 None => PAD_BLOCK,
-                Some(s) => 1 + s * 1000 + u32::try_from(group).unwrap() * 100 + logical,
+                Some(s) => 1 + s * 100_000 + u32::try_from(group).unwrap() * 10_000 + logical,
             }
         }
     }
@@ -2182,7 +2292,11 @@ mod tests {
             drafter_window: 8,
             drafter_group_size: 8,
             cap_rows,
-            max_blocks: 64,
+            // Past the first global chunk (1,024 positions) at every block
+            // size.
+            max_blocks: 2048u32.div_ceil(bs),
+            max_model_len: 2048u32.div_ceil(bs) * bs,
+            partial_rows: 1 << 20,
             graph,
         }
     }
@@ -2455,7 +2569,7 @@ mod tests {
                     }
                     assert_eq!(n, t);
                     for (g, plan) in plans.iter().enumerate() {
-                        check_target_pages(&w, plan, rows, kv, g, ctx);
+                        check_target_pages(&w, plan, &op_rows, rows, kv, g, ctx);
                     }
                     level_buf = outs;
                     let lr = words(&w, *logit_rows, *num_logit_rows as usize);
@@ -2551,77 +2665,126 @@ mod tests {
         (plan, w)
     }
 
-    /// Every query of an MTP launch sees exactly the positions from the
-    /// first its window and its depth allow to itself, in order.
+    /// A pass's requests as `(first query row, query rows, pages, kv_len)`
+    /// out of the table, empty (padding) requests left out.
+    fn pass_requests(w: &World, p: &PassAt) -> Vec<(usize, usize, Vec<u32>, u32)> {
+        let reqs = p.shape.num_requests as usize;
+        let qi = &w.table[p.arrays[0]..p.arrays[0] + reqs + 1];
+        let ip = &w.table[p.arrays[2]..p.arrays[2] + reqs + 1];
+        let last_len = &w.table[p.arrays[3]..p.arrays[3] + reqs];
+        (0..reqs)
+            .filter(|&q| qi[q + 1] > qi[q])
+            .map(|q| {
+                let pages = w.table[p.arrays[1] + ip[q] as usize..p.arrays[1] + ip[q + 1] as usize]
+                    .to_vec();
+                let kv_len =
+                    (u32::try_from(pages.len()).unwrap() - 1) * p.shape.page_size + last_len[q];
+                (qi[q] as usize, (qi[q + 1] - qi[q]) as usize, pages, kv_len)
+            })
+            .collect()
+    }
+
+    /// Every query of an MTP launch sees the positions from the anchor below
+    /// the first its window allows (depth `depth`'s first position plus a
+    /// multiple of the KV tile, never below it) to itself, in order.
     fn check_mtp_pages(
         w: &World,
-        p: &PlanAt,
+        plan: &[PassAt],
         op_rows: &[(usize, u32)],
         rows: &[Row],
         kv: &FakeKv,
         depth: u32,
         ctx: &PlanCtx,
     ) {
-        assert_eq!(p.page_size, 1);
-        let reqs = p.num_requests as usize;
-        let qi = &w.table[p.arrays[0]..p.arrays[0] + reqs + 1];
-        let ip = &w.table[p.arrays[2]..p.arrays[2] + reqs + 1];
-        for q in 0..reqs {
-            let (q0, q1) = (qi[q] as usize, qi[q + 1] as usize);
-            let pages = &w.table[p.arrays[1] + ip[q] as usize..p.arrays[1] + ip[q + 1] as usize];
+        let [p] = plan else {
+            panic!("an MTP work list is one pass")
+        };
+        assert_eq!(p.shape.page_size, 1);
+        assert!(!p.shape.split);
+        for (q0, n, pages, kv_len) in pass_requests(w, p) {
             let (r, first) = op_rows[q0];
-            let (_, last) = op_rows[q1 - 1];
-            assert!(op_rows[q0..q1].iter().all(|&(rr, _)| rr == r));
-            assert_eq!(q1 - q0, (last - first + 1) as usize);
+            let (_, last) = op_rows[q0 + n - 1];
+            assert!(op_rows[q0..q0 + n].iter().all(|&(rr, _)| rr == r));
+            assert_eq!(n, (last - first + 1) as usize);
             let row = &rows[r];
             let window = AttentionKind::Sliding {
                 window: ctx.drafter_window,
             };
             let lo = window.first_visible(first).max(depth + 1);
-            let want: Vec<u32> = (lo..=last)
-                .map(|x| kv.drafter_row(row.slot, x, false))
+            let start = last + 1 - kv_len;
+            assert!(
+                start <= lo && start > depth,
+                "depth {depth} row {r}: {start}"
+            );
+            assert_eq!((start - depth - 1) % crate::attention::KV_TILE, 0);
+            assert!(lo - start < crate::attention::KV_TILE);
+            // Positions before the window: masked pages, never the pool's.
+            let want: Vec<u32> = (start..lo)
+                .map(|_| crate::attention::MASKED_PAGE)
+                .chain((lo..=last).map(|x| kv.drafter_row(row.slot, x, false)))
                 .collect();
             assert_eq!(
-                pages,
-                &want[..],
+                pages, want,
                 "depth {depth} row {r} queries {first}..={last}"
             );
-            // Every position listed has this depth's KV (written this step
-            // or before it).
-            if row.slot.is_some() {
-                for x in lo..=last {
-                    assert!(x > depth);
-                }
-            }
         }
     }
 
+    /// The target's requests: sliding ones a row each, from the anchor below
+    /// the row's window; global ones the row's queries cut at multiples of
+    /// the split, each from position 0 through its last query; every query
+    /// in exactly one request, in order.
     fn check_target_pages(
         w: &World,
-        p: &PlanAt,
+        plan: &[PassAt],
+        op_rows: &[(usize, u32)],
         rows: &[Row],
         kv: &FakeKv,
         g: usize,
         ctx: &PlanCtx,
     ) {
-        let reqs = p.num_requests as usize;
-        assert_eq!(reqs, rows.len());
-        let ip = &w.table[p.arrays[2]..p.arrays[2] + reqs + 1];
-        let last_len = &w.table[p.arrays[3]..p.arrays[3] + reqs];
-        for (r, row) in rows.iter().enumerate() {
-            let pages = &w.table[p.arrays[1] + ip[r] as usize..p.arrays[1] + ip[r + 1] as usize];
-            let first_page = ctx.targets[g].attention.first_visible(row.c) / ctx.block_size;
-            let last = row.p() + row.k;
-            assert_eq!(
-                pages,
-                &kv.pages(row.slot, g, first_page..=last / ctx.block_size)[..]
-            );
-            let kv_len = last + 1 - first_page * ctx.block_size;
-            assert_eq!(
-                (u32::try_from(pages.len()).unwrap() - 1) * ctx.block_size + last_len[r],
-                kv_len
-            );
+        use crate::attention::{KV_TILE, MASKED_PAGE, SPLIT_KEYS};
+        let bs = ctx.block_size;
+        let attention = ctx.targets[g].attention;
+        let mut next = 0usize;
+        for p in plan {
+            assert_eq!(p.shape.split, attention == AttentionKind::Full);
+            for (q0, n, pages, kv_len) in pass_requests(w, p) {
+                assert_eq!(q0, next, "group {g}: queries in order");
+                next = q0 + n;
+                let (r, first) = op_rows[q0];
+                let (_, last) = op_rows[q0 + n - 1];
+                assert!(op_rows[q0..q0 + n].iter().all(|&(rr, _)| rr == r));
+                assert_eq!(n, (last - first + 1) as usize);
+                let row = &rows[r];
+                let start = last + 1 - kv_len;
+                if p.shape.split {
+                    assert_eq!(start, 0);
+                    assert_eq!(
+                        first / SPLIT_KEYS,
+                        last / SPLIT_KEYS,
+                        "a piece in one chunk"
+                    );
+                    assert!(first == row.c || first.is_multiple_of(SPLIT_KEYS));
+                } else {
+                    assert_eq!((first, last), (row.c, row.p() + row.k));
+                    let lo = attention.first_visible(row.c);
+                    assert!(
+                        start <= lo && lo - start < KV_TILE * bs,
+                        "group {g} row {r}: {start} for {lo}"
+                    );
+                    assert_eq!(start % KV_TILE, 0);
+                    assert_eq!(start % bs, 0);
+                    // Pages wholly before the window: masked, never the pool's.
+                    let masked = (lo / bs - start / bs) as usize;
+                    assert!(pages[..masked].iter().all(|&b| b == MASKED_PAGE));
+                    assert_eq!(pages[masked..], kv.pages(row.slot, g, lo / bs..=last / bs));
+                    continue;
+                }
+                assert_eq!(pages, kv.pages(row.slot, g, start / bs..=last / bs));
+            }
         }
+        assert_eq!(next, op_rows.len(), "group {g}: every query once");
     }
 
     /// After the step: the state of every real row holds its levels at `p
@@ -2758,6 +2921,14 @@ mod tests {
                     // Resumed from a tap at a block boundary.
                     rows.push(decode(slot, bs * 3, depths, Load::Tap { block: 4242 }));
                     slot += 1;
+                    // Verify runs and a chunk across the first global chunk
+                    // boundary (1,024).
+                    for p in [1021, 1022, 1023, 1024] {
+                        rows.push(decode(slot, p, depths, Load::State { entry: 0 }));
+                        slot += 1;
+                    }
+                    rows.push(prefill(slot, 1000, 60, true, Load::State { entry: 1 }));
+                    slot += 1;
                     rows.push(prefill(slot, 0, 13, true, Load::None));
                     slot += 1;
                     rows.push(prefill(slot, 0, 1, false, Load::None));
@@ -2888,7 +3059,14 @@ mod tests {
                     for real in 1..=rung {
                         let mut rows: Vec<Row> = (0..real)
                             .map(|i| {
-                                let p = depths + i * 7 + (i % 3) * bs;
+                                // Every fourth row near the first global
+                                // chunk boundary (1,024), its verify run
+                                // across it at some widths.
+                                let p = if i % 4 == 3 {
+                                    1019 + i
+                                } else {
+                                    depths + i * 7 + (i % 3) * bs
+                                };
                                 let load = if i % 2 == 0 {
                                     Load::State {
                                         entry: i % (depths + 1),

@@ -221,9 +221,15 @@ fn entries_and_meta_records() {
     let fa2 = manifest
         .cubin("flashinfer_fa2_sink_paged", "sm_103a")
         .expect("fa2");
-    for tile in [16, 64, 128] {
-        let symbol = format!("eidola_fa2_sink_paged_bf16_q{tile}");
-        assert!(fa2.entry(&symbol).is_some(), "{symbol}");
+    // One reduction shape (one KV warp, 64-key tiles) at three query tiles,
+    // for global layers (split and merged) and sliding ones (anchored), and
+    // the merge: nothing else.
+    assert_eq!(fa2.entries.len(), 7);
+    for kind in ["", "anchored_"] {
+        for tile in [16, 64, 128] {
+            let symbol = format!("eidola_fa2_sink_paged_{kind}bf16_q{tile}");
+            assert!(fa2.entry(&symbol).is_some(), "{symbol}");
+        }
     }
     let merge = fa2
         .entry_for_meta("eidola_fa2_merge_states_bf16_d128_meta")

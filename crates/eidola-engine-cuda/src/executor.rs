@@ -30,7 +30,9 @@ use eidola_engine_model::config::AttentionKind as ModelAttention;
 use eidola_engine_model::config::AttentionSpec;
 use eidola_engine_model::safetensors::WeightSet;
 
-use crate::attention::{AttnPlan, AttnRequest, HostPlan, PlanShape};
+use crate::attention::{
+    AttnPlan, AttnRequest, HostPlan, MASKED_PAGE, PlanShape, Reduction, SPLIT_KEYS,
+};
 use crate::device::ImageArch;
 use crate::draft::MtpHidden;
 use crate::graph::{
@@ -201,6 +203,21 @@ pub struct DraftRecord {
     pub drafts: Vec<u32>,
 }
 
+/// Rows of split attention's partial scratch (global layers, [`Reduction::Split`]):
+/// the most tokens a captured step holds, `min(max_seqs × (1 + draft_tokens),
+/// max_tokens)` of the last bucket, times the chunks of the longest sequence
+/// (`ceil(max_model_len / SPLIT_KEYS)`), so a rung's work list is one pass;
+/// an eager step's runs in passes of at most this many rows. Each row holds
+/// [`crate::attention::PARTIAL_BYTES_PER_HEAD`] bytes per query head.
+pub fn split_partial_rows(last: Bucket, draft_tokens: u32, max_model_len: u32) -> Result<u32> {
+    let tokens = u64::from(last.max_seqs)
+        .saturating_mul(u64::from(draft_tokens) + 1)
+        .min(u64::from(last.max_tokens))
+        .max(1);
+    let chunks = u64::from(max_model_len.max(1)).div_ceil(u64::from(SPLIT_KEYS));
+    narrow(tokens * chunks, "split attention partial rows")
+}
+
 /// What [`CudaExecutor::new`] builds from, once every host-side check passed.
 struct Plan {
     config: eidola_engine_model::ModelConfig,
@@ -367,6 +384,7 @@ impl CudaExecutor {
             max_tokens,
             max_tokens,
             cfg.max_model_len as usize,
+            split_partial_rows(last, depths, cfg.max_model_len)?,
         )?;
         let s = gpu.stream();
         let v = cfg.sampleable_vocab_size as usize;
@@ -384,6 +402,8 @@ impl CudaExecutor {
                 drafter_group_size: 0,
                 cap_rows: last.max_seqs,
                 max_blocks: spec.max_blocks_per_seq(),
+                max_model_len: cfg.max_model_len,
+                partial_rows: model.partial_rows(),
                 graph: false,
             };
             Some(Drafting {
@@ -476,7 +496,9 @@ impl CudaExecutor {
                 group_size,
                 page_size: bs,
                 pad_block: geom.pad_block(),
+                reduction: Reduction::target(group.attention),
                 max_pages: max_decode_pages(group.attention, bs, max_blocks),
+                max_model_len: self.spec.max_model_len,
             })
             .collect();
         let mut graphs = DecodeGraphs::new(&self.gpu, decode_ladder(&self.spec.buckets), slots)?;
@@ -617,18 +639,21 @@ impl CudaExecutor {
                     let block = tables.writable_block(e.slot, g, pos);
                     kv_targets[g].push((block, pos % bs));
                 }
-                // Visible KV of the row: from the first position its first
-                // query sees, whole pages, through p.
+                // Visible KV of the row: from the anchor at or below the
+                // first position its first query sees, whole pages, through
+                // p; pages wholly before that position are masked.
                 let first = group.attention.first_visible(e.context_len);
-                let first_page = first / bs;
-                let pages: Vec<u32> = (first_page..=p / bs)
-                    .map(|i| tables.block_of(e.slot, g, i * bs))
+                let kv_start = Reduction::target(group.attention).kv_start(first, bs);
+                let pages: Vec<u32> = (kv_start / bs..first / bs)
+                    .map(|_| MASKED_PAGE)
+                    .chain((first / bs..=p / bs).map(|i| tables.block_of(e.slot, g, i * bs)))
                     .collect();
                 requests[g].push(AttnRequest {
                     q_start,
                     qo_len: e.num_tokens,
                     pages,
-                    kv_len: p + 1 - first_page * bs,
+                    kv_start,
+                    kv_len: p + 1 - kv_start,
                 });
             }
             if e.sample && !self.record_all_logits {
@@ -664,7 +689,13 @@ impl CudaExecutor {
         }
         let mut plans: Vec<AttnPlan> = Vec::with_capacity(groups.len());
         for (g, &group_size) in group_sizes.iter().enumerate() {
-            let host = HostPlan::new(&requests[g], group_size, bs)?;
+            let host = HostPlan::new(
+                &requests[g],
+                group_size,
+                bs,
+                Reduction::target(groups[g].attention),
+                self.model.partial_rows(),
+            )?;
             // Fresh buffers for this step only: no executor state changes.
             plans.push(self.model.kernels.attention.upload(&self.gpu, host)?);
         }
@@ -788,10 +819,15 @@ impl CudaExecutor {
     ) -> Result<StepOutput> {
         let n = step.seqs.len();
         let bs = self.spec.block_size;
+        let partial_rows = self.model.partial_rows();
         let shapes = requests
             .iter()
             .zip(group_sizes)
-            .map(|(r, &gs)| Ok(HostPlan::new(r, gs, bs)?.shape()))
+            .zip(&self.spec.kv_groups)
+            .map(|((r, &gs), group)| {
+                let reduction = Reduction::target(group.attention);
+                Ok(HostPlan::new(r, gs, bs, reduction, partial_rows)?.shape())
+            })
             .collect::<Result<Vec<PlanShape>>>()?;
         let logit_rows: Vec<u32> = (0..narrow(n, "decode rows")?).collect();
         self.model.check_parts(
@@ -909,6 +945,8 @@ fn draft_ctx(
             .map(|nq: u32| nq / drafter.num_kv_heads)?,
         cap_rows: last.max_seqs,
         max_blocks: spec.max_blocks_per_seq(),
+        max_model_len: spec.max_model_len,
+        partial_rows: model.partial_rows(),
         graph: false,
     })
 }

@@ -13,10 +13,9 @@
 //!   [`MARGIN`] of the f32 reference's argmax, and both acceptance rates are
 //!   printed;
 //! - greedy speculation never changes greedy output: drafted and undrafted
-//!   runs on the GPU produce the same tokens, unless the undrafted run's own
-//!   logits put the two candidates within [`NEAR_TIE`] of each other (the
-//!   executor is not batch-invariant: verification attends with other query
-//!   tiles than a decode step);
+//!   runs on the GPU produce exactly the same tokens at every width (the
+//!   executor is batch-invariant, so a verify run computes each position's
+//!   logits bit for bit as a decode step does);
 //! - seeded sampling with drafts is reproducible, and every token sampleable;
 //! - with graphs on, uniform drafted decode steps give bit-identical tokens
 //!   and logits replayed, launched directly and run eagerly, and an engine
@@ -60,14 +59,6 @@ const SAMPLEABLE: u32 = 151_675;
 /// argmax by at most this many logits: the GPU's measured max |Δlogit|
 /// against the reference on this truncation is 1.18 (`engine.rs`).
 const MARGIN: f32 = 1.5;
-/// Two candidates whose logits in one run differ by at most this much may
-/// swap in another run of a different batch shape. A decode row alone
-/// against beside a prefill moves by at most 0.052, but drafted against
-/// undrafted greedy runs of the full checkpoint (240 prompts) first diverged
-/// where the two tokens' log-probabilities differed by a median 0.15, p90
-/// 0.34, at most 1.47: the verify pass's other query tiles and expert
-/// layouts compound over a long decode (the crate AGENTS.md → Numerics).
-const NEAR_TIE: f32 = 1.5;
 
 struct Env {
     store: Arc<WeightSet>,
@@ -551,55 +542,6 @@ fn drafted_steps_match_the_cpu_executor() {
     }
 }
 
-/// The GPU's own logits for the token after `tokens`, from an eager prefill
-/// on a fresh undrafted executor.
-fn gpu_logits(ex: &mut CudaExecutor, tokens: &[u32]) -> Vec<f32> {
-    let n = u32::try_from(tokens.len()).unwrap();
-    let mut updates = Vec::new();
-    for group in 0..2u32 {
-        for index in 0..n.div_ceil(BS) {
-            updates.push(TableUpdate {
-                slot: 0,
-                group,
-                index,
-                block: 1 + index,
-            });
-        }
-    }
-    let mut logits = None;
-    // Chunks of at most 256 tokens (the largest bucket).
-    for start in (0..n).step_by(256) {
-        let len = (n - start).min(256);
-        let last = start + len == n;
-        let step = StepInput {
-            bucket: buckets()[1],
-            maintenance: if start == 0 {
-                vec![eidola_engine::executor::Maintenance::ResetSlot { slot: 0 }]
-            } else {
-                vec![]
-            },
-            table_updates: if start == 0 { updates.clone() } else { vec![] },
-            seqs: vec![SeqEntry {
-                slot: 0,
-                token_start: 0,
-                num_tokens: len,
-                context_len: start,
-                num_drafts: 0,
-                sample: last,
-                sampling: SamplingParams::greedy(),
-            }],
-            token_ids: tokens[start as usize..(start + len) as usize].to_vec(),
-            positions: (start..start + len).collect(),
-            return_logits: last,
-        };
-        let out = ex.execute(&step).unwrap();
-        if last {
-            logits = out.logits.map(|mut l| l.remove(0).remove(0));
-        }
-    }
-    logits.expect("logits of the last token")
-}
-
 #[test]
 fn greedy_drafting_never_changes_greedy_output() {
     let Some(env) = env() else { return };
@@ -622,7 +564,6 @@ fn greedy_drafting_never_changes_greedy_output() {
     while !plain.done() {
         plain.step();
     }
-    let mut probe = gpu_executor(0, 64, CudaGraphs::Off).unwrap();
     for depths in 1..=3u32 {
         let mut drafted = Run::new(
             gpu_executor(depths, 64, CudaGraphs::Off).unwrap(),
@@ -633,34 +574,19 @@ fn greedy_drafting_never_changes_greedy_output() {
         while !drafted.done() {
             drafted.step();
         }
-        let (mut same, mut ties) = (0, Vec::new());
         for r in &greedy_only {
             let (a, b) = (&plain.outputs[&r.id], &drafted.outputs[&r.id]);
-            match a.iter().zip(b).position(|(x, y)| x != y) {
-                None => {
-                    assert_eq!(a.len(), b.len(), "request {}", r.id);
-                    same += 1;
-                }
-                Some(j) => {
-                    let mut tokens = r.prompt.clone();
-                    tokens.extend(&a[..j]);
-                    let logits = gpu_logits(&mut probe, &tokens);
-                    let gap = (logits[a[j] as usize] - logits[b[j] as usize]).abs();
-                    assert!(
-                        gap <= NEAR_TIE,
-                        "D {depths} request {}: drafting changed token {j} from {} to {} \
-                         ({gap} logits apart)",
-                        r.id,
-                        a[j],
-                        b[j]
-                    );
-                    ties.push((r.id, j, gap));
-                }
-            }
+            assert_eq!(
+                a,
+                b,
+                "D {depths} request {}: drafting changed greedy output (first difference at \
+                 token {:?})",
+                r.id,
+                a.iter().zip(b).position(|(x, y)| x != y)
+            );
         }
         println!(
-            "D {depths}: {same}/{} requests identical drafted and undrafted; near-tie divergences \
-             (request, token, gap): {ties:?}; acceptance per depth {:?}",
+            "D {depths}: {} requests identical drafted and undrafted; acceptance per depth {:?}",
             greedy_only.len(),
             drafted.acceptance()
         );

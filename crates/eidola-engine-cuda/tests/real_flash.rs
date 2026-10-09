@@ -2,7 +2,8 @@
 //! (checkpoint layers 0, 1, 2 and 5: global + dense FFN, two sliding MoE layers,
 //! global MoE) against the f32 reference forward on the same truncation:
 //! residual stream after every layer, and logits at every position, for one
-//! unchunked prefill, a chunked prefill, and decode steps.
+//! unchunked prefill, a chunked prefill, and decode steps (and the three
+//! bit for bit equal to each other: the executor is batch-invariant).
 //!
 //! Needs a GPU, `EIDOLA_ENGINE_KERNELS_DIR`, `EIDOLA_MIMO_DIR` (a checkpoint
 //! directory: the truncated one, or the whole checkpoint) and
@@ -286,6 +287,11 @@ fn truncated_flash_matches_the_reference() {
         let self_c = compare_logits(&logits, &chunked, vocab).unwrap();
         println!("{arch:?}: logits vs reference (chunked 37/64/rest): {agree_c}");
         println!("{arch:?}: chunked vs unchunked on the GPU: {self_c}");
+        // Batch invariance: chunking changes no bit of any position's logits.
+        assert!(
+            bits_equal(&chunked, &logits),
+            "{arch:?}: chunked and unchunked logits differ"
+        );
 
         // Decode: prefill n - 8 tokens in slot 2, then 8 single-token steps.
         let base = base + nb;
@@ -311,11 +317,22 @@ fn truncated_flash_matches_the_reference() {
         let want_dec = &want.logits.data[pre as usize * vocab..];
         let agree_d = compare_logits(want_dec, &decoded, vocab).unwrap();
         println!("{arch:?}: logits vs reference (8 decode steps): {agree_d}");
+        // A decode step computes a position's logits bit for bit as the
+        // prefill that held it did.
+        assert!(
+            bits_equal(&decoded, &logits[pre as usize * vocab..]),
+            "{arch:?}: decoded and prefilled logits differ"
+        );
 
         ex.model_mut().capture_layers = false;
         gpu_slot = None;
         drop(ex);
     }
+}
+
+/// Whether two logit slices hold the same bits.
+fn bits_equal(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 /// The emulation's e4m3 rounding reproduces every finite e4m3 value exactly

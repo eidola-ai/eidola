@@ -113,8 +113,9 @@
 //! A block drafter (DFlash shape) satisfies the same invariant: its per-position context
 //! KV at `s` is projected from target hidden states at `s`, which depend only on tokens
 //! `<= s`; the target taps it continues from at a resume point are stored the same way.
-//! A GPU executor that cannot make attention or GEMMs batch-invariant must document its
-//! tolerance; the CPU reference executor meets it exactly.
+//! Every executor meets this exactly, bit for bit: the CPU reference executor by
+//! construction, the CUDA executor by a batch-invariant forward (one reduction order per
+//! row, whatever the step holds: `eidola-engine-cuda/AGENTS.md` → Batch invariance).
 
 use crate::sampling::SamplingParams;
 use crate::spec::{Bucket, ModelSpec};
