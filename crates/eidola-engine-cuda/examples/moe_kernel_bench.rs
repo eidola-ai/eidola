@@ -6,17 +6,14 @@
 //! checkpoint needed.
 //!
 //! ```text
-//! moe_kernel_bench <kernels_dir> [--iters N] [--tokens 1,2,4,...] [--layout executor|psum]
+//! moe_kernel_bench <kernels_dir> [--iters N] [--tokens 1,2,4,...]
 //! ```
 //!
 //! Each measurement enqueues `--iters` launches (default 200) behind a
 //! long-running launch, so the device runs them back to back whatever the
 //! host's launch rate, and divides the time between two events around them.
-//! The expert layout is the executor's for that token count (masked up to 128
-//! tokens, psum above), placed from the router's own selection; `--layout
-//! psum` takes the psum layout at every count, to compare it with the masked
-//! one at 128 tokens and below. The
-//! router is timed in both forms at every token count (`router/token`,
+//! The expert layout is the executor's for that token count, placed from the
+//! router's own selection. The router is timed in both forms at every token count (`router/token`,
 //! `router/tiled`), with the form the executor picks marked `*`: the data
 //! `ROUTER_PER_TOKEN_MAX` is chosen from. `qkv` is a sliding layer's (two KV
 //! heads per chunk). Prints a table and one JSON line per kernel and token
@@ -28,14 +25,13 @@ use eidola_engine_cuda::bf16;
 use eidola_engine_cuda::engine_ops::psum_rows;
 use eidola_engine_cuda::engine_ops::{EngineOps, QkvArgs, RouterForm};
 use eidola_engine_cuda::launch::dptr;
-use eidola_engine_cuda::moe_gemm::{GROUPS, MoeGemm, MoeGemmArgs, MoeLayout, MoeProj};
+use eidola_engine_cuda::moe_gemm::{GROUPS, MoeGemm, MoeGemmArgs, MoeProj};
 use eidola_engine_cuda::{Gpu, KernelDir, KernelModule};
 
 const HIDDEN: u32 = 4096;
 const EXPERTS: u32 = 256;
 const TOP_K: u32 = 8;
 const INTER: u32 = 2048;
-const CAP: u32 = 128;
 /// Tokens of the launch that keeps the device busy while the timed launches
 /// are enqueued (the reference router at this size runs for milliseconds).
 const HEAD_START_TOKENS: u32 = 4096;
@@ -99,11 +95,6 @@ fn main() {
     };
     let rest = &a[2..];
     let iters: usize = flag(rest, "--iters").map_or(200, |x| x.parse().unwrap());
-    let psum_only = match flag(rest, "--layout").unwrap_or("executor") {
-        "executor" => false,
-        "psum" => true,
-        other => panic!("--layout takes executor or psum, not {other}"),
-    };
     let token_counts: Vec<u32> = flag(rest, "--tokens")
         .unwrap_or("1,2,4,8,16,32,64,128,513,2048")
         .split(',')
@@ -190,17 +181,7 @@ fn main() {
     );
     let mut json = Vec::new();
     for &t in &token_counts {
-        let masked = t <= CAP && !psum_only;
-        // Whether this count's layout is the one the executor runs.
-        let layout_is_executors = !psum_only || t > CAP;
-        let (rows, cap) = if masked {
-            (EXPERTS * CAP, CAP)
-        } else {
-            (
-                u32::try_from(psum_rows(usize_of(t), usize_of(TOP_K))).unwrap(),
-                0,
-            )
-        };
+        let rows = u32::try_from(psum_rows(usize_of(t), usize_of(TOP_K))).unwrap();
         let rows4 = rows.div_ceil(4) * 4;
         let mut report = |kernel: &str, executor: bool, new_us: f64, ref_us: Option<f64>| {
             let mark = if executor { "*" } else { " " };
@@ -271,10 +252,10 @@ fn main() {
         let row_of = s.alloc_zeros::<i32>(usize_of(t * TOP_K)).unwrap();
         let (pgrouped, prow_of) = (dptr(&grouped, s), dptr(&row_of, s));
         let permute = time_us(&gpu, iters, &head_start, &|| unsafe {
-            ops.moe_permute(&gpu, pgrouped, prow_of, pid, t, TOP_K, cap, rows)
+            ops.moe_permute(&gpu, pgrouped, prow_of, pid, t, TOP_K, rows)
                 .unwrap();
         });
-        report("permute", layout_is_executors, permute, None);
+        report("permute", true, permute, None);
         let host_row_of = s.clone_dtoh(&row_of).unwrap();
         let mut row_src = vec![-1i32; usize_of(rows)];
         for (i, &r) in host_row_of.iter().enumerate() {
@@ -290,10 +271,8 @@ fn main() {
             .unwrap();
         let (pa, pasf) = (dptr(&a, s), dptr(&asf, s));
         let new = time_us(&gpu, iters, &head_start, &|| unsafe {
-            ops.gather_quant_ue8m0(
-                &gpu, pa, pasf, px, prow_of, t, TOP_K, rows, HIDDEN, rows4, cap,
-            )
-            .unwrap();
+            ops.gather_quant_ue8m0(&gpu, pa, pasf, px, prow_of, t, TOP_K, rows, HIDDEN, rows4)
+                .unwrap();
         });
         let old = time_us(&gpu, iters, &head_start, &|| unsafe {
             eidola_engine_cuda::launch!(
@@ -305,12 +284,11 @@ fn main() {
                 px,
                 prow_src,
                 HIDDEN,
-                rows4,
-                cap
+                rows4
             )
             .unwrap();
         });
-        report("gather", layout_is_executors, new, Some(old));
+        report("gather", true, new, Some(old));
 
         // SwiGLU.
         let gu = s
@@ -320,10 +298,8 @@ fn main() {
         let qsf = s.alloc_zeros::<i32>(usize_of(INTER / 512 * rows4)).unwrap();
         let (pgu, pq, pqsf) = (dptr(&gu, s), dptr(&q, s), dptr(&qsf, s));
         let new = time_us(&gpu, iters, &head_start, &|| unsafe {
-            ops.swiglu_quant_ue8m0(
-                &gpu, pq, pqsf, pgu, prow_of, t, TOP_K, rows, INTER, rows4, cap,
-            )
-            .unwrap();
+            ops.swiglu_quant_ue8m0(&gpu, pq, pqsf, pgu, prow_of, t, TOP_K, rows, INTER, rows4)
+                .unwrap();
         });
         let old = time_us(&gpu, iters, &head_start, &|| unsafe {
             eidola_engine_cuda::launch!(
@@ -334,12 +310,11 @@ fn main() {
                 pqsf,
                 pgu,
                 INTER,
-                rows4,
-                cap
+                rows4
             )
             .unwrap();
         });
-        report("swiglu", layout_is_executors, new, Some(old));
+        report("swiglu", true, new, Some(old));
 
         // Combine, over the down projection's rows.
         let edown = s
@@ -369,16 +344,10 @@ fn main() {
 
         // The grouped GEMMs over this layout: gate/up from the gathered rows
         // into the SwiGLU's input, down from the SwiGLU's output.
-        let (layout, m) = if masked {
-            (MoeLayout::Masked, CAP)
-        } else {
-            (MoeLayout::Psum, rows)
-        };
         let gemm = |proj, a, sfa, b, sfb, d| {
             let args = MoeGemmArgs {
-                layout,
                 proj,
-                m,
+                m: rows,
                 grouped_layout: pgrouped,
                 a,
                 sfa,
@@ -398,7 +367,7 @@ fn main() {
             dptr(&gate_up_sf, s),
             pgu,
         );
-        report("gemm/gate_up", layout_is_executors, gate_up, None);
+        report("gemm/gate_up", true, gate_up, None);
         let down = gemm(
             MoeProj::Down,
             pq,
@@ -407,7 +376,7 @@ fn main() {
             dptr(&down_sf, s),
             pedown,
         );
-        report("gemm/down", layout_is_executors, down, None);
+        report("gemm/down", true, down, None);
 
         // Fused QKV RoPE + KV write: token i at block 1 + i / 16, slot i % 16.
         let nkv = QKV_CHUNKS * QKV_KV_HEADS;

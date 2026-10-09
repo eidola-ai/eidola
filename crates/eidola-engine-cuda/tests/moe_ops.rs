@@ -22,9 +22,8 @@ const HIDDEN: usize = 4096;
 const EXPERTS: usize = 256;
 const TOP_K: usize = 8;
 const INTER: usize = 2048;
-const CAP: usize = 128;
-/// Token counts: decode rows, a masked-layout batch, the largest masked one,
-/// psum ones (the smallest, and 513 leaves the tiled router a one-token last
+/// Token counts: decode rows, decode batches (64 and 128 tokens, and 129, one
+/// past a block of rows), 513 (which leaves the tiled router a one-token last
 /// tile), and a full prefill step.
 const TOKENS: [usize; 9] = [1, 2, 7, 64, 128, 129, 513, 2048, 8192];
 /// Both router forms, whatever the token count.
@@ -378,27 +377,18 @@ fn topk_ids(rng: &mut Lcg, tokens: usize) -> Vec<i32> {
     ids
 }
 
+/// The executor's expert layout for a step of `tokens` rows.
 struct Layout {
     rows: usize,
     rows4: usize,
-    cap: usize,
 }
 
 impl Layout {
     fn for_tokens(tokens: usize) -> Layout {
-        if tokens <= CAP {
-            Layout {
-                rows: EXPERTS * CAP,
-                rows4: EXPERTS * CAP,
-                cap: CAP,
-            }
-        } else {
-            let rows = psum_rows(tokens, TOP_K);
-            Layout {
-                rows,
-                rows4: rows.div_ceil(4) * 4,
-                cap: 0,
-            }
+        let rows = psum_rows(tokens, TOP_K);
+        Layout {
+            rows,
+            rows4: rows.div_ceil(4) * 4,
         }
     }
 
@@ -407,11 +397,8 @@ impl Layout {
     }
 
     /// `sfa_index` in `engine_ops_common.cuh`.
-    fn sf_index(&self, r: usize, w: usize, k: usize) -> usize {
-        match self.cap {
-            0 => w * self.rows4 + r,
-            cap => (r / cap * (k / 512) + w) * cap + r % cap,
-        }
+    fn sf_index(&self, r: usize, w: usize) -> usize {
+        w * self.rows4 + r
     }
 }
 
@@ -419,7 +406,7 @@ impl Layout {
 /// word for word against its host form along with the grouped layout.
 fn place(gpu: &Gpu, ops: &EngineOps, ids: &[i32], tokens: usize, layout: &Layout) -> Vec<i32> {
     let (row_of, grouped) = permute(gpu, ops, ids, tokens, layout);
-    let (want_row_of, want_grouped) = expert_placement(ids, u32_of(layout.cap));
+    let (want_row_of, want_grouped) = expert_placement(ids);
     assert_eq!(row_of, want_row_of, "{tokens} tokens: row_of");
     assert_eq!(grouped, want_grouped, "{tokens} tokens: grouped layout");
     let mut seen = vec![false; layout.rows];
@@ -455,7 +442,6 @@ fn permute(
             dptr(&dids, s),
             u32_of(tokens),
             u32_of(TOP_K),
-            u32_of(layout.cap),
             u32_of(layout.rows),
         )
         .unwrap();
@@ -466,11 +452,10 @@ fn permute(
     )
 }
 
-/// The placement equals its host form word for word, in the masked layout
-/// (up to 128 tokens) and the psum one (every count), over spread and
-/// concentrated routing (runs of many blocks), and an id outside the experts
-/// is placed nowhere: its `row_of` word is left as it was and it counts for
-/// no expert.
+/// The placement equals its host form word for word at every count, over
+/// spread and concentrated routing (runs of many blocks), and an id outside
+/// the experts is placed nowhere: its `row_of` word is left as it was and it
+/// counts for no expert.
 #[test]
 fn permute_matches_host_placement() {
     let Some(su) = setup() else { return };
@@ -488,31 +473,21 @@ fn permute_matches_host_placement() {
             for i in (0..stray.len()).step_by(37) {
                 stray[i] = if i % 2 == 0 { -1 } else { 256 };
             }
-            let psum = Layout {
-                rows: psum_rows(tokens, TOP_K),
-                rows4: 0,
-                cap: 0,
-            };
-            let masked = Layout::for_tokens(tokens.min(CAP));
+            let layout = Layout::for_tokens(tokens);
             for (what, ids) in [
                 ("spread", &spread),
                 ("concentrated", &concentrated),
                 ("stray", &stray),
             ] {
-                for layout in [&psum, &masked] {
-                    if layout.cap != 0 && tokens > layout.cap {
-                        continue;
-                    }
-                    let (row_of, grouped) = permute(gpu, &ops, ids, tokens, layout);
-                    let (want_row_of, want_grouped) = expert_placement(ids, u32_of(layout.cap));
-                    let want_row_of: Vec<i32> = want_row_of
-                        .iter()
-                        .map(|&r| if r < 0 { -7 } else { r })
-                        .collect();
-                    let tag = format!("{arch:?} {tokens} tokens {what} cap {}", layout.cap);
-                    assert_eq!(row_of, want_row_of, "{tag}: row_of");
-                    assert_eq!(grouped, want_grouped, "{tag}: grouped layout");
-                }
+                let (row_of, grouped) = permute(gpu, &ops, ids, tokens, &layout);
+                let (want_row_of, want_grouped) = expert_placement(ids);
+                let want_row_of: Vec<i32> = want_row_of
+                    .iter()
+                    .map(|&r| if r < 0 { -7 } else { r })
+                    .collect();
+                let tag = format!("{arch:?} {tokens} tokens {what}");
+                assert_eq!(row_of, want_row_of, "{tag}: row_of");
+                assert_eq!(grouped, want_grouped, "{tag}: grouped layout");
             }
         }
     }
@@ -544,7 +519,7 @@ fn compare_rows(
             "{what}: row {r} codes"
         );
         for w in 0..k / 512 {
-            let i = layout.sf_index(r, w, k);
+            let i = layout.sf_index(r, w);
             assert_eq!(new_sf[i], old_sf[i], "{what}: row {r} scale word {w}");
         }
     }
@@ -557,7 +532,7 @@ fn compare_rows(
         );
         for w in 0..k / 512 {
             assert_eq!(
-                new_sf[layout.sf_index(r, w, k)],
+                new_sf[layout.sf_index(r, w)],
                 SENTINEL_WORD,
                 "{what}: padding row {r} scale written"
             );
@@ -628,7 +603,6 @@ fn gather_matches_reference_bit_for_bit() {
                             u32_of(layout.rows),
                             u32_of(k),
                             u32_of(layout.rows4),
-                            u32_of(layout.cap),
                         )
                         .unwrap();
                     } else {
@@ -641,8 +615,7 @@ fn gather_matches_reference_bit_for_bit() {
                             dptr(&dx, s),
                             dptr(&drow_src, s),
                             u32_of(k),
-                            u32_of(layout.rows4),
-                            u32_of(layout.cap)
+                            u32_of(layout.rows4)
                         )
                         .unwrap();
                     }
@@ -720,7 +693,6 @@ fn swiglu_matches_reference_bit_for_bit() {
                             u32_of(layout.rows),
                             u32_of(INTER),
                             u32_of(layout.rows4),
-                            u32_of(layout.cap),
                         )
                         .unwrap();
                     } else {
@@ -732,8 +704,7 @@ fn swiglu_matches_reference_bit_for_bit() {
                             dptr(&sf, s),
                             dptr(&dgu, s),
                             u32_of(INTER),
-                            u32_of(layout.rows4),
-                            u32_of(layout.cap)
+                            u32_of(layout.rows4)
                         )
                         .unwrap();
                     }

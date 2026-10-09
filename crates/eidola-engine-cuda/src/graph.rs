@@ -26,10 +26,11 @@
 //! bit for bit. Against the eager (unpadded) path each real row runs the same
 //! kernels over the same operands: the attention tile is 16 for every decode
 //! row either way (a decode row's packed query run is one row times the GQA
-//! group size), the expert layout is the masked one exactly when the eager
-//! step's would be (the ladder keeps 128 as a rung, see [`decode_ladder`]),
-//! and the GEMMs reduce each output row in an order that does not depend on
-//! the number of rows. The GPU tests check token and logit identity.
+//! group size), the expert layout places each routed row in its expert's run
+//! whatever the row count (only the layout's bound and the run boundaries
+//! move with the padding rows), and the GEMMs reduce each output row in an
+//! order that does not depend on the number of rows. The GPU tests check
+//! token and logit identity.
 
 use cudarc::driver::{CudaGraph, CudaSlice, sys};
 use eidola_engine::executor::StepInput;
@@ -108,10 +109,7 @@ const SAMPLE_ROW_WORDS: usize = 8;
 /// Powers of two bound the padding at under half the rung, and padding is
 /// cheap where small rungs sit: a decode step is bound by reading weights,
 /// a GEMM's M tile is 128 rows, and padding rows are identical, so together
-/// they route to the same `top_k` experts. 128 is a rung whenever the
-/// capacity exceeds it, so a step of at most 128 rows (the masked expert
-/// layout's limit) always gets a rung of at most 128, and the padded step
-/// takes the expert layout the eager step would.
+/// they route to the same `top_k` experts.
 pub fn decode_ladder(buckets: &[Bucket]) -> Vec<u32> {
     let rows = |b: &Bucket| b.max_seqs.min(b.max_tokens);
     let cap = buckets.last().map_or(0, rows);
@@ -841,11 +839,10 @@ mod tests {
         assert_eq!(decode_ladder(&[]), Vec::<u32>::new());
     }
 
-    /// The padded step takes the expert layout the eager one would: masked
-    /// exactly when its rows are at most 128.
+    /// Every row count up to the capacity has a rung: the smallest that
+    /// fits, padded by under half past the first rungs.
     #[test]
-    fn a_rung_is_masked_exactly_when_its_rows_are() {
-        const MASKED: usize = 128;
+    fn every_row_count_gets_the_smallest_rung() {
         for cap in 1..=600u32 {
             let ladder = decode_ladder(&[bucket(cap, 4096)]);
             assert!(ladder.windows(2).all(|w| w[0] < w[1]), "{ladder:?}");
@@ -853,11 +850,6 @@ mod tests {
             for rows in 1..=cap as usize {
                 let rung = ladder[rung_for(&ladder, rows).unwrap()] as usize;
                 assert!(rung >= rows, "cap {cap}: {rows} rows in rung {rung}");
-                assert_eq!(
-                    rows <= MASKED,
-                    rung <= MASKED,
-                    "cap {cap}: {rows} rows in rung {rung}"
-                );
                 // The smallest rung that fits.
                 assert!(
                     ladder

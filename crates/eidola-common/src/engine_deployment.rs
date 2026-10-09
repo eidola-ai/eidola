@@ -197,7 +197,7 @@ pub const SUPPORTED_GPU_MEMORY_BYTES: u64 = 287_428_640_768;
 
 /// Device memory the CUDA executor holds whatever its sizing: the CUDA
 /// context, the loaded kernel modules, the decode graphs' captures (a few
-/// MiB a rung; with drafting, a ladder for each draft width), and the slack of the weights' device layouts over their file
+/// MiB a rung; with drafting, a ladder each for `k` drafts and for none), and the slack of the weights' device layouts over their file
 /// bytes (each fused QKV chunk padded to whole 128-row tiles, norm and bias
 /// vectors widened to f32): 4 GiB.
 pub const DEVICE_FIXED_RESERVE_BYTES: u64 = 4 << 30;
@@ -210,9 +210,9 @@ pub const DEVICE_FIXED_RESERVE_BYTES: u64 = 4 << 30;
 /// bytes each, about 1.03 MB in all, rounded up to 1.25 MiB.
 pub const STEP_TOKEN_DEVICE_BYTES: u64 = 5 << 18;
 
-/// The expert scratch held whatever the step: rows of the masked layout (256
-/// experts × 128) or the contiguous layout's per-expert padding, at most
-/// 65,536 rows of at most 24 KiB.
+/// The expert scratch held whatever the step, beside its eight rows a token:
+/// the expert layout's padding (up to 127 rows for each of the 256 experts,
+/// and a block's rounding), bounded by 65,536 rows of at most 24 KiB.
 pub const EXPERT_FLOOR_DEVICE_BYTES: u64 = 65_536 * (24 << 10);
 
 /// Device memory per sampler row (`eidola-engine-cuda`'s sampler scratch):

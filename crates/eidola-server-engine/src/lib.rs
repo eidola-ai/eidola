@@ -238,7 +238,6 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
                 mtp_hidden: MtpHidden::Normed,
                 sampleable_vocab_size,
                 pad_batches: false,
-                draft_step_tokens: 0,
                 record: false,
             };
             let engine = worker::spawn(

@@ -74,7 +74,7 @@ EIDOLA_KERNEL_META(eidola_reference_router_topk, kThreads, 1, 1, 0, 1, 1, 1, 0);
 extern "C" __global__ void __launch_bounds__(128)
     eidola_reference_swiglu_quant_fp8_ue8m0(uint8_t* __restrict__ q, int32_t* __restrict__ sf,
                                   const uint16_t* __restrict__ gu, uint32_t inter,
-                                  uint32_t rows4, uint32_t cap) {
+                                  uint32_t rows4) {
   __shared__ uint8_t exps[4];
   const uint32_t r = blockIdx.x, w = blockIdx.y, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const uint32_t g = w * 4 + warp;
@@ -99,7 +99,7 @@ extern "C" __global__ void __launch_bounds__(128)
   __syncthreads();
   if (threadIdx.x == 0) {
     const uint32_t word = exps[0] | (exps[1] << 8) | (exps[2] << 16) | (static_cast<uint32_t>(exps[3]) << 24);
-    sf[sfa_index(r, w, inter / 512, rows4, cap)] = static_cast<int32_t>(word);
+    sf[sfa_index(r, w, rows4)] = static_cast<int32_t>(word);
   }
 }
 EIDOLA_KERNEL_META(eidola_reference_swiglu_quant_fp8_ue8m0, 128, 1, 1, 0, 1, 1, 1, 0);
@@ -110,7 +110,7 @@ EIDOLA_KERNEL_META(eidola_reference_swiglu_quant_fp8_ue8m0, 128, 1, 1, 0, 1, 1, 
 extern "C" __global__ void __launch_bounds__(128)
     eidola_reference_gather_quant_ue8m0(uint8_t* __restrict__ a, int32_t* __restrict__ sf,
                               const float* __restrict__ x, const int32_t* __restrict__ row_src,
-                              uint32_t k, uint32_t rows4, uint32_t cap) {
+                              uint32_t k, uint32_t rows4) {
   __shared__ uint8_t exps[4];
   const uint32_t r = blockIdx.x, w = blockIdx.y, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const uint32_t g = w * 4 + warp;
@@ -132,7 +132,7 @@ extern "C" __global__ void __launch_bounds__(128)
   __syncthreads();
   if (threadIdx.x == 0) {
     const uint32_t word = exps[0] | (exps[1] << 8) | (exps[2] << 16) | (static_cast<uint32_t>(exps[3]) << 24);
-    sf[sfa_index(r, w, k / 512, rows4, cap)] = static_cast<int32_t>(word);
+    sf[sfa_index(r, w, rows4)] = static_cast<int32_t>(word);
   }
 }
 EIDOLA_KERNEL_META(eidola_reference_gather_quant_ue8m0, 128, 1, 1, 0, 1, 1, 1, 0);

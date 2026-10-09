@@ -9,8 +9,7 @@
 //   - FP8 for DeepGEMM: per (row, 128 of K), a power-of-two scale
 //     2^ceil(log2(amax / 448)) stored as UE8M0 (exponent + 127), four K blocks
 //     packed little-endian per i32, words laid out [K/512][rows'] with rows'
-//     the row count rounded up to 4 (psum layout), or per expert
-//     [E][K/512][cap] for the masked layout's `cap` rows per expert.
+//     the expert layout's row count rounded up to 4.
 
 #include <cooperative_groups.h>
 
@@ -192,7 +191,7 @@ extern "C" __global__ void __launch_bounds__(128)
     eidola_swiglu_quant_fp8_ue8m0(uint8_t* __restrict__ q, int32_t* __restrict__ sf,
                                   const uint16_t* __restrict__ gu,
                                   const int32_t* __restrict__ row_of, uint32_t inter,
-                                  uint32_t rows4, uint32_t cap) {
+                                  uint32_t rows4) {
   __shared__ uint8_t exps[4];
   const uint32_t r = static_cast<uint32_t>(row_of[blockIdx.x]);
   const uint32_t w = blockIdx.y, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -218,7 +217,7 @@ extern "C" __global__ void __launch_bounds__(128)
   __syncthreads();
   if (threadIdx.x == 0) {
     const uint32_t word = exps[0] | (exps[1] << 8) | (exps[2] << 16) | (static_cast<uint32_t>(exps[3]) << 24);
-    sf[sfa_index(r, w, inter / 512, rows4, cap)] = static_cast<int32_t>(word);
+    sf[sfa_index(r, w, rows4)] = static_cast<int32_t>(word);
   }
 }
 EIDOLA_KERNEL_META(eidola_swiglu_quant_fp8_ue8m0, 128, 1, 1, 0, 1, 1, 1, 0);
@@ -600,12 +599,10 @@ EIDOLA_KERNEL_META(eidola_router_topk_tiled, kRouterTiledThreads, 1, 1, 0, kRout
 // 256 threads: thread e owns expert e's count and start, and warp w places
 // the w-th eighth of the pairs.
 //
-//   psum (cap == 0): expert e's rows start at the previous expert's end
-//     rounded up to 128 rows, in expert order; grouped_layout[e] = the end
-//     of expert e's rows (DeepGEMM's psum layout). An expert's rows past its
-//     pairs, to the next multiple of 128, are padding.
-//   masked (cap > 0): expert e's rows are e*cap + i; grouped_layout[e] =
-//     its row count (at most cap).
+// Expert e's rows start at the previous expert's end rounded up to 128 rows,
+// in expert order; grouped_layout[e] = the end of expert e's rows
+// (DeepGEMM's psum layout). An expert's rows past its pairs, to the next
+// multiple of 128, are padding.
 //
 // row_of[t*k + j] = the row (token t, slot j) landed in; the gather, the
 // SwiGLU and the combine address rows through it. An id outside 0..256 is
@@ -621,8 +618,7 @@ constexpr uint32_t kPermuteWarps = kPermuteExperts / 32;
 
 extern "C" __global__ void __launch_bounds__(kPermuteExperts)
     eidola_moe_permute(int32_t* __restrict__ grouped_layout, int32_t* __restrict__ row_of,
-                       const int32_t* __restrict__ topk_ids, uint32_t tokens, uint32_t top_k,
-                       uint32_t cap) {
+                       const int32_t* __restrict__ topk_ids, uint32_t tokens, uint32_t top_k) {
   __shared__ uint32_t next[kPermuteWarps][kPermuteExperts];
   __shared__ uint32_t scan[kPermuteExperts];
   const uint32_t e = threadIdx.x, warp = e / 32, lane = e % 32;
@@ -645,7 +641,7 @@ extern "C" __global__ void __launch_bounds__(kPermuteExperts)
     next[w][e] = count;
     count += h;
   }
-  // Starts: an exclusive scan of the runs (psum), or e * cap (masked).
+  // Starts: an exclusive scan of the runs.
   scan[e] = (count + 127) / 128 * 128;
   __syncthreads();
   for (uint32_t d = 1; d < kPermuteExperts; d *= 2) {
@@ -655,8 +651,8 @@ extern "C" __global__ void __launch_bounds__(kPermuteExperts)
     __syncthreads();
   }
   const uint32_t run = (count + 127) / 128 * 128;
-  const uint32_t start = cap ? e * cap : scan[e] - run;
-  grouped_layout[e] = static_cast<int32_t>(cap ? count : start + count);
+  const uint32_t start = scan[e] - run;
+  grouped_layout[e] = static_cast<int32_t>(start + count);
 #pragma unroll
   for (uint32_t w = 0; w < kPermuteWarps; ++w) next[w][e] += start;
   __syncthreads();
@@ -682,7 +678,7 @@ EIDOLA_KERNEL_META(eidola_moe_permute, 256, 1, 1, 0, 1, 1, 1, 0);
 extern "C" __global__ void __launch_bounds__(128)
     eidola_gather_quant_ue8m0(uint8_t* __restrict__ a, int32_t* __restrict__ sf,
                               const float* __restrict__ x, const int32_t* __restrict__ row_of,
-                              uint32_t top_k, uint32_t k, uint32_t rows4, uint32_t cap) {
+                              uint32_t top_k, uint32_t k, uint32_t rows4) {
   __shared__ uint8_t exps[4];
   const uint32_t r = static_cast<uint32_t>(row_of[blockIdx.x]), src = blockIdx.x / top_k;
   const uint32_t w = blockIdx.y, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -704,7 +700,7 @@ extern "C" __global__ void __launch_bounds__(128)
   __syncthreads();
   if (threadIdx.x == 0) {
     const uint32_t word = exps[0] | (exps[1] << 8) | (exps[2] << 16) | (static_cast<uint32_t>(exps[3]) << 24);
-    sf[sfa_index(r, w, k / 512, rows4, cap)] = static_cast<int32_t>(word);
+    sf[sfa_index(r, w, rows4)] = static_cast<int32_t>(word);
   }
 }
 EIDOLA_KERNEL_META(eidola_gather_quant_ue8m0, 128, 1, 1, 0, 1, 1, 1, 0);

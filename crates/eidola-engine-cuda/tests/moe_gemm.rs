@@ -1,13 +1,13 @@
 //! DeepGEMM's FP8 × MXFP4 grouped GEMM, launched with Rust-built descriptors,
-//! against a host reference over the same quantized operands, in both grouped
-//! layouts, on every image this device runs.
+//! against a host reference over the same quantized operands, in the psum
+//! layout, on every image this device runs.
 
 mod common;
 
 use common::{Lcg, setup};
 use eidola_engine_cuda::bf16;
 use eidola_engine_cuda::launch::dptr;
-use eidola_engine_cuda::moe_gemm::{BLOCK_M, GROUPS, MoeGemm, MoeGemmArgs, MoeLayout, MoeProj};
+use eidola_engine_cuda::moe_gemm::{BLOCK_M, GROUPS, MoeGemm, MoeGemmArgs, MoeProj};
 use eidola_engine_model::numeric::fp8_e4m3_to_f32;
 
 const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
@@ -140,7 +140,7 @@ fn check(got: &[u16], want: &[f64], what: &str) -> f64 {
     worst
 }
 
-fn run(proj: MoeProj, layout: MoeLayout) {
+fn run(proj: MoeProj) {
     let Some(su) = setup() else { return };
     let gpu = &su.gpu;
     let s = gpu.stream();
@@ -186,69 +186,40 @@ fn run(proj: MoeProj, layout: MoeLayout) {
         .collect();
 
     // Lay A, SFA, D and the grouped layout out.
-    let (m, a, sfa, layout_vec, offsets): (usize, Vec<u8>, Vec<i32>, Vec<i32>, Vec<usize>) =
-        match layout {
-            MoeLayout::Psum => {
-                // Runs in group order, each from the previous run's end
-                // rounded up to a block; the layout holds a few spare blocks
-                // past the last run, as the executor's bound does.
-                let mut order: Vec<usize> = (0..active.len()).collect();
-                order.sort_by_key(|&i| active[i].0);
-                let mut offsets = vec![0usize; active.len()];
-                let mut ends = vec![0i32; g_all];
-                let mut total = 0usize;
-                let mut gi = 0usize;
-                for (g, end) in ends.iter_mut().enumerate() {
-                    while gi < order.len() && active[order[gi]].0 == g {
-                        let (_, r) = active[order[gi]];
-                        offsets[order[gi]] = total;
-                        total += r;
-                        gi += 1;
-                    }
-                    *end = i32::try_from(total).unwrap();
-                    total = total.div_ceil(BLOCK_M as usize) * BLOCK_M as usize;
-                }
-                let m = total + 2 * BLOCK_M as usize;
-                let mut a = vec![0u8; m * k];
-                let mut scales = vec![127u8; m * k / 128];
-                for ((&(_, r), off), (codes, sc, _)) in active.iter().zip(&offsets).zip(&rows) {
-                    a[off * k..(off + r) * k].copy_from_slice(codes);
-                    scales[off * k / 128..(off + r) * k / 128].copy_from_slice(sc);
-                }
-                let sfa = sfa_words(&scales, m, k);
-                (m, a, sfa, ends, offsets)
-            }
-            MoeLayout::Masked => {
-                let cap = 2 * BLOCK_M as usize;
-                let r4 = cap.div_ceil(4) * 4;
-                let mut a = vec![0u8; g_all * cap * k];
-                let mut sfa = vec![0i32; g_all * (k / 512) * r4];
-                let mut masked = vec![0i32; g_all];
-                let mut offsets = Vec::new();
-                for ((g, r), (codes, sc, _)) in active.iter().zip(&rows) {
-                    offsets.push(g * cap);
-                    a[g * cap * k..(g * cap + r) * k].copy_from_slice(codes);
-                    let mut padded = sc.clone();
-                    padded.resize(cap * k / 128, 127);
-                    let words = sfa_words(&padded, cap, k);
-                    sfa[g * (k / 512) * r4..(g + 1) * (k / 512) * r4].copy_from_slice(&words);
-                    masked[*g] = i32::try_from(*r).unwrap();
-                }
-                (cap, a, sfa, masked, offsets)
-            }
-        };
+    // Runs in group order, each from the previous run's end rounded up to a
+    // block; the layout holds a few spare blocks past the last run, as the
+    // executor's bound does.
+    let mut order: Vec<usize> = (0..active.len()).collect();
+    order.sort_by_key(|&i| active[i].0);
+    let mut offsets = vec![0usize; active.len()];
+    let mut ends = vec![0i32; g_all];
+    let mut total = 0usize;
+    let mut gi = 0usize;
+    for (g, end) in ends.iter_mut().enumerate() {
+        while gi < order.len() && active[order[gi]].0 == g {
+            let (_, r) = active[order[gi]];
+            offsets[order[gi]] = total;
+            total += r;
+            gi += 1;
+        }
+        *end = i32::try_from(total).unwrap();
+        total = total.div_ceil(BLOCK_M as usize) * BLOCK_M as usize;
+    }
+    let m = total + 2 * BLOCK_M as usize;
+    let mut a = vec![0u8; m * k];
+    let mut scales = vec![127u8; m * k / 128];
+    for ((&(_, r), off), (codes, sc, _)) in active.iter().zip(&offsets).zip(&rows) {
+        a[off * k..(off + r) * k].copy_from_slice(codes);
+        scales[off * k / 128..(off + r) * k / 128].copy_from_slice(sc);
+    }
+    let sfa = sfa_words(&scales, m, k);
     let da = s.clone_htod(&a).unwrap();
     let dsfa = s.clone_htod(&sfa).unwrap();
-    let dgl = s.clone_htod(&layout_vec).unwrap();
-    let d_rows = match layout {
-        MoeLayout::Psum => m,
-        MoeLayout::Masked => m * g_all,
-    };
+    let dgl = s.clone_htod(&ends).unwrap();
     for &arch in &su.archs {
         let gemm = MoeGemm::from_module(su.module("deepgemm_fp8_fp4_grouped", arch)).unwrap();
-        let dd = s.alloc_zeros::<u16>(d_rows * n).unwrap();
+        let dd = s.alloc_zeros::<u16>(m * n).unwrap();
         let args = MoeGemmArgs {
-            layout,
             proj,
             m: u32::try_from(m).unwrap(),
             grouped_layout: dptr(&dgl, s),
@@ -264,31 +235,19 @@ fn run(proj: MoeProj, layout: MoeLayout) {
             let w = check(
                 &got[off * n..(off + r) * n],
                 &wants[i],
-                &format!("{arch:?} {proj:?} {layout:?} group {g}"),
+                &format!("{arch:?} {proj:?} group {g}"),
             );
-            eprintln!(
-                "{arch:?} {proj:?} {layout:?} group {g} ({r} rows): worst relative error {w:.2e}"
-            );
+            eprintln!("{arch:?} {proj:?} group {g} ({r} rows): worst relative error {w:.2e}");
         }
     }
 }
 
 #[test]
-fn psum_gate_up() {
-    run(MoeProj::GateUp, MoeLayout::Psum);
+fn gate_up() {
+    run(MoeProj::GateUp);
 }
 
 #[test]
-fn psum_down() {
-    run(MoeProj::Down, MoeLayout::Psum);
-}
-
-#[test]
-fn masked_gate_up() {
-    run(MoeProj::GateUp, MoeLayout::Masked);
-}
-
-#[test]
-fn masked_down() {
-    run(MoeProj::Down, MoeLayout::Masked);
+fn down() {
+    run(MoeProj::Down);
 }

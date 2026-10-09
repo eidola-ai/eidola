@@ -745,8 +745,8 @@ fn drafting_under_kv_pressure_preempts_and_resumes() {
 /// Uniform drafted decode steps bit-identical across replay, direct launch
 /// and the eager path: three copies of the same rows (each prefilled alone,
 /// so identical), one decoded per path, twice at the full width (the second
-/// step loading the state the first left) and then at widths 1 and 0 (the
-/// serving core narrows a step's width; every width has its rungs); then an
+/// step loading the state the first left) and then at width 0 (a step that
+/// ran short of KV; the executor captures both widths); then an
 /// engine workload with graphs on and off.
 #[test]
 fn graphs_and_eager_agree_with_drafting() {
@@ -815,8 +815,8 @@ fn graphs_and_eager_agree_with_drafting() {
     let mut next_tok: Vec<u32> = (0..9u32).map(|s| *row_tokens(s).last().unwrap()).collect();
     let mut ctx: Vec<u32> = (0..9u32).map(|s| contexts[(s % 3) as usize]).collect();
     // Two rounds at the full width (the second loading the state the first
-    // left), then the narrower widths the serving core may give a step.
-    for (round, width) in [depths, depths, 1, 0].into_iter().enumerate() {
+    // left), then the width a step that ran short of KV is given.
+    for (round, width) in [depths, depths, 0].into_iter().enumerate() {
         let mut results = Vec::new();
         for (copy, path) in [DecodePath::Eager, DecodePath::Direct, DecodePath::Replay]
             .into_iter()

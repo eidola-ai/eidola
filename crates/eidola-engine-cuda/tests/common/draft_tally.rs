@@ -4,8 +4,8 @@
 //!
 //! Depth `d`'s rate is conditional: draft `d` accepted among the rows that
 //! drafted at least `d` tokens in a step and had their first `d - 1`
-//! accepted. A row that drafted nothing (a prefill end, a step narrowed to
-//! width 0) or fewer than `d` tokens (narrowed by the serving core) is outside
+//! accepted. A row that drafted nothing (a prefill end, a step that ran short
+//! of KV) or fewer than `d` tokens (trimmed near the model length) is outside
 //! depth `d`'s denominator, not a rejection there.
 
 use eidola_engine::executor::{Executor, ExecutorError, SeqEntry, StepInput, StepOutput};
@@ -137,8 +137,8 @@ mod tests {
     }
 
     /// Depth `d`'s denominator is the rows that drafted at least `d` tokens
-    /// and had the first `d - 1` accepted: rows that drafted nothing, or were
-    /// narrowed below `d`, are not rejections at `d`.
+    /// and had the first `d - 1` accepted: rows that drafted nothing, or fewer
+    /// than `d`, are not rejections at `d`.
     #[test]
     fn acceptance_is_conditional_on_the_drafted_width() {
         let mut t = DraftTally::new(3);

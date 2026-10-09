@@ -1874,10 +1874,7 @@ pub(crate) fn check_plan(
 
 /// The rungs of drafted decode steps of draft width `width`: like
 /// [`crate::graph::decode_ladder`] over rows that each cost `1 + width`
-/// tokens (`min(max_seqs, max_tokens / (1 + width))` per bucket), with the
-/// masked expert layout's limit (`128 / (1 + width)` rows) a rung whenever
-/// the capacity exceeds it, so a padded step takes the layout its eager run
-/// would.
+/// tokens (`min(max_seqs, max_tokens / (1 + width))` per bucket).
 pub fn draft_ladder(buckets: &[eidola_engine::spec::Bucket], width: u32) -> Vec<u32> {
     let rows = |b: &eidola_engine::spec::Bucket| b.max_seqs.min(b.max_tokens / (width + 1));
     let cap = buckets.last().map_or(0, rows);
@@ -1886,20 +1883,21 @@ pub fn draft_ladder(buckets: &[eidola_engine::spec::Bucket], width: u32) -> Vec<
         .take_while(|&r| r < cap)
         .collect();
     rungs.extend(buckets.iter().map(rows).filter(|&r| r > 0));
-    let masked = crate::model::MASKED_TOKENS / (width + 1);
-    if masked > 0 && masked < cap {
-        rungs.push(masked);
-    }
     rungs.sort_unstable();
     rungs.dedup();
     rungs
 }
 
-/// The drafted ladders an executor of `depths` draft depths captures: one
-/// per width `0 ..= depths`, since the serving core narrows a step's width to
-/// keep it within the masked layout (`ModelSpec::draft_step_tokens`).
+/// The drafted ladders an executor of `depths` draft depths captures: the
+/// widths the serving core gives a whole step, `depths` and 0 (every row
+/// without drafts, as a step that ran short of KV is). A narrower uniform
+/// width arises only when every row is trimmed alike near the model length,
+/// and runs eagerly.
 pub fn draft_ladders(buckets: &[eidola_engine::spec::Bucket], depths: u32) -> Vec<(u32, Vec<u32>)> {
-    (0..=depths)
+    let mut widths = vec![0, depths];
+    widths.dedup();
+    widths
+        .into_iter()
         .map(|w| (w, draft_ladder(buckets, w)))
         .collect()
 }
@@ -2818,18 +2816,18 @@ mod tests {
         }
     }
 
-    /// Rows of a drafted rung cost `1 + D` tokens each, and the padded step
-    /// takes the expert layout its eager run would: its target tokens are
-    /// at most 128 exactly when the real step's are.
+    /// Rows of a drafted rung cost `1 + D` tokens each; the rungs are the
+    /// decode ladder's over that row capacity, and the smallest rung holding
+    /// a step pads it by under half.
     #[test]
-    fn the_drafted_ladder_keeps_the_masked_layout() {
+    fn the_drafted_ladder_covers_every_row_count() {
         assert_eq!(
             draft_ladder(&[bucket(64, 8192)], 3),
             vec![1, 2, 4, 8, 16, 32, 64]
         );
         assert_eq!(
             draft_ladder(&[bucket(64, 8192)], 2),
-            vec![1, 2, 4, 8, 16, 32, 42, 64]
+            vec![1, 2, 4, 8, 16, 32, 64]
         );
         // Tokens bound the rows: 100 tokens hold 25 rows of 1 + 3.
         assert_eq!(
@@ -2845,15 +2843,24 @@ mod tests {
                 assert_eq!(*ladder.last().unwrap(), rows_cap);
                 for rows in 1..=rows_cap {
                     let rung = *ladder.iter().find(|&&r| r >= rows).unwrap();
-                    let tokens = |n: u32| n * (depths + 1);
-                    assert_eq!(
-                        tokens(rows) <= 128,
-                        tokens(rung) <= 128,
-                        "D {depths} cap {cap}: {rows} rows in rung {rung}"
-                    );
+                    if rung.is_power_of_two() && rung > 1 {
+                        assert!(
+                            rows > rung / 2,
+                            "D {depths} cap {cap}: {rows} rows in rung {rung}"
+                        );
+                    }
                 }
             }
         }
+        // The widths the serving core gives a whole step.
+        let widths = |depths| -> Vec<u32> {
+            draft_ladders(&[bucket(64, 8192)], depths)
+                .into_iter()
+                .map(|(w, _)| w)
+                .collect()
+        };
+        assert_eq!(widths(3), vec![0, 3]);
+        assert_eq!(widths(1), vec![0, 1]);
     }
 
     /// Every uniform drafted decode step (each row one host token, sampled,

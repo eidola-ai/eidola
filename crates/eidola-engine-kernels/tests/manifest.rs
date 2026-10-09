@@ -239,36 +239,32 @@ fn entries_and_meta_records() {
         let deepgemm = manifest
             .cubin("deepgemm_fp8_fp4_grouped", arch)
             .expect("deepgemm");
-        assert_eq!(deepgemm.entries.len(), 4);
-        // Each record describes the instance its name says: masked is
-        // GemmType 2, psum (`MGroupedContiguousWithPsumLayout`) 5; gate/up
-        // has K = 4096, down K = 2048.
-        for (kind, gemm_type) in [("masked", 2), ("psum", 5)] {
-            for (proj, shape_k) in [("gate_up", 4096), ("down", 2048)] {
-                let meta = format!("eidola_deepgemm_fp8_fp4_{kind}_{proj}_meta");
-                let entry = deepgemm.entry_for_meta(&meta).expect(&meta);
-                assert!(
-                    entry
-                        .demangled
-                        .starts_with("void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<"),
-                    "{}",
-                    entry.demangled
-                );
-                assert!(
-                    entry
-                        .demangled
-                        .contains(&format!("(deep_gemm::GemmType){gemm_type}")),
-                    "{meta}: {}",
-                    entry.demangled
-                );
-                assert!(
-                    entry.demangled.contains(&format!(
-                        "(unsigned int)0, (unsigned int)4096, (unsigned int){shape_k},"
-                    )),
-                    "{meta}: {}",
-                    entry.demangled
-                );
-            }
+        assert_eq!(deepgemm.entries.len(), 2);
+        // Each record describes the instance its name says: the psum layout
+        // (`MGroupedContiguousWithPsumLayout`, GemmType 5); gate/up has
+        // K = 4096, down K = 2048.
+        for (proj, shape_k) in [("gate_up", 4096), ("down", 2048)] {
+            let meta = format!("eidola_deepgemm_fp8_fp4_psum_{proj}_meta");
+            let entry = deepgemm.entry_for_meta(&meta).expect(&meta);
+            assert!(
+                entry
+                    .demangled
+                    .starts_with("void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<"),
+                "{}",
+                entry.demangled
+            );
+            assert!(
+                entry.demangled.contains("(deep_gemm::GemmType)5"),
+                "{meta}: {}",
+                entry.demangled
+            );
+            assert!(
+                entry.demangled.contains(&format!(
+                    "(unsigned int)0, (unsigned int)4096, (unsigned int){shape_k},"
+                )),
+                "{meta}: {}",
+                entry.demangled
+            );
         }
     }
 }
