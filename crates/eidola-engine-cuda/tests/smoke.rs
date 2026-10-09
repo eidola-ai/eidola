@@ -49,7 +49,7 @@ fn every_entry_and_contract_resolves() {
                 }
                 if meta.cluster != [1, 1, 1] {
                     assert!(
-                        fatbin.name == "deepgemm_fp8_fp4_grouped"
+                        fatbin.name.starts_with("deepgemm_fp8_fp4_grouped")
                             || (fatbin.name == "engine_ops"
                                 && entry.symbol.starts_with("eidola_router_topk")),
                         "{}",

@@ -110,6 +110,9 @@ mod tests {
                 seen += 1;
             }
         }
-        assert_eq!(seen, 6, "two instances, three images");
+        assert_eq!(
+            seen, 30,
+            "two executor instances and eight bench variants, three images each"
+        );
     }
 }

@@ -145,7 +145,11 @@ fn mma(manifest: &Manifest, name: &str, arch: &str, family: &str) -> u64 {
 fn sass_uses_the_intended_tensor_core_path() {
     let manifest = Manifest::embedded();
     for arch in ["sm_100a", "sm_103a", "sm_100f"] {
-        for gemm in ["cutlass_fp8_blockwise_gemm", "deepgemm_fp8_fp4_grouped"] {
+        for gemm in [
+            "cutlass_fp8_blockwise_gemm",
+            "deepgemm_fp8_fp4_grouped",
+            "deepgemm_fp8_fp4_grouped_variants",
+        ] {
             assert!(mma(manifest, gemm, arch, "UTCQMMA") > 0, "{gemm} {arch}");
             assert_eq!(mma(manifest, gemm, arch, "HMMA"), 0, "{gemm} {arch}");
         }
@@ -265,6 +269,38 @@ fn entries_and_meta_records() {
                 "{meta}: {}",
                 entry.demangled
             );
+        }
+        // The bench-only variants: the same template over the psum layout,
+        // each record bound to the instance its name says (block M, stages,
+        // cluster).
+        let variants = manifest
+            .cubin("deepgemm_fp8_fp4_grouped_variants", arch)
+            .expect("variants");
+        assert_eq!(variants.entries.len(), 8);
+        for (name, block_m, stages, cluster) in [
+            ("m64s8", 64, 8, 2),
+            ("m64s10", 64, 10, 2),
+            ("m32s11", 32, 11, 2),
+            ("m64s8c1", 64, 8, 1),
+        ] {
+            for (proj, shape_k) in [("gate_up", 4096), ("down", 2048)] {
+                let meta = format!("eidola_deepgemm_variant_{name}_{proj}_meta");
+                let entry = variants.entry_for_meta(&meta).expect(&meta);
+                let want = format!(
+                    "(unsigned int)0, (unsigned int)4096, (unsigned int){shape_k}, \
+                     (unsigned int){block_m}, (unsigned int)128, (unsigned int)128, \
+                     (unsigned int)256, (unsigned int)128, (unsigned int)128, \
+                     (unsigned int)128, (unsigned int){stages}, (unsigned int)2, \
+                     (unsigned int)128, (unsigned int)128, (unsigned int){cluster}, \
+                     (bool)1, (unsigned int)148,"
+                );
+                assert!(
+                    entry.demangled.contains(&want)
+                        && entry.demangled.contains("(deep_gemm::GemmType)5"),
+                    "{meta}: {}",
+                    entry.demangled
+                );
+            }
         }
     }
 }
