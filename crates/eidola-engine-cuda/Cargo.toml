@@ -34,6 +34,12 @@ name = "eval"
 path = "examples/eval.rs"
 test = true
 
+# The attention-invariance bench's host-side plans are unit-tested with the crate.
+[[example]]
+name = "attention_invariance"
+path = "examples/attention_invariance.rs"
+test = true
+
 # No integer conversion may lose a value silently, in any target (library,
 # tests, examples): counts and ids are converted with `try_from`.
 [lints.clippy]
