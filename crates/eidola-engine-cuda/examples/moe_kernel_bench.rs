@@ -6,14 +6,16 @@
 //! checkpoint needed.
 //!
 //! ```text
-//! moe_kernel_bench <kernels_dir> [--iters N] [--tokens 1,2,4,...]
+//! moe_kernel_bench <kernels_dir> [--iters N] [--tokens 1,2,4,...] [--layout executor|psum]
 //! ```
 //!
 //! Each measurement enqueues `--iters` launches (default 200) behind a
 //! long-running launch, so the device runs them back to back whatever the
 //! host's launch rate, and divides the time between two events around them.
 //! The expert layout is the executor's for that token count (masked up to 128
-//! tokens, psum above), placed from the router's own selection. The
+//! tokens, psum above), placed from the router's own selection; `--layout
+//! psum` takes the psum layout at every count, to compare it with the masked
+//! one at 128 tokens and below. The
 //! router is timed in both forms at every token count (`router/token`,
 //! `router/tiled`), with the form the executor picks marked `*`: the data
 //! `ROUTER_PER_TOKEN_MAX` is chosen from. `qkv` is a sliding layer's (two KV
@@ -97,6 +99,11 @@ fn main() {
     };
     let rest = &a[2..];
     let iters: usize = flag(rest, "--iters").map_or(200, |x| x.parse().unwrap());
+    let psum_only = match flag(rest, "--layout").unwrap_or("executor") {
+        "executor" => false,
+        "psum" => true,
+        other => panic!("--layout takes executor or psum, not {other}"),
+    };
     let token_counts: Vec<u32> = flag(rest, "--tokens")
         .unwrap_or("1,2,4,8,16,32,64,128,513,2048")
         .split(',')
@@ -183,7 +190,9 @@ fn main() {
     );
     let mut json = Vec::new();
     for &t in &token_counts {
-        let masked = t <= CAP;
+        let masked = t <= CAP && !psum_only;
+        // Whether this count's layout is the one the executor runs.
+        let layout_is_executors = !psum_only || t > CAP;
         let (rows, cap) = if masked {
             (EXPERTS * CAP, CAP)
         } else {
@@ -265,7 +274,7 @@ fn main() {
             ops.moe_permute(&gpu, pgrouped, prow_of, pid, t, TOP_K, cap, rows)
                 .unwrap();
         });
-        report("permute", true, permute, None);
+        report("permute", layout_is_executors, permute, None);
         let host_row_of = s.clone_dtoh(&row_of).unwrap();
         let mut row_src = vec![-1i32; usize_of(rows)];
         for (i, &r) in host_row_of.iter().enumerate() {
@@ -301,7 +310,7 @@ fn main() {
             )
             .unwrap();
         });
-        report("gather", true, new, Some(old));
+        report("gather", layout_is_executors, new, Some(old));
 
         // SwiGLU.
         let gu = s
@@ -330,7 +339,7 @@ fn main() {
             )
             .unwrap();
         });
-        report("swiglu", true, new, Some(old));
+        report("swiglu", layout_is_executors, new, Some(old));
 
         // Combine, over the down projection's rows.
         let edown = s
@@ -389,7 +398,7 @@ fn main() {
             dptr(&gate_up_sf, s),
             pgu,
         );
-        report("gemm/gate_up", true, gate_up, None);
+        report("gemm/gate_up", layout_is_executors, gate_up, None);
         let down = gemm(
             MoeProj::Down,
             pq,
@@ -398,7 +407,7 @@ fn main() {
             dptr(&down_sf, s),
             pedown,
         );
-        report("gemm/down", true, down, None);
+        report("gemm/down", layout_is_executors, down, None);
 
         // Fused QKV RoPE + KV write: token i at block 1 + i / 16, slot i % 16.
         let nkv = QKV_CHUNKS * QKV_KV_HEADS;
