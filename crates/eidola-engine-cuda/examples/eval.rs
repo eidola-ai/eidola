@@ -5,7 +5,7 @@
 //! ```text
 //! eval render   <model_dir> <tasks.jsonl> <prompts.jsonl>
 //! eval generate <kernels_dir> <model_dir> <prompts.jsonl> <outputs.jsonl> <max_tokens> [--draft-tokens K]
-//! eval logprobs <kernels_dir> <model_dir> <prompts.jsonl> <out.jsonl> [--reference] [--full <out.f32>]
+//! eval logprobs <kernels_dir> <model_dir> <prompts.jsonl> <out.jsonl> [--reference] [--full <out.f32>] [--chunk N]
 //! eval score    <model_dir> <tasks.jsonl> <outputs.jsonl>
 //! eval compare  <a.jsonl> <b.jsonl> [--full <a.f32> <b.f32>] [--from <prompts.jsonl>]
 //! ```
@@ -23,7 +23,10 @@
 //!   with their log-probabilities over the sampleable vocabulary, from the GPU
 //!   executor or (`--reference`) the f32 reference forward. `--full` also
 //!   writes every position's whole log-probability row (little-endian f32,
-//!   sampleable vocabulary wide, prompts in order).
+//!   sampleable vocabulary wide, prompts in order). `--chunk N` prefills in
+//!   chunks of `N` tokens (at most, and by default, the step budget of
+//!   2,048); the executor is batch-invariant, so every chunk size writes the
+//!   same bytes.
 //! - `compare`: top-1 agreement and top-20 overlap always. With both sides'
 //!   full rows (`--full`), KL(a ‖ b) itself. With only top-20 lists (another
 //!   engine's API), never KL but a labelled lower bound on it: the KL of both
@@ -35,8 +38,8 @@
 //! The executor replays decode graphs when `EIDOLA_ENGINE_CUDA_GRAPHS` is `on`
 //! (`off`, eager, when unset), so `generate` runs with each setting give the
 //! outputs to compare. `generate --draft-tokens K` drafts `K` tokens a step
-//! with the checkpoint's MTP layers (greedy speculation: the outputs are the
-//! undrafted run's but for near-ties) and prints the acceptance of each draft
+//! with the checkpoint's MTP layers (greedy speculation: the outputs are
+//! exactly the undrafted run's) and prints the acceptance of each draft
 //! depth over the prompts, conditional: draft `d` accepted among the rows
 //! that drafted at least `d` tokens in a step and had their first `d - 1`
 //! accepted (`tests/common/draft_tally.rs`, shared with `tests/drafting.rs`).
@@ -348,7 +351,12 @@ fn logprobs(
     out: &str,
     reference: bool,
     full: Option<&str>,
+    chunk: u32,
 ) {
+    assert!(
+        (1..=STEP_TOKENS).contains(&chunk),
+        "--chunk {chunk}: 1 to {STEP_TOKENS} tokens"
+    );
     let rows = read_jsonl(prompts);
     by_id(&rows, "prompts");
     let vocab = 152_576usize;
@@ -389,8 +397,9 @@ fn logprobs(
         let max_len = ex.config().max_model_len;
         for r in &rows {
             let p = ids(&r["prompt_ids"]);
-            // Prefilled in chunks of the executor's step budget, as serving
-            // does; a prompt past the model length is refused by name.
+            // Prefilled in chunks of `chunk` tokens (the executor's step
+            // budget unless asked otherwise), as serving does; a prompt past
+            // the model length is refused by name.
             let len = u32::try_from(p.len())
                 .ok()
                 .filter(|&l| l <= max_len)
@@ -405,7 +414,7 @@ fn logprobs(
             let mut tops = Vec::with_capacity(p.len());
             let mut start = 0u32;
             while start < len {
-                let chunk = (len - start).min(STEP_TOKENS);
+                let chunk = (len - start).min(chunk);
                 // The first chunk maps and zeroes every block the prompt needs.
                 let (maintenance, table_updates) = if start == 0 {
                     let mut m = vec![eidola_engine::executor::Maintenance::ResetSlot { slot: 0 }];
@@ -883,6 +892,7 @@ fn main() {
             &a[5],
             a[6..].iter().any(|x| x == "--reference"),
             flag(&a[6..], "--full", 1).map(|v| v[0]),
+            flag(&a[6..], "--chunk", 1).map_or(STEP_TOKENS, |v| v[0].parse().unwrap()),
         ),
         Some("score") => score(&a[2], &a[3], &a[4]),
         Some("compare") => compare(

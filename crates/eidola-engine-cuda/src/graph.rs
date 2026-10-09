@@ -23,21 +23,26 @@
 //!
 //! **Numerics.** The graph is a recording of the padded launch sequence, so
 //! replaying it computes what launching that sequence directly computes,
-//! bit for bit. Against the eager (unpadded) path each real row runs the same
-//! kernels over the same operands: the attention tile is 16 for every decode
-//! row either way (a decode row's packed query run is one row times the GQA
-//! group size), the expert layout places each routed row in its expert's run
-//! whatever the row count (only the layout's bound and the run boundaries
-//! move with the padding rows), and the GEMMs reduce each output row in an
-//! order that does not depend on the number of rows. The GPU tests check
-//! token and logit identity.
+//! bit for bit. Against the eager (unpadded) path each real row computes the
+//! same bits: attention is batch-invariant (one reduction order per row,
+//! whatever else the step holds: [`crate::attention`]), the expert layout
+//! places each routed row in its expert's run whatever the row count (only
+//! the layout's bound and the run boundaries move with the padding rows),
+//! and the GEMMs reduce each output row in an order that does not depend on
+//! the number of rows. The GPU tests check token and logit identity.
+//!
+//! **Attention's shape is the rung's.** Each group's work list is padded to
+//! the rung's reservation ([`PassCaps`]): request slots, work items, pages and
+//! a split's partial rows. A global group's work items (one per row and
+//! 1,024-key chunk) grow with the context, so they are device data its fixed
+//! grid walks.
 
 use cudarc::driver::{CudaGraph, CudaSlice, sys};
 use eidola_engine::executor::StepInput;
 use eidola_engine::sampling::Stream;
 use eidola_engine::spec::{AttentionKind, Bucket};
 
-use crate::attention::{AttnRequest, HostPlan, PlanView};
+use crate::attention::{AttnRequest, HostPlan, PassCaps, PlanView, Reduction, SPLIT_KEYS};
 use crate::kv::KvStore;
 use crate::launch::dptr;
 use crate::model::{GpuModel, Indirect};
@@ -96,7 +101,7 @@ pub const PAD_TOKEN: u32 = 0;
 pub const PAD_POSITION: u32 = 0;
 /// The query tile every decode work item uses: a decode row's packed query
 /// run is the GQA group size (16 or 8 on Flash), which FlashInfer's rule
-/// tiles at 16.
+/// tiles at 16 (a speed choice only: the tile changes no row's bits).
 pub const DECODE_TILE: u32 = 16;
 /// Words per [`SampleRow`] in the step table.
 const SAMPLE_ROW_WORDS: usize = 8;
@@ -142,17 +147,17 @@ pub fn decode_rows(step: &StepInput) -> Option<usize> {
     decode.then_some(step.seqs.len())
 }
 
-/// The most pages one decode row of a group can list: every block of the
-/// longest sequence for full attention; for a window `W`, the blocks
-/// `W` consecutive positions can touch, `ceil((W - 1) / B) + 1` (the core's
-/// bound), and never more than the sequence's blocks.
+/// The most pages one decode row of a group can list
+/// ([`Reduction::max_pages`] of one query): every block of the longest
+/// sequence for full attention; for a window `W`, the blocks from the anchor
+/// below the row's window through the row, and never more than the
+/// sequence's blocks.
 pub fn max_decode_pages(attention: AttentionKind, block_size: u32, max_blocks_per_seq: u32) -> u32 {
-    match attention {
-        AttentionKind::Full => max_blocks_per_seq,
-        AttentionKind::Sliding { window } => {
-            (window.saturating_sub(1).div_ceil(block_size) + 1).min(max_blocks_per_seq)
-        }
-    }
+    let window = match attention {
+        AttentionKind::Full => None,
+        AttentionKind::Sliding { window } => Some(window),
+    };
+    Reduction::target(attention).max_pages(window, 1, block_size, max_blocks_per_seq)
 }
 
 /// One KV group as the decode graphs see it.
@@ -163,11 +168,16 @@ pub struct GroupSlots {
     pub page_size: u32,
     /// Where padding rows write and read ([`crate::kv::GroupGeometry::pad_block`]).
     pub pad_block: u32,
+    /// How the group reduces a row ([`Reduction::target`]).
+    pub reduction: Reduction,
     /// The most pages one decode row lists ([`max_decode_pages`]).
     pub max_pages: u32,
+    /// The longest sequence: a split's chunks per row.
+    pub max_model_len: u32,
 }
 
-/// One group's arrays in the step table: word offsets.
+/// One group's arrays in the step table: word offsets, and what the rung
+/// reserves for its work list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupRegion {
     pub kv_block: usize,
@@ -175,12 +185,18 @@ pub struct GroupRegion {
     pub q_indptr: usize,
     pub indptr: usize,
     pub last_page_len: usize,
+    pub o_indptr: usize,
+    pub merge_indptr: usize,
     pub request_indices: usize,
     pub qo_tile_indices: usize,
     pub kv_tile_indices: usize,
+    /// One word: the work-item count.
+    pub work_items: usize,
     pub indices: usize,
     /// Words reserved for `indices`: rows × the group's page bound.
     pub indices_cap: usize,
+    /// The rung's reservation and launch shape.
+    pub caps: PassCaps,
 }
 
 /// The step table of one rung: where each array sits, in 32-bit words from
@@ -194,7 +210,7 @@ pub struct DecodeLayout {
     pub token_ids: usize,
     pub positions: usize,
     pub logit_rows: usize,
-    /// One word, always zero (FlashInfer reads it only when splitting KV).
+    /// One word, [`SPLIT_KEYS`] (FlashInfer reads it on every launch).
     pub kv_chunk_size: usize,
     pub sample_rows: usize,
     pub groups: Vec<GroupRegion>,
@@ -218,23 +234,35 @@ impl DecodeLayout {
         let logit_rows = place(r, 1)?;
         let kv_chunk_size = place(1, 1)?;
         let mut fixed = Vec::with_capacity(groups.len());
-        for _ in groups {
+        let mut all_caps = Vec::with_capacity(groups.len());
+        for g in groups {
+            let caps = PassCaps::new(
+                g.reduction,
+                rows,
+                1,
+                g.group_size,
+                g.page_size,
+                g.max_pages,
+                g.max_model_len,
+            )?;
+            let (n, work) = (caps.request_words(), caps.work_items as usize);
             fixed.push([
                 place(r, 1)?,
                 place(r, 1)?,
-                place(r + 1, 1)?,
-                place(r + 1, 1)?,
-                place(r, 1)?,
-                place(r, 1)?,
-                place(r, 1)?,
-                place(r, 1)?,
+                place(n, 1)?,
+                place(n, 1)?,
+                place(n - 1, 1)?,
+                place(n, 1)?,
+                place(caps.merge_words(), 1)?,
+                place(work, 1)?,
+                place(work, 1)?,
+                place(work, 1)?,
+                place(1, 1)?,
             ]);
+            all_caps.push(caps);
         }
         let sample_rows = place(r.checked_mul(SAMPLE_ROW_WORDS).ok_or_else(overflow)?, 2)?;
-        let caps: Vec<usize> = groups
-            .iter()
-            .map(|g| r.checked_mul(g.max_pages as usize).ok_or_else(overflow))
-            .collect::<Result<_>>()?;
+        let caps: Vec<usize> = all_caps.iter().map(|c| c.pages as usize).collect();
         let mut order: Vec<usize> = (0..groups.len()).collect();
         order.sort_by_key(|&g| (caps[g], g));
         let mut indices = vec![0; groups.len()];
@@ -243,18 +271,23 @@ impl DecodeLayout {
         }
         let groups = fixed
             .into_iter()
+            .zip(all_caps)
             .enumerate()
-            .map(|(g, f)| GroupRegion {
+            .map(|(g, (f, c))| GroupRegion {
                 kv_block: f[0],
                 kv_slot: f[1],
                 q_indptr: f[2],
                 indptr: f[3],
                 last_page_len: f[4],
-                request_indices: f[5],
-                qo_tile_indices: f[6],
-                kv_tile_indices: f[7],
+                o_indptr: f[5],
+                merge_indptr: f[6],
+                request_indices: f[7],
+                qo_tile_indices: f[8],
+                kv_tile_indices: f[9],
+                work_items: f[10],
                 indices: indices[g],
                 indices_cap: caps[g],
+                caps: c,
             })
             .collect();
         Ok(DecodeLayout {
@@ -303,19 +336,45 @@ impl DecodeLayout {
             (self.sample_rows, r * SAMPLE_ROW_WORDS),
         ];
         for g in &self.groups {
+            let (n, work) = (g.caps.request_words(), g.caps.work_items as usize);
             v.extend([
                 (g.kv_block, r),
                 (g.kv_slot, r),
-                (g.q_indptr, r + 1),
-                (g.indptr, r + 1),
-                (g.last_page_len, r),
-                (g.request_indices, r),
-                (g.qo_tile_indices, r),
-                (g.kv_tile_indices, r),
+                (g.q_indptr, n),
+                (g.indptr, n),
+                (g.last_page_len, n - 1),
+                (g.o_indptr, n),
+                (g.merge_indptr, g.caps.merge_words()),
+                (g.request_indices, work),
+                (g.qo_tile_indices, work),
+                (g.kv_tile_indices, work),
+                (g.work_items, 1),
                 (g.indices, g.indices_cap),
             ]);
         }
+        v.retain(|&(_, len)| len > 0);
         v
+    }
+
+    /// The launch view of group `g`'s work list over a table at `base`.
+    pub(crate) fn view(&self, g: usize, base: u64) -> PlanView {
+        let at = |off: usize| base + 4 * off as u64;
+        let r = &self.groups[g];
+        PlanView {
+            shape: r.caps.shape,
+            out_row: 0,
+            q_indptr: at(r.q_indptr),
+            indices: at(r.indices),
+            indptr: at(r.indptr),
+            last_page_len: at(r.last_page_len),
+            request_indices: at(r.request_indices),
+            qo_tile_indices: at(r.qo_tile_indices),
+            kv_tile_indices: at(r.kv_tile_indices),
+            o_indptr: at(r.o_indptr),
+            merge_indptr: at(r.merge_indptr),
+            work_items: at(r.work_items),
+            kv_chunk_size: at(self.kv_chunk_size),
+        }
     }
 }
 
@@ -342,12 +401,14 @@ pub struct PackedStep {
 }
 
 /// The row a padding row's attention request is: one query over the one
-/// position of the pad block it wrote.
+/// position of the pad block it wrote (position 0, every reduction's
+/// anchor).
 pub fn pad_request(row: u32, pad_block: u32) -> AttnRequest {
     AttnRequest {
         q_start: row,
         qo_len: 1,
         pages: vec![pad_block],
+        kv_start: 0,
         kv_len: 1,
     }
 }
@@ -365,9 +426,10 @@ pub fn pad_sample() -> SampleRow {
 /// first, as given; padding rows after them ([`PAD_TOKEN`] at
 /// [`PAD_POSITION`], KV and pages in each group's pad block, sample rows from
 /// [`pad_sample`]). Every group's work list, padding included, is made by
-/// [`HostPlan::new`], so it passes the eager path's checks; it must be one
-/// work item per row at [`DECODE_TILE`], within the group's page
-/// reservation. Refuses (changing nothing) anything else.
+/// [`HostPlan::new`], so it passes the eager path's checks, and padded to the
+/// rung's reservation ([`HostPlan::padded`]): one pass at [`DECODE_TILE`],
+/// within the group's work-item, page and partial-row reservations. Refuses
+/// (changing nothing) anything else.
 pub fn pack(
     layout: &DecodeLayout,
     groups: &[GroupSlots],
@@ -411,7 +473,6 @@ pub fn pack(
             w[at + i] = x;
         }
     };
-    let word = |x: i32| u32::try_from(x).expect("HostPlan indices are non-negative");
     let pad = n..rows;
     put(
         &mut w,
@@ -432,6 +493,7 @@ pub fn pack(
             .chain(pad.clone().map(|_| PAD_POSITION)),
     );
     put(&mut w, layout.logit_rows, &mut (0..rows32));
+    w[layout.kv_chunk_size] = SPLIT_KEYS;
     for (i, s) in real
         .samples
         .iter()
@@ -465,18 +527,24 @@ pub fn pack(
             (n..rows)
                 .map(|i| pad_request(u32::try_from(i).expect("rows is a u32"), slots.pad_block)),
         );
-        let plan = HostPlan::new(&padded, slots.group_size, slots.page_size)?;
-        if plan.tile() != DECODE_TILE || plan.work_items() != rows || plan.num_requests() != rows {
-            return bad(format!(
-                "group {g}: tile {}, {} work items for {rows} rows",
-                plan.tile(),
-                plan.work_items()
-            ));
+        let caps = &region.caps;
+        let plan = HostPlan::new(
+            &padded,
+            slots.group_size,
+            slots.page_size,
+            slots.reduction,
+            caps.shape.partial_rows,
+        )?;
+        if plan.tile() != DECODE_TILE {
+            return bad(format!("group {g}: tile {}", plan.tile()));
         }
-        if plan.indices.len() > region.indices_cap {
+        let p = plan
+            .padded(caps)
+            .map_err(|e| CudaError::new(format!("decode step: group {g}: {e}")))?;
+        if p.indices.len() > region.indices_cap {
             return bad(format!(
                 "group {g}: {} pages past the reservation of {}",
-                plan.indices.len(),
+                p.indices.len(),
                 region.indices_cap
             ));
         }
@@ -497,17 +565,20 @@ pub fn pack(
                 .chain(pad.clone().map(|_| PAD_POSITION % slots.page_size)),
         );
         for (at, xs) in [
-            (region.q_indptr, &plan.q_indptr),
-            (region.indptr, &plan.indptr),
-            (region.last_page_len, &plan.last_page_len),
-            (region.request_indices, &plan.request_indices),
-            (region.qo_tile_indices, &plan.qo_tile_indices),
-            (region.kv_tile_indices, &plan.kv_tile_indices),
-            (region.indices, &plan.indices),
+            (region.q_indptr, &p.q_indptr),
+            (region.indptr, &p.indptr),
+            (region.last_page_len, &p.last_page_len),
+            (region.o_indptr, &p.o_indptr),
+            (region.merge_indptr, &p.merge_indptr),
+            (region.request_indices, &p.request_indices),
+            (region.qo_tile_indices, &p.qo_tile_indices),
+            (region.kv_tile_indices, &p.kv_tile_indices),
+            (region.indices, &p.indices),
         ] {
-            put(&mut w, at, &mut xs.iter().map(|&x| word(x)));
+            put(&mut w, at, &mut xs.iter().copied());
         }
-        used.push(plan.indices.len());
+        w[region.work_items] = p.work_items;
+        used.push(p.indices.len());
     }
     Ok(PackedStep {
         upload: layout.upload_words(&used),
@@ -657,25 +728,8 @@ impl DecodeGraphs {
             positions: at(layout.positions),
             kv_block: layout.groups.iter().map(|r| at(r.kv_block)).collect(),
             kv_slot: layout.groups.iter().map(|r| at(r.kv_slot)).collect(),
-            plans: layout
-                .groups
-                .iter()
-                .zip(&self.slots)
-                .map(|(r, g)| PlanView {
-                    tile: DECODE_TILE,
-                    page_size: g.page_size,
-                    group_size: g.group_size,
-                    work_items: rows32,
-                    num_requests: rows32,
-                    q_indptr: at(r.q_indptr),
-                    indices: at(r.indices),
-                    indptr: at(r.indptr),
-                    last_page_len: at(r.last_page_len),
-                    request_indices: at(r.request_indices),
-                    qo_tile_indices: at(r.qo_tile_indices),
-                    kv_tile_indices: at(r.kv_tile_indices),
-                    kv_chunk_size: at(layout.kv_chunk_size),
-                })
+            plans: (0..layout.groups.len())
+                .map(|g| vec![layout.view(g, base)])
                 .collect(),
             logit_rows: at(layout.logit_rows),
             num_logit_rows: rows,
@@ -797,6 +851,7 @@ pub(crate) fn free_memory() -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attention::{KV_TILE, MASKED_PAGE, PERSISTENT_CTAS};
     use eidola_engine::executor::SeqEntry;
     use eidola_engine::sampling::SamplingParams;
 
@@ -905,18 +960,24 @@ mod tests {
         assert_eq!(decode_rows(&step_of(vec![entry(1, true, 2)])), None);
     }
 
-    /// The page bound holds for every decode position, and is reached.
+    /// The page bound holds for every decode position, its anchor included,
+    /// and is reached.
     #[test]
     fn page_bounds_cover_every_decode_row() {
         for bs in 1..=8u32 {
             for window in 1..=40u32 {
                 let kind = AttentionKind::Sliding { window };
-                let max_len = 200u32;
+                let max_len = 1200u32;
                 let max_blocks = max_len.div_ceil(bs);
                 let bound = max_decode_pages(kind, bs, max_blocks);
+                let r = Reduction::target(kind);
                 let mut most = 0;
                 for p in 0..max_len {
-                    let pages = p / bs - kind.first_visible(p) / bs + 1;
+                    let start = r.kv_start(kind.first_visible(p), bs);
+                    assert_eq!(start % bs, 0);
+                    assert_eq!(start % KV_TILE, 0);
+                    assert!(start <= kind.first_visible(p));
+                    let pages = p / bs - start / bs + 1;
                     assert!(
                         pages <= bound,
                         "bs {bs} window {window} p {p}: {pages} > {bound}"
@@ -934,24 +995,27 @@ mod tests {
         );
     }
 
-    /// Flash's two groups: global (GQA 16, unbounded pages) and sliding
-    /// (GQA 8, window 128), each with 64 blocks the seam may name (`1..64`;
-    /// the pad block is 64).
+    /// The pad block of both of Flash's pools in these tests: real blocks
+    /// lie below it.
+    const PAD: u32 = 200;
+
+    /// Flash's two groups: global (GQA 16, unbounded pages, split) and
+    /// sliding (GQA 8, window 128, anchored), each with `max_blocks` blocks a
+    /// sequence (positions `max_blocks × 16`).
     fn flash_slots(max_blocks: u32) -> Vec<GroupSlots> {
-        vec![
-            GroupSlots {
-                group_size: 16,
+        let global = AttentionKind::Full;
+        let sliding = AttentionKind::Sliding { window: 128 };
+        [(global, 16), (sliding, 8)]
+            .into_iter()
+            .map(|(kind, group_size)| GroupSlots {
+                group_size,
                 page_size: 16,
-                pad_block: 64,
-                max_pages: max_decode_pages(AttentionKind::Full, 16, max_blocks),
-            },
-            GroupSlots {
-                group_size: 8,
-                page_size: 16,
-                pad_block: 64,
-                max_pages: max_decode_pages(AttentionKind::Sliding { window: 128 }, 16, max_blocks),
-            },
-        ]
+                pad_block: PAD,
+                reduction: Reduction::target(kind),
+                max_pages: max_decode_pages(kind, 16, max_blocks),
+                max_model_len: max_blocks * 16,
+            })
+            .collect()
     }
 
     #[test]
@@ -971,8 +1035,8 @@ mod tests {
             // list's used part ends the upload.
             assert!(l.groups[1].indices < l.groups[0].indices);
             assert_eq!(l.groups[0].indices_cap, rows as usize * 64);
-            assert_eq!(l.groups[1].indices_cap, rows as usize * 9);
-            assert_eq!(l.upload_words(&[0, 9]), l.groups[0].indices);
+            assert_eq!(l.groups[1].indices_cap, rows as usize * 12);
+            assert_eq!(l.upload_words(&[0, 12]), l.groups[0].indices);
             assert_eq!(l.upload_words(&[5, 0]), l.groups[0].indices + 5);
             // Every region but the last-placed one lies inside the upload.
             for (off, len) in l.regions() {
@@ -980,7 +1044,26 @@ mod tests {
                     assert!(off + len <= l.upload_words(&[0, 0]));
                 }
             }
+            // The global group: a request a row, every row's chunks of the
+            // longest sequence (1,024 positions, one chunk), a merged row a
+            // row; the sliding group one work item a row.
+            let (g, s) = (&l.groups[0].caps, &l.groups[1].caps);
+            assert_eq!(
+                (g.shape.num_requests, g.work_items, g.shape.merge_rows),
+                (rows, rows, rows)
+            );
+            assert!(g.shape.split && !s.shape.split);
+            assert_eq!(g.shape.grid, rows.min(PERSISTENT_CTAS));
+            assert_eq!(
+                (s.shape.grid, s.work_items, s.shape.merge_rows),
+                (rows, rows, 0)
+            );
+            assert_eq!((g.shape.tile, s.shape.tile), (DECODE_TILE, DECODE_TILE));
         }
+        // Longer sequences reserve more chunks a row.
+        let l = DecodeLayout::new(4, &flash_slots(1000)).unwrap();
+        let g = &l.groups[0].caps;
+        assert_eq!((g.work_items, g.shape.partial_rows), (4 * 16, 4 * 16));
     }
 
     #[test]
@@ -1015,23 +1098,33 @@ mod tests {
 
     impl Rows {
         fn three() -> Rows {
-            // Contexts 17, 40 and 150 (past the window), each row's blocks
+            // Contexts 17, 40 and 1,100 (past the window, whose first
+            // visible position 973 anchors at 960, and past the first
+            // global chunk), each row's blocks
             // 1.., 11.., 21.. in both groups.
-            let contexts = [17u32, 40, 150];
+            let contexts = [17u32, 40, 1100];
             let mut kv_targets = vec![Vec::new(), Vec::new()];
             let mut requests = vec![Vec::new(), Vec::new()];
             for (i, &c) in contexts.iter().enumerate() {
                 let i32 = u32::try_from(i).unwrap();
                 let base = 1 + 10 * i32;
                 let block = |pos: u32| base + pos / 16;
-                for (g, window) in [(0, None), (1, Some(128u32))] {
+                for (g, kind) in [
+                    (0, AttentionKind::Full),
+                    (1, AttentionKind::Sliding { window: 128 }),
+                ] {
                     kv_targets[g].push((block(c), c % 16));
-                    let first = window.map_or(0, |w| (c + 1).saturating_sub(w)) / 16;
+                    let first = kind.first_visible(c);
+                    let start = Reduction::target(kind).kv_start(first, 16);
                     requests[g].push(AttnRequest {
                         q_start: i32,
                         qo_len: 1,
-                        pages: (first..=c / 16).map(|p| base + p).collect(),
-                        kv_len: c + 1 - first * 16,
+                        pages: (start / 16..first / 16)
+                            .map(|_| MASKED_PAGE)
+                            .chain((first / 16..=c / 16).map(|p| base + p))
+                            .collect(),
+                        kv_start: start,
+                        kv_len: c + 1 - start,
                     });
                 }
             }
@@ -1068,12 +1161,12 @@ mod tests {
     #[test]
     fn padding_rows_are_inert() {
         let rows = Rows::three();
-        let slots = flash_slots(64);
+        let slots = flash_slots(128);
         let l = DecodeLayout::new(8, &slots).unwrap();
         let packed = pack(&l, &slots, &rows.rows()).unwrap();
         let w = &packed.words;
         assert_eq!(read(w, l.token_ids, 8), [11, 22, 33, 0, 0, 0, 0, 0]);
-        assert_eq!(read(w, l.positions, 8), [17, 40, 150, 0, 0, 0, 0, 0]);
+        assert_eq!(read(w, l.positions, 8), [17, 40, 1100, 0, 0, 0, 0, 0]);
         assert_eq!(read(w, l.logit_rows, 8), (0..8).collect::<Vec<_>>());
         for i in 0..8 {
             let at = l.sample_rows + i * SAMPLE_ROW_WORDS;
@@ -1104,17 +1197,27 @@ mod tests {
             );
             assert!(offs[3..].iter().all(|&o| o == 0));
             // Attention: the real rows' arrays are exactly the unpadded
-            // plan's; each padding row reads one position of the pad block.
-            let eager = HostPlan::new(&rows.requests[g], s.group_size, s.page_size).unwrap();
+            // plan's, as a prefix; each padding row reads one position of
+            // the pad block, one chunk.
+            let eager = HostPlan::new(
+                &rows.requests[g],
+                s.group_size,
+                s.page_size,
+                s.reduction,
+                r.caps.shape.partial_rows,
+            )
+            .unwrap();
+            assert_eq!(eager.tile(), DECODE_TILE);
+            let e = &eager.passes()[0];
             let words = |xs: &[i32]| {
                 xs.iter()
                     .map(|&x| u32::try_from(x).unwrap())
                     .collect::<Vec<_>>()
             };
             let indptr = read(w, r.indptr, 9);
-            assert_eq!(indptr[..4], words(&eager.indptr)[..]);
-            let real_pages = eager.indices.len();
-            assert_eq!(read(w, r.indices, real_pages), words(&eager.indices));
+            assert_eq!(indptr[..4], words(&e.indptr)[..]);
+            let real_pages = e.indices.len();
+            assert_eq!(read(w, r.indices, real_pages), words(&e.indices));
             assert_eq!(read(w, r.indices + real_pages, 5), [s.pad_block; 5]);
             assert_eq!(
                 (4..9)
@@ -1123,26 +1226,44 @@ mod tests {
                 [1; 5]
             );
             let last = read(w, r.last_page_len, 8);
-            assert_eq!(last[..3], words(&eager.last_page_len)[..]);
+            assert_eq!(last[..3], words(&e.last_page_len)[..]);
             assert_eq!(last[3..], [1; 5]);
             assert_eq!(read(w, r.q_indptr, 9), (0..9).collect::<Vec<_>>());
-            assert_eq!(read(w, r.request_indices, 8), (0..8).collect::<Vec<_>>());
-            assert_eq!(read(w, r.qo_tile_indices, 8), [0; 8]);
-            assert_eq!(read(w, r.kv_tile_indices, 8), [0; 8]);
-            assert_eq!(eager.tile(), DECODE_TILE);
+            // Work items: the real rows' first, then one per padding row.
+            let work = e.work_items();
+            let n = w[r.work_items] as usize;
+            assert_eq!(n, work + 5);
+            assert_eq!(read(w, r.request_indices, work), words(&e.request_indices));
+            assert_eq!(read(w, r.kv_tile_indices, work), words(&e.kv_tile_indices));
+            assert_eq!(
+                read(w, r.request_indices + work, 5),
+                (3..8).collect::<Vec<_>>()
+            );
+            assert_eq!(read(w, r.qo_tile_indices, n), vec![0; n]);
+            assert_eq!(read(w, r.kv_tile_indices + work, 5), [0; 5]);
+            if s.reduction.is_split() {
+                // Row 2 at 1,100 merges two chunks; every other row one.
+                assert_eq!(read(w, r.kv_tile_indices, work), [0, 0, 0, 1]);
+                assert_eq!(read(w, r.merge_indptr, 9), [0, 1, 2, 4, 5, 6, 7, 8, 9]);
+                assert_eq!(read(w, r.o_indptr, 9), [0, 1, 2, 4, 5, 6, 7, 8, 9]);
+            } else {
+                // The anchor: row 2's pages start at position 960.
+                assert_eq!(rows.requests[g][2].kv_start, 960);
+                assert_eq!(read(w, r.o_indptr, 9), (0..9).collect::<Vec<_>>());
+            }
         }
-        assert_eq!(w[l.kv_chunk_size], 0);
+        assert_eq!(w[l.kv_chunk_size], SPLIT_KEYS);
         // The upload ends with the global group's used pages.
-        let global_pages = HostPlan::new(&rows.requests[0], 16, 16)
-            .unwrap()
-            .indices
-            .len()
+        let global_pages = rows.requests[0]
+            .iter()
+            .map(|r| r.pages.len())
+            .sum::<usize>()
             + 5;
         assert_eq!(packed.upload, l.groups[0].indices + global_pages);
         // A full rung has no padding rows; an empty one is all padding.
         let full = DecodeLayout::new(3, &slots).unwrap();
         let p = pack(&full, &slots, &rows.rows()).unwrap();
-        assert_eq!(read(&p.words, full.groups[0].kv_block, 3), [2, 13, 30]);
+        assert_eq!(read(&p.words, full.groups[0].kv_block, 3), [2, 13, 89]);
         let (targets, requests) = (vec![Vec::new(); 2], vec![Vec::new(); 2]);
         let none = DecodeRows {
             tokens: &[],
@@ -1155,12 +1276,13 @@ mod tests {
         for (s, r) in slots.iter().zip(&l.groups) {
             assert_eq!(read(&p.words, r.kv_block, 8), [s.pad_block; 8]);
             assert_eq!(read(&p.words, r.indices, 8), [s.pad_block; 8]);
+            assert_eq!(p.words[r.work_items], 8);
         }
     }
 
     #[test]
     fn steps_the_rung_cannot_run_are_refused() {
-        let slots = flash_slots(64);
+        let slots = flash_slots(128);
         let rows = Rows::three();
         let refused = |l: &DecodeLayout, r: &Rows| {
             pack(l, &slots, &r.rows()).expect_err("refused");
@@ -1180,10 +1302,21 @@ mod tests {
         let mut r = Rows::three();
         r.requests[1][0].kv_len = 40;
         refused(&l, &r);
+        // Sliding pages off their anchor.
+        let mut r = Rows::three();
+        r.requests[1][2].kv_start = 976;
+        r.requests[1][2].kv_len = 1101 - 976;
+        r.requests[1][2].pages.drain(..1);
+        refused(&l, &r);
         // More pages than the reservation.
         let tight = flash_slots(2);
         let l2 = DecodeLayout::new(4, &tight).unwrap();
         pack(&l2, &tight, &rows.rows()).expect_err("past the reservation");
+        // More chunks than the rung reserves (a sequence past the model
+        // length it was sized for).
+        let short = flash_slots(64);
+        let l3 = DecodeLayout::new(4, &short).unwrap();
+        pack(&l3, &short, &rows.rows()).expect_err("past the chunks");
         // A missing KV target.
         let mut r = Rows::three();
         r.kv_targets[1].pop();

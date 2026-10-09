@@ -420,6 +420,37 @@ mod tests {
         assert!(e.0.contains("sliding"), "{e}");
     }
 
+    /// The device reserve counts split attention's partial rows as the executor
+    /// sizes them, from the node's one bucket.
+    #[test]
+    fn the_reserved_partial_rows_are_the_executors() {
+        for (seats, step) in [(1u32, 4u32), (8, 512), (64, 8192), (1024, 2048)] {
+            for draft in 0..=3u32 {
+                for len in [1u32, 1024, 1025, 131_072, 1 << 20] {
+                    let sizing = Sizing {
+                        max_seqs: seats,
+                        max_batched_tokens: step,
+                        max_model_len: len,
+                        draft_tokens: draft,
+                        ..sizing()
+                    };
+                    let bucket = Bucket {
+                        max_seqs: seats,
+                        max_tokens: step,
+                    };
+                    assert_eq!(
+                        u64::from(
+                            eidola_engine_cuda::executor::split_partial_rows(bucket, draft, len)
+                                .unwrap()
+                        ),
+                        eidola_common::engine_deployment::split_partial_rows(&sizing),
+                        "{sizing:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The gateway's build holds a pinned deployment's budget to
     /// `cuda_kv_min_bytes`; it is exactly the least this derivation accepts, across
     /// block sizes, seats, step sizes, the cache switch and the draft width.

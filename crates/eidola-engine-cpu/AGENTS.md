@@ -157,5 +157,5 @@ Measured on a 16-core Apple-silicon machine (128 GB), release build:
 
 1. Implement `Executor`, honouring the seam contract and the MTP row layout above.
 2. Run this crate's workloads with the faster executor in place of `CpuExecutor`. Compare each step's outputs and returned logits with `CpuExecutor` on the same inputs, or with `DenseOracle` directly.
-3. Where bit equality is impossible (non-batch-invariant GEMMs or attention, lower precision), document the tolerance and why. Greedy outputs must still match except at documented near-ties.
+3. Where bit equality with this executor is impossible (lower precision, another quantization recipe), document the tolerance and why; greedy outputs must still match except at documented near-ties. Bit equality with *itself* is not optional: the seam's determinism contract (`eidola-engine/AGENTS.md`) holds a faster executor to batch invariance, exactly.
 4. Keep the zero-on-free observable: after maintenance, a freed block must hold no data from its previous owner, and a reset slot no per-sequence model state.

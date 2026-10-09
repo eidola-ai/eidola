@@ -23,7 +23,7 @@ use eidola_engine_model::attention::rope_cos_sin;
 use eidola_engine_model::config::{AttentionSpec, FfnKind};
 use eidola_engine_model::safetensors::WeightSet;
 
-use crate::attention::{Attention, AttnLayer, AttnPlan, PlanShape, PlanView};
+use crate::attention::{Attention, AttnLayer, AttnPlan, Partials, PlanShape, PlanView};
 use crate::device::ImageArch;
 use crate::engine_ops::{COPY_BUFFERS, CopyArgs, EngineOps, QkvArgs};
 use crate::gemm::{Gemm, GemmArgs, GemmKind};
@@ -112,8 +112,8 @@ pub(crate) struct Indirect {
     /// Per group: `tokens` block ids, then `tokens` offsets in the block.
     pub kv_block: Vec<u64>,
     pub kv_slot: Vec<u64>,
-    /// Per group: the attention work list.
-    pub plans: Vec<PlanView>,
+    /// Per group: the attention work list, pass by pass.
+    pub plans: Vec<Vec<PlanView>>,
     /// `num_logit_rows` token rows whose logits the head computes.
     pub logit_rows: u64,
     pub num_logit_rows: usize,
@@ -178,6 +178,11 @@ struct Scratch {
     logit_rows: CudaSlice<u32>,
     sel: CudaSlice<u16>,
     pub logits: CudaSlice<f32>,
+    // Split attention's partial states between the attention and the merge.
+    partials_v: CudaSlice<u16>,
+    partials_s: CudaSlice<f32>,
+    partial_rows: u32,
+    partial_heads: u32,
 }
 
 /// Floats per position in a RoPE table (32 cos, 32 sin).
@@ -384,6 +389,7 @@ impl ScratchSizes {
 impl GpuModel {
     /// The model over its weights, with `layer_kv` from [`group_layers`] of
     /// the same configuration (the executor's construction).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         gpu: &Gpu,
         weights: ModelWeights,
@@ -392,6 +398,7 @@ impl GpuModel {
         max_tokens: usize,
         max_logit_rows: usize,
         max_len: usize,
+        partial_rows: u32,
     ) -> Result<GpuModel> {
         let c = &weights.config;
         let s = gpu.stream();
@@ -405,6 +412,26 @@ impl GpuModel {
             .max()
             .unwrap_or(0);
         let mtp_inter = weights.mtp.first().map_or(0, |m| m.ffn.inter as usize);
+        // Split attention's partial rows: every query head's output and
+        // log-sum-exp, for the global layers (no scratch without one).
+        let global_heads = c
+            .layers
+            .iter()
+            .filter(|l| l.attention.window().is_none())
+            .map(|l| l.attention.num_q_heads)
+            .max()
+            .unwrap_or(0);
+        let partial_rows = if global_heads == 0 { 0 } else { partial_rows };
+        let partial_heads: u32 = narrow(global_heads, "query heads")?;
+        let partials_overflow = || CudaError::new("split attention scratch overflows");
+        let partial_cells = (partial_rows as usize)
+            .checked_mul(global_heads)
+            .ok_or_else(partials_overflow)?;
+        let partials_v = partial_cells
+            .checked_mul(crate::attention::HEAD_DIM_VO as usize)
+            .ok_or_else(partials_overflow)?
+            .max(1);
+        let partials_s = partial_cells.max(1);
         let ScratchSizes {
             toks,
             per_group,
@@ -467,6 +494,10 @@ impl GpuModel {
             logit_rows: s.alloc_zeros(rows)?,
             sel: s.alloc_zeros(sel)?,
             logits: s.alloc_zeros(logits)?,
+            partials_v: s.alloc_zeros(partials_v)?,
+            partials_s: s.alloc_zeros(partials_s)?,
+            partial_rows,
+            partial_heads,
         };
         let mut rope = Vec::new();
         let mtp_spec = (!weights.mtp.is_empty()).then_some(&c.mtp.attention);
@@ -528,6 +559,12 @@ impl GpuModel {
     /// Positions the RoPE tables cover.
     pub fn max_positions(&self) -> usize {
         self.max_len
+    }
+
+    /// Partial rows split attention's scratch holds (0 without global
+    /// layers): the most one pass of a global group's work list may write.
+    pub fn partial_rows(&self) -> u32 {
+        self.scratch.partial_rows
     }
 
     /// KV groups the retained layers use.
@@ -708,7 +745,7 @@ impl GpuModel {
             kv_slot: (0..groups)
                 .map(|g| dptr_at(&sc.kv_slot, &s, g * mt))
                 .collect(),
-            plans: input.plans.iter().map(|p| p.view(gpu)).collect(),
+            plans: input.plans.iter().map(|p| p.views(gpu)).collect(),
             logit_rows: dptr(&sc.logit_rows, &s),
             num_logit_rows: n,
             final_norm: false,
@@ -1049,7 +1086,7 @@ impl GpuModel {
                 },
                 sink: dptr(&mw.attention.sinks, &s),
             },
-            plan: &src.plan,
+            plan: std::slice::from_ref(&src.plan),
         };
         unsafe {
             layer(
@@ -1123,7 +1160,8 @@ struct LayerKvAt<'a> {
     k_off: u64,
     v_off: u64,
     attn: AttnLayer,
-    plan: &'a PlanView,
+    /// The group's work list, pass by pass.
+    plan: &'a [PlanView],
 }
 
 /// One layer's launches over `t` rows of the residual stream `sc.h`: norm,
@@ -1215,14 +1253,23 @@ unsafe fn layer(
             },
             t32,
         )?;
-        k.attention.run_view(
-            gpu,
-            at.plan,
-            &at.attn,
-            nq,
-            dptr(&sc.q, &s),
-            dptr(&sc.attn, &s),
-        )?;
+        let partials = Partials {
+            v: dptr(&sc.partials_v, &s),
+            s: dptr(&sc.partials_s, &s),
+            rows: sc.partial_rows,
+            heads: sc.partial_heads,
+        };
+        for view in at.plan {
+            k.attention.run_view(
+                gpu,
+                view,
+                &at.attn,
+                nq,
+                dptr(&sc.q, &s),
+                dptr(&sc.attn, &s),
+                &partials,
+            )?;
+        }
         // 3. o_proj with the value scale, added into h.
         k.bf16_gemm.launch(
             gpu,

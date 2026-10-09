@@ -1,11 +1,16 @@
 //! FlashInfer's FA2 sink attention over the executor's paged KV pools, against
-//! the model crate's reference `attend`, for global and sliding layers,
-//! prefill chunks and decode rows, on every image this device runs.
+//! the model crate's reference `attend`, for global (split at absolute
+//! multiples of 1,024 keys, then merged) and sliding (anchored) layers,
+//! prefill chunks and decode rows, on every image this device runs. A global
+//! plan run in several passes (a small partial-row scratch) gives the same
+//! bits as in one.
 
 mod common;
 
 use common::{Lcg, setup};
-use eidola_engine_cuda::attention::{Attention, AttnLayer, AttnRequest, HEAD_DIM_QK, HEAD_DIM_VO};
+use eidola_engine_cuda::attention::{
+    Attention, AttnLayer, AttnRequest, HEAD_DIM_QK, HEAD_DIM_VO, MASKED_PAGE, Partials, Reduction,
+};
 use eidola_engine_cuda::bf16;
 use eidola_engine_cuda::kv::{GroupGeometry, KvLayout, KvStore};
 use eidola_engine_cuda::launch::dptr;
@@ -26,6 +31,10 @@ fn run(window: Option<u32>, kv_heads: u32, rows: &[Row], seed: u64) {
     let gpu = &su.gpu;
     let s = gpu.stream();
     let mut rng = Lcg(seed);
+    let reduction = match window {
+        Some(_) => Reduction::Anchored { origin: 0 },
+        None => Reduction::Split,
+    };
     let layers = 3u32;
     let layer = 1u32;
     let total_blocks: u32 = rows
@@ -81,17 +90,24 @@ fn run(window: Option<u32>, kv_heads: u32, rows: &[Row], seed: u64) {
             }
             row_kv.push((k, v));
         }
-        // Leave out leading pages no query can see.
+        // Leave out leading pages no query can see, from the anchor at or
+        // below the first query's first visible position.
         let first_visible = match window {
             Some(w) => (r.context + 1).saturating_sub(w),
             None => 0,
         };
-        let first_page = first_visible / BS;
+        // Pages wholly before it are masked, as the executor lists them.
+        let kv_start = reduction.kv_start(first_visible, BS);
+        let first_page = (first_visible / BS) as usize;
         requests.push(AttnRequest {
             q_start,
             qo_len: r.queries,
-            pages: pages[first_page as usize..].to_vec(),
-            kv_len: end - first_page * BS,
+            pages: (kv_start / BS..first_visible / BS)
+                .map(|_| MASKED_PAGE)
+                .chain(pages[first_page..].iter().copied())
+                .collect(),
+            kv_start,
+            kv_len: end - kv_start,
         });
         for _ in 0..r.queries {
             q_rows.push(
@@ -175,14 +191,50 @@ fn run(window: Option<u32>, kv_heads: u32, rows: &[Row], seed: u64) {
         window_left: window.map_or(-1, |w| i32::try_from(w).unwrap() - 1),
         sink: dptr(&dsink, s),
     };
+    // Split attention's partial rows: enough for one pass, and a scratch
+    // small enough to need several (one row's chunks at the least).
+    let chunks = |r: &Row| (r.context + r.queries).div_ceil(1024);
+    let one_pass: u32 = rows.iter().map(|r| r.queries * chunks(r)).sum();
+    let small = rows.iter().map(chunks).max().unwrap_or(1) + 1;
+    let tv = s
+        .alloc_zeros::<u16>(one_pass as usize * NQ as usize * dv)
+        .unwrap();
+    let ts = s
+        .alloc_zeros::<f32>(one_pass as usize * NQ as usize)
+        .unwrap();
     for &arch in &su.archs {
         let attn = Attention::from_module(su.module("flashinfer_fa2_sink_paged", arch)).unwrap();
-        let plan = attn.plan(gpu, &requests, NQ / kv_heads, BS).unwrap();
-        let o = s
-            .alloc_zeros::<u16>(q_rows.len() * NQ as usize * dv)
+        let attend_with = |budget: u32| -> Vec<u16> {
+            let plan = attn
+                .plan(gpu, &requests, NQ / kv_heads, BS, reduction, budget)
+                .unwrap();
+            let o = s
+                .alloc_zeros::<u16>(q_rows.len() * NQ as usize * dv)
+                .unwrap();
+            let partials = Partials {
+                v: dptr(&tv, s),
+                s: dptr(&ts, s),
+                rows: one_pass,
+                heads: NQ,
+            };
+            unsafe {
+                attn.run(
+                    gpu,
+                    &plan,
+                    &layer_desc,
+                    NQ,
+                    dptr(&dq, s),
+                    dptr(&o, s),
+                    &partials,
+                )
+            }
             .unwrap();
-        unsafe { attn.run(gpu, &plan, &layer_desc, NQ, dptr(&dq, s), dptr(&o, s)) }.unwrap();
-        let got = s.clone_dtoh(&o).unwrap();
+            s.clone_dtoh(&o).unwrap()
+        };
+        let got = attend_with(one_pass);
+        if window.is_none() {
+            assert_eq!(attend_with(small), got, "{arch:?}: passes change no bit");
+        }
         let mut worst = 0f32;
         for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
             let g = bf16::to_f32(g);
@@ -224,6 +276,18 @@ fn global_prefill_and_decode() {
             Row {
                 context: 17,
                 queries: 1,
+            },
+            Row {
+                context: 2500,
+                queries: 1,
+            },
+            Row {
+                context: 900,
+                queries: 300,
+            },
+            Row {
+                context: 1022,
+                queries: 4,
             },
         ],
         5,

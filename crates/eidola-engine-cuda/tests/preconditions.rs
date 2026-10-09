@@ -4,7 +4,7 @@
 mod common;
 
 use common::setup;
-use eidola_engine_cuda::attention::{Attention, AttnLayer};
+use eidola_engine_cuda::attention::{Attention, AttnLayer, Partials, Reduction};
 use eidola_engine_cuda::engine_ops::{EngineOps, QkvArgs, RouterForm};
 
 #[test]
@@ -184,12 +184,21 @@ fn out_of_range_launches_are_refused() {
                 q_start: 0,
                 qo_len: 1,
                 pages: vec![1],
+                kv_start: 0,
                 kv_len: 1,
             }],
             16,
             16,
+            Reduction::Split,
+            1,
         )
         .unwrap();
+    let partials = Partials {
+        v: 0,
+        s: 0,
+        rows: 1,
+        heads: 64,
+    };
     let layer = AttnLayer {
         k_base: 0,
         v_base: 0,
@@ -201,7 +210,7 @@ fn out_of_range_launches_are_refused() {
         sink: 0,
     };
     assert!(
-        unsafe { attn.run(gpu, &plan, &layer, 63, 0, 0) }.is_err(),
+        unsafe { attn.run(gpu, &plan, &layer, 63, 0, 0, &partials) }.is_err(),
         "GQA groups"
     );
     let other_pages = AttnLayer {
@@ -209,7 +218,23 @@ fn out_of_range_launches_are_refused() {
         ..layer
     };
     assert!(
-        unsafe { attn.run(gpu, &plan, &other_pages, 64, 0, 0) }.is_err(),
+        unsafe { attn.run(gpu, &plan, &other_pages, 64, 0, 0, &partials) }.is_err(),
         "a plan for another page size"
+    );
+    let windowed = AttnLayer {
+        window_left: 127,
+        ..layer
+    };
+    assert!(
+        unsafe { attn.run(gpu, &plan, &windowed, 64, 0, 0, &partials) }.is_err(),
+        "a split plan on a sliding layer"
+    );
+    let no_room = Partials {
+        rows: 0,
+        ..partials
+    };
+    assert!(
+        unsafe { attn.run(gpu, &plan, &layer, 64, 0, 0, &no_room) }.is_err(),
+        "partial rows past the scratch"
     );
 }

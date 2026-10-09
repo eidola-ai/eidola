@@ -1,7 +1,7 @@
 //! The CUDA executor driven directly through the seam on the truncated real
 //! checkpoint (see `real_flash.rs` for the environment it needs): zero really
-//! zeroes, a copied block resumes bit for bit in a fresh slot, rows are
-//! independent of their batch (within the measured tolerance), the sampler
+//! zeroes, a copied block resumes bit for bit in a fresh slot, a row's logits
+//! are bit for bit independent of its batch and its chunking, the sampler
 //! never returns a padded id, contract violations panic, and a malformed
 //! step changes nothing.
 
@@ -14,7 +14,7 @@ use common::setup;
 use eidola_engine::executor::{Executor, Maintenance, SeqEntry, StepInput, TableUpdate};
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::spec::Bucket;
-use eidola_engine_cuda::attention::AttnRequest;
+use eidola_engine_cuda::attention::{AttnRequest, Reduction};
 use eidola_engine_cuda::model::ForwardInput;
 use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, CudaGraphs, KvBlocks, MtpHidden};
 use eidola_engine_model::safetensors::WeightSet;
@@ -179,9 +179,11 @@ fn seam_contract_on_the_truncated_checkpoint() {
     }
     let a = &out.logits.as_ref().unwrap()[0][0];
     let b = &resumed.logits.as_ref().unwrap()[0][0];
-    let max_diff = a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
-    println!(
-        "logits at position 39, one 40-token prefill vs resume at 32 from copied blocks: max |Δ| {max_diff:.3e}"
+    // One 40-token prefill against a resume at 32 from copied blocks: the
+    // same bits at position 39.
+    assert!(
+        a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+        "logits at position 39 differ between a prefill and a resume"
     );
     assert_eq!(out.row(0), resumed.row(0), "the same greedy token");
 
@@ -205,9 +207,11 @@ fn seam_contract_on_the_truncated_checkpoint() {
         .unwrap();
     let a = &alone.logits.as_ref().unwrap()[0][0];
     let b = &together.logits.as_ref().unwrap()[0][0];
-    let max_diff = a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
-    println!("decode row alone vs batched with a 30-token prefill: max |Δlogit| {max_diff:.3e}");
-    assert!(max_diff < 0.5, "{max_diff}");
+    // A decode row alone and beside a 30-token prefill: the same bits.
+    assert!(
+        a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+        "a decode row's logits move with its batch"
+    );
     assert_eq!(alone.row(0), together.row(0));
     assert_eq!(a.len(), VOCAB);
 
@@ -304,10 +308,13 @@ fn seam_contract_on_the_truncated_checkpoint() {
                         q_start: 0,
                         qo_len: 1,
                         pages: vec![11],
+                        kv_start: 0,
                         kv_len: 1,
                     }],
                     [16, 8][g],
                     BS,
+                    [Reduction::Split, Reduction::Anchored { origin: 0 }][g],
+                    1,
                 )
                 .unwrap()
         })

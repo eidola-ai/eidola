@@ -127,7 +127,7 @@
     },
     {
       "path": "csrc/flashinfer_fa2_sink_paged.cu",
-      "sha256": "8157a71f063d7857c7c1123337859f37c4de247675fc70f5f2cf0daa8a643645"
+      "sha256": "76d32d6b0330f474ed3b79530704d24532983b5abbecbe8b19f75c0749f7d0fb"
     },
     {
       "path": "csrc/kernels.json",
@@ -922,13 +922,28 @@
       "source": "csrc/flashinfer_fa2_sink_paged.cu",
       "profile": "flashinfer",
       "file": "cubin/flashinfer_fa2_sink_paged.sm_100a.cubin",
-      "sha256": "6fc822f336e71b8054c0fef76b26a6c877a674e39428e9ee1708ccdbf222138f",
-      "size": 246440,
+      "sha256": "790d2cda17a500dea541634c1524369c85d52e7cf30947705f2603d024fe2e37",
+      "size": 456384,
       "entries": [
         {
           "symbol": "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj16ELj8ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj",
           "demangled": "void flashinfer::PersistentVariableLengthMergeStatesKernel<(unsigned int)8, (unsigned int)16, (unsigned int)8, (unsigned int)4, __nv_bfloat16, __nv_bfloat16, int>(T5 *, float *, T7 *, T6 *, float *, unsigned int, unsigned int *, unsigned int)",
           "meta": "eidola_fa2_merge_states_bf16_d128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q16_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q64_meta"
         },
         {
           "symbol": "eidola_fa2_sink_paged_bf16_q128",
@@ -948,12 +963,15 @@
       ],
       "meta": [
         "eidola_fa2_merge_states_bf16_d128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q16_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q64_meta",
         "eidola_fa2_sink_paged_bf16_q128_meta",
         "eidola_fa2_sink_paged_bf16_q16_meta",
         "eidola_fa2_sink_paged_bf16_q64_meta"
       ],
       "mma_sass": {
-        "HMMA": 738
+        "HMMA": 1312
       }
     },
     {
@@ -962,13 +980,28 @@
       "source": "csrc/flashinfer_fa2_sink_paged.cu",
       "profile": "flashinfer",
       "file": "cubin/flashinfer_fa2_sink_paged.sm_100f.cubin",
-      "sha256": "7db507cf2e42d9c35fefa5f35a4835744a90faf1d13c5da21b1e97d16be56a80",
-      "size": 246440,
+      "sha256": "3d1cf8db47feb586bc94181ff06a1b282011dc3465ee07c3fccc4bf8e0615407",
+      "size": 456256,
       "entries": [
         {
           "symbol": "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj16ELj8ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj",
           "demangled": "void flashinfer::PersistentVariableLengthMergeStatesKernel<(unsigned int)8, (unsigned int)16, (unsigned int)8, (unsigned int)4, __nv_bfloat16, __nv_bfloat16, int>(T5 *, float *, T7 *, T6 *, float *, unsigned int, unsigned int *, unsigned int)",
           "meta": "eidola_fa2_merge_states_bf16_d128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q16_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q64_meta"
         },
         {
           "symbol": "eidola_fa2_sink_paged_bf16_q128",
@@ -988,12 +1021,15 @@
       ],
       "meta": [
         "eidola_fa2_merge_states_bf16_d128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q16_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q64_meta",
         "eidola_fa2_sink_paged_bf16_q128_meta",
         "eidola_fa2_sink_paged_bf16_q16_meta",
         "eidola_fa2_sink_paged_bf16_q64_meta"
       ],
       "mma_sass": {
-        "HMMA": 738
+        "HMMA": 1312
       }
     },
     {
@@ -1002,13 +1038,28 @@
       "source": "csrc/flashinfer_fa2_sink_paged.cu",
       "profile": "flashinfer",
       "file": "cubin/flashinfer_fa2_sink_paged.sm_103a.cubin",
-      "sha256": "8c886475bcd700379e9a21878c06e6e27f3899bfd94c493add200b73c8892325",
-      "size": 246128,
+      "sha256": "356caa6875d3ee1b1cb5551f4d577a0ce5415e4900282b70f5beae2a07eedd32",
+      "size": 457720,
       "entries": [
         {
           "symbol": "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj16ELj8ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj",
           "demangled": "void flashinfer::PersistentVariableLengthMergeStatesKernel<(unsigned int)8, (unsigned int)16, (unsigned int)8, (unsigned int)4, __nv_bfloat16, __nv_bfloat16, int>(T5 *, float *, T7 *, T6 *, float *, unsigned int, unsigned int *, unsigned int)",
           "meta": "eidola_fa2_merge_states_bf16_d128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q16_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q64_meta"
         },
         {
           "symbol": "eidola_fa2_sink_paged_bf16_q128",
@@ -1028,12 +1079,15 @@
       ],
       "meta": [
         "eidola_fa2_merge_states_bf16_d128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q16_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q64_meta",
         "eidola_fa2_sink_paged_bf16_q128_meta",
         "eidola_fa2_sink_paged_bf16_q16_meta",
         "eidola_fa2_sink_paged_bf16_q64_meta"
       ],
       "mma_sass": {
-        "HMMA": 738
+        "HMMA": 1312
       }
     },
     {
@@ -1229,8 +1283,8 @@
     {
       "name": "flashinfer_fa2_sink_paged",
       "file": "fatbin/flashinfer_fa2_sink_paged.fatbin",
-      "sha256": "fd2bb6cdb694942a0c1e56f778e097e5edb29a65bdf540d2d211095f9d0690ba",
-      "size": 492800,
+      "sha256": "55789bbd3af58bde637c9fcd0551ed30b21d5696cae919cbfe20e24aad053e02",
+      "size": 914336,
       "archs": [
         "sm_100a",
         "sm_103a"

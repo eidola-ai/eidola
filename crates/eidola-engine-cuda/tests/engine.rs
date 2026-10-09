@@ -1,7 +1,9 @@
 //! The serving core's engine over the CUDA executor on the truncated real
 //! checkpoint (see `real_flash.rs` for the environment): the CPU executor's
 //! workloads (chunked prefill, prefix hits and salt isolation, preemption and
-//! resume, cancellation, a randomized mix) adapted to GPU tolerance.
+//! resume, cancellation, a randomized mix) adapted to GPU tolerance, and a
+//! request's tokens unchanged by prefix hits, chunk sizes and concurrent
+//! requests (the executor is batch-invariant).
 //!
 //! After every step the KV manager's invariants hold and every free block is
 //! zero on the device or has a zero queued. Every finished greedy output is
@@ -130,6 +132,10 @@ struct Harness {
 
 impl Harness {
     fn new(blocks: u32, chunk: u32) -> Option<Harness> {
+        Harness::with_len(blocks, chunk, 1024)
+    }
+
+    fn with_len(blocks: u32, chunk: u32, max_model_len: u32) -> Option<Harness> {
         let env = env()?;
         let su = setup()?;
         let cfg = CudaExecutorConfig {
@@ -140,7 +146,7 @@ impl Harness {
                 drafter: 0,
             },
             num_state_slots: 8,
-            max_model_len: 1024,
+            max_model_len,
             buckets: vec![
                 Bucket {
                     max_seqs: 1,
@@ -311,8 +317,97 @@ fn chunked_prefill_and_prefix_hits() {
         "chunked prefill + prefix hits: {n} greedy tokens, {exact} the reference argmax, worst trail {worst:.3}; {} zero checks",
         h.zero_checks
     );
-    // Hit or not, the same greedy continuation (near-ties aside, checked above).
-    println!("outputs 3 / 4: {:?} / {:?}", h.outputs[&3], h.outputs[&4]);
+    // Hit or not, the same greedy continuation.
+    assert_eq!(
+        h.outputs[&3], h.outputs[&4],
+        "a prefix hit changed the output"
+    );
+}
+
+/// A request's tokens, greedy and seeded, are the same whether its prefix
+/// was recomputed or hit in the cache, whatever the prefill chunk, and
+/// whatever runs beside it: prompts past the first global chunk boundary
+/// (1,024 positions), run alone in chunks of 16, alone in chunks of 256,
+/// beside three other requests, and after an earlier request under the same
+/// key cached their prefix.
+#[test]
+fn prefix_hits_chunking_and_neighbours_change_no_token() {
+    let Some(env) = env() else { return };
+    let text: Vec<u32> = env.text.iter().copied().cycle().take(1300).collect();
+    let jobs: Vec<(u64, Vec<u32>, SamplingParams)> = vec![
+        (1, text[..1100].to_vec(), greedy()),
+        (
+            2,
+            text[37..1090].to_vec(),
+            SamplingParams::random(1.0, 9).unwrap(),
+        ),
+        (
+            3,
+            text[200..1250].to_vec(),
+            SamplingParams::new(0.8, 40, 0.95, 0.02, 11).unwrap(),
+        ),
+    ];
+    let run = |chunk: u32, neighbours: bool, warm: bool| -> Option<HashMap<u64, Vec<u32>>> {
+        let mut h = Harness::with_len(400, chunk, 2048)?;
+        if warm {
+            // The same prompts under the same key, first: their prefixes are
+            // cached when the measured requests arrive.
+            for (id, prompt, params) in &jobs {
+                h.submit(request(
+                    100 + id,
+                    prompt.clone(),
+                    *params,
+                    4,
+                    CacheScope::Keyed(salt(u8::try_from(*id).unwrap())),
+                ));
+            }
+            h.run();
+        }
+        for (id, prompt, params) in &jobs {
+            h.submit(request(
+                *id,
+                prompt.clone(),
+                *params,
+                24,
+                CacheScope::Keyed(salt(u8::try_from(*id).unwrap())),
+            ));
+            if neighbours {
+                h.submit(request(
+                    10 + id,
+                    text[300 + 50 * usize::try_from(*id).unwrap()..][..400].to_vec(),
+                    greedy(),
+                    24,
+                    CacheScope::Private,
+                ));
+            }
+        }
+        h.run();
+        if warm {
+            for (id, _, _) in &jobs {
+                assert!(h.cached[id] >= 1024, "request {id}: a prefix hit");
+            }
+        }
+        Some(
+            jobs.iter()
+                .map(|(id, _, _)| (*id, h.outputs[id].clone()))
+                .collect(),
+        )
+    };
+    let Some(base) = run(16, false, false) else {
+        return;
+    };
+    for (chunk, neighbours, warm) in [(256, false, false), (64, true, false), (16, false, true)] {
+        let got = run(chunk, neighbours, warm).unwrap();
+        for (id, _, _) in &jobs {
+            assert_eq!(
+                got[id], base[id],
+                "request {id}: chunk {chunk}, neighbours {neighbours}, cached prefix {warm}"
+            );
+        }
+        println!(
+            "chunk {chunk}, neighbours {neighbours}, cached prefix {warm}: every token the same"
+        );
+    }
 }
 
 #[test]
