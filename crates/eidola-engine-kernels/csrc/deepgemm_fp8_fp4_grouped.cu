@@ -23,6 +23,24 @@
 //   per stage A 64*128 + B 128*128 + SFA 512 + SFB 512 = 25600; 8 stages
 //   -> 9020 + 204800 = 213820 bytes.
 //
+// The two layouts:
+//
+//   masked   decode-sized batches: A is [256][M][K], `grouped_layout[g]` the
+//            number of valid rows of group g.
+//   psum     prefill-sized batches (DeepGEMM's `use_psum_layout`): every
+//            group's rows back to back in group order, group g's run starting
+//            at the previous run's end rounded up to 128 rows;
+//            `grouped_layout[g]` is the end of group g's rows (a prefix sum).
+//            The scheduler visits only each group's own 128-row blocks, and
+//            with `ensure_zero_padding` false it narrows a group's last block
+//            to its rows rounded up to 16 (the swap-AB UMMA N), so empty
+//            experts cost nothing and a sparse expert one narrow block. The
+//            plain contiguous layout (`grouped_layout[row]` per row, -1 for
+//            padding) is not used: on SM100 its scheduler runs every block of
+//            M through the tensor cores, padding blocks included (against
+//            group 0's weights), so its cost follows the layout's worst-case
+//            bound rather than the routed rows.
+//
 // The persistent scheduler bakes the SM count into the instantiation, so a
 // kernel built for 148 SMs must be launched with a 148-block grid on a part
 // with at least that many SMs.
@@ -70,8 +88,8 @@ constexpr uint32_t kCluster = 2;
 namespace deep_gemm {
 EIDOLA_DEEPGEMM_INSTANCE(kGateUpN, kGateUpK, GemmType::MGroupedMasked);
 EIDOLA_DEEPGEMM_INSTANCE(kDownN, kDownK, GemmType::MGroupedMasked);
-EIDOLA_DEEPGEMM_INSTANCE(kGateUpN, kGateUpK, GemmType::MGroupedContiguous);
-EIDOLA_DEEPGEMM_INSTANCE(kDownN, kDownK, GemmType::MGroupedContiguous);
+EIDOLA_DEEPGEMM_INSTANCE(kGateUpN, kGateUpK, GemmType::MGroupedContiguousWithPsumLayout);
+EIDOLA_DEEPGEMM_INSTANCE(kDownN, kDownK, GemmType::MGroupedContiguousWithPsumLayout);
 }  // namespace deep_gemm
 
 // The entries' names are mangled, so each launch-contract record is bound to
@@ -80,5 +98,5 @@ EIDOLA_DEEPGEMM_INSTANCE(kDownN, kDownK, GemmType::MGroupedContiguous);
 // entries and records do not correspond one to one.
 EIDOLA_KERNEL_META(eidola_deepgemm_fp8_fp4_masked_gate_up, kThreads, 1, 1, kSmemBytes, kCluster, 1, 1, 0);
 EIDOLA_KERNEL_META(eidola_deepgemm_fp8_fp4_masked_down, kThreads, 1, 1, kSmemBytes, kCluster, 1, 1, 0);
-EIDOLA_KERNEL_META(eidola_deepgemm_fp8_fp4_contiguous_gate_up, kThreads, 1, 1, kSmemBytes, kCluster, 1, 1, 0);
-EIDOLA_KERNEL_META(eidola_deepgemm_fp8_fp4_contiguous_down, kThreads, 1, 1, kSmemBytes, kCluster, 1, 1, 0);
+EIDOLA_KERNEL_META(eidola_deepgemm_fp8_fp4_psum_gate_up, kThreads, 1, 1, kSmemBytes, kCluster, 1, 1, 0);
+EIDOLA_KERNEL_META(eidola_deepgemm_fp8_fp4_psum_down, kThreads, 1, 1, kSmemBytes, kCluster, 1, 1, 0);

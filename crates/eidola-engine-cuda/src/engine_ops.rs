@@ -402,6 +402,10 @@ impl EngineOps {
         }
     }
 
+    /// Expert-major placement of `tokens × top_k` routed pairs
+    /// ([`expert_placement`] is its host form): `row_of` per pair, and the
+    /// grouped layout, 256 words, in the psum layout (`cap == 0`, every run
+    /// within `rows_bound` rows) or the masked one (`cap` rows per expert).
     pub unsafe fn moe_permute(
         &self,
         gpu: &Gpu,
@@ -416,11 +420,13 @@ impl EngineOps {
         require(
             (1..=crate::support::MAX_TOP_K).contains(&(top_k as usize))
                 && (if cap == 0 {
-                    rows_bound > 0
+                    rows_bound as usize >= psum_rows(tokens as usize, top_k as usize)
+                        && i32::try_from(rows_bound).is_ok()
                 } else {
                     cap >= tokens
                 }),
-            "permute: at most 8 experts per token; a masked expert holds every token",
+            "permute: at most 8 experts per token; a masked expert holds every token; \
+             the psum layout's rows hold every run",
         )?;
         unsafe {
             launch!(
@@ -432,8 +438,7 @@ impl EngineOps {
                 topk_ids,
                 tokens,
                 top_k,
-                cap,
-                rows_bound
+                cap
             )
         }
     }
@@ -709,6 +714,62 @@ pub fn pair_grid(tokens: u32, top_k: u32, width: u32, rows: u32) -> Result<[u32;
     Ok([pairs, width / 512, 1])
 }
 
+/// Rows per block of the grouped GEMMs: in the psum layout every expert's
+/// run starts on a multiple of it.
+pub const EXPERT_BLOCK_ROWS: usize = crate::moe_gemm::BLOCK_M as usize;
+
+/// Rows the psum expert layout can need for `tokens × top_k` routed pairs
+/// over the 256 experts: every pair, plus up to 127 padding rows for each
+/// expert some pair reaches, rounded up to a whole block.
+pub fn psum_rows(tokens: usize, top_k: usize) -> usize {
+    let n = tokens * top_k;
+    let experts = crate::support::EXPERTS;
+    (n + n.min(experts) * (EXPERT_BLOCK_ROWS - 1)).div_ceil(EXPERT_BLOCK_ROWS) * EXPERT_BLOCK_ROWS
+}
+
+/// `eidola_moe_permute` on the host: the placement it computes for
+/// `topk_ids` (the router's ids, `top_k` per token). Returns `row_of` (-1 for
+/// an id outside the 256 experts, which the kernel leaves unwritten) and the
+/// grouped layout (256 words): with `cap == 0` the psum layout (expert `e`'s
+/// run starts at the previous run's end rounded up to
+/// [`EXPERT_BLOCK_ROWS`]; its word is the end of its pairs), otherwise the
+/// masked one (expert `e`'s rows from `e × cap`; its word is its count).
+/// Pairs keep their order within an expert.
+pub fn expert_placement(topk_ids: &[i32], cap: u32) -> (Vec<i32>, Vec<i32>) {
+    let experts = crate::support::EXPERTS;
+    let expert = |id: i32| usize::try_from(id).ok().filter(|&e| e < experts);
+    let mut counts = vec![0usize; experts];
+    for &id in topk_ids {
+        if let Some(e) = expert(id) {
+            counts[e] += 1;
+        }
+    }
+    let mut next = vec![0usize; experts];
+    let mut grouped = vec![0i32; experts];
+    let mut start = 0usize;
+    for e in 0..experts {
+        next[e] = if cap == 0 { start } else { e * cap as usize };
+        let word = if cap == 0 {
+            start + counts[e]
+        } else {
+            counts[e]
+        };
+        grouped[e] = i32::try_from(word).expect("an expert layout within i32 rows");
+        start += counts[e].div_ceil(EXPERT_BLOCK_ROWS) * EXPERT_BLOCK_ROWS;
+    }
+    let row_of = topk_ids
+        .iter()
+        .map(|&id| match expert(id) {
+            Some(e) => {
+                next[e] += 1;
+                i32::try_from(next[e] - 1).expect("an expert layout within i32 rows")
+            }
+            None => -1,
+        })
+        .collect();
+    (row_of, grouped)
+}
+
 fn require(ok: bool, what: &str) -> Result<()> {
     if ok {
         Ok(())
@@ -881,10 +942,9 @@ mod tests {
                 "swiglu, {tokens} tokens"
             );
         }
-        // Contiguous layouts hold every pair plus padding.
+        // Psum layouts hold every pair plus padding.
         for tokens in [129u32, 513, 8192] {
-            let n = (tokens * 8) as usize;
-            let rows = u32::try_from((n + n.min(256) * 127).div_ceil(128) * 128).unwrap();
+            let rows = u32::try_from(psum_rows(tokens as usize, 8)).unwrap();
             assert_eq!(
                 pair_grid(tokens, 8, 4096, rows).unwrap(),
                 [tokens * 8, 8, 1]
@@ -901,6 +961,158 @@ mod tests {
         assert!(
             pair_grid(1 << 28, 8, 4096, u32::MAX).is_err(),
             "past the grid"
+        );
+    }
+
+    /// DeepGEMM's psum scheduler (`sched::Scheduler::get_next_block` for
+    /// `MGroupedContiguousWithPsumLayout`, with `get_aligned_effective_m_in_block`
+    /// as `ensure_zero_padding = false` makes it) over a grouped layout:
+    /// every block it computes, as (group, first row, rows computed). Group
+    /// `g`'s rows run from the previous end rounded up to 128 to its own end;
+    /// the scheduler subtracts those in `u32`, so an end below the previous
+    /// run's rounded end would wrap: refused here.
+    fn psum_blocks(ends: &[i32]) -> Vec<(usize, usize, usize)> {
+        let mut blocks = Vec::new();
+        let mut first = 0usize;
+        for (g, &end) in ends.iter().enumerate() {
+            let end = usize::try_from(end).unwrap();
+            assert!(
+                end >= first,
+                "group {g} ends at {end}, before its start {first}"
+            );
+            let n = (end - first).div_ceil(128);
+            for b in 0..n {
+                let row = first + b * 128;
+                let rows = if b + 1 == n {
+                    (end - row).div_ceil(16) * 16
+                } else {
+                    128
+                };
+                blocks.push((g, row, rows));
+            }
+            first = end.div_ceil(128) * 128;
+        }
+        blocks
+    }
+
+    /// Router-like ids: `top_k` distinct experts per token, drawn from the
+    /// first `spread` experts.
+    fn ids(seed: u64, tokens: usize, top_k: usize, spread: usize) -> Vec<i32> {
+        let mut state = seed;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            usize::try_from(state >> 33).unwrap()
+        };
+        let mut out = Vec::with_capacity(tokens * top_k);
+        for _ in 0..tokens {
+            let mut row: Vec<i32> = Vec::with_capacity(top_k);
+            while row.len() < top_k {
+                let e = i32::try_from(next() % spread).unwrap();
+                if !row.contains(&e) {
+                    row.push(e);
+                }
+            }
+            row.sort_unstable();
+            out.extend(row);
+        }
+        out
+    }
+
+    /// The psum placement is what DeepGEMM's psum scheduler expects: every
+    /// routed row lies in exactly one block the scheduler computes, of its own
+    /// expert; no two blocks overlap (no expert's output lands in another's
+    /// rows); nothing is computed past the layout's bound; and the blocks are
+    /// exactly each expert's ceil(count / 128), so the work follows the
+    /// routed rows. Pairs keep their order within an expert.
+    #[test]
+    fn psum_placement_matches_the_psum_scheduler() {
+        for (tokens, spread) in [
+            (1usize, 256usize),
+            (16, 256),
+            (129, 256),
+            (256, 256),
+            (513, 256),
+            (2048, 256),
+            (300, 8),
+            (129, 9),
+            (4096, 12),
+        ] {
+            let top_k = 8;
+            let ids = ids(tokens as u64 * 31 + spread as u64, tokens, top_k, spread);
+            let (row_of, ends) = expert_placement(&ids, 0);
+            let bound = psum_rows(tokens, top_k);
+            let blocks = psum_blocks(&ends);
+            let mut owner = vec![None; bound];
+            for &(g, first, rows) in &blocks {
+                for (r, o) in owner.iter_mut().enumerate().skip(first).take(rows) {
+                    assert!(o.is_none(), "{tokens}/{spread}: row {r} computed twice");
+                    *o = Some(g);
+                }
+                assert!(
+                    first + rows <= bound,
+                    "{tokens}/{spread}: block past the bound"
+                );
+            }
+            let mut counts = vec![0usize; 256];
+            let mut last = vec![None; 256];
+            for (i, (&id, &r)) in ids.iter().zip(&row_of).enumerate() {
+                let (e, r) = (usize::try_from(id).unwrap(), usize::try_from(r).unwrap());
+                assert_eq!(owner[r], Some(e), "{tokens}/{spread}: pair {i} at row {r}");
+                assert!(
+                    last[e].is_none_or(|l| l < r),
+                    "pairs out of order in expert {e}"
+                );
+                last[e] = Some(r);
+                counts[e] += 1;
+            }
+            let want: usize = counts.iter().map(|c| c.div_ceil(128)).sum();
+            assert_eq!(blocks.len(), want, "{tokens}/{spread}: blocks");
+        }
+    }
+
+    /// The psum bound holds the placements that pad the most: the pairs
+    /// spread over as many experts as they can reach, each run padded to a
+    /// whole block.
+    #[test]
+    fn psum_rows_hold_the_worst_placement() {
+        for tokens in [1usize, 2, 16, 17, 32, 33, 129, 513, 8192] {
+            let top_k = 8;
+            let n = tokens * top_k;
+            let experts = n.min(256);
+            let mut ids = Vec::with_capacity(n);
+            for i in 0..n {
+                ids.push(i32::try_from(i % experts).unwrap());
+            }
+            let (_, ends) = expert_placement(&ids, 0);
+            let last = usize::try_from(*ends.last().unwrap()).unwrap();
+            let used = last.div_ceil(128) * 128;
+            assert!(used <= psum_rows(tokens, top_k), "{tokens}: {used} rows");
+            assert!(psum_rows(tokens, top_k).is_multiple_of(128));
+        }
+        assert_eq!(
+            psum_rows(129, 8),
+            33_664,
+            "1,032 pairs + 256 × 127, in whole blocks"
+        );
+    }
+
+    /// The masked placement: expert `e`'s rows from `e × cap`, its word its
+    /// count; an id outside the experts is placed nowhere and counted for
+    /// none, in either layout.
+    #[test]
+    fn masked_placement_and_stray_ids() {
+        let ids = [3, 7, 3, -1, 256, 7, 3, 0];
+        let (row_of, counts) = expert_placement(&ids, 128);
+        assert_eq!(row_of, [384, 896, 385, -1, -1, 897, 386, 0]);
+        assert_eq!((counts[0], counts[3], counts[7]), (1, 3, 2));
+        assert_eq!(counts.iter().sum::<i32>(), 6);
+        let (row_of, ends) = expert_placement(&ids, 0);
+        assert_eq!(row_of, [128, 256, 129, -1, -1, 257, 130, 0]);
+        assert_eq!(
+            (ends[0], ends[2], ends[3], ends[7], ends[255]),
+            (1, 128, 131, 258, 384)
         );
     }
 }

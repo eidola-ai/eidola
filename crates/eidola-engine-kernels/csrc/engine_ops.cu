@@ -9,7 +9,7 @@
 //   - FP8 for DeepGEMM: per (row, 128 of K), a power-of-two scale
 //     2^ceil(log2(amax / 448)) stored as UE8M0 (exponent + 127), four K blocks
 //     packed little-endian per i32, words laid out [K/512][rows'] with rows'
-//     the row count rounded up to 4 (contiguous layout), or per expert
+//     the row count rounded up to 4 (psum layout), or per expert
 //     [E][K/512][cap] for the masked layout's `cap` rows per expert.
 
 #include <cooperative_groups.h>
@@ -596,57 +596,80 @@ extern "C" __global__ void __launch_bounds__(kRouterTiledThreads)
 EIDOLA_KERNEL_META(eidola_router_topk_tiled, kRouterTiledThreads, 1, 1, 0, kRouterCluster, 1, 1, 0);
 
 // Expert-major placement of the T*k routed (token, slot) pairs, deterministic
-// (tokens ascending within an expert). One block of 256 threads, thread e
-// owning expert e.
+// (pairs ascending within an expert, i.e. tokens ascending). One block of
+// 256 threads: thread e owns expert e's count and start, and warp w places
+// the w-th eighth of the pairs.
 //
-//   contiguous (cap == 0): expert e's rows start at a multiple of 128 in
-//     expert order; grouped_layout[row] = e for its rows, -1 for padding;
-//     the layout covers `rows_bound` rows.
+//   psum (cap == 0): expert e's rows start at the previous expert's end
+//     rounded up to 128 rows, in expert order; grouped_layout[e] = the end
+//     of expert e's rows (DeepGEMM's psum layout). An expert's rows past its
+//     pairs, to the next multiple of 128, are padding.
 //   masked (cap > 0): expert e's rows are e*cap + i; grouped_layout[e] =
 //     its row count (at most cap).
 //
 // row_of[t*k + j] = the row (token t, slot j) landed in; the gather, the
-// SwiGLU and the combine address rows through it.
-extern "C" __global__ void __launch_bounds__(256)
+// SwiGLU and the combine address rows through it. An id outside 0..256 is
+// placed nowhere (its row_of entry is left as it is); the router writes none.
+//
+// Each warp counts its eighth into its own histogram (shared atomics: the
+// counts do not depend on their order), thread e turns the histograms into
+// each warp's first row for expert e, and each warp then walks its eighth in
+// order 32 pairs at a time: a pair's row is its warp's next row for its
+// expert plus the lanes before it holding the same expert.
+constexpr uint32_t kPermuteExperts = 256;
+constexpr uint32_t kPermuteWarps = kPermuteExperts / 32;
+
+extern "C" __global__ void __launch_bounds__(kPermuteExperts)
     eidola_moe_permute(int32_t* __restrict__ grouped_layout, int32_t* __restrict__ row_of,
-                       const int32_t* __restrict__ topk_ids,
-                       uint32_t tokens, uint32_t top_k, uint32_t cap, uint32_t rows_bound) {
-  __shared__ uint32_t counts[256];
-  __shared__ uint32_t starts[256];
-  const uint32_t e = threadIdx.x;
+                       const int32_t* __restrict__ topk_ids, uint32_t tokens, uint32_t top_k,
+                       uint32_t cap) {
+  __shared__ uint32_t next[kPermuteWarps][kPermuteExperts];
+  __shared__ uint32_t scan[kPermuteExperts];
+  const uint32_t e = threadIdx.x, warp = e / 32, lane = e % 32;
   const uint32_t n = tokens * top_k;
-  uint32_t c = 0;
-  for (uint32_t i = 0; i < n; ++i) c += topk_ids[i] == static_cast<int32_t>(e);
-  counts[e] = c;
+  const uint32_t seg = (n + kPermuteWarps - 1) / kPermuteWarps;
+  const uint32_t lo = min(warp * seg, n), hi = min(lo + seg, n);
+#pragma unroll
+  for (uint32_t w = 0; w < kPermuteWarps; ++w) next[w][e] = 0;
   __syncthreads();
-  if (e == 0) {
-    uint32_t s = 0;
-    for (uint32_t x = 0; x < 256; ++x) {
-      starts[x] = cap ? x * cap : s;
-      s += cap ? 0 : (counts[x] + 127) / 128 * 128;
-    }
+  for (uint32_t i = lo + lane; i < hi; i += 32) {
+    const uint32_t id = static_cast<uint32_t>(topk_ids[i]);
+    if (id < kPermuteExperts) atomicAdd(&next[warp][id], 1u);
   }
   __syncthreads();
-  // Clear the layout (contiguous: every row -1; masked: counts below).
-  if (cap == 0) {
-    for (uint32_t r = e; r < rows_bound; r += 256) grouped_layout[r] = -1;
+  // Expert e's count, and each warp's offset inside the expert's rows.
+  uint32_t count = 0;
+#pragma unroll
+  for (uint32_t w = 0; w < kPermuteWarps; ++w) {
+    const uint32_t h = next[w][e];
+    next[w][e] = count;
+    count += h;
   }
+  // Starts: an exclusive scan of the runs (psum), or e * cap (masked).
+  scan[e] = (count + 127) / 128 * 128;
   __syncthreads();
-  uint32_t k = 0;
-  for (uint32_t i = 0; i < n; ++i) {
-    if (topk_ids[i] == static_cast<int32_t>(e)) {
-      const uint32_t row = starts[e] + k++;
-      row_of[i] = static_cast<int32_t>(row);
-      if (cap == 0) grouped_layout[row] = static_cast<int32_t>(e);
-    }
+  for (uint32_t d = 1; d < kPermuteExperts; d *= 2) {
+    const uint32_t add = e >= d ? scan[e - d] : 0;
+    __syncthreads();
+    scan[e] += add;
+    __syncthreads();
   }
-  if (cap == 0) {
-    // Padding rows of this expert's run belong to it too (blocks are
-    // assigned by their first row).
-    for (uint32_t row = starts[e] + counts[e]; row < starts[e] + (counts[e] + 127) / 128 * 128; ++row)
-      grouped_layout[row] = static_cast<int32_t>(e);
-  } else {
-    grouped_layout[e] = static_cast<int32_t>(counts[e]);
+  const uint32_t run = (count + 127) / 128 * 128;
+  const uint32_t start = cap ? e * cap : scan[e] - run;
+  grouped_layout[e] = static_cast<int32_t>(cap ? count : start + count);
+#pragma unroll
+  for (uint32_t w = 0; w < kPermuteWarps; ++w) next[w][e] += start;
+  __syncthreads();
+  for (uint32_t base = lo; base < hi; base += 32) {
+    const uint32_t i = base + lane;
+    const uint32_t id = i < hi ? static_cast<uint32_t>(topk_ids[i]) : kPermuteExperts;
+    const bool placed = id < kPermuteExperts;
+    const uint32_t same = __match_any_sync(0xffffffffu, placed ? id : kPermuteExperts);
+    const uint32_t before = __popc(same & ((1u << lane) - 1u));
+    if (placed) row_of[i] = static_cast<int32_t>(next[warp][id] + before);
+    __syncwarp();
+    if (placed && before == 0) next[warp][id] += __popc(same);
+    __syncwarp();
   }
 }
 EIDOLA_KERNEL_META(eidola_moe_permute, 256, 1, 1, 0, 1, 1, 1, 0);
