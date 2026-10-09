@@ -1,8 +1,8 @@
 // Reference kernels for the GPU tests and the kernel bench: the router, the
-// UE8M0 SwiGLU, the UE8M0 gather, the fused-QKV RoPE + KV write and the expert
-// combine in their single-block, row-per-block forms, which define the
-// numerics the executor's kernels (engine_ops.cu) reproduce bit for bit. Not
-// loaded by the executor.
+// f32-scale activation quantization, both SwiGLUs (f32 and UE8M0 scales), the
+// UE8M0 gather, the fused-QKV RoPE + KV write and the expert combine in their
+// single-block, row-per-block forms, which define the numerics the executor's
+// kernels (engine_ops.cu) reproduce bit for bit. Not loaded by the executor.
 //
 // The reference gather walks every row of the expert layout and reads the
 // token feeding it from `row_src` (-1 for padding); the reference SwiGLU
@@ -68,6 +68,58 @@ extern "C" __global__ void __launch_bounds__(kThreads)
   }
 }
 EIDOLA_KERNEL_META(eidola_reference_router_topk, kThreads, 1, 1, 0, 1, 1, 1, 0);
+
+// FP8 with f32 scales (the CUTLASS blockwise recipe) of `rows` f32 rows of K:
+// q [rows][K] e4m3, sf [K/128][m_pad] f32. Grid (rows, K/128), one warp per
+// group of 128.
+extern "C" __global__ void __launch_bounds__(32)
+    eidola_reference_quant_fp8_f32scale(uint8_t* __restrict__ q, float* __restrict__ sf,
+                                        const float* __restrict__ x, uint32_t k, uint32_t m_pad) {
+  const uint32_t r = blockIdx.x, g = blockIdx.y;
+  const float* src = x + static_cast<size_t>(r) * k + g * 128;
+  float v[4];
+  float amax = 0.f;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    v[j] = src[threadIdx.x + 32 * j];
+    amax = fmaxf(amax, fabsf(v[j]));
+  }
+  amax = warp_max(amax);
+  const float scale = amax > 0.f ? amax / kFp8Max : 1.f;
+  uint8_t* dst = q + static_cast<size_t>(r) * k + g * 128;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) dst[threadIdx.x + 32 * j] = f2e4m3(v[j] / scale);
+  if (threadIdx.x == 0) sf[static_cast<size_t>(g) * m_pad + r] = scale;
+}
+EIDOLA_KERNEL_META(eidola_reference_quant_fp8_f32scale, 32, 1, 1, 0, 1, 1, 1, 0);
+
+// SwiGLU over BF16 [rows][2I] (gate | up), silu(g) * u in f32, quantized for
+// the CUTLASS blockwise GEMM: q [rows][I], sf [I/128][m_pad]. Grid (rows,
+// I/128), one warp per group.
+extern "C" __global__ void __launch_bounds__(32)
+    eidola_reference_swiglu_quant_fp8_f32scale(uint8_t* __restrict__ q, float* __restrict__ sf,
+                                               const uint16_t* __restrict__ gu, uint32_t inter,
+                                               uint32_t m_pad) {
+  const uint32_t r = blockIdx.x, g = blockIdx.y;
+  const uint16_t* gate = gu + static_cast<size_t>(r) * 2 * inter + g * 128;
+  const uint16_t* up = gate + inter;
+  float v[4];
+  float amax = 0.f;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const uint32_t i = threadIdx.x + 32 * j;
+    const float x = bf16f(gate[i]);
+    v[j] = x / (1.f + expf(-x)) * bf16f(up[i]);
+    amax = fmaxf(amax, fabsf(v[j]));
+  }
+  amax = warp_max(amax);
+  const float scale = amax > 0.f ? amax / kFp8Max : 1.f;
+  uint8_t* dst = q + static_cast<size_t>(r) * inter + g * 128;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) dst[threadIdx.x + 32 * j] = f2e4m3(v[j] / scale);
+  if (threadIdx.x == 0) sf[static_cast<size_t>(g) * m_pad + r] = scale;
+}
+EIDOLA_KERNEL_META(eidola_reference_swiglu_quant_fp8_f32scale, 32, 1, 1, 0, 1, 1, 1, 0);
 
 // SwiGLU over BF16 [rows][2I] quantized for DeepGEMM: q [rows][I], packed
 // UE8M0 sf (see sfa_index). Grid (rows, I/512), 4 warps (one per 128 group).

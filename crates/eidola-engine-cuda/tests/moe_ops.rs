@@ -9,9 +9,9 @@ mod common;
 use common::{Lcg, setup};
 use eidola_engine_cuda::bf16;
 use eidola_engine_cuda::engine_ops::{
-    COMBINE_WIDTH, EngineOps, ROUTER_CLUSTER, ROUTER_SCORES_SMEM, ROUTER_SCORES_THREADS,
-    ROUTER_SELECT_WARPS, ROUTER_THREADS, RouterForm, executor_router, expert_placement, psum_rows,
-    router_scores_len,
+    COMBINE_WIDTH, EngineOps, PERMUTE_SCRATCH_WORDS, QUANT_WARPS, ROUTER_CLUSTER,
+    ROUTER_SCORES_SMEM, ROUTER_SCORES_THREADS, ROUTER_SELECT_WARPS, ROUTER_THREADS, RouterForm,
+    SWIGLU_WARPS, executor_router, expert_placement, psum_rows, router_scores_len,
 };
 use eidola_engine_cuda::launch::dptr;
 use eidola_engine_cuda::{Gpu, ImageArch, Kernel};
@@ -28,6 +28,11 @@ const INTER: usize = 2048;
 /// past a block of rows), 513 (which leaves the split router a one-token last
 /// tile), and a full prefill step.
 const TOKENS: [usize; 11] = [1, 2, 7, 15, 16, 64, 128, 129, 513, 2048, 8192];
+/// The placement's further counts: 65 tokens (520 pairs, the first count
+/// split over two blocks), 8,193 (one token past the most blocks at whole
+/// chunks, so every block's run grows past `PERMUTE_CHUNK`), 16,384 and
+/// 32,768.
+const PERMUTE_TOKENS: [usize; 4] = [65, 8193, 16_384, 32_768];
 /// Both router forms, whatever the token count.
 const FORMS: [RouterForm; 2] = [RouterForm::PerToken, RouterForm::Split];
 
@@ -206,11 +211,22 @@ fn router_launch_contract() {
         let meta = *m.kernel("eidola_moe_combine").unwrap().meta();
         assert_eq!(meta.block, [COMBINE_WIDTH / 8, 1, 1], "{arch:?}");
         assert_eq!(meta.cluster, [1, 1, 1], "{arch:?}");
-        for k in ["eidola_gather_quant_ue8m0", "eidola_swiglu_quant_fp8_ue8m0"] {
+        let meta = *m.kernel("eidola_gather_quant_ue8m0").unwrap().meta();
+        assert_eq!(meta.block, [128, 1, 1], "{arch:?}");
+        assert_eq!(meta.cluster, [1, 1, 1], "{arch:?}");
+        for k in [
+            "eidola_swiglu_quant_fp8_ue8m0",
+            "eidola_swiglu_quant_fp8_f32scale",
+        ] {
             let meta = *m.kernel(k).unwrap().meta();
-            assert_eq!(meta.block, [128, 1, 1], "{k} {arch:?}");
+            assert_eq!(meta.block, [SWIGLU_WARPS * 32, 1, 1], "{k} {arch:?}");
             assert_eq!(meta.cluster, [1, 1, 1], "{k} {arch:?}");
         }
+        let meta = *m.kernel("eidola_quant_fp8_f32scale").unwrap().meta();
+        assert_eq!(meta.block, [QUANT_WARPS * 32, 1, 1], "{arch:?}");
+        let meta = *m.kernel("eidola_moe_permute").unwrap().meta();
+        assert_eq!(meta.block, [u32_of(EXPERTS), 1, 1], "{arch:?}");
+        assert_eq!(meta.cluster, [1, 1, 1], "{arch:?}");
     }
 }
 
@@ -548,35 +564,50 @@ fn permute(
     let dids = s.clone_htod(ids).unwrap();
     let grouped = s.clone_htod(&vec![-7i32; EXPERTS]).unwrap();
     let row_of = s.clone_htod(&vec![-7i32; ids.len()]).unwrap();
-    unsafe {
-        ops.moe_permute(
-            gpu,
-            dptr(&grouped, s),
-            dptr(&row_of, s),
-            dptr(&dids, s),
-            u32_of(tokens),
-            u32_of(TOP_K),
-            u32_of(layout.rows),
-        )
-        .unwrap();
+    let scratch = s.alloc_zeros::<u32>(PERMUTE_SCRATCH_WORDS).unwrap();
+    // Twice over the same scratch: the first launch must leave the grid
+    // barrier's counters as it found them.
+    for _ in 0..2 {
+        unsafe {
+            ops.moe_permute(
+                gpu,
+                dptr(&grouped, s),
+                dptr(&row_of, s),
+                dptr(&dids, s),
+                dptr(&scratch, s),
+                u32_of(tokens),
+                u32_of(TOP_K),
+                u32_of(layout.rows),
+            )
+            .unwrap();
+        }
     }
+    let counters = s.clone_dtoh(&scratch).unwrap()[PERMUTE_SCRATCH_WORDS - 2..].to_vec();
+    assert_eq!(
+        counters,
+        [0, 0],
+        "{tokens} tokens: barrier counters left set"
+    );
     (
         s.clone_dtoh(&row_of).unwrap(),
         s.clone_dtoh(&grouped).unwrap(),
     )
 }
 
-/// The placement equals its host form word for word at every count, over
-/// spread and concentrated routing (runs of many blocks), and an id outside
-/// the experts is placed nowhere: its `row_of` word is left as it was and it
-/// counts for no expert.
+/// The placement equals its host form word for word at every count (and
+/// past the step sizes, up to 32,768 tokens: from one block to the most
+/// blocks, and then longer runs per block), over spread, concentrated (runs
+/// of many 128-row blocks, every block's pairs on the same 12 experts) and
+/// single-expert routing, and an id outside the experts is placed nowhere:
+/// its `row_of` word is left as it was and it counts for no expert.
 #[test]
 fn permute_matches_host_placement() {
     let Some(su) = setup() else { return };
     let gpu = &su.gpu;
+    let counts: Vec<usize> = TOKENS.iter().copied().chain(PERMUTE_TOKENS).collect();
     for &arch in &su.archs {
         let ops = EngineOps::from_module(su.module("engine_ops", arch)).unwrap();
-        for &tokens in &TOKENS {
+        for &tokens in &counts {
             let mut rng = Lcg(0x5e7 ^ tokens as u64);
             let spread = topk_ids(&mut rng, tokens);
             // Every token on 8 of the first 12 experts.
@@ -587,11 +618,23 @@ fn permute_matches_host_placement() {
             for i in (0..stray.len()).step_by(37) {
                 stray[i] = if i % 2 == 0 { -1 } else { 256 };
             }
+            // Every pair on expert 255, but slot j of token t on expert j
+            // when t % 5 == 4: one run past every other.
+            let single: Vec<i32> = (0..tokens * TOP_K)
+                .map(|i| {
+                    if (i / TOP_K) % 5 == 4 {
+                        i32::try_from(i % TOP_K).unwrap()
+                    } else {
+                        255
+                    }
+                })
+                .collect();
             let layout = Layout::for_tokens(tokens);
             for (what, ids) in [
                 ("spread", &spread),
                 ("concentrated", &concentrated),
                 ("stray", &stray),
+                ("single", &single),
             ] {
                 let (row_of, grouped) = permute(gpu, &ops, ids, tokens, &layout);
                 let (want_row_of, want_grouped) = expert_placement(ids);

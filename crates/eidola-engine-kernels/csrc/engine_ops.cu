@@ -48,28 +48,36 @@ extern "C" __global__ void __launch_bounds__(kThreads)
 EIDOLA_KERNEL_META(eidola_rmsnorm_f32, kThreads, 1, 1, 0, 1, 1, 1, 0);
 
 // FP8 with f32 scales (the CUTLASS blockwise recipe) of `rows` f32 rows of K:
-// q [rows][K] e4m3, sf [K/128][m_pad] f32. Grid (rows, K/128), one warp per
-// group of 128.
-extern "C" __global__ void __launch_bounds__(32)
+// q [rows][K] e4m3, sf [K/128][m_pad] f32.
+//
+// Grid (rows, ceil(K/512)), 4 warps: each warp one 128-wide group, each lane
+// 4 consecutive elements (a 16-byte load, a 4-byte store). Every element's
+// code is the reference form's (engine_ops_reference.cu) expression, and the
+// group's amax is a maximum, which no reduction order changes. x must be
+// 16-byte and q 4-byte aligned (the host checks both).
+constexpr uint32_t kQuantWarps = 4;
+
+extern "C" __global__ void __launch_bounds__(kQuantWarps * 32)
     eidola_quant_fp8_f32scale(uint8_t* __restrict__ q, float* __restrict__ sf,
                               const float* __restrict__ x, uint32_t k, uint32_t m_pad) {
-  const uint32_t r = blockIdx.x, g = blockIdx.y;
-  const float* src = x + static_cast<size_t>(r) * k + g * 128;
-  float v[4];
+  const uint32_t r = blockIdx.x, lane = threadIdx.x % 32;
+  const uint32_t g = blockIdx.y * kQuantWarps + threadIdx.x / 32;
+  if (g * 128 >= k) return;
+  const size_t at = static_cast<size_t>(r) * k + g * 128 + lane * 4;
+  const float4 x4 = __ldg(reinterpret_cast<const float4*>(x + at));
+  const float v[4] = {x4.x, x4.y, x4.z, x4.w};
   float amax = 0.f;
 #pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    v[j] = src[threadIdx.x + 32 * j];
-    amax = fmaxf(amax, fabsf(v[j]));
-  }
+  for (int j = 0; j < 4; ++j) amax = fmaxf(amax, fabsf(v[j]));
   amax = warp_max(amax);
   const float scale = amax > 0.f ? amax / kFp8Max : 1.f;
-  uint8_t* dst = q + static_cast<size_t>(r) * k + g * 128;
+  uint32_t codes = 0;
 #pragma unroll
-  for (int j = 0; j < 4; ++j) dst[threadIdx.x + 32 * j] = f2e4m3(v[j] / scale);
-  if (threadIdx.x == 0) sf[static_cast<size_t>(g) * m_pad + r] = scale;
+  for (int j = 0; j < 4; ++j) codes |= static_cast<uint32_t>(f2e4m3(v[j] / scale)) << (8 * j);
+  *reinterpret_cast<uint32_t*>(q + at) = codes;
+  if (lane == 0) sf[static_cast<size_t>(g) * m_pad + r] = scale;
 }
-EIDOLA_KERNEL_META(eidola_quant_fp8_f32scale, 32, 1, 1, 0, 1, 1, 1, 0);
+EIDOLA_KERNEL_META(eidola_quant_fp8_f32scale, kQuantWarps * 32, 1, 1, 0, 1, 1, 1, 0);
 
 // h[i] += d[i] (f32 or BF16 delta), n elements.
 extern "C" __global__ void __launch_bounds__(kThreads)
@@ -191,47 +199,28 @@ extern "C" __global__ void __launch_bounds__(kThreads)
 }
 EIDOLA_KERNEL_META(eidola_qkv_rope_kv, kThreads, 1, 1, 0, 1, 1, 1, sizeof(EidolaQkvArgs));
 
-// SwiGLU over BF16 [rows][2I] (gate | up), silu(g) * u in f32, quantized for
-// the CUTLASS blockwise GEMM: q [rows][I], sf [I/128][m_pad]. Grid (rows,
-// I/128), one warp per group.
-extern "C" __global__ void __launch_bounds__(32)
-    eidola_swiglu_quant_fp8_f32scale(uint8_t* __restrict__ q, float* __restrict__ sf,
-                                     const uint16_t* __restrict__ gu, uint32_t inter,
-                                     uint32_t m_pad) {
-  const uint32_t r = blockIdx.x, g = blockIdx.y;
-  const uint16_t* gate = gu + static_cast<size_t>(r) * 2 * inter + g * 128;
-  const uint16_t* up = gate + inter;
-  float v[4];
-  float amax = 0.f;
-#pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    const uint32_t i = threadIdx.x + 32 * j;
-    const float x = bf16f(gate[i]);
-    v[j] = x / (1.f + expf(-x)) * bf16f(up[i]);
-    amax = fmaxf(amax, fabsf(v[j]));
-  }
-  amax = warp_max(amax);
-  const float scale = amax > 0.f ? amax / kFp8Max : 1.f;
-  uint8_t* dst = q + static_cast<size_t>(r) * inter + g * 128;
-#pragma unroll
-  for (int j = 0; j < 4; ++j) dst[threadIdx.x + 32 * j] = f2e4m3(v[j] / scale);
-  if (threadIdx.x == 0) sf[static_cast<size_t>(g) * m_pad + r] = scale;
-}
-EIDOLA_KERNEL_META(eidola_swiglu_quant_fp8_f32scale, 32, 1, 1, 0, 1, 1, 1, 0);
-
-// SwiGLU over BF16 [rows][2I] quantized for DeepGEMM: q [rows][I], packed
-// UE8M0 sf (see sfa_index), for exactly the rows a routed (token, slot) pair
-// landed in: block x is pair i, its row row_of[i]. Rows no pair names (the
-// expert layout's padding) are not touched; the grouped GEMMs compute every
-// row independently, so what they hold reaches only padding outputs, which
-// the combine never reads.
+// The two SwiGLU kernels: silu(g) * u in f32 over BF16 [rows][2I] (gate |
+// up), each element x / (1 + expf(-x)) * u as in the reference forms
+// (engine_ops_reference.cu), quantized per 128-wide group.
 //
-// Grid (pairs, I/1024), 4 warps: block y covers two 512-wide scale words
-// (eight 128-wide groups), each half-warp one group, each lane 8 consecutive
-// elements (16-byte gate and up loads, an 8-byte store). gu and q must be
-// 16- and 8-byte aligned (the host checks both).
+// Both walk items of kSwigluPiece consecutive elements of one row (item i
+// is piece i % P of row i / P, P pieces a row), one item per warp at a time:
+// each half-warp one 128-wide group, each lane kSwigluVec consecutive
+// elements (16-byte gate and up loads, an 8-byte store). A warp takes items
+// warp, warp + W, warp + 2W, ... (W the grid's warps), and loads the next
+// item's gate and up before computing the current one, so its loads are in
+// flight while it computes; the grid is at most kSwigluMaxWarps warps, which
+// a 148-SM part holds at once (8 blocks of 4 warps per SM, which
+// __launch_bounds__ keeps in registers), so every warp starts at once. The
+// arithmetic is per element and per group (a group's amax is a maximum,
+// which no reduction order changes), so which warp runs an item changes no
+// bit. Each lane computes its 8 denominators before its 8 divisions, which
+// lets their exponentials overlap.
 constexpr uint32_t kSwigluVec = 8;
-constexpr uint32_t kSwigluWidth = 128 * kSwigluVec;
+constexpr uint32_t kSwigluPiece = 32 * kSwigluVec;
+constexpr uint32_t kSwigluWarps = 4;
+constexpr uint32_t kSwigluBlocksPerSm = 8;
+constexpr uint32_t kSwigluMaxWarps = 148 * kSwigluBlocksPerSm * kSwigluWarps;
 
 __device__ __forceinline__ float half_warp_max(float v) {
 #pragma unroll
@@ -239,46 +228,151 @@ __device__ __forceinline__ float half_warp_max(float v) {
   return v;
 }
 
-extern "C" __global__ void __launch_bounds__(128)
-    eidola_swiglu_quant_fp8_ue8m0(uint8_t* __restrict__ q, int32_t* __restrict__ sf,
-                                  const uint16_t* __restrict__ gu,
-                                  const int32_t* __restrict__ row_of, uint32_t inter,
-                                  uint32_t rows4) {
-  __shared__ uint8_t exps[8];
-  const uint32_t r = static_cast<uint32_t>(row_of[blockIdx.x]);
-  const uint32_t gb = threadIdx.x / 16, i0 = (threadIdx.x % 16) * kSwigluVec;
-  const uint32_t g = blockIdx.y * 8 + gb;
-  const uint16_t* gate = gu + static_cast<size_t>(r) * 2 * inter + g * 128 + i0;
-  const uint4 gw = *reinterpret_cast<const uint4*>(gate);
-  const uint4 uw = *reinterpret_cast<const uint4*>(gate + inter);
+// v = SwiGLU of a lane's 8 gate and up values; returns their amax.
+__device__ __forceinline__ float swiglu8(const uint4 gw, const uint4 uw, float (&v)[kSwigluVec]) {
   const uint32_t gws[4] = {gw.x, gw.y, gw.z, gw.w}, uws[4] = {uw.x, uw.y, uw.z, uw.w};
-  float v[kSwigluVec];
+  float x[kSwigluVec], den[kSwigluVec];
+#pragma unroll
+  for (uint32_t e = 0; e < kSwigluVec; ++e) {
+    x[e] = bf16f(static_cast<uint16_t>(gws[e / 2] >> (16 * (e % 2))));
+    den[e] = 1.f + expf(-x[e]);
+  }
   float amax = 0.f;
 #pragma unroll
   for (uint32_t e = 0; e < kSwigluVec; ++e) {
-    const float x = bf16f(static_cast<uint16_t>(gws[e / 2] >> (16 * (e % 2))));
-    v[e] = x / (1.f + expf(-x)) * bf16f(static_cast<uint16_t>(uws[e / 2] >> (16 * (e % 2))));
+    v[e] = x[e] / den[e] * bf16f(static_cast<uint16_t>(uws[e / 2] >> (16 * (e % 2))));
     amax = fmaxf(amax, fabsf(v[e]));
   }
-  amax = half_warp_max(amax);
-  const uint8_t e8 = ue8m0_for(amax);
-  const float inv = 1.f / ue8m0_value(e8);
-  uint32_t lo = 0, hi = 0;
-#pragma unroll
-  for (uint32_t e = 0; e < 4; ++e) {
-    lo |= static_cast<uint32_t>(f2e4m3(v[e] * inv)) << (8 * e);
-    hi |= static_cast<uint32_t>(f2e4m3(v[e + 4] * inv)) << (8 * e);
+  return amax;
+}
+
+// A lane's 8 gate and up values of row r, piece `piece`.
+__device__ __forceinline__ void swiglu_load(const uint16_t* __restrict__ gu, uint32_t inter, uint32_t r,
+                                            uint32_t piece, uint32_t lane, uint4& gw, uint4& uw) {
+  const uint16_t* gate = gu + static_cast<size_t>(r) * 2 * inter + piece * kSwigluPiece + lane * kSwigluVec;
+  gw = __ldg(reinterpret_cast<const uint4*>(gate));
+  uw = __ldg(reinterpret_cast<const uint4*>(gate + inter));
+}
+
+// A warp's walk over items (row, piece), item i = row * pieces + piece, from
+// its first item in steps of the grid's warps, kept as (row, piece) so no
+// step divides.
+struct SwigluWalk {
+  uint32_t pieces, step_rows, step_pieces;
+  __device__ __forceinline__ SwigluWalk(uint32_t pieces_, uint32_t stride)
+      : pieces(pieces_), step_rows(stride / pieces_), step_pieces(stride % pieces_) {}
+  __device__ __forceinline__ void advance(uint32_t& row, uint32_t& piece) const {
+    row += step_rows;
+    piece += step_pieces;
+    if (piece >= pieces) {
+      piece -= pieces;
+      ++row;
+    }
   }
-  *reinterpret_cast<uint2*>(q + static_cast<size_t>(r) * inter + g * 128 + i0) = make_uint2(lo, hi);
-  if (threadIdx.x % 16 == 0) exps[gb] = e8;
-  __syncthreads();
-  if (threadIdx.x < 2) {
-    const uint8_t* e4 = exps + 4 * threadIdx.x;
-    const uint32_t word = e4[0] | (e4[1] << 8) | (e4[2] << 16) | (static_cast<uint32_t>(e4[3]) << 24);
-    sf[sfa_index(r, blockIdx.y * 2 + threadIdx.x, rows4)] = static_cast<int32_t>(word);
+};
+
+// Quantized for the CUTLASS blockwise GEMM: q [rows][I], sf [I/128][m_pad]
+// f32 (amax / 448, 1 for an all-zero group; each code x / scale), every row
+// of `rows`. gu must be 16-byte and q 8-byte aligned (the host checks both).
+extern "C" __global__ void __launch_bounds__(kSwigluWarps * 32, kSwigluBlocksPerSm)
+    eidola_swiglu_quant_fp8_f32scale(uint8_t* __restrict__ q, float* __restrict__ sf,
+                                     const uint16_t* __restrict__ gu, uint32_t inter,
+                                     uint32_t m_pad, uint32_t rows) {
+  const uint32_t lane = threadIdx.x % 32, pieces = inter / kSwigluPiece;
+  const SwigluWalk walk(pieces, gridDim.x * kSwigluWarps);
+  const uint32_t first = blockIdx.x * kSwigluWarps + threadIdx.x / 32;
+  uint32_t r = first / pieces, piece = first % pieces;
+  if (r >= rows) return;
+  uint4 gw, uw;
+  swiglu_load(gu, inter, r, piece, lane, gw, uw);
+  for (;;) {
+    uint32_t next_r = r, next_piece = piece;
+    walk.advance(next_r, next_piece);
+    uint4 ngw = gw, nuw = uw;
+    if (next_r < rows) swiglu_load(gu, inter, next_r, next_piece, lane, ngw, nuw);
+    const uint32_t col = piece * kSwigluPiece + lane * kSwigluVec;
+    float v[kSwigluVec];
+    const float amax = half_warp_max(swiglu8(gw, uw, v));
+    const float scale = amax > 0.f ? amax / kFp8Max : 1.f;
+    uint32_t lo = 0, hi = 0;
+#pragma unroll
+    for (uint32_t e = 0; e < 4; ++e) {
+      lo |= static_cast<uint32_t>(f2e4m3(v[e] / scale)) << (8 * e);
+      hi |= static_cast<uint32_t>(f2e4m3(v[e + 4] / scale)) << (8 * e);
+    }
+    *reinterpret_cast<uint2*>(q + static_cast<size_t>(r) * inter + col) = make_uint2(lo, hi);
+    if (lane % 16 == 0) sf[static_cast<size_t>(col / 128) * m_pad + r] = scale;
+    if (next_r >= rows) break;
+    r = next_r;
+    piece = next_piece;
+    gw = ngw;
+    uw = nuw;
   }
 }
-EIDOLA_KERNEL_META(eidola_swiglu_quant_fp8_ue8m0, 128, 1, 1, 0, 1, 1, 1, 0);
+EIDOLA_KERNEL_META(eidola_swiglu_quant_fp8_f32scale, kSwigluWarps * 32, 1, 1, 0, 1, 1, 1, 0);
+
+// Quantized for DeepGEMM: q [rows][I], packed UE8M0 sf (see sfa_index), for
+// exactly the rows a routed (token, slot) pair landed in: the items are
+// (pair, piece) for every one of `pairs` pairs, the row row_of[pair]. Rows
+// no pair names (the expert layout's padding) are not touched; the grouped
+// GEMMs compute every row independently, so what they hold reaches only
+// padding outputs, which the combine never reads.
+//
+// A warp loads the row of the item after next while it loads the next item's
+// data, so no load waits on a row index. Each half-warp's first lane stores
+// its group's exponent as the scale word's byte for that group (byte j of a
+// word is group 4w + j, little-endian, as the reference packs it), so the
+// warps never synchronize. gu must be 16-byte and q 8-byte aligned (the host
+// checks both).
+extern "C" __global__ void __launch_bounds__(kSwigluWarps * 32, kSwigluBlocksPerSm)
+    eidola_swiglu_quant_fp8_ue8m0(uint8_t* __restrict__ q, int32_t* __restrict__ sf,
+                                  const uint16_t* __restrict__ gu,
+                                  const int32_t* __restrict__ row_of, uint32_t inter,
+                                  uint32_t rows4, uint32_t pairs) {
+  const uint32_t lane = threadIdx.x % 32, pieces = inter / kSwigluPiece;
+  const SwigluWalk walk(pieces, gridDim.x * kSwigluWarps);
+  const uint32_t first = blockIdx.x * kSwigluWarps + threadIdx.x / 32;
+  uint32_t pair = first / pieces, piece = first % pieces;
+  if (pair >= pairs) return;
+  uint32_t r = static_cast<uint32_t>(__ldg(row_of + pair));
+  uint4 gw, uw;
+  swiglu_load(gu, inter, r, piece, lane, gw, uw);
+  uint32_t next_pair = pair, next_piece = piece;
+  walk.advance(next_pair, next_piece);
+  uint32_t next_r = next_pair < pairs ? static_cast<uint32_t>(__ldg(row_of + next_pair)) : 0;
+  for (;;) {
+    uint4 ngw = gw, nuw = uw;
+    if (next_pair < pairs) swiglu_load(gu, inter, next_r, next_piece, lane, ngw, nuw);
+    uint32_t after_pair = next_pair, after_piece = next_piece;
+    walk.advance(after_pair, after_piece);
+    const uint32_t after_r = after_pair < pairs ? static_cast<uint32_t>(__ldg(row_of + after_pair)) : 0;
+    const uint32_t col = piece * kSwigluPiece + lane * kSwigluVec;
+    float v[kSwigluVec];
+    const float amax = half_warp_max(swiglu8(gw, uw, v));
+    const uint8_t e8 = ue8m0_for(amax);
+    const float inv = 1.f / ue8m0_value(e8);
+    uint32_t lo = 0, hi = 0;
+#pragma unroll
+    for (uint32_t e = 0; e < 4; ++e) {
+      lo |= static_cast<uint32_t>(f2e4m3(v[e] * inv)) << (8 * e);
+      hi |= static_cast<uint32_t>(f2e4m3(v[e + 4] * inv)) << (8 * e);
+    }
+    *reinterpret_cast<uint2*>(q + static_cast<size_t>(r) * inter + col) = make_uint2(lo, hi);
+    if (lane % 16 == 0) {
+      const uint32_t g = col / 128;
+      reinterpret_cast<uint8_t*>(sf + sfa_index(r, g / 4, rows4))[g % 4] = e8;
+    }
+    if (next_pair >= pairs) break;
+    r = next_r;
+    piece = next_piece;
+    next_pair = after_pair;
+    next_piece = after_piece;
+    next_r = after_r;
+    gw = ngw;
+    uw = nuw;
+  }
+}
+EIDOLA_KERNEL_META(eidola_swiglu_quant_fp8_ue8m0, kSwigluWarps * 32, 1, 1, 0, 1, 1, 1, 0);
 
 // Router: logits = x · Wᵀ (x f32 [T][H], W BF16 [E][H], f32 accumulation),
 // scores = sigmoid(logits), top-k of scores + bias (ties to the lower expert),
@@ -690,9 +784,7 @@ extern "C" __global__ void __launch_bounds__(kRouterSelectWarps * 32)
 EIDOLA_KERNEL_META(eidola_router_select, kRouterSelectWarps * 32, 1, 1, 0, 1, 1, 1, 0);
 
 // Expert-major placement of the T*k routed (token, slot) pairs, deterministic
-// (pairs ascending within an expert, i.e. tokens ascending). One block of
-// 256 threads: thread e owns expert e's count and start, and warp w places
-// the w-th eighth of the pairs.
+// (pairs ascending within an expert, i.e. tokens ascending).
 //
 // Expert e's rows start at the previous expert's end rounded up to 128 rows,
 // in expert order; grouped_layout[e] = the end of expert e's rows
@@ -703,23 +795,51 @@ EIDOLA_KERNEL_META(eidola_router_select, kRouterSelectWarps * 32, 1, 1, 0, 1, 1,
 // SwiGLU and the combine address rows through it. An id outside 0..256 is
 // placed nowhere (its row_of entry is left as it is); the router writes none.
 //
-// Each warp counts its eighth into its own histogram (shared atomics: the
-// counts do not depend on their order), thread e turns the histograms into
-// each warp's first row for expert e, and each warp then walks its eighth in
-// order 32 pairs at a time: a pair's row is its warp's next row for its
-// expert plus the lanes before it holding the same expert.
+// Grid B blocks of 256 threads (B = ceil(pairs / kPermuteChunk), at least
+// one and at most kPermuteMaxBlocks): block b takes the b-th of B equal contiguous runs of
+// the pairs, and its warp w the w-th eighth of that run. Each warp counts its
+// eighth into its own shared histogram (shared atomics: the counts do not
+// depend on their order), and thread e turns the histograms into each warp's
+// offset for expert e inside the block and the block's count of expert e.
+// With more than one block, every block publishes its counts to
+// scratch[e][b], waits until every block has (a grid barrier: the grid is
+// small enough to be resident at once), and thread e reads expert e's counts
+// of every block: their sum is the expert's count and the sum over the
+// blocks before b the block's first row inside the expert's run. Every block
+// then computes the same starts (an exclusive scan of the rounded runs);
+// block 0 writes the grouped layout. Each warp walks its eighth in order 32
+// pairs at a time: a pair's row is its warp's next row for its expert plus
+// the lanes before it holding the same expert. Blocks, warps and lanes are
+// in pair order, so pairs keep their order within an expert.
+//
+// scratch (16-byte aligned) holds the counts, expert-major (256 ×
+// kPermuteMaxBlocks words), then the barrier's arrival and departure
+// counters, which must be zero before the first launch; the last block to
+// leave the barrier zeroes both, so every launch leaves them as it found
+// them. One block needs no scratch (it may be null).
 constexpr uint32_t kPermuteExperts = 256;
 constexpr uint32_t kPermuteWarps = kPermuteExperts / 32;
+constexpr uint32_t kPermuteChunk = 512;
+constexpr uint32_t kPermuteMaxBlocks = 128;
+
+__device__ __forceinline__ uint32_t ld_acquire_gpu(const uint32_t* p) {
+  uint32_t v;
+  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
 
 extern "C" __global__ void __launch_bounds__(kPermuteExperts)
     eidola_moe_permute(int32_t* __restrict__ grouped_layout, int32_t* __restrict__ row_of,
-                       const int32_t* __restrict__ topk_ids, uint32_t tokens, uint32_t top_k) {
+                       const int32_t* __restrict__ topk_ids, uint32_t* scratch,
+                       uint32_t tokens, uint32_t top_k) {
   __shared__ uint32_t next[kPermuteWarps][kPermuteExperts];
   __shared__ uint32_t scan[kPermuteExperts];
   const uint32_t e = threadIdx.x, warp = e / 32, lane = e % 32;
-  const uint32_t n = tokens * top_k;
-  const uint32_t seg = (n + kPermuteWarps - 1) / kPermuteWarps;
-  const uint32_t lo = min(warp * seg, n), hi = min(lo + seg, n);
+  const uint32_t n = tokens * top_k, blocks = gridDim.x, b = blockIdx.x;
+  const uint32_t run = (n + blocks - 1) / blocks;
+  const uint32_t blo = min(b * run, n), bhi = min(blo + run, n);
+  const uint32_t seg = (bhi - blo + kPermuteWarps - 1) / kPermuteWarps;
+  const uint32_t lo = min(blo + warp * seg, bhi), hi = min(lo + seg, bhi);
 #pragma unroll
   for (uint32_t w = 0; w < kPermuteWarps; ++w) next[w][e] = 0;
   __syncthreads();
@@ -728,7 +848,7 @@ extern "C" __global__ void __launch_bounds__(kPermuteExperts)
     if (id < kPermuteExperts) atomicAdd(&next[warp][id], 1u);
   }
   __syncthreads();
-  // Expert e's count, and each warp's offset inside the expert's rows.
+  // This block's count of expert e, and each warp's offset inside it.
   uint32_t count = 0;
 #pragma unroll
   for (uint32_t w = 0; w < kPermuteWarps; ++w) {
@@ -736,8 +856,43 @@ extern "C" __global__ void __launch_bounds__(kPermuteExperts)
     next[w][e] = count;
     count += h;
   }
+  // Expert e's count over every block, and the pairs of it before this block.
+  uint32_t total = count, before = 0;
+  if (blocks > 1) {
+    uint32_t* counters = scratch + kPermuteExperts * kPermuteMaxBlocks;
+    scratch[e * kPermuteMaxBlocks + b] = count;
+    __syncthreads();
+    if (e == 0) {
+      __threadfence();
+      atomicAdd(counters, 1u);
+      while (ld_acquire_gpu(counters) < blocks) __nanosleep(64);
+      __threadfence();
+    }
+    __syncthreads();
+    // Expert e's counts are contiguous: every 16-byte load is issued at once.
+    total = 0;
+    const uint4* counts = reinterpret_cast<const uint4*>(scratch + e * kPermuteMaxBlocks);
+#pragma unroll
+    for (uint32_t c4 = 0; c4 < kPermuteMaxBlocks / 4; ++c4) {
+      if (c4 * 4 < blocks) {
+        const uint4 h4 = __ldcg(counts + c4);
+        const uint32_t h[4] = {h4.x, h4.y, h4.z, h4.w};
+#pragma unroll
+        for (uint32_t j = 0; j < 4; ++j) {
+          const uint32_t c = c4 * 4 + j;
+          total += c < blocks ? h[j] : 0;
+          before += c < b ? h[j] : 0;
+        }
+      }
+    }
+    if (e == 0 && atomicAdd(counters + 1, 1u) == blocks - 1) {
+      atomicExch(counters, 0u);
+      atomicExch(counters + 1, 0u);
+    }
+  }
   // Starts: an exclusive scan of the runs.
-  scan[e] = (count + 127) / 128 * 128;
+  const uint32_t rounded = (total + 127) / 128 * 128;
+  scan[e] = rounded;
   __syncthreads();
   for (uint32_t d = 1; d < kPermuteExperts; d *= 2) {
     const uint32_t add = e >= d ? scan[e - d] : 0;
@@ -745,25 +900,24 @@ extern "C" __global__ void __launch_bounds__(kPermuteExperts)
     scan[e] += add;
     __syncthreads();
   }
-  const uint32_t run = (count + 127) / 128 * 128;
-  const uint32_t start = scan[e] - run;
-  grouped_layout[e] = static_cast<int32_t>(start + count);
+  const uint32_t start = scan[e] - rounded;
+  if (b == 0) grouped_layout[e] = static_cast<int32_t>(start + total);
 #pragma unroll
-  for (uint32_t w = 0; w < kPermuteWarps; ++w) next[w][e] += start;
+  for (uint32_t w = 0; w < kPermuteWarps; ++w) next[w][e] += start + before;
   __syncthreads();
   for (uint32_t base = lo; base < hi; base += 32) {
     const uint32_t i = base + lane;
     const uint32_t id = i < hi ? static_cast<uint32_t>(topk_ids[i]) : kPermuteExperts;
     const bool placed = id < kPermuteExperts;
     const uint32_t same = __match_any_sync(0xffffffffu, placed ? id : kPermuteExperts);
-    const uint32_t before = __popc(same & ((1u << lane) - 1u));
-    if (placed) row_of[i] = static_cast<int32_t>(next[warp][id] + before);
+    const uint32_t ahead = __popc(same & ((1u << lane) - 1u));
+    if (placed) row_of[i] = static_cast<int32_t>(next[warp][id] + ahead);
     __syncwarp();
-    if (placed && before == 0) next[warp][id] += __popc(same);
+    if (placed && ahead == 0) next[warp][id] += __popc(same);
     __syncwarp();
   }
 }
-EIDOLA_KERNEL_META(eidola_moe_permute, 256, 1, 1, 0, 1, 1, 1, 0);
+EIDOLA_KERNEL_META(eidola_moe_permute, kPermuteExperts, 1, 1, 0, 1, 1, 1, 0);
 
 // Gather f32 token rows into DeepGEMM's FP8 A with packed UE8M0 scales:
 // a [rows][K], sf (see sfa_index). Every routed (token, slot) pair i gets
