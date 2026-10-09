@@ -277,10 +277,14 @@ impl EngineOps {
         rows4: u32,
     ) -> Result<()> {
         require(
-            inter > 0 && inter.is_multiple_of(512) && sfa_layout_ok(rows, rows4),
-            "swiglu (UE8M0): intermediate must be whole 512-wide words and the scale layout cover the rows",
+            sfa_layout_ok(rows, rows4),
+            "swiglu (UE8M0): the scale layout must cover the rows",
         )?;
-        let grid = pair_grid(tokens, top_k, inter, rows)?;
+        require(
+            gu.is_multiple_of(16) && q.is_multiple_of(8),
+            "swiglu (UE8M0): gate/up rows must be 16-byte and codes 8-byte aligned",
+        )?;
+        let grid = swiglu_grid(tokens, top_k, inter, rows)?;
         if grid[0] == 0 {
             return Ok(());
         }
@@ -497,10 +501,14 @@ impl EngineOps {
         rows4: u32,
     ) -> Result<()> {
         require(
-            k > 0 && k.is_multiple_of(512) && sfa_layout_ok(rows, rows4),
-            "gather_quant: K must be whole 512-wide words and the scale layout cover the rows",
+            sfa_layout_ok(rows, rows4),
+            "gather_quant: the scale layout must cover the rows",
         )?;
-        let grid = pair_grid(tokens, top_k, k, rows)?;
+        require(
+            x.is_multiple_of(16) && a.is_multiple_of(4),
+            "gather_quant: token rows must be 16-byte and codes 4-byte aligned",
+        )?;
+        let grid = gather_grid(tokens, top_k, k, rows)?;
         if grid[0] == 0 {
             return Ok(());
         }
@@ -737,9 +745,16 @@ pub fn combine_grid(tokens: u32, hidden: u32) -> Result<[u32; 3]> {
 /// Threads per block of `eidola_qkv_rope_kv`.
 pub const QKV_THREADS: u32 = 256;
 
-/// The fused-QKV kernel's grid: one thread per output element of a token
-/// (its chunks' Q and K heads of 192 and V heads of 128), one block row per
-/// token.
+/// Consecutive output elements each `eidola_qkv_rope_kv` thread computes
+/// (one 16-byte BF16 vector).
+pub const QKV_VEC: u32 = 8;
+
+/// The fused-QKV kernel's grid: one thread per [`QKV_VEC`] consecutive
+/// output elements of a token (its chunks' Q and K heads of 192 and V heads
+/// of 128, all whole vectors), one block row per token. Every load and store
+/// is a 16-byte vector, so the QKV rows, the Q output, the pool and the RoPE
+/// table must be 16-byte aligned, and the chunk stride, the block's elements
+/// and the K and V offsets whole vectors.
 pub fn qkv_grid(tokens: u32, args: &QkvArgs) -> Result<[u32; 3]> {
     let per_chunk = args
         .q_heads_per_chunk
@@ -755,9 +770,24 @@ pub fn qkv_grid(tokens: u32, args: &QkvArgs) -> Result<[u32; 3]> {
         args.chunks > 0 && per_chunk.is_some(),
         "qkv_rope_kv: chunk stride below its heads",
     )?;
+    let vec = u64::from(QKV_VEC);
+    require(
+        [args.qkv, args.q_out, args.pool, args.rope]
+            .iter()
+            .all(|a| a.is_multiple_of(16))
+            && [
+                u64::from(args.chunk_stride),
+                args.block_elems,
+                args.k_off,
+                args.v_off,
+            ]
+            .iter()
+            .all(|n| n.is_multiple_of(vec)),
+        "qkv_rope_kv: buffers must be 16-byte aligned and strides and offsets whole 8-element vectors",
+    )?;
     let blocks = per_chunk
         .and_then(|n| n.checked_mul(args.chunks))
-        .map(|n| n.div_ceil(QKV_THREADS))
+        .map(|n| (n / QKV_VEC).div_ceil(QKV_THREADS))
         .filter(|&b| b <= 65_535)
         .ok_or_else(|| crate::CudaError::new("qkv_rope_kv: too many heads per token"))?;
     require(
@@ -767,17 +797,12 @@ pub fn qkv_grid(tokens: u32, args: &QkvArgs) -> Result<[u32; 3]> {
     Ok([tokens, blocks, 1])
 }
 
-/// The grid of the pair-indexed expert kernels (gather, SwiGLU): one block
-/// per routed (token, slot) pair and 512-wide word of `width`. Every pair
-/// lands in its own row, so the layout's `rows` must hold them all.
-pub fn pair_grid(tokens: u32, top_k: u32, width: u32, rows: u32) -> Result<[u32; 3]> {
+/// Every routed (token, slot) pair lands in its own row of the expert
+/// layout, so its `rows` must hold them all: the pair count.
+fn routed_pairs(tokens: u32, top_k: u32, rows: u32) -> Result<u32> {
     require(
         (1..=crate::support::MAX_TOP_K).contains(&(top_k as usize)),
         "expert rows: 1..=8 experts per token",
-    )?;
-    require(
-        width > 0 && width.is_multiple_of(512) && width / 512 <= 65_535,
-        "expert rows: width must be whole 512-wide words",
     )?;
     let pairs = tokens
         .checked_mul(top_k)
@@ -787,7 +812,34 @@ pub fn pair_grid(tokens: u32, top_k: u32, width: u32, rows: u32) -> Result<[u32;
         pairs <= rows,
         "expert rows: the layout holds fewer rows than pairs",
     )?;
-    Ok([pairs, width / 512, 1])
+    Ok(pairs)
+}
+
+/// Elements of a routed row each `eidola_swiglu_quant_fp8_ue8m0` block
+/// covers: two 512-wide scale words, 128 threads of 8 consecutive elements.
+pub const SWIGLU_WIDTH: u32 = 1024;
+
+/// The expert SwiGLU's grid: one block per routed (token, slot) pair and
+/// [`SWIGLU_WIDTH`] elements of the intermediate, which must be whole.
+pub fn swiglu_grid(tokens: u32, top_k: u32, inter: u32, rows: u32) -> Result<[u32; 3]> {
+    require(
+        inter > 0 && inter.is_multiple_of(SWIGLU_WIDTH) && inter / SWIGLU_WIDTH <= 65_535,
+        "swiglu (UE8M0): intermediate must be whole 1024-wide pieces",
+    )?;
+    let pairs = routed_pairs(tokens, top_k, rows)?;
+    Ok([pairs, inter / SWIGLU_WIDTH, 1])
+}
+
+/// The expert gather's grid: one block per token and 512-wide word of `k`,
+/// which stores the word into the rows of all the token's pairs (each
+/// quantized once, not once per pair).
+pub fn gather_grid(tokens: u32, top_k: u32, k: u32, rows: u32) -> Result<[u32; 3]> {
+    require(
+        k > 0 && k.is_multiple_of(512) && k / 512 <= 65_535,
+        "gather_quant: K must be whole 512-wide words",
+    )?;
+    routed_pairs(tokens, top_k, rows)?;
+    Ok([tokens, k / 512, 1])
 }
 
 /// Rows per block of the grouped GEMMs: in the psum layout every expert's
@@ -975,10 +1027,11 @@ mod tests {
         assert!(combine_grid(1 << 31, 4096).is_err());
     }
 
-    /// One thread per output element of a token: Flash's global (one KV head
-    /// per chunk) and sliding (two) layers, and the refusals.
+    /// One thread per 8 consecutive output elements of a token: Flash's
+    /// global (one KV head per chunk) and sliding (two) layers, and the
+    /// refusals.
     #[test]
-    fn qkv_grid_is_one_thread_per_element() {
+    fn qkv_grid_is_one_thread_per_vector() {
         let args = |kv: u32, stride: u32| QkvArgs {
             chunks: 4,
             chunk_stride: stride,
@@ -986,29 +1039,33 @@ mod tests {
             kv_heads_per_chunk: kv,
             ..QkvArgs::default()
         };
-        // Global: 4 x (17 x 192 + 128) = 13,568 elements, 53 blocks of 256.
-        // Sliding: 4 x (18 x 192 + 256) = 14,848 elements, 58 blocks.
+        // Global: 4 x (17 x 192 + 128) = 13,568 elements, 1,696 vectors, 7
+        // blocks of 256. Sliding: 4 x (18 x 192 + 256) = 14,848 elements,
+        // 1,856 vectors, 8 blocks.
         for tokens in [0u32, 1, 7, 64, 8192] {
-            assert_eq!(qkv_grid(tokens, &args(1, 3456)).unwrap(), [tokens, 53, 1]);
-            assert_eq!(qkv_grid(tokens, &args(2, 3712)).unwrap(), [tokens, 58, 1]);
+            assert_eq!(qkv_grid(tokens, &args(1, 3456)).unwrap(), [tokens, 7, 1]);
+            assert_eq!(qkv_grid(tokens, &args(2, 3712)).unwrap(), [tokens, 8, 1]);
         }
         for (kv, stride) in [(1u32, 3456u32), (2, 3712)] {
             let [_, blocks, _] = qkv_grid(1, &args(kv, stride)).unwrap();
             let elements = 4 * ((16 + kv) * 192 + kv * 128);
-            assert!(blocks * QKV_THREADS >= elements);
-            assert!((blocks - 1) * QKV_THREADS < elements);
+            assert!(elements.is_multiple_of(QKV_VEC));
+            let vectors = elements / QKV_VEC;
+            assert!(blocks * QKV_THREADS >= vectors);
+            assert!((blocks - 1) * QKV_THREADS < vectors);
         }
         assert!(
             qkv_grid(1, &args(1, 3391)).is_err(),
             "stride below the heads"
         );
         assert!(qkv_grid(1, &args(1, 3392)).is_ok());
-        // A count that is not whole blocks rounds up: 3 x 3,392 = 10,176.
+        // A count that is not whole blocks rounds up: 3 x 3,392 = 10,176
+        // elements, 1,272 vectors.
         let three = QkvArgs {
             chunks: 3,
             ..args(1, 3392)
         };
-        assert_eq!(qkv_grid(2, &three).unwrap(), [2, 40, 1]);
+        assert_eq!(qkv_grid(2, &three).unwrap(), [2, 5, 1]);
         assert!(
             qkv_grid(
                 1,
@@ -1021,38 +1078,73 @@ mod tests {
         );
         assert!(qkv_grid(1, &args(u32::MAX, u32::MAX)).is_err(), "overflow");
         assert!(qkv_grid(1 << 31, &args(1, 3456)).is_err());
+        // Every vector access is 16 bytes: the buffers aligned, the strides
+        // and offsets whole vectors.
+        assert!(
+            qkv_grid(1, &args(1, 3460)).is_err(),
+            "stride not whole vectors"
+        );
+        let ok = QkvArgs {
+            qkv: 256,
+            q_out: 512,
+            pool: 1024,
+            rope: 2048,
+            block_elems: 80,
+            k_off: 8,
+            v_off: 16,
+            ..args(1, 3456)
+        };
+        assert!(qkv_grid(1, &ok).is_ok());
+        for bad in [
+            QkvArgs { qkv: 264, ..ok },
+            QkvArgs { q_out: 8, ..ok },
+            QkvArgs { pool: 1032, ..ok },
+            QkvArgs { rope: 2052, ..ok },
+            QkvArgs {
+                block_elems: 84,
+                ..ok
+            },
+            QkvArgs { k_off: 4, ..ok },
+            QkvArgs { v_off: 18, ..ok },
+        ] {
+            assert!(qkv_grid(1, &bad).is_err(), "{bad:?}");
+        }
     }
 
-    /// One block per routed pair and 512-wide word, whatever the layout's
-    /// row count (every pair plus the padding of each expert reached):
-    /// launches scale with the tokens, not the layout's padding.
+    /// The SwiGLU: one block per routed pair and 1024 elements; the gather:
+    /// one block per token and 512-wide word. Neither depends on the
+    /// layout's row count (every pair plus the padding of each expert
+    /// reached): launches scale with the tokens, not the layout's padding.
     #[test]
-    fn pair_grid_is_one_block_per_pair_and_word() {
+    fn expert_row_grids_follow_the_tokens() {
         for tokens in [1u32, 2, 7, 64, 128, 129, 513, 8192] {
             let rows = u32::try_from(psum_rows(tokens as usize, 8)).unwrap();
             assert_eq!(
-                pair_grid(tokens, 8, 4096, rows).unwrap(),
-                [tokens * 8, 8, 1],
+                gather_grid(tokens, 8, 4096, rows).unwrap(),
+                [tokens, 8, 1],
                 "gather, {tokens} tokens"
             );
             assert_eq!(
-                pair_grid(tokens, 8, 2048, rows).unwrap(),
-                [tokens * 8, 4, 1],
+                swiglu_grid(tokens, 8, 2048, rows).unwrap(),
+                [tokens * 8, 2, 1],
                 "swiglu, {tokens} tokens"
             );
         }
-        assert_eq!(pair_grid(0, 8, 4096, 0).unwrap(), [0, 8, 1]);
-        assert!(pair_grid(2, 8, 4096, 15).is_err(), "more pairs than rows");
-        assert!(pair_grid(2, 8, 4096, 16).is_ok());
-        assert!(pair_grid(1, 0, 4096, 8).is_err(), "top_k 0");
-        assert!(pair_grid(1, 9, 4096, 9).is_err(), "top_k 9");
-        assert!(pair_grid(1, 8, 1000, 8).is_err(), "not whole words");
-        assert!(pair_grid(1, 8, 0, 8).is_err(), "no words");
-        assert!(pair_grid(u32::MAX / 8 + 1, 8, 4096, u32::MAX).is_err());
-        assert!(
-            pair_grid(1 << 28, 8, 4096, u32::MAX).is_err(),
-            "past the grid"
-        );
+        assert_eq!(gather_grid(0, 8, 4096, 0).unwrap(), [0, 8, 1]);
+        assert_eq!(swiglu_grid(0, 8, 2048, 0).unwrap(), [0, 2, 1]);
+        for grid in [gather_grid, swiglu_grid] {
+            assert!(grid(2, 8, 2048, 15).is_err(), "more pairs than rows");
+            assert!(grid(2, 8, 2048, 16).is_ok());
+            assert!(grid(1, 0, 2048, 8).is_err(), "top_k 0");
+            assert!(grid(1, 9, 2048, 9).is_err(), "top_k 9");
+            assert!(grid(1, 8, 1000, 8).is_err(), "not whole words");
+            assert!(grid(1, 8, 0, 8).is_err(), "no words");
+            assert!(grid(u32::MAX / 8 + 1, 8, 2048, u32::MAX).is_err());
+            assert!(grid(1 << 28, 8, 2048, u32::MAX).is_err(), "past the grid");
+        }
+        assert!(gather_grid(1, 8, 512, 8).is_ok());
+        assert!(swiglu_grid(1, 8, 512, 8).is_err(), "half a piece");
+        assert!(swiglu_grid(1, 8, 1536, 8).is_err(), "not whole pieces");
     }
 
     /// DeepGEMM's psum scheduler (`sched::Scheduler::get_next_block` for
