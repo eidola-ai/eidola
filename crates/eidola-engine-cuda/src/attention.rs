@@ -560,6 +560,8 @@ impl HostPlan {
                                 continue;
                             }
                             let n = u64::from(chunk_end - b).min(room).min(most);
+                            // Every piece takes a query: the loop always ends.
+                            assert!(n > 0, "a split piece with no queries");
                             let n32 = u32::try_from(n).expect("below a u32 span");
                             pass.push(Piece {
                                 q_start: r.q_start + (b - first),
