@@ -273,23 +273,21 @@ impl EngineOps {
         rows4: u32,
     ) -> Result<()> {
         swiglu_operands(q, gu, rows, rows4)?;
-        let launch = swiglu_grid(tokens, top_k, inter, rows)?;
-        if launch.items == 0 {
+        let grid = swiglu_grid(tokens, top_k, inter, rows)?;
+        if grid[0] == 0 {
             return Ok(());
         }
-        // The kernel walks the items of `launch.rows` routed pairs.
         unsafe {
             launch!(
                 gpu,
                 self.swiglu_ue8m0,
-                launch.grid,
+                grid,
                 q,
                 sf,
                 gu,
                 row_of,
                 inter,
-                rows4,
-                launch.rows
+                rows4
             )
         }
     }
@@ -882,20 +880,19 @@ pub fn swiglu_f32scale_grid(
     )
 }
 
-/// The expert SwiGLU's launch: `pairs × inter / SWIGLU_PIECE` items, one per
-/// piece of each routed (token, slot) pair's row, the intermediate whole
-/// 512-wide scale words.
-pub fn swiglu_grid(tokens: u32, top_k: u32, inter: u32, rows: u32) -> Result<SwigluLaunch> {
+/// Elements of a routed row each `eidola_swiglu_quant_fp8_ue8m0` block
+/// covers: two 512-wide scale words, 128 threads of 8 consecutive elements.
+pub const SWIGLU_WIDTH: u32 = 1024;
+
+/// The expert SwiGLU's grid: one block per routed (token, slot) pair and
+/// [`SWIGLU_WIDTH`] elements of the intermediate, which must be whole.
+pub fn swiglu_grid(tokens: u32, top_k: u32, inter: u32, rows: u32) -> Result<[u32; 3]> {
     require(
-        inter > 0 && inter.is_multiple_of(512),
-        "swiglu (UE8M0): intermediate must be whole 512-wide words",
+        inter > 0 && inter.is_multiple_of(SWIGLU_WIDTH) && inter / SWIGLU_WIDTH <= 65_535,
+        "swiglu (UE8M0): intermediate must be whole 1024-wide pieces",
     )?;
     let pairs = routed_pairs(tokens, top_k, rows)?;
-    swiglu_launch(
-        pairs,
-        inter / SWIGLU_PIECE,
-        "swiglu (UE8M0): too many pairs for one launch",
-    )
+    Ok([pairs, inter / SWIGLU_WIDTH, 1])
 }
 
 /// The expert SwiGLU's operands: the scale layout covers the rows, gate/up
@@ -943,11 +940,20 @@ pub const PERMUTE_CHUNK: u32 = 512;
 /// holds a count per (expert, block), each expert's read in 16-byte loads.
 pub const PERMUTE_MAX_BLOCKS: u32 = 128;
 
+/// Most pairs `eidola_moe_permute` places in one launch of one block (640
+/// tokens of 8). On a B300 the one block costs 8.2 µs at 4,104 pairs and
+/// 14.3 at 8,192, the two-launch form a flat 10.2–10.3 µs from 1,024 pairs
+/// to 8,192: they cross near 5,500 pairs (interpolating the one block
+/// linearly), so the bound sits just below, where one block still wins.
+pub const PERMUTE_ONE_BLOCK_PAIRS: u32 = 5120;
+
 /// Words of `eidola_moe_permute`'s scratch: a count per (expert, block).
 pub const PERMUTE_SCRATCH_WORDS: usize = crate::support::EXPERTS * PERMUTE_MAX_BLOCKS as usize;
 
-/// The placement's grid: one block per [`PERMUTE_CHUNK`] pairs, at least
-/// one (it writes the grouped layout) and at most [`PERMUTE_MAX_BLOCKS`].
+/// The placement's grid: one block up to [`PERMUTE_ONE_BLOCK_PAIRS`] (one
+/// launch; it writes the grouped layout even with no pairs), else one block
+/// per [`PERMUTE_CHUNK`] pairs, at most [`PERMUTE_MAX_BLOCKS`] (a count
+/// launch, then the placement).
 /// The layout's rows must hold every run, and the scratch be 16-byte aligned.
 pub fn permute_grid(tokens: u32, top_k: u32, rows_bound: u32, scratch: u64) -> Result<[u32; 3]> {
     require(
@@ -966,11 +972,12 @@ pub fn permute_grid(tokens: u32, top_k: u32, rows_bound: u32, scratch: u64) -> R
         scratch != 0 && scratch.is_multiple_of(16),
         "permute: scratch must be 16-byte aligned",
     )?;
-    Ok([
-        pairs.div_ceil(PERMUTE_CHUNK).clamp(1, PERMUTE_MAX_BLOCKS),
-        1,
-        1,
-    ])
+    let blocks = if pairs <= PERMUTE_ONE_BLOCK_PAIRS {
+        1
+    } else {
+        pairs.div_ceil(PERMUTE_CHUNK).min(PERMUTE_MAX_BLOCKS)
+    };
+    Ok([blocks, 1, 1])
 }
 
 /// The expert gather's grid: one block per token and 512-wide word of `k`,
@@ -1275,18 +1282,15 @@ mod tests {
                 [tokens, 8, 1],
                 "gather, {tokens} tokens"
             );
-            let launch = swiglu_grid(tokens, 8, 2048, rows).unwrap();
-            assert_eq!(launch.items, tokens * 8 * 8, "swiglu, {tokens} tokens");
-            assert_eq!(launch.rows, tokens * 8, "swiglu, {tokens} tokens: pairs");
+            assert_eq!(
+                swiglu_grid(tokens, 8, 2048, rows).unwrap(),
+                [tokens * 8, 2, 1],
+                "swiglu, {tokens} tokens"
+            );
         }
         assert_eq!(gather_grid(0, 8, 4096, 0).unwrap(), [0, 8, 1]);
-        assert_eq!(swiglu_grid(0, 8, 2048, 0).unwrap().items, 0);
-        let gather = |t, k, w, r| gather_grid(t, k, w, r).map(|_| ());
-        let swiglu = |t, k, w, r| swiglu_grid(t, k, w, r).map(|_| ());
-        for grid in [
-            &gather as &dyn Fn(u32, u32, u32, u32) -> Result<()>,
-            &swiglu,
-        ] {
+        assert_eq!(swiglu_grid(0, 8, 2048, 0).unwrap(), [0, 2, 1]);
+        for grid in [gather_grid, swiglu_grid] {
             assert!(grid(2, 8, 2048, 15).is_err(), "more pairs than rows");
             assert!(grid(2, 8, 2048, 16).is_ok());
             assert!(grid(1, 0, 2048, 8).is_err(), "top_k 0");
@@ -1297,39 +1301,32 @@ mod tests {
             assert!(grid(1 << 28, 8, 2048, u32::MAX).is_err(), "past the grid");
         }
         assert!(gather_grid(1, 8, 512, 8).is_ok());
-        assert!(swiglu_grid(1, 8, 512, 8).is_ok(), "one scale word");
-        assert!(swiglu_grid(1, 8, 768, 8).is_err(), "half a scale word");
+        assert!(swiglu_grid(1, 8, 512, 8).is_err(), "half a piece");
+        assert!(swiglu_grid(1, 8, 1536, 8).is_err(), "not whole pieces");
     }
 
-    /// Both SwiGLUs launch one warp per item (a 256-element piece of a row)
-    /// in whole blocks of 4 warps up to the most warps a 148-SM part holds at
-    /// once, then the same grid whatever the items: every warp walks its
-    /// share, and every item has a warp, whatever the count.
+    /// The dense SwiGLU launches one warp per item (a 256-element piece of a
+    /// row) in whole blocks of 4 warps up to the most warps a 148-SM part
+    /// holds at once, then the same grid whatever the items: every warp
+    /// walks its share, and every item has a warp, whatever the count.
     #[test]
     fn swiglu_launches_a_warp_per_item_up_to_a_resident_grid() {
         assert_eq!(SWIGLU_MAX_WARPS, 4736);
-        for (tokens, blocks) in [
+        // Rows × 64 items at Flash's 16,384.
+        for (rows, blocks) in [
             (1u32, 16u32),
-            (2, 32),
-            (7, 112),
-            (64, 1024),
+            (4, 64),
+            (73, 1168),
             (74, SWIGLU_MAX_WARPS / 4),
-            (513, SWIGLU_MAX_WARPS / 4),
-            (8192, SWIGLU_MAX_WARPS / 4),
+            (2048, SWIGLU_MAX_WARPS / 4),
         ] {
-            let rows = u32::try_from(psum_rows(tokens as usize, 8)).unwrap();
-            let launch = swiglu_grid(tokens, 8, 2048, rows).unwrap();
-            assert_eq!(launch.grid, [blocks, 1, 1], "{tokens} tokens");
-            let warps = launch.grid[0] * SWIGLU_WARPS;
-            assert!(warps >= launch.items.min(SWIGLU_MAX_WARPS));
-            assert!(warps < launch.items.min(SWIGLU_MAX_WARPS) + SWIGLU_WARPS);
-        }
-        // The dense SwiGLU: rows × 64 items at Flash's 16,384.
-        for (rows, blocks) in [(1u32, 16u32), (4, 64), (74, SWIGLU_MAX_WARPS / 4)] {
             let launch = swiglu_f32scale_grid(rows, 16_384, rows, 0, 0).unwrap();
             assert_eq!(launch.items, rows * 64, "{rows} rows");
             assert_eq!(launch.rows, rows);
             assert_eq!(launch.grid, [blocks, 1, 1], "{rows} rows");
+            let warps = launch.grid[0] * SWIGLU_WARPS;
+            assert!(warps >= launch.items.min(SWIGLU_MAX_WARPS));
+            assert!(warps < launch.items.min(SWIGLU_MAX_WARPS) + SWIGLU_WARPS);
         }
         // Three items: one block, its last warp idle.
         let three = swiglu_f32scale_grid(3, 256, 4, 0, 0).unwrap();
@@ -1414,9 +1411,10 @@ mod tests {
             (0u32, 1u32),
             (1, 1),
             (64, 1),
-            (65, 2),
-            (128, 2),
-            (129, 3),
+            (65, 1),
+            (513, 1),
+            (640, 1),
+            (641, 11),
             (2048, 32),
             (8192, 128),
             (8193, 128),

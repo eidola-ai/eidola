@@ -201,21 +201,23 @@ EIDOLA_KERNEL_META(eidola_qkv_rope_kv, kThreads, 1, 1, 0, 1, 1, 1, sizeof(Eidola
 
 // The two SwiGLU kernels: silu(g) * u in f32 over BF16 [rows][2I] (gate |
 // up), each element x / (1 + expf(-x)) * u as in the reference forms
-// (engine_ops_reference.cu), quantized per 128-wide group.
+// (engine_ops_reference.cu), quantized per 128-wide group. Each half-warp
+// covers one 128-wide group, each lane kSwigluVec consecutive elements
+// (16-byte gate and up loads, an 8-byte store). The arithmetic is per
+// element and per group (a group's amax is a maximum, which no reduction
+// order changes), so which thread runs an element changes no bit.
 //
-// Both walk items of kSwigluPiece consecutive elements of one row (item i
-// is piece i % P of row i / P, P pieces a row), one item per warp at a time:
-// each half-warp one 128-wide group, each lane kSwigluVec consecutive
-// elements (16-byte gate and up loads, an 8-byte store). A warp takes items
-// warp, warp + W, warp + 2W, ... (W the grid's warps), and loads the next
-// item's gate and up before computing the current one, so its loads are in
-// flight while it computes; the grid is at most kSwigluMaxWarps warps, which
-// a 148-SM part holds at once (8 blocks of 4 warps per SM, which
-// __launch_bounds__ keeps in registers), so every warp starts at once. The
-// arithmetic is per element and per group (a group's amax is a maximum,
-// which no reduction order changes), so which warp runs an item changes no
-// bit. Each lane computes its 8 denominators before its 8 divisions, which
-// lets their exponentials overlap.
+// The dense form walks items of kSwigluPiece consecutive elements of one row
+// (item i is piece i % P of row i / P, P pieces a row), one item per warp at
+// a time: a warp takes items warp, warp + W, warp + 2W, ... (W the grid's
+// warps), and loads the next item's gate and up before computing the current
+// one; the grid is at most kSwigluMaxWarps warps, which a 148-SM part holds
+// at once (8 blocks of 4 warps per SM, which __launch_bounds__ keeps in
+// registers). Each lane computes its 8 denominators before its 8 divisions.
+// The expert form is one block per routed pair and 1024 elements, 64
+// resident warps an SM: walking items, with half as many warps resident,
+// measured slower for it (the kernels crate's AGENTS.md, "Why the expert
+// SwiGLU is one block per pair").
 constexpr uint32_t kSwigluVec = 8;
 constexpr uint32_t kSwigluPiece = 32 * kSwigluVec;
 constexpr uint32_t kSwigluWarps = 4;
@@ -311,68 +313,59 @@ extern "C" __global__ void __launch_bounds__(kSwigluWarps * 32, kSwigluBlocksPer
 }
 EIDOLA_KERNEL_META(eidola_swiglu_quant_fp8_f32scale, kSwigluWarps * 32, 1, 1, 0, 1, 1, 1, 0);
 
-// Quantized for DeepGEMM: q [rows][I], packed UE8M0 sf (see sfa_index), for
-// exactly the rows a routed (token, slot) pair landed in: the items are
-// (pair, piece) for every one of `pairs` pairs, the row row_of[pair]. Rows
-// no pair names (the expert layout's padding) are not touched; the grouped
-// GEMMs compute every row independently, so what they hold reaches only
-// padding outputs, which the combine never reads.
+// SwiGLU over BF16 [rows][2I] quantized for DeepGEMM: q [rows][I], packed
+// UE8M0 sf (see sfa_index), for exactly the rows a routed (token, slot) pair
+// landed in: block x is pair i, its row row_of[i]. Rows no pair names (the
+// expert layout's padding) are not touched; the grouped GEMMs compute every
+// row independently, so what they hold reaches only padding outputs, which
+// the combine never reads.
 //
-// A warp loads the row of the item after next while it loads the next item's
-// data, so no load waits on a row index. Each half-warp's first lane stores
-// its group's exponent as the scale word's byte for that group (byte j of a
-// word is group 4w + j, little-endian, as the reference packs it), so the
-// warps never synchronize. gu must be 16-byte and q 8-byte aligned (the host
-// checks both).
-extern "C" __global__ void __launch_bounds__(kSwigluWarps * 32, kSwigluBlocksPerSm)
+// Grid (pairs, I/1024), 4 warps: block y covers two 512-wide scale words
+// (eight 128-wide groups), each half-warp one group, each lane 8 consecutive
+// elements (16-byte gate and up loads, an 8-byte store). gu and q must be
+// 16- and 8-byte aligned (the host checks both).
+constexpr uint32_t kSwigluWidth = 128 * kSwigluVec;
+
+extern "C" __global__ void __launch_bounds__(128)
     eidola_swiglu_quant_fp8_ue8m0(uint8_t* __restrict__ q, int32_t* __restrict__ sf,
                                   const uint16_t* __restrict__ gu,
                                   const int32_t* __restrict__ row_of, uint32_t inter,
-                                  uint32_t rows4, uint32_t pairs) {
-  const uint32_t lane = threadIdx.x % 32, pieces = inter / kSwigluPiece;
-  const SwigluWalk walk(pieces, gridDim.x * kSwigluWarps);
-  const uint32_t first = blockIdx.x * kSwigluWarps + threadIdx.x / 32;
-  uint32_t pair = first / pieces, piece = first % pieces;
-  if (pair >= pairs) return;
-  uint32_t r = static_cast<uint32_t>(__ldg(row_of + pair));
-  uint4 gw, uw;
-  swiglu_load(gu, inter, r, piece, lane, gw, uw);
-  uint32_t next_pair = pair, next_piece = piece;
-  walk.advance(next_pair, next_piece);
-  uint32_t next_r = next_pair < pairs ? static_cast<uint32_t>(__ldg(row_of + next_pair)) : 0;
-  for (;;) {
-    uint4 ngw = gw, nuw = uw;
-    if (next_pair < pairs) swiglu_load(gu, inter, next_r, next_piece, lane, ngw, nuw);
-    uint32_t after_pair = next_pair, after_piece = next_piece;
-    walk.advance(after_pair, after_piece);
-    const uint32_t after_r = after_pair < pairs ? static_cast<uint32_t>(__ldg(row_of + after_pair)) : 0;
-    const uint32_t col = piece * kSwigluPiece + lane * kSwigluVec;
-    float v[kSwigluVec];
-    const float amax = half_warp_max(swiglu8(gw, uw, v));
-    const uint8_t e8 = ue8m0_for(amax);
-    const float inv = 1.f / ue8m0_value(e8);
-    uint32_t lo = 0, hi = 0;
+                                  uint32_t rows4) {
+  __shared__ uint8_t exps[8];
+  const uint32_t r = static_cast<uint32_t>(row_of[blockIdx.x]);
+  const uint32_t gb = threadIdx.x / 16, i0 = (threadIdx.x % 16) * kSwigluVec;
+  const uint32_t g = blockIdx.y * 8 + gb;
+  const uint16_t* gate = gu + static_cast<size_t>(r) * 2 * inter + g * 128 + i0;
+  const uint4 gw = *reinterpret_cast<const uint4*>(gate);
+  const uint4 uw = *reinterpret_cast<const uint4*>(gate + inter);
+  const uint32_t gws[4] = {gw.x, gw.y, gw.z, gw.w}, uws[4] = {uw.x, uw.y, uw.z, uw.w};
+  float v[kSwigluVec];
+  float amax = 0.f;
 #pragma unroll
-    for (uint32_t e = 0; e < 4; ++e) {
-      lo |= static_cast<uint32_t>(f2e4m3(v[e] * inv)) << (8 * e);
-      hi |= static_cast<uint32_t>(f2e4m3(v[e + 4] * inv)) << (8 * e);
-    }
-    *reinterpret_cast<uint2*>(q + static_cast<size_t>(r) * inter + col) = make_uint2(lo, hi);
-    if (lane % 16 == 0) {
-      const uint32_t g = col / 128;
-      reinterpret_cast<uint8_t*>(sf + sfa_index(r, g / 4, rows4))[g % 4] = e8;
-    }
-    if (next_pair >= pairs) break;
-    r = next_r;
-    piece = next_piece;
-    next_pair = after_pair;
-    next_piece = after_piece;
-    next_r = after_r;
-    gw = ngw;
-    uw = nuw;
+  for (uint32_t e = 0; e < kSwigluVec; ++e) {
+    const float x = bf16f(static_cast<uint16_t>(gws[e / 2] >> (16 * (e % 2))));
+    v[e] = x / (1.f + expf(-x)) * bf16f(static_cast<uint16_t>(uws[e / 2] >> (16 * (e % 2))));
+    amax = fmaxf(amax, fabsf(v[e]));
+  }
+  amax = half_warp_max(amax);
+  const uint8_t e8 = ue8m0_for(amax);
+  const float inv = 1.f / ue8m0_value(e8);
+  uint32_t lo = 0, hi = 0;
+#pragma unroll
+  for (uint32_t e = 0; e < 4; ++e) {
+    lo |= static_cast<uint32_t>(f2e4m3(v[e] * inv)) << (8 * e);
+    hi |= static_cast<uint32_t>(f2e4m3(v[e + 4] * inv)) << (8 * e);
+  }
+  *reinterpret_cast<uint2*>(q + static_cast<size_t>(r) * inter + g * 128 + i0) = make_uint2(lo, hi);
+  if (threadIdx.x % 16 == 0) exps[gb] = e8;
+  __syncthreads();
+  if (threadIdx.x < 2) {
+    const uint8_t* e4 = exps + 4 * threadIdx.x;
+    const uint32_t word = e4[0] | (e4[1] << 8) | (e4[2] << 16) | (static_cast<uint32_t>(e4[3]) << 24);
+    sf[sfa_index(r, blockIdx.y * 2 + threadIdx.x, rows4)] = static_cast<int32_t>(word);
   }
 }
-EIDOLA_KERNEL_META(eidola_swiglu_quant_fp8_ue8m0, kSwigluWarps * 32, 1, 1, 0, 1, 1, 1, 0);
+EIDOLA_KERNEL_META(eidola_swiglu_quant_fp8_ue8m0, 128, 1, 1, 0, 1, 1, 1, 0);
 
 // Router: logits = x · Wᵀ (x f32 [T][H], W BF16 [E][H], f32 accumulation),
 // scores = sigmoid(logits), top-k of scores + bias (ties to the lower expert),
@@ -795,8 +788,9 @@ EIDOLA_KERNEL_META(eidola_router_select, kRouterSelectWarps * 32, 1, 1, 0, 1, 1,
 // SwiGLU and the combine address rows through it. An id outside 0..256 is
 // placed nowhere (its row_of entry is left as it is); the router writes none.
 //
-// Grid B blocks of 256 threads (B = ceil(pairs / kPermuteChunk), at least
-// one and at most kPermuteMaxBlocks): block b takes the b-th of B equal
+// Grid B blocks of 256 threads (the host picks one block up to a few
+// thousand pairs, else ceil(pairs / kPermuteChunk), at most
+// kPermuteMaxBlocks): block b takes the b-th of B equal
 // contiguous runs of the pairs, and its warp w the w-th eighth of that run.
 // Each warp counts its eighth into its own shared histogram (shared atomics:
 // the counts do not depend on their order), and thread e turns the

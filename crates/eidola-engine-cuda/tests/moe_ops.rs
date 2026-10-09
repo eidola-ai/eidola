@@ -28,11 +28,11 @@ const INTER: usize = 2048;
 /// past a block of rows), 513 (which leaves the split router a one-token last
 /// tile), and a full prefill step.
 const TOKENS: [usize; 11] = [1, 2, 7, 15, 16, 64, 128, 129, 513, 2048, 8192];
-/// The placement's further counts: 65 tokens (520 pairs, the first count
-/// split over two blocks), 8,193 (one token past the most blocks at whole
-/// chunks, so every block's run grows past `PERMUTE_CHUNK`), 16,384 and
-/// 32,768.
-const PERMUTE_TOKENS: [usize; 4] = [65, 8193, 16_384, 32_768];
+/// The placement's further counts: 640 tokens (the most one block places),
+/// 641 (the first count of two launches, 11 blocks), 8,193 (one token past
+/// the most blocks at whole chunks, so every block's run grows past
+/// `PERMUTE_CHUNK`), 16,384 and 32,768.
+const PERMUTE_TOKENS: [usize; 5] = [640, 641, 8193, 16_384, 32_768];
 /// Both router forms, whatever the token count.
 const FORMS: [RouterForm; 2] = [RouterForm::PerToken, RouterForm::Split];
 
