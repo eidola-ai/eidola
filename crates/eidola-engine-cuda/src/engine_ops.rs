@@ -358,20 +358,7 @@ impl EngineOps {
         top_k: u32,
         scaling: f32,
     ) -> Result<()> {
-        require(
-            (1..=ROUTER_MAX_HIDDEN).contains(&hidden)
-                && hidden.is_multiple_of(ROUTER_CHUNK)
-                && (1..=crate::support::EXPERTS).contains(&(experts as usize))
-                && (2..=crate::support::MAX_TOP_K).contains(&(top_k as usize))
-                && top_k <= experts,
-            // The kernel always renormalizes the selection; the reference does
-            // not for a single expert, so one expert per token is not served.
-            "router: hidden whole 128-wide chunks up to 4096, at most 256 experts and 2..=8 per token",
-        )?;
-        require(
-            x.is_multiple_of(16) && router.is_multiple_of(16),
-            "router: rows and weights must be 16-byte aligned",
-        )?;
+        router_preconditions(scores, x, router, hidden, experts, top_k)?;
         match form {
             RouterForm::PerToken => {
                 let grid = router_grid(tokens)?;
@@ -396,10 +383,6 @@ impl EngineOps {
                 }
             }
             RouterForm::Split => {
-                require(
-                    scores.is_multiple_of(4),
-                    "router: the scores scratch must be 4-byte aligned",
-                )?;
                 let grid = router_scores_grid(tokens, experts)?;
                 if tokens == 0 {
                     return Ok(());
@@ -641,16 +624,17 @@ pub enum RouterForm {
 /// split form.
 ///
 /// On a B300 (`moe_kernel_bench`, MiMo-V2.6-Flash shapes, µs per layer) the
-/// one-token form costs 20.5 at 1 token and 20.9 at 8, then 38.9 at 16, 57.3
-/// at 32 and 93.3 at 64, growing with the token count from there; the split
-/// form costs 25.6 at 1 token, 26.6 at 8 and 16, 27.6 at 64, 49.7 at 256 and
-/// 825 at 8192, below the one-token form from 16 tokens on. At 1 to 8 tokens
-/// the one-token form saves about 5 µs a layer, a quarter of a millisecond of
-/// a decode step over the 47 expert layers. Between 8 and 16 its cost steps
-/// up once its clusters no longer all run at once, at a count the
-/// measurements do not pin, while the split form's holds at 26.6; so the
-/// bound is the largest count measured where the one-token form wins.
-pub const ROUTER_PER_TOKEN_MAX: u32 = 8;
+/// one-token form costs 20.5 at 1 token, 20.9 at 8, 21.27 at 9, 21.26 at 10,
+/// 21.37 at 12 and 21.55 at 14, then 38.91 at 16, 57.3 at 32 and 93.3 at 64,
+/// growing with the token count from there: it steps up once its clusters no
+/// longer all run at once. The split form costs 25.6 at 1 token, 26.6 at 8,
+/// 27.52 at 9, 26.83 at 10, 27.54 at 12, 27.36 at 14, 27.49 at 16, 27.6 at
+/// 64, 49.7 at 256 and 825 at 8192, below the one-token form from 16 tokens
+/// on. Up to 14 tokens the one-token form saves 5–6 µs a layer, a quarter of
+/// a millisecond of a decode step over the 47 expert layers. 15 is not
+/// measured, so the bound is the largest count measured where the one-token
+/// form wins.
+pub const ROUTER_PER_TOKEN_MAX: u32 = 14;
 
 /// The form the executor routes `tokens` rows in. A function of the token
 /// count alone, so a captured decode rung, its replays and the same step run
@@ -661,6 +645,40 @@ pub fn executor_router(tokens: u32) -> RouterForm {
     } else {
         RouterForm::Split
     }
+}
+
+/// What a router call must satisfy whichever form runs it, checked before
+/// either form launches: past these, only each form's own grid limit can
+/// refuse a call, so whether an argument is accepted never depends on the
+/// form a token count picks. `scores` is the split form's scratch; the
+/// one-token form does not read it, but the executor passes the same scratch
+/// to both.
+pub fn router_preconditions(
+    scores: u64,
+    x: u64,
+    router: u64,
+    hidden: u32,
+    experts: u32,
+    top_k: u32,
+) -> Result<()> {
+    require(
+        (1..=ROUTER_MAX_HIDDEN).contains(&hidden)
+            && hidden.is_multiple_of(ROUTER_CHUNK)
+            && (1..=crate::support::EXPERTS).contains(&(experts as usize))
+            && (2..=crate::support::MAX_TOP_K).contains(&(top_k as usize))
+            && top_k <= experts,
+        // The kernel always renormalizes the selection; the reference does
+        // not for a single expert, so one expert per token is not served.
+        "router: hidden whole 128-wide chunks up to 4096, at most 256 experts and 2..=8 per token",
+    )?;
+    require(
+        x.is_multiple_of(16) && router.is_multiple_of(16),
+        "router: rows and weights must be 16-byte aligned",
+    )?;
+    require(
+        scores.is_multiple_of(4),
+        "router: the scores scratch must be 4-byte aligned",
+    )
 }
 
 /// The one-token form's grid: one cluster of [`ROUTER_CLUSTER`] blocks per
@@ -950,17 +968,39 @@ mod tests {
         assert_eq!(router_scores_len(usize::MAX / 2, 256), None);
     }
 
+    /// Every router precondition holds whichever form runs: the split form's
+    /// scratch alignment too, which the one-token form does not read, so a
+    /// misaligned scratch is refused at every token count before any launch.
+    #[test]
+    fn router_preconditions_do_not_depend_on_the_form() {
+        let ok = |scores, x, router, hidden, experts, top_k| {
+            router_preconditions(scores, x, router, hidden, experts, top_k).is_ok()
+        };
+        assert!(ok(0, 0, 0, 4096, 256, 8));
+        assert!(ok(4, 16, 32, 128, 2, 2));
+        assert!(!ok(2, 0, 0, 4096, 256, 8), "scores scratch unaligned");
+        assert!(!ok(0, 8, 0, 4096, 256, 8), "rows unaligned");
+        assert!(!ok(0, 0, 8, 4096, 256, 8), "weights unaligned");
+        assert!(!ok(0, 0, 0, 4097, 256, 8), "hidden past the staged row");
+        assert!(!ok(0, 0, 0, 4000, 256, 8), "hidden not whole chunks");
+        assert!(!ok(0, 0, 0, 0, 256, 8), "no hidden");
+        assert!(!ok(0, 0, 0, 4096, 257, 8), "experts");
+        assert!(!ok(0, 0, 0, 4096, 256, 9), "top_k");
+        assert!(!ok(0, 0, 0, 4096, 256, 1), "one expert per token");
+        assert!(!ok(0, 0, 0, 4096, 4, 8), "top_k past the experts");
+    }
+
     /// The executor routes up to [`ROUTER_PER_TOKEN_MAX`] tokens in the
     /// one-token form and more in the split form: every rung of the decode
     /// ladder, and of each drafted ladder (rows of `1 + width` tokens), runs
     /// the form its token count picks, the same whether captured or eager.
     #[test]
     fn executor_router_picks_the_form_by_token_count() {
-        assert_eq!(ROUTER_PER_TOKEN_MAX, 8);
+        assert_eq!(ROUTER_PER_TOKEN_MAX, 14);
         for tokens in 0..=ROUTER_PER_TOKEN_MAX {
             assert_eq!(executor_router(tokens), RouterForm::PerToken, "{tokens}");
         }
-        for tokens in [9u32, 15, 16, 64, 513, 8192, u32::MAX] {
+        for tokens in [15u32, 16, 64, 513, 8192, u32::MAX] {
             assert_eq!(executor_router(tokens), RouterForm::Split, "{tokens}");
         }
         // Decode rungs of one token per row; drafted rungs of four (width 3).
@@ -971,6 +1011,7 @@ mod tests {
         assert_eq!(form(16, 0), RouterForm::Split);
         assert_eq!(form(1, 3), RouterForm::PerToken);
         assert_eq!(form(2, 3), RouterForm::PerToken);
+        assert_eq!(form(3, 3), RouterForm::PerToken);
         assert_eq!(form(4, 3), RouterForm::Split);
     }
 

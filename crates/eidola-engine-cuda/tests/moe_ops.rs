@@ -24,10 +24,10 @@ const EXPERTS: usize = 256;
 const TOP_K: usize = 8;
 const INTER: usize = 2048;
 /// Token counts: decode rows, the executor's last one-token-form count and the
-/// first past it (8 and 9), decode batches (64 and 128 tokens, and 129, one
+/// first past it (14 and 15), decode batches (64 and 128 tokens, and 129, one
 /// past a block of rows), 513 (which leaves the split router a one-token last
 /// tile), and a full prefill step.
-const TOKENS: [usize; 11] = [1, 2, 7, 8, 9, 64, 128, 129, 513, 2048, 8192];
+const TOKENS: [usize; 11] = [1, 2, 7, 14, 15, 64, 128, 129, 513, 2048, 8192];
 /// Both router forms, whatever the token count.
 const FORMS: [RouterForm; 2] = [RouterForm::PerToken, RouterForm::Split];
 
@@ -260,7 +260,7 @@ fn router_matches_reference_bit_for_bit() {
     }
 }
 
-/// The executor's router, in the form it picks for each count from 1 to 16
+/// The executor's router, in the form it picks for each count from 1 to 24
 /// tokens (across the bound between the one-token and the split form): the
 /// reference's ids and weights, bit for bit.
 #[test]
@@ -271,7 +271,7 @@ fn executor_router_matches_reference_across_the_form_bound() {
     for &arch in &su.archs {
         let ops = EngineOps::from_module(su.module("engine_ops", arch)).unwrap();
         let reference = Reference::load(&su, arch);
-        for tokens in 1..=16 {
+        for tokens in 1..=24 {
             let mut rng = Lcg(0xb0 ^ tokens as u64);
             let case = router_case(&mut rng, tokens);
             let form = executor_router(u32_of(tokens));
