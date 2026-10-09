@@ -922,18 +922,22 @@ fn allocations_are_capped_and_fit_the_deployment() {
     refused(&tree, "less than the 12228280320 bytes the KV pools need");
 
     // The device holds the KV budget, the weights (the pack's data size,
-    // 17,419,419,648 bytes here) and the executor's reserve (16,831,741,952
-    // bytes for this sizing) within the B300's 287,428,640,768.
+    // 17,419,419,648 bytes here) and the executor's reserve
+    // (`engine_deployment::cuda_device_reserve_bytes`: 16,968,056,832 bytes
+    // for this sizing, 16,831,741,952 of step, expert, sampler, table and
+    // RoPE memory plus split attention's 64 tokens × 128 chunks of 16,640-byte
+    // partial rows, 136,314,880) within the B300's 287,428,640,768:
+    // 287,428,640,768 − 17,419,419,648 − 16,968,056,832 = 253,041,164,288.
     let mut tree = Tree::fixture();
     tree.edit_config(
         "KV_DEVICE_BYTES: \"68719476736\"",
-        "KV_DEVICE_BYTES: \"253177479168\"",
+        "KV_DEVICE_BYTES: \"253041164288\"",
     );
     tree.check().expect("the budget fills the device exactly");
     let mut tree = Tree::fixture();
     tree.edit_config(
         "KV_DEVICE_BYTES: \"68719476736\"",
-        "KV_DEVICE_BYTES: \"253177479169\"",
+        "KV_DEVICE_BYTES: \"253041164289\"",
     );
     refused(&tree, "more than the NVIDIA B300 SXM6 AC's 287428640768");
     // A Flash-sized pack leaves room for 64 GiB, and not for twice that.
