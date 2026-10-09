@@ -27,8 +27,10 @@
 //! the four rows (out of 4 x 64 heads x 128) and the largest difference;
 //! `ref` is the worst error against the f32 reference `attend` and whether
 //! every element is inside the attention test's tolerance. The executor's
-//! own path is the positive control: if it shows no difference anywhere, the
-//! matrix has no teeth and the run exits 1.
+//! own path is the positive control: every cell where its tile rule picks
+//! another query tile than a lone decode row's (`control_required`; today
+//! all four scenarios on both layer kinds at every context) must differ, and
+//! the run lists each one that did not and exits 1.
 //!
 //! Structures (`flashinfer_fa2_sink_paged_variants.cu` names the shapes):
 //!
@@ -50,14 +52,16 @@
 //! `decode` in every cell is invariant to it.
 //!
 //! **Timing.** Device time per attention call of one layer (attention plus,
-//! for split structures, the merge), median of `--iters` launches enqueued
-//! behind a long launch, for decode (1, 8, 32, 64 rows), verify (8 and 64
+//! for split structures, the merge): the median of `--iters` calls enqueued
+//! back to back behind a long launch, each timed by its own pair of events
+//! (p10 and p90 in the JSON lines, for noise), for decode (1, 8, 32, 64 rows), verify (8 and 64
 //! rows of four queries), prefill chunks (64, 364, 2,048 queries after 0 or
 //! 4,096 positions), and a mixed step (64 decode rows beside a 364-query
-//! chunk at 4,096). `step_us` scales a call to Flash's 48 layers (9 global,
-//! 39 sliding) for the shapes both kinds run. Prints tables and one JSON line
+//! chunk at 4,096). The per-step table scales each call's median to Flash's
+//! 48 layers (9 global, 39 sliding) for the shapes both kinds run
+//! (`{"section": "step", "structure", "shape", "context", "ms"}`). Prints tables and one JSON line
 //! per measurement (`{"section": "timing", "structure", "layer", "shape",
-//! "context", "us"}` and `{"section": "matrix", ...}`).
+//! "context", "us", "p10_us", "p90_us"}` and `{"section": "matrix", ...}`).
 
 use cudarc::driver::CudaSlice;
 use cudarc::driver::sys::CUevent_flags;
@@ -767,6 +771,34 @@ const SCENARIOS: [&str; 4] = ["+prefill", "verify", "chunk300", "chunk2048"];
 
 /// The probe rows (positions `p ..= p + 3`) of every scenario: `decode`,
 /// then `SCENARIOS` in order.
+/// Each scenario of `SCENARIOS` for probes at `p`: the step's sequences
+/// and the row of the step the first probe lands in.
+fn scenario_queries(p: u32) -> [(Queries, u32); 4] {
+    // Four decode rows beside another sequence's 300-query chunk.
+    let mut beside: Queries = (0..PROBES).map(|i| (p + i, 1)).collect();
+    beside.push((p - 700, 300));
+    [
+        (beside, 0),
+        (vec![(p, PROBES)], 0),
+        (vec![(p - 150, 300)], 150),
+        (vec![(p - 1000, 2048)], 1000),
+    ]
+}
+
+/// Whether the executor's own rows must differ from its decode rows in a
+/// scenario: they must wherever the executor's tile rule picks another
+/// query tile than a lone decode row's (16), because the three tiles reduce
+/// a row's softmax in different orders (four KV warps over 128-key tiles,
+/// one warp over 128-key tiles, one warp over 64-key tiles) over more keys
+/// than one tile holds (every context is at least 1,000). A scenario the
+/// rule gives the decode row's own tile is left out: there a sliding row can
+/// still differ through where its tiles start, but need not.
+fn control_required(kind: Kind, queries: &[(u32, u32)]) -> bool {
+    class_of(queries, kind.group()) != class_of(&[(0, 1)], kind.group())
+}
+
+/// The probe rows (positions `p ..= p + 3`) of every scenario: `decode`,
+/// then `SCENARIOS` in order.
 fn scenarios(gpu: &Gpu, kernels: &Kernels, st: &Structure, pool: &Pool, p: u32) -> Vec<Vec<u16>> {
     let mut decode = Vec::new();
     for i in 0..PROBES {
@@ -774,33 +806,10 @@ fn scenarios(gpu: &Gpu, kernels: &Kernels, st: &Structure, pool: &Pool, p: u32) 
         decode.extend(rows_of(gpu, &call, 0, 1));
     }
     let mut out = vec![decode];
-    // Four decode rows beside another sequence's 300-query chunk.
-    let mut q: Vec<(u32, u32)> = (0..PROBES).map(|i| (p + i, 1)).collect();
-    q.push((p - 700, 300));
-    out.push(rows_of(
-        gpu,
-        &prepare(gpu, kernels, st, pool, &q),
-        0,
-        PROBES,
-    ));
-    out.push(rows_of(
-        gpu,
-        &prepare(gpu, kernels, st, pool, &[(p, PROBES)]),
-        0,
-        PROBES,
-    ));
-    out.push(rows_of(
-        gpu,
-        &prepare(gpu, kernels, st, pool, &[(p - 150, 300)]),
-        150,
-        PROBES,
-    ));
-    out.push(rows_of(
-        gpu,
-        &prepare(gpu, kernels, st, pool, &[(p - 1000, 2048)]),
-        1000,
-        PROBES,
-    ));
+    for (queries, first) in scenario_queries(p) {
+        let call = prepare(gpu, kernels, st, pool, &queries);
+        out.push(rows_of(gpu, &call, first, PROBES));
+    }
     out
 }
 
@@ -822,7 +831,7 @@ fn matrix(
     structures: &[Structure],
     pools: &[Pool],
     contexts: &[u32],
-) -> bool {
+) -> Vec<String> {
     let per = usize_of(PROBES * NQ * HEAD_DIM_VO);
     println!("\n## Bitwise matrix: probe rows p..p+3 against `decode` (one launch per row)\n");
     println!(
@@ -836,9 +845,12 @@ fn matrix(
         SCENARIOS[3],
         "ref worst"
     );
-    let mut control = 0usize;
+    // Positive controls the executor failed: (layer, p, scenario).
+    let mut missed = Vec::new();
+    let mut required = 0usize;
     for pool in pools {
         for &p in contexts {
+            let controls = scenario_queries(p).map(|(q, _)| control_required(pool.kind, &q));
             let want: Vec<f32> = (0..PROBES).flat_map(|i| pool.reference(p + i)).collect();
             for st in structures {
                 if st.split > 0 && pool.kind == Kind::Sliding {
@@ -847,11 +859,14 @@ fn matrix(
                 let got = scenarios(gpu, kernels, st, pool, p);
                 let mut cells = Vec::new();
                 let mut json_cells = Vec::new();
-                for (name, rows) in SCENARIOS.iter().zip(&got[1..]) {
+                for ((name, rows), &control) in SCENARIOS.iter().zip(&got[1..]).zip(&controls) {
                     assert_eq!(rows.len(), per);
                     let (n, worst) = diff(&got[0], rows);
-                    if st.family == Family::Executor {
-                        control += n;
+                    if st.family == Family::Executor && control {
+                        required += 1;
+                        if n == 0 {
+                            missed.push(format!("{} p={p} {name}", pool.kind.name()));
+                        }
                     }
                     cells.push(if n == 0 {
                         "=".to_owned()
@@ -894,30 +909,51 @@ fn matrix(
         }
     }
     println!(
-        "\ncontrol: the executor's rows differ from its own decode rows in {control} elements"
+        "\ncontrol: {} of {required} required executor cells differ from its decode rows",
+        required - missed.len()
     );
-    control > 0
+    missed
 }
 
-/// Microseconds per call, `iters` calls enqueued behind `head_start`.
-fn time_us(gpu: &Gpu, iters: usize, head_start: &Call, call: &Call) -> f64 {
+/// Device microseconds per call: the median, p10 and p90 of `iters` calls
+/// enqueued back to back behind `head_start`, each bracketed by its own pair
+/// of events (consecutive calls share one), so the device runs them without
+/// host gaps whatever the host's launch rate.
+fn time_us(gpu: &Gpu, iters: usize, head_start: &Call, call: &Call) -> Timing {
     call.fire(gpu);
     gpu.synchronize().unwrap();
     let ctx = gpu.context();
-    let start = ctx
-        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
-        .unwrap();
-    let end = ctx
-        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
-        .unwrap();
+    let events: Vec<_> = (0..=iters)
+        .map(|_| {
+            ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+                .unwrap()
+        })
+        .collect();
     head_start.fire(gpu);
-    start.record(gpu.stream()).unwrap();
-    for _ in 0..iters {
+    events[0].record(gpu.stream()).unwrap();
+    for e in &events[1..] {
         call.fire(gpu);
+        e.record(gpu.stream()).unwrap();
     }
-    end.record(gpu.stream()).unwrap();
-    let ms = start.elapsed_ms(&end).unwrap();
-    f64::from(ms) * 1000.0 / iters as f64
+    let mut us: Vec<f64> = events
+        .windows(2)
+        .map(|w| f64::from(w[0].elapsed_ms(&w[1]).unwrap()) * 1000.0)
+        .collect();
+    us.sort_by(f64::total_cmp);
+    // The sample at `percent` of the sorted run, to the nearest index.
+    let at = |percent: usize| us[(percent * (us.len() - 1) + 50) / 100];
+    Timing {
+        median: at(50),
+        p10: at(10),
+        p90: at(90),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Timing {
+    median: f64,
+    p10: f64,
+    p90: f64,
 }
 
 /// A step's sequences: (first query position, queries).
@@ -964,7 +1000,9 @@ fn timing(
     let executor = &structures[0];
     let head = prepare(gpu, kernels, executor, &pools[0], &[(4096, 2048)]);
     let shapes = shapes(contexts);
-    println!("\n## Device time per layer call (us), mean of {iters} back-to-back calls\n");
+    println!(
+        "\n## Device time per layer call (us): median of {iters} back-to-back calls (p10 / p90 in the JSON lines)\n"
+    );
     let mut header = format!("{:<8} {:<16} {:>6}", "layer", "shape", "ctx");
     for st in structures {
         header += &format!(" {:>22}", st.name);
@@ -981,13 +1019,16 @@ fn timing(
                     continue;
                 }
                 let call = prepare(gpu, kernels, st, pool, queries);
-                let us = time_us(gpu, iters, &head, &call);
+                let t = time_us(gpu, iters, &head, &call);
+                let us = t.median;
                 table[pi][ti][si] = Some(us);
                 line += &format!(" {us:>22.1}");
                 println!(
-                    "{{\"section\": \"timing\", \"structure\": \"{}\", \"layer\": \"{}\", \"shape\": \"{label}\", \"context\": {c}, \"us\": {us:.2}}}",
+                    "{{\"section\": \"timing\", \"structure\": \"{}\", \"layer\": \"{}\", \"shape\": \"{label}\", \"context\": {c}, \"us\": {us:.2}, \"p10_us\": {:.2}, \"p90_us\": {:.2}}}",
                     st.name,
-                    pool.kind.name()
+                    pool.kind.name(),
+                    t.p10,
+                    t.p90
                 );
             }
             println!("{line}");
@@ -1082,15 +1123,18 @@ fn main() {
     structures.push(Structure::new("w4-k2", Family::FourWarp, false, 0));
     structures.push(Structure::new("w4-k2+anchor", Family::FourWarp, true, 0));
 
-    let mut teeth = true;
+    let mut missed = Vec::new();
     if want_matrix {
-        teeth = matrix(&gpu, &kernels, &structures, &pools, &contexts);
+        missed = matrix(&gpu, &kernels, &structures, &pools, &contexts);
     }
     if want_timing {
         timing(&gpu, &kernels, &structures, &pools, &contexts, iters);
     }
-    if !teeth {
-        eprintln!("the executor's own rows never differed: the matrix has no teeth");
+    if !missed.is_empty() {
+        eprintln!("the matrix has no teeth: these executor cells must differ and did not:");
+        for m in &missed {
+            eprintln!("  {m}");
+        }
         std::process::exit(1);
     }
 }
@@ -1224,6 +1268,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every scenario is a required positive control on both layer kinds
+    /// at the default contexts: each moves the probe rows off the decode
+    /// row's query tile.
+    #[test]
+    fn every_scenario_is_a_required_control() {
+        for p in [1037, 4101, 16389] {
+            for kind in [Kind::Global, Kind::Sliding] {
+                for (i, (q, first)) in scenario_queries(p).iter().enumerate() {
+                    assert!(control_required(kind, q), "{kind:?} {}", SCENARIOS[i]);
+                    // The probes are rows `first ..` of the step, at `p ..`.
+                    let mut row = 0;
+                    let mut found = None;
+                    for &(start, n) in q {
+                        if (start..start + n).contains(&p) {
+                            found = Some(row + p - start);
+                            break;
+                        }
+                        row += n;
+                    }
+                    assert_eq!(found, Some(*first), "{}", SCENARIOS[i]);
+                }
+            }
+        }
+        assert!(!control_required(Kind::Sliding, &[(5000, 2)]));
     }
 
     /// The executor's tile rule.
