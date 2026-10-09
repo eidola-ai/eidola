@@ -6,10 +6,12 @@
 //! - against the CPU reference executor (`eidola-engine-cpu`, the oracle for
 //!   drafting): both engines run the same workload in lockstep at every draft
 //!   width; while their outputs agree every step's drafts are compared row by
-//!   row, and a draft that differs must be within [`MARGIN`] logits of the
-//!   CPU drafter's argmax at that depth and position (the GPU's quantization
-//!   tolerance); every greedy output is within [`MARGIN`] of the f32
-//!   reference's argmax, and both acceptance rates are printed;
+//!   row, and a greedy row's draft that differs must be within [`MARGIN`]
+//!   logits of the CPU drafter's argmax at that depth and position (the GPU's
+//!   quantization tolerance; a seeded draft is a draw, so its trail is
+//!   printed apart and not bounded); every greedy output is within
+//!   [`MARGIN`] of the f32 reference's argmax, and both acceptance rates are
+//!   printed;
 //! - greedy speculation never changes greedy output: drafted and undrafted
 //!   runs on the GPU produce the same tokens, unless the undrafted run's own
 //!   logits put the two candidates within [`NEAR_TIE`] of each other (the
@@ -473,7 +475,11 @@ fn drafted_steps_match_the_cpu_executor() {
         let w = workload(&env.text);
         let mut g = Run::new(gpu, 16, true, w.clone());
         let mut c = Run::new(cpu, 16, true, w.clone());
-        let (mut lockstep, mut compared, mut agreed, mut worst) = (true, 0usize, 0usize, 0f32);
+        let (mut lockstep, mut compared, mut agreed) = (true, 0usize, 0usize);
+        // The worst trail of a differing draft, over greedy rows (asserted
+        // within `MARGIN`) and seeded rows (a seeded draft is a draw, so its
+        // trail is reported, not bounded) apart.
+        let (mut worst_greedy, mut worst_seeded) = (0f32, 0f32);
         let mut zero_checks = 0;
         while !g.done() || !c.done() {
             let ge = if g.done() { Vec::new() } else { g.step() };
@@ -503,14 +509,16 @@ fn drafted_steps_match_the_cpu_executor() {
                             .2[..SAMPLEABLE as usize];
                         let max = logits.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
                         let trail = max - logits[gt as usize];
-                        worst = worst.max(trail);
                         if crr.sampling.is_greedy() {
+                            worst_greedy = worst_greedy.max(trail);
                             assert!(
                                 trail <= MARGIN,
                                 "D {depths} slot {} at {p}: draft {} trails the CPU's by {trail}",
                                 gr.slot,
                                 i + 1
                             );
+                        } else {
+                            worst_seeded = worst_seeded.max(trail);
                         }
                         // Later drafts continue from different tokens.
                         break;
@@ -527,7 +535,7 @@ fn drafted_steps_match_the_cpu_executor() {
         assert_eq!(g.cached[&3], c.cached[&3], "the same hit on both executors");
         let (gs, cs) = (g.eng.stats(), c.eng.stats());
         println!(
-            "D {depths}: drafts agreeing with the CPU's {agreed}/{compared} (worst greedy trail {worst:.3}); \
+            "D {depths}: drafts agreeing with the CPU's {agreed}/{compared} (worst trail: greedy {worst_greedy:.3}, seeded {worst_seeded:.3}); \
              {n} greedy tokens, {exact} the reference argmax, worst trail {trail:.3}; \
              GPU accepted {}/{} drafts, CPU {}/{}; GPU acceptance per depth {:?}, CPU {:?}; \
              {zero_checks} zero checks",
