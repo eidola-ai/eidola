@@ -110,6 +110,10 @@
       "sha256": "10d4c6cdc6bd1ac6d8e2f62342196e7ea06c0b5e0ce95544b6e3591af069d1e7"
     },
     {
+      "path": "csrc/deepgemm_fp8_fp4_grouped_variants.cu",
+      "sha256": "dd1669f67233b2d75494e0d12acc93c155987b58c21ec48b1e10fb2de598f219"
+    },
+    {
       "path": "csrc/eidola_kernel.cuh",
       "sha256": "1981aeed1a06e214fdb23c4723dfeac389c76d0df311fc31a4295a2627a399fb"
     },
@@ -131,7 +135,7 @@
     },
     {
       "path": "csrc/kernels.json",
-      "sha256": "8f94d86f6f47c1850568e6394ac9454ea4b0d3fc1281a76acc4d40f3f4418327"
+      "sha256": "845c00b3d73c61c9a04bc5fd530d17c93d7f45183900b626859077f68dd2ca37"
     },
     {
       "path": "csrc/rmsnorm.cu",
@@ -398,6 +402,207 @@
         "UTCBAR": 10,
         "UTCCP": 10,
         "UTCQMMA": 32
+      }
+    },
+    {
+      "name": "deepgemm_fp8_fp4_grouped_variants",
+      "arch": "sm_100a",
+      "source": "csrc/deepgemm_fp8_fp4_grouped_variants.cu",
+      "profile": "deepgemm",
+      "file": "cubin/deepgemm_fp8_fp4_grouped_variants.sm_100a.cubin",
+      "sha256": "a56ffb576941eab0cb01a8f3cfbf1a2829d262b9d6249661f1ba816eb100faf8",
+      "size": 585888,
+      "entries": [
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj32ELj128ELj128ELj256ELj128ELj128ELj128ELj11ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)32, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)11, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m32s11_down_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj10ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)10, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s10_down_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj1ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s8c1_down_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s8_down_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj32ELj128ELj128ELj256ELj128ELj128ELj128ELj11ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)32, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)11, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m32s11_gate_up_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj10ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)10, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s10_gate_up_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj1ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s8c1_gate_up_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s8_gate_up_meta"
+        }
+      ],
+      "meta": [
+        "eidola_deepgemm_variant_m32s11_down_meta",
+        "eidola_deepgemm_variant_m32s11_gate_up_meta",
+        "eidola_deepgemm_variant_m64s10_down_meta",
+        "eidola_deepgemm_variant_m64s10_gate_up_meta",
+        "eidola_deepgemm_variant_m64s8_down_meta",
+        "eidola_deepgemm_variant_m64s8_gate_up_meta",
+        "eidola_deepgemm_variant_m64s8c1_down_meta",
+        "eidola_deepgemm_variant_m64s8c1_gate_up_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 24,
+        "UTCBAR": 40,
+        "UTCCP": 40,
+        "UTCQMMA": 128
+      }
+    },
+    {
+      "name": "deepgemm_fp8_fp4_grouped_variants",
+      "arch": "sm_100f",
+      "source": "csrc/deepgemm_fp8_fp4_grouped_variants.cu",
+      "profile": "deepgemm",
+      "file": "cubin/deepgemm_fp8_fp4_grouped_variants.sm_100f.cubin",
+      "sha256": "97de3cbff74af6131be204ff099fbbf1d2b4db85b896f34dc218a4e8f75f7453",
+      "size": 585888,
+      "entries": [
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj32ELj128ELj128ELj256ELj128ELj128ELj128ELj11ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)32, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)11, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m32s11_down_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj10ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)10, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s10_down_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj1ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s8c1_down_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s8_down_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj32ELj128ELj128ELj256ELj128ELj128ELj128ELj11ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)32, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)11, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m32s11_gate_up_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj10ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)10, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s10_gate_up_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj1ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s8c1_gate_up_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s8_gate_up_meta"
+        }
+      ],
+      "meta": [
+        "eidola_deepgemm_variant_m32s11_down_meta",
+        "eidola_deepgemm_variant_m32s11_gate_up_meta",
+        "eidola_deepgemm_variant_m64s10_down_meta",
+        "eidola_deepgemm_variant_m64s10_gate_up_meta",
+        "eidola_deepgemm_variant_m64s8_down_meta",
+        "eidola_deepgemm_variant_m64s8_gate_up_meta",
+        "eidola_deepgemm_variant_m64s8c1_down_meta",
+        "eidola_deepgemm_variant_m64s8c1_gate_up_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 24,
+        "UTCBAR": 40,
+        "UTCCP": 40,
+        "UTCQMMA": 128
+      }
+    },
+    {
+      "name": "deepgemm_fp8_fp4_grouped_variants",
+      "arch": "sm_103a",
+      "source": "csrc/deepgemm_fp8_fp4_grouped_variants.cu",
+      "profile": "deepgemm",
+      "file": "cubin/deepgemm_fp8_fp4_grouped_variants.sm_103a.cubin",
+      "sha256": "759e675c4702e76df9566b5f334fc69a7096c9765ee8225ec5608763db3f450e",
+      "size": 585888,
+      "entries": [
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj32ELj128ELj128ELj256ELj128ELj128ELj128ELj11ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)32, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)11, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m32s11_down_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj10ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)10, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s10_down_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj1ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s8c1_down_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s8_down_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj32ELj128ELj128ELj256ELj128ELj128ELj128ELj11ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)32, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)11, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m32s11_gate_up_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj10ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)10, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s10_gate_up_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj1ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)1, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s8c1_gate_up_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj64ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)64, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_variant_m64s8_gate_up_meta"
+        }
+      ],
+      "meta": [
+        "eidola_deepgemm_variant_m32s11_down_meta",
+        "eidola_deepgemm_variant_m32s11_gate_up_meta",
+        "eidola_deepgemm_variant_m64s10_down_meta",
+        "eidola_deepgemm_variant_m64s10_gate_up_meta",
+        "eidola_deepgemm_variant_m64s8_down_meta",
+        "eidola_deepgemm_variant_m64s8_gate_up_meta",
+        "eidola_deepgemm_variant_m64s8c1_down_meta",
+        "eidola_deepgemm_variant_m64s8c1_gate_up_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 24,
+        "UTCBAR": 40,
+        "UTCCP": 40,
+        "UTCQMMA": 128
       }
     },
     {
@@ -1165,6 +1370,16 @@
       "file": "fatbin/deepgemm_fp8_fp4_grouped.fatbin",
       "sha256": "f3bd19f7385c3ad2c873876f336cc89862cb4a181a81b883a552ff0d3a611903",
       "size": 304312,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "deepgemm_fp8_fp4_grouped_variants",
+      "file": "fatbin/deepgemm_fp8_fp4_grouped_variants.fatbin",
+      "sha256": "afb2fe95878476ec9006df0db818bd6426e60cbe2dc456368de8f85b7a8be062",
+      "size": 1172008,
       "archs": [
         "sm_100a",
         "sm_103a"

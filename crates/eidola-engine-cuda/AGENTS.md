@@ -11,7 +11,7 @@ The CUDA executor for the MiMo-V2.6 engine: the serving core's `Executor` on one
 | `weights.rs` | The checkpoint on the device in kernel layouts (no dequantization), MTP layers for the draft depth. |
 | `kv.rs` | `KvStore`: KV pools per group (each with a pad block past the seam's ids; the drafter's laid out by layer, with boundary taps), device block tables with a host mirror, per-slot state, `Zero`/`Copy`/`ResetSlot`. |
 | `gemm.rs` | CUTLASS FP8-blockwise and BF16 GEMMs: their `Params` built in Rust. |
-| `moe_gemm.rs` | DeepGEMM FP8 × MXFP4 grouped GEMM (the psum layout): its TMA descriptors built in Rust. |
+| `moe_gemm.rs` | DeepGEMM FP8 × MXFP4 grouped GEMM (the psum layout): its TMA descriptors built in Rust; the bench-only variants (`MoeVariant`). |
 | `attention.rs` | FlashInfer FA2 sink attention: `PagedParams` mirror and the per-step work list. |
 | `sampler.rs` | The device sampler and chain acceptance (host-plan and device-side launches). |
 | `engine_ops.rs` | Wrappers for our own kernels (`engine_ops.cu`), and the decode path's launch geometry (`RouterForm`, `EXECUTOR_ROUTER`, `router_scores_grid`, `router_select_grid` and the cluster forms' `router_grid`, `gather_grid`, `swiglu_grid`, `combine_grid`, `qkv_grid`, `copy_grid`). |
@@ -197,6 +197,40 @@ cargo run --release -p eidola-engine-cuda --example moe_kernel_bench -- "$EIDOLA
 ```
 
 Then the logprobs of the eval prompts of at most 128 tokens and greedy `generate` (graphs on) against the previous engine, byte for byte, and the step cost: `decode_bench` at every width and mixed steps of zero or one decode row beside an extend.
+
+### Where the grouped GEMMs' time goes
+
+The two grouped GEMMs are the largest share of GPU time on the B300: about 52–57 % of a pure decode step at 32–64 rows and 36–52 % of a mixed step (about 248 µs a layer at 64 decode rows, 452 µs in a 634-token step). Their cost is weight streaming. An expert holds 8 MiB of FP4 gate/up weights plus 512 KiB of UE8M0 scales, and 4 MiB plus 256 KiB for down: 12.75 MiB a layer, 3.19 GiB for all 256 experts. Every expert a step reaches is streamed whole whatever its row count (32 blocks of N for each projection), so with synthetic routing that reaches every expert the pair costs a flat 595–633 µs from 128 to 2,048 tokens: 5.4–5.7 TB/s of weight bytes, about 70 % of the part's 8 TB/s nominal HBM bandwidth. At 64 decode rows the synthetic routing reaches about 225 experts and costs 502 µs, which puts the measured 248 µs of real decode at roughly 110 experts a layer (inferred: the counts were not read back).
+
+How the executor's instance streams them (from DeepGEMM's kernel and scheduler at the pinned commit):
+
+- **Cluster.** The two CTAs of a cluster take adjacent 128-row N blocks of the same expert and the same 128-row M block, and one 2-CTA UMMA (M = 256 weight rows, N = the block's rows rounded up to 16) consumes both. The activations are what is shared (multicast on A: each CTA loads half the block's rows); the weights are not, and each N block's weights are read once per M block. The persistent scheduler hands block `i · 148 + cta` to each CTA, walking the experts in order and each expert's N blocks in groups of 16, so the 148 CTAs stream about 4.6 experts at a time.
+- **Pipeline.** A stage holds, per CTA, a 128 × 128 FP4 weight tile (8 KiB from HBM, which the TMA unpacks to one byte per element: 16 KiB of shared memory), its scales (512 B), 64 rows of A (8 KiB from L2, whatever the expert's real row count) and their scales. Eight stages keep about 70 KB of HBM reads in flight per SM, 10 MB over the part; at the measured 39 GB/s per SM that is a round trip of about 1.8 µs a stage, well above HBM's unloaded latency, which is what a stream limited by bytes in flight looks like (inferred). The instance cannot hold more stages: 213,820 of the 232,448 bytes a block can have, and a stage is 25,600.
+- **The FP4 unpack** costs no instructions (the TMA does it, `16U4_ALIGN16B`), but it doubles the weights' shared-memory footprint, which is what caps the stages; the MMA runs at the FP8 rate (`kind::f8f6f4`), which decode does not approach.
+- **The tail** is small: at decode the blocks are 32 per reached expert, so about 110 experts is 23.8 rounds of the 148 CTAs, and the partial last round costs at most about 4 %.
+
+An upper bound for this access pattern is what a plain device-to-device copy reaches on the same part (the bench prints it); streaming kernels typically reach 85–90 % of nominal, so about 15–25 % of headroom is plausible (inferred). SGLang's baseline runs this same DeepGEMM kernel with DeepGEMM's own heuristics (`moe_runner_backend=deep_gemm`), which choose this instance's tiling for these shapes, so it is at the same point (inferred; no per-kernel measurement of it exists here).
+
+**Experimental variants** (`deepgemm_fp8_fp4_grouped_variants`, `moe_gemm::MoeVariant`; the executor keeps its instance). Each is the executor's instance with a few template arguments changed:
+
+| Variant | Block M | Cluster | Stages | What it tests | Prediction | Bits |
+|---|---|---|---|---|---|---|
+| `m64s8` | 64 | 2 | 8 | half the A tile per stage, same stages | within ±3 % at decode (separates block M from stages) | expected identical |
+| `m64s10` | 64 | 2 | 10 | 25 % more weight bytes in flight | 8–15 % faster at 8–64 rows if bytes in flight bound it; slower than base wherever experts exceed 64 rows (a second M block re-reads the weights) | expected identical |
+| `m32s11` | 32 | 2 | 11 | 37 % more bytes in flight | more than `m64s10` at 8–32 rows; loses wherever experts exceed 32 rows (skewed decode, every prefill) | expected identical |
+| `m64s8c1` | 64 | 1 | 8 | no 2-CTA lockstep (each SM waits only on its own weight tile), A loaded per CTA | 0–5 % if the paired CTAs' coupling costs anything | not guaranteed (1-CTA vs 2-CTA UMMA) |
+
+"Expected identical": every output element is the same block-scaled dot product over the same K order; only the MMA's N and which rows share a block change, which the psum layout's narrowed last blocks already showed to leave rows bit-identical. The bench checks it rather than assuming it. A smaller block M needs runs aligned to it, so the bench places each variant's layout on the host (`engine_ops::expert_placement_aligned`, `psum_rows_aligned`); the executor's device placement stays 128-aligned. A winner would become the executor's instance for the token counts where it wins (a launch is already a function of the rung), with the layout's alignment following it.
+
+```sh
+# Decode-like counts on the router's routing, then on a skewed routing (64 rows reach ~106 experts), then prefill-like counts.
+cargo run --release -p eidola-engine-cuda --example moe_kernel_bench -- "$EIDOLA_ENGINE_KERNELS_DIR" \
+  --gemm-only --variants --tokens 8,32,64
+cargo run --release -p eidola-engine-cuda --example moe_kernel_bench -- "$EIDOLA_ENGINE_KERNELS_DIR" \
+  --gemm-only --variants --skew 1.4 --tokens 8,32,64
+cargo run --release -p eidola-engine-cuda --example moe_kernel_bench -- "$EIDOLA_ENGINE_KERNELS_DIR" \
+  --gemm-only --variants --tokens 256,512,1024,2048
+```
 
 ## Numerics
 

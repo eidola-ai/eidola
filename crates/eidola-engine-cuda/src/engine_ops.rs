@@ -850,9 +850,16 @@ pub const EXPERT_BLOCK_ROWS: usize = crate::moe_gemm::BLOCK_M as usize;
 /// over the 256 experts: every pair, plus up to 127 padding rows for each
 /// expert some pair reaches, rounded up to a whole block.
 pub fn psum_rows(tokens: usize, top_k: usize) -> usize {
+    psum_rows_aligned(tokens, top_k, EXPERT_BLOCK_ROWS)
+}
+
+/// [`psum_rows`] for runs aligned to `align` rows (an instance with that
+/// block M): every pair, plus up to `align - 1` padding rows for each expert
+/// some pair reaches, rounded up to a whole block.
+pub fn psum_rows_aligned(tokens: usize, top_k: usize, align: usize) -> usize {
     let n = tokens * top_k;
     let experts = crate::support::EXPERTS;
-    (n + n.min(experts) * (EXPERT_BLOCK_ROWS - 1)).div_ceil(EXPERT_BLOCK_ROWS) * EXPERT_BLOCK_ROWS
+    (n + n.min(experts) * (align - 1)).div_ceil(align) * align
 }
 
 /// `eidola_moe_permute` on the host: the placement it computes for
@@ -862,6 +869,13 @@ pub fn psum_rows(tokens: usize, top_k: usize) -> usize {
 /// previous run's end rounded up to [`EXPERT_BLOCK_ROWS`], and its word is
 /// the end of its pairs. Pairs keep their order within an expert.
 pub fn expert_placement(topk_ids: &[i32]) -> (Vec<i32>, Vec<i32>) {
+    expert_placement_aligned(topk_ids, EXPERT_BLOCK_ROWS)
+}
+
+/// [`expert_placement`] with every run starting on a multiple of `align`
+/// rows: the layout an instance with block M `align` reads (the kernel
+/// bench's variants; `eidola_moe_permute` places for the executor's 128).
+pub fn expert_placement_aligned(topk_ids: &[i32], align: usize) -> (Vec<i32>, Vec<i32>) {
     let experts = crate::support::EXPERTS;
     let expert = |id: i32| usize::try_from(id).ok().filter(|&e| e < experts);
     let mut counts = vec![0usize; experts];
@@ -876,7 +890,7 @@ pub fn expert_placement(topk_ids: &[i32]) -> (Vec<i32>, Vec<i32>) {
     for e in 0..experts {
         next[e] = start;
         grouped[e] = i32::try_from(start + counts[e]).expect("an expert layout within i32 rows");
-        start += counts[e].div_ceil(EXPERT_BLOCK_ROWS) * EXPERT_BLOCK_ROWS;
+        start += counts[e].div_ceil(align) * align;
     }
     let row_of = topk_ids
         .iter()
@@ -1154,7 +1168,7 @@ mod tests {
     /// `g`'s rows run from the previous end rounded up to 128 to its own end;
     /// the scheduler subtracts those in `u32`, so an end below the previous
     /// run's rounded end would wrap: refused here.
-    fn psum_blocks(ends: &[i32]) -> Vec<(usize, usize, usize)> {
+    fn psum_blocks(ends: &[i32], block_m: usize) -> Vec<(usize, usize, usize)> {
         let mut blocks = Vec::new();
         let mut first = 0usize;
         for (g, &end) in ends.iter().enumerate() {
@@ -1163,17 +1177,17 @@ mod tests {
                 end >= first,
                 "group {g} ends at {end}, before its start {first}"
             );
-            let n = (end - first).div_ceil(128);
+            let n = (end - first).div_ceil(block_m);
             for b in 0..n {
-                let row = first + b * 128;
+                let row = first + b * block_m;
                 let rows = if b + 1 == n {
                     (end - row).div_ceil(16) * 16
                 } else {
-                    128
+                    block_m
                 };
                 blocks.push((g, row, rows));
             }
-            first = end.div_ceil(128) * 128;
+            first = end.div_ceil(block_m) * block_m;
         }
         blocks
     }
@@ -1208,9 +1222,17 @@ mod tests {
     /// expert; no two blocks overlap (no expert's output lands in another's
     /// rows); nothing is computed past the layout's bound; and the blocks are
     /// exactly each expert's ceil(count / 128), so the work follows the
-    /// routed rows. Pairs keep their order within an expert.
+    /// routed rows. Pairs keep their order within an expert. The same holds
+    /// for the kernel bench's variants with block M 64 and 32 over
+    /// placements aligned to it.
     #[test]
     fn psum_placement_matches_the_psum_scheduler() {
+        for block_m in [128usize, 64, 32] {
+            psum_placement_matches_the_psum_scheduler_at(block_m);
+        }
+    }
+
+    fn psum_placement_matches_the_psum_scheduler_at(block_m: usize) {
         for (tokens, spread) in [
             (1usize, 256usize),
             (16, 256),
@@ -1224,9 +1246,13 @@ mod tests {
         ] {
             let top_k = 8;
             let ids = ids(tokens as u64 * 31 + spread as u64, tokens, top_k, spread);
-            let (row_of, ends) = expert_placement(&ids);
-            let bound = psum_rows(tokens, top_k);
-            let blocks = psum_blocks(&ends);
+            let (row_of, ends) = expert_placement_aligned(&ids, block_m);
+            if block_m == EXPERT_BLOCK_ROWS {
+                assert_eq!((row_of.clone(), ends.clone()), expert_placement(&ids));
+            }
+            let bound = psum_rows_aligned(tokens, top_k, block_m);
+            assert!(bound.is_multiple_of(block_m));
+            let blocks = psum_blocks(&ends, block_m);
             let mut owner = vec![None; bound];
             for &(g, first, rows) in &blocks {
                 for (r, o) in owner.iter_mut().enumerate().skip(first).take(rows) {
@@ -1250,7 +1276,7 @@ mod tests {
                 last[e] = Some(r);
                 counts[e] += 1;
             }
-            let want: usize = counts.iter().map(|c| c.div_ceil(128)).sum();
+            let want: usize = counts.iter().map(|c| c.div_ceil(block_m)).sum();
             assert_eq!(blocks.len(), want, "{tokens}/{spread}: blocks");
         }
     }
@@ -1273,6 +1299,14 @@ mod tests {
             let used = last.div_ceil(128) * 128;
             assert!(used <= psum_rows(tokens, top_k), "{tokens}: {used} rows");
             assert!(psum_rows(tokens, top_k).is_multiple_of(128));
+            for align in [64usize, 32] {
+                let (_, ends) = expert_placement_aligned(&ids, align);
+                let last = usize::try_from(*ends.last().unwrap()).unwrap();
+                let used = last.div_ceil(align) * align;
+                let bound = psum_rows_aligned(tokens, top_k, align);
+                assert!(used <= bound, "{tokens}/{align}: {used} rows");
+                assert!(bound.is_multiple_of(align));
+            }
         }
         assert_eq!(
             psum_rows(129, 8),
