@@ -1668,6 +1668,17 @@ mod tests {
                 }) > reserve
             );
         }
+        // Pinned deployments draft three tokens: with the drafter pool in the
+        // KV budget and the larger reserve, 64 GiB of KV still fits beside
+        // Flash's checkpoint, and the device is still the bound.
+        let drafting_reserve = cuda_device_reserve_bytes(&drafting);
+        assert!(cuda_kv_min_bytes(&drafting, &cache) < 64 << 30);
+        let fits_drafting =
+            |kv: u64| check_resources(&drafting, &cache, &cuda(kv), FLASH_PACK, 65_536, 8);
+        assert!(fits_drafting(64 << 30).is_ok());
+        let room = SUPPORTED_GPU_MEMORY_BYTES - FLASH_PACK - drafting_reserve;
+        assert!(fits_drafting(room).is_ok());
+        assert!(fits_drafting(room + 1).is_err());
         let fits = |kv: u64, weights: u64, gpus: u64| {
             check_resources(&sizing, &cache, &cuda(kv), weights, 65_536, gpus)
         };
@@ -2011,7 +2022,7 @@ mod tests {
             (env::MAX_SEQS, "64"),
             (env::MAX_BATCHED_TOKENS, "8192"),
             (env::MAX_PREFILL_CHUNK, "4096"),
-            (env::DRAFT_TOKENS, "0"),
+            (env::DRAFT_TOKENS, "3"),
             (env::MAX_REQUESTS, "8"),
             (env::PREFIX_CACHE, "true"),
             (env::CACHE_IDLE_TTL_SECS, "900"),
