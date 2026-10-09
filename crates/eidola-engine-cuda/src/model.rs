@@ -160,6 +160,9 @@ struct Scratch {
     // MoE
     topk_ids: CudaSlice<i32>,
     topk_w: CudaSlice<f32>,
+    /// The router's choices and scores between its two launches
+    /// (`engine_ops::router_scores_len`).
+    router_scores: CudaSlice<f32>,
     row_of: CudaSlice<i32>,
     grouped: CudaSlice<i32>,
     ea: CudaSlice<u8>,
@@ -215,6 +218,7 @@ pub(crate) struct ScratchSizes {
     attn: usize,
     gu: usize,
     topk: usize,
+    router_scores: usize,
     eah: usize,
     esf: usize,
     egu: usize,
@@ -303,6 +307,7 @@ impl ScratchSizes {
             prod(&[max_tokens, nq, 128])?,
             prod(&[tp, 2, dense_i])?,
             prod(&[max_tokens, top_k])?,
+            prod(&[2, max_tokens, experts])?,
             prod(&[erows, h])?,
             prod(&[h / 512, erows4])?,
             prod(&[erows, 2, inter])?,
@@ -323,6 +328,7 @@ impl ScratchSizes {
             attn,
             gu,
             topk,
+            router_scores,
             eah,
             esf,
             egu,
@@ -343,6 +349,7 @@ impl ScratchSizes {
             attn,
             gu,
             topk,
+            router_scores,
             eah,
             esf,
             egu,
@@ -398,6 +405,7 @@ impl GpuModel {
             attn,
             gu,
             topk,
+            router_scores,
             eah,
             esf,
             egu,
@@ -434,6 +442,7 @@ impl GpuModel {
             ffn_out: s.alloc_zeros(tph)?,
             topk_ids: s.alloc_zeros(topk)?,
             topk_w: s.alloc_zeros(topk)?,
+            router_scores: s.alloc_zeros(router_scores)?,
             row_of: s.alloc_zeros(topk)?,
             grouped: s.alloc_zeros(experts.max(1))?,
             ea: s.alloc_zeros(eah)?,
@@ -1276,6 +1285,7 @@ unsafe fn layer(
                     gpu,
                     dptr(&sc.topk_ids, &s),
                     p(&sc.topk_w),
+                    p(&sc.router_scores),
                     p(&sc.x),
                     dptr(&m.router, &s),
                     dptr(&m.bias, &s),
@@ -1584,5 +1594,13 @@ mod tests {
         assert_eq!(moe.gu, 1, "no dense layer, no SwiGLU buffer");
         assert_eq!(dense.gu, both.gu);
         assert!(dense.gu > 1);
+        // The router's scratch holds a choice and a score per (token, expert)
+        // at the step capacity, and exists only with expert layers.
+        assert_eq!(
+            Some(moe.router_scores),
+            crate::engine_ops::router_scores_len(8192, 256)
+        );
+        assert_eq!(moe.router_scores, both.router_scores);
+        assert_eq!(dense.router_scores, 1);
     }
 }

@@ -49,34 +49,39 @@ fn out_of_range_launches_are_refused() {
             "top_k"
         );
         assert!(
-            ops.router_topk(gpu, 0, 0, 0, 0, 0, 1, 4096, 300, 8, 1.0)
+            ops.router_topk(gpu, 0, 0, 0, 0, 0, 0, 1, 4096, 300, 8, 1.0)
                 .is_err(),
             "experts"
         );
         assert!(
-            ops.router_topk(gpu, 0, 0, 0, 0, 0, 1, 4096, 256, 9, 1.0)
+            ops.router_topk(gpu, 0, 0, 0, 0, 0, 0, 1, 4096, 256, 9, 1.0)
                 .is_err(),
             "top_k"
         );
         assert!(
-            ops.router_topk(gpu, 0, 0, 0, 0, 0, 1, 4097, 256, 8, 1.0)
+            ops.router_topk(gpu, 0, 0, 0, 0, 0, 0, 1, 4097, 256, 8, 1.0)
                 .is_err(),
             "hidden past the staged row"
         );
         assert!(
-            ops.router_topk(gpu, 0, 0, 0, 0, 0, 1, 4000, 256, 8, 1.0)
+            ops.router_topk(gpu, 0, 0, 0, 0, 0, 0, 1, 4000, 256, 8, 1.0)
                 .is_err(),
             "hidden not whole chunks"
         );
         assert!(
-            ops.router_topk(gpu, 0, 0, 8, 0, 0, 1, 4096, 256, 8, 1.0)
+            ops.router_topk(gpu, 0, 0, 0, 8, 0, 0, 1, 4096, 256, 8, 1.0)
                 .is_err(),
             "rows unaligned"
         );
         assert!(
-            ops.router_topk(gpu, 0, 0, 0, 8, 0, 64, 4096, 256, 8, 1.0)
+            ops.router_topk(gpu, 0, 0, 0, 0, 8, 0, 64, 4096, 256, 8, 1.0)
                 .is_err(),
             "weights unaligned"
+        );
+        assert!(
+            ops.router_topk(gpu, 0, 0, 2, 0, 0, 0, 1, 4096, 256, 8, 1.0)
+                .is_err(),
+            "scores scratch unaligned"
         );
         assert!(
             ops.moe_permute(gpu, 0, 0, 0, 200, 8, 33_664).is_err(),
