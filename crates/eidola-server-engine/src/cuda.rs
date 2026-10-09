@@ -326,7 +326,6 @@ mod tests {
                 group(AttentionKind::Sliding { window: 128 }, 39, 8),
             ],
             max_draft_tokens: 0,
-            draft_step_tokens: 0,
             num_state_slots: 8,
             buckets: vec![Bucket {
                 max_seqs: 8,

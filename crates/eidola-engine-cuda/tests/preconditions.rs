@@ -24,27 +24,27 @@ fn out_of_range_launches_are_refused() {
         );
         assert!(ops.swiglu_quant_f32scale(gpu, 0, 0, 0, 4, 200, 4).is_err());
         assert!(
-            ops.swiglu_quant_ue8m0(gpu, 0, 0, 0, 0, 1, 4, 4, 1000, 4, 0)
+            ops.swiglu_quant_ue8m0(gpu, 0, 0, 0, 0, 1, 4, 4, 1000, 4)
                 .is_err(),
             "not whole words"
         );
         assert!(
-            ops.swiglu_quant_ue8m0(gpu, 0, 0, 0, 0, 1, 8, 130, 2048, 4, 128)
+            ops.swiglu_quant_ue8m0(gpu, 0, 0, 0, 0, 1, 8, 8, 2048, 10)
                 .is_err(),
-            "rows not whole experts"
+            "rows4 not a multiple of 4"
         );
         assert!(
-            ops.swiglu_quant_ue8m0(gpu, 0, 0, 0, 0, 2, 8, 8, 2048, 8, 0)
+            ops.swiglu_quant_ue8m0(gpu, 0, 0, 0, 0, 2, 8, 8, 2048, 8)
                 .is_err(),
             "more pairs than rows"
         );
         assert!(
-            ops.gather_quant_ue8m0(gpu, 0, 0, 0, 0, 1, 8, 8, 4096, 4, 0)
+            ops.gather_quant_ue8m0(gpu, 0, 0, 0, 0, 1, 8, 8, 4096, 4)
                 .is_err(),
             "rows4 below rows"
         );
         assert!(
-            ops.gather_quant_ue8m0(gpu, 0, 0, 0, 0, 1, 9, 16, 4096, 16, 0)
+            ops.gather_quant_ue8m0(gpu, 0, 0, 0, 0, 1, 9, 16, 4096, 16)
                 .is_err(),
             "top_k"
         );
@@ -79,8 +79,8 @@ fn out_of_range_launches_are_refused() {
             "weights unaligned"
         );
         assert!(
-            ops.moe_permute(gpu, 0, 0, 0, 200, 8, 128, 0).is_err(),
-            "masked capacity"
+            ops.moe_permute(gpu, 0, 0, 0, 200, 8, 33_664).is_err(),
+            "rows below the layout's bound"
         );
         assert!(
             ops.moe_combine(gpu, 0, 0, 0, 0, 1, 4096, 0).is_err(),

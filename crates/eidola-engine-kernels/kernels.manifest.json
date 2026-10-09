@@ -107,7 +107,7 @@
     },
     {
       "path": "csrc/deepgemm_fp8_fp4_grouped.cu",
-      "sha256": "1e7d5756cddf3fef3b70a2ef1ab4080be73fe69b6548aa1eeb4396ed71521e04"
+      "sha256": "10d4c6cdc6bd1ac6d8e2f62342196e7ea06c0b5e0ce95544b6e3591af069d1e7"
     },
     {
       "path": "csrc/eidola_kernel.cuh",
@@ -115,15 +115,15 @@
     },
     {
       "path": "csrc/engine_ops.cu",
-      "sha256": "d6013e23e8bf151ab1237d39b97ac013ef2b4c8c47be1428861a4e77c376987b"
+      "sha256": "c819e06640e24b0a1724cb234cac526a4d72d5d2d9dee54587e147dff66f4bf5"
     },
     {
       "path": "csrc/engine_ops_common.cuh",
-      "sha256": "1f21863c7b784238d11bae970bfdfa5a46d67f2c0bfc0d7d87facc1e705f93cf"
+      "sha256": "00778cb94b7cedb631e56ba53df989c7744a4072d6a7ad4029272237512e116e"
     },
     {
       "path": "csrc/engine_ops_reference.cu",
-      "sha256": "5b5d2c568c0c5946a721ee05e5478b9e170fffa35a5ee07ea91c09eb1875586d"
+      "sha256": "89d7aaae868bac02d0e9d6d2f380e7230fe169394d219b64bceb5085b0825395"
     },
     {
       "path": "csrc/flashinfer_fa2_sink_paged.cu",
@@ -131,7 +131,7 @@
     },
     {
       "path": "csrc/kernels.json",
-      "sha256": "8adbaee728f46b320046529d90caca63abcd80e2e860f6c91e1bc649d9e92e14"
+      "sha256": "8f94d86f6f47c1850568e6394ac9454ea4b0d3fc1281a76acc4d40f3f4418327"
     },
     {
       "path": "csrc/rmsnorm.cu",
@@ -313,23 +313,13 @@
       "source": "csrc/deepgemm_fp8_fp4_grouped.cu",
       "profile": "deepgemm",
       "file": "cubin/deepgemm_fp8_fp4_grouped.sm_100a.cubin",
-      "sha256": "e9ec42243756b906bff4c93ec761c85f13b808c4ff268780dec5cea8329b2eac",
-      "size": 306064,
+      "sha256": "8f87addf2ad7acc20af4ec054edf2ccbf0d6ee1726ef795d0641c3b7d2548fc9",
+      "size": 152040,
       "entries": [
-        {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE2ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)2, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_masked_down_meta"
-        },
         {
           "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
           "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
           "meta": "eidola_deepgemm_fp8_fp4_psum_down_meta"
-        },
-        {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE2ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)2, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_masked_gate_up_meta"
         },
         {
           "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
@@ -338,16 +328,14 @@
         }
       ],
       "meta": [
-        "eidola_deepgemm_fp8_fp4_masked_down_meta",
-        "eidola_deepgemm_fp8_fp4_masked_gate_up_meta",
         "eidola_deepgemm_fp8_fp4_psum_down_meta",
         "eidola_deepgemm_fp8_fp4_psum_gate_up_meta"
       ],
       "mma_sass": {
-        "UTCATOMSWS": 12,
-        "UTCBAR": 20,
-        "UTCCP": 20,
-        "UTCQMMA": 64
+        "UTCATOMSWS": 6,
+        "UTCBAR": 10,
+        "UTCCP": 10,
+        "UTCQMMA": 32
       }
     },
     {
@@ -356,23 +344,13 @@
       "source": "csrc/deepgemm_fp8_fp4_grouped.cu",
       "profile": "deepgemm",
       "file": "cubin/deepgemm_fp8_fp4_grouped.sm_100f.cubin",
-      "sha256": "cb8aff03428b0bf0a9fb23c7ad3ff9c81c974be6d148cb111e952c90b41b278d",
-      "size": 306064,
+      "sha256": "cf7048d7468c80047b61d7fafc8c275a0e5b5b1668db8156e71284ab04ab6b76",
+      "size": 152040,
       "entries": [
-        {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE2ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)2, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_masked_down_meta"
-        },
         {
           "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
           "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
           "meta": "eidola_deepgemm_fp8_fp4_psum_down_meta"
-        },
-        {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE2ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)2, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_masked_gate_up_meta"
         },
         {
           "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
@@ -381,16 +359,14 @@
         }
       ],
       "meta": [
-        "eidola_deepgemm_fp8_fp4_masked_down_meta",
-        "eidola_deepgemm_fp8_fp4_masked_gate_up_meta",
         "eidola_deepgemm_fp8_fp4_psum_down_meta",
         "eidola_deepgemm_fp8_fp4_psum_gate_up_meta"
       ],
       "mma_sass": {
-        "UTCATOMSWS": 12,
-        "UTCBAR": 20,
-        "UTCCP": 20,
-        "UTCQMMA": 64
+        "UTCATOMSWS": 6,
+        "UTCBAR": 10,
+        "UTCCP": 10,
+        "UTCQMMA": 32
       }
     },
     {
@@ -399,23 +375,13 @@
       "source": "csrc/deepgemm_fp8_fp4_grouped.cu",
       "profile": "deepgemm",
       "file": "cubin/deepgemm_fp8_fp4_grouped.sm_103a.cubin",
-      "sha256": "f7c594f395c3a9e8c159537c2890136b1a13d4cc40917dabd2fe882577576715",
-      "size": 306064,
+      "sha256": "03635ce127c67264eb360f0ae6ef60a7cb200777525c24b41d3bc1a6dbcb3c4d",
+      "size": 152040,
       "entries": [
-        {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE2ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)2, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_masked_down_meta"
-        },
         {
           "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
           "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
           "meta": "eidola_deepgemm_fp8_fp4_psum_down_meta"
-        },
-        {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE2ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)2, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_masked_gate_up_meta"
         },
         {
           "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
@@ -424,16 +390,14 @@
         }
       ],
       "meta": [
-        "eidola_deepgemm_fp8_fp4_masked_down_meta",
-        "eidola_deepgemm_fp8_fp4_masked_gate_up_meta",
         "eidola_deepgemm_fp8_fp4_psum_down_meta",
         "eidola_deepgemm_fp8_fp4_psum_gate_up_meta"
       ],
       "mma_sass": {
-        "UTCATOMSWS": 12,
-        "UTCBAR": 20,
-        "UTCCP": 20,
-        "UTCQMMA": 64
+        "UTCATOMSWS": 6,
+        "UTCBAR": 10,
+        "UTCCP": 10,
+        "UTCQMMA": 32
       }
     },
     {
@@ -442,8 +406,8 @@
       "source": "csrc/engine_ops.cu",
       "profile": "own",
       "file": "cubin/engine_ops.sm_100a.cubin",
-      "sha256": "4b81440bc076d0a09a4dea3e96701f7ce9806be1b611fa8405c9c2e0b150bb10",
-      "size": 340104,
+      "sha256": "5fecdb19428ef82cda36e8a288ca19966f2ea97acda2d8397362dde32e5c9a9c",
+      "size": 338696,
       "entries": [
         {
           "symbol": "eidola_add_bf16",
@@ -546,8 +510,8 @@
       "source": "csrc/engine_ops.cu",
       "profile": "own",
       "file": "cubin/engine_ops.sm_100f.cubin",
-      "sha256": "f27131cd8dfd3cfd64b014f4a5395b9ffb7c3d7caadc05dbde8a22afdcd4651a",
-      "size": 340104,
+      "sha256": "c3e443f3d5d21b31fdd42f34002fde3d606a805ded375510054c21d0e38d8773",
+      "size": 338696,
       "entries": [
         {
           "symbol": "eidola_add_bf16",
@@ -650,8 +614,8 @@
       "source": "csrc/engine_ops.cu",
       "profile": "own",
       "file": "cubin/engine_ops.sm_103a.cubin",
-      "sha256": "4008c273d7b37dab731fb667dd8bd0087a54ccb6c17fe7f936c356b684fc954c",
-      "size": 340104,
+      "sha256": "167fcc30fa27da9c5edb98cfd74e4cee5da72ca2378fec933636777856e3d172",
+      "size": 338696,
       "entries": [
         {
           "symbol": "eidola_add_bf16",
@@ -754,8 +718,8 @@
       "source": "csrc/engine_ops_reference.cu",
       "profile": "own",
       "file": "cubin/engine_ops_reference.sm_100a.cubin",
-      "sha256": "33808c9f82497b6697f16646db3eeeefd54dc53263924df8d336f76d5d372957",
-      "size": 80960,
+      "sha256": "7310946ed44432e3a3b0283d7c76011c52d3587c7eb23fb36bf1127ebf552727",
+      "size": 79744,
       "entries": [
         {
           "symbol": "eidola_reference_gather_quant_ue8m0",
@@ -798,8 +762,8 @@
       "source": "csrc/engine_ops_reference.cu",
       "profile": "own",
       "file": "cubin/engine_ops_reference.sm_100f.cubin",
-      "sha256": "3101d3d72bc786fe92577658d3fad654c1b9278f8cbcd04ebd5fff0846e6908a",
-      "size": 80960,
+      "sha256": "e1948595d417eb13c7a48a275d81237f59a2f0db5429b41f97dd336fcebb0f69",
+      "size": 79744,
       "entries": [
         {
           "symbol": "eidola_reference_gather_quant_ue8m0",
@@ -842,8 +806,8 @@
       "source": "csrc/engine_ops_reference.cu",
       "profile": "own",
       "file": "cubin/engine_ops_reference.sm_103a.cubin",
-      "sha256": "c023dad96ffb85703da1912c1ba3741a409d943a13c3bc50113b04f92928809b",
-      "size": 80960,
+      "sha256": "e34f9643f925d4042169bc62944d9df17d4a73c113407140323a593fb5eb9ef8",
+      "size": 79744,
       "entries": [
         {
           "symbol": "eidola_reference_gather_quant_ue8m0",
@@ -1163,8 +1127,8 @@
     {
       "name": "deepgemm_fp8_fp4_grouped",
       "file": "fatbin/deepgemm_fp8_fp4_grouped.fatbin",
-      "sha256": "9587221dbee63bead729150dda66fe51fcca2e9c21ff9d6c17b2294d50220186",
-      "size": 612360,
+      "sha256": "f3bd19f7385c3ad2c873876f336cc89862cb4a181a81b883a552ff0d3a611903",
+      "size": 304312,
       "archs": [
         "sm_100a",
         "sm_103a"
@@ -1173,8 +1137,8 @@
     {
       "name": "engine_ops",
       "file": "fatbin/engine_ops.fatbin",
-      "sha256": "a56a44020ef5f70f4a38a4169522d8419dcc0d8c3ba0945276205ce02b347579",
-      "size": 680440,
+      "sha256": "b8f526c9755d3df5b50510dc1c8d1005d289c1e2970ccc2bbff71f00b3c1e30a",
+      "size": 677624,
       "archs": [
         "sm_100a",
         "sm_103a"
@@ -1183,8 +1147,8 @@
     {
       "name": "engine_ops_reference",
       "file": "fatbin/engine_ops_reference.fatbin",
-      "sha256": "06cdab8146dde94141112b7583fb858ae7d438a38a242fa955aac074f396b772",
-      "size": 162152,
+      "sha256": "2de62fb456375188aa863aaa4347430547c15766530978d977a5cd1e801762c3",
+      "size": 159720,
       "archs": [
         "sm_100a",
         "sm_103a"

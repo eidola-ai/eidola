@@ -156,7 +156,7 @@ fn main() {
     let (ladder, capture) = match (ex.decode_graphs(), ex.draft_graphs()) {
         (Some(g), _) => (g.ladder().to_vec(), g.capture_bytes().to_vec()),
         (_, Some(g)) => {
-            // Every width's rungs are captured; this bench runs width `depths`.
+            // Widths 0 and `depths` are captured; this bench runs `depths`.
             let bytes = g
                 .rungs()
                 .into_iter()

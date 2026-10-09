@@ -41,12 +41,11 @@
 //! that drafted at least `d` tokens in a step and had their first `d - 1`
 //! accepted (`tests/common/draft_tally.rs`, shared with `tests/drafting.rs`).
 //! Rows are counted from what the executor was asked to draft, so a row that
-//! drafted nothing (a prefill, a step narrowed to width 0) or fewer than `d`
-//! tokens (narrowed by the serving core to stay in the masked expert layout)
-//! is outside depth `d`'s denominator, not a rejection there. A second
-//! line gives each depth's counts and the width distribution of sampled
-//! decode rows (with sampled prefill rows apart), so narrowing is visible; the
-//! first line's totals are the engine's own accepted/drafted.
+//! drafted nothing (a prefill, a step that ran short of KV) or fewer than `d`
+//! tokens (trimmed near the model length) is outside depth `d`'s denominator,
+//! not a rejection there. A second line gives each depth's counts and the
+//! width distribution of sampled decode rows (with sampled prefill rows
+//! apart); the first line's totals are the engine's own accepted/drafted.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};

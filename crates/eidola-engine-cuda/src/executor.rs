@@ -307,10 +307,6 @@ impl CudaExecutor {
             max_model_len: cfg.max_model_len,
             kv_groups,
             max_draft_tokens: cfg.draft_tokens,
-            // A target pass of at most this many tokens takes the masked
-            // expert layout, past it the psum one (`AGENTS.md` → Drafting:
-            // the limit stays until the psum layout's step cost is measured).
-            draft_step_tokens: crate::model::MASKED_TOKENS,
             num_state_slots: cfg.num_state_slots,
             buckets: cfg.buckets.clone(),
         };
@@ -1048,9 +1044,9 @@ impl CudaExecutor {
         // A uniform drafted decode step that fits a rung replays (or runs
         // directly) padded to it.
         let path = self.decode_path.get();
-        // Every row one host token, sampled, at one draft width (any of `0
-        // ..= depths`: the serving core narrows it), past the first `depths`
-        // positions so every depth has its rows.
+        // Every row one host token, sampled, at one draft width (a captured
+        // one: `draft::draft_ladders`), past the first `depths` positions so
+        // every depth has its rows.
         let width = rows.first().map_or(0, |r| r.k);
         let uniform = !rows.is_empty()
             && rows

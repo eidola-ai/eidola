@@ -271,10 +271,9 @@ impl EngineOps {
         rows: u32,
         inter: u32,
         rows4: u32,
-        cap: u32,
     ) -> Result<()> {
         require(
-            inter > 0 && inter.is_multiple_of(512) && sfa_layout_ok(rows, rows4, cap),
+            inter > 0 && inter.is_multiple_of(512) && sfa_layout_ok(rows, rows4),
             "swiglu (UE8M0): intermediate must be whole 512-wide words and the scale layout cover the rows",
         )?;
         let grid = pair_grid(tokens, top_k, inter, rows)?;
@@ -291,8 +290,7 @@ impl EngineOps {
                 gu,
                 row_of,
                 inter,
-                rows4,
-                cap
+                rows4
             )
         }
     }
@@ -404,8 +402,8 @@ impl EngineOps {
 
     /// Expert-major placement of `tokens × top_k` routed pairs
     /// ([`expert_placement`] is its host form): `row_of` per pair, and the
-    /// grouped layout, 256 words, in the psum layout (`cap == 0`, every run
-    /// within `rows_bound` rows) or the masked one (`cap` rows per expert).
+    /// psum layout's grouped layout, 256 words, every run within
+    /// `rows_bound` rows.
     pub unsafe fn moe_permute(
         &self,
         gpu: &Gpu,
@@ -414,19 +412,13 @@ impl EngineOps {
         topk_ids: u64,
         tokens: u32,
         top_k: u32,
-        cap: u32,
         rows_bound: u32,
     ) -> Result<()> {
         require(
             (1..=crate::support::MAX_TOP_K).contains(&(top_k as usize))
-                && (if cap == 0 {
-                    rows_bound as usize >= psum_rows(tokens as usize, top_k as usize)
-                        && i32::try_from(rows_bound).is_ok()
-                } else {
-                    cap >= tokens
-                }),
-            "permute: at most 8 experts per token; a masked expert holds every token; \
-             the psum layout's rows hold every run",
+                && rows_bound as usize >= psum_rows(tokens as usize, top_k as usize)
+                && i32::try_from(rows_bound).is_ok(),
+            "permute: at most 8 experts per token; the layout's rows hold every run",
         )?;
         unsafe {
             launch!(
@@ -437,8 +429,7 @@ impl EngineOps {
                 row_of,
                 topk_ids,
                 tokens,
-                top_k,
-                cap
+                top_k
             )
         }
     }
@@ -458,10 +449,9 @@ impl EngineOps {
         rows: u32,
         k: u32,
         rows4: u32,
-        cap: u32,
     ) -> Result<()> {
         require(
-            k > 0 && k.is_multiple_of(512) && sfa_layout_ok(rows, rows4, cap),
+            k > 0 && k.is_multiple_of(512) && sfa_layout_ok(rows, rows4),
             "gather_quant: K must be whole 512-wide words and the scale layout cover the rows",
         )?;
         let grid = pair_grid(tokens, top_k, k, rows)?;
@@ -479,8 +469,7 @@ impl EngineOps {
                 row_of,
                 top_k,
                 k,
-                rows4,
-                cap
+                rows4
             )
         }
     }
@@ -730,12 +719,10 @@ pub fn psum_rows(tokens: usize, top_k: usize) -> usize {
 /// `eidola_moe_permute` on the host: the placement it computes for
 /// `topk_ids` (the router's ids, `top_k` per token). Returns `row_of` (-1 for
 /// an id outside the 256 experts, which the kernel leaves unwritten) and the
-/// grouped layout (256 words): with `cap == 0` the psum layout (expert `e`'s
-/// run starts at the previous run's end rounded up to
-/// [`EXPERT_BLOCK_ROWS`]; its word is the end of its pairs), otherwise the
-/// masked one (expert `e`'s rows from `e × cap`; its word is its count).
-/// Pairs keep their order within an expert.
-pub fn expert_placement(topk_ids: &[i32], cap: u32) -> (Vec<i32>, Vec<i32>) {
+/// psum layout's grouped layout (256 words): expert `e`'s run starts at the
+/// previous run's end rounded up to [`EXPERT_BLOCK_ROWS`], and its word is
+/// the end of its pairs. Pairs keep their order within an expert.
+pub fn expert_placement(topk_ids: &[i32]) -> (Vec<i32>, Vec<i32>) {
     let experts = crate::support::EXPERTS;
     let expert = |id: i32| usize::try_from(id).ok().filter(|&e| e < experts);
     let mut counts = vec![0usize; experts];
@@ -748,13 +735,8 @@ pub fn expert_placement(topk_ids: &[i32], cap: u32) -> (Vec<i32>, Vec<i32>) {
     let mut grouped = vec![0i32; experts];
     let mut start = 0usize;
     for e in 0..experts {
-        next[e] = if cap == 0 { start } else { e * cap as usize };
-        let word = if cap == 0 {
-            start + counts[e]
-        } else {
-            counts[e]
-        };
-        grouped[e] = i32::try_from(word).expect("an expert layout within i32 rows");
+        next[e] = start;
+        grouped[e] = i32::try_from(start + counts[e]).expect("an expert layout within i32 rows");
         start += counts[e].div_ceil(EXPERT_BLOCK_ROWS) * EXPERT_BLOCK_ROWS;
     }
     let row_of = topk_ids
@@ -778,14 +760,10 @@ fn require(ok: bool, what: &str) -> Result<()> {
     }
 }
 
-/// The packed UE8M0 scale layouts (`sfa_index` in `engine_ops.cu`): `[K/512][rows4]`
-/// for the contiguous layout, `[rows / cap][K/512][cap]` for the masked one.
-fn sfa_layout_ok(rows: u32, rows4: u32, cap: u32) -> bool {
-    if cap == 0 {
-        rows4 >= rows && rows4.is_multiple_of(4)
-    } else {
-        rows.is_multiple_of(cap) && cap.is_multiple_of(4)
-    }
+/// The packed UE8M0 scale layout (`sfa_index` in `engine_ops.cu`):
+/// `[K/512][rows4]`.
+fn sfa_layout_ok(rows: u32, rows4: u32) -> bool {
+    rows4 >= rows && rows4.is_multiple_of(4)
 }
 
 #[cfg(test)]
@@ -925,29 +903,21 @@ mod tests {
     }
 
     /// One block per routed pair and 512-wide word, whatever the layout's
-    /// row count: decode launches scale with the tokens, not the experts'
-    /// capacity.
+    /// row count (every pair plus the padding of each expert reached):
+    /// launches scale with the tokens, not the layout's padding.
     #[test]
     fn pair_grid_is_one_block_per_pair_and_word() {
-        let masked_rows = 256 * 128;
-        for tokens in [1u32, 2, 7, 64, 128] {
+        for tokens in [1u32, 2, 7, 64, 128, 129, 513, 8192] {
+            let rows = u32::try_from(psum_rows(tokens as usize, 8)).unwrap();
             assert_eq!(
-                pair_grid(tokens, 8, 4096, masked_rows).unwrap(),
+                pair_grid(tokens, 8, 4096, rows).unwrap(),
                 [tokens * 8, 8, 1],
                 "gather, {tokens} tokens"
             );
             assert_eq!(
-                pair_grid(tokens, 8, 2048, masked_rows).unwrap(),
+                pair_grid(tokens, 8, 2048, rows).unwrap(),
                 [tokens * 8, 4, 1],
                 "swiglu, {tokens} tokens"
-            );
-        }
-        // Psum layouts hold every pair plus padding.
-        for tokens in [129u32, 513, 8192] {
-            let rows = u32::try_from(psum_rows(tokens as usize, 8)).unwrap();
-            assert_eq!(
-                pair_grid(tokens, 8, 4096, rows).unwrap(),
-                [tokens * 8, 8, 1]
             );
         }
         assert_eq!(pair_grid(0, 8, 4096, 0).unwrap(), [0, 8, 1]);
@@ -1041,7 +1011,7 @@ mod tests {
         ] {
             let top_k = 8;
             let ids = ids(tokens as u64 * 31 + spread as u64, tokens, top_k, spread);
-            let (row_of, ends) = expert_placement(&ids, 0);
+            let (row_of, ends) = expert_placement(&ids);
             let bound = psum_rows(tokens, top_k);
             let blocks = psum_blocks(&ends);
             let mut owner = vec![None; bound];
@@ -1085,7 +1055,7 @@ mod tests {
             for i in 0..n {
                 ids.push(i32::try_from(i % experts).unwrap());
             }
-            let (_, ends) = expert_placement(&ids, 0);
+            let (_, ends) = expert_placement(&ids);
             let last = usize::try_from(*ends.last().unwrap()).unwrap();
             let used = last.div_ceil(128) * 128;
             assert!(used <= psum_rows(tokens, top_k), "{tokens}: {used} rows");
@@ -1098,17 +1068,11 @@ mod tests {
         );
     }
 
-    /// The masked placement: expert `e`'s rows from `e × cap`, its word its
-    /// count; an id outside the experts is placed nowhere and counted for
-    /// none, in either layout.
+    /// An id outside the experts is placed nowhere and counted for none.
     #[test]
-    fn masked_placement_and_stray_ids() {
+    fn stray_ids_are_placed_nowhere() {
         let ids = [3, 7, 3, -1, 256, 7, 3, 0];
-        let (row_of, counts) = expert_placement(&ids, 128);
-        assert_eq!(row_of, [384, 896, 385, -1, -1, 897, 386, 0]);
-        assert_eq!((counts[0], counts[3], counts[7]), (1, 3, 2));
-        assert_eq!(counts.iter().sum::<i32>(), 6);
-        let (row_of, ends) = expert_placement(&ids, 0);
+        let (row_of, ends) = expert_placement(&ids);
         assert_eq!(row_of, [128, 256, 129, -1, -1, 257, 130, 0]);
         assert_eq!(
             (ends[0], ends[2], ends[3], ends[7], ends[255]),

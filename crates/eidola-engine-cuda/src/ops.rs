@@ -110,6 +110,6 @@ mod tests {
                 seen += 1;
             }
         }
-        assert_eq!(seen, 12);
+        assert_eq!(seen, 6, "two instances, three images");
     }
 }

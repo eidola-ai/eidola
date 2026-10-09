@@ -30,7 +30,7 @@ use crate::gemm::{Gemm, GemmArgs, GemmKind};
 use crate::kv::{GroupGeometry, KvStore};
 use crate::launch::{dptr, dptr_at};
 use crate::module::{ImageSource, KernelModule};
-use crate::moe_gemm::{BLOCK_M, MoeGemm, MoeGemmArgs, MoeLayout, MoeProj};
+use crate::moe_gemm::{BLOCK_M, MoeGemm, MoeGemmArgs, MoeProj};
 use crate::sampler::Sampler;
 use crate::weights::{AttentionWeights, DenseFfn, Ffn, ModelWeights, MoeFfn};
 use crate::{CudaError, Gpu, Result, narrow};
@@ -177,13 +177,6 @@ struct Scratch {
 /// Floats per position in a RoPE table (32 cos, 32 sin).
 const ROPE_TABLE_WIDTH: usize = 64;
 
-/// Masked layout (decode-sized batches): rows per expert, and the most
-/// tokens a forward runs it for.
-const MASKED_CAP: usize = 128;
-const MASKED_CAP32: u32 = 128;
-pub(crate) const MASKED_TOKENS: u32 = MASKED_CAP32;
-const _: () = assert!(MASKED_CAP32 as usize == MASKED_CAP);
-
 fn round_up(x: usize, m: usize) -> usize {
     x.div_ceil(m) * m
 }
@@ -293,7 +286,7 @@ impl ScratchSizes {
             let padded = prod(&[n.min(experts), BLOCK_M as usize - 1])?
                 .checked_add(n)
                 .ok_or_else(overflow)?;
-            up(padded, BLOCK_M as usize)?.max(prod(&[experts, MASKED_CAP])?)
+            up(padded, BLOCK_M as usize)?
         } else {
             1
         };
@@ -1292,17 +1285,7 @@ unsafe fn layer(
                     m.top_k,
                     m.scaling,
                 )?;
-                let masked = t <= MASKED_CAP;
-                let (layout, rows, cap) = if masked {
-                    (
-                        MoeLayout::Masked,
-                        m.experts as usize * MASKED_CAP,
-                        MASKED_CAP32,
-                    )
-                } else {
-                    let r = crate::engine_ops::psum_rows(t, m.top_k as usize);
-                    (MoeLayout::Psum, r, 0)
-                };
+                let rows = crate::engine_ops::psum_rows(t, m.top_k as usize);
                 let rows4: u32 = narrow(round_up(rows, 4), "padded expert rows")?;
                 let rows32: u32 = narrow(rows, "expert rows")?;
                 ops.moe_permute(
@@ -1312,7 +1295,6 @@ unsafe fn layer(
                     dptr(&sc.topk_ids, &s),
                     t32,
                     m.top_k,
-                    cap,
                     rows32,
                 )?;
                 ops.gather_quant_ue8m0(
@@ -1326,15 +1308,12 @@ unsafe fn layer(
                     rows32,
                     h32,
                     rows4,
-                    cap,
                 )?;
-                let gemm_m = if masked { MASKED_CAP32 } else { rows32 };
                 k.moe.launch(
                     gpu,
                     &MoeGemmArgs {
-                        layout,
                         proj: MoeProj::GateUp,
-                        m: gemm_m,
+                        m: rows32,
                         grouped_layout: dptr(&sc.grouped, &s),
                         a: dptr(&sc.ea, &s),
                         sfa: dptr(&sc.esf, &s),
@@ -1354,14 +1333,12 @@ unsafe fn layer(
                     rows32,
                     m.inter,
                     rows4,
-                    cap,
                 )?;
                 k.moe.launch(
                     gpu,
                     &MoeGemmArgs {
-                        layout,
                         proj: MoeProj::Down,
-                        m: gemm_m,
+                        m: rows32,
                         grouped_layout: dptr(&sc.grouped, &s),
                         a: dptr(&sc.eact, &s),
                         sfa: dptr(&sc.eact_sf, &s),

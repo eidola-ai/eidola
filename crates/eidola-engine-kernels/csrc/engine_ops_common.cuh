@@ -65,12 +65,9 @@ __device__ __forceinline__ uint8_t ue8m0_for(float amax) {
 
 __device__ __forceinline__ float ue8m0_value(uint8_t b) { return exp2f(static_cast<float>(b) - 127.f); }
 
-// Index of SFA word `w` (of `words` per row) for row `r`: [words][rows4]
-// when cap == 0, else [r / cap][words][cap].
-__device__ __forceinline__ size_t sfa_index(uint32_t r, uint32_t w, uint32_t words, uint32_t rows4,
-                                            uint32_t cap) {
-  if (cap == 0) return static_cast<size_t>(w) * rows4 + r;
-  return (static_cast<size_t>(r / cap) * words + w) * cap + r % cap;
+// Index of SFA word `w` for row `r`: [words][rows4].
+__device__ __forceinline__ size_t sfa_index(uint32_t r, uint32_t w, uint32_t rows4) {
+  return static_cast<size_t>(w) * rows4 + r;
 }
 
 }  // namespace
