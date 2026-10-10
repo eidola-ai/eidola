@@ -1,7 +1,8 @@
 # A synthetic engine deployment, used by the gateway's engine-trust tests.
 # Laid out as a real one is: deploy/engine/<model>/<variant>/. Decode graphs
-# are on, the production setting, so the KV budget here is checked with the
-# pad block each pool keeps for graph replay.
+# are on and three tokens are drafted a step, the production settings, so the
+# KV budget here is checked with the pad block each pool keeps for graph
+# replay and with the drafter pool.
 cvm-version: 0.15.0@sha256:1111111111111111111111111111111111111111111111111111111111111111
 cpus: 16
 memory: 65536
@@ -37,7 +38,7 @@ containers:
       - EIDOLA_ENGINE_MAX_SEQS: "64"
       - EIDOLA_ENGINE_MAX_BATCHED_TOKENS: "8192"
       - EIDOLA_ENGINE_MAX_PREFILL_CHUNK: "4096"
-      - EIDOLA_ENGINE_DRAFT_TOKENS: "0"
+      - EIDOLA_ENGINE_DRAFT_TOKENS: "3"
       - EIDOLA_ENGINE_MAX_REQUESTS: "8"
       - EIDOLA_ENGINE_PREFIX_CACHE: "true"
       - EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS: "900"

@@ -10,10 +10,28 @@ use std::path::{Path, PathBuf};
 
 use super::manifest::{self, CheckedCachePolicy, CheckedModel, CheckedWeights};
 use super::*;
+use eidola_common::engine_deployment;
 
 const MODEL: &str = "fixture-model";
 const CONFIG: &str = "deploy/engine/fixture-model/tdx-a/tinfoil-config.yml";
 const SIDECAR: &str = "deploy/engine/fixture-model/tdx-a/deployment.json";
+
+/// The weights pack's data size in the fixture's `mpk` (`_17419419648_`).
+const FIXTURE_PACK_BYTES: u64 = 17_419_419_648;
+
+/// The fixture config's env, read by the node's own boot grammar.
+fn fixture_measured(tree: &Tree) -> engine_deployment::MeasuredConfig {
+    let text = tree.config_text();
+    let env: BTreeMap<String, String> = text
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.trim_start().strip_prefix("- ")?.split_once(": ")?;
+            Some((name.to_string(), value.trim_matches('"').to_string()))
+        })
+        .collect();
+    engine_deployment::parse_measured(&|name| env.get(name).cloned())
+        .expect("the fixture's env is one the node boots with")
+}
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -882,7 +900,7 @@ fn allocations_are_capped_and_fit_the_deployment() {
         ("EIDOLA_ENGINE_MAX_PREFILL_CHUNK", "\"4096\"", "\"65537\""),
         ("EIDOLA_ENGINE_MAX_MODEL_LEN", "\"131072\"", "\"1048577\""),
         ("EIDOLA_ENGINE_MAX_REQUESTS", "\"8\"", "\"4097\""),
-        ("EIDOLA_ENGINE_DRAFT_TOKENS", "\"0\"", "\"9\""),
+        ("EIDOLA_ENGINE_DRAFT_TOKENS", "\"3\"", "\"9\""),
         ("EIDOLA_ENGINE_KV_BLOCK_SIZE", "\"16\"", "\"1025\""),
         (
             "EIDOLA_ENGINE_KV_DEVICE_BYTES",
@@ -905,39 +923,63 @@ fn allocations_are_capped_and_fit_the_deployment() {
     let mut tree = Tree::fixture();
     tree.edit_config("MAX_REQUESTS: \"8\"", "MAX_REQUESTS: \"100\"");
     refused(&tree, "more than the VM's");
-    // Device: the KV budget holds one longest sequence and every seat's
-    // sliding windows, each pool with its pad block, at their smallest
-    // (12,228,280,320 bytes for this sizing with the prefix cache).
+    // Device: the KV budget holds one longest sequence, every seat's sliding
+    // windows and, drafting three tokens, the drafter pool of as many blocks
+    // with their boundary taps, each pool with its pad block, at their
+    // smallest (`engine_deployment::cuda_kv_min_bytes`, from the fixture's own
+    // measured sizing).
+    let measured = fixture_measured(&Tree::fixture());
+    assert_eq!(measured.sizing.draft_tokens, 3);
+    let kv_min = engine_deployment::cuda_kv_min_bytes(&measured.sizing, &measured.cache);
     let mut tree = Tree::fixture();
     tree.edit_config(
         "KV_DEVICE_BYTES: \"68719476736\"",
-        "KV_DEVICE_BYTES: \"12228280320\"",
+        &format!("KV_DEVICE_BYTES: \"{kv_min}\""),
     );
     tree.check().expect("the smallest KV budget fits");
     let mut tree = Tree::fixture();
     tree.edit_config(
         "KV_DEVICE_BYTES: \"68719476736\"",
-        "KV_DEVICE_BYTES: \"12228280319\"",
+        &format!("KV_DEVICE_BYTES: \"{}\"", kv_min - 1),
     );
-    refused(&tree, "less than the 12228280320 bytes the KV pools need");
-
-    // The device holds the KV budget, the weights (the pack's data size,
-    // 17,419,419,648 bytes here) and the executor's reserve
-    // (`engine_deployment::cuda_device_reserve_bytes`: 16,968,056,832 bytes
-    // for this sizing, 16,831,741,952 of step, expert, sampler, table and
-    // RoPE memory plus split attention's 64 tokens × 128 chunks of 16,640-byte
-    // partial rows, 136,314,880) within the B300's 287,428,640,768:
-    // 287,428,640,768 − 17,419,419,648 − 16,968,056,832 = 253,041,164,288.
+    refused(
+        &tree,
+        &format!("less than the {kv_min} bytes the KV pools need"),
+    );
+    // The undrafted minimum leaves no room for the drafter pool.
+    let undrafted = engine_deployment::Sizing {
+        draft_tokens: 0,
+        ..measured.sizing
+    };
+    let undrafted_min = engine_deployment::cuda_kv_min_bytes(&undrafted, &measured.cache);
+    assert!(undrafted_min < kv_min);
     let mut tree = Tree::fixture();
     tree.edit_config(
         "KV_DEVICE_BYTES: \"68719476736\"",
-        "KV_DEVICE_BYTES: \"253041164288\"",
+        &format!("KV_DEVICE_BYTES: \"{undrafted_min}\""),
+    );
+    refused(
+        &tree,
+        &format!("less than the {kv_min} bytes the KV pools need"),
+    );
+
+    // The device holds the KV budget, the weights (the pack's data size) and
+    // the executor's reserve (`engine_deployment::cuda_device_reserve_bytes`
+    // for this sizing, the drafter's seat rows, step tables, third group of
+    // block tables and wider partial rows included) within the B300's
+    // `SUPPORTED_GPU_MEMORY_BYTES`.
+    let reserve = engine_deployment::cuda_device_reserve_bytes(&measured.sizing);
+    let room = engine_deployment::SUPPORTED_GPU_MEMORY_BYTES - FIXTURE_PACK_BYTES - reserve;
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "KV_DEVICE_BYTES: \"68719476736\"",
+        &format!("KV_DEVICE_BYTES: \"{room}\""),
     );
     tree.check().expect("the budget fills the device exactly");
     let mut tree = Tree::fixture();
     tree.edit_config(
         "KV_DEVICE_BYTES: \"68719476736\"",
-        "KV_DEVICE_BYTES: \"253041164289\"",
+        &format!("KV_DEVICE_BYTES: \"{}\"", room + 1),
     );
     refused(&tree, "more than the NVIDIA B300 SXM6 AC's 287428640768");
     // A Flash-sized pack leaves room for 64 GiB, and not for twice that.
@@ -956,12 +998,11 @@ fn allocations_are_capped_and_fit_the_deployment() {
         "of device memory, more than the NVIDIA B300 SXM6 AC's",
     );
 
-    // A cuda deployment drafting three tokens fits: its drafter pool and the
-    // larger reserve are held to the same rules.
+    // An undrafted cuda deployment fits too: no drafter pool, and the smaller
+    // reserve.
     let mut tree = Tree::fixture();
-    tree.edit_config("DRAFT_TOKENS: \"0\"", "DRAFT_TOKENS: \"3\"");
-    tree.check()
-        .expect("a cuda deployment may draft three tokens");
+    tree.edit_config("DRAFT_TOKENS: \"3\"", "DRAFT_TOKENS: \"0\"");
+    tree.check().expect("a cuda deployment may draft nothing");
 
     // The kernels ship in the image, never in an attached mount.
     let mut tree = Tree::fixture();
