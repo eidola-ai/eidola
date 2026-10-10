@@ -26,7 +26,7 @@
 //!
 //! * **Real issuance crypto.** The mock holds a freshly generated ACT issuer
 //!   `PrivateKey` and reuses the *same* `anonymous-credit-tokens` primitives
-//!   the production server (`crates/eidola-server/src/credentials.rs`) uses —
+//!   the production server (`crates/eidola-server-gateway/src/credentials.rs`) uses —
 //!   `issue` for `/v1/account/credentials`, `refund` for the inline chat refund
 //!   and `/v1/credentials/refund`. The server's issuance handler is glued to
 //!   postgres and can't be called as a library, so this reimplements only the
@@ -147,6 +147,28 @@ pub enum ChatBehavior {
     /// and silently skips them — the deltas, the model rewrite, and the refund in
     /// the metadata event all go missing without anything failing.
     StreamingSplitDataFields,
+    /// [`ChatBehavior::StreamingWithMetadataRefund`] framed the way the Eidola
+    /// server frames every stream it answers: through its own
+    /// `eidola_server_gateway::padding::Framer`, as writes of exactly
+    /// `FRAME_BYTES`, each the events waiting plus padding (a comment event,
+    /// trailing whitespace on a JSON line, or blank lines after `[DONE]`), an
+    /// event larger than a frame carried across frames, and frames of nothing
+    /// but padding between the content deltas.
+    StreamingPadded,
+    /// [`ChatBehavior::StreamingPadded`] with **more padding than the read
+    /// ceiling** between its content deltas — what a slow answer looks like
+    /// when the frames keep coming at the frame rate. Ten megabytes of padding,
+    /// spelled here rather than imported: the mock must not learn this app's
+    /// ceilings.
+    StreamingPaddedPastReadCeiling,
+    /// A padded stream whose **answer is just under the read ceiling** —
+    /// eight megabytes less four kilobytes of events that carry data — and
+    /// whose last frames (several of nothing but padding, then the tail)
+    /// arrive coalesced into one transport chunk, as an intermediary that
+    /// buffers may deliver them. A reader that counts a transport chunk
+    /// before telling its padding from its data crosses the ceiling here;
+    /// one that counts only data does not.
+    StreamingPaddedNearReadCeiling,
     /// A plain success in **whichever transport asked** — SSE for a streaming
     /// request, JSON for a blocking one. One behaviour for a test that must
     /// exercise both twins against one upstream, which is otherwise impossible:
@@ -204,7 +226,7 @@ pub enum ChatBehavior {
     /// A **refund-bearing** non-2xx, the shape the server answers with when a
     /// streaming request fails after the nullifier is recorded but before the
     /// SSE opens — request validation, `send_stream`, a spend-proof re-encode
-    /// (`eidola-server/src/handlers.rs`: `error_response_with_refund`). The
+    /// (`eidola-server-gateway/src/handlers.rs`: `error_response_with_refund`). The
     /// credential is spent and the only copy of its refund may be in this body,
     /// because the server's own persistence of the token is best-effort.
     Non2xxWithRefund(u16),
@@ -298,7 +320,7 @@ pub enum ChatBehavior {
     /// This is the deployed shape, not an invented one. The server's request
     /// type is `deny_unknown_fields`, so an unknown member fails in the
     /// `LoggedJson` extractor, whose `Rejection` is axum's `JsonRejection`
-    /// (`crates/eidola-server/src/handlers.rs`). Axum renders `JsonDataError`
+    /// (`crates/eidola-server-gateway/src/handlers.rs`). Axum renders `JsonDataError`
     /// as `(422, String)` — **`text/plain`, not JSON** — and the handler body
     /// never runs, so no `refund` rides the response and the ACT nullifier is
     /// never recorded.
@@ -383,6 +405,22 @@ pub const ROUTER_REMOTE_MODEL: &str = "router-remote";
 pub const FLAT_MODEL: &str = "flat-priced";
 /// The flat price, in credits, [`FLAT_MODEL`] costs per request.
 pub const FLAT_PRICE: u64 = 7;
+
+/// The idle TTL [`supported_prompt_cache`] declares, in seconds.
+pub const CACHE_IDLE_TTL_SECS: i64 = 900;
+/// The maximum key age [`supported_prompt_cache`] declares, in seconds.
+pub const CACHE_MAX_AGE_SECS: i64 = 7200;
+
+/// The `prompt_cache` leaf an Eidola-hosted catalog row carries: its engine
+/// reuses a prompt prefix between requests sharing a `cache_key`, under the
+/// engine core's own default retention.
+pub fn supported_prompt_cache() -> serde_json::Value {
+    serde_json::json!({
+        "supported": true,
+        "idle_ttl_secs": CACHE_IDLE_TTL_SECS,
+        "max_age_secs": CACHE_MAX_AGE_SECS,
+    })
+}
 
 /// The head of `eidola_app_core::summaries::SUMMARY_SYSTEM_PROMPT`. Branch
 /// summaries share the router's *model*, so the mock tells the two chores apart
@@ -521,6 +559,16 @@ pub struct MockConfig {
     /// reaches this mock through a base-URL override and an override is a
     /// hint, never a declaration.
     pub declared_tool_calling: Option<bool>,
+    /// The `capabilities.prompt_cache` leaf `GET /v1/models` publishes for
+    /// [`MODEL`], verbatim. `None` — the default — publishes none, which is
+    /// every model the server sells today; [`supported_prompt_cache`] is the
+    /// leaf an Eidola-hosted row carries.
+    pub declared_prompt_cache: Option<serde_json::Value>,
+    /// Armed by a test to make the mock **stop listening** once it has served
+    /// the next `GET /v1/models` — so the turn that fetched the catalog then
+    /// meets a refused connection for its completion, the one failure that
+    /// provably sends nothing.
+    pub close_switch: CloseSwitch,
     /// List [`FLAT_MODEL`], the flat-priced entry, in the catalog. Opt-in so
     /// the listings every other test pins are unchanged.
     pub list_flat_model: bool,
@@ -545,8 +593,50 @@ impl Default for MockConfig {
             catalog_omits: catalog_omissions(),
             tool_script: tool_script(),
             declared_tool_calling: None,
+            declared_prompt_cache: None,
+            close_switch: CloseSwitch::default(),
             list_flat_model: false,
             chat_delay_ms: 0,
+        }
+    }
+}
+
+/// See [`MockConfig::close_switch`].
+#[derive(Clone, Default)]
+pub struct CloseSwitch(Arc<CloseSwitchState>);
+
+#[derive(Default)]
+struct CloseSwitchState {
+    armed: std::sync::atomic::AtomicBool,
+    tx: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>,
+    >,
+}
+
+impl CloseSwitch {
+    /// Close the listener after the next catalog fetch.
+    pub fn arm(&self) {
+        self.0.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn install(&self, tx: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>) {
+        *self.0.tx.lock().unwrap() = Some(tx);
+    }
+
+    async fn trip_if_armed(&self) {
+        if !self.0.armed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let (ack, closed) = tokio::sync::oneshot::channel();
+        let sent = self
+            .0
+            .tx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|tx| tx.send(ack).is_ok());
+        if sent == Some(true) {
+            let _ = closed.await;
         }
     }
 }
@@ -562,6 +652,10 @@ pub struct MockServer {
     /// order — lets tests assert exactly what context the client sent
     /// upstream (e.g. regenerate's upstream-only thread).
     chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    /// The exact bytes of every `POST /v1/chat/completions` body, in arrival
+    /// order — for the assertions that are about bytes rather than JSON
+    /// values (a body that must be byte-for-byte what it was before).
+    chat_raw_bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     /// Whether each `POST /v1/chat/completions` carried an `Authorization`
     /// header, in arrival order — local turns must send none (no spend).
     chat_auths: Arc<std::sync::Mutex<Vec<bool>>>,
@@ -594,6 +688,21 @@ impl MockServer {
     /// The recorded chat request bodies (see `chat_bodies`).
     pub fn chat_bodies(&self) -> Vec<serde_json::Value> {
         self.chat_bodies.lock().unwrap().clone()
+    }
+    /// The recorded chat request bodies as sent (see `chat_raw_bodies`).
+    pub fn chat_raw_bodies(&self) -> Vec<Vec<u8>> {
+        self.chat_raw_bodies.lock().unwrap().clone()
+    }
+    /// The `cache_key` each chat request carried, in arrival order.
+    pub fn chat_cache_keys(&self) -> Vec<Option<String>> {
+        self.chat_bodies()
+            .iter()
+            .map(|b| {
+                b.get("cache_key")
+                    .and_then(|k| k.as_str())
+                    .map(str::to_owned)
+            })
+            .collect()
     }
     /// Per-chat-request `Authorization` presence (see `chat_auths`).
     pub fn chat_auths(&self) -> Vec<bool> {
@@ -979,6 +1088,9 @@ impl Issuer {
 
 /// Start the mock upstream on an ephemeral loopback port.
 pub async fn start(config: MockConfig) -> MockServer {
+    let (close_tx, mut close_rx) =
+        tokio::sync::mpsc::unbounded_channel::<tokio::sync::oneshot::Sender<()>>();
+    config.close_switch.install(close_tx);
     let issuer = Arc::new(Issuer::new());
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
@@ -986,6 +1098,8 @@ pub async fn start(config: MockConfig) -> MockServer {
 
     let chat_hits = Arc::new(AtomicU64::new(0));
     let chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let chat_raw_bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let chat_auths: Arc<std::sync::Mutex<Vec<bool>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>> =
@@ -997,19 +1111,31 @@ pub async fn start(config: MockConfig) -> MockServer {
         let issuer = issuer.clone();
         let chat_hits = chat_hits.clone();
         let chat_bodies = chat_bodies.clone();
+        let chat_raw_bodies = chat_raw_bodies.clone();
         let chat_auths = chat_auths.clone();
         let chat_auth_values = chat_auth_values.clone();
         let refund_hits = refund_hits.clone();
         let models_hits = models_hits.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    Some(ack) = close_rx.recv() => {
+                        // Stop listening *before* acknowledging, so the next
+                        // connection attempt is refused rather than queued.
+                        drop(listener);
+                        let _ = ack.send(());
+                        break;
+                    }
+                };
+                let Ok((stream, _)) = accepted else {
                     break;
                 };
                 let issuer = issuer.clone();
                 let config = config.clone();
                 let chat_hits = chat_hits.clone();
                 let chat_bodies = chat_bodies.clone();
+                let chat_raw_bodies = chat_raw_bodies.clone();
                 let chat_auths = chat_auths.clone();
                 let chat_auth_values = chat_auth_values.clone();
                 let refund_hits = refund_hits.clone();
@@ -1021,6 +1147,7 @@ pub async fn start(config: MockConfig) -> MockServer {
                         config,
                         chat_hits,
                         chat_bodies,
+                        chat_raw_bodies,
                         chat_auths,
                         chat_auth_values,
                         refund_hits,
@@ -1036,6 +1163,7 @@ pub async fn start(config: MockConfig) -> MockServer {
         base_url,
         chat_hits,
         chat_bodies,
+        chat_raw_bodies,
         chat_auths,
         chat_auth_values,
         refund_hits,
@@ -1115,6 +1243,7 @@ async fn handle_conn(
     config: MockConfig,
     chat_hits: Arc<AtomicU64>,
     chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    chat_raw_bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     chat_auths: Arc<std::sync::Mutex<Vec<bool>>>,
     chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     refund_hits: Arc<AtomicU64>,
@@ -1133,6 +1262,7 @@ async fn handle_conn(
     match (req.method.as_str(), path) {
         ("GET", "/v1/models") => {
             models_hits.fetch_add(1, Ordering::SeqCst);
+            config.close_switch.trip_if_armed().await;
             match config.models_status {
                 Some(status) => {
                     write_json(&mut stream, status, r#"{"error":"models unavailable"}"#).await?;
@@ -1189,6 +1319,7 @@ async fn handle_conn(
             if let Some(body) = parsed {
                 chat_bodies.lock().unwrap().push(body);
             }
+            chat_raw_bodies.lock().unwrap().push(req.body.clone());
             chat_auths.lock().unwrap().push(req.auth.is_some());
             chat_auth_values.lock().unwrap().push(req.auth.clone());
             let parsed: serde_json::Value =
@@ -1448,6 +1579,23 @@ async fn handle_chat(
                 });
             write_sse_stream_with_metadata(stream, &[STREAM_CONTENT], refund).await
         }
+        ChatBehavior::StreamingPadded | ChatBehavior::StreamingPaddedPastReadCeiling => {
+            let refund = auth
+                .and_then(Issuer::spend_proof_from_auth)
+                .and_then(|sp| issuer.refund_for(&sp))
+                .map(|refund_b64| {
+                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex })
+                });
+            let idle_frames = if matches!(config.chat, ChatBehavior::StreamingPaddedPastReadCeiling)
+            {
+                // Ten megabytes of padding frames across the deltas below.
+                10 * 1024 * 1024 / eidola_server_gateway::padding::FRAME_BYTES / 3
+            } else {
+                2
+            };
+            write_padded_sse_stream(stream, &PADDED_CONTENT, refund, idle_frames).await
+        }
+        ChatBehavior::StreamingPaddedNearReadCeiling => write_padded_near_ceiling(stream).await,
         ChatBehavior::StreamingSplitDataFields => {
             let refund = auth
                 .and_then(Issuer::spend_proof_from_auth)
@@ -2251,6 +2399,159 @@ async fn write_sse_stream_with_metadata(
     Ok(())
 }
 
+/// The content [`ChatBehavior::StreamingPadded`] streams, one delta each;
+/// joined, [`STREAM_CONTENT`].
+pub const PADDED_CONTENT: [&str; 3] = ["Hello ", "from the ", "stream."];
+
+/// The metadata stream framed by the Eidola server's own framer, with
+/// `idle_frames` frames of nothing but padding after each content delta. See
+/// [`ChatBehavior::StreamingPadded`].
+async fn write_padded_sse_stream(
+    stream: &mut TcpStream,
+    content_chunks: &[&str],
+    refund: Option<serde_json::Value>,
+    idle_frames: usize,
+) -> std::io::Result<()> {
+    use eidola_server_gateway::padding::{FRAME_BYTES, Framer, StreamEvent};
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut framer = Framer::new(FRAME_BYTES);
+    // One write per frame, as the server's ticks write them.
+    async fn tick(stream: &mut TcpStream, framer: &mut Framer) -> std::io::Result<()> {
+        let frame = framer.frame();
+        let mut out = format!("{:x}\r\n", frame.len()).into_bytes();
+        out.extend_from_slice(&frame);
+        out.extend_from_slice(b"\r\n");
+        stream.write_all(&out).await?;
+        stream.flush().await
+    }
+
+    tick(stream, &mut framer).await?;
+    for chunk in content_chunks {
+        let content = serde_json::json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "model": STREAM_WIRE_MODEL,
+            "choices": [{ "index": 0, "delta": { "content": chunk }, "finish_reason": null }]
+        });
+        framer.push(&StreamEvent::Json(content.to_string()));
+        tick(stream, &mut framer).await?;
+        for _ in 0..idle_frames {
+            tick(stream, &mut framer).await?;
+        }
+    }
+    let finish = serde_json::json!({
+        "id": "chatcmpl-mock",
+        "object": "chat.completion.chunk",
+        "model": STREAM_WIRE_MODEL,
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+    });
+    framer.push(&StreamEvent::Json(finish.to_string()));
+    let usage = serde_json::json!({
+        "id": "chatcmpl-mock",
+        "object": "chat.completion.chunk",
+        "model": STREAM_WIRE_MODEL,
+        "choices": [],
+        "usage": { "prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16 }
+    });
+    framer.push(&StreamEvent::Json(usage.to_string()));
+    let mut metadata = serde_json::json!({
+        "object": "eidola.chat.completion.metadata",
+        "id": "chatcmpl-mock",
+        // Larger than a frame, as the server's privacy and verification
+        // metadata is, so the event crosses frames.
+        "privacy": { "note": "m".repeat(eidola_server_gateway::padding::FRAME_BYTES) },
+    });
+    if let Some(refund) = refund {
+        metadata["refund"] = refund;
+    }
+    framer.push(&StreamEvent::Json(metadata.to_string()));
+    framer.push(&StreamEvent::Done);
+    while framer.backlog() > 0 {
+        tick(stream, &mut framer).await?;
+    }
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// See [`ChatBehavior::StreamingPaddedNearReadCeiling`]. The sizes are the
+/// server's own encoding (`data: ` + JSON + a blank line), summed here.
+async fn write_padded_near_ceiling(stream: &mut TcpStream) -> std::io::Result<()> {
+    use eidola_server_gateway::padding::{FRAME_BYTES, Framer, StreamEvent};
+    // Spelled here rather than imported: the mock is the peer.
+    const TARGET: usize = 8 * 1024 * 1024 - 4096;
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+
+    let chunk = |content: &str| {
+        serde_json::json!({
+            "choices": [{ "index": 0, "delta": { "content": content }, "finish_reason": null }]
+        })
+        .to_string()
+    };
+    let encoded = |json: &str| json.len() + "data: ".len() + 2;
+    let tail = vec![
+        serde_json::json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] })
+            .to_string(),
+        serde_json::json!({
+            "choices": [],
+            "usage": { "prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16 }
+        })
+        .to_string(),
+        serde_json::json!({ "object": "eidola.chat.completion.metadata", "id": "chatcmpl-mock" })
+            .to_string(),
+    ];
+    let tail_bytes: usize =
+        tail.iter().map(|j| encoded(j)).sum::<usize>() + "data: [DONE]\n\n".len();
+    let overhead = encoded(&chunk(""));
+    let piece = 64 * 1024;
+    let mut contents = Vec::new();
+    let mut total = tail_bytes;
+    while total + overhead + piece <= TARGET {
+        contents.push("y".repeat(piece));
+        total += overhead + piece;
+    }
+    contents.push("y".repeat(TARGET - total - overhead));
+
+    let mut framer = Framer::new(FRAME_BYTES);
+    let chunked = |frames: &[u8]| {
+        let mut out = format!("{:x}\r\n", frames.len()).into_bytes();
+        out.extend_from_slice(frames);
+        out.extend_from_slice(b"\r\n");
+        out
+    };
+    for content in &contents {
+        framer.push(&StreamEvent::Json(chunk(content)));
+        while framer.backlog() > 0 {
+            stream.write_all(&chunked(&framer.frame())).await?;
+        }
+    }
+    // The last frames, coalesced: padding, then the tail.
+    let mut last = Vec::new();
+    for _ in 0..8 {
+        last.extend_from_slice(&framer.frame());
+    }
+    for json in tail {
+        framer.push(&StreamEvent::Json(json));
+    }
+    framer.push(&StreamEvent::Done);
+    while framer.backlog() > 0 {
+        last.extend_from_slice(&framer.frame());
+    }
+    stream.write_all(&chunked(&last)).await?;
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await
+}
+
 /// The metadata stream with each JSON payload split across one `data:` field
 /// per line of its pretty-printed form. See
 /// [`ChatBehavior::StreamingSplitDataFields`].
@@ -2481,6 +2782,12 @@ fn models_body(config: &MockConfig) -> String {
         });
         primary["max_output_tokens"] = serde_json::json!(4096u64);
         primary["output_budget_class"] = serde_json::json!("standard");
+    }
+    if let Some(leaf) = &config.declared_prompt_cache {
+        if primary.get("capabilities").is_none() {
+            primary["capabilities"] = serde_json::json!({});
+        }
+        primary["capabilities"]["prompt_cache"] = leaf.clone();
     }
     let router = serde_json::json!({
         "id": ROUTER_REMOTE_MODEL,

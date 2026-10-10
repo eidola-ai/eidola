@@ -1,0 +1,101 @@
+# syntax=docker/dockerfile:1@sha256:a7f5ec8c4a35a7f8cd9e6e413f59fd1bfd33f8b623c26981c684f5065dfe3044
+
+# ── base ───────────────────────────────────────────────────────────────────────
+# Environment variables, pinned toolchain digest.
+FROM stagex/pallet-rust:sx2026.09.0@sha256:6033fb215dd7c87c885dd7b1c12de42464606dcc0323fc57339318d61f010a30 AS base
+
+ARG CARGO_PROFILE=release
+
+ENV TARGET=x86_64-unknown-linux-musl
+ENV SOURCE_DATE_EPOCH=0
+ENV CARGO_INCREMENTAL=0
+ENV ZERO_AR_DATE=1
+ENV RUSTFLAGS="-C target-feature=+crt-static -C debuginfo=0 -C target-cpu=generic"
+
+WORKDIR /src
+
+# ── fetch ──────────────────────────────────────────────────────────────────────
+# Copy only manifests and create stub source files so cargo can resolve the
+# workspace. This layer is only invalidated when dependencies change, not on
+# every source edit. Dependencies are fetched and pre-compiled, with all
+# artifacts baked into the layer (no cache mounts) so they persist via
+# BuildKit's layer cache across CI runs.
+FROM base AS fetch
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY --parents crates/*/Cargo.toml ./
+
+# Stub source files so cargo can resolve all workspace members.
+# Creates both lib.rs and main.rs (for [[bin]] crates) so that cargo can
+# resolve intra-workspace library dependencies during fetch.
+RUN find . -name Cargo.toml -not -path ./Cargo.toml | while read -r manifest; do \
+      dir="$(dirname "$manifest")/src"; mkdir -p "$dir"; \
+      touch "$dir/lib.rs"; \
+      if grep -q '^\[\[bin\]\]' "$manifest"; then echo 'fn main(){}' > "$dir/main.rs"; fi; \
+    done
+
+ARG CARGO_PROFILE=release
+
+RUN cargo fetch --locked --target ${TARGET}
+
+# Pre-compile dependencies using stub sources. Compiled rlibs are baked into
+# the layer so they persist via BuildKit's layer cache. Cache mounts (the
+# previous approach) don't survive across CI runs because each run creates a
+# fresh BuildKit daemon; layer caching does survive via type=local export.
+RUN --network=none \
+    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-server-gateway
+
+# ── build ──────────────────────────────────────────────────────────────────────
+# Copy real source over the stubs and compile (no network access).
+# Cargo detects that external dependency rlibs are unchanged and only
+# recompiles workspace crates.
+FROM fetch AS build
+
+ARG CARGO_PROFILE=release
+
+COPY crates/ ./crates/
+
+# Trust-root build input: `eidola-server-gateway/build.rs` embeds the pinned Sigstore
+# trusted root (sigstore-trusted-root.json) that the runtime measurement
+# resolver (`src/upstream_trust`) verifies Tinfoil release attestations
+# against. We deliberately COPY only this one path rather than `releases/`
+# wholesale — other files in `releases/trust/` (notably `server-enclave.json`)
+# are functions of our own server image's digest and would create a circular
+# cache dependency if pulled in here. This file is external Sigstore public
+# material, so it introduces no such cycle.
+COPY releases/trust/sigstore-trusted-root.json ./releases/trust/sigstore-trusted-root.json
+
+# Engine trust inputs: `build.rs` embeds the engine deployments this gateway
+# accepts (`engine-enclaves.json`) after checking every pin against the
+# committed deployment configs under `deploy/engine/`. Neither depends on the
+# gateway's own digest, so they add no cycle either. A glob rather than
+# `deploy/engine/` so a tree without that directory still builds; the
+# build script then sees no deployments.
+COPY --parents releases/trust/engine-enclaves.json deploy/engine* ./
+
+# Ensure Cargo detects source changes over the fetch-stage stubs.
+# SOURCE_DATE_EPOCH=0 clamps COPY timestamps to epoch 0, matching the
+# stubs created in the fetch stage, so Cargo's fingerprint check sees
+# no mtime change and skips recompilation. Touching the real source
+# files gives them a current timestamp that differs from the stubs.
+RUN find crates/ -name '*.rs' -exec touch {} +
+
+RUN --network=none \
+    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-server-gateway \
+    && install -D target/${TARGET}/${CARGO_PROFILE}/eidola-server-gateway /out/eidola-server-gateway
+
+# ── install ────────────────────────────────────────────────────────────────────
+# Place binary into /rootfs.
+FROM scratch AS install
+
+COPY --from=build /out/eidola-server-gateway /rootfs/eidola-server-gateway
+
+# ── package ────────────────────────────────────────────────────────────────────
+# Final minimal image.
+FROM scratch AS package
+
+COPY --from=install /rootfs/ /
+ENV BIND_ADDR=0.0.0.0:8080
+EXPOSE 8080
+USER 65534:65534
+ENTRYPOINT ["/eidola-server-gateway"]

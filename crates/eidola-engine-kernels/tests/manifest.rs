@@ -138,8 +138,9 @@ fn mma(manifest: &Manifest, name: &str, arch: &str, family: &str) -> u64 {
 }
 
 /// The GEMMs run on Blackwell's tcgen05 tensor cores (UTC* SASS: UTCQMMA is
-/// the f8f6f4 MMA), on every target; FlashInfer's FA2 attention is the
-/// mma.sync path (HMMA), with no tcgen05 at all.
+/// the f8f6f4 MMA, UTCHMMA the 16-bit one), on every target; FlashInfer's FA2
+/// attention is the mma.sync path (HMMA), with no tcgen05 at all; our own
+/// kernels use no tensor cores.
 #[test]
 fn sass_uses_the_intended_tensor_core_path() {
     let manifest = Manifest::embedded();
@@ -151,8 +152,19 @@ fn sass_uses_the_intended_tensor_core_path() {
         let fa2 = "flashinfer_fa2_sink_paged";
         assert!(mma(manifest, fa2, arch, "HMMA") > 0, "{arch}");
         assert_eq!(mma(manifest, fa2, arch, "UTC"), 0, "{arch}");
-        let rmsnorm = manifest.cubin("rmsnorm", arch).expect("cubin");
-        assert!(rmsnorm.mma_sass.is_empty(), "rmsnorm {arch}");
+        assert!(
+            mma(manifest, "cutlass_bf16_gemm", arch, "UTCHMMA") > 0,
+            "{arch}"
+        );
+        assert_eq!(
+            mma(manifest, "cutlass_bf16_gemm", arch, "HMMA"),
+            0,
+            "{arch}"
+        );
+        for own in ["rmsnorm", "sampling", "engine_ops", "engine_ops_reference"] {
+            let cubin = manifest.cubin(own, arch).expect("cubin");
+            assert!(cubin.mma_sass.is_empty(), "{own} {arch}");
+        }
     }
 }
 
@@ -209,9 +221,15 @@ fn entries_and_meta_records() {
     let fa2 = manifest
         .cubin("flashinfer_fa2_sink_paged", "sm_103a")
         .expect("fa2");
-    for tile in [16, 64, 128] {
-        let symbol = format!("eidola_fa2_sink_paged_bf16_q{tile}");
-        assert!(fa2.entry(&symbol).is_some(), "{symbol}");
+    // One reduction shape (one KV warp, 64-key tiles) at three query tiles,
+    // for global layers (split and merged) and sliding ones (anchored), and
+    // the merge: nothing else.
+    assert_eq!(fa2.entries.len(), 7);
+    for kind in ["", "anchored_"] {
+        for tile in [16, 64, 128] {
+            let symbol = format!("eidola_fa2_sink_paged_{kind}bf16_q{tile}");
+            assert!(fa2.entry(&symbol).is_some(), "{symbol}");
+        }
     }
     let merge = fa2
         .entry_for_meta("eidola_fa2_merge_states_bf16_d128_meta")
@@ -227,52 +245,60 @@ fn entries_and_meta_records() {
         let deepgemm = manifest
             .cubin("deepgemm_fp8_fp4_grouped", arch)
             .expect("deepgemm");
-        assert_eq!(deepgemm.entries.len(), 4);
-        // Each record describes the instance its name says: masked is
-        // GemmType 2, contiguous 1; gate/up has K = 4096, down K = 2048.
-        for (kind, gemm_type) in [("masked", 2), ("contiguous", 1)] {
-            for (proj, shape_k) in [("gate_up", 4096), ("down", 2048)] {
-                let meta = format!("eidola_deepgemm_fp8_fp4_{kind}_{proj}_meta");
-                let entry = deepgemm.entry_for_meta(&meta).expect(&meta);
-                assert!(
-                    entry
-                        .demangled
-                        .starts_with("void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<"),
-                    "{}",
-                    entry.demangled
-                );
-                assert!(
-                    entry
-                        .demangled
-                        .contains(&format!("(deep_gemm::GemmType){gemm_type}")),
-                    "{meta}: {}",
-                    entry.demangled
-                );
-                assert!(
-                    entry.demangled.contains(&format!(
-                        "(unsigned int)0, (unsigned int)4096, (unsigned int){shape_k},"
-                    )),
-                    "{meta}: {}",
-                    entry.demangled
-                );
-            }
+        assert_eq!(deepgemm.entries.len(), 2);
+        // Each record describes the instance its name says: the psum layout
+        // (`MGroupedContiguousWithPsumLayout`, GemmType 5); gate/up has
+        // K = 4096, down K = 2048.
+        for (proj, shape_k) in [("gate_up", 4096), ("down", 2048)] {
+            let meta = format!("eidola_deepgemm_fp8_fp4_psum_{proj}_meta");
+            let entry = deepgemm.entry_for_meta(&meta).expect(&meta);
+            assert!(
+                entry
+                    .demangled
+                    .starts_with("void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<"),
+                "{}",
+                entry.demangled
+            );
+            assert!(
+                entry.demangled.contains("(deep_gemm::GemmType)5"),
+                "{meta}: {}",
+                entry.demangled
+            );
+            assert!(
+                entry.demangled.contains(&format!(
+                    "(unsigned int)0, (unsigned int)4096, (unsigned int){shape_k},"
+                )),
+                "{meta}: {}",
+                entry.demangled
+            );
         }
     }
 }
 
-/// Sampling is not in the AOT set: it is an Eidola kernel that must reproduce
-/// the serving core's sampling semantics bit for bit (see AGENTS.md).
+/// Sampling comes only from our own kernel (`sampling.cu`), which reproduces
+/// the serving core's sampling semantics bit for bit (see AGENTS.md): no
+/// upstream sampling entry is in the set.
 #[test]
 fn no_third_party_sampling_kernels() {
     let manifest = Manifest::embedded();
     for cubin in &manifest.kernels {
         for entry in &cubin.entries {
             assert!(
-                !entry.demangled.contains("sampling"),
+                !entry.demangled.to_lowercase().contains("sampling"),
                 "{} {}: {}",
                 cubin.name,
                 cubin.arch,
                 entry.demangled
+            );
+        }
+        if cubin.name == "sampling" {
+            let mut names: Vec<&str> = cubin.entries.iter().map(|e| e.symbol.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                ["eidola_chain_accept", "eidola_sample"],
+                "{}",
+                cubin.arch
             );
         }
     }

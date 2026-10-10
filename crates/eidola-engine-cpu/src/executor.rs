@@ -17,12 +17,11 @@ use rayon::prelude::*;
 
 use crate::pool::{GroupLayout, Pool, Tag};
 
-/// Which hidden state feeds an MTP layer: the main model's into depth 0, and each depth's
-/// own output into the next.
+/// Which of the main model's hidden states feeds the MTP depths (every depth takes the
+/// main model's state, never another depth's output).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MtpHidden {
-    /// The state after the final norm (the main model's `norm`, each MTP layer's
-    /// `final_layernorm`): what vLLM and SGLang feed.
+    /// The state after the main model's final `norm`: what SGLang feeds.
     #[default]
     Normed,
     /// The state before it: what llama.cpp feeds.
@@ -45,7 +44,7 @@ pub struct CpuExecutorConfig {
     /// The loaded MTP layer serving each draft depth; its length is the draft width `k`.
     /// Empty disables drafting (and the drafter KV group).
     pub mtp_depths: Vec<usize>,
-    /// Hidden-state chaining between the main model and the MTP depths.
+    /// Which of the main model's hidden states every MTP depth conditions on.
     pub mtp_hidden: MtpHidden,
     /// Token ids the model may emit (the tokenizer's vocabulary, added tokens included);
     /// the head's rows past it are padding and take no part in sampling, drafting or
@@ -117,8 +116,8 @@ pub struct RowRecord {
     pub sampling: SamplingParams,
 }
 
-/// Per-slot model state: the hidden states the drafter continues from, one per chain level
-/// (level 0 is the main model's, level `d` is MTP depth `d - 1`'s), all at position `at`.
+/// Per-slot model state: the main model's hidden states the drafter continues from, one per
+/// level, level `l` the state at position `at - l` (zeros before position 0).
 ///
 /// The buffers are allocated once, at full size, and only ever overwritten in place, like
 /// device-resident slot state: storing a new state and `ResetSlot` both write into the
@@ -170,9 +169,10 @@ struct Row {
     params: SamplingParams,
     /// Tokens at positions `c ..`: host tokens, then drafts as they are proposed.
     toks: Vec<u32>,
-    /// Chain-level hidden states by `(level, position)` computed in this step.
+    /// The main model's hidden states by `(0, position)` computed in this step.
     levels: HashMap<(usize, u32), Vec<f32>>,
-    /// State loaded at step start (levels at `c - 1`).
+    /// State loaded at step start (levels at `c - 1`: level `l` is the main model's state
+    /// at `c - 1 - l`).
     state: Vec<Vec<f32>>,
     /// Target logits by position (needed ones, or every one when recording).
     target_logits: HashMap<u32, Vec<f32>>,
@@ -189,13 +189,22 @@ impl Row {
         self.toks[(pos - self.c) as usize]
     }
 
+    /// Level `level` at `pos`: the main model's hidden state at `pos - level`, from this
+    /// step's forward or, before `c`, from the state loaded at `c - 1`.
     fn level(&self, level: usize, pos: u32) -> &[f32] {
-        if pos + 1 == self.c {
-            return &self.state[level];
+        let a = pos
+            .checked_sub(level as u32)
+            .unwrap_or_else(|| panic!("level {level} at {pos} precedes position 0"));
+        if a < self.c {
+            let m = (self.c - 1 - a) as usize;
+            return self
+                .state
+                .get(m)
+                .unwrap_or_else(|| panic!("state at {a} is {m} levels before {}", self.c - 1));
         }
         self.levels
-            .get(&(level, pos))
-            .unwrap_or_else(|| panic!("chain level {level} at {pos} not computed"))
+            .get(&(0, a))
+            .unwrap_or_else(|| panic!("main-model state at {a} not computed"))
     }
 
     /// Last position whose KV is valid after the step.
@@ -676,7 +685,7 @@ impl CpuExecutor {
     }
 
     /// Runs the target over `(row, position)` pairs (tokens taken from the rows), storing
-    /// chain level 0 and the logits each row needs.
+    /// the main model's state (level 0) and the logits each row needs.
     fn run_target(
         &mut self,
         rows: &mut [Row],
@@ -720,9 +729,10 @@ impl CpuExecutor {
     }
 
     /// Runs MTP depth `depth` over `(row, slot position)` pairs. A row at slot `s` consumes
-    /// the token at `s` and chain level `depth` at `s - 1`, uses RoPE position `s - 1`, and
-    /// writes its KV at `s`. Stores chain level `depth + 1` and returns the logits of the
-    /// items listed in `logits_for` (plus every item's when recording).
+    /// the token at `s` and the main model's hidden state at the anchor `s - 1 - depth`
+    /// (level `depth` at `s - 1`), uses the anchor as its RoPE position, and writes its KV
+    /// at `s`. Returns the logits of the items listed in `logits_for` (plus every item's
+    /// when recording).
     fn run_depth(
         &mut self,
         rows: &mut [Row],
@@ -745,17 +755,17 @@ impl CpuExecutor {
                 AttnRow {
                     slot: rows[ri].slot,
                     pos: s,
-                    rope: s - 1,
+                    rope: s - 1 - depth as u32,
                     min_pos: depth as u32 + 1,
                     token: rows[ri].token(s),
                 }
             })
             .collect();
-        let (hidden, normed) = self.mtp_forward(depth, &attn, &prev)?;
+        // The depth's own output feeds nothing but its logits: every depth continues from
+        // the main model's state.
+        let (_, normed) = self.mtp_forward(depth, &attn, &prev)?;
         let mut want = Vec::new();
         for (i, &(ri, s)) in items.iter().enumerate() {
-            let state = self.chain_state(&hidden, &normed, i).to_vec();
-            rows[ri].levels.insert((depth + 1, s), state);
             if self.cfg.record || logits_for.contains(&(ri, s)) {
                 want.push(i);
             }
@@ -921,7 +931,7 @@ impl Executor for CpuExecutor {
         self.run_target(&mut rows, &host, padded, |r, pos| r.sample && pos == r.p)?;
 
         // 2. Drafter over every host position, depth by depth: depth `d` at slot `s`
-        //    consumes the token at `s` and depth `d - 1`'s state at `s - 1`.
+        //    consumes the token at `s` and the main model's state at `s - 1 - d`.
         let mut first_draft_logits = HashMap::new();
         for d in 0..depths {
             let items: Vec<(usize, u32)> = rows

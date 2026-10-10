@@ -20,12 +20,14 @@ SPDX-License-Identifier = "MIT OR Apache-2.0"
 # Server layer.
 [[annotations]]
 path = [
-    "crates/eidola-server/**",
+    "crates/eidola-server-gateway/**",
+    "crates/eidola-server-engine/**",
     "crates/eidola-engine/**",
     "crates/eidola-engine-model/**",
     "crates/eidola-engine-chat/**",
     "crates/eidola-engine-kernels/**",
     "crates/eidola-engine-cpu/**",
+    "crates/eidola-engine-cuda/**",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = "© Eidola, Inc. and contributors"
@@ -103,3 +105,16 @@ path = [
 precedence = "closest"
 SPDX-FileCopyrightText = ["© Eidola, Inc. and contributors", "© 2026 Xiaomi Corporation"]
 SPDX-License-Identifier = "AGPL-3.0-only AND MIT"
+
+# Verbatim sample TDX quote and Intel collateral from the dcap-qvl crate
+# (declared MIT), kept as test fixtures; and the Intel SGX root certificate,
+# byte-identical to dcap-qvl's copy of Intel's published root.
+[[annotations]]
+path = [
+    "crates/tinfoil-verifier/tests/fixtures/dcap-qvl/tdx_quote",
+    "crates/tinfoil-verifier/tests/fixtures/dcap-qvl/tdx_quote_collateral.json",
+    "crates/tinfoil-verifier/src/intel_sgx_root_ca.der",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "© 2026 Phala Network"
+SPDX-License-Identifier = "MIT"

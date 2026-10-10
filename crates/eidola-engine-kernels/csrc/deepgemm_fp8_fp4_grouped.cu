@@ -10,9 +10,9 @@
 //   D    bf16
 //
 // Template arguments mirror what DeepGEMM's own host wrapper
-// (`sm100_m_grouped_fp8_fp4_gemm_{masked,contiguous}_1d1d`) and its SM100
-// heuristics select for these shapes, with `compiled_dims = "nk"` (M stays a
-// runtime argument):
+// (`sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d` with `use_psum_layout`)
+// and its SM100 heuristics select for these shapes, with
+// `compiled_dims = "nk"` (M stays a runtime argument):
 //
 //   swap_ab, BLOCK_M/N/K = 128/128/128, cluster 2 multicast on A (N/128 is
 //   even), LOAD_BLOCK_M 64, STORE_BLOCK_M 16, 128-byte swizzles everywhere,
@@ -22,6 +22,22 @@
 //   C/D 16*128*2B*2 = 8192; barriers 32*8*3 + 2*8*3 + 8 = 824; TMEM ptr 4;
 //   per stage A 64*128 + B 128*128 + SFA 512 + SFB 512 = 25600; 8 stages
 //   -> 9020 + 204800 = 213820 bytes.
+//
+// The layout is DeepGEMM's psum one (`MGroupedContiguousWithPsumLayout`), at
+// every token count: every group's rows back to back in group order, group
+// g's run starting at the previous run's end rounded up to 128 rows;
+// `grouped_layout[g]` is the end of group g's rows (a prefix sum). The
+// scheduler visits only each group's own 128-row blocks, and with
+// `ensure_zero_padding` false it narrows a group's last block to its rows
+// rounded up to 16 (the swap-AB UMMA N), so empty experts cost nothing and a
+// sparse expert one narrow block. Its launch is a function of M (the
+// layout's row bound) alone; the routing is read from `grouped_layout` on
+// the device. Not used: the masked layout (`[G][M][K]`, a count per group),
+// whose scheduler visits the same blocks but always runs them 128 rows wide;
+// and the plain contiguous layout (`grouped_layout[row]` per row, -1 for
+// padding), whose SM100 scheduler runs every block of M through the tensor
+// cores, padding blocks included (against group 0's weights), so its cost
+// follows the layout's worst-case bound rather than the routed rows.
 //
 // The persistent scheduler bakes the SM count into the instantiation, so a
 // kernel built for 148 SMs must be launched with a 148-block grid on a part
@@ -68,17 +84,13 @@ constexpr uint32_t kCluster = 2;
 // declares its kernels `__global__ static` (CUTLASS_GLOBAL), so the entries
 // keep internal linkage (STB_LOCAL in the cubin's symbol table).
 namespace deep_gemm {
-EIDOLA_DEEPGEMM_INSTANCE(kGateUpN, kGateUpK, GemmType::MGroupedMasked);
-EIDOLA_DEEPGEMM_INSTANCE(kDownN, kDownK, GemmType::MGroupedMasked);
-EIDOLA_DEEPGEMM_INSTANCE(kGateUpN, kGateUpK, GemmType::MGroupedContiguous);
-EIDOLA_DEEPGEMM_INSTANCE(kDownN, kDownK, GemmType::MGroupedContiguous);
+EIDOLA_DEEPGEMM_INSTANCE(kGateUpN, kGateUpK, GemmType::MGroupedContiguousWithPsumLayout);
+EIDOLA_DEEPGEMM_INSTANCE(kDownN, kDownK, GemmType::MGroupedContiguousWithPsumLayout);
 }  // namespace deep_gemm
 
 // The entries' names are mangled, so each launch-contract record is bound to
 // its entry explicitly: `meta_aliases` in kernels.json maps every record below
 // to the mangled symbol it describes, and the build refuses an image whose
 // entries and records do not correspond one to one.
-EIDOLA_KERNEL_META(eidola_deepgemm_fp8_fp4_masked_gate_up, kThreads, 1, 1, kSmemBytes, kCluster, 1, 1, 0);
-EIDOLA_KERNEL_META(eidola_deepgemm_fp8_fp4_masked_down, kThreads, 1, 1, kSmemBytes, kCluster, 1, 1, 0);
-EIDOLA_KERNEL_META(eidola_deepgemm_fp8_fp4_contiguous_gate_up, kThreads, 1, 1, kSmemBytes, kCluster, 1, 1, 0);
-EIDOLA_KERNEL_META(eidola_deepgemm_fp8_fp4_contiguous_down, kThreads, 1, 1, kSmemBytes, kCluster, 1, 1, 0);
+EIDOLA_KERNEL_META(eidola_deepgemm_fp8_fp4_psum_gate_up, kThreads, 1, 1, kSmemBytes, kCluster, 1, 1, 0);
+EIDOLA_KERNEL_META(eidola_deepgemm_fp8_fp4_psum_down, kThreads, 1, 1, kSmemBytes, kCluster, 1, 1, 0);

@@ -77,7 +77,7 @@ jobs:
           allow-dependencies-licenses: >-
             pkg:githubactions/Swatinem/rust-cache,
             pkg:githubactions/tinfoilsh/measure-image-action,
-            pkg:cargo/eidola-server,
+            pkg:cargo/eidola-server-gateway,
             pkg:cargo/eidola-app-core,
             pkg:cargo/eidola-cli,
             pkg:cargo/eidola-gui,

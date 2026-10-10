@@ -109,8 +109,11 @@ pub struct ModelSpec {
     pub buckets: Vec<Bucket>,
 }
 
-/// Reserved physical block id in every group: never allocated, never written, never read.
-/// Block-table entries the sequence does not own (out of window, beyond its length) hold it.
+/// Reserved physical block id in every group: never allocated and never written, so it
+/// reads as zeros. Block-table entries the sequence does not own (out of window, beyond its
+/// length) hold it. An executor may read it only where every key it supplies is masked (the
+/// CUDA executor lists it for positions before a sliding window's anchor); no seam
+/// operation reads or writes it.
 pub const NULL_BLOCK: u32 = 0;
 
 impl ModelSpec {

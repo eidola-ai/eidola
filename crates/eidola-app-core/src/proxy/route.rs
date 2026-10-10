@@ -1100,6 +1100,13 @@ impl Inner {
             // upstream for its own refunds — asking or not asking changes
             // nothing there.)
             stream && request.include_usage,
+            // **No prefix-cache key, ever.** A proxied request has no lineage
+            // — no space, no participant — for an app-minted key to be scoped
+            // to, and `cache_key` is not a body field this proxy reads from a
+            // caller: a value a downstream tool picks and never rotates would
+            // link every request it rides on, which is `traceparent`'s reason
+            // for being stripped too.
+            None,
         );
         if let Some(object) = body.as_object_mut() {
             for (key, value) in [
@@ -1672,7 +1679,7 @@ impl Inner {
             // failure after the nullifier is recorded — request validation,
             // `send_stream`, a spend-proof re-encode — answers with a
             // refund-bearing JSON error body rather than an SSE stream
-            // (`eidola-server/src/handlers.rs`: `error_response_with_refund`).
+            // (`eidola-server-gateway/src/handlers.rs`: `error_response_with_refund`).
             // Persisting that token for recovery is best-effort there, so the
             // in-band value is again the only one that can answer for the arm
             // where persistence failed. Third door, same rule: the refund the
@@ -1837,7 +1844,6 @@ impl Inner {
                     break;
                 }
             };
-            raw.push(&bytes);
             buf.extend_from_slice(&bytes);
             let mut oversized = false;
             while let Some((pos, boundary_len)) = find_event_boundary(&buf) {
@@ -1849,6 +1855,12 @@ impl Inner {
                 }
                 let event: Vec<u8> = buf.drain(..pos).collect();
                 let terminator: Vec<u8> = buf.drain(..boundary_len).collect();
+                // Recorded event by event, so the server's stream padding is
+                // counted rather than kept (`RecordedBody::push_event`). It is
+                // still forwarded: the caller is on this machine, where there
+                // is no network observer for it to hide anything from, and
+                // every server-sent-events reader already ignores it.
+                raw.push_event(&event, &terminator);
                 let (mut out, refund) = forward_sse_event(&event, &route.canonical);
                 if refund.is_some() {
                     inline_refund = refund;
@@ -1893,6 +1905,8 @@ impl Inner {
                 // Refused, so not forwarded: the tail below exists to hand a
                 // downstream parser the bytes the upstream really sent, and
                 // these are the bytes this app has just declined to accept.
+                // They did arrive, so the Record keeps them.
+                raw.push_event(&buf, &[]);
                 buf.clear();
                 break;
             }
@@ -1907,6 +1921,7 @@ impl Inner {
         // is the same fact: an unterminated tail nobody received is not a
         // complete delivery, and discarding the result sealed the row as one.
         if !buf.is_empty() {
+            raw.push_event(&buf, &[]);
             let (out, refund) = forward_sse_event(&buf, &route.canonical);
             if refund.is_some() {
                 inline_refund = refund;

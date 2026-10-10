@@ -1,0 +1,148 @@
+[package]
+name = "eidola-server-gateway"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+license = "AGPL-3.0-only"
+
+[features]
+# Test-only bridge for app-core's chat harness to exercise this crate's strict
+# request deserialization. It exposes no runtime behavior or test bypass.
+test-support = []
+
+[[bin]]
+name = "eidola-server-gateway"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server
+axum = "0.8"
+utoipa-axum = "0.3"
+
+# HTTP client for upstream requests (using rustls with pure-Rust crypto for cross-compilation).
+# `blocking` is for the OTLP exporters' client (`telemetry::otlp_http_client`).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream", "form", "query", "blocking"] }
+
+# Pure Rust TLS crypto provider (no C/assembly dependencies)
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# OpenAPI documentation
+utoipa = { version = "6", features = ["uuid"] }
+
+# Logging & telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# OpenTelemetry (enabled when OTEL_EXPORTER_OTLP_ENDPOINT is set)
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics", "logs"] }
+tracing-opentelemetry = "0.34"
+opentelemetry-appender-tracing = "0.33"
+
+# Anonymous credentials (Privacy Pass)
+anonymous-credit-tokens = "0.4"
+aes-gcm = "0.11"
+hkdf = "0.13"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Database
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+deadpool-postgres = "0.14"
+tokio-postgres-rustls = "0.14.0"
+# PEM parsing for DATABASE_SSL_CERT (the `pem` module); already in the
+# rustls dep tree — this adds no new code to the graph.
+rustls-pki-types = "1"
+
+# Authentication
+argon2 = "0.6"
+
+# Identifiers
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Encoding
+base64 = "0.23"
+hex = "0.4"
+
+# Webhook signature verification; hashing the engine route key, whose hasher
+# state is scrubbed on drop (`zeroize`).
+hmac = "0.13"
+sha2 = { version = "0.11", features = ["zeroize"] }
+subtle = "2"
+
+# Shared client/server contract logic (pricing formula)
+eidola-common = { path = "../eidola-common", features = ["argon2"] }
+
+# Tinfoil attestation verification
+tinfoil-verifier = { path = "../tinfoil-verifier" }
+
+# Runtime upstream-measurement resolution (src/upstream_trust): verifies the
+# Sigstore DSSE/in-toto GitHub artifact attestation on Tinfoil's latest
+# confidential-model-router release so the allowed enclave measurements can
+# track upstream without a rebuild. Same pure-Rust crypto stack the client's
+# update verifier (`eidola-app-core::updater`) uses; versions kept in lockstep.
+# This whole subsystem is temporary — it goes away when we self-host inference
+# and revert to a statically pinned measurement set.
+const-oid = { version = "0.9", features = ["db"] }
+der = { version = "0.7", features = ["pem", "alloc"] }
+spki = { version = "0.7", features = ["pem"] }
+x509-cert = "0.2"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+signature = "2"
+regex = "1"
+# Hot-swap the attesting reqwest::Client when the allowed measurement set
+# changes, without touching tinfoil-verifier (its connector bakes the set in
+# at construction, so we rebuild the client and swap it atomically).
+arc-swap = "1"
+
+# Scrubbing secret material held in memory (a client's prefix-cache key, the
+# engine gateway token).
+zeroize = "1"
+
+# Utilities
+futures-util = "0.3"
+bytes = "1"
+
+[build-dependencies]
+serde_json = "1"
+# `src/engine_trust/file.rs`: the typed parse of engine-enclaves.json.
+serde = { version = "1", features = ["derive"] }
+# `src/engine_trust/manifest.rs`, compiled into the build script: hashing the
+# engine deployment configs it re-derives `engine-enclaves.json` from.
+sha2 = "0.11"
+# The node's own config grammar, and the one deployment check the measurer
+# also runs (`engine_deployment::deployment`).
+eidola-common = { path = "../eidola-common", features = ["deployment"] }
+# The attesting client's own pin compiler (`validate_pins`), so a committed pin
+# the client would refuse fails the build rather than the first connection.
+# Costs a host build of the verifier's dependency tree for the build script.
+tinfoil-verifier = { path = "../tinfoil-verifier" }
+
+[dev-dependencies]
+# The same module, compiled into the crate's tests.
+eidola-common = { path = "../eidola-common", features = ["deployment"] }
+# `InMemoryLogExporter` for the telemetry regression test pinning that
+# exported log records carry no trace context.
+opentelemetry_sdk = { version = "0.33", features = ["testing"] }
+# The engine router's tests run fake engines behind in-process shims that
+# serve real (mock-rooted SEV-SNP) attestation, so routing is exercised over
+# the same attesting client production uses.
+tinfoil-shim-mock = { path = "../tinfoil-shim-mock" }
+# The client-facing stream's framing is tested on a paused clock, and its
+# independence from token lengths over generated delta sequences.
+tokio = { version = "1", features = ["full", "test-util"] }
+proptest = "1.11"
+# `ServiceExt::oneshot`, to drive the shaped router's refusals in process.
+tower = { version = "0.5", features = ["util"] }

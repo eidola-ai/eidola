@@ -168,6 +168,106 @@
             [ pname ] ++ getAllDeps pname ++ builtins.concatMap (d: [ d ] ++ getAllDeps d) devDeps
           );
 
+        # Which workspace crate (if any) a path belongs to; `relPath` is
+        # relative to the repository root, with a leading `/`.
+        getCrateForPath =
+          relPath:
+          pkgs.lib.findFirst (
+            name:
+            let
+              p = cratePaths.${name};
+            in
+            relPath == "/${p}" || pkgs.lib.hasPrefix "/${p}/" relPath
+          ) null workspaceCrates;
+
+        # The non-Cargo inputs a build or its tests read, which
+        # `craneLib.filterCargoSources` would drop because they are not Rust
+        # or Cargo files. One predicate for both source filters
+        # (`mkFilteredSrc`, scoped to a crate set, and `fullSrc`, the whole
+        # workspace), so they cannot diverge: a new input is added here once.
+        # `crateInSet name` says whether crate `name` is being built;
+        # `wholeWorkspace` is set for the workspace-wide checks only.
+        keepNonCargoInput =
+          { crateInSet, wholeWorkspace }:
+          relPath: path: type:
+          let
+            matchingCrate = getCrateForPath relPath;
+            # Both `eidola-app-core/build.rs` and `eidola-server-gateway/build.rs`
+            # consume pinned trust data from `releases/`:
+            #   * eidola-app-core → all of `releases/trust/*.json` +
+            #     `releases/schema/*.json` (client trust root)
+            #   * eidola-server-gateway → `releases/trust/sigstore-trusted-root.json`
+            #     (pinned Sigstore root; the runtime measurement resolver
+            #     verifies Tinfoil release attestations against it) and
+            #     `releases/trust/engine-enclaves.json` (the engine pins)
+            # Included only when either crate is built, so unrelated crates
+            # do not cache-bust on every manifest regeneration.
+            # `artifact-manifest.json` (at the root, not under `releases/`)
+            # is deliberately excluded — it records the eidola-cli narHash
+            # itself, so including it would create a self-reference that
+            # prevents the build from reaching a fixed point.
+            isTrustRootPath = relPath == "/releases" || pkgs.lib.hasPrefix "/releases/" relPath;
+            # `eidola-server-gateway/build.rs` also checks every engine pin in
+            # `releases/trust/engine-enclaves.json` against the committed
+            # deployment configs it names.
+            isEngineDeployPath =
+              relPath == "/deploy"
+              || relPath == "/deploy/engine"
+              || pkgs.lib.hasPrefix "/deploy/engine/" relPath;
+          in
+          ((crateInSet "eidola-app-core" || crateInSet "eidola-server-gateway") && isTrustRootPath)
+          || (crateInSet "eidola-server-gateway" && isEngineDeployPath)
+          # Test fixtures and data of a crate being built: a package build
+          # runs that crate's tests (`doCheck`), and the workspace checks run
+          # every crate's; fixtures are rarely Rust source (the gateway's
+          # engine-trust fixtures are YAML and JSON, the engine crates' test
+          # data JSON).
+          || (
+            matchingCrate != null
+            && crateInSet matchingCrate
+            && (
+              pkgs.lib.hasInfix "/tests/fixtures/" relPath || pkgs.lib.hasInfix "/tests/data/" relPath
+            )
+          )
+          # The kernel crate whole: its library embeds the committed
+          # `kernels.manifest.json`, and its tests hash every input of the
+          # kernel build the manifest lists (CUDA sources, Nix expressions,
+          # scripts) against it.
+          || (matchingCrate == "eidola-engine-kernels" && crateInSet matchingCrate)
+          # eidola-apple's tests read the synthetic universal app the
+          # round-trip checks use. Only the workspace checks run those tests
+          # (the desktop packages compile eidola-apple but test only
+          # themselves), so the desktop sources stay as they are.
+          || (
+            wholeWorkspace
+            && (
+              relPath == "/scripts"
+              || relPath == "/scripts/fixtures"
+              || relPath == "/scripts/fixtures/apple-roundtrip"
+              || pkgs.lib.hasPrefix "/scripts/fixtures/apple-roundtrip/" relPath
+            )
+          )
+          # The committed `artifact-manifest.json`, which app-core's tests
+          # hold to the claim set this build expects. Only the workspace
+          # checks take it: a package source that included it would be an
+          # input to the very hashes the manifest records (see above).
+          || (wholeWorkspace && relPath == "/artifact-manifest.json")
+          # .sql files (include_str! in the CLI), .ttf font files
+          # (include_bytes! in the GUI), .ftl localization files (read by the
+          # GUI's build.rs, which emits them as string literals — every
+          # shipped string is a build input inside the measured artifact,
+          # never loaded at runtime), and .der certificates (tinfoil-verifier's
+          # pinned Intel SGX root, include_bytes!).
+          || (
+            type == "regular"
+            && (
+              pkgs.lib.hasSuffix ".sql" path
+              || pkgs.lib.hasSuffix ".ttf" path
+              || pkgs.lib.hasSuffix ".ftl" path
+              || pkgs.lib.hasSuffix ".der" path
+            )
+          );
+
         # Create filtered source that only includes specific crates
         mkFilteredSrc =
           crates:
@@ -182,16 +282,6 @@
                 value = true;
               }) crates
             );
-            # Find which crate (if any) a path belongs to
-            getCrateForPath =
-              relPath:
-              pkgs.lib.findFirst (
-                name:
-                let
-                  p = cratePaths.${name};
-                in
-                relPath == "/${p}" || pkgs.lib.hasPrefix "/${p}/" relPath
-              ) null workspaceCrates;
             # Check if path is a parent directory of any workspace crate
             isParentOfCrate =
               relPath: pkgs.lib.any (path: pkgs.lib.hasPrefix "${relPath}/" "/${path}") workspaceMemberPaths;
@@ -208,32 +298,16 @@
                   matchingCrate = getCrateForPath relPath;
                   # Is this an irrelevant crate? (in a crate dir but not in our set)
                   isIrrelevantCrate = matchingCrate != null && !(crateSet ? ${matchingCrate});
-                  # Both `eidola-app-core/build.rs` and `eidola-server/build.rs`
-                  # consume pinned trust data from `releases/`:
-                  #   * eidola-app-core → all of `releases/trust/*.json` +
-                  #     `releases/schema/*.json` (client trust root)
-                  #   * eidola-server → just `releases/trust/sigstore-trusted-root.json`
-                  #     (pinned Sigstore root; the runtime measurement resolver
-                  #     verifies Tinfoil release attestations against it)
-                  # Include `releases/` when either crate is in the set, but
-                  # only for those crates — unrelated crates shouldn't
-                  # cache-bust on every manifest regeneration.
-                  # `artifact-manifest.json` is deliberately excluded — it
-                  # records the eidola-cli narHash itself, so including it
-                  # would create a self-reference that prevents the build
-                  # from reaching a fixed point.
-                  trustRootFiles =
-                    crateSet ? "eidola-app-core"
-                    || crateSet ? "eidola-server";
-                  isTrustRootPath =
-                    relPath == "/releases"
-                    || pkgs.lib.hasPrefix "/releases/" relPath;
                 in
                 # Exclude irrelevant crate directories entirely
                 if isIrrelevantCrate then
                   false
-                # Trust-root build inputs for `eidola-app-core/build.rs`.
-                else if trustRootFiles && isTrustRootPath then
+                else if
+                  keepNonCargoInput {
+                    crateInSet = name: crateSet ? ${name};
+                    wholeWorkspace = false;
+                  } relPath path type
+                then
                   true
                 # Keep only root-level files that affect Cargo resolution/builds.
                 # This avoids generated files like artifact-manifest.json from
@@ -242,19 +316,6 @@
                   builtins.hasAttr baseName rootBuildFiles
                 # Keep directories that are parents of crate paths
                 else if type == "directory" && isParentOfCrate relPath then
-                  true
-                # Include .sql files (used by include_str! in the CLI), .ttf
-                # font files (used by include_bytes! in the GUI), and .ftl
-                # localization files (read by the GUI's build.rs, which emits
-                # them as string literals — every shipped string is a build
-                # input inside the measured artifact, never loaded at runtime).
-                # All three feed compile-time inputs; craneLib.filterCargoSources
-                # discards them by default because they aren't Rust source.
-                else if type == "regular" && (
-                  pkgs.lib.hasSuffix ".sql" path
-                  || pkgs.lib.hasSuffix ".ttf" path
-                  || pkgs.lib.hasSuffix ".ftl" path
-                ) then
                   true
                 # For everything else, use crane's filter (which handles .rs, Cargo.toml, etc.)
                 else
@@ -328,22 +389,19 @@
         # Full repo source for checks that compare committed vs generated files
         repoSrc = craneLib.path ./.;
 
-        # Full source for workspace-wide operations. Carries the same `.ftl`
-        # exception as `filteredSrc`: craneLib's filter keeps only Rust and
-        # Cargo files, and the GUI's build script reads `locales/` to generate
-        # its typed accessors, so the workspace-wide clippy/test derivations
-        # cannot compile it without them.
+        # Full source for workspace-wide operations (`checks.clippy`,
+        # `checks.tests`, `checks.rust-formatting`): every crate is built, so
+        # every crate's non-Cargo inputs are kept, by the same predicate the
+        # per-package sources use.
         fullSrc = pkgs.lib.cleanSourceWith {
           src = ./.;
           filter =
             path: type:
             craneLib.filterCargoSources path type
-            || (type == "regular" && pkgs.lib.hasSuffix ".ftl" path)
-            # .ttf and .sql feed include_bytes!/include_str! the same way .ftl
-            # feeds the localization build script; without them the workspace
-            # check derivations cannot compile eidola-gui or eidola-app-core.
-            || (type == "regular" && pkgs.lib.hasSuffix ".ttf" path)
-            || (type == "regular" && pkgs.lib.hasSuffix ".sql" path);
+            || keepNonCargoInput {
+              crateInSet = _: true;
+              wholeWorkspace = true;
+            } (pkgs.lib.removePrefix (toString ./.) (toString path)) path type;
         };
 
         # Base RUSTFLAGS for deterministic builds (extended per-target in mkTargetConfig)
@@ -566,8 +624,8 @@
           nixCrossSystem = null;
         };
 
-        # Generate OpenAPI specification from the server code
-        serverOpenApiSpec =
+        # Generate OpenAPI specification from the gateway code
+        gatewayOpenApiSpec =
           pkgs.runCommand "eidola-openapi-spec"
             {
               nativeBuildInputs = [ generateOpenapiBin ];
@@ -1715,12 +1773,12 @@ with open(path, "wb") as f:
       in
       {
         packages = {
-          server = mkPackage {
-            pname = "eidola-server";
+          gateway = mkPackage {
+            pname = "eidola-server-gateway";
             rustTarget = nativeRustTarget;
             nixCrossSystem = null;
           };
-          server-openapi-spec = serverOpenApiSpec;
+          gateway-openapi-spec = gatewayOpenApiSpec;
           # Static llama.cpp `llama-server` — the bundled on-device inference
           # engine sidecar. Buildable on its own (`nix build .#llama-server`)
           # for the dev-path `just engine` recipe.
@@ -1825,12 +1883,12 @@ with open(path, "wb") as f:
               ''
                 echo "Checking if committed OpenAPI spec matches generated one..."
 
-                GENERATED="${self.packages.${system}.server-openapi-spec}/openapi.json"
-                COMMITTED="${repoSrc}/crates/eidola-server/openapi.json"
+                GENERATED="${self.packages.${system}.gateway-openapi-spec}/openapi.json"
+                COMMITTED="${repoSrc}/crates/eidola-server-gateway/openapi.json"
 
                 if [ ! -f "$COMMITTED" ]; then
-                  echo "ERROR: No committed OpenAPI spec found at crates/eidola-server/openapi.json"
-                  echo "Run: nix run '.#update-server-openapi'"
+                  echo "ERROR: No committed OpenAPI spec found at crates/eidola-server-gateway/openapi.json"
+                  echo "Run: nix run '.#update-gateway-openapi'"
                   echo "Then commit the generated file."
                   exit 1
                 fi
@@ -1840,7 +1898,7 @@ with open(path, "wb") as f:
                   echo "ERROR: Committed OpenAPI spec doesn't match generated one!"
                   echo ""
                   echo "To fix this:"
-                  echo "  1. Run: nix run '.#update-server-openapi'"
+                  echo "  1. Run: nix run '.#update-gateway-openapi'"
                   echo "  2. Review the changes"
                   echo "  3. Commit the updated spec"
                   echo ""
@@ -1854,22 +1912,22 @@ with open(path, "wb") as f:
         };
 
         apps = {
-          update-server-openapi = {
+          update-gateway-openapi = {
             type = "app";
             meta.description = "Update committed OpenAPI spec from generated sources";
             program = "${
               pkgs.writeShellApplication {
-                name = "update-server-openapi";
+                name = "update-gateway-openapi";
                 runtimeInputs = [
                   pkgs.coreutils
                   pkgs.git
                 ];
 
                 text = ''
-                  ${./scripts/update-server-openapi.sh} "${self.packages.${system}.server-openapi-spec}/openapi.json"
+                  ${./scripts/update-gateway-openapi.sh} "${self.packages.${system}.gateway-openapi-spec}/openapi.json"
                 '';
               }
-            }/bin/update-server-openapi";
+            }/bin/update-gateway-openapi";
           };
 
           format-rust = {

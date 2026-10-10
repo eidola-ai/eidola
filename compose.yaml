@@ -13,18 +13,18 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./crates/eidola-server/schema:/docker-entrypoint-initdb.d:ro
+      - ./crates/eidola-server-gateway/schema:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "eidola"]
       interval: 5s
       retries: 5
 
-  server:
-    image: eidola-server:dev
+  gateway:
+    image: eidola-server-gateway:dev
     platform: linux/amd64
     build:
       context: .
-      dockerfile: oci/eidola-server/Containerfile
+      dockerfile: oci/eidola-server-gateway/Containerfile
     environment:
       DATABASE_URL: postgres://eidola@postgres/eidola
       TINFOIL_API_KEY: ${TINFOIL_API_KEY}
@@ -36,7 +36,7 @@ services:
       BIND_ADDR: 0.0.0.0:8080
     ports:
       - "8080:8080"
-    profiles: ["server"]
+    profiles: ["gateway"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -48,10 +48,10 @@ services:
       context: .
       dockerfile: oci/tinfoil-shim-mock/Containerfile
     environment:
-      # Default targets the in-compose `server` container. Override with
+      # Default targets the in-compose `gateway` container. Override with
       # `SHIM_UPSTREAM_URL=http://host.docker.internal:8080` to forward to a
-      # cargo-built server running on the host (see `just services`).
-      - UPSTREAM_URL=${SHIM_UPSTREAM_URL:-http://server:8080}
+      # cargo-built gateway running on the host (see `just services`).
+      - UPSTREAM_URL=${SHIM_UPSTREAM_URL:-http://gateway:8080}
       - LISTEN_ADDR=0.0.0.0:8443
       - CERT_DIR=/src/.dev-certs
       # Bare pass-through (no `=`): forwarded only when set in the environment

@@ -1,0 +1,2454 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Eidola API",
+    "description": "Privacy-transparent AI proxy API with inline verification metadata",
+    "contact": {
+      "name": "Mike Marcacci"
+    },
+    "license": {
+      "name": "",
+      "identifier": "UNLICENSED"
+    },
+    "version": "0.1.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080",
+      "description": "Local"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "Public"
+        ],
+        "summary": "Health check endpoint.",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Server is healthy",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": {
+                  "status": "ok"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/account": {
+      "get": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "GET /v1/account — retrieve account info (authenticated).",
+        "operationId": "get_account",
+        "responses": {
+          "200": {
+            "description": "Account info",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetAccountResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "POST /v1/account — create a new account.",
+        "operationId": "create_account",
+        "responses": {
+          "201": {
+            "description": "Account created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateAccountResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/account/balances": {
+      "get": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "GET /v1/account/balances — get credit balance breakdown (authenticated).",
+        "operationId": "get_balances",
+        "responses": {
+          "200": {
+            "description": "Balance breakdown",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BalancesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      }
+    },
+    "/v1/account/checkout": {
+      "post": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "POST /v1/account/checkout — create a checkout session (authenticated).",
+        "description": "Accepts any active Stripe price ID. Automatically determines whether to\ncreate a subscription or one-time payment checkout based on the price type.\nFor subscription prices, enforces the one-active-subscription constraint.",
+        "operationId": "create_checkout",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CheckoutRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Checkout session created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CheckoutUrlResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already subscribed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "Terms acceptance required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Stripe not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      }
+    },
+    "/v1/account/credentials": {
+      "post": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "`POST /v1/account/credentials` — issue anonymous credentials (authenticated).",
+        "operationId": "issue_credentials",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IssueCredentialsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Credential issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueCredentialsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Insufficient credit balance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "Terms acceptance required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Credential issuance not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      }
+    },
+    "/v1/account/ledger": {
+      "get": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "GET /v1/account/ledger — get credit ledger entries (authenticated).",
+        "operationId": "get_ledger",
+        "responses": {
+          "200": {
+            "description": "Ledger entries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LedgerResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      }
+    },
+    "/v1/account/portal": {
+      "post": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "POST /v1/account/portal — mint a Stripe billing-portal session\n(authenticated).",
+        "description": "Separate from the subscription read on purpose. Minting is a write to\nStripe and the session expires quickly, so a link that rides a status\nresponse is one no client can responsibly hold — ours already discarded\nit and asked again at the moment of the click. Riding along, it made\nevery status read create-and-throw-away a Stripe session, and put that\nwrite's latency in front of an answer that did not need it.\n\nRefuses for an account with no payment relationship, on the same test\n`GET /v1/account/subscription` calls `none`: a portal minted for someone\nmoney has never moved for is a door onto an empty room.",
+        "operationId": "create_portal_session",
+        "responses": {
+          "200": {
+            "description": "A billing-portal session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No payment relationship to manage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Stripe not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      }
+    },
+    "/v1/account/subscription": {
+      "get": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "GET /v1/account/subscription — the account's subscription standing\n(authenticated).",
+        "description": "Always 200 on a reachable Stripe: having no subscription is an answer,\nnot a failure. The states are distinguished so a client can tell \"never\ntransacted\" from \"has a payment relationship but nothing in force\" —\nthe second has a billing portal worth offering, the first does not.",
+        "operationId": "get_subscription",
+        "responses": {
+          "200": {
+            "description": "Subscription standing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriptionResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Stripe not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      }
+    },
+    "/v1/account/terms": {
+      "post": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "POST /v1/account/terms — record acceptance of a current document version\n(authenticated).",
+        "operationId": "accept_terms",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcceptTermsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Acceptance recorded"
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not the currently required version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "tags": [
+          "Unlinked"
+        ],
+        "summary": "Create a chat completion.",
+        "description": "Requires an ACT (Anonymous Credit Token) for authorization. The spend proof\nis verified, the nullifier is recorded, and a refund token is issued with\nany unspent credits.",
+        "operationId": "chat_completions",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatCompletionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Chat completion response with privacy and verification metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EidolaResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Insufficient charge amount",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Credential already spent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Upstream provider error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No upstream is available for the model",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/credentials/refund": {
+      "post": {
+        "tags": [
+          "Unlinked"
+        ],
+        "summary": "Recover a refund token for a previously spent ACT.",
+        "description": "If the ACT's nullifier was already recorded (the server received and\nprocessed the original request), the stored refund token is returned.\n\nIf the nullifier was NOT recorded (the original request never arrived),\nthe server verifies the spend proof, records the nullifier, issues a\nfull refund (no credits consumed), stores it, and returns it.\n\nIn both cases, the client gets a refund token it can combine with its\nlocal `PreRefund` state to reconstruct a credential.",
+        "operationId": "recover_refund",
+        "responses": {
+          "200": {
+            "description": "Refund token recovered or issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RefundRecoveryResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid spend proof",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Nullifier found but refund token not yet available",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/keys": {
+      "get": {
+        "tags": [
+          "Public"
+        ],
+        "summary": "`GET /v1/keys` — list valid issuer public keys (unauthenticated).",
+        "operationId": "list_keys",
+        "responses": {
+          "200": {
+            "description": "Valid issuer public keys",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListKeysResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": [
+          "Public"
+        ],
+        "summary": "List available models.",
+        "operationId": "list_models",
+        "responses": {
+          "200": {
+            "description": "List of available models",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelsResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Upstream provider error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/prices": {
+      "get": {
+        "tags": [
+          "Public"
+        ],
+        "summary": "GET /v1/prices — list available prices.",
+        "operationId": "list_prices",
+        "responses": {
+          "200": {
+            "description": "List of available prices",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListPricesResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Stripe not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/terms": {
+      "get": {
+        "tags": [
+          "Public"
+        ],
+        "summary": "GET /v1/terms — the document versions whose acceptance is required.",
+        "description": "Public, and necessarily so: a client fetches this *before* it has an\naccount, to learn what it must accept. It takes no credential and returns\nno account-specific data. (Accepting them is `POST /v1/account/terms`,\nwhich is on the linked surface.)",
+        "operationId": "get_terms",
+        "responses": {
+          "200": {
+            "description": "Currently required document versions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TermsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/webhooks/stripe": {
+      "post": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "POST /v1/webhooks/stripe",
+        "operationId": "stripe_webhook",
+        "responses": {
+          "200": {
+            "description": "Event received"
+          },
+          "400": {
+            "description": "Signature verification failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Webhook secret not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AcceptTermsRequest": {
+        "type": "object",
+        "description": "Acceptance of one currently required document version.",
+        "required": [
+          "document",
+          "sha256"
+        ],
+        "properties": {
+          "document": {
+            "type": "string",
+            "description": "`terms_of_service` or `privacy_policy`."
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Hex-encoded SHA-256 of the document text being accepted; must match\nthe currently required version from `GET /v1/terms`."
+          }
+        }
+      },
+      "AssistantMessage": {
+        "type": "object",
+        "description": "An assistant message in a response.",
+        "required": [
+          "role"
+        ],
+        "properties": {
+          "content": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reasoning": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reasoning_content": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Reasoning (\"thinking\") output from models that emit it. Two\nspellings are in the wild: OpenAI o-series and many compatible\ngateways use `reasoning_content`; vLLM uses `reasoning`. We\nfaithfully round-trip whichever the upstream sent so clients can\npick. Both stay `None` for non-thinking models."
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "tool_calls": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {},
+            "description": "Tool calls the model asked for. Relayed to the client **verbatim**\n(raw `Value`s) so the ids and any provider extension fields survive —\nthe client replays these objects unchanged on its follow-up request,\nand a narrower struct here would silently drop what it doesn't model,\nexactly the defect the `reasoning*` fields above were added to fix."
+          }
+        }
+      },
+      "AttestationStatus": {
+        "type": "string",
+        "description": "Attestation status.",
+        "enum": [
+          "unavailable",
+          "verified"
+        ]
+      },
+      "AuthMethod": {
+        "type": "string",
+        "description": "Supported authorization methods.",
+        "enum": [
+          "anonymous_credential",
+          "none"
+        ]
+      },
+      "AuthorizationInfo": {
+        "type": "object",
+        "description": "Authorization information.",
+        "required": [
+          "method",
+          "linkable"
+        ],
+        "properties": {
+          "linkable": {
+            "type": "boolean",
+            "description": "Whether this authorization method allows linking across requests."
+          },
+          "method": {
+            "$ref": "#/components/schemas/AuthMethod",
+            "description": "The authorization method used."
+          }
+        }
+      },
+      "BackendAttestation": {
+        "type": "object",
+        "description": "Backend attestation from the inference provider.",
+        "required": [
+          "provider",
+          "signing_address",
+          "signature",
+          "signed_content",
+          "signing_algorithm"
+        ],
+        "properties": {
+          "provider": {
+            "type": "string",
+            "description": "The provider that issued the attestation (e.g., \"redpill\")."
+          },
+          "signature": {
+            "type": "string",
+            "description": "The ECDSA signature over the signed content."
+          },
+          "signed_content": {
+            "type": "string",
+            "description": "What was signed: \"sha256(request_body):sha256(response_body)\"."
+          },
+          "signing_address": {
+            "type": "string",
+            "description": "The signing address (e.g., Ethereum address for Phala/RedPill)."
+          },
+          "signing_algorithm": {
+            "type": "string",
+            "description": "The signing algorithm (e.g., \"ecdsa\")."
+          }
+        }
+      },
+      "BalancePool": {
+        "type": "object",
+        "description": "One balance pool: credits sharing an origin and expiration.",
+        "required": [
+          "amount",
+          "source"
+        ],
+        "properties": {
+          "amount": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Credits remaining in this pool (micro-USD denominated)."
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO-8601 instant at which these credits expire; absent for credits\nthat never expire."
+          },
+          "source": {
+            "type": "string",
+            "description": "Where the pool came from: `subscription`, `purchase`, or `other`."
+          }
+        }
+      },
+      "BalancesResponse": {
+        "type": "object",
+        "description": "Credit balance breakdown. All amounts are credits, denominated in\nmicro-USD (1 credit = $0.000001).",
+        "required": [
+          "available",
+          "pools"
+        ],
+        "properties": {
+          "available": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total spendable credits (expired pools excluded)."
+          },
+          "pools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BalancePool"
+            },
+            "description": "Per-pool breakdown, earliest expiry first."
+          }
+        }
+      },
+      "Capability": {
+        "type": "object",
+        "description": "One capability leaf.\n\nAn object rather than a bare boolean, so a capability can grow a sibling\nkey later — an effort ladder, a weights measurement — without a type change\nbreaking a client already deployed against this shape.",
+        "required": [
+          "supported"
+        ],
+        "properties": {
+          "supported": {
+            "type": "boolean",
+            "description": "Whether the model supports it."
+          }
+        }
+      },
+      "ChatCompletionChunk": {
+        "type": "object",
+        "description": "A streaming chat completion chunk.",
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices"
+        ],
+        "properties": {
+          "choices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChunkChoice"
+            },
+            "description": "List of completion choices (deltas)."
+          },
+          "created": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix timestamp of when the chunk was created.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "description": "Unique identifier for the completion."
+          },
+          "model": {
+            "type": "string",
+            "description": "The model used for completion."
+          },
+          "object": {
+            "type": "string",
+            "description": "The object type (always \"chat.completion.chunk\")."
+          },
+          "usage": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Usage",
+                "description": "Usage statistics (included in the final chunk by some providers)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "ChatCompletionRequest": {
+        "type": "object",
+        "description": "A chat completion request.",
+        "required": [
+          "model",
+          "messages"
+        ],
+        "properties": {
+          "cache_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The client's prefix-cache key: 32 bytes, base64url without padding\n(`eidola_common::engine_protocol`). An Eidola-hosted engine scopes\nprefix-cache reuse to requests carrying the same key; without one,\nnothing a request computes is reused by any other.\n\n**Secret, and never serialized.** It is held decoded in a\nscrubbed-on-drop buffer, prints redacted, and `Serialize` skips it, so\nre-serializing a request for the Tinfoil upstream (which has no use\nfor it) cannot carry it there. The one writer is\n`engine_trust::protocol::engine_request_body`.",
+            "maxLength": 43,
+            "minLength": 43,
+            "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+          },
+          "max_completion_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The maximum number of completion tokens to generate.",
+            "minimum": 0
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            },
+            "description": "A list of messages comprising the conversation."
+          },
+          "model": {
+            "type": "string",
+            "description": "ID of the model to use."
+          },
+          "stop": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/StopSequence",
+                "description": "Up to 4 sequences where the API will stop generating."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "stream": {
+            "type": "boolean",
+            "description": "Whether to stream partial responses."
+          },
+          "stream_options": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/StreamOptions",
+                "description": "Streaming options. The OpenAI-compatible field; we accept it for\nAPI parity with clients that already set it (e.g. an SDK setting\n`include_usage: true` to capture token counts in the final chunk).\nNote: the server overrides `include_usage` to `true` for any\nstreaming request before forwarding upstream — usage is required\nfor accurate per-token refunds and isn't a client choice."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "temperature": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Sampling temperature between 0 and 2."
+          },
+          "tool_choice": {
+            "description": "How the model should choose among `tools` (`\"none\"` / `\"auto\"` /\n`\"required\"`, or a `{\"type\":\"function\", …}` object). Opaque\npass-through for the same reason as [`Self::tools`]."
+          },
+          "tools": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {},
+            "description": "Tool (function) definitions the model may call.\n\n**Opaque pass-through.** Each entry is forwarded upstream verbatim:\nthe server never executes a tool and has no reason to understand the\nJSON Schema inside `function.parameters`, while modelling it would\nmean rejecting (via this struct's `deny_unknown_fields`) every\nprovider extension a client legitimately sends. Keeping the entries\nas raw `Value`s is also what lets the pricing contract measure\nexactly the bytes that go on the wire — see\n`handlers::chargeable_prompt_tokens_for`."
+          },
+          "top_p": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Nucleus sampling parameter."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ChatCompletionResponse": {
+        "type": "object",
+        "description": "A chat completion response.",
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices"
+        ],
+        "properties": {
+          "choices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Choice"
+            },
+            "description": "List of completion choices."
+          },
+          "created": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix timestamp of when the completion was created.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "description": "Unique identifier for the completion."
+          },
+          "model": {
+            "type": "string",
+            "description": "The model used for completion."
+          },
+          "object": {
+            "type": "string",
+            "description": "The object type (always \"chat.completion\")."
+          },
+          "usage": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Usage",
+                "description": "Usage statistics for the request."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "CheckoutRequest": {
+        "type": "object",
+        "required": [
+          "price_id"
+        ],
+        "properties": {
+          "cancel_url": {
+            "type": "string"
+          },
+          "price_id": {
+            "type": "string"
+          },
+          "success_url": {
+            "type": "string"
+          }
+        }
+      },
+      "CheckoutUrlResponse": {
+        "type": "object",
+        "required": [
+          "checkout_url"
+        ],
+        "properties": {
+          "checkout_url": {
+            "type": "string"
+          }
+        }
+      },
+      "Choice": {
+        "type": "object",
+        "description": "A completion choice.",
+        "required": [
+          "index",
+          "message"
+        ],
+        "properties": {
+          "finish_reason": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FinishReason",
+                "description": "The reason the model stopped generating."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The index of this choice.",
+            "minimum": 0
+          },
+          "message": {
+            "$ref": "#/components/schemas/AssistantMessage",
+            "description": "The generated message."
+          }
+        }
+      },
+      "ChunkChoice": {
+        "type": "object",
+        "description": "A choice delta in a streaming chunk.",
+        "required": [
+          "index",
+          "delta"
+        ],
+        "properties": {
+          "delta": {
+            "$ref": "#/components/schemas/ChunkDelta",
+            "description": "The delta (partial update) for this choice."
+          },
+          "finish_reason": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FinishReason",
+                "description": "The reason the model stopped generating (only in final chunk)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The index of this choice.",
+            "minimum": 0
+          }
+        }
+      },
+      "ChunkDelta": {
+        "type": "object",
+        "description": "A delta update in a streaming response.",
+        "properties": {
+          "content": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reasoning": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reasoning_content": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Reasoning (\"thinking\") deltas — same dual spelling as\n`AssistantMessage`. Without these fields here, serde silently\ndrops the upstream `reasoning_content` / `reasoning` keys during\ndeserialization and the client only ever sees `delta.content`.\nRound-trip whatever the upstream emits."
+          },
+          "role": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Role"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tool_calls": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {},
+            "description": "Streamed tool-call deltas, relayed **verbatim** as raw `Value`s.\n\nNothing about a streamed tool call is guaranteed to arrive whole: the\nid, the function name and the `arguments` string all arrive in\nfragments keyed by the entry's `index`, and the client reassembles\nthem. The proxy therefore must not model, reorder, or normalize these\nentries — including the streaming-only `index` framing key, which the\nclient's accumulator needs. Same rule as `reasoning*` above: a field\nthis struct does not name is dropped on re-serialization."
+          }
+        }
+      },
+      "ContentPart": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Text content.",
+            "required": [
+              "text",
+              "type"
+            ],
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "text"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Image content via URL.",
+            "required": [
+              "image_url",
+              "type"
+            ],
+            "properties": {
+              "image_url": {
+                "$ref": "#/components/schemas/ImageUrl"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "image_url"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A content part within a multimodal message."
+      },
+      "CreateAccountResponse": {
+        "type": "object",
+        "required": [
+          "account_id",
+          "secret",
+          "created_at"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "secret": {
+            "type": "string"
+          }
+        }
+      },
+      "DataExposure": {
+        "type": "object",
+        "description": "Describes a party's visibility into request/response data.",
+        "required": [
+          "party",
+          "sees",
+          "confidentiality",
+          "logged"
+        ],
+        "properties": {
+          "confidentiality": {
+            "type": "string",
+            "description": "How confidentiality is enforced: \"tee\" or \"provider-policy\"."
+          },
+          "logged": {
+            "type": "string",
+            "description": "Whether this party logs requests: \"none\", \"unknown\", \"yes\"."
+          },
+          "party": {
+            "type": "string",
+            "description": "The party (e.g., \"eidola-proxy\", \"phala-gpu-tee\", \"anthropic\")."
+          },
+          "sees": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What data this party can see (e.g., [\"prompt\", \"response\", \"token_count\"])."
+          }
+        }
+      },
+      "EidolaResponse": {
+        "type": "object",
+        "description": "An Eidola chat completion response.",
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices",
+          "privacy",
+          "verification"
+        ],
+        "properties": {
+          "choices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Choice"
+            },
+            "description": "Completion choices."
+          },
+          "created": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix timestamp of when the completion was created.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "description": "Unique identifier for the completion."
+          },
+          "model": {
+            "type": "string",
+            "description": "The model that produced the completion."
+          },
+          "object": {
+            "type": "string",
+            "description": "The object type."
+          },
+          "privacy": {
+            "$ref": "#/components/schemas/PrivacyMetadata",
+            "description": "Privacy metadata describing data exposure and authorization."
+          },
+          "refund": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RefundInfo",
+                "description": "Refund token for unspent credits (only present for ACT-authenticated requests)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "usage": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Usage",
+                "description": "Token usage statistics."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "verification": {
+            "$ref": "#/components/schemas/VerificationMetadata",
+            "description": "Verification metadata with cryptographic attestations."
+          }
+        }
+      },
+      "EidolaStreamMetadata": {
+        "type": "object",
+        "description": "Metadata event sent as the final SSE event before [DONE] in streaming responses.\n\nClients identify this by checking `object == \"eidola.chat.completion.metadata\"`.\nStandard OpenAI clients will ignore it.",
+        "required": [
+          "object",
+          "id",
+          "privacy",
+          "verification"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The completion ID this metadata belongs to."
+          },
+          "object": {
+            "type": "string",
+            "description": "The object type."
+          },
+          "privacy": {
+            "$ref": "#/components/schemas/PrivacyMetadata",
+            "description": "Privacy metadata."
+          },
+          "refund": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RefundInfo",
+                "description": "Refund token for unspent credits."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "verification": {
+            "$ref": "#/components/schemas/VerificationMetadata",
+            "description": "Verification metadata."
+          }
+        }
+      },
+      "ErrorDetail": {
+        "type": "object",
+        "required": [
+          "message",
+          "type"
+        ],
+        "properties": {
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "description": "An error response in OpenAI format, optionally including a refund token.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail"
+          },
+          "refund": {
+            "description": "Refund token for unspent credits (present when an error occurs after\nthe ACT nullifier has been recorded)."
+          }
+        }
+      },
+      "FinishReason": {
+        "type": "string",
+        "description": "The reason the model stopped generating.",
+        "enum": [
+          "stop",
+          "length",
+          "content_filter",
+          "tool_calls"
+        ]
+      },
+      "GetAccountResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "stripe_customer_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ImageUrl": {
+        "type": "object",
+        "description": "An image URL reference.",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional detail level for the image."
+          },
+          "url": {
+            "type": "string",
+            "description": "The URL of the image, or a base64-encoded data URI."
+          }
+        },
+        "additionalProperties": false
+      },
+      "IssueCredentialsRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/account/credentials`.",
+        "required": [
+          "issuance_request",
+          "credits"
+        ],
+        "properties": {
+          "credits": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of credits to issue."
+          },
+          "issuance_request": {
+            "type": "string",
+            "description": "Base64-encoded CBOR `IssuanceRequest`."
+          }
+        }
+      },
+      "IssueCredentialsResponse": {
+        "type": "object",
+        "description": "Response for `POST /v1/account/credentials`.",
+        "required": [
+          "issuance_response",
+          "issuer_key_id",
+          "credits",
+          "ledger_entry_id"
+        ],
+        "properties": {
+          "credits": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of credits issued."
+          },
+          "issuance_response": {
+            "type": "string",
+            "description": "Base64-encoded CBOR `IssuanceResponse`."
+          },
+          "issuer_key_id": {
+            "type": "string",
+            "description": "Issuer key identifier: hex-encoded SHA-256(pkI_serialized)."
+          },
+          "ledger_entry_id": {
+            "type": "string",
+            "description": "The ledger entry ID for this issuance."
+          }
+        }
+      },
+      "IssuerKeyResponse": {
+        "type": "object",
+        "description": "A single issuer public key in the `GET /v1/keys` response.",
+        "required": [
+          "id",
+          "public_key",
+          "domain_separator",
+          "issue_from",
+          "issue_until",
+          "accept_until"
+        ],
+        "properties": {
+          "accept_until": {
+            "type": "string",
+            "description": "End of the acceptance window (ISO 8601)."
+          },
+          "domain_separator": {
+            "type": "string",
+            "description": "Domain separator used for parameter generation."
+          },
+          "id": {
+            "type": "string",
+            "description": "Issuer key ID: hex-encoded SHA-256(pkI_serialized)."
+          },
+          "issue_from": {
+            "type": "string",
+            "description": "Start of the issuance window (ISO 8601)."
+          },
+          "issue_until": {
+            "type": "string",
+            "description": "End of the issuance window (ISO 8601)."
+          },
+          "public_key": {
+            "type": "string",
+            "description": "Base64url-encoded CBOR public key (compressed Ristretto255 point)."
+          }
+        }
+      },
+      "LedgerEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "delta",
+          "reason",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "credential_credits": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "credential_key_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "delta": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "LedgerResponse": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LedgerEntry"
+            }
+          }
+        }
+      },
+      "ListKeysResponse": {
+        "type": "object",
+        "description": "Response for `GET /v1/keys`.",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IssuerKeyResponse"
+            }
+          }
+        }
+      },
+      "ListPricesResponse": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PriceResponse"
+            }
+          }
+        }
+      },
+      "Message": {
+        "type": "object",
+        "description": "A message in the conversation.",
+        "required": [
+          "role"
+        ],
+        "properties": {
+          "content": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MessageContent",
+                "description": "The content of the message.\n\nNullable since tool calling: an assistant message that only called\ntools carries `\"content\": null`. The key is deliberately **always\nserialized** (no `skip_serializing_if`) — several chat templates\nrequire it to exist, and clients send the explicit `null` for that\nreason, so dropping it on the way upstream would change the request."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An optional name for the participant."
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role",
+            "description": "The role of the message author."
+          },
+          "tool_call_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The id of the tool call this message answers (`role: \"tool\"` only)."
+          },
+          "tool_calls": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {},
+            "description": "Tool calls the assistant made, replayed by the client verbatim on the\nfollow-up request.\n\n**Opaque pass-through**, like [`ChatCompletionRequest::tools`]: the\nclient is required to replay the provider's own call objects\nunchanged (ids and any provider extension fields intact), so the\nserver must not normalize them through a narrower struct."
+          }
+        },
+        "additionalProperties": false
+      },
+      "MessageContent": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ContentPart"
+            }
+          }
+        ],
+        "description": "Message content can be a simple string or array of content parts (for multimodal)."
+      },
+      "Modality": {
+        "type": "string",
+        "description": "A kind of content a model accepts or produces.",
+        "enum": [
+          "text",
+          "image",
+          "audio"
+        ]
+      },
+      "Model": {
+        "type": "object",
+        "description": "A model descriptor.",
+        "required": [
+          "id",
+          "name",
+          "description",
+          "context_length",
+          "output_budget_class",
+          "hosting",
+          "capabilities",
+          "pricing"
+        ],
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/ModelCapabilities",
+            "description": "What this model can do."
+          },
+          "context_length": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Maximum context window size in tokens.",
+            "minimum": 0
+          },
+          "description": {
+            "type": "string",
+            "description": "Short description of the model's capabilities."
+          },
+          "hosting": {
+            "$ref": "#/components/schemas/ModelHosting",
+            "description": "Who runs the inference for this model."
+          },
+          "id": {
+            "type": "string",
+            "description": "The model identifier (e.g. \"openai/gpt-4o\")."
+          },
+          "max_output_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The largest completion this model may be asked for.\n\nSeparate from `context_length` on purpose: a context window is what a\nrequest may *contain*, not what one response may *be*. `null` means\nundeclared — a client must treat that as \"unknown\" and keep whatever\ndefault it already applies, never as zero.",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable display name."
+          },
+          "output_budget_class": {
+            "$ref": "#/components/schemas/OutputBudgetClass",
+            "description": "Which public output-budget ladder this model draws from."
+          },
+          "pricing": {
+            "$ref": "#/components/schemas/ModelPricing",
+            "description": "Pricing in integer credits per 1k tokens."
+          }
+        }
+      },
+      "ModelCapabilities": {
+        "type": "object",
+        "description": "What a model can do, as the catalog declares it.\n\nOnly axes that actually vary across the models this server sells are\ncarried. An axis every model shares tells a client nothing and is one more\nassertion that has to stay true. `prompt_cache` and `pinned_weights` are\nthe axes on which an Eidola-hosted row differs from a Tinfoil-hosted one.",
+        "required": [
+          "tool_calling",
+          "reasoning",
+          "input_modalities",
+          "output_modalities",
+          "prompt_cache",
+          "pinned_weights"
+        ],
+        "properties": {
+          "input_modalities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Modality"
+            },
+            "description": "The content kinds the model accepts."
+          },
+          "output_modalities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Modality"
+            },
+            "description": "The content kinds the model produces."
+          },
+          "pinned_weights": {
+            "$ref": "#/components/schemas/PinnedWeightsCapability",
+            "description": "The weights this gateway pins for the model, and where they came from."
+          },
+          "prompt_cache": {
+            "$ref": "#/components/schemas/PromptCacheCapability",
+            "description": "Whether, and for how long, requests may reuse each other's prompt\nprefix (`cache_key`)."
+          },
+          "reasoning": {
+            "$ref": "#/components/schemas/Capability",
+            "description": "Whether the model produces reasoning content before its answer."
+          },
+          "tool_calling": {
+            "$ref": "#/components/schemas/Capability",
+            "description": "Whether the model accepts a `tools` request field.\n\nNamed after the wire rather than after an adjective: the question a\nclient actually has is \"will this request be accepted\", and a field\nname answers it where \"supports tool use\" does not."
+          }
+        }
+      },
+      "ModelHosting": {
+        "type": "string",
+        "description": "Who runs a model's inference, as the catalog declares it.",
+        "enum": [
+          "tinfoil",
+          "eidola"
+        ]
+      },
+      "ModelPricing": {
+        "type": "object",
+        "description": "Pricing for a model in scaled integer credits per token (or per request).",
+        "required": [
+          "per_prompt_token",
+          "per_completion_token"
+        ],
+        "properties": {
+          "per_completion_token": {
+            "$ref": "#/components/schemas/ScaledPrice"
+          },
+          "per_prompt_token": {
+            "$ref": "#/components/schemas/ScaledPrice"
+          },
+          "per_request": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ScaledPrice",
+                "description": "Per-request pricing (for models like Whisper or TTS that charge per request\nrather than per token). When present, `per_prompt_token` and\n`per_completion_token` are zero."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "ModelsResponse": {
+        "type": "object",
+        "description": "A list of available models.",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Model"
+            },
+            "description": "The list of models."
+          }
+        }
+      },
+      "OutputBudgetClass": {
+        "type": "string",
+        "description": "Which public output-budget ladder a model draws from.\n\nA *class*, not a number: the ladder's rungs are policy that can move\nwithout the catalog moving, and keeping the selection public and\nper-model is what keeps an output budget from becoming a per-user value.",
+        "enum": [
+          "standard",
+          "reasoning"
+        ]
+      },
+      "PinnedWeightsCapability": {
+        "type": "object",
+        "description": "The exact weights a model is served from, when this gateway pins them.\n\n`supported` means this gateway build accepts only deployments serving the\nweights hashed here, and tells each one so on every request. `sha256` is\nthe engine's weights hash (a SHA-256 over the manifest of every file the\nengine reads from its weights directory); `repo` and `revision` say where\nthose files were taken from. All three are absent when `supported` is\nfalse.",
+        "required": [
+          "supported"
+        ],
+        "properties": {
+          "repo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The source repository, `<owner>/<name>`."
+          },
+          "revision": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The source repository's revision."
+          },
+          "sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The weights hash, lowercase hex."
+          },
+          "supported": {
+            "type": "boolean",
+            "description": "Whether the weights are pinned by this gateway."
+          }
+        }
+      },
+      "PortalResponse": {
+        "type": "object",
+        "description": "A freshly minted Stripe billing-portal session.\n\nIts own endpoint rather than a field on the subscription standing:\nminting is a **write** to Stripe and the session expires quickly, so a\nlink handed out with a status read is one the client cannot responsibly\nkeep — and every status read was creating a portal session that was then\nthrown away.",
+        "required": [
+          "portal_url"
+        ],
+        "properties": {
+          "portal_url": {
+            "type": "string",
+            "description": "Open this in a browser now. Short-lived by construction; ask again\nrather than storing it."
+          }
+        }
+      },
+      "PriceResponse": {
+        "type": "object",
+        "description": "A purchasable plan.",
+        "required": [
+          "id",
+          "product_name",
+          "currency",
+          "type",
+          "credits"
+        ],
+        "properties": {
+          "credits": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Credits granted by this plan, denominated in micro-USD\n(1 credit = $0.000001). Subscription credits expire at the end of\neach billing period; one-time purchase credits expire one year\nafter purchase."
+          },
+          "currency": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "lookup_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "product_description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "product_name": {
+            "type": "string"
+          },
+          "recurring": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RecurringResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": {
+            "type": "string"
+          },
+          "unit_amount": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Purchase price in the minor unit of `currency` (e.g. cents for USD)."
+          }
+        }
+      },
+      "PrivacyMetadata": {
+        "type": "object",
+        "description": "Privacy metadata describing how the request was authorized, what data is\nvisible to which parties, and transport security properties.",
+        "required": [
+          "authorization",
+          "data_exposure",
+          "transport"
+        ],
+        "properties": {
+          "authorization": {
+            "$ref": "#/components/schemas/AuthorizationInfo",
+            "description": "Authorization details."
+          },
+          "data_exposure": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DataExposure"
+            },
+            "description": "Which parties can see which data, and under what guarantees."
+          },
+          "transport": {
+            "$ref": "#/components/schemas/TransportInfo",
+            "description": "Transport security between hops."
+          }
+        }
+      },
+      "PromptCacheCapability": {
+        "type": "object",
+        "description": "Prompt-cache reuse across requests.\n\n`supported` means requests to this model may carry a `cache_key`, and that\nrequests carrying the same key can reuse each other's computed prompt\nprefix. The two bounds are the serving deployments' measured retention:\na prefix nothing has used for `idle_ttl_secs`, or any prefix older than\n`max_age_secs`, is never reused and is zeroed. Both are absent when\n`supported` is false.",
+        "required": [
+          "supported"
+        ],
+        "properties": {
+          "idle_ttl_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Longest a cached prefix stays reusable without being used, in seconds.",
+            "minimum": 0
+          },
+          "max_age_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Longest a cached prefix stays reusable at all, in seconds.",
+            "minimum": 0
+          },
+          "supported": {
+            "type": "boolean",
+            "description": "Whether requests may carry a `cache_key`."
+          }
+        }
+      },
+      "ProxyAttestation": {
+        "type": "object",
+        "description": "Proxy attestation (placeholder for future TEE deployment).",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/AttestationStatus",
+            "description": "Current attestation status."
+          }
+        }
+      },
+      "RecurringResponse": {
+        "type": "object",
+        "required": [
+          "interval",
+          "interval_count"
+        ],
+        "properties": {
+          "interval": {
+            "type": "string"
+          },
+          "interval_count": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "RefundInfo": {
+        "type": "object",
+        "description": "A refund token issued after spending an ACT.",
+        "required": [
+          "refund",
+          "issuer_key_id"
+        ],
+        "properties": {
+          "issuer_key_id": {
+            "type": "string",
+            "description": "The issuer key ID that signed this refund."
+          },
+          "refund": {
+            "type": "string",
+            "description": "Base64url-encoded CBOR `Refund` message."
+          }
+        }
+      },
+      "RefundRecoveryResponse": {
+        "type": "object",
+        "description": "Response from the refund recovery endpoint.",
+        "required": [
+          "refund"
+        ],
+        "properties": {
+          "refund": {
+            "$ref": "#/components/schemas/RefundInfo",
+            "description": "The refund token."
+          }
+        }
+      },
+      "RequiredDocument": {
+        "type": "object",
+        "description": "A document whose current version must be accepted before purchases or\ncredential issuance. `sha256` identifies the exact text (the markdown\nsource, retrievable at `{url}source.md`), so acceptance binds to\nprecise words rather than a mutable URL; `version` is the document's\nmonotonically increasing front-matter version, which orders releases\n(accepting version N satisfies any requirement ≤ N).",
+        "required": [
+          "document",
+          "version",
+          "url",
+          "sha256"
+        ],
+        "properties": {
+          "document": {
+            "type": "string",
+            "description": "`terms_of_service` or `privacy_policy`."
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Hex-encoded SHA-256 of the exact published document text."
+          },
+          "url": {
+            "type": "string",
+            "description": "Where the current text is published."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Monotonically increasing document version."
+          }
+        }
+      },
+      "Role": {
+        "type": "string",
+        "description": "The role of a message author.",
+        "enum": [
+          "system",
+          "user",
+          "assistant",
+          "tool"
+        ]
+      },
+      "ScaledPrice": {
+        "type": "object",
+        "description": "A price expressed as an integer value with a fixed scale factor.\n\nActual credits per unit = `value / scale_factor`.",
+        "required": [
+          "value",
+          "scale_factor"
+        ],
+        "properties": {
+          "scale_factor": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "value": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "StopSequence": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        ],
+        "description": "Stop sequence can be a single string or array of strings."
+      },
+      "StreamOptions": {
+        "type": "object",
+        "description": "OpenAI-compatible streaming options.",
+        "properties": {
+          "include_usage": {
+            "type": "boolean",
+            "description": "Include token-usage statistics in the final stream chunk. The\nserver forces this on for upstream calls so it can compute\naccurate refunds; the field exists here only to round-trip\nhonest clients."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SubscriptionResponse": {
+        "type": "object",
+        "description": "The account's subscription standing.\n\nThe `state` field is the answer; the rest is detail that exists only\nwhere it is meaningful. It is deliberately a three-value state rather\nthan a present/absent subscription, because \"this account has never\ntransacted\" and \"this account has a payment relationship but no live\nsubscription\" are different situations and lead to different UI.",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "current_period_end": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "End of the current billing period, ISO-8601. Present when `state`\nis `active` and Stripe reported one."
+          },
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The in-force subscription's Stripe id. Present exactly when `state`\nis `active`."
+          },
+          "state": {
+            "type": "string",
+            "description": "`none` — the account has never transacted, so it has no payment\nrelationship and nothing to manage. That means no Stripe customer\n*or* a customer record with no money ever moved under it, which\ncheckout can leave behind when a session is abandoned — a customer\nid alone buys nobody a card, an invoice or a receipt. `inactive` — a\nreal payment history, but no subscription in a status Eidola treats\nas in force. `active` — a subscription is in force.\n\n\"In force\" means Stripe status `active`, `trialing`, or `past_due`\n— the same set the checkout endpoint refuses to double-subscribe\nover, so the two answers cannot disagree."
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The in-force subscription's raw Stripe status, so a client can show\nwhat it actually is (a `past_due` subscription is in force and\nwants attention). Present exactly when `state` is `active`."
+          }
+        }
+      },
+      "TermsResponse": {
+        "type": "object",
+        "description": "The documents (and versions) whose acceptance the server currently\nrequires. Empty when no acceptance gate is configured.",
+        "required": [
+          "documents"
+        ],
+        "properties": {
+          "documents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RequiredDocument"
+            }
+          }
+        }
+      },
+      "TransportInfo": {
+        "type": "object",
+        "description": "Transport security information.",
+        "required": [
+          "client_to_proxy",
+          "proxy_to_backend"
+        ],
+        "properties": {
+          "client_to_proxy": {
+            "type": "string",
+            "description": "Transport from client to this proxy."
+          },
+          "proxy_to_backend": {
+            "type": "string",
+            "description": "Transport from this proxy to the backend."
+          }
+        }
+      },
+      "Usage": {
+        "type": "object",
+        "description": "Token usage statistics.",
+        "required": [
+          "prompt_tokens",
+          "completion_tokens",
+          "total_tokens"
+        ],
+        "properties": {
+          "completion_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "prompt_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "total_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "VerificationMetadata": {
+        "type": "object",
+        "description": "Verification metadata with cryptographic attestations for the proxy and backend.",
+        "properties": {
+          "backend": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BackendAttestation",
+                "description": "Backend attestation (only for TEE-backed models like phala/*)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "proxy": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ProxyAttestation",
+                "description": "Proxy attestation (None until the proxy runs in a TEE)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "basic": {
+        "type": "http",
+        "scheme": "basic",
+        "description": "Account credentials. Username is the account UUID, password is the secret returned at account creation."
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Public",
+      "description": "Unauthenticated endpoints available to anyone."
+    },
+    {
+      "name": "Linked",
+      "description": "Authenticated endpoints tied to a known account (HTTP Basic auth)."
+    },
+    {
+      "name": "Unlinked",
+      "description": "Endpoints authenticated with anonymous credentials — usage cannot be linked back to an account."
+    }
+  ]
+}

@@ -41,6 +41,9 @@ pub(crate) const RECORD_BODY_MAX_BYTES: usize = 1 << 20;
 pub(crate) struct RecordedBody {
     pub(crate) kept: Vec<u8>,
     pub(crate) received: usize,
+    /// Bytes of stream padding received and not kept (see
+    /// [`RecordedBody::push_event`]); counted in `received` too.
+    pub(crate) padding: usize,
 }
 
 impl RecordedBody {
@@ -55,6 +58,36 @@ impl RecordedBody {
         }
     }
 
+    /// Take one server-sent event and the terminator that ended it (empty for
+    /// the unterminated rest of a stream) — **unless it is padding**, which is
+    /// counted and not kept.
+    ///
+    /// The Eidola server writes its streams as fixed-size frames on a fixed
+    /// tick, filling each with comment events, so that a network observer
+    /// cannot read token lengths or timing off the ciphertext. That padding
+    /// runs at the frame rate for as long as the answer does, so kept
+    /// byte for byte it would fill the retention cap within seconds and push
+    /// the answer itself out of the Record. A padding event
+    /// ([`crate::is_padding_event`]: nothing but comments and blank lines)
+    /// dispatches nothing, so omitting it loses nothing a reader could use,
+    /// and the seal states how much was omitted.
+    pub(crate) fn push_event(&mut self, event: &[u8], terminator: &[u8]) {
+        if crate::is_padding_event(event) {
+            let len = event.len() + terminator.len();
+            self.received += len;
+            self.padding += len;
+        } else {
+            self.push(event);
+            self.push(terminator);
+        }
+    }
+
+    /// What arrived, less padding: the bytes the answer is made of, which is
+    /// what a read ceiling bounds.
+    pub(crate) fn payload_received(&self) -> usize {
+        self.received - self.padding
+    }
+
     /// The bytes to record for a **response**, with the cap's note when they
     /// are not all of them, and nothing about how the response ended — that is
     /// the caller's ending to state (see the module doc).
@@ -63,11 +96,22 @@ impl RecordedBody {
     /// only then is `received` the response's size rather than how far this app
     /// got.
     pub(crate) fn seal_response(self, read_to_end: bool) -> Vec<u8> {
-        seal_recorded_body(
+        let mut out = seal_recorded_body(
             self.kept,
-            self.received,
+            self.received - self.padding,
             RecordedSide::Response { read_to_end },
-        )
+        );
+        if self.padding > 0 {
+            out.extend_from_slice(
+                format!(
+                    "\n\n[eidola: {} bytes of stream padding (events carrying only comments \
+                     or blank lines, which carry no data) were received and not kept.]\n",
+                    self.padding
+                )
+                .as_bytes(),
+            );
+        }
+        out
     }
 
     /// The bytes to record for a **request** body.
@@ -202,11 +246,38 @@ fn seal_recorded_body(mut kept: Vec<u8>, received: usize, side: RecordedSide) ->
 /// honest about it. See [`RecordedBody::seal_request`].
 ///
 /// **The request still travels whole**; what is bounded is what is kept.
+///
+/// **One member is withheld rather than kept: `cache_key`.** The prefix-cache
+/// key is secret ([`crate::prefix_cache`]) and the Record is a surface people
+/// read, so the row says a key was sent — its value replaced by
+/// [`WITHHELD_CACHE_KEY`] — and never which. A body without one is kept
+/// exactly as before.
 pub(crate) fn recorded_request(body: &Value) -> Vec<u8> {
     let mut kept = RecordedBody::default();
-    kept.push(body.to_string().as_bytes());
+    if let Some(sent_key_len) = body.get("cache_key").and_then(Value::as_str).map(str::len) {
+        let mut shown = body.clone();
+        crate::prefix_cache::scrub_body_key(&mut shown);
+        shown["cache_key"] = Value::String(WITHHELD_CACHE_KEY.to_string());
+        let shown = shown.to_string();
+        kept.push(shown.as_bytes());
+        // **The size the seal states is the size that was sent**, not the
+        // redacted copy's: the two serializations differ only in that one
+        // string, and neither a key (base64url) nor the placeholder needs
+        // escaping, so the difference is their lengths. The placeholder is a
+        // key's length besides, so the kept copy is the sent one's size and
+        // the seal's "was it all kept" comparison means what it says.
+        kept.received = shown.len() - WITHHELD_CACHE_KEY.len() + sent_key_len;
+    } else {
+        kept.push(body.to_string().as_bytes());
+    }
     kept.seal_request()
 }
+
+/// What the Record shows in place of a request's prefix-cache key — exactly
+/// as long as the key's text, so withholding it changes no size.
+pub(crate) const WITHHELD_CACHE_KEY: &str = "[withheld: this request's prefix-cache key]";
+const _: () =
+    assert!(WITHHELD_CACHE_KEY.len() == eidola_common::engine_protocol::CACHE_KEY_TEXT_LEN);
 
 /// What the Record keeps of a blocking answer, stating both the retention cap
 /// and the read ceiling where either applied.
@@ -234,6 +305,92 @@ pub(crate) fn recorded_cut_answer(partial: &BoundedBody) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// The Record says a key was sent and never which; a keyless body is kept
+    /// byte for byte.
+    #[test]
+    fn a_requests_cache_key_is_withheld_from_the_record() {
+        let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+        let messages = [serde_json::json!({"role": "user", "content": "hi"})];
+        let keyed = eidola_common::chat_completion_request_body(
+            "m",
+            &messages,
+            16,
+            &[],
+            false,
+            false,
+            Some(key),
+        );
+        let kept = String::from_utf8(recorded_request(&keyed)).unwrap();
+        assert!(!kept.contains(key), "{kept}");
+        let parsed: Value = serde_json::from_str(&kept).unwrap();
+        assert_eq!(parsed["cache_key"], WITHHELD_CACHE_KEY);
+        assert_eq!(parsed["messages"], keyed["messages"]);
+        // The caller's body still carries the key it sends.
+        assert_eq!(keyed["cache_key"], key);
+
+        let keyless = eidola_common::chat_completion_request_body(
+            "m",
+            &messages,
+            16,
+            &[],
+            false,
+            false,
+            None,
+        );
+        assert_eq!(recorded_request(&keyless), keyless.to_string().into_bytes());
+    }
+
+    /// Past the retention cap, the seal states the size of the body that was
+    /// **sent**, key and all — not the size of the copy the Record withheld it
+    /// from.
+    #[test]
+    fn a_withheld_keys_request_past_the_cap_states_the_size_that_was_sent() {
+        let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+        let messages = [serde_json::json!({
+            "role": "user",
+            "content": "x".repeat(RECORD_BODY_MAX_BYTES + 4096),
+        })];
+        let keyed = eidola_common::chat_completion_request_body(
+            "m",
+            &messages,
+            16,
+            &[],
+            false,
+            false,
+            Some(key),
+        );
+        let sent = keyed.to_string().len();
+        let kept = String::from_utf8_lossy(&recorded_request(&keyed)).into_owned();
+        assert!(!kept.contains(key));
+        let tail = &kept[kept.len() - 300..];
+        assert!(
+            tail.contains(&format!(
+                "first {RECORD_BODY_MAX_BYTES} bytes of a {sent}-byte request"
+            )),
+            "{tail}"
+        );
+    }
+
+    /// Under the cap, withholding the key adds no truncation note: the kept
+    /// copy is whole.
+    #[test]
+    fn a_withheld_key_is_not_a_truncation() {
+        let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+        let messages = [serde_json::json!({"role": "user", "content": "hi"})];
+        let keyed = eidola_common::chat_completion_request_body(
+            "m",
+            &messages,
+            16,
+            &[],
+            false,
+            false,
+            Some(key),
+        );
+        let kept = String::from_utf8(recorded_request(&keyed)).unwrap();
+        assert_eq!(kept.len(), keyed.to_string().len());
+        assert!(!kept.contains("[eidola:"), "{kept}");
+    }
+
     /// A request's note is a request's: it states the size this app built and
     /// claims nothing about sending, delivering or receiving.
     #[test]
@@ -258,6 +415,32 @@ mod tests {
         let mut response = RecordedBody::default();
         response.push(b"data: hi\n\n");
         assert_eq!(response.seal_response(true), b"data: hi\n\n".to_vec());
+    }
+
+    /// Padding events are counted and not kept; everything else is kept in
+    /// order, and the seal says how much padding there was. A body with none
+    /// seals exactly as before.
+    #[test]
+    fn stream_padding_is_counted_and_not_kept() {
+        let mut body = RecordedBody::default();
+        body.push_event(b": ", b"\n\n");
+        body.push_event(b"data: {\"a\":1}", b"\n\n");
+        body.push_event(b"", b"\n\n");
+        body.push_event(b"\n:   ", b"\n\n");
+        body.push_event(b"id: 1\ndata: [DONE]", b"\n\n");
+        assert_eq!(body.padding, 4 + 2 + 7);
+        assert_eq!(body.payload_received(), 15 + 20);
+        let sealed = String::from_utf8(body.seal_response(true)).unwrap();
+        assert!(
+            sealed.starts_with(
+                "data: {\"a\":1}\n\nid: 1\ndata: [DONE]\n\n\n\n[eidola: 13 bytes of stream padding"
+            ),
+            "{sealed}"
+        );
+
+        let mut plain = RecordedBody::default();
+        plain.push_event(b"data: x", b"\n\n");
+        assert_eq!(plain.seal_response(true), b"data: x\n\n".to_vec());
     }
 
     /// A response read to its end names its size; one this app stopped reading

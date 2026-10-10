@@ -98,28 +98,48 @@
   },
   "inputs": [
     {
+      "path": "csrc/cutlass_bf16_gemm.cu",
+      "sha256": "202854c0dae292662ed5f5c9ebc7cac30c3b3ec280fff48d499ef35518765c5e"
+    },
+    {
       "path": "csrc/cutlass_fp8_blockwise_gemm.cu",
       "sha256": "0d0b0a25f98192d772de6e56da1e25366882604006f8eb6a0dcde595932efc5c"
     },
     {
       "path": "csrc/deepgemm_fp8_fp4_grouped.cu",
-      "sha256": "f9c0cce12bee43273e1a465cbc8a4d1897cdc1f3651d298116f44b0dbde492a3"
+      "sha256": "10d4c6cdc6bd1ac6d8e2f62342196e7ea06c0b5e0ce95544b6e3591af069d1e7"
     },
     {
       "path": "csrc/eidola_kernel.cuh",
       "sha256": "1981aeed1a06e214fdb23c4723dfeac389c76d0df311fc31a4295a2627a399fb"
     },
     {
+      "path": "csrc/engine_ops.cu",
+      "sha256": "a4226322b313e3228774fd905c50720f911d7c53504c670a210e1d36642bfa04"
+    },
+    {
+      "path": "csrc/engine_ops_common.cuh",
+      "sha256": "00778cb94b7cedb631e56ba53df989c7744a4072d6a7ad4029272237512e116e"
+    },
+    {
+      "path": "csrc/engine_ops_reference.cu",
+      "sha256": "e1e29a55014c2a73ec105f2eaec4b608fec994c81e5ec3bcc80255bb5fb3a03c"
+    },
+    {
       "path": "csrc/flashinfer_fa2_sink_paged.cu",
-      "sha256": "8157a71f063d7857c7c1123337859f37c4de247675fc70f5f2cf0daa8a643645"
+      "sha256": "76d32d6b0330f474ed3b79530704d24532983b5abbecbe8b19f75c0749f7d0fb"
     },
     {
       "path": "csrc/kernels.json",
-      "sha256": "bc1ca978070cbd8528daf1ee29259ef19776bbfc5be4e298e4cd9abdec645e9e"
+      "sha256": "8f94d86f6f47c1850568e6394ac9454ea4b0d3fc1281a76acc4d40f3f4418327"
     },
     {
       "path": "csrc/rmsnorm.cu",
       "sha256": "a59065bb35f28e42b0876e2b2fb2e824daab63f134e55aba6d1d9d9106a4c291"
+    },
+    {
+      "path": "csrc/sampling.cu",
+      "sha256": "ab849b061a53ae211d598f169ed29b5a87909daa2f3e49e37165670abd67d6f3"
     },
     {
       "path": "generated/flashinfer_sink/batch_prefill_config.inc",
@@ -143,6 +163,78 @@
     }
   ],
   "kernels": [
+    {
+      "name": "cutlass_bf16_gemm",
+      "arch": "sm_100a",
+      "source": "csrc/cutlass_bf16_gemm.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_bf16_gemm.sm_100a.cubin",
+      "sha256": "70b0c4765baa1a54fb69fa0da62fff585087d9314d8fa2f627a2248447c1ac55",
+      "size": 65808,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_bf16_gemm_f32",
+          "demangled": "eidola_cutlass_bf16_gemm_f32",
+          "meta": "eidola_cutlass_bf16_gemm_f32_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_bf16_gemm_f32_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 3,
+        "UTCBAR": 2,
+        "UTCHMMA": 4
+      }
+    },
+    {
+      "name": "cutlass_bf16_gemm",
+      "arch": "sm_100f",
+      "source": "csrc/cutlass_bf16_gemm.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_bf16_gemm.sm_100f.cubin",
+      "sha256": "b4fa4df03f8f2c54e411ea9019445531996e90f0f2dc6d86464b748006300355",
+      "size": 65808,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_bf16_gemm_f32",
+          "demangled": "eidola_cutlass_bf16_gemm_f32",
+          "meta": "eidola_cutlass_bf16_gemm_f32_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_bf16_gemm_f32_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 3,
+        "UTCBAR": 2,
+        "UTCHMMA": 4
+      }
+    },
+    {
+      "name": "cutlass_bf16_gemm",
+      "arch": "sm_103a",
+      "source": "csrc/cutlass_bf16_gemm.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_bf16_gemm.sm_103a.cubin",
+      "sha256": "c20d01f44099d056e355707e561ae42bb6cc427e3b50919f7323a8dc3547775d",
+      "size": 65808,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_bf16_gemm_f32",
+          "demangled": "eidola_cutlass_bf16_gemm_f32",
+          "meta": "eidola_cutlass_bf16_gemm_f32_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_bf16_gemm_f32_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 3,
+        "UTCBAR": 2,
+        "UTCHMMA": 4
+      }
+    },
     {
       "name": "cutlass_fp8_blockwise_gemm",
       "arch": "sm_100a",
@@ -221,41 +313,29 @@
       "source": "csrc/deepgemm_fp8_fp4_grouped.cu",
       "profile": "deepgemm",
       "file": "cubin/deepgemm_fp8_fp4_grouped.sm_100a.cubin",
-      "sha256": "9cf396e89881eb45885af5264f9bd72ebdeccccc9a700764ea923d6f24d2f316",
-      "size": 309728,
+      "sha256": "8f87addf2ad7acc20af4ec054edf2ccbf0d6ee1726ef795d0641c3b7d2548fc9",
+      "size": 152040,
       "entries": [
         {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE1ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)1, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_contiguous_down_meta"
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_fp8_fp4_psum_down_meta"
         },
         {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE2ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)2, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_masked_down_meta"
-        },
-        {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE1ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)1, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_contiguous_gate_up_meta"
-        },
-        {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE2ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)2, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_masked_gate_up_meta"
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_fp8_fp4_psum_gate_up_meta"
         }
       ],
       "meta": [
-        "eidola_deepgemm_fp8_fp4_contiguous_down_meta",
-        "eidola_deepgemm_fp8_fp4_contiguous_gate_up_meta",
-        "eidola_deepgemm_fp8_fp4_masked_down_meta",
-        "eidola_deepgemm_fp8_fp4_masked_gate_up_meta"
+        "eidola_deepgemm_fp8_fp4_psum_down_meta",
+        "eidola_deepgemm_fp8_fp4_psum_gate_up_meta"
       ],
       "mma_sass": {
-        "UTCATOMSWS": 12,
-        "UTCBAR": 20,
-        "UTCCP": 20,
-        "UTCQMMA": 64
+        "UTCATOMSWS": 6,
+        "UTCBAR": 10,
+        "UTCCP": 10,
+        "UTCQMMA": 32
       }
     },
     {
@@ -264,41 +344,29 @@
       "source": "csrc/deepgemm_fp8_fp4_grouped.cu",
       "profile": "deepgemm",
       "file": "cubin/deepgemm_fp8_fp4_grouped.sm_100f.cubin",
-      "sha256": "f5b5330bc1a0b4921ad3b73472768a1017b1580fbc06f99a350bdfe10d1a84bf",
-      "size": 309728,
+      "sha256": "cf7048d7468c80047b61d7fafc8c275a0e5b5b1668db8156e71284ab04ab6b76",
+      "size": 152040,
       "entries": [
         {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE1ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)1, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_contiguous_down_meta"
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_fp8_fp4_psum_down_meta"
         },
         {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE2ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)2, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_masked_down_meta"
-        },
-        {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE1ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)1, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_contiguous_gate_up_meta"
-        },
-        {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE2ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)2, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_masked_gate_up_meta"
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_fp8_fp4_psum_gate_up_meta"
         }
       ],
       "meta": [
-        "eidola_deepgemm_fp8_fp4_contiguous_down_meta",
-        "eidola_deepgemm_fp8_fp4_contiguous_gate_up_meta",
-        "eidola_deepgemm_fp8_fp4_masked_down_meta",
-        "eidola_deepgemm_fp8_fp4_masked_gate_up_meta"
+        "eidola_deepgemm_fp8_fp4_psum_down_meta",
+        "eidola_deepgemm_fp8_fp4_psum_gate_up_meta"
       ],
       "mma_sass": {
-        "UTCATOMSWS": 12,
-        "UTCBAR": 20,
-        "UTCCP": 20,
-        "UTCQMMA": 64
+        "UTCATOMSWS": 6,
+        "UTCBAR": 10,
+        "UTCCP": 10,
+        "UTCQMMA": 32
       }
     },
     {
@@ -307,42 +375,546 @@
       "source": "csrc/deepgemm_fp8_fp4_grouped.cu",
       "profile": "deepgemm",
       "file": "cubin/deepgemm_fp8_fp4_grouped.sm_103a.cubin",
-      "sha256": "fe20479e63ba097cc0be608b174599c836cdda4d94bd85cc990c06dd923f1211",
-      "size": 309728,
+      "sha256": "03635ce127c67264eb360f0ae6ef60a7cb200777525c24b41d3bc1a6dbcb3c4d",
+      "size": 152040,
       "entries": [
         {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE1ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)1, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_contiguous_down_meta"
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_fp8_fp4_psum_down_meta"
         },
         {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE2ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)2, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_masked_down_meta"
-        },
-        {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE1ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)1, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_contiguous_gate_up_meta"
-        },
-        {
-          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE2ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
-          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)2, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
-          "meta": "eidola_deepgemm_fp8_fp4_masked_gate_up_meta"
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_fp8_fp4_psum_gate_up_meta"
         }
       ],
       "meta": [
-        "eidola_deepgemm_fp8_fp4_contiguous_down_meta",
-        "eidola_deepgemm_fp8_fp4_contiguous_gate_up_meta",
-        "eidola_deepgemm_fp8_fp4_masked_down_meta",
-        "eidola_deepgemm_fp8_fp4_masked_gate_up_meta"
+        "eidola_deepgemm_fp8_fp4_psum_down_meta",
+        "eidola_deepgemm_fp8_fp4_psum_gate_up_meta"
       ],
       "mma_sass": {
-        "UTCATOMSWS": 12,
-        "UTCBAR": 20,
-        "UTCCP": 20,
-        "UTCQMMA": 64
+        "UTCATOMSWS": 6,
+        "UTCBAR": 10,
+        "UTCCP": 10,
+        "UTCQMMA": 32
       }
+    },
+    {
+      "name": "engine_ops",
+      "arch": "sm_100a",
+      "source": "csrc/engine_ops.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops.sm_100a.cubin",
+      "sha256": "fb3d0a55d692ea618ac5f9de078cc40974eb3ddb71fbb9fe916dd8908f2fbb37",
+      "size": 340336,
+      "entries": [
+        {
+          "symbol": "eidola_add_bf16",
+          "demangled": "eidola_add_bf16",
+          "meta": "eidola_add_bf16_meta"
+        },
+        {
+          "symbol": "eidola_add_f32",
+          "demangled": "eidola_add_f32",
+          "meta": "eidola_add_f32_meta"
+        },
+        {
+          "symbol": "eidola_copy_rows",
+          "demangled": "eidola_copy_rows",
+          "meta": "eidola_copy_rows_meta"
+        },
+        {
+          "symbol": "eidola_embed",
+          "demangled": "eidola_embed",
+          "meta": "eidola_embed_meta"
+        },
+        {
+          "symbol": "eidola_gather_quant_ue8m0",
+          "demangled": "eidola_gather_quant_ue8m0",
+          "meta": "eidola_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_gather_rows_bf16",
+          "demangled": "eidola_gather_rows_bf16",
+          "meta": "eidola_gather_rows_bf16_meta"
+        },
+        {
+          "symbol": "eidola_moe_combine",
+          "demangled": "eidola_moe_combine",
+          "meta": "eidola_moe_combine_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute",
+          "demangled": "eidola_moe_permute",
+          "meta": "eidola_moe_permute_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute_count",
+          "demangled": "eidola_moe_permute_count",
+          "meta": "eidola_moe_permute_count_meta"
+        },
+        {
+          "symbol": "eidola_qkv_rope_kv",
+          "demangled": "eidola_qkv_rope_kv",
+          "meta": "eidola_qkv_rope_kv_meta"
+        },
+        {
+          "symbol": "eidola_quant_fp8_f32scale",
+          "demangled": "eidola_quant_fp8_f32scale",
+          "meta": "eidola_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_rmsnorm_f32",
+          "demangled": "eidola_rmsnorm_f32",
+          "meta": "eidola_rmsnorm_f32_meta"
+        },
+        {
+          "symbol": "eidola_router_scores",
+          "demangled": "eidola_router_scores",
+          "meta": "eidola_router_scores_meta"
+        },
+        {
+          "symbol": "eidola_router_select",
+          "demangled": "eidola_router_select",
+          "meta": "eidola_router_select_meta"
+        },
+        {
+          "symbol": "eidola_router_topk",
+          "demangled": "eidola_router_topk",
+          "meta": "eidola_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_swiglu_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_add_bf16_meta",
+        "eidola_add_f32_meta",
+        "eidola_copy_rows_meta",
+        "eidola_embed_meta",
+        "eidola_gather_quant_ue8m0_meta",
+        "eidola_gather_rows_bf16_meta",
+        "eidola_moe_combine_meta",
+        "eidola_moe_permute_count_meta",
+        "eidola_moe_permute_meta",
+        "eidola_qkv_rope_kv_meta",
+        "eidola_quant_fp8_f32scale_meta",
+        "eidola_rmsnorm_f32_meta",
+        "eidola_router_scores_meta",
+        "eidola_router_select_meta",
+        "eidola_router_topk_meta",
+        "eidola_swiglu_quant_fp8_f32scale_meta",
+        "eidola_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "engine_ops",
+      "arch": "sm_100f",
+      "source": "csrc/engine_ops.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops.sm_100f.cubin",
+      "sha256": "419d1d17d84183ab9a7a8a766db735f38fb2ee3ebf6dc1d276aa5530d4f0e4a9",
+      "size": 340336,
+      "entries": [
+        {
+          "symbol": "eidola_add_bf16",
+          "demangled": "eidola_add_bf16",
+          "meta": "eidola_add_bf16_meta"
+        },
+        {
+          "symbol": "eidola_add_f32",
+          "demangled": "eidola_add_f32",
+          "meta": "eidola_add_f32_meta"
+        },
+        {
+          "symbol": "eidola_copy_rows",
+          "demangled": "eidola_copy_rows",
+          "meta": "eidola_copy_rows_meta"
+        },
+        {
+          "symbol": "eidola_embed",
+          "demangled": "eidola_embed",
+          "meta": "eidola_embed_meta"
+        },
+        {
+          "symbol": "eidola_gather_quant_ue8m0",
+          "demangled": "eidola_gather_quant_ue8m0",
+          "meta": "eidola_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_gather_rows_bf16",
+          "demangled": "eidola_gather_rows_bf16",
+          "meta": "eidola_gather_rows_bf16_meta"
+        },
+        {
+          "symbol": "eidola_moe_combine",
+          "demangled": "eidola_moe_combine",
+          "meta": "eidola_moe_combine_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute",
+          "demangled": "eidola_moe_permute",
+          "meta": "eidola_moe_permute_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute_count",
+          "demangled": "eidola_moe_permute_count",
+          "meta": "eidola_moe_permute_count_meta"
+        },
+        {
+          "symbol": "eidola_qkv_rope_kv",
+          "demangled": "eidola_qkv_rope_kv",
+          "meta": "eidola_qkv_rope_kv_meta"
+        },
+        {
+          "symbol": "eidola_quant_fp8_f32scale",
+          "demangled": "eidola_quant_fp8_f32scale",
+          "meta": "eidola_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_rmsnorm_f32",
+          "demangled": "eidola_rmsnorm_f32",
+          "meta": "eidola_rmsnorm_f32_meta"
+        },
+        {
+          "symbol": "eidola_router_scores",
+          "demangled": "eidola_router_scores",
+          "meta": "eidola_router_scores_meta"
+        },
+        {
+          "symbol": "eidola_router_select",
+          "demangled": "eidola_router_select",
+          "meta": "eidola_router_select_meta"
+        },
+        {
+          "symbol": "eidola_router_topk",
+          "demangled": "eidola_router_topk",
+          "meta": "eidola_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_swiglu_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_add_bf16_meta",
+        "eidola_add_f32_meta",
+        "eidola_copy_rows_meta",
+        "eidola_embed_meta",
+        "eidola_gather_quant_ue8m0_meta",
+        "eidola_gather_rows_bf16_meta",
+        "eidola_moe_combine_meta",
+        "eidola_moe_permute_count_meta",
+        "eidola_moe_permute_meta",
+        "eidola_qkv_rope_kv_meta",
+        "eidola_quant_fp8_f32scale_meta",
+        "eidola_rmsnorm_f32_meta",
+        "eidola_router_scores_meta",
+        "eidola_router_select_meta",
+        "eidola_router_topk_meta",
+        "eidola_swiglu_quant_fp8_f32scale_meta",
+        "eidola_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "engine_ops",
+      "arch": "sm_103a",
+      "source": "csrc/engine_ops.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops.sm_103a.cubin",
+      "sha256": "6a95b6a446103f16dcf3520a2b8fa9694230ea2e63f45b523216c3bb00cb561e",
+      "size": 340336,
+      "entries": [
+        {
+          "symbol": "eidola_add_bf16",
+          "demangled": "eidola_add_bf16",
+          "meta": "eidola_add_bf16_meta"
+        },
+        {
+          "symbol": "eidola_add_f32",
+          "demangled": "eidola_add_f32",
+          "meta": "eidola_add_f32_meta"
+        },
+        {
+          "symbol": "eidola_copy_rows",
+          "demangled": "eidola_copy_rows",
+          "meta": "eidola_copy_rows_meta"
+        },
+        {
+          "symbol": "eidola_embed",
+          "demangled": "eidola_embed",
+          "meta": "eidola_embed_meta"
+        },
+        {
+          "symbol": "eidola_gather_quant_ue8m0",
+          "demangled": "eidola_gather_quant_ue8m0",
+          "meta": "eidola_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_gather_rows_bf16",
+          "demangled": "eidola_gather_rows_bf16",
+          "meta": "eidola_gather_rows_bf16_meta"
+        },
+        {
+          "symbol": "eidola_moe_combine",
+          "demangled": "eidola_moe_combine",
+          "meta": "eidola_moe_combine_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute",
+          "demangled": "eidola_moe_permute",
+          "meta": "eidola_moe_permute_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute_count",
+          "demangled": "eidola_moe_permute_count",
+          "meta": "eidola_moe_permute_count_meta"
+        },
+        {
+          "symbol": "eidola_qkv_rope_kv",
+          "demangled": "eidola_qkv_rope_kv",
+          "meta": "eidola_qkv_rope_kv_meta"
+        },
+        {
+          "symbol": "eidola_quant_fp8_f32scale",
+          "demangled": "eidola_quant_fp8_f32scale",
+          "meta": "eidola_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_rmsnorm_f32",
+          "demangled": "eidola_rmsnorm_f32",
+          "meta": "eidola_rmsnorm_f32_meta"
+        },
+        {
+          "symbol": "eidola_router_scores",
+          "demangled": "eidola_router_scores",
+          "meta": "eidola_router_scores_meta"
+        },
+        {
+          "symbol": "eidola_router_select",
+          "demangled": "eidola_router_select",
+          "meta": "eidola_router_select_meta"
+        },
+        {
+          "symbol": "eidola_router_topk",
+          "demangled": "eidola_router_topk",
+          "meta": "eidola_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_swiglu_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_add_bf16_meta",
+        "eidola_add_f32_meta",
+        "eidola_copy_rows_meta",
+        "eidola_embed_meta",
+        "eidola_gather_quant_ue8m0_meta",
+        "eidola_gather_rows_bf16_meta",
+        "eidola_moe_combine_meta",
+        "eidola_moe_permute_count_meta",
+        "eidola_moe_permute_meta",
+        "eidola_qkv_rope_kv_meta",
+        "eidola_quant_fp8_f32scale_meta",
+        "eidola_rmsnorm_f32_meta",
+        "eidola_router_scores_meta",
+        "eidola_router_select_meta",
+        "eidola_router_topk_meta",
+        "eidola_swiglu_quant_fp8_f32scale_meta",
+        "eidola_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "engine_ops_reference",
+      "arch": "sm_100a",
+      "source": "csrc/engine_ops_reference.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops_reference.sm_100a.cubin",
+      "sha256": "014df5e4f2ac069b04d36ecc6f4ab94f20dc8163c4865e803d4f61af424ba50f",
+      "size": 98272,
+      "entries": [
+        {
+          "symbol": "eidola_reference_gather_quant_ue8m0",
+          "demangled": "eidola_reference_gather_quant_ue8m0",
+          "meta": "eidola_reference_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_reference_moe_combine",
+          "demangled": "eidola_reference_moe_combine",
+          "meta": "eidola_reference_moe_combine_meta"
+        },
+        {
+          "symbol": "eidola_reference_qkv_rope_kv",
+          "demangled": "eidola_reference_qkv_rope_kv",
+          "meta": "eidola_reference_qkv_rope_kv_meta"
+        },
+        {
+          "symbol": "eidola_reference_quant_fp8_f32scale",
+          "demangled": "eidola_reference_quant_fp8_f32scale",
+          "meta": "eidola_reference_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_reference_router_topk",
+          "demangled": "eidola_reference_router_topk",
+          "meta": "eidola_reference_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_reference_swiglu_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_reference_gather_quant_ue8m0_meta",
+        "eidola_reference_moe_combine_meta",
+        "eidola_reference_qkv_rope_kv_meta",
+        "eidola_reference_quant_fp8_f32scale_meta",
+        "eidola_reference_router_topk_meta",
+        "eidola_reference_swiglu_quant_fp8_f32scale_meta",
+        "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "engine_ops_reference",
+      "arch": "sm_100f",
+      "source": "csrc/engine_ops_reference.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops_reference.sm_100f.cubin",
+      "sha256": "2a2bba67df978c1bad584d6a6e09b32e5288ec331a1dc24816a608a0b135f52e",
+      "size": 98272,
+      "entries": [
+        {
+          "symbol": "eidola_reference_gather_quant_ue8m0",
+          "demangled": "eidola_reference_gather_quant_ue8m0",
+          "meta": "eidola_reference_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_reference_moe_combine",
+          "demangled": "eidola_reference_moe_combine",
+          "meta": "eidola_reference_moe_combine_meta"
+        },
+        {
+          "symbol": "eidola_reference_qkv_rope_kv",
+          "demangled": "eidola_reference_qkv_rope_kv",
+          "meta": "eidola_reference_qkv_rope_kv_meta"
+        },
+        {
+          "symbol": "eidola_reference_quant_fp8_f32scale",
+          "demangled": "eidola_reference_quant_fp8_f32scale",
+          "meta": "eidola_reference_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_reference_router_topk",
+          "demangled": "eidola_reference_router_topk",
+          "meta": "eidola_reference_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_reference_swiglu_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_reference_gather_quant_ue8m0_meta",
+        "eidola_reference_moe_combine_meta",
+        "eidola_reference_qkv_rope_kv_meta",
+        "eidola_reference_quant_fp8_f32scale_meta",
+        "eidola_reference_router_topk_meta",
+        "eidola_reference_swiglu_quant_fp8_f32scale_meta",
+        "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "engine_ops_reference",
+      "arch": "sm_103a",
+      "source": "csrc/engine_ops_reference.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops_reference.sm_103a.cubin",
+      "sha256": "84aad29f3fc2acb22336d310445890ec7f46d11117151252e99aea7ce93cf89a",
+      "size": 98272,
+      "entries": [
+        {
+          "symbol": "eidola_reference_gather_quant_ue8m0",
+          "demangled": "eidola_reference_gather_quant_ue8m0",
+          "meta": "eidola_reference_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_reference_moe_combine",
+          "demangled": "eidola_reference_moe_combine",
+          "meta": "eidola_reference_moe_combine_meta"
+        },
+        {
+          "symbol": "eidola_reference_qkv_rope_kv",
+          "demangled": "eidola_reference_qkv_rope_kv",
+          "meta": "eidola_reference_qkv_rope_kv_meta"
+        },
+        {
+          "symbol": "eidola_reference_quant_fp8_f32scale",
+          "demangled": "eidola_reference_quant_fp8_f32scale",
+          "meta": "eidola_reference_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_reference_router_topk",
+          "demangled": "eidola_reference_router_topk",
+          "meta": "eidola_reference_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_reference_swiglu_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_reference_gather_quant_ue8m0_meta",
+        "eidola_reference_moe_combine_meta",
+        "eidola_reference_qkv_rope_kv_meta",
+        "eidola_reference_quant_fp8_f32scale_meta",
+        "eidola_reference_router_topk_meta",
+        "eidola_reference_swiglu_quant_fp8_f32scale_meta",
+        "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
     },
     {
       "name": "flashinfer_fa2_sink_paged",
@@ -350,13 +922,28 @@
       "source": "csrc/flashinfer_fa2_sink_paged.cu",
       "profile": "flashinfer",
       "file": "cubin/flashinfer_fa2_sink_paged.sm_100a.cubin",
-      "sha256": "6fc822f336e71b8054c0fef76b26a6c877a674e39428e9ee1708ccdbf222138f",
-      "size": 246440,
+      "sha256": "790d2cda17a500dea541634c1524369c85d52e7cf30947705f2603d024fe2e37",
+      "size": 456384,
       "entries": [
         {
           "symbol": "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj16ELj8ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj",
           "demangled": "void flashinfer::PersistentVariableLengthMergeStatesKernel<(unsigned int)8, (unsigned int)16, (unsigned int)8, (unsigned int)4, __nv_bfloat16, __nv_bfloat16, int>(T5 *, float *, T7 *, T6 *, float *, unsigned int, unsigned int *, unsigned int)",
           "meta": "eidola_fa2_merge_states_bf16_d128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q16_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q64_meta"
         },
         {
           "symbol": "eidola_fa2_sink_paged_bf16_q128",
@@ -376,12 +963,15 @@
       ],
       "meta": [
         "eidola_fa2_merge_states_bf16_d128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q16_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q64_meta",
         "eidola_fa2_sink_paged_bf16_q128_meta",
         "eidola_fa2_sink_paged_bf16_q16_meta",
         "eidola_fa2_sink_paged_bf16_q64_meta"
       ],
       "mma_sass": {
-        "HMMA": 738
+        "HMMA": 1312
       }
     },
     {
@@ -390,13 +980,28 @@
       "source": "csrc/flashinfer_fa2_sink_paged.cu",
       "profile": "flashinfer",
       "file": "cubin/flashinfer_fa2_sink_paged.sm_100f.cubin",
-      "sha256": "7db507cf2e42d9c35fefa5f35a4835744a90faf1d13c5da21b1e97d16be56a80",
-      "size": 246440,
+      "sha256": "3d1cf8db47feb586bc94181ff06a1b282011dc3465ee07c3fccc4bf8e0615407",
+      "size": 456256,
       "entries": [
         {
           "symbol": "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj16ELj8ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj",
           "demangled": "void flashinfer::PersistentVariableLengthMergeStatesKernel<(unsigned int)8, (unsigned int)16, (unsigned int)8, (unsigned int)4, __nv_bfloat16, __nv_bfloat16, int>(T5 *, float *, T7 *, T6 *, float *, unsigned int, unsigned int *, unsigned int)",
           "meta": "eidola_fa2_merge_states_bf16_d128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q16_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q64_meta"
         },
         {
           "symbol": "eidola_fa2_sink_paged_bf16_q128",
@@ -416,12 +1021,15 @@
       ],
       "meta": [
         "eidola_fa2_merge_states_bf16_d128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q16_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q64_meta",
         "eidola_fa2_sink_paged_bf16_q128_meta",
         "eidola_fa2_sink_paged_bf16_q16_meta",
         "eidola_fa2_sink_paged_bf16_q64_meta"
       ],
       "mma_sass": {
-        "HMMA": 738
+        "HMMA": 1312
       }
     },
     {
@@ -430,13 +1038,28 @@
       "source": "csrc/flashinfer_fa2_sink_paged.cu",
       "profile": "flashinfer",
       "file": "cubin/flashinfer_fa2_sink_paged.sm_103a.cubin",
-      "sha256": "8c886475bcd700379e9a21878c06e6e27f3899bfd94c493add200b73c8892325",
-      "size": 246128,
+      "sha256": "356caa6875d3ee1b1cb5551f4d577a0ce5415e4900282b70f5beae2a07eedd32",
+      "size": 457720,
       "entries": [
         {
           "symbol": "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj16ELj8ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj",
           "demangled": "void flashinfer::PersistentVariableLengthMergeStatesKernel<(unsigned int)8, (unsigned int)16, (unsigned int)8, (unsigned int)4, __nv_bfloat16, __nv_bfloat16, int>(T5 *, float *, T7 *, T6 *, float *, unsigned int, unsigned int *, unsigned int)",
           "meta": "eidola_fa2_merge_states_bf16_d128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q16_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q64_meta"
         },
         {
           "symbol": "eidola_fa2_sink_paged_bf16_q128",
@@ -456,12 +1079,15 @@
       ],
       "meta": [
         "eidola_fa2_merge_states_bf16_d128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q16_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q64_meta",
         "eidola_fa2_sink_paged_bf16_q128_meta",
         "eidola_fa2_sink_paged_bf16_q16_meta",
         "eidola_fa2_sink_paged_bf16_q64_meta"
       ],
       "mma_sass": {
-        "HMMA": 738
+        "HMMA": 1312
       }
     },
     {
@@ -523,9 +1149,97 @@
         "eidola_rmsnorm_bf16_meta"
       ],
       "mma_sass": {}
+    },
+    {
+      "name": "sampling",
+      "arch": "sm_100a",
+      "source": "csrc/sampling.cu",
+      "profile": "own",
+      "file": "cubin/sampling.sm_100a.cubin",
+      "sha256": "da501406981ec5e4ed15460858f329acce9749809ab65212312e4a2b3c75a02c",
+      "size": 191616,
+      "entries": [
+        {
+          "symbol": "eidola_chain_accept",
+          "demangled": "eidola_chain_accept",
+          "meta": "eidola_chain_accept_meta"
+        },
+        {
+          "symbol": "eidola_sample",
+          "demangled": "eidola_sample",
+          "meta": "eidola_sample_meta"
+        }
+      ],
+      "meta": [
+        "eidola_chain_accept_meta",
+        "eidola_sample_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "sampling",
+      "arch": "sm_100f",
+      "source": "csrc/sampling.cu",
+      "profile": "own",
+      "file": "cubin/sampling.sm_100f.cubin",
+      "sha256": "7f26bcdb4319e8c08dde564e7e4e8835b5b91fc2851607a1778b866e84cb7427",
+      "size": 191616,
+      "entries": [
+        {
+          "symbol": "eidola_chain_accept",
+          "demangled": "eidola_chain_accept",
+          "meta": "eidola_chain_accept_meta"
+        },
+        {
+          "symbol": "eidola_sample",
+          "demangled": "eidola_sample",
+          "meta": "eidola_sample_meta"
+        }
+      ],
+      "meta": [
+        "eidola_chain_accept_meta",
+        "eidola_sample_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "sampling",
+      "arch": "sm_103a",
+      "source": "csrc/sampling.cu",
+      "profile": "own",
+      "file": "cubin/sampling.sm_103a.cubin",
+      "sha256": "61edfa3847eb098fdda6a086bce4f53639adc16d9631418e7ae9cc3ae950ad56",
+      "size": 243312,
+      "entries": [
+        {
+          "symbol": "eidola_chain_accept",
+          "demangled": "eidola_chain_accept",
+          "meta": "eidola_chain_accept_meta"
+        },
+        {
+          "symbol": "eidola_sample",
+          "demangled": "eidola_sample",
+          "meta": "eidola_sample_meta"
+        }
+      ],
+      "meta": [
+        "eidola_chain_accept_meta",
+        "eidola_sample_meta"
+      ],
+      "mma_sass": {}
     }
   ],
   "fatbins": [
+    {
+      "name": "cutlass_bf16_gemm",
+      "file": "fatbin/cutlass_bf16_gemm.fatbin",
+      "sha256": "fdd448d2975772448f45e8dd621ec927fa2919b17a16c226b4194328a0ada157",
+      "size": 131848,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
     {
       "name": "cutlass_fp8_blockwise_gemm",
       "file": "fatbin/cutlass_fp8_blockwise_gemm.fatbin",
@@ -539,8 +1253,28 @@
     {
       "name": "deepgemm_fp8_fp4_grouped",
       "file": "fatbin/deepgemm_fp8_fp4_grouped.fatbin",
-      "sha256": "5b0ab05b2f5922567532ca101eb993768b50427296ff8075aed354e5c878ddb9",
-      "size": 619688,
+      "sha256": "f3bd19f7385c3ad2c873876f336cc89862cb4a181a81b883a552ff0d3a611903",
+      "size": 304312,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "engine_ops",
+      "file": "fatbin/engine_ops.fatbin",
+      "sha256": "c95e83d50ab178ffa47e5921956bc44fd557d2d18ecd1a91da5cbba5d0c1b1fe",
+      "size": 680904,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "engine_ops_reference",
+      "file": "fatbin/engine_ops_reference.fatbin",
+      "sha256": "093c78189728b548b88a00a4ce093e6d02f04e958da860da67217996189ab0b4",
+      "size": 196776,
       "archs": [
         "sm_100a",
         "sm_103a"
@@ -549,8 +1283,8 @@
     {
       "name": "flashinfer_fa2_sink_paged",
       "file": "fatbin/flashinfer_fa2_sink_paged.fatbin",
-      "sha256": "fd2bb6cdb694942a0c1e56f778e097e5edb29a65bdf540d2d211095f9d0690ba",
-      "size": 492800,
+      "sha256": "55789bbd3af58bde637c9fcd0551ed30b21d5696cae919cbfe20e24aad053e02",
+      "size": 914336,
       "archs": [
         "sm_100a",
         "sm_103a"
@@ -561,6 +1295,16 @@
       "file": "fatbin/rmsnorm.fatbin",
       "sha256": "f7910af91ef02140c407a9f0d10efdfb811efcfafd239114e20fd1e53c3b58c2",
       "size": 43784,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "sampling",
+      "file": "fatbin/sampling.fatbin",
+      "sha256": "e83daa3ee7891e8ae6b1ec1f55a971e5885f391eed0876b9fecd700359424984",
+      "size": 435160,
       "archs": [
         "sm_100a",
         "sm_103a"
