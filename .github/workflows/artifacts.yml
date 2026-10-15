@@ -413,7 +413,7 @@ jobs:
         # needs the file to exist somewhere they can fetch it. The tagged
         # release workflow pulls these from this run and re-checks each
         # hash against the manifest before attaching them.
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets-macos
           path: /tmp/eidola-release-assets
@@ -436,7 +436,7 @@ jobs:
           shasum -a 256 /tmp/eidola-shipping/eidola-gui-macos-universal.zip
 
       - name: Upload the unsigned macOS shipping zip
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: eidola-gui-macos-universal-zip
           path: /tmp/eidola-shipping/eidola-gui-macos-universal.zip
@@ -540,7 +540,7 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Upload the Linux amd64 release assets
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets-linux-amd64
           path: /tmp/eidola-release-assets
@@ -633,7 +633,7 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Upload the Linux arm64 release assets
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets-linux-arm64
           path: /tmp/eidola-release-assets
