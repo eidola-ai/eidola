@@ -52,7 +52,7 @@ jobs:
           persist-credentials: false
 
       - name: Build and release
-        uses: tinfoilsh/measure-image-action@768ada355b32b301839c983409304dc53bcc03ff # v0.13.1
+        uses: tinfoilsh/measure-image-action@beba4296251f7a9bc44b481ebafe4863509e4380 # v0.14.1
         with:
           config-file: ${{ github.workspace }}/tinfoil-config.yml
           github-token: ${{ secrets.GITHUB_TOKEN }}
