@@ -50,6 +50,7 @@ pub fn fixture_post(
         references: Vec::new(),
         created_at: 0,
         truncated: false,
+        continuable: false,
     }
 }
 

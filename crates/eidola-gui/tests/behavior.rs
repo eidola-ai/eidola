@@ -212,6 +212,7 @@ fn fixture_user_post(action_id: &str, text: &str) -> PostNode {
         references: Vec::new(),
         created_at: 0,
         truncated: false,
+        continuable: false,
     }
 }
 
@@ -3125,6 +3126,7 @@ fn open_floating_composer_scene(
         references: Vec::new(),
         created_at: 0,
         truncated: false,
+        continuable: false,
     };
     let nodes: Vec<PostNode> = (0..8)
         .map(|i| {
@@ -3352,6 +3354,7 @@ fn space_composer_dock_shadow_is_stable_cold(cx: &mut TestAppContext) {
         references: Vec::new(),
         created_at: 0,
         truncated: false,
+        continuable: false,
     };
     let mut nodes = Vec::new();
     for i in 0..12 {
@@ -3440,6 +3443,7 @@ fn space_resize_above_column_cap_does_not_churn_height_cache(cx: &mut TestAppCon
         references: Vec::new(),
         created_at: 0,
         truncated: false,
+        continuable: false,
     };
     let mut nodes = Vec::new();
     for i in 0..12 {
@@ -5558,6 +5562,7 @@ fn space_composer_edit_arms_caret_scroll_into_view(cx: &mut TestAppContext) {
         references: Vec::new(),
         created_at: 0,
         truncated: false,
+        continuable: false,
     };
     let nodes: Vec<PostNode> = (0..8)
         .map(|i| {
@@ -5671,6 +5676,7 @@ fn space_scrolled_floating_composer_glides_to_its_top_by_the_dock(cx: &mut TestA
         references: Vec::new(),
         created_at: 0,
         truncated: false,
+        continuable: false,
     };
     let nodes: Vec<PostNode> = (0..8)
         .map(|i| {
@@ -18740,8 +18746,8 @@ fn space_regeneration_failure_keeps_the_generation_it_would_replace(cx: &mut Tes
         space.update(cx, |s, cx| {
             s.fail_revision_for_test(
                 seq,
-                AppError::ResponseTruncated {
-                    output_tokens: Some(4096),
+                AppError::ModelUnavailable {
+                    model: "kimi-k2".into(),
                 },
                 cx,
             )
@@ -18759,8 +18765,7 @@ fn space_regeneration_failure_keeps_the_generation_it_would_replace(cx: &mut Tes
     });
     view.read_with(cx, |v, cx| {
         assert!(
-            v.error_for_test(cx)
-                .is_some_and(|t| t.contains("length allowance")),
+            v.error_for_test(cx).is_some_and(|t| t.contains("kimi-k2")),
             "the reader is told what happened, in their own language"
         );
     });
