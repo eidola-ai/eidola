@@ -386,6 +386,11 @@ pub enum ChatBehavior {
     /// the tool round answers [`TOOL_FINAL_CONTENT`]. Whichever transport
     /// asked.
     ContinueIntoToolRound,
+    /// An answer opening with a mimicked header line ([`MIMICKED_HEADER`]) and
+    /// then cut off at the ceiling, which the engine reports `continuable` —
+    /// the strip this app applies is what makes the stored text differ.
+    /// Whichever transport asked.
+    HeaderThenLength,
 }
 
 /// Where a [`ChatBehavior::ContinueAfterLength`] answer stops the first time.
@@ -395,6 +400,10 @@ pub enum Cut {
     Reasoning,
     /// Mid-answer: [`TRUNCATED_REASONING`], then [`STREAM_CONTENT`].
     Answer,
+    /// Mid-answer, where the engine's parser dropped what it was cut inside of
+    /// (an unfinished tool call): the same text as [`Cut::Answer`], reported
+    /// `continuable: false`.
+    Dropped,
 }
 
 /// The rest of a continued reasoning.
@@ -1878,6 +1887,7 @@ async fn handle_chat(
                         "reasoning_content": TRUNCATED_REASONING,
                     },
                     "finish_reason": "length",
+                    "continuable": true,
                 }],
                 "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS },
             });
@@ -1898,6 +1908,7 @@ async fn handle_chat(
                         "reasoning_content": TRUNCATED_REASONING,
                     },
                     "finish_reason": "length",
+                    "continuable": true,
                 }],
                 "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS },
             });
@@ -1910,7 +1921,7 @@ async fn handle_chat(
             let (reasoning, content, finish) = match request.get("continue_final_message") {
                 None => match cut {
                     Cut::Reasoning => (TRUNCATED_REASONING, "", "length"),
-                    Cut::Answer => (TRUNCATED_REASONING, STREAM_CONTENT, "length"),
+                    Cut::Answer | Cut::Dropped => (TRUNCATED_REASONING, STREAM_CONTENT, "length"),
                 },
                 Some(serde_json::Value::String(field)) if field == "reasoning_content" => {
                     if again && hit == 2 {
@@ -1925,7 +1936,21 @@ async fn handle_chat(
                     if again && hit == 2 { "length" } else { "stop" },
                 ),
             };
-            write_ending(stream, request, inline_refund, reasoning, content, finish).await
+            let exact = !(cut == Cut::Dropped && request.get("continue_final_message").is_none());
+            write_ending(
+                stream,
+                request,
+                inline_refund,
+                reasoning,
+                content,
+                finish,
+                exact,
+            )
+            .await
+        }
+        ChatBehavior::HeaderThenLength => {
+            let content = format!("{MIMICKED_HEADER}\n\nThe tides are");
+            write_ending(stream, request, inline_refund, "", &content, "length", true).await
         }
         ChatBehavior::ContinueIntoToolRound => {
             let streamed = request.get("stream").and_then(|s| s.as_bool()) == Some(true);
@@ -1947,6 +1972,7 @@ async fn handle_chat(
                     TRUNCATED_REASONING,
                     "",
                     "length",
+                    true,
                 )
                 .await
             } else {
@@ -1957,6 +1983,7 @@ async fn handle_chat(
                     "",
                     TOOL_FINAL_CONTENT,
                     "stop",
+                    true,
                 )
                 .await
             }
@@ -2356,7 +2383,7 @@ async fn write_sse_length_stream(
     }
 
     let terminal = serde_json::json!({
-        "choices": [{ "delta": {}, "finish_reason": "length" }],
+        "choices": [{ "delta": {}, "finish_reason": "length", "continuable": true }],
         "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS }
     });
     stream.write_all(&sse_event(&terminal.to_string())).await?;
@@ -2368,8 +2395,9 @@ async fn write_sse_length_stream(
 
 /// Answer in whichever transport asked: `reasoning`, then `content`, ending
 /// with `finish`. A `length` ending reports the whole ceiling spent, as the
-/// truncating behaviours do. A stream carries the reasoning as one delta and the
-/// content as two, so the client's accumulation is exercised.
+/// truncating behaviours do, with the engine's `continuable` verdict (`exact`).
+/// A stream carries the reasoning as one delta and the content as two, so the
+/// client's accumulation is exercised.
 async fn write_ending(
     stream: &mut TcpStream,
     request: &serde_json::Value,
@@ -2377,6 +2405,7 @@ async fn write_ending(
     reasoning: &str,
     content: &str,
     finish: &str,
+    exact: bool,
 ) -> std::io::Result<()> {
     let completion_tokens = if finish == "length" {
         CEILING_TOKENS
@@ -2395,6 +2424,9 @@ async fn write_ending(
             }],
             "usage": { "prompt_tokens": 11, "completion_tokens": completion_tokens },
         });
+        if finish == "length" {
+            body["choices"][0]["continuable"] = serde_json::json!(exact);
+        }
         if let Some(refund) = inline_refund {
             body["refund"] = refund;
         }
@@ -2416,10 +2448,13 @@ async fn write_ending(
         let chunk = serde_json::json!({"choices": [{"delta": delta, "finish_reason": null}]});
         stream.write_all(&sse_event(&chunk.to_string())).await?;
     }
-    let terminal = serde_json::json!({
+    let mut terminal = serde_json::json!({
         "choices": [{ "delta": {}, "finish_reason": finish }],
         "usage": { "prompt_tokens": 11, "completion_tokens": completion_tokens }
     });
+    if finish == "length" {
+        terminal["choices"][0]["continuable"] = serde_json::json!(exact);
+    }
     stream.write_all(&sse_event(&terminal.to_string())).await?;
     stream.write_all(&sse_event("[DONE]")).await?;
     stream.write_all(b"0\r\n\r\n").await?;

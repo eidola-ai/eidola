@@ -660,6 +660,51 @@ async fn max_tokens_ends_with_length() {
     assert_eq!(v["choices"][0]["finish_reason"], expected);
 }
 
+/// A `length` ending says whether it can be continued exactly: the choice's
+/// `continuable` is the chat layer's verdict over the very tokens the engine
+/// generated (`OutputParser::resumes_exactly`, the decoder's lossy flush
+/// included), on both transports, and absent on any other ending.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_length_ending_says_whether_it_can_be_continued_exactly() {
+    let node = TestNode::start(&[]).await;
+    let model = loaded();
+    let mut checked = 0;
+    for max in [1u32, 2, 3, 5, 8, 13] {
+        let (tokens, finish) = direct_greedy(prompt_tokens(LONG_TEXT), max);
+        let (_, v) = node.chat_json(&request(LONG_TEXT, max)).await;
+        let choice = &v["choices"][0];
+        if finish != FinishReason::Length {
+            assert!(choice.get("continuable").is_none(), "{v}");
+            continue;
+        }
+        let mut detok = eidola_engine_chat::Detokenizer::new(true);
+        let mut parser =
+            OutputParser::new(OutputConfig::new(None, None), PrefixedCallIds("c".into()));
+        for &t in &tokens {
+            parser.push_text(&detok.push(model.tokenizer(), t).unwrap());
+        }
+        if detok.pending_len() > 0 {
+            parser.mark_lossy();
+        }
+        parser.push_text(&detok.finish());
+        parser.finish(StopCause::MaxTokens);
+        let expected = parser.resumes_exactly();
+        assert_eq!(choice["continuable"], expected, "max {max}: {v}");
+
+        let mut body = request(LONG_TEXT, max);
+        body["stream"] = true.into();
+        let (chunks, _) = parse_chunks(&node.chat_stream(&body).await);
+        let finish_choice = chunks
+            .iter()
+            .filter_map(|c| c["choices"].get(0))
+            .find(|c| c["finish_reason"] == "length")
+            .expect("a finishing chunk");
+        assert_eq!(finish_choice["continuable"], expected, "max {max} streamed");
+        checked += 1;
+    }
+    assert!(checked > 0, "some ceiling must cut the dev model off");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn client_disconnect_cancels_in_the_engine() {
     let node = TestNode::start(&[]).await;

@@ -343,7 +343,7 @@ async fn complete_response(
 ) -> Result<Response, ApiError> {
     let mut decoder = Decoder::new(run.state.model.clone(), output, stop, call_prefix);
     let mut all = ChatDelta::default();
-    let reason = loop {
+    let (reason, continuable) = loop {
         match run.next(&mut decoder).await {
             Polled::Step(step) => {
                 all.reasoning_content
@@ -351,7 +351,7 @@ async fn complete_response(
                 all.content.push_str(&step.delta.content);
                 all.tool_calls.extend(step.delta.tool_calls);
                 if let Some(reason) = step.finish {
-                    break reason;
+                    break (reason, step.continuable);
                 }
             }
             Polled::Failed(e) => return Err(e),
@@ -383,10 +383,21 @@ async fn complete_response(
         "object": "chat.completion",
         "created": r.created,
         "model": r.model,
-        "choices": [{"index": 0, "message": message, "finish_reason": reason.as_str()}],
+        "choices": [finish_choice(json!({"index": 0, "message": message, "finish_reason": reason.as_str()}), continuable)],
         "usage": usage(r.prompt_tokens, decoder.completion_tokens(), run.cached_prompt_tokens),
     }))
     .into_response())
+}
+
+/// A finishing choice, carrying `continuable` on a `length` ending: whether the
+/// reasoning and content it gave out can be sent back as a continued final message
+/// that renders exactly the text the model generated (`OutputParser::resumes_exactly`).
+/// A client offers continuation only where it is `true`.
+fn finish_choice(mut choice: Value, continuable: Option<bool>) -> Value {
+    if let Some(c) = continuable {
+        choice["continuable"] = Value::Bool(c);
+    }
+    choice
 }
 
 fn chunk(r: &ResponseMeta, choices: Value, usage: Option<Value>) -> Event {
@@ -456,7 +467,10 @@ fn stream_response(
                 if let Some(reason) = step.finish {
                     out.push(chunk(
                         &s.run.response,
-                        json!([{"index": 0, "delta": {}, "finish_reason": reason.as_str()}]),
+                        json!([finish_choice(
+                            json!({"index": 0, "delta": {}, "finish_reason": reason.as_str()}),
+                            step.continuable
+                        )]),
                         None,
                     ));
                     if s.include_usage {

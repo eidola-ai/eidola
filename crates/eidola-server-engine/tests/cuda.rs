@@ -712,6 +712,10 @@ async fn real_flash_continues_a_cut_off_generation_exactly() {
         .await;
         eprintln!("B ({place}, k={k}): {b}");
         assert_eq!(b["choices"][0]["finish_reason"], "length", "{place}: {b}");
+        assert_eq!(
+            b["choices"][0]["continuable"], true,
+            "{place}: a clean cut says it can be continued exactly: {b}"
+        );
         let (b_reasoning, b_content) = (text_of(&b, "reasoning_content"), text_of(&b, "content"));
         let field = match place {
             "reasoning" => {

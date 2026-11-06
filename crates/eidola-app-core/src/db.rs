@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 13;
+const LATEST_VERSION: i64 = 14;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -2281,6 +2281,8 @@ pub struct ContinuationSource {
     pub participant_id: String,
     pub model: Option<String>,
     pub truncated: bool,
+    /// Its text is exactly what the model generated (`action.resumable`).
+    pub resumable: bool,
     pub thinking: String,
     pub text: String,
 }
@@ -2292,7 +2294,8 @@ pub async fn continuation_source(
 ) -> Result<Option<ContinuationSource>, AppError> {
     let mut rows = conn
         .query(
-            "SELECT participant_id, model, truncated, action_type FROM action WHERE id = ?1",
+            "SELECT participant_id, model, truncated, action_type, resumable FROM action \
+             WHERE id = ?1",
             [Value::Text(action_id.to_string())],
         )
         .await
@@ -2305,6 +2308,7 @@ pub async fn continuation_source(
         participant_id: row.get::<String>(0).map_err(AppError::db)?,
         model: row.get::<Option<String>>(1).map_err(AppError::db)?,
         truncated: row.get::<i64>(2).map_err(AppError::db)? != 0,
+        resumable: row.get::<i64>(4).map_err(AppError::db)? != 0,
         thinking: String::new(),
         text: String::new(),
     };
@@ -3121,6 +3125,7 @@ async fn spawn_subspace_tx_body(
             output_tokens: None,
             credits_consumed: None,
             truncated: false,
+            resumable: false,
             created_at: plan.now,
         },
     )
@@ -5886,6 +5891,9 @@ pub struct ActionEntry {
     /// than because the model was done. Only an `inference` may set it (the
     /// schema CHECKs that); every other writer passes `false`.
     pub truncated: bool,
+    /// A truncated generation whose text is exactly what the model generated, so
+    /// it can be continued (the schema CHECKs it implies `truncated`).
+    pub resumable: bool,
     pub created_at: i64,
 }
 
@@ -6017,6 +6025,7 @@ async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<PostOutc
             output_tokens: None,
             credits_consumed: None,
             truncated: false,
+            resumable: false,
             created_at: plan.created_at,
         },
     )
@@ -6122,6 +6131,7 @@ async fn edit_post_tx_body(conn: &Connection, plan: &EditPostPlan<'_>) -> Result
             output_tokens: None,
             credits_consumed: None,
             truncated: false,
+            resumable: false,
             created_at: plan.created_at,
         },
     )
@@ -6159,9 +6169,9 @@ pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(),
         "INSERT INTO action (id, space_id, participant_id, participant_scope, item_id, \
          supersedes_action_id, supersedes_item_id, action_type, status, \
          intent, model, input_tokens, output_tokens, credits_consumed, truncated, \
-         created_at) \
+         resumable, created_at) \
          VALUES (?1, ?2, ?3, (SELECT scope FROM participant WHERE id = ?3), \
-                 ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                 ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         (
             Value::Text(entry.id.clone()),
             Value::Text(entry.space_id.clone()),
@@ -6192,6 +6202,7 @@ pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(),
                 None => Value::Null,
             },
             Value::Integer(i64::from(entry.truncated)),
+            Value::Integer(i64::from(entry.resumable)),
             Value::Integer(entry.created_at),
         ),
     )
@@ -10309,6 +10320,7 @@ mod tests {
                 output_tokens: None,
                 credits_consumed: None,
                 truncated: false,
+                resumable: false,
                 created_at,
             },
         )
@@ -10583,6 +10595,7 @@ mod tests {
                 output_tokens: None,
                 credits_consumed: None,
                 truncated: false,
+                resumable: false,
                 created_at,
             },
         )
@@ -10632,6 +10645,7 @@ mod tests {
                 output_tokens: None,
                 credits_consumed: None,
                 truncated: false,
+                resumable: false,
                 created_at,
             },
         )
@@ -10938,6 +10952,7 @@ mod tests {
                 output_tokens: None,
                 credits_consumed: None,
                 truncated: false,
+                resumable: false,
                 created_at: 4_000,
             },
         )
@@ -11131,6 +11146,7 @@ mod tests {
                     output_tokens: None,
                     credits_consumed: credits,
                     truncated: false,
+                    resumable: false,
                     created_at: at,
                 },
             )
@@ -11283,6 +11299,7 @@ mod tests {
             output_tokens: None,
             credits_consumed: None,
             truncated: false,
+            resumable: false,
             created_at: 1_000,
         };
 
@@ -11374,6 +11391,7 @@ mod tests {
                 output_tokens: Some(480),
                 credits_consumed: Some(700),
                 truncated: false,
+                resumable: false,
                 created_at: 2_200,
             },
         )

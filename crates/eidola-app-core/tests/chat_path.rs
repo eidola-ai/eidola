@@ -6658,6 +6658,77 @@ fn an_answer_whose_request_the_record_cut_is_not_continuable() {
     });
 }
 
+/// **Continue is offered only where the stored text is exactly what the model
+/// generated.** An engine that cut the answer off inside something its parser
+/// drops (an unfinished tool call) says so (`continuable: false`): the answer is
+/// still written and marked, but not continuable — offered nowhere, refused at
+/// the door — on both transports, since continuing it would resume before the
+/// dropped text rather than where generation stopped.
+#[test]
+fn an_answer_cut_inside_what_the_engine_dropped_is_not_continuable() {
+    for streamed in [false, true] {
+        run(move || {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: ChatBehavior::ContinueAfterLength {
+                    cut: Cut::Dropped,
+                    again: false,
+                },
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            let cut = if streamed {
+                let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+                core.runtime().block_on(async {
+                    let chat =
+                        core.chat_stream("How do tides work?".into(), MODEL.into(), None, tx);
+                    let (res, _) = tokio::join!(chat, collect_deltas(events_rx));
+                    res
+                })
+            } else {
+                core.runtime()
+                    .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            }
+            .expect("the cut-off turn");
+            assert!(cut.truncated, "streamed {streamed}");
+            assert!(!cut.continuable, "streamed {streamed}");
+            let answer = post_at(&core, &cut.space_id, 1);
+            assert!(
+                answer.truncated && !answer.continuable,
+                "streamed {streamed}"
+            );
+            let hits = mock.chat_hits();
+            let refused = core
+                .runtime()
+                .block_on(core.continue_answer(answer.action_id));
+            assert!(
+                matches!(refused, Err(AppError::WrongPostKind { .. })),
+                "streamed {streamed}: got {refused:?}"
+            );
+            assert_eq!(mock.chat_hits(), hits, "nothing was sent");
+        });
+    }
+}
+
+/// A header-shaped first line this app strips from an answer makes the stored
+/// text differ from what was generated, so that answer is not continuable
+/// either, whatever the engine said of its own output.
+#[test]
+fn an_answer_whose_header_line_was_stripped_is_not_continuable() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::HeaderThenLength,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        assert!(cut.truncated && !cut.continuable);
+        assert!(!post_at(&core, &cut.space_id, 1).continuable);
+    });
+}
+
 /// The door refuses what it cannot continue **before anything is spent**: an
 /// answer that finished, and a post that is not an agent's answer at all. No
 /// request goes out, nothing is written, no credential moves.

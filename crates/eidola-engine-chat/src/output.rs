@@ -151,6 +151,15 @@ pub struct OutputParser {
     reasoning: ReasoningParser,
     tools: Option<ToolCallParser>,
     tool_calls_emitted: bool,
+    /// What [`OutputParser::resumes_exactly`] compares: the text fed in, the
+    /// reasoning and content given out, whether the text lost bytes on the
+    /// way, and where the prompt ended.
+    raw: String,
+    emitted_reasoning: String,
+    emitted_content: String,
+    lossy: bool,
+    thinking: bool,
+    continuing: Option<&'static str>,
 }
 
 impl std::fmt::Debug for OutputParser {
@@ -173,7 +182,52 @@ impl OutputParser {
                 .tools
                 .map(|schemas| ToolCallParser::new(schemas, ids)),
             tool_calls_emitted: false,
+            raw: String::new(),
+            emitted_reasoning: String::new(),
+            emitted_content: String::new(),
+            lossy: false,
+            thinking: config.thinking,
+            continuing: config.continuing,
         }
+    }
+
+    /// The text fed in was decoded lossily (an incomplete UTF-8 sequence
+    /// flushed at the end), so it is not the bytes the model generated. Called
+    /// by a caller that runs its own detokenizer and feeds text.
+    pub fn mark_lossy(&mut self) {
+        self.lossy = true;
+    }
+
+    /// **Whether this response can be continued from what it gave out**, read
+    /// after [`Self::finish`]: true exactly when the reasoning and content it
+    /// emitted, sent back as a continued final message (the answer once there
+    /// is any, the reasoning before), make the template render precisely the
+    /// text the model generated after the prompt — nothing dropped, nothing
+    /// added. A tool call, an unfinished tool-call block the parser drops, a
+    /// lossy final character, a repeated or missing `<think>`, reasoning ended
+    /// by `<tool_call>` instead of `</think>`, or a `</think>` with no answer
+    /// after it each make it false.
+    pub fn resumes_exactly(&self) -> bool {
+        if self.tool_calls_emitted || self.lossy {
+            return false;
+        }
+        let (r, c) = (&self.emitted_reasoning, &self.emitted_content);
+        let after_reasoning = |open: &str| {
+            if c.is_empty() {
+                format!("{open}{r}")
+            } else {
+                format!("{open}{r}</think>{c}")
+            }
+        };
+        let expected = match self.continuing {
+            None if self.thinking => after_reasoning("<think>"),
+            Some("reasoning_content") => after_reasoning(""),
+            // Thinking disabled, or the answer continued: the prompt already
+            // holds any reasoning, so all the output is answer.
+            _ if r.is_empty() => c.clone(),
+            _ => return false,
+        };
+        expected == self.raw
     }
 
     /// Feeds one generated token. An id the tokenizer does not define is refused
@@ -192,12 +246,15 @@ impl OutputParser {
         if text.is_empty() {
             return ChatDelta::default();
         }
+        self.raw.push_str(text);
         let split = self.reasoning.push(text);
         let mut delta = ChatDelta {
             reasoning_content: split.reasoning,
             ..ChatDelta::default()
         };
         delta.append(self.route_content(&split.content));
+        self.emitted_reasoning.push_str(&delta.reasoning_content);
+        self.emitted_content.push_str(&delta.content);
         delta
     }
 
@@ -221,14 +278,16 @@ impl OutputParser {
 
     /// Ends the response: flushes held-back text and maps the finish reason.
     pub fn finish(&mut self, cause: StopCause) -> (ChatDelta, FinishReason) {
+        self.lossy |= self.detok.pending_len() > 0;
         let tail = self.detok.finish();
         let mut delta = self.push_text(&tail);
-        delta
-            .reasoning_content
-            .push_str(&self.reasoning.finish().reasoning);
+        let held = self.reasoning.finish().reasoning;
+        self.emitted_reasoning.push_str(&held);
+        delta.reasoning_content.push_str(&held);
         if let Some(parser) = &mut self.tools {
             let rest = parser.finish();
             self.tool_calls_emitted |= !rest.calls.is_empty();
+            self.emitted_content.push_str(&rest.content);
             delta.content.push_str(&rest.content);
             delta.tool_calls.extend(rest.calls);
         }
@@ -322,6 +381,67 @@ mod tests {
         );
         assert_eq!((d.content.as_str(), reason), ("Hi ", FinishReason::Length));
         assert!(d.reasoning_content.is_empty());
+    }
+
+    /// Which length endings can be continued from what the parser gave out —
+    /// exactly those where the given-out text, rendered back as the continued
+    /// message, is the text the model generated.
+    #[test]
+    fn a_cut_resumes_exactly_only_where_nothing_was_dropped() {
+        let ends = |thinking: Option<bool>, tools: bool, chunks: &[&str]| {
+            let mut p = parser(thinking, tools);
+            run(&mut p, chunks, StopCause::MaxTokens);
+            p.resumes_exactly()
+        };
+        // Inside the reasoning, inside the answer, and an answer with thinking off.
+        assert!(ends(None, true, &["<think>weighing the"]));
+        assert!(ends(None, true, &["<think>weighed</think>The sky is"]));
+        assert!(ends(Some(false), true, &["The sky is"]));
+        // Markup the parser keeps as text is still exact.
+        assert!(ends(Some(false), false, &["Hi <tool_call><function=x>"]));
+        // The reported case: an unfinished tool call is dropped.
+        assert!(!ends(
+            Some(false),
+            true,
+            &["Hi <tool_call><function=get_weather>"]
+        ));
+        assert!(!ends(
+            None,
+            true,
+            &["<think>plan<tool_call><function=get_weather>"]
+        ));
+        // A completed call is a tool round, never a continued answer.
+        assert!(!ends(
+            Some(false),
+            true,
+            &["<tool_call><function=get_weather></function></tool_call>"]
+        ));
+        // A repeated `<think>` is stripped; a `</think>` with no answer after it
+        // would be dropped by a reasoning continuation.
+        assert!(!ends(None, true, &["<think><think>twice"]));
+        assert!(!ends(None, true, &["<think>done</think>"]));
+        // No opening `<think>`: the continued prompt would add one.
+        assert!(!ends(None, true, &["straight into it"]));
+        // An incomplete final character is flushed lossily.
+        let mut p = parser(Some(false), false);
+        run(&mut p, &["ok"], StopCause::MaxTokens);
+        assert!(p.resumes_exactly());
+        p.mark_lossy();
+        assert!(!p.resumes_exactly());
+
+        // Continuations, judged from where their prompt ended.
+        let resumed = |field: &'static str, chunks: &[&str]| {
+            let mut p = OutputParser::new(
+                OutputConfig::new(None, None).continuing_in(Some(field)),
+                PrefixedCallIds("call_".into()),
+            );
+            run(&mut p, chunks, StopCause::MaxTokens);
+            p.resumes_exactly()
+        };
+        assert!(resumed("reasoning_content", &[" more thought"]));
+        assert!(resumed("reasoning_content", &[" more</think>An answer"]));
+        assert!(!resumed("reasoning_content", &[" more</think>"]));
+        assert!(resumed("content", &[" and the rest"]));
     }
 
     #[test]

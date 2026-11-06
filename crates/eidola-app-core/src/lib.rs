@@ -7948,6 +7948,8 @@ impl Inner {
         } else {
             strip_leading_header(raw_content).to_string()
         };
+        // The stored text is the generated text only if the strip took nothing.
+        let text_is_generated = response_content == raw_content;
 
         // The blocking twin of the streaming path's reasoning capture: the
         // same two non-standard spellings, on the aggregated `message` object
@@ -8092,6 +8094,12 @@ impl Inner {
         // regenerate, or switch away from (the generation it superseded stays
         // one step back in the switcher).
         let truncated = stopped_at_ceiling(finish_reason.as_deref());
+        // **Continuable only when the text written is exactly what the model
+        // generated**: the engine says so of its own output (`continuable` on
+        // the ending — a parser that dropped an unfinished construct or a lossy
+        // final character makes it false, and a server that does not say so is
+        // never trusted), and this side's header strip must have taken nothing.
+        let resumable = truncated && choice_continuable(&body) == Some(true) && text_is_generated;
         // The generation a successful continuation writes is the continued
         // text; a refused one wrote nothing of it.
         let (response_reasoning, response_content) = if status.is_success() {
@@ -8112,6 +8120,7 @@ impl Inner {
                     "error"
                 },
                 truncated,
+                resumable,
                 input_tokens,
                 output_tokens,
                 &response_reasoning,
@@ -8752,6 +8761,8 @@ impl Inner {
         // chunk or on a trailing one with an empty delta — so it is read off
         // every chunk, before the delta gate, and the last one named wins.
         let mut finish_reason: Option<String> = None;
+        // The engine's verdict on a `length` ending (see the blocking twin).
+        let mut continuable: Option<bool> = None;
         // The raw bytes for the request log, kept to the retention cap.
         let mut raw = recorded::RecordedBody::default();
         // **The refund the server closed the stream with**, if it sent one —
@@ -8845,6 +8856,9 @@ impl Inner {
 
                     if let Some(reason) = choice_finish_reason(&json) {
                         finish_reason = Some(reason.to_string());
+                    }
+                    if let Some(c) = choice_continuable(&json) {
+                        continuable = Some(c);
                     }
 
                     let Some(delta) = json
@@ -8986,10 +9000,12 @@ impl Inner {
         // this is the same strip applied to the accumulated text at persist
         // time — what lands in the durable trail (and in `ChatResult`) is what
         // the reader watched arrive.
-        let full_content = if continues_an_answer {
-            full_content
+        let (full_content, text_is_generated) = if continues_an_answer {
+            (full_content, true)
         } else {
-            strip_leading_header(&full_content).to_string()
+            let stripped = strip_leading_header(&full_content).to_string();
+            let same = stripped == full_content;
+            (stripped, same)
         };
 
         // **A stream that stopped without ever saying it was over is a
@@ -9120,6 +9136,7 @@ impl Inner {
         // Every ending at the ceiling is written, whatever it holds (see the
         // blocking twin).
         let truncated = stopped_at_ceiling(finish_reason.as_deref());
+        let resumable = truncated && continuable == Some(true) && text_is_generated;
         let (full_reasoning, full_content) = prep.round_text(&full_reasoning, &full_content);
 
         #[cfg(feature = "test-support")]
@@ -9130,6 +9147,7 @@ impl Inner {
             .persist_turn(
                 "complete",
                 truncated,
+                resumable,
                 input_tokens,
                 output_tokens,
                 &full_reasoning,
@@ -13770,6 +13788,7 @@ impl TurnPrep {
                 // request, so each round's action carries its own charge.
                 credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
                 truncated: false,
+                resumable: false,
                 created_at: now_ms(),
             },
         )
@@ -13904,6 +13923,7 @@ impl TurnPrep {
                 // Tools run locally — no inference was purchased.
                 credits_consumed: None,
                 truncated: false,
+                resumable: false,
                 created_at: now_ms(),
             },
         )
@@ -14008,6 +14028,7 @@ impl TurnPrep {
                 output_tokens: None,
                 credits_consumed: None,
                 truncated: false,
+                resumable: false,
                 created_at: now_ms(),
             },
         )
@@ -14080,6 +14101,7 @@ impl TurnPrep {
         &mut self,
         action_status: &str,
         truncated: bool,
+        resumable: bool,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
         reasoning: &str,
@@ -14095,6 +14117,7 @@ impl TurnPrep {
             .persist_turn_body(
                 action_status,
                 truncated,
+                resumable,
                 input_tokens,
                 output_tokens,
                 reasoning,
@@ -14160,6 +14183,7 @@ impl TurnPrep {
         &mut self,
         action_status: &str,
         truncated: bool,
+        resumable: bool,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
         reasoning: &str,
@@ -14207,6 +14231,7 @@ impl TurnPrep {
                 // Local turns record no charge (`None`), not a fake zero.
                 credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
                 truncated,
+                resumable: truncated && resumable,
                 created_at: now_ms(),
             },
         )
@@ -15800,6 +15825,18 @@ fn choice_finish_reason(value: &serde_json::Value) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
+/// The engine's `continuable` verdict on the first choice, if it gave one: on a
+/// `length` ending, whether what it gave out can be continued exactly. Read off a
+/// whole chunk or a whole completion body, like [`choice_finish_reason`].
+fn choice_continuable(value: &serde_json::Value) -> Option<bool> {
+    value
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("continuable"))
+        .and_then(|v| v.as_bool())
+}
+
 /// The upstream stopped at the completion ceiling (`finish_reason: "length"`).
 /// Both transports read the same key, so this is the one place the spelling is
 /// written down.
@@ -15912,7 +15949,11 @@ async fn continuation_basis(
     let Some(model) = source.model.as_deref().map(canonical_model) else {
         return Ok(None);
     };
-    if source.action_type != "inference" || !source.truncated || !can_continue(Some(&model)) {
+    if source.action_type != "inference"
+        || !source.truncated
+        || !source.resumable
+        || !can_continue(Some(&model))
+    {
         return Ok(None);
     }
     let author_answers_with_it = db::space_participants(conn, space_id)

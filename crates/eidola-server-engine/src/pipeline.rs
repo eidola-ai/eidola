@@ -137,6 +137,9 @@ pub struct Step {
     pub finish: Option<FinishReason>,
     /// A stop sequence matched: the caller must cancel the engine request.
     pub stopped_by_sequence: bool,
+    /// On a `length` finish, whether the response can be continued exactly from what
+    /// it gave out (`OutputParser::resumes_exactly`); `None` on any other ending.
+    pub continuable: Option<bool>,
 }
 
 /// Turns one request's engine tokens into OpenAI deltas.
@@ -209,6 +212,10 @@ impl Decoder {
                     return Err(ApiError::Internal("the request was cancelled"));
                 }
             };
+            if self.detok.pending_len() > 0 {
+                // The final character is incomplete and flushes lossily.
+                self.parser.mark_lossy();
+            }
             let rest = self.detok.finish();
             let (released, matched) = self.stop.push(&rest);
             append(&mut step.delta, self.parser.push_text(&released));
@@ -220,6 +227,9 @@ impl Decoder {
             };
             let (tail, reason) = self.parser.finish(cause);
             append(&mut step.delta, tail);
+            if reason == FinishReason::Length {
+                step.continuable = Some(self.parser.resumes_exactly());
+            }
             step.finish = Some(reason);
             self.done = true;
         }

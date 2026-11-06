@@ -1213,6 +1213,13 @@
           "message"
         ],
         "properties": {
+          "continuable": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "On a `length` ending from an Eidola engine: whether the reasoning and\ncontent given out can be sent back as a continued final message\n(`continue_final_message`) that renders exactly the text the model\ngenerated. A client offers continuation only where it is `true`."
+          },
           "finish_reason": {
             "oneOf": [
               {
@@ -1244,6 +1251,13 @@
           "delta"
         ],
         "properties": {
+          "continuable": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "On a `length` ending from an Eidola engine: whether the reasoning and\ncontent given out can be sent back as a continued final message\n(`continue_final_message`) that renders exactly the text the model\ngenerated. A client offers continuation only where it is `true`."
+          },
           "delta": {
             "$ref": "#/components/schemas/ChunkDelta",
             "description": "The delta (partial update) for this choice."

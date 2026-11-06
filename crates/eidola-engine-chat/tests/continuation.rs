@@ -40,13 +40,24 @@ fn tokenizer() -> MimoTokenizer {
 /// Parses model output: from the start of a new assistant turn (`None`), or
 /// from inside the field a continued prompt ended in.
 fn parse(output: &str, continuing: Option<&'static str>) -> (String, String) {
+    let (r, c, _) = parse_judged(output, continuing);
+    (r, c)
+}
+
+/// [`parse`], with the parser's verdict on whether the output can be continued
+/// exactly ([`OutputParser::resumes_exactly`]).
+fn parse_judged(output: &str, continuing: Option<&'static str>) -> (String, String, bool) {
     let config = OutputConfig::new(None, None).continuing_in(continuing);
     let mut parser = OutputParser::new(config, PrefixedCallIds("call_".into()));
     let mut delta = parser.push_text(output);
     let (tail, _) = parser.finish(StopCause::MaxTokens);
     delta.reasoning_content.push_str(&tail.reasoning_content);
     delta.content.push_str(&tail.content);
-    (delta.reasoning_content, delta.content)
+    (
+        delta.reasoning_content,
+        delta.content,
+        parser.resumes_exactly(),
+    )
 }
 
 /// The prompt of a request continuing `partial` (reasoning and answer so far),
@@ -135,8 +146,16 @@ fn a_generation_cut_after_any_token_continues_into_the_same_output() {
                 // whole characters.
                 continue;
             }
-            let (r, c) = parse(&cut_text, None);
+            let (r, c, exact) = parse_judged(&cut_text, None);
             let (prompt, field) = continued_prompt(&template, question, &r, &c);
+            // **The invariant continuation is offered under**: the parser says
+            // the cut can be continued exactly when the continued prompt is the
+            // original prompt followed by precisely the cut text.
+            assert_eq!(
+                exact,
+                prompt == format!("{original}{cut_text}"),
+                "cut after {k} tokens of {generation:?}"
+            );
             assert!(
                 whole.starts_with(&prompt),
                 "cut after {k} tokens of {generation:?}: {prompt:?} is not a prefix"

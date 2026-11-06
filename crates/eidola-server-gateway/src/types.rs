@@ -419,6 +419,13 @@ pub struct Choice {
 
     /// The reason the model stopped generating.
     pub finish_reason: Option<FinishReason>,
+
+    /// On a `length` ending from an Eidola engine: whether the reasoning and
+    /// content given out can be sent back as a continued final message
+    /// (`continue_final_message`) that renders exactly the text the model
+    /// generated. A client offers continuation only where it is `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuable: Option<bool>,
 }
 
 /// An assistant message in a response.
@@ -517,6 +524,13 @@ pub struct ChunkChoice {
 
     /// The reason the model stopped generating (only in final chunk).
     pub finish_reason: Option<FinishReason>,
+
+    /// On a `length` ending from an Eidola engine: whether the reasoning and
+    /// content given out can be sent back as a continued final message
+    /// (`continue_final_message`) that renders exactly the text the model
+    /// generated. A client offers continuation only where it is `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuable: Option<bool>,
 }
 
 /// A delta update in a streaming response.
@@ -962,6 +976,7 @@ mod tests {
                     tool_calls: None,
                 },
                 finish_reason: Some(FinishReason::Stop),
+                continuable: None,
             }],
             usage: Some(Usage {
                 prompt_tokens: 10,
@@ -993,6 +1008,7 @@ mod tests {
                     tool_calls: None,
                 },
                 finish_reason: None,
+                continuable: None,
             }],
             usage: None,
         };
@@ -1154,6 +1170,37 @@ mod tests {
             serde_json::from_value::<ChatCompletionRequest>(body)
                 .expect("the body app-core sends must remain accepted by the strict server type");
         }
+    }
+
+    /// An engine's `continuable` verdict on a `length` ending reaches the
+    /// client through the relay, in both shapes, and is absent where the engine
+    /// sent none.
+    #[test]
+    fn a_length_endings_continuable_verdict_is_relayed() {
+        let blocking = serde_json::json!({
+            "id": "c", "object": "chat.completion", "created": 1, "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi "},
+                         "finish_reason": "length", "continuable": false}],
+        });
+        let parsed: ChatCompletionResponse = serde_json::from_value(blocking).unwrap();
+        let back = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(back["choices"][0]["continuable"], false);
+
+        let chunk = serde_json::json!({
+            "id": "c", "object": "chat.completion.chunk", "created": 1, "model": "m",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length", "continuable": true}],
+        });
+        let parsed: ChatCompletionChunk = serde_json::from_value(chunk).unwrap();
+        let back = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(back["choices"][0]["continuable"], true);
+
+        let plain = serde_json::json!({
+            "id": "c", "object": "chat.completion.chunk", "created": 1, "model": "m",
+            "choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": null}],
+        });
+        let parsed: ChatCompletionChunk = serde_json::from_value(plain).unwrap();
+        let back = serde_json::to_value(&parsed).unwrap();
+        assert!(back["choices"][0].get("continuable").is_none());
     }
 
     // -----------------------------------------------------------------
