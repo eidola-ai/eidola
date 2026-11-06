@@ -91,7 +91,7 @@ const CONTROL_WIDTH: Pixels = px(40.);
 /// `Window` to ask yet, and a window opens untiled, so this is the widest
 /// [`content_insets`] can be. Zero off Linux (and harmlessly generous if the
 /// compositor then insists on server-side decorations).
-pub(crate) fn opening_content_inset() -> Pixels {
+pub fn opening_content_inset() -> Pixels {
     if cfg!(target_os = "linux") {
         SHADOW_SIZE + FRAME_BORDER
     } else {
@@ -129,7 +129,7 @@ pub(crate) fn controls_reserve(window: &Window) -> Pixels {
 /// background moves into the chrome layer: the client frame paints it inside
 /// the visible border, and the `Decorations::Server` arm paints it edge to
 /// edge. See the module docs.
-pub(crate) fn themed_root(view: AnyView, window: &mut Window, cx: &mut Context<Root>) -> Root {
+pub fn themed_root(view: AnyView, window: &mut Window, cx: &mut Context<Root>) -> Root {
     let root = Root::new(view, window, cx);
     if cfg!(target_os = "linux") {
         root.bg(gpui::transparent_black())
@@ -163,7 +163,7 @@ fn content_insets(window: &Window) -> Edges<Pixels> {
 /// bottom/right (floating overlays, scroll ranges, dock positions) must use
 /// this instead of `window.viewport_size()`, or the result lands in the
 /// shadow band. Identical to the viewport when no chrome is drawn.
-pub(crate) fn content_size(window: &Window) -> Size<Pixels> {
+pub fn content_size(window: &Window) -> Size<Pixels> {
     let viewport = window.viewport_size();
     let insets = content_insets(window);
     size(
@@ -197,7 +197,7 @@ pub(crate) fn in_resize_band(window: &Window, pos: Point<Pixels>) -> bool {
 /// Round all four corners of a full-bleed surface to match the window's
 /// client-side frame (no-op on macOS / SSD / tiled edges). Apply to any
 /// surface that spans the whole window (view roots) — see the module docs.
-pub(crate) fn round_client_corners<E: Styled>(el: E, window: &Window) -> E {
+pub fn round_client_corners<E: Styled>(el: E, window: &Window) -> E {
     round_bottom_client_corners(round_top_client_corners(el, window), window)
 }
 
@@ -205,7 +205,7 @@ pub(crate) fn round_client_corners<E: Styled>(el: E, window: &Window) -> E {
 /// client-side frame (no-op on macOS / SSD / tiled edges). Apply to any
 /// surface that owns the window's top edge but not its bottom (e.g. the
 /// space view's gradient title band) — see the module docs.
-pub(crate) fn round_top_client_corners<E: Styled>(el: E, window: &Window) -> E {
+pub fn round_top_client_corners<E: Styled>(el: E, window: &Window) -> E {
     round_tr_client_corner(round_tl_client_corner(el, window), window)
 }
 
