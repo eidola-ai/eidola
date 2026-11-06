@@ -88,6 +88,9 @@ pub struct Stats {
     pub rejected: u64,
     /// Requests in the engine now (waiting or running).
     pub in_engine: u64,
+    /// Idle-KV keys the engine holds (a count): zero whenever no request is in the
+    /// engine, since the last request's maintenance runs as soon as it ends.
+    pub kv_keys_held: u64,
     /// The engine's own counters.
     pub engine_steps: u64,
     pub preemptions: u64,
@@ -377,6 +380,16 @@ impl<E: Executor> Worker<E> {
                     Err(_) => return self.fail(),
                 }
             }
+            // The last request just ended (finished, or cancelled while running): run the
+            // maintenance it left now rather than at the next sweep, so the blocks it left
+            // cached are encrypted, the ones it freed zeroed, and its key dropped while the
+            // engine would otherwise sit idle.
+            if self.engine.unfinished() == 0
+                && self.engine.has_pending_maintenance()
+                && self.engine.flush().is_err()
+            {
+                return self.fail();
+            }
             self.publish();
         }
     }
@@ -463,6 +476,7 @@ impl<E: Executor> Worker<E> {
     fn publish(&mut self) {
         let s = self.engine.stats();
         self.counters.in_engine = self.engine.unfinished() as u64;
+        self.counters.kv_keys_held = self.engine.kv_keys_held() as u64;
         self.counters.engine_steps = s.steps;
         self.counters.preemptions = s.preemptions;
         self.counters.drafted = s.drafted;

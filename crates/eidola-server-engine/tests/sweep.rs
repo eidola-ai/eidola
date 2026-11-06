@@ -40,6 +40,53 @@ fn request(handle: &worker::EngineHandle, prompt: Vec<u32>, cache: CacheScope) -
     }
 }
 
+/// When the last request ends, the engine runs the maintenance it left (encrypting the
+/// blocks it left cached, zeroing the ones it freed) at once, not at the next sweep: with
+/// the sweep an hour away, the finish is followed by exactly one maintenance-only step,
+/// and the engine holds no key.
+#[test]
+fn the_last_request_leaves_no_maintenance_and_no_key() {
+    let (stopped_tx, _stopped_rx) = tokio::sync::oneshot::channel();
+    let spec = mimo_like_spec(32, 4, 6, 10, 256, 8, 3);
+    let handle = worker::spawn(
+        move || Ok(MockExecutor::new(spec, MockConfig::default())),
+        SchedulerConfig {
+            eos_token_ids: Vec::new(),
+            speculative: false,
+            sweep_interval_ms: 3_600_000,
+            ..SchedulerConfig::default()
+        },
+        Duration::from_secs(3600),
+        stopped_tx,
+    )
+    .unwrap();
+    let admission = Admission::new(4);
+    let (guard, mut events) = handle
+        .submit(
+            request(&handle, (1..=17).collect(), CacheScope::Keyed(lineage(7))),
+            admission.try_acquire().unwrap(),
+        )
+        .unwrap();
+    while let Some(out) = events.blocking_recv() {
+        if matches!(
+            out,
+            Output::Tokens {
+                finish: Some(_),
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+    drop((guard, events));
+    // One step prefills the 17 tokens and samples the one output token; the second is
+    // the maintenance its release queued.
+    let s = wait_for(&handle, |s| s.finished == 1 && s.in_engine == 0);
+    assert_eq!((s.engine_steps, s.kv_keys_held), (2, 0), "{s:?}");
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(handle.stats().engine_steps, 2, "nothing else runs");
+}
+
 #[test]
 fn commands_faster_than_the_sweep_interval_do_not_postpone_it() {
     const SWEEP: Duration = Duration::from_millis(100);
