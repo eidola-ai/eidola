@@ -2271,6 +2271,62 @@ pub async fn turns_taken_in_space(conn: &Connection, space_id: &str) -> Result<i
     }
 }
 
+/// What a continuation extends: the generation's author and model, whether it
+/// stopped at its completion ceiling, and the reasoning and answer it wrote —
+/// each its `thinking` / `text` blocks joined in ordinal order (a turn writes
+/// at most one of each).
+#[derive(Debug, Clone)]
+pub struct ContinuationSource {
+    pub participant_id: String,
+    pub model: Option<String>,
+    pub truncated: bool,
+    pub thinking: String,
+    pub text: String,
+}
+
+/// The [`ContinuationSource`] of `action_id`, or `None` for no such action.
+pub async fn continuation_source(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<ContinuationSource>, AppError> {
+    let mut rows = conn
+        .query(
+            "SELECT participant_id, model, truncated FROM action WHERE id = ?1",
+            [Value::Text(action_id.to_string())],
+        )
+        .await
+        .map_err(AppError::db)?;
+    let Some(row) = rows.next().await.map_err(AppError::db)? else {
+        return Ok(None);
+    };
+    let mut source = ContinuationSource {
+        participant_id: row.get::<String>(0).map_err(AppError::db)?,
+        model: row.get::<Option<String>>(1).map_err(AppError::db)?,
+        truncated: row.get::<i64>(2).map_err(AppError::db)? != 0,
+        thinking: String::new(),
+        text: String::new(),
+    };
+    drop(rows);
+    let mut blocks = conn
+        .query(
+            "SELECT block_type, text_content FROM content_block \
+             WHERE action_id = ?1 AND block_type IN ('thinking', 'text') \
+               AND text_content IS NOT NULL \
+             ORDER BY ordinal ASC",
+            [Value::Text(action_id.to_string())],
+        )
+        .await
+        .map_err(AppError::db)?;
+    while let Some(row) = blocks.next().await.map_err(AppError::db)? {
+        let text = row.get::<String>(1).map_err(AppError::db)?;
+        match row.get::<String>(0).map_err(AppError::db)?.as_str() {
+            "thinking" => source.thinking.push_str(&text),
+            _ => source.text.push_str(&text),
+        }
+    }
+    Ok(Some(source))
+}
+
 /// `(id, text)` of an action's first quotable ([`QUOTABLE_BLOCK_TYPE`]) content
 /// block — what a driver quotes when it attaches a post to a turn it is about
 /// to run. `None` for an action with no text block (a decline, a trace).

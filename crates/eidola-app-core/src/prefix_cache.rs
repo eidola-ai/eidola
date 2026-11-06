@@ -399,6 +399,7 @@ mod tests {
             false,
             false,
             Some(key.as_str()),
+            None,
         );
         scrub_body_key(&mut body);
         assert!(!body.to_string().contains(key.as_str()));

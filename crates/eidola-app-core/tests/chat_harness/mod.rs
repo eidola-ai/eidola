@@ -368,10 +368,41 @@ pub enum ChatBehavior {
     /// [`ChatBehavior::ReasoningOnlyLength`]. Whichever transport asked.
     ///
     /// This is how a test gets a *readable answer already in the transcript*
-    /// and then a regeneration that hits the ceiling — the reported case, and
-    /// the one where the classification decides whether a real answer survives.
+    /// and then a regeneration that hits the ceiling — the case where the
+    /// generation switcher is what keeps the readable answer.
     OkThenReasoningOnlyLength,
+    /// **An answer cut off at the ceiling, and its continuation**, in whichever
+    /// transport asked. A request without `continue_final_message` stops at
+    /// the ceiling as `cut` says ([`Cut`]); one with it is answered from inside
+    /// the field it continues: the rest of the reasoning
+    /// ([`CONTINUED_REASONING`]) and then the answer ([`CONTINUED_ANSWER`]) for
+    /// `"reasoning_content"`, the rest of the answer ([`CONTINUED_TAIL`]) for
+    /// `true`. With `again`, the first continuation (the turn's second chat
+    /// request) stops at the ceiling too, before any answer when it continued
+    /// the reasoning — so a continuation is continued.
+    ContinueAfterLength { cut: Cut, again: bool },
+    /// A reasoning-only cut whose continuation calls the harness's tool (one
+    /// round, [`TOOL_NAME`]), after which the ordinary request that follows
+    /// the tool round answers [`TOOL_FINAL_CONTENT`]. Whichever transport
+    /// asked.
+    ContinueIntoToolRound,
 }
+
+/// Where a [`ChatBehavior::ContinueAfterLength`] answer stops the first time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cut {
+    /// Reasoning only: [`TRUNCATED_REASONING`], no answer.
+    Reasoning,
+    /// Mid-answer: [`TRUNCATED_REASONING`], then [`STREAM_CONTENT`].
+    Answer,
+}
+
+/// The rest of a continued reasoning.
+pub const CONTINUED_REASONING: &str = " and so: the moon.";
+/// The answer a continued reasoning reaches.
+pub const CONTINUED_ANSWER: &str = "The tides follow the moon.";
+/// The rest of a continued answer.
+pub const CONTINUED_TAIL: &str = " Then it carries on.";
 
 /// The reason the decline behaviours state; asserted on the persisted
 /// `decision` action's text block.
@@ -564,6 +595,11 @@ pub struct MockConfig {
     /// every model the server sells today; [`supported_prompt_cache`] is the
     /// leaf an Eidola-hosted row carries.
     pub declared_prompt_cache: Option<serde_json::Value>,
+    /// The `max_output_tokens` `GET /v1/models` declares for [`MODEL`].
+    /// `None` — the default — declares none (unless `declared_tool_calling`
+    /// publishes its standard row), which leaves a turn on the fallback
+    /// ceiling every test written before declarations were read expects.
+    pub declared_max_output: Option<u64>,
     /// Armed by a test to make the mock **stop listening** once it has served
     /// the next `GET /v1/models` — so the turn that fetched the catalog then
     /// meets a refused connection for its completion, the one failure that
@@ -594,6 +630,7 @@ impl Default for MockConfig {
             tool_script: tool_script(),
             declared_tool_calling: None,
             declared_prompt_cache: None,
+            declared_max_output: None,
             close_switch: CloseSwitch::default(),
             list_flat_model: false,
             chat_delay_ms: 0,
@@ -1869,6 +1906,61 @@ async fn handle_chat(
             }
             write_json(stream, 200, &body.to_string()).await
         }
+        ChatBehavior::ContinueAfterLength { cut, again } => {
+            let (reasoning, content, finish) = match request.get("continue_final_message") {
+                None => match cut {
+                    Cut::Reasoning => (TRUNCATED_REASONING, "", "length"),
+                    Cut::Answer => (TRUNCATED_REASONING, STREAM_CONTENT, "length"),
+                },
+                Some(serde_json::Value::String(field)) if field == "reasoning_content" => {
+                    if again && hit == 2 {
+                        (CONTINUED_REASONING, "", "length")
+                    } else {
+                        (CONTINUED_REASONING, CONTINUED_ANSWER, "stop")
+                    }
+                }
+                Some(_) => (
+                    "",
+                    CONTINUED_TAIL,
+                    if again && hit == 2 { "length" } else { "stop" },
+                ),
+            };
+            write_ending(stream, request, inline_refund, reasoning, content, finish).await
+        }
+        ChatBehavior::ContinueIntoToolRound => {
+            let streamed = request.get("stream").and_then(|s| s.as_bool()) == Some(true);
+            if request.get("continue_final_message").is_some() {
+                if streamed {
+                    return write_sse_tool_stream(stream, 1, false).await;
+                }
+                let mut body = tool_call_body(&tool_call_object(1, &tool_arguments(1)));
+                if let Some(refund) = inline_refund {
+                    body["refund"] = refund;
+                }
+                return write_json(stream, 200, &body.to_string()).await;
+            }
+            if hit == 1 {
+                write_ending(
+                    stream,
+                    request,
+                    inline_refund,
+                    TRUNCATED_REASONING,
+                    "",
+                    "length",
+                )
+                .await
+            } else {
+                write_ending(
+                    stream,
+                    request,
+                    inline_refund,
+                    "",
+                    TOOL_FINAL_CONTENT,
+                    "stop",
+                )
+                .await
+            }
+        }
         ChatBehavior::OkEitherTransport => {
             if request.get("stream").and_then(|s| s.as_bool()) == Some(true) {
                 return write_sse_stream(stream, true, &[STREAM_CONTENT]).await;
@@ -2266,6 +2358,67 @@ async fn write_sse_length_stream(
     let terminal = serde_json::json!({
         "choices": [{ "delta": {}, "finish_reason": "length" }],
         "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS }
+    });
+    stream.write_all(&sse_event(&terminal.to_string())).await?;
+    stream.write_all(&sse_event("[DONE]")).await?;
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Answer in whichever transport asked: `reasoning`, then `content`, ending
+/// with `finish`. A `length` ending reports the whole ceiling spent, as the
+/// truncating behaviours do. A stream carries the reasoning as one delta and the
+/// content as two, so the client's accumulation is exercised.
+async fn write_ending(
+    stream: &mut TcpStream,
+    request: &serde_json::Value,
+    inline_refund: Option<serde_json::Value>,
+    reasoning: &str,
+    content: &str,
+    finish: &str,
+) -> std::io::Result<()> {
+    let completion_tokens = if finish == "length" {
+        CEILING_TOKENS
+    } else {
+        5
+    };
+    if request.get("stream").and_then(|s| s.as_bool()) != Some(true) {
+        let mut body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "reasoning_content": reasoning,
+                },
+                "finish_reason": finish,
+            }],
+            "usage": { "prompt_tokens": 11, "completion_tokens": completion_tokens },
+        });
+        if let Some(refund) = inline_refund {
+            body["refund"] = refund;
+        }
+        return write_json(stream, 200, &body.to_string()).await;
+    }
+    stream.write_all(sse_head().as_bytes()).await?;
+    let mut deltas = Vec::new();
+    if !reasoning.is_empty() {
+        deltas.push(serde_json::json!({"reasoning_content": reasoning}));
+    }
+    if !content.is_empty() {
+        let half = content.floor_char_boundary(content.len() / 2);
+        let (a, b) = content.split_at(half);
+        for piece in [a, b].into_iter().filter(|p| !p.is_empty()) {
+            deltas.push(serde_json::json!({"content": piece}));
+        }
+    }
+    for delta in deltas {
+        let chunk = serde_json::json!({"choices": [{"delta": delta, "finish_reason": null}]});
+        stream.write_all(&sse_event(&chunk.to_string())).await?;
+    }
+    let terminal = serde_json::json!({
+        "choices": [{ "delta": {}, "finish_reason": finish }],
+        "usage": { "prompt_tokens": 11, "completion_tokens": completion_tokens }
     });
     stream.write_all(&sse_event(&terminal.to_string())).await?;
     stream.write_all(&sse_event("[DONE]")).await?;
@@ -2788,6 +2941,9 @@ fn models_body(config: &MockConfig) -> String {
             primary["capabilities"] = serde_json::json!({});
         }
         primary["capabilities"]["prompt_cache"] = leaf.clone();
+    }
+    if let Some(ceiling) = config.declared_max_output {
+        primary["max_output_tokens"] = serde_json::json!(ceiling);
     }
     let router = serde_json::json!({
         "id": ROUTER_REMOTE_MODEL,
