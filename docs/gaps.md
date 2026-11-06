@@ -2,7 +2,7 @@
 
 Every piece of the Eidola trust chain that is intentionally deferred is catalogued here. Each gap closes a specific class of attack that is already constrained by other parts of the chain — but they are real and worth understanding. Reading this page is the fastest way to see what Eidola does not yet defend against.
 
-The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app-core/src/updater/ci_sigstore/mod.rs`](../crates/eidola-app-core/src/updater/ci_sigstore/mod.rs) and `rekor.rs`, and the install-side gap is described where the verifier hands off to [`crates/eidola-app-core/src/updater/install/`](../crates/eidola-app-core/src/updater/install/mod.rs). The same two cryptographic-verifier gaps apply to the server-side runtime upstream-measurement resolver ([`crates/eidola-server-gateway/src/upstream_trust/sigstore.rs`](../crates/eidola-server-gateway/src/upstream_trust/sigstore.rs)), which reuses the same Fulcio/Rekor primitives.
+The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app-core/src/updater/ci_sigstore/mod.rs`](../crates/eidola-app-core/src/updater/ci_sigstore/mod.rs) and `rekor.rs`, and the install-side gap is described where the verifier hands off to [`crates/eidola-app-core/src/updater/install/`](../crates/eidola-app-core/src/updater/install/mod.rs).
 
 ## Cryptographic verifier
 
@@ -86,9 +86,9 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 
 ### TDX acceptance
 
-**Current behavior.** Both live attested paths (client → Eidola server, Eidola server → inference upstream) accept SEV-SNP only, and refuse an Intel TDX presentation before authenticating it. Acceptance is driven by the caller's pins, never by the document: every pinned entry names its platform, evidence is checked only against entries of its own platform, and evidence from a platform with no entry is refused. Both live paths build their pins from release records, and a record pins its SEV-SNP launch digest only — the RTMR1/RTMR2 values the trust root records are guest-extendable (any firmware on a genuine TDX machine can replay published digests into them), so they are recorded and never accepted. A document author therefore cannot select the TDX branch to sidestep the SEV-SNP pin.
+**Current behavior.** The client → Eidola server path accepts SEV-SNP only, and refuses an Intel TDX presentation before authenticating it. Acceptance is driven by the caller's pins, never by the document: every pinned entry names its platform, evidence is checked only against entries of its own platform, and evidence from a platform with no entry is refused. The client builds its pins from release records, and a record pins its SEV-SNP launch digest only — the RTMR1/RTMR2 values the trust root records are guest-extendable (any firmware on a genuine TDX machine can replay published digests into them), so they are recorded and never accepted. A document author therefore cannot select the TDX branch to sidestep the SEV-SNP pin.
 
-The verifier does accept TDX for a caller that pins an explicit TDX entry. That is intended for the server's future connection to its own GPU inference enclaves, whose hosts are Intel TDX; no caller pins one yet. Such a pin follows the platform provider's IGVM launch model, in which the guest is a single firmware-less image with no measured boot after launch:
+The verifier accepts TDX for a caller that pins an explicit TDX entry. The one such caller is the server's connection to its own engine deployments, whose hosts are Intel TDX ([engine.md](engine.md#what-pins-the-engine)), and those pins are TDX-only by the same construction. Such a pin follows the platform provider's IGVM launch model, in which the guest is a single firmware-less image with no measured boot after launch:
 
 - **Launch identity.** MRTD, which the TDX module measures over every page of the image and which is fixed per image release, and MRCONFIGID, the SHA-256 of the deployment's config followed by sixteen zero bytes, which the guest refuses to boot without. RTMR0–RTMR3 must all be zero. `measure-enclave` recomputes MRTD from the release's published image, checked against the release manifest, and MRCONFIGID from the config bytes.
 - **Machine policy**, for the report fields an image cannot fix. An allowlist of TDX modules (MR_SEAM), exact TD attributes (debug off, `SEPT_VE_DISABLE` on — a debug relaunch of the pinned image has the same MRTD) and XFAM, a TEE TCB SVN floor, the QE vendor, a floor on the Intel collateral's evaluation-data number, and an optional platform (FMSPC) allowlist. Intel's platform, QE and TDX-module TCB statuses must all be `UpToDate`.
@@ -96,13 +96,13 @@ The verifier does accept TDX for a caller that pins an explicit TDX entry. That 
 
 `REPORT_DATA` binding and the envelope checks are the same as on the SEV-SNP path. An entry may also declare how many GPUs its enclave runs with. The document must then carry exactly that many NVIDIA GPU evidence items, each produced for this handshake's nonce.
 
-**What constrains it today.** Only a caller that pins a TDX entry can accept TDX, and none does. Recording RTMR1/RTMR2 in the trust root remains an honest statement of what a release would measure, not acceptance. For a future TDX pin:
+**What constrains it today.** Only a caller that pins a TDX entry can accept TDX: the server's engine connections, and no engine deployment is pinned yet. Recording RTMR1/RTMR2 in the trust root remains an honest statement of what a release would measure, not acceptance. For an engine pin:
 
 - **GPU evidence is counted, not appraised.** The CPU measurement vouches for boot code that refuses to start unless the GPUs attest in confidential-computing mode. The per-handshake items are bound to the nonce and to the quote's `REPORT_DATA`. NVIDIA's certificate chain, the SPDM report signature and the reference measurements are not verified.
 - **Machine policy is hand-supplied.** The policy values come from whoever writes the pin. Nothing yet sources them from the provider's signed platform endorsements, and no individual machine (PPID) is pinned — the FMSPC allowlist pins a platform family. That includes the PCK certificate's platform flags — dynamic platform, cached keys and SMT enabled. Each must be stated in the pin, and a host whose flag differs is refused. The right values for the provider's hosts must come from its platform endorsements or a real attestation document from those hosts. A sample multi-package TDX host asserts all three, and accepting SMT in particular admits cross-thread side channels ([threat-model.md](threat-model.md)).
 - **Collateral can be replayed within its window.** As with the AMD CRL, a relay can serve older Intel-signed collateral (CRLs, TCB Info, QE Identity) until its signed validity ends. That delays recognition of a newer revocation or TCB recovery; the evaluation-data floor bounds how old it may be.
 
-**Future.** Wire a TDX pin into the server's connection to its inference enclaves. Source the machine policy from the provider's published endorsements, with review. Appraise GPU evidence against NVIDIA's roots and reference values. Adopt the SEV-SNP half of the same launch model (`HOST_DATA` and the ID block) when the server's own enclave moves to it.
+**Future.** Measure and pin the first engine deployment. Source the machine policy from the provider's published endorsements, with review. Appraise GPU evidence against NVIDIA's roots and reference values. Adopt the SEV-SNP half of the same launch model (`HOST_DATA` and the ID block) when the server's own enclave moves to it.
 
 ## Network / metadata
 
@@ -124,35 +124,6 @@ Eidola does not defend against an adversary observing network metadata (connecti
 
 **Future.** Same direction as above (oHTTP, MASQUE, partner relays). The Eidola-side mitigation here is partnering with an independent organization whose role is to terminate the network connection so that no single party — Eidola included — sees both the network identity and the account it corresponds to.
 
-## Inference upstream
-
-Inference does not run in the Eidola server enclave. `inference.tinfoil.sh` is a *router* enclave operated by the upstream provider (currently Tinfoil) that reverse-proxies each request to a **separate per-model GPU enclave**. That structure shapes the two gaps below.
-
-### The inference code is trusted at the provider's bar, not reviewed or pinned by Eidola
-
-**Current behavior.** The Eidola server attests the *router* enclave on every handshake — genuine confidential-compute hardware, running a measurement that corresponds to a Sigstore-signed release of the expected repository at the expected tag. But two things sit outside Eidola's own review:
-
-- **The downstream fan-out is not chained.** The router's attestation covers only the router; it does not fold in the attestations of the per-model enclaves it forwards to. The router trusts each model enclave via "the latest Sigstore-signed release of that model's repo" (the same trust model as `tinfoilsh/tinfoil-go` / `tinfoil-rs`), and Eidola does not independently attest those enclaves. So the code *actually running inference* — which necessarily sees cleartext prompts and completions — is trusted at the provider's release-signing bar, not re-derived by Eidola.
-- **Eidola tracks the latest signed release rather than a reviewed pin.** The server resolves the router measurement at runtime and adopts any new release whose Sigstore provenance verifies (see [upstream.md](upstream.md#what-pins-the-upstream-measurement)) — there is no human-review gate the way there is for Eidola's *own* releases. This is deliberate, not an oversight: pinning-and-reviewing the router measurement bought little rigor while the downstream model enclaves (which also see cleartext) remain trust-latest regardless, so Eidola matches the provider's actual model here instead of performing review theater. Eidola previously carried a pinned-and-PR-reviewed router measurement; that path was removed for this reason.
-
-**What constrains it today.** The model enclaves are themselves confidential-compute enclaves, so a genuine one seals cleartext against its own operator exactly as Eidola's does; every measurement the router or Eidola trusts must still correspond to a Sigstore-signed release of the expected repository; and Eidola's per-handshake, nonce-fresh verifier still runs on the connection it opens. The residual gap is specifically that Eidola does not itself review or pin the inference code — it trusts the provider's release-signing not to ship a malicious model build — and that while retroactive transparency and auditability are preserved, the system does not "fail closed" and a malicious version could be published, deployed, and exploited without an opportunity for the end user to prevent it.
-
-### Upstream-provider trust-discipline mismatch
-
-**Current behavior.** Even for the code Eidola *does* verify (the router) and the model code the provider signs, the upstream release pipeline does not match the discipline applied to Eidola's own releases:
-
-- Tinfoil's builds are **not source-bootstrapped reproducible** in the StageX sense. They are hermetic and provenance-attested through GitHub's CI attestation, which is rigorous, but shaped differently than Eidola's.
-- Tinfoil does **not yet ship per-release human attestations under named legal identities** the way Eidola releases do.
-
-A user's chain of trust at the inference layer therefore ends at Tinfoil's release discipline, which is non-trivially different from Eidola's.
-
-**Future.** The intent is to close both gaps by ending the inference-layer trust chain where the rest of Eidola's does. There are two paths, and either one suffices:
-
-- **Primary — self-host inference.** Run the models on hardware Eidola controls, such as GPU-enabled Tinfoil containers, built and released through Eidola's own source-bootstrapped, human-attested flow, so Eidola owns the inference measurement, can *statically pin* it, and reviews the downstream code directly. This is the long-term goal regardless, since it also brings reproducibility and human attestation to the inference layer. Its cost is high fixed GPU spend that is hard to justify before there is meaningful demand — so it is not the immediate move.
-- **Alternative — the provider adopts static-pinned upstreams.** If Tinfoil itself moves its router from "trust the latest signed release" to *statically pinning* the specific model-enclave measurements it will forward to, then the downstream-review gap closes without Eidola self-hosting: Eidola would simply keep using Tinfoil's inference and pin the reviewed set. This is the cheaper outcome, and if it materializes it is the preferred long-term solution.
-
-In the meantime, the runtime-resolution scheme above is the honest interim: it claims exactly the assurance the provider's own model provides, and no more.
-
 ## Build chain opacity
 
 ### Non-source-bootstrapped components in the trust chain
@@ -163,7 +134,7 @@ In the meantime, the runtime-resolution scheme above is the honest interim: it c
 
 - **macOS Nix builds.** Hermetic and reproducible (`narHash` / `archiveSha256` pinning of the unsigned payload), but rely on the Apple SDK / Xcode toolchain as opaque inputs. Cross-compiling macOS binaries from Linux is not viable today, so macOS releases must be built on macOS. The Apple envelope (Developer ID, notarization) is non-reproducible by construction and is bound only in the human attestation; see [verification.md](verification.md) and [apple-distribution.md](apple-distribution.md).
 - **Linux GUI Nix build.** Hermetic and reproducible (`narHash` / `archiveSha256`) from the open nixpkgs toolchain, but not source-bootstrapped in the StageX sense. The Nix installable is a glibc dynamic binary with nixpkgs Mesa referenced via `VK_ADD_DRIVER_FILES` (those driver bytes are not in the archive). A desktop GUI that talks to host Vulkan must be glibc; the musl-by-design StageX pipeline cannot produce it. Separately, that artifact is **Nix-shaped**: its archive is a store-path serialization whose binary resolves its libraries out of `/nix/store`, so it is not a download a non-Nix user can extract and run — the Debian package is the installable for everyone else, and it carries no GPU bytes at all ([verification.md](verification.md#the-two-linux-installables)).
-- **`cvmimage` and OVMF firmware.** Pinned by hash, but their build chains do not match Eidola's source-bootstrapping discipline. Their contents are bound into the server's enclave measurement, so they cannot be changed silently — but the original build chain is more trusted than we ideally want.
+- **`cvmimage` and OVMF firmware.** Pinned by hash, but their build chains do not match Eidola's source-bootstrapping discipline. Their contents are bound into the server's enclave measurement, and the TDX image an engine deployment boots is bound into its pin (MRTD), so they cannot be changed silently — but the original build chain is more trusted than we ideally want.
 
 **What constrains it today.** Each of these has digest pinning and provenance verification at the import boundary (committed sha256 pins for OVMF and the `cvmimage` release manifest — with Sigstore provenance verified on top — and `narHash` / `archiveSha256` for Nix outputs), so silent substitution is detectable. The gap is that the upstream *builders* of those artifacts are trusted to a degree we don't fully audit.
 

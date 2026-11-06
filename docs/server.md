@@ -1,6 +1,6 @@
 # The server
 
-The Eidola server is an OpenAI-compatible proxy that sits between the client and an upstream inference provider. It also runs the account and billing surface. Its design is dominated by one structural decision: the **linked** account surface and the **unlinked** inference surface are kept disjoint, in code and at runtime.
+The Eidola server is an OpenAI-compatible proxy that sits between the client and Eidola's inference engines. It also runs the account and billing surface. Its design is dominated by one structural decision: the **linked** account surface and the **unlinked** inference surface are kept disjoint, in code and at runtime.
 
 ## Linked vs. unlinked
 
@@ -62,7 +62,7 @@ The server is `FROM scratch`, statically linked musl, runs as non-root, and ship
 
 Several things that a typical AI proxy might do are deliberately absent:
 
-- **No session caching, no request memory, no learned state per account.** The server is request-based. Two inference requests with the same content produce two independent upstream calls. Caching across requests would create a correlation surface; it is not implemented.
+- **No session caching, no request memory, no learned state per account.** The server is request-based. Two inference requests with the same content produce two independent engine calls. Caching across requests would create a correlation surface; it is not implemented.
 - **No content-based logging.** Inference request bodies and response bodies are not logged, persisted, or tee'd into observability systems. Telemetry is limited to generic, unidentifiable fields and emits no per-request records at all — spans are aggregated into metrics in process and never exported.
 - **No "ask the operator to approve this request" path.** There is no human-review queue, no flagging system, no operator interface for inspecting inference traffic. The server's job on the inference path is to route and account for usage; no operator-visible branches exist.
 
@@ -95,24 +95,24 @@ The trace id comes from the client rather than the server. The client knows it b
 
 A consequence to keep in view is that the id is caller-supplied: a caller reusing one across requests asserts that those requests are related, which on the anonymous surface is a self-linking primitive.
 
-`traceparent` is parsed directly by Eidola code rather than by installing a `TextMapPropagator`. A global propagator would also inject context into the server's *outbound* calls, putting the trace id on requests to the inference upstream, Stripe, and GitHub. As written, no outbound request carries trace context, and a traced request's spans go only to the OTLP endpoint.
+`traceparent` is parsed directly by Eidola code rather than by installing a `TextMapPropagator`. A global propagator would also inject context into the server's *outbound* calls, putting the trace id on requests to the inference engines, Stripe, and the website the terms feed is read from. As written, no outbound request carries trace context, and a traced request's spans go only to the OTLP endpoint.
 
 Inbound headers are counted by outcome (`sampled`, `not_sampled`, `malformed`).
 
 ## Inference is proxied, not performed
 
-The Eidola server is **not** the inference engine. Models run in a separate confidential-compute deployment operated by the upstream inference provider (Tinfoil), with its own attestation. The Eidola server's role on the inference path is:
+The Eidola server is **not** the inference engine. Models run on Eidola's engine in separate confidential-compute deployments, with their own attestation, pinned in the server's own build. The Eidola server's role on the inference path is:
 
 1. Verify the anonymous credential.
-2. Open an attested HTTPS connection to the inference upstream.
+2. Open an attested HTTPS connection to an engine deployment pinned for the requested model.
 3. Stream the request through, stream the response back — re-framed, so that what a network observer sees of it does not follow the tokens (see [Response shape](#response-shape)).
 4. Record the per-request token counts for accounting.
 
-This means **two layers of confidential compute** protect the inference content: the Eidola server enclave (which sees the content only in transit, never logged) and the upstream provider's confidential-compute enclaves that perform the inference. The upstream is itself a *router* enclave that forwards to a separate per-model enclave; the Eidola server attests the router it connects to on every handshake, and how far that verification reaches (and where it stops) is detailed in [upstream.md](upstream.md) and [gaps.md § Inference upstream](gaps.md#inference-upstream). The client verifies the attestation of the Eidola server directly on every handshake.
+This means **two layers of confidential compute** protect the inference content: the Eidola server enclave (which sees the content only in transit, never logged) and the engine's confidential VM that performs the inference. The client verifies the attestation of the Eidola server on every handshake, and the Eidola server verifies the engine's on every handshake, against the deployments its own build pins. What that verification covers, and where it stops, is detailed in [engine.md](engine.md). No deployment is pinned yet, so today the server sells no models.
 
 ### Response shape
 
-Encrypted traffic still has a size and a timing, and a streamed answer relayed chunk by chunk would put one encrypted record on the wire per token: their sizes trace the tokens' lengths and their spacing traces the model's pace, which published attacks turn back into topics and text. So the server writes a streamed answer as frames of one fixed size (2 KiB) at a fixed interval (every 50 ms), from the moment the stream opens until it ends. Each frame carries whatever output is waiting and is filled out with padding that every server-sent-events reader ignores. Every other response the server sends (a blocking answer, an error, the refusal of a malformed request, a 404) is padded to the next power-of-two size, at least 4 KiB, and a refusal never quotes what the request contained. An observer on the network path learns how long a response ran (which tracks its length) and a padded response's size bucket, not the size or timing of any token. The padding stops at the Eidola server: its connection to the inference provider carries the stream as the provider sends it. The reasoning and its costs are in `crates/eidola-server-gateway/AGENTS.md`.
+Encrypted traffic still has a size and a timing, and a streamed answer relayed chunk by chunk would put one encrypted record on the wire per token: their sizes trace the tokens' lengths and their spacing traces the model's pace, which published attacks turn back into topics and text. So the server writes a streamed answer as frames of one fixed size (2 KiB) at a fixed interval (every 50 ms), from the moment the stream opens until it ends. Each frame carries whatever output is waiting and is filled out with padding that every server-sent-events reader ignores. Every other response the server sends (a blocking answer, an error, the refusal of a malformed request, a 404) is padded to the next power-of-two size, at least 4 KiB, and a refusal never quotes what the request contained. An observer on the network path learns how long a response ran (which tracks its length) and a padded response's size bucket, not the size or timing of any token. The padding stops at the Eidola server: its connection to the engine carries the stream as the engine sends it. The reasoning and its costs are in `crates/eidola-server-gateway/AGENTS.md`.
 
 ## Where to read the code
 

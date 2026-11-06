@@ -121,7 +121,7 @@ releases/
     attestation-templates.json          # pinned claim templates
   trust/
     trust-constants.json                # non-derivable trust values (input)
-    sigstore-trusted-root.json          # upstream Sigstore TrustedRoot snapshot (input — both eidola-app-core (updater) and eidola-server-gateway (runtime upstream-measurement resolver) build.rs embed it)
+    sigstore-trusted-root.json          # upstream Sigstore TrustedRoot snapshot (input — eidola-app-core's build.rs embeds it for the updater)
     server-enclave.json                 # paired-server enclave measurement (input — projection of artifact-manifest.json's enclave block, materialized as its own file so the cli build context can COPY it without dragging the manifest in)
     engine-enclaves.json                # Eidola-hosted engine deployments the gateway accepts (input — gateway build only; checked against deploy/engine/ on every build)
     attestant-provenance/               # informational hardware-attestation evidence for pinned attestant keys (NOT a build input — no build.rs or client reads it; auditor-facing only)
@@ -131,9 +131,8 @@ crates/eidola-app-core/
   src/trust_root.rs                     # exposes the generated constants
 deploy/engine/<model-id>/<variant>/     # one engine deployment: tinfoil-config.yml + deployment.json (pinned by engine-enclaves.json)
 crates/eidola-server-gateway/
-  build.rs                              # generator: sigstore-trusted-root.json → sigstore_root.gen.rs; engine-enclaves.json (checked against deploy/engine/) → engine_enclaves.gen.rs
+  build.rs                              # generator: engine-enclaves.json (checked against deploy/engine/) → engine_enclaves.gen.rs
   src/engine_trust/                     # the engine pins, the compile-time catalog binding, and the gateway→node wire contract
-  src/upstream_trust/                   # runtime upstream-measurement resolver (embeds SIGSTORE_TRUSTED_ROOT_JSON; resolves + Sigstore-verifies Tinfoil's latest release at runtime — no static measurement pin)
 ```
 
 The generator (`build.rs`) reads `releases/trust/server-enclave.json` — never the per-artifact digests. The chain that invalidates the pin: server source changes → server image digest changes → `tinfoil-config.yml` changes → kernel cmdline changes → enclave measurement changes → `server-enclave.json` changes → client rebuilds with the new pin. Because the client build context never reads `artifact-manifest.json`, regenerating the manifest after a client build doesn't trigger another client rebuild, so `just update-manifest` reaches a fixed point in a single run.

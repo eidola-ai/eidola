@@ -18,7 +18,7 @@ The list is short because the architecture makes it short: inference content nev
 
 | Vendor | Role | What it sees |
 | --- | --- | --- |
-| **Tinfoil** | Confidential-compute hosting and inference upstream | Ciphertext, attested enclaves, and network metadata (connection IPs, timing, volume). Inference content is decrypted only inside enclaves whose measurements the client verifies on every connection — see [inference upstream](upstream.md) and the [threat model](threat-model.md). We treat Tinfoil's network layer as potentially logging transport metadata, like any network operator. |
+| **Tinfoil** | Confidential-compute hosting, for the Eidola server and the inference engines | Ciphertext, attested enclaves, and network metadata (connection IPs, timing, volume). Inference content is decrypted only inside enclaves whose measurements are verified on every connection: the client verifies the Eidola server's, and the server verifies each engine's against the deployments its own build pins — see [inference engine](engine.md) and the [threat model](threat-model.md). We treat Tinfoil's network layer as potentially logging transport metadata, like any network operator. |
 
 ## Independent platforms we participate in
 

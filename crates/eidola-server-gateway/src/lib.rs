@@ -25,7 +25,6 @@ pub mod stripe;
 pub mod telemetry;
 pub mod terms_feed;
 pub mod types;
-pub mod upstream_trust;
 pub mod webhook;
 
 /// Build a `rustls::ClientConfig` with Mozilla root CA certificates.
@@ -47,7 +46,7 @@ pub struct AppState {
 }
 
 pub struct AppStateInner {
-    pub backend: backend::TinfoilBackend,
+    pub catalog: backend::Catalog,
     /// The router to Eidola-hosted engines; `None` when this build pins none.
     pub engines: Option<engine_router::EngineRouter>,
     pub db_pool: deadpool_postgres::Pool,
@@ -61,7 +60,7 @@ pub struct AppStateInner {
 impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        backend: backend::TinfoilBackend,
+        catalog: backend::Catalog,
         engines: Option<engine_router::EngineRouter>,
         db_pool: deadpool_postgres::Pool,
         stripe: Option<stripe::StripeClient>,
@@ -72,7 +71,7 @@ impl AppState {
     ) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
-                backend,
+                catalog,
                 engines,
                 db_pool,
                 stripe,

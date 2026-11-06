@@ -10,9 +10,8 @@
 //! - [`PINNED_MODELS`] — each pinned model's weights (the engine's weights
 //!   hash and their `repo@revision` provenance) and prompt-cache retention, as
 //!   the deployments' measured configs set them. The catalog
-//!   (`backend::MODEL_CATALOG`) is bound to this list at compile time: an
-//!   Eidola-hosted row without a pin, or a pin without such a row, does not
-//!   build.
+//!   (`backend::MODEL_CATALOG`) is bound to this list at compile time: a row
+//!   without a pin, or a pin without a row, does not build.
 //! - [`allowed_measurements`] / [`accepted_deployments`] — the attestation
 //!   pins for one model's deployments, in `tinfoil-verifier`'s shape, and the
 //!   config hash each deployment is named by.

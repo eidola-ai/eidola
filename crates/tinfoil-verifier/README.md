@@ -13,7 +13,7 @@ let client = tinfoil_verifier::attesting_client(
     tinfoil_verifier::AttestingClientConfig {
         // e.g. vec![AllowedMeasurement::from(&release_record)]
         allowed_measurements: &allowed_measurements,
-        inference_base_url: "https://inference.tinfoil.sh/v1",
+        inference_base_url: "https://enclave.example/v1",
         tls_roots,
         trusted_ark_der: None,
         trusted_ask_der: None,
@@ -25,4 +25,4 @@ let client = tinfoil_verifier::attesting_client(
 .await?;
 ```
 
-Run unit and offline contract tests with `cargo test -p tinfoil-verifier`. Ignored tests exercise the production endpoint; `mock_attesting_client_e2e` runs the full connector against `tinfoil-shim-mock` when `MOCK_URL` and `MOCK_CERT_DIR` are set.
+Run unit and offline contract tests with `cargo test -p tinfoil-verifier`. Ignored tests exercise a live production Tinfoil enclave (`inference.tinfoil.sh`, which serves real SEV-SNP evidence); `mock_attesting_client_e2e` runs the full connector against `tinfoil-shim-mock` when `MOCK_URL` and `MOCK_CERT_DIR` are set.

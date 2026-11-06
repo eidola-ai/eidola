@@ -57,7 +57,7 @@ Some operations stay local even when they could be moved to the server, because 
 
 ## Prefix-cache keys
 
-An Eidola-hosted inference engine can reuse the computation behind a prompt prefix it has already processed, which makes each turn of a long conversation cheaper and faster. Reuse is scoped by a `cache_key` the client sends: requests carrying the same key may share cached computation, and no other requests do. Because a key links the requests it rides on, the client treats it as the thing to minimize ([Privacy guarantees §2.7](privacy-guarantees.md#2-unlinkability)):
+The inference engine can reuse the computation behind a prompt prefix it has already processed, which makes each turn of a long conversation cheaper and faster. Reuse is scoped by a `cache_key` the client sends: requests carrying the same key may share cached computation, and no other requests do. Because a key links the requests it rides on, the client treats it as the thing to minimize ([Privacy guarantees §2.7](privacy-guarantees.md#2-unlinkability)):
 
 - **When one is sent.** Only for a model whose catalog entry declares an engine prefix cache (`prompt_cache` with `supported: true` and both retention bounds). Any other model gets a request byte-for-byte the one it would get if keys did not exist. Requests made through the client's local inference proxy never carry one.
 - **What it is.** 32 bytes from the operating system's random number generator, scoped to one *lineage* — one participant answering in one space, that conversation's branches and regenerations included — and to the server endpoint and trust configuration it was created under. It is never sent for another space, another participant, or to another endpoint or trust configuration.
