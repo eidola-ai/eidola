@@ -108,7 +108,7 @@ The Eidola server is **not** the inference engine. Models run on Eidola's engine
 3. Stream the request through, stream the response back — re-framed, so that what a network observer sees of it does not follow the tokens (see [Response shape](#response-shape)).
 4. Record the per-request token counts for accounting.
 
-This means **two layers of confidential compute** protect the inference content: the Eidola server enclave (which sees the content only in transit, never logged) and the engine's confidential VM that performs the inference. The client verifies the attestation of the Eidola server on every handshake, and the Eidola server verifies the engine's on every handshake, against the deployments its own build pins. What that verification covers, and where it stops, is detailed in [upstream.md](upstream.md). No deployment is pinned yet, so today the server sells no models.
+This means **two layers of confidential compute** protect the inference content: the Eidola server enclave (which sees the content only in transit, never logged) and the engine's confidential VM that performs the inference. The client verifies the attestation of the Eidola server on every handshake, and the Eidola server verifies the engine's on every handshake, against the deployments its own build pins. What that verification covers, and where it stops, is detailed in [engine.md](engine.md). No deployment is pinned yet, so today the server sells no models.
 
 ### Response shape
 

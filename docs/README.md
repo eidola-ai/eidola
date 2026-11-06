@@ -12,7 +12,7 @@ These docs describe how Eidola works, what it commits to, and what it doesn't ye
 
 4. **[The client](client.md)** — Fail-safe by design, embedded trust root, per-handshake attestation.
 5. **[The server](server.md)** — Linked vs. unlinked surfaces, anonymous credentials, what runs in confidential compute.
-6. **[Inference engine](upstream.md)** — Where models actually run, and how that layer is verified.
+6. **[Inference engine](engine.md)** — Where models actually run, and how that layer is verified.
 
 ## Release flow
 

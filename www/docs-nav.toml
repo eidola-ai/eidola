@@ -22,7 +22,7 @@ title = "Design pieces"
 pages = [
     ["client.md", "The client"],
     ["server.md", "The server"],
-    ["upstream.md", "Inference engine"],
+    ["engine.md", "Inference engine"],
 ]
 
 [[sections]]
