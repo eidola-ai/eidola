@@ -1,0 +1,50 @@
+[package]
+name = "eidola-notepad"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+# Links `eidola-gui` (GPL-3.0-only) for its theme, prose typography and window
+# chrome, so it shares that license bucket.
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "eidola-notepad"
+path = "src/main.rs"
+
+[dependencies]
+# The same exact pins as eidola-gui, so the workspace resolves one gpui (see
+# eidola-gui's AGENTS.md → gpui / gpui-component pinning). `runtime_shaders`
+# for the same reason eidola-gui carries it: no Metal toolchain at build time.
+gpui = { package = "gpui-pre", version = "=0.3.7" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["font-kit", "runtime_shaders", "wayland"] }
+gpui-component = "=0.7.0"
+gpui-kit-assets = "=0.7.0"
+
+# The visuals are Eidola's by construction rather than by copy: the Circadian
+# theme, the Newsreader prose style, the title band and scroll indicator all
+# come from the app itself.
+eidola-gui = { path = "../eidola-gui" }
+# Read-only: the user's appearance settings (`config.toml`), so the notepad
+# wears whatever palette Eidola does. Nothing is ever written back.
+eidola-app-core = { path = "../eidola-app-core" }
+gpui-markdown-editor = { path = "../gpui-markdown-editor" }
+
+# The recent-documents list lives in the platform config directory.
+dirs = "6"
+# The open-URL channel: AppKit hands over files dropped on the Dock icon
+# before (and after) the app's run callback, outside any `App`.
+futures = "0.3"
+
+[dev-dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.7", features = ["test-support"] }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["test-support", "font-kit", "wayland"] }
+tempfile = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[[test]]
+name = "visual"
+path = "tests/visual.rs"
+# `VisualTestAppContext` talks to AppKit and must run on the main thread.
+harness = false

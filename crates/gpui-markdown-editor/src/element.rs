@@ -2122,6 +2122,7 @@ impl Element for BlockElement {
         let container_indent = containers_left_indent(&self.block.containers, &self.style, window);
 
         let source = self.editor.read(cx).state.markdown.clone();
+        let image_base = self.editor.read(cx).image_base_dir.clone();
         style.size.width = relative(1.0).into();
 
         // Pre-resolve every image referenced by this block *before*
@@ -2140,7 +2141,7 @@ impl Element for BlockElement {
             .block
             .image_overlays
             .iter()
-            .map(|o| crate::image::load(&o.dest_url, window, cx))
+            .map(|o| crate::image::load(&o.dest_url, image_base.as_deref(), window, cx))
             .collect();
         // Pre-load the block image in *both* display and edit mode.
         // Edit mode also needs the image's natural size to honor the
@@ -2149,7 +2150,12 @@ impl Element for BlockElement {
         // toggling edit mode doesn't shift surrounding content.
         let block_image_loaded: Option<crate::image::LoadedImage> =
             if let BlockKind::Image { dest_url, .. } = &self.block.kind {
-                Some(crate::image::load(dest_url, window, cx))
+                Some(crate::image::load(
+                    dest_url,
+                    image_base.as_deref(),
+                    window,
+                    cx,
+                ))
             } else {
                 None
             };
@@ -2425,6 +2431,7 @@ impl Element for BlockElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let image_base = self.editor.read(cx).image_base_dir.clone();
         let (selection, source, scroll_offset, caret_downstream, highlight_layers) = {
             let editor = self.editor.read(cx);
             let scroll = editor.code_block_scroll(self.block_index);
@@ -2493,7 +2500,7 @@ impl Element for BlockElement {
             .block
             .image_overlays
             .iter()
-            .map(|o| crate::image::load(&o.dest_url, window, cx))
+            .map(|o| crate::image::load(&o.dest_url, image_base.as_deref(), window, cx))
             .collect();
         let (augmented_block, inline_image_specs) = augment_block_with_images(
             &augmented_block,
@@ -2519,6 +2526,7 @@ impl Element for BlockElement {
                     BlockKind::Image { dest_url, .. } => dest_url,
                     _ => unreachable!(),
                 },
+                image_base.as_deref(),
                 window,
                 cx,
             );
@@ -2994,7 +3002,7 @@ impl Element for BlockElement {
             ..
         } = &self.block.kind
         {
-            match crate::image::load(dest_url, window, cx) {
+            match crate::image::load(dest_url, image_base.as_deref(), window, cx) {
                 crate::image::LoadedImage::Loaded(img) => {
                     let inner_w = (block_width - inner_pad * 2.).max(px(1.0));
                     let size = crate::image::block_size(img.as_ref(), inner_w);
