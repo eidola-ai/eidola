@@ -73,7 +73,17 @@ enum Command {
     /// Send a chat message
     Chat {
         /// The prompt to send
-        prompt: String,
+        #[arg(required_unless_present = "continue_post")]
+        prompt: Option<String>,
+        /// Continue an answer that stopped at its length limit, by its post id
+        /// (the one the length-limit warning names), from where it stopped —
+        /// by the model that wrote it, as a new version of that answer
+        #[arg(
+            long = "continue",
+            value_name = "POST",
+            conflicts_with_all = ["prompt", "model", "space"]
+        )]
+        continue_post: Option<String>,
         /// Model to use (defaults to the default template's agent model —
         /// transitional until wave 2 makes turns participant-aware)
         #[arg(long, short)]
@@ -980,6 +990,7 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
             prompt,
             model,
             space,
+            continue_post,
         }) => {
             // No --model flag → the default template's agent model, resolved
             // by **whichever process takes the turn**, at the moment it takes
@@ -991,9 +1002,12 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
             // the wire from a model the reader named, so sending one would
             // leave the app unable to apply its own current answer. It
             // therefore travels unnamed.
+            //
+            // A continuation names no model: the answer it continues names its
+            // own participant and model, and is continued by exactly those.
             let model = match model {
                 Some(m) => Some(m),
-                None if session.is_client() => None,
+                None if session.is_client() || continue_post.is_some() => None,
                 None => Some(session.default_model().await?),
             };
 
@@ -1019,7 +1033,17 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
             // (dim, prefixed with "thinking: ") so a piped stdout still
             // captures only the final answer text.
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
-            let chat_fut = session.chat_stream(prompt, model, space, tx);
+            let chat_fut = async {
+                match continue_post {
+                    // The stream opens with the text being continued, so
+                    // stdout ends holding the whole answer, as for any turn.
+                    Some(post) => session.continue_stream(post, tx).await,
+                    None => {
+                        let prompt = prompt.expect("clap requires a prompt without --continue");
+                        session.chat_stream(prompt, model, space, tx).await
+                    }
+                }
+            };
 
             // Pump events while chat_fut runs. We `tokio::join!` the two
             // halves so events drain in real time rather than only after
@@ -2008,11 +2032,24 @@ fn chat_summary(result: &eidola_app_core::ChatResult) -> String {
         }
     }
     if result.truncated {
-        out.push_str(
-            "warning: this answer stopped at the model's length limit, not because the model \
-             was done — ask for a shorter answer, or ask it to carry on from where this one \
-             stops\n",
-        );
+        // Where the answer can be continued the warning names the command that
+        // does it, with the post it acts on — the one id this run has that the
+        // reader could not otherwise find.
+        match result
+            .response_action_id
+            .as_deref()
+            .filter(|_| eidola_app_core::can_continue(Some(&result.model)))
+        {
+            Some(post) => out.push_str(&format!(
+                "warning: this answer stopped at the model's length limit, not because the \
+                 model was done — continue it from where it stopped with `eidola chat \
+                 --continue {post}`\n"
+            )),
+            None => out.push_str(
+                "warning: this answer stopped at the model's length limit, not because the \
+                 model was done — ask for a shorter answer\n",
+            ),
+        }
     }
     out.push_str(&format!(
         "---\nspace: {}  model: {}  tokens: {}/{}  credits: {}",
@@ -2134,6 +2171,53 @@ mod tests {
             cut_off.contains("---\nspace: s1  model: kimi-k2  tokens: 11/4096  credits: 320"),
             "and the footer is unchanged beneath it: {cut_off:?}"
         );
+    }
+
+    #[test]
+    fn a_cut_off_answer_names_the_command_that_continues_it() {
+        // The warning is not a dead end where the answer can be continued: it
+        // names the command and the post it acts on, which this run is the
+        // only place to learn.
+        let cut_off = chat_summary(&finished_turn(true));
+        assert!(
+            cut_off.contains("`eidola chat --continue a2`"),
+            "{cut_off:?}"
+        );
+        // A local model's answer cannot be continued, so the warning offers
+        // no command that would be refused.
+        let local = chat_summary(&eidola_app_core::ChatResult {
+            model: "gemma@local".into(),
+            ..finished_turn(true)
+        });
+        assert!(
+            local.starts_with("warning: this answer stopped at the model's length limit"),
+            "{local:?}"
+        );
+        assert!(!local.contains("--continue"), "{local:?}");
+    }
+
+    #[test]
+    fn chat_takes_a_prompt_or_a_post_to_continue_but_not_both() {
+        use clap::Parser;
+        let continued = Cli::try_parse_from(["eidola", "chat", "--continue", "a2"])
+            .expect("a continuation needs no prompt");
+        assert!(matches!(
+            continued.command,
+            Some(Command::Chat {
+                prompt: None,
+                continue_post: Some(ref post),
+                ..
+            }) if post == "a2"
+        ));
+        for refused in [
+            vec!["eidola", "chat"],
+            vec!["eidola", "chat", "--continue", "a2", "more please"],
+            vec!["eidola", "chat", "--continue", "a2", "--model", "m"],
+            vec!["eidola", "chat", "--continue", "a2", "--space", "s"],
+        ] {
+            assert!(Cli::try_parse_from(&refused).is_err(), "{refused:?}");
+        }
+        assert!(Cli::try_parse_from(["eidola", "chat", "hello"]).is_ok());
     }
 
     fn declined_turn(reason: &str) -> eidola_app_core::ChatResult {

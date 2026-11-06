@@ -697,6 +697,24 @@ impl Session {
             }
         }
     }
+
+    /// Continue an answer that stopped at its length limit
+    /// (`AppCore::continue_stream`), streamed like [`Self::chat_stream`] — the
+    /// text being continued first, then what the model adds. Nothing is
+    /// resolved here: the answer names its own participant and model.
+    pub async fn continue_stream(
+        &self,
+        action_id: String,
+        tx: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(core.continue_stream(action_id, tx).await?),
+            Mode::Client { client, .. } => {
+                let call = Call::ChatContinue { action_id };
+                client.lock().await.chat_stream(&call, &tx).await
+            }
+        }
+    }
 }
 
 #[cfg(test)]
