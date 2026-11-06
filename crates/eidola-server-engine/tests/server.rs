@@ -984,6 +984,7 @@ fn configuration_refuses_anything_missing_or_malformed() {
         (env::KV_DEVICE_BYTES, "1073741824"),
         (env::KERNELS_DIR, "/k"),
         (env::CUDA_GRAPHS, "on"),
+        (env::GPU_CC, "required"),
     ] {
         let mut map = full.clone();
         map.insert(key, value.to_string());

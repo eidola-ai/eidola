@@ -5,9 +5,10 @@
 //! of the executor's), the executor's own refusal of a model it does not support, the
 //! refusals before the device (a draft width past the model's MTP layers and an
 //! oversized block in the grammar, a KV budget that cannot hold one sequence in the
-//! node), drafting within the MTP layers reaching the device, and a device-less machine
-//! failing closed, in process and as the real binary, with nothing served and no CPU
-//! fallback.
+//! node), drafting within the MTP layers reaching the device, the GPU
+//! confidential-computing check refusing before the device unless the driver reports it,
+//! and a device-less machine failing closed, in process and as the real binary, with
+//! nothing served and no CPU fallback.
 //!
 //! With a device (`EIDOLA_TEST_CUDA_WEIGHTS` and `EIDOLA_ENGINE_KERNELS_DIR`): the node
 //! booted on real MiMo-V2.6-Flash weights answers a chat request end to end, and its
@@ -25,7 +26,7 @@ use std::time::Duration;
 
 use common::*;
 use eidola_engine_cuda::{CudaGraphs, Gpu};
-use eidola_server_engine::config::{ExecutorConfig, ExecutorKind, WeightsStorage, env};
+use eidola_server_engine::config::{ExecutorConfig, ExecutorKind, GpuCc, WeightsStorage, env};
 use serde_json::{Value, json};
 
 /// The message a machine without a CUDA driver or device refuses with.
@@ -46,6 +47,12 @@ fn cuda_env(dir: &Path, hash: &str) -> HashMap<&'static str, String> {
     map.insert(
         env::CUDA_GRAPHS,
         std::env::var(env::CUDA_GRAPHS).unwrap_or_else(|_| "off".into()),
+    );
+    // Likewise the GPU confidential-computing check: `required` on a CC-mode GPU, else
+    // `not-required` (a development GPU, or none).
+    map.insert(
+        env::GPU_CC,
+        std::env::var(env::GPU_CC).unwrap_or_else(|_| "not-required".into()),
     );
     map
 }
@@ -94,7 +101,12 @@ fn cuda_settings_are_required_with_it_and_the_cpus_refused() {
     let full = cuda_env(model_dir(), weights_hash());
     let config = config_from(&full).unwrap();
     assert_eq!(config.executor.kind(), ExecutorKind::Cuda);
-    for key in [env::KV_DEVICE_BYTES, env::KERNELS_DIR, env::CUDA_GRAPHS] {
+    for key in [
+        env::KV_DEVICE_BYTES,
+        env::KERNELS_DIR,
+        env::CUDA_GRAPHS,
+        env::GPU_CC,
+    ] {
         let mut map = full.clone();
         map.remove(key);
         let err = config_from(&map).unwrap_err();
@@ -127,6 +139,24 @@ fn cuda_settings_are_required_with_it_and_the_cpus_refused() {
         map.insert(env::CUDA_GRAPHS, bad.into());
         let err = config_from(&map).unwrap_err();
         assert!(err.contains(env::CUDA_GRAPHS), "{bad}: {err}");
+    }
+    // Exactly `required` or `not-required`.
+    for bad in ["Required", "yes", "off", "not_required", "required "] {
+        let mut map = full.clone();
+        map.insert(env::GPU_CC, bad.into());
+        let err = config_from(&map).unwrap_err();
+        assert!(err.contains(env::GPU_CC), "{bad}: {err}");
+    }
+    for (value, gpu_cc) in [
+        ("required", GpuCc::Required),
+        ("not-required", GpuCc::NotRequired),
+    ] {
+        let mut map = full.clone();
+        map.insert(env::GPU_CC, value.into());
+        match config_from(&map).unwrap().executor {
+            ExecutorConfig::Cuda { gpu_cc: g, .. } => assert_eq!(g, gpu_cc),
+            _ => unreachable!(),
+        }
     }
     for (value, graphs) in [("on", CudaGraphs::On), ("off", CudaGraphs::Off)] {
         let mut map = full.clone();
@@ -244,6 +274,43 @@ fn a_supported_configuration_without_a_device_fails_closed() {
     }
 }
 
+/// Whether the driver here reports the GPUs in production confidential-computing mode.
+fn driver_reports_cc() -> bool {
+    eidola_server_engine::gpu_cc::query()
+        .is_ok_and(|state| eidola_server_engine::gpu_cc::check(&state).is_ok())
+}
+
+/// With `GPU_CC=required`, a configuration the executor accepts on the host is refused
+/// before the device opens unless the driver reports confidential computing on, DevTools
+/// off, production, and the GPUs accepting work: on a machine without NVML (or without a
+/// CC-mode GPU) the refusal is the CC check's, never the device's. Where the driver does
+/// report it, the boot goes on to the device. In process and as the real binary.
+#[test]
+fn gpu_cc_required_is_checked_before_the_device() {
+    let (dir, hash) = flash_shaped_dir();
+    let mut map = cuda_env(dir, hash);
+    map.insert(env::GPU_CC, "required".into());
+    let err = boot_err(&map);
+    let refusal = "EIDOLA_ENGINE_GPU_CC is required, but the GPUs are not in production \
+                   confidential-computing mode";
+    if driver_reports_cc() {
+        assert!(!err.contains(env::GPU_CC), "{err}");
+    } else {
+        assert!(err.contains(refusal), "{err}");
+        assert!(!err.contains(NO_DEVICE), "{err}");
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_eidola-server-engine"))
+            .env_clear()
+            .envs(&map)
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&output.stdout);
+        assert!(!output.status.success(), "{log}");
+        assert!(log.contains(refusal), "{log}");
+        assert!(!log.contains("listening"), "{log}");
+    }
+}
+
 /// The real binary, over the same configuration: exits non-zero without ever listening.
 #[test]
 fn the_binary_refuses_to_serve_without_a_usable_executor() {
@@ -304,12 +371,13 @@ async fn real_flash_serves_what_the_executor_computes() {
     let config = config_from(&map).unwrap();
     let kv_host_bytes = config.kv_host_bytes;
     let (sizing, cache) = (config.sizing, config.cache);
-    let (kernels_dir, kv_device_bytes, graphs) = match &config.executor {
+    let (kernels_dir, kv_device_bytes, graphs, gpu_cc) = match &config.executor {
         ExecutorConfig::Cuda {
             kernels_dir,
             kv_device_bytes,
             graphs,
-        } => (kernels_dir.clone(), *kv_device_bytes, *graphs),
+            gpu_cc,
+        } => (kernels_dir.clone(), *kv_device_bytes, *graphs, *gpu_cc),
         _ => unreachable!(),
     };
 
@@ -463,6 +531,7 @@ async fn real_flash_serves_what_the_executor_computes() {
             kv_device_bytes,
             kv_host_bytes,
             graphs,
+            gpu_cc,
         )
         .unwrap()
         .build()

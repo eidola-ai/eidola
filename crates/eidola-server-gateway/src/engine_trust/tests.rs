@@ -341,10 +341,25 @@ fn the_release_is_the_configs_and_pinned_inline() {
     refused(&tree, "but the config selects");
 
     let mut tree = Tree::fixture();
-    let pinned = format!("0.15.0@sha256:{}", "1".repeat(64));
-    tree.edit_config(&pinned, "0.15.0");
-    tree.deployment()["cvm_version"] = "0.15.0".into();
+    let pinned = format!("0.15.3-rc.1+gpu@sha256:{}", "1".repeat(64));
+    tree.edit_config(&pinned, "0.15.3-rc.1+gpu");
+    tree.deployment()["cvm_version"] = "0.15.3-rc.1+gpu".into();
     refused(&tree, "must pin its release manifest inline");
+}
+
+/// The cuda executor runs on the release's GPU image (`X+gpu`), whose measured
+/// boot attests the GPUs before opening them; the plain CPU image, or any
+/// other build tag, is refused (`engine_deployment::check_cvm_image`).
+#[test]
+fn a_cuda_deployment_runs_on_the_gpu_image() {
+    let pinned = format!("0.15.3-rc.1+gpu@sha256:{}", "1".repeat(64));
+    for other in ["0.15.3-rc.1", "0.15.3-rc.1+GPU", "0.15.3-rc.1+gpu2"] {
+        let bad = format!("{other}@sha256:{}", "1".repeat(64));
+        let mut tree = Tree::fixture();
+        tree.edit_config(&pinned, &bad);
+        tree.deployment()["cvm_version"] = bad.clone().into();
+        refused(&tree, "is not a GPU image");
+    }
 }
 
 #[test]
@@ -364,6 +379,19 @@ fn the_config_serves_this_model_and_these_weights() {
     let mut tree = Tree::fixture();
     tree.edit_config("\"verified-readonly\"", "\"dev-writable\"");
     refused(&tree, "EIDOLA_ENGINE_WEIGHTS_STORAGE is \"dev-writable\"");
+}
+
+/// The node's own GPU confidential-computing check is on in every pinned
+/// deployment: `not-required` boots only unpinned, for development on a GPU
+/// without confidential computing.
+#[test]
+fn a_pinned_deployment_requires_gpu_confidential_computing() {
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "EIDOLA_ENGINE_GPU_CC: \"required\"",
+        "EIDOLA_ENGINE_GPU_CC: \"not-required\"",
+    );
+    refused(&tree, "EIDOLA_ENGINE_GPU_CC is \"not-required\"");
 }
 
 #[test]
@@ -473,11 +501,11 @@ fn the_prompt_cache_policy_is_one_the_node_boots_with() {
 /// bare version and exactly one inline manifest pin.
 #[test]
 fn the_release_grammar_is_the_measurers() {
-    let pinned = format!("0.15.0@sha256:{}", "1".repeat(64));
+    let pinned = format!("0.15.3-rc.1+gpu@sha256:{}", "1".repeat(64));
     for bad in [
         format!("v{pinned}"),
         format!("{pinned}@sha256:{}", "1".repeat(64)),
-        format!("0.15.0@sha256:{}", "A".repeat(64)),
+        format!("0.15.3-rc.1+gpu@sha256:{}", "A".repeat(64)),
     ] {
         let mut tree = Tree::fixture();
         tree.edit_config(&pinned, &bad);
@@ -719,6 +747,7 @@ fn every_variable_the_node_requires_is_checked() {
         env::KV_DEVICE_BYTES,
         env::KERNELS_DIR,
         env::CUDA_GRAPHS,
+        env::GPU_CC,
         env::MAX_MODEL_LEN,
         env::MAX_SEQS,
         env::MAX_BATCHED_TOKENS,
@@ -753,6 +782,7 @@ fn every_variable_the_node_requires_is_checked() {
         (env::KV_DEVICE_BYTES, "0"),
         (env::KERNELS_DIR, "kernels"),
         (env::CUDA_GRAPHS, "yes"),
+        (env::GPU_CC, "optional"),
         // Past MiMo-V2.6-Flash's three MTP layers, the cuda executor's bound.
         (env::DRAFT_TOKENS, "4"),
         (env::MAX_MODEL_LEN, "-1"),
@@ -844,9 +874,10 @@ fn set_expected_gpus(tree: &mut Tree, gpus: Option<u64>) {
     tree.set_sidecar(sidecar);
 }
 
-/// A CUDA deployment attaches an NVIDIA-CC shape of GPUs (`gpus`, 1 or 8)
-/// and its pin requires exactly that many evidence items, which is what the
-/// shim collects; a CPU deployment attaches and requires none.
+/// A CUDA deployment attaches one to eight GPUs (`gpus`; Tinfoil's validator
+/// range, less zero) and its pin requires exactly that many evidence items,
+/// which is what the shim collects; a CPU deployment attaches and requires
+/// none.
 #[test]
 fn a_cuda_deployment_attests_its_gpus() {
     for gpus in [None, Some(0), Some(4)] {
@@ -860,16 +891,19 @@ fn a_cuda_deployment_attests_its_gpus() {
     tree.edit_config("gpus: 8\n", "");
     refused(&tree, "the cuda executor needs the config to attach GPUs");
 
-    // A GPU count outside the NVIDIA-CC shapes.
+    // More GPUs than Tinfoil's validator allows.
     let mut tree = Tree::fixture();
-    tree.edit_config("gpus: 8\n", "gpus: 2\n");
-    set_expected_gpus(&mut tree, Some(2));
-    refused(&tree, "`gpus: 2` is not an NVIDIA-CC shape");
+    tree.edit_config("gpus: 8\n", "gpus: 9\n");
+    set_expected_gpus(&mut tree, Some(9));
+    refused(&tree, "gpus must be between 0 and 8");
 
-    let mut tree = Tree::fixture();
-    tree.edit_config("gpus: 8\n", "gpus: 1\n");
-    set_expected_gpus(&mut tree, Some(1));
-    tree.check().expect("a single-GPU CUDA deployment");
+    for n in [1, 4] {
+        let mut tree = Tree::fixture();
+        tree.edit_config("gpus: 8\n", &format!("gpus: {n}\n"));
+        set_expected_gpus(&mut tree, Some(n));
+        tree.check()
+            .expect("a CUDA deployment of any count it attests");
+    }
 
     // A pinned deployment runs the CUDA executor: a CPU deployment is refused
     // even when it is consistent in every other way (no GPUs, no evidence).
@@ -887,6 +921,7 @@ fn a_cuda_deployment_attests_its_gpus() {
         "",
     );
     tree.edit_config("      - EIDOLA_ENGINE_CUDA_GRAPHS: \"on\"\n", "");
+    tree.edit_config("      - EIDOLA_ENGINE_GPU_CC: \"required\"\n", "");
     set_expected_gpus(&mut tree, None);
     refused(&tree, "a pinned deployment runs the cuda executor");
 }

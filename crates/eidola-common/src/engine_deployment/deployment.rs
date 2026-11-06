@@ -5,7 +5,8 @@
 //! the gateway's build, before it accepts a pin for the deployment, and
 //! `measure-enclave`, before it emits one. Every rule this module states
 //! (the key allow-list, the one digest-pinned container, the measured env,
-//! the shim, the weights pack, the VM shape, GPU attestation) is applied here
+//! the shim, the weights pack, the VM shape, the platform image, GPU
+//! attestation and the node's own GPU confidential-computing check) is applied here
 //! and nowhere else, so the two cannot drift. What is left to each caller is
 //! what only it has: the gateway compares the pin it is given with the
 //! returned [`Deployment`], and the measurer computes the launch identity
@@ -19,10 +20,11 @@ use std::collections::BTreeMap;
 use serde_json::Value as Json;
 
 use super::{
-    CacheConfig, ExecutorSettings, MeasuredConfig, ModelPack, WeightsStorage, artifact_data_bytes,
-    check_container_gpu_access, check_env_names, check_gpu_attestation, check_kernels_dir,
-    check_resources, check_secrets, check_shim_paths, check_vm_resources, check_weights_pack, env,
-    is_safe_component, parse_cvm_version, parse_measured,
+    CacheConfig, ExecutorSettings, GpuCc, MeasuredConfig, ModelPack, WeightsStorage,
+    artifact_data_bytes, check_container_gpu_access, check_cvm_image, check_env_names,
+    check_gpu_attestation, check_kernels_dir, check_resources, check_secrets, check_shim_paths,
+    check_vm_resources, check_weights_pack, env, is_safe_component, parse_cvm_version,
+    parse_measured,
 };
 
 /// The image every engine deployment runs, pinned by digest.
@@ -75,13 +77,30 @@ pub fn check_deployment(
     // A pinned deployment runs the CUDA executor: the CPU executor is the
     // numerics reference and the development path, and nothing confidential
     // ships on it.
-    let ExecutorSettings::Cuda { kernels_dir, .. } = &measured.executor else {
+    let ExecutorSettings::Cuda {
+        kernels_dir,
+        gpu_cc,
+        ..
+    } = &measured.executor
+    else {
         return Err(format!(
             "{at}: a pinned deployment runs the cuda executor; cpu is the reference and \
              development path"
         ));
     };
     check_kernels_dir(kernels_dir).map_err(|e| format!("{at}: {e}"))?;
+    // The node's own check of its GPUs' confidential-computing mode is on in
+    // every pinned deployment; skipping it is for development boots only.
+    if *gpu_cc != GpuCc::Required {
+        return Err(format!(
+            "{at}: {} is {:?}, but a pinned deployment must be \"required\"",
+            env::GPU_CC,
+            gpu_cc.as_str()
+        ));
+    }
+    // The platform image the executor needs: the release's GPU image.
+    let release = parse_cvm_version(&c.cvm_version).map_err(|e| format!("{at}: {e}"))?;
+    check_cvm_image(measured.executor.kind(), &release).map_err(|e| format!("{at}: {e}"))?;
     if measured.model_id != model_id {
         return Err(format!(
             "{at}: EIDOLA_ENGINE_MODEL_ID is {:?}, but the deployment is for {model_id:?}",

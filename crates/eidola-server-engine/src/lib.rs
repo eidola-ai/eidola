@@ -22,6 +22,7 @@ pub mod config;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod error;
+pub mod gpu_cc;
 pub mod http;
 pub mod model;
 pub mod pipeline;
@@ -282,6 +283,7 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
             kernels_dir,
             kv_device_bytes,
             graphs,
+            gpu_cc,
         } => {
             let prepared = cuda::prepare(
                 &model,
@@ -291,6 +293,7 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
                 *kv_device_bytes,
                 config.kv_host_bytes,
                 *graphs,
+                *gpu_cc,
             )?;
             let report = prepared.report();
             let blocks = prepared.config().num_blocks;

@@ -59,6 +59,10 @@ pub mod env {
     /// disables the tier; a non-zero value needs the prefix cache. The node
     /// derives the per-group host block counts from it.
     pub const KV_HOST_BYTES: &str = "EIDOLA_ENGINE_KV_HOST_BYTES";
+    /// Whether the node requires its GPUs in confidential-computing mode
+    /// before it opens one: `required` (production; checked through NVML) or
+    /// `not-required` (development on a GPU without it) (`cuda` only).
+    pub const GPU_CC: &str = "EIDOLA_ENGINE_GPU_CC";
     /// Longest sequence (prompt plus completion), in tokens.
     pub const MAX_MODEL_LEN: &str = "EIDOLA_ENGINE_MAX_MODEL_LEN";
     /// Sequences per step (and per-sequence state slots).
@@ -97,6 +101,7 @@ pub mod env {
         KERNELS_DIR,
         CUDA_GRAPHS,
         KV_HOST_BYTES,
+        GPU_CC,
         MAX_MODEL_LEN,
         MAX_SEQS,
         MAX_BATCHED_TOKENS,
@@ -651,6 +656,30 @@ pub enum CudaGraphs {
     On,
 }
 
+/// Whether the CUDA executor's node requires its GPUs in confidential-computing
+/// mode before it opens one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuCc {
+    /// Production: the node refuses to open a GPU unless the driver reports
+    /// confidential computing on, DevTools mode off, the production
+    /// environment, and the GPUs accepting work. Every pinned deployment sets
+    /// this.
+    Required,
+    /// Development, on a GPU without confidential computing: the node skips the
+    /// check. A gateway never pins a deployment that sets this.
+    NotRequired,
+}
+
+impl GpuCc {
+    /// The configuration spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GpuCc::Required => "required",
+            GpuCc::NotRequired => "not-required",
+        }
+    }
+}
+
 /// The executor and the settings only it takes. A setting of the other
 /// executor is refused rather than ignored, so the measured configuration
 /// never shows a value that does nothing.
@@ -666,6 +695,8 @@ pub enum ExecutorSettings {
         /// Device memory for the KV pools, in bytes.
         kv_device_bytes: u64,
         graphs: CudaGraphs,
+        /// Whether the GPUs must be in confidential-computing mode.
+        gpu_cc: GpuCc,
     },
 }
 
@@ -814,6 +845,7 @@ pub fn parse_measured(
             refuse_unless(env::KV_DEVICE_BYTES, "cuda")?;
             refuse_unless(env::KERNELS_DIR, "cuda")?;
             refuse_unless(env::CUDA_GRAPHS, "cuda")?;
+            refuse_unless(env::GPU_CC, "cuda")?;
             let kv_blocks = positive(env::KV_BLOCKS)?;
             if kv_blocks < 2 {
                 return Err(ConfigError(format!(
@@ -865,10 +897,21 @@ pub fn parse_measured(
                     )));
                 }
             };
+            let gpu_cc = match get(env::GPU_CC)?.as_str() {
+                "required" => GpuCc::Required,
+                "not-required" => GpuCc::NotRequired,
+                _ => {
+                    return Err(ConfigError(format!(
+                        "{}: expected `required` or `not-required`",
+                        env::GPU_CC
+                    )));
+                }
+            };
             ExecutorSettings::Cuda {
                 kernels_dir,
                 kv_device_bytes,
                 graphs,
+                gpu_cc,
             }
         }
     };
@@ -1237,9 +1280,14 @@ pub fn check_shim_paths(paths: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-/// The GPU counts a confidential NVIDIA deployment may attach (the
-/// config's top-level `gpus`): the platform provider's NVIDIA-CC shapes.
-pub const CUDA_GPU_COUNTS: &[u64] = &[1, 8];
+/// The GPU counts a `cuda` deployment may attach (the config's top-level
+/// `gpus`): one to eight, the range Tinfoil's validator accepts
+/// (`tinfoil-config/validation.go`: `gpus must be between 0 and 8`) less the
+/// zero that attaches none. The node computes on one GPU (device 0); any
+/// further GPU a host shape attaches is attested like the first and left
+/// idle, so the count is the platform's shape to choose, and what protects the
+/// deployment is that every attached GPU is attested (below).
+pub const CUDA_GPU_COUNTS: core::ops::RangeInclusive<u64> = 1..=8;
 
 /// Whether a deployment's GPUs are attested on every handshake.
 ///
@@ -1247,7 +1295,7 @@ pub const CUDA_GPU_COUNTS: &[u64] = &[1, 8];
 /// of GPU evidence items (Tinfoil's `shimConfig.ExpectedGPUs = config.GPUs`),
 /// and a pin's `expected_gpus` requires exactly that many. So:
 ///
-/// - the `cuda` executor needs GPUs, in one of [`CUDA_GPU_COUNTS`], and a pin
+/// - the `cuda` executor needs GPUs, a count in [`CUDA_GPU_COUNTS`], and a pin
 ///   requiring all of them, or its accelerators would go unattested (or, with
 ///   no `gpus`, every handshake would fail for want of evidence);
 /// - the `cpu` executor attaches none and requires none. A pinned deployment
@@ -1266,7 +1314,9 @@ pub fn check_gpu_attestation(
         Executor::Cuda => match gpus {
             None => Err("the cuda executor needs the config to attach GPUs (`gpus`)".into()),
             Some(n) if !CUDA_GPU_COUNTS.contains(&n) => Err(format!(
-                "`gpus: {n}` is not an NVIDIA-CC shape; it must be one of {CUDA_GPU_COUNTS:?}"
+                "`gpus: {n}` is out of range; it must be from {} to {}",
+                CUDA_GPU_COUNTS.start(),
+                CUDA_GPU_COUNTS.end()
             )),
             Some(n) if expected != Some(n) => Err(format!(
                 "the config attaches {n} GPUs, so expected_gpus must be {n} (the shim collects \
@@ -1369,6 +1419,39 @@ pub fn parse_cvm_version(raw: &str) -> Result<CvmVersion<'_>, CvmVersionError> {
         version,
         manifest_sha256,
     })
+}
+
+/// The build tag that names a platform release's GPU image
+/// (`0.15.3-rc.1+gpu`).
+pub const GPU_IMAGE_TAG: &str = "gpu";
+
+/// Whether a `cvm-version` names the image its executor needs.
+///
+/// Each platform release publishes two TDX images with different MRTDs: the
+/// CPU image (`X`) and the GPU image (`X+gpu`). Only the GPU image carries the
+/// NVIDIA driver, and its measured boot opens the GPUs to work only after it
+/// has checked their device IDs and NVIDIA's local verifier has passed for
+/// exactly `gpus` of them (cvmimage `tinfoil/cmd/boot/gpu.go`,
+/// `gpuattest.go`); the CPU image refuses a config that attaches any
+/// (`tinfoil/cmd/boot/gpu_disabled.go`). So the `cuda` executor needs `X+gpu`,
+/// and the `cpu` executor, which attaches no GPUs ([`check_gpu_attestation`]),
+/// needs the plain `X`, with no build tag.
+pub fn check_cvm_image(executor: Executor, release: &CvmVersion<'_>) -> Result<(), String> {
+    let tag = release.version.split_once('+').map(|(_, tag)| tag);
+    match (executor, tag) {
+        (Executor::Cuda, Some(GPU_IMAGE_TAG)) | (Executor::Cpu, None) => Ok(()),
+        (Executor::Cuda, _) => Err(format!(
+            "cvm-version {:?} is not a GPU image; the cuda executor runs on the release's \
+             `+{GPU_IMAGE_TAG}` image (VERSION+{GPU_IMAGE_TAG}@sha256:<its manifest>), whose \
+             measured boot attests the GPUs before opening them",
+            release.version
+        )),
+        (Executor::Cpu, Some(_)) => Err(format!(
+            "cvm-version {:?} names a tagged image; the cpu executor runs on the release's \
+             plain CPU image",
+            release.version
+        )),
+    }
 }
 
 /// Why a gateway-token hash is refused.
@@ -1497,15 +1580,16 @@ mod tests {
     #[test]
     fn a_deployments_gpus_are_attested_exactly() {
         use Executor::{Cpu, Cuda};
-        assert!(check_gpu_attestation(Cuda, Some(8), Some(8)).is_ok());
-        assert!(check_gpu_attestation(Cuda, Some(1), Some(1)).is_ok());
+        for n in 1..=8 {
+            assert!(check_gpu_attestation(Cuda, Some(n), Some(n)).is_ok(), "{n}");
+        }
         assert!(check_gpu_attestation(Cpu, None, None).is_ok());
         assert!(check_gpu_attestation(Cpu, Some(0), Some(0)).is_ok());
         for (executor, gpus, expected) in [
             (Cuda, None, Some(4)),
             (Cuda, None, None),
             (Cuda, Some(0), Some(8)),
-            (Cuda, Some(2), Some(2)),
+            (Cuda, Some(9), Some(9)),
             (Cuda, Some(8), Some(4)),
             (Cuda, Some(8), None),
             (Cuda, Some(8), Some(0)),
@@ -1524,6 +1608,43 @@ mod tests {
             kernels_dir: "/opt/eidola/kernels".into(),
             kv_device_bytes,
             graphs: CudaGraphs::On,
+            gpu_cc: GpuCc::Required,
+        }
+    }
+
+    #[test]
+    fn each_executor_runs_on_its_own_image() {
+        use Executor::{Cpu, Cuda};
+        let pin = "ab".repeat(32);
+        let check =
+            |executor, raw: &str| check_cvm_image(executor, &parse_cvm_version(raw).unwrap());
+        for raw in [
+            "0.15.3-rc.1+gpu".to_string(),
+            format!("0.15.3-rc.1+gpu@sha256:{pin}"),
+            "0.16.0+gpu".to_string(),
+        ] {
+            assert!(check(Cuda, &raw).is_ok(), "{raw}");
+            assert!(check(Cpu, &raw).unwrap_err().contains("cpu"), "{raw}");
+        }
+        for raw in [
+            "0.15.3-rc.1".to_string(),
+            format!("0.15.3-rc.1@sha256:{pin}"),
+        ] {
+            assert!(check(Cpu, &raw).is_ok(), "{raw}");
+            assert!(check(Cuda, &raw).unwrap_err().contains("+gpu"), "{raw}");
+        }
+        // Only the exact tag names the GPU image.
+        for raw in [
+            "0.15.3-rc.1+GPU",
+            "0.15.3-rc.1+gpu2",
+            "0.15.3-rc.1+gpu+gpu",
+            "0.15.3-rc.1+",
+            "0.15.3-rc.1-gpu",
+        ] {
+            assert!(check(Cuda, raw).is_err(), "{raw}");
+        }
+        for raw in ["0.15.3-rc.1+GPU", "0.15.3-rc.1+", "0.15.3+cpu"] {
+            assert!(check(Cpu, raw).is_err(), "{raw}");
         }
     }
 
@@ -2074,6 +2195,7 @@ mod tests {
             (env::KV_DEVICE_BYTES, "68719476736"),
             (env::KERNELS_DIR, "/opt/eidola/kernels"),
             (env::CUDA_GRAPHS, "on"),
+            (env::GPU_CC, "required"),
             (env::MAX_MODEL_LEN, "131072"),
             (env::MAX_SEQS, "64"),
             (env::MAX_BATCHED_TOKENS, "8192"),
@@ -2146,6 +2268,14 @@ mod tests {
         let err = fits(room - rest + 1, mib(room)).unwrap_err();
         assert!(err.contains(env::KV_HOST_BYTES), "{err}");
     }
+    /// The settings only the cuda executor takes.
+    #[cfg(feature = "argon2")]
+    const CUDA_SETTINGS: [&str; 4] = [
+        env::KV_DEVICE_BYTES,
+        env::KERNELS_DIR,
+        env::CUDA_GRAPHS,
+        env::GPU_CC,
+    ];
 
     #[cfg(feature = "argon2")]
     fn parse_map(
@@ -2164,10 +2294,11 @@ mod tests {
                 kernels_dir: "/opt/eidola/kernels".into(),
                 kv_device_bytes: 64 << 30,
                 graphs: CudaGraphs::On,
+                gpu_cc: GpuCc::Required,
             }
         );
         // Every cuda setting is required with cuda.
-        for name in [env::KV_DEVICE_BYTES, env::KERNELS_DIR, env::CUDA_GRAPHS] {
+        for name in CUDA_SETTINGS {
             let mut map = cuda.clone();
             map.remove(name);
             assert!(parse_map(&map).unwrap_err().contains(name), "{name}");
@@ -2194,7 +2325,7 @@ mod tests {
         // The cpu executor: its block count required, every cuda setting refused.
         let mut cpu = cuda.clone();
         cpu.insert(env::EXECUTOR, "cpu".into());
-        for name in [env::KV_DEVICE_BYTES, env::KERNELS_DIR, env::CUDA_GRAPHS] {
+        for name in CUDA_SETTINGS {
             cpu.remove(name);
         }
         cpu.insert(env::KV_BLOCKS, "256".into());
@@ -2203,7 +2334,7 @@ mod tests {
             parse_map(&cpu).unwrap().executor,
             ExecutorSettings::Cpu { kv_blocks: 256 }
         );
-        for name in [env::KV_DEVICE_BYTES, env::KERNELS_DIR, env::CUDA_GRAPHS] {
+        for name in CUDA_SETTINGS {
             let mut map = cpu.clone();
             map.insert(name, cuda[name].clone());
             let err = parse_map(&map).unwrap_err();
@@ -2229,7 +2360,7 @@ mod tests {
     fn a_step_holds_a_decode_row() {
         let mut cpu = cuda_env();
         cpu.insert(env::EXECUTOR, "cpu".into());
-        for name in [env::KV_DEVICE_BYTES, env::KERNELS_DIR, env::CUDA_GRAPHS] {
+        for name in CUDA_SETTINGS {
             cpu.remove(name);
         }
         cpu.insert(env::KV_BLOCKS, "256".into());
@@ -2276,6 +2407,29 @@ mod tests {
         }
         for bad in ["ON", "true", "1", "auto", "on "] {
             assert!(refused(env::CUDA_GRAPHS, bad), "{bad:?}");
+        }
+        for bad in [
+            "Required",
+            "true",
+            "off",
+            "not_required",
+            "notrequired",
+            "required ",
+            "optional",
+        ] {
+            assert!(refused(env::GPU_CC, bad), "{bad:?}");
+        }
+        for (value, gpu_cc) in [
+            ("required", GpuCc::Required),
+            ("not-required", GpuCc::NotRequired),
+        ] {
+            let mut map = cuda.clone();
+            map.insert(env::GPU_CC, value.into());
+            assert!(matches!(
+                parse_map(&map).unwrap().executor,
+                ExecutorSettings::Cuda { gpu_cc: g, .. } if g == gpu_cc
+            ));
+            assert_eq!(gpu_cc.as_str(), value);
         }
         let mut off = cuda.clone();
         off.insert(env::CUDA_GRAPHS, "off".into());

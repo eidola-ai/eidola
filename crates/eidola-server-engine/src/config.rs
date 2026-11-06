@@ -18,7 +18,7 @@ use crate::auth::GatewayToken;
 /// Environment variable names, and the measured-configuration types: the grammar lives in
 /// `eidola_common::engine_deployment`, which the gateway's build also runs every pinned
 /// deployment's env through, so a pin can only name a configuration this node boots with.
-pub use eidola_common::engine_deployment::{CacheConfig, Sizing, WeightsStorage, env};
+pub use eidola_common::engine_deployment::{CacheConfig, GpuCc, Sizing, WeightsStorage, env};
 
 /// Which executor runs the model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +49,9 @@ pub enum ExecutorConfig {
         kv_device_bytes: u64,
         /// Whether decode steps replay captured graphs.
         graphs: eidola_engine_cuda::CudaGraphs,
+        /// Whether the GPUs must be in confidential-computing mode before the device opens
+        /// (`crate::gpu_cc`).
+        gpu_cc: GpuCc,
     },
 }
 
@@ -133,6 +136,7 @@ impl Config {
                 kernels_dir,
                 kv_device_bytes,
                 graphs,
+                gpu_cc,
             } => ExecutorConfig::Cuda {
                 kernels_dir: PathBuf::from(kernels_dir),
                 kv_device_bytes,
@@ -144,6 +148,7 @@ impl Config {
                         eidola_engine_cuda::CudaGraphs::Off
                     }
                 },
+                gpu_cc,
             },
             #[cfg(not(feature = "cuda"))]
             ExecutorSettings::Cuda { .. } => return Err(no_cuda_executor()),

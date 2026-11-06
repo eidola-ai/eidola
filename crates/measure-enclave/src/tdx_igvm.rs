@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha384};
 
 const PAGE_SIZE: u64 = 4096;
+/// A 2 MiB page directive covers this many 4 KiB pages.
+const PAGES_PER_2MB: u64 = 512;
 /// TDH.MR.EXTEND measures a page in 256-byte chunks.
 const MR_EXTEND_CHUNK: usize = 256;
 /// Each MRTD update starts with a 128-byte record: an ASCII operation name,
@@ -65,10 +67,16 @@ impl Mrtd {
 /// page data is added and extended; unmeasured page data and inserted
 /// parameter areas are added only, so their addresses reach MRTD and their
 /// contents do not; shared pages are never added to the private address
-/// space. Directives that only describe parameters or memory the host
-/// supplies after measurement contribute nothing. Anything this
-/// computation does not model — large pages, non-normal page types, an
-/// explicit initial VP context — is refused rather than guessed at.
+/// space. A 2 MiB zero page is the 512 4 KiB zero pages it holds, added and
+/// measured in ascending order: the platform's image compiler emits each
+/// 2 MiB-aligned run of 512 zero pages as one such directive, and documents
+/// that a loader measures it as those pages (cvmimage `compiler/src/image.rs`,
+/// `zero_run` and `zero_directive`). Directives that only describe parameters
+/// or memory the host supplies after measurement contribute nothing. Anything
+/// this computation does not model — a 2 MiB page carrying data, which the
+/// `igvm` parser reads only the first 4 KiB of, a misaligned 2 MiB page,
+/// non-normal page types, an explicit initial VP context — is refused rather
+/// than guessed at.
 pub fn mrtd_from_igvm(bytes: &[u8]) -> Result<[u8; 48]> {
     let file = IgvmFile::new_from_binary(bytes, None).context("parsing IGVM image")?;
     let tdx_mask = match file.platforms() {
@@ -98,26 +106,38 @@ pub fn mrtd_from_igvm(bytes: &[u8]) -> Result<[u8; 48]> {
                     continue;
                 }
                 ensure!(
-                    !flags.is_2mb_page(),
-                    "2 MiB page at {gpa:#x} is not supported"
-                );
-                ensure!(
                     *data_type == IgvmPageDataType::NORMAL,
                     "page at {gpa:#x} has a non-normal data type"
                 );
+                let pages = if flags.is_2mb_page() {
+                    ensure!(
+                        data.is_empty(),
+                        "2 MiB page at {gpa:#x} carries data; only a 2 MiB zero page is supported"
+                    );
+                    ensure!(
+                        gpa.is_multiple_of(PAGES_PER_2MB * PAGE_SIZE),
+                        "2 MiB page at {gpa:#x} is not 2 MiB-aligned"
+                    );
+                    PAGES_PER_2MB
+                } else {
+                    1
+                };
                 if flags.shared() {
                     continue;
                 }
-                mrtd.add_page(*gpa);
-                if !flags.unmeasured() {
-                    let mut content = [0u8; PAGE_SIZE as usize];
-                    ensure!(
-                        data.is_empty() || data.len() == content.len(),
-                        "page at {gpa:#x} carries {} bytes",
-                        data.len()
-                    );
-                    content[..data.len()].copy_from_slice(data);
-                    mrtd.extend_page(*gpa, &content);
+                let mut content = [0u8; PAGE_SIZE as usize];
+                ensure!(
+                    data.is_empty() || data.len() == content.len(),
+                    "page at {gpa:#x} carries {} bytes",
+                    data.len()
+                );
+                content[..data.len()].copy_from_slice(data);
+                for page in 0..pages {
+                    let page_gpa = gpa + page * PAGE_SIZE;
+                    mrtd.add_page(page_gpa);
+                    if !flags.unmeasured() {
+                        mrtd.extend_page(page_gpa, &content);
+                    }
                 }
             }
             IgvmDirectiveHeader::ParameterArea {
@@ -435,6 +455,86 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) fn zero_2mb(gpa: u64, flags: IgvmPageDataFlags) -> IgvmDirectiveHeader {
+        IgvmDirectiveHeader::PageData {
+            gpa,
+            compatibility_mask: TDX_MASK,
+            flags: flags.with_is_2mb_page(true),
+            data_type: IgvmPageDataType::NORMAL,
+            data: vec![],
+        }
+    }
+
+    /// A 2 MiB zero page measures as the 512 4 KiB zero pages it holds, in
+    /// ascending order, exactly as if they were stated one by one.
+    #[test]
+    fn a_2mb_zero_page_is_its_512_zero_pages() {
+        let base = 0x20_0000;
+        let huge = mrtd_from_igvm(&image(vec![
+            page(0x1f_f000, 0xaa, IgvmPageDataFlags::new()),
+            zero_2mb(base, IgvmPageDataFlags::new()),
+            page(0x40_0000, 0xbb, IgvmPageDataFlags::new()),
+        ]))
+        .unwrap();
+
+        let mut small = vec![page(0x1f_f000, 0xaa, IgvmPageDataFlags::new())];
+        small.extend((0..PAGES_PER_2MB).map(|i| IgvmDirectiveHeader::PageData {
+            gpa: base + i * PAGE_SIZE,
+            compatibility_mask: TDX_MASK,
+            flags: IgvmPageDataFlags::new(),
+            data_type: IgvmPageDataType::NORMAL,
+            data: vec![],
+        }));
+        small.push(page(0x40_0000, 0xbb, IgvmPageDataFlags::new()));
+        assert_eq!(huge, mrtd_from_igvm(&image(small)).unwrap());
+
+        let mut ops = vec![("MEM.PAGE.ADD", 0x1f_f000, Some(0xaa))];
+        ops.extend((0..PAGES_PER_2MB).map(|i| ("MEM.PAGE.ADD", base + i * PAGE_SIZE, Some(0))));
+        ops.push(("MEM.PAGE.ADD", 0x40_0000, Some(0xbb)));
+        assert_eq!(huge, longhand(&ops));
+
+        // Unmeasured: every page added, none extended. Shared: none added.
+        // (Each image keeps one page of data: the parser refuses a file with
+        // no file data.)
+        let lead = || page(0x1000, 0xee, IgvmPageDataFlags::new());
+        let unmeasured = mrtd_from_igvm(&image(vec![
+            lead(),
+            zero_2mb(base, IgvmPageDataFlags::new().with_unmeasured(true)),
+        ]))
+        .unwrap();
+        let mut added = vec![("MEM.PAGE.ADD", 0x1000, Some(0xee))];
+        added.extend((0..PAGES_PER_2MB).map(|i| ("MEM.PAGE.ADD", base + i * PAGE_SIZE, None)));
+        assert_eq!(unmeasured, longhand(&added));
+        let shared = mrtd_from_igvm(&image(vec![
+            lead(),
+            zero_2mb(base, IgvmPageDataFlags::new().with_shared(true)),
+        ]))
+        .unwrap();
+        assert_eq!(shared, longhand(&[("MEM.PAGE.ADD", 0x1000, Some(0xee))]));
+    }
+
+    #[test]
+    fn a_2mb_page_with_data_or_misaligned_is_refused() {
+        let err = mrtd_from_igvm(&image(vec![
+            page(0x1000, 0xee, IgvmPageDataFlags::new()),
+            zero_2mb(0x20_1000, IgvmPageDataFlags::new()),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not 2 MiB-aligned"), "{err}");
+        let with_data = IgvmDirectiveHeader::PageData {
+            gpa: 0x20_0000,
+            compatibility_mask: TDX_MASK,
+            flags: IgvmPageDataFlags::new().with_is_2mb_page(true),
+            data_type: IgvmPageDataType::NORMAL,
+            data: vec![1; PAGE_SIZE as usize],
+        };
+        let err = mrtd_from_igvm(&image(vec![with_data]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("carries data"), "{err}");
+    }
+
     #[test]
     fn mrconfigid_pads_the_config_hash() {
         assert_eq!(
@@ -446,7 +546,7 @@ pub(crate) mod tests {
 
     pub(crate) fn manifest(igvm: &[u8], mrtd: &str, rtmr0: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
-            "version": "v0.0.0-test",
+            "version": "v0.0.0-test+gpu",
             "root": "00",
             "igvm": {
                 "format_version": 1,
@@ -474,7 +574,7 @@ pub(crate) mod tests {
         let pin = release_pin(&good, &good_sha, &igvm, CONFIG).unwrap();
         assert_eq!(pin.mrtd, mrtd);
         assert_eq!(pin.mrconfigid, hex::encode(mrconfigid(CONFIG)));
-        assert_eq!(pin.cvm_version, "v0.0.0-test");
+        assert_eq!(pin.cvm_version, "v0.0.0-test+gpu");
 
         let err = |manifest: &[u8], sha: &str, igvm: &[u8]| {
             release_pin(manifest, sha, igvm, CONFIG)
@@ -492,7 +592,7 @@ pub(crate) mod tests {
         assert!(err(&measured_boot, &sha, &igvm).contains("rtmr0"));
     }
 
-    const CONFIG: &[u8] = b"cvm-version: 0.0.0-test\ncpus: 2\n";
+    const CONFIG: &[u8] = b"cvm-version: 0.0.0-test+gpu\ncpus: 2\n";
 
     #[test]
     fn config_release_reads_the_version_and_inline_pin() {
@@ -530,17 +630,19 @@ pub(crate) mod tests {
         let sha = hex::encode(Sha256::digest(&good));
         let pin = |config: String| release_pin(&good, &sha, &igvm, config.as_bytes());
 
-        let err = pin("cvm-version: 0.0.1-test\n".into())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("config selects cvm-version 0.0.1-test"),
-            "{err}"
-        );
+        for other in ["0.0.1-test+gpu", "0.0.0-test"] {
+            let err = pin(format!("cvm-version: {other}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("config selects cvm-version {other},")),
+                "{err}"
+            );
+        }
 
-        pin(format!("cvm-version: 0.0.0-test@sha256:{sha}\n")).expect("inline pin matches");
+        pin(format!("cvm-version: 0.0.0-test+gpu@sha256:{sha}\n")).expect("inline pin matches");
         let other = "cd".repeat(32);
-        let err = pin(format!("cvm-version: 0.0.0-test@sha256:{other}\n"))
+        let err = pin(format!("cvm-version: 0.0.0-test+gpu@sha256:{other}\n"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("config pins release manifest"), "{err}");
@@ -555,17 +657,64 @@ pub(crate) mod tests {
         assert!(err.contains("format_version"), "{err}");
     }
 
-    /// Known answer against a published release: set `TDX_IGVM` to the
-    /// release's `tinfoil-tdx-<version>.igvm` and `TDX_IGVM_MRTD` to the
-    /// MRTD its manifest states.
+    /// Published TDX images and the MRTD each release manifest states:
+    /// `(file name, image SHA-256, MRTD)`. The images (about 9 MB of kernel and
+    /// initramfs each) are not committed; the hashes come from each release's
+    /// `tinfoil-inference-<version>-manifest.json` (`igvm.tdx`,
+    /// `igvm.tdx_launch.mrtd`).
+    const PUBLISHED: &[(&str, &str, &str)] = &[
+        (
+            "tinfoil-tdx-v0.15.0-rc8.igvm",
+            "e5203a5369996bc80abe038049166b71f2db334864f68409089dac197c0d3048",
+            "5cfedb59d5a8baba6d8de85cafaae0277d242b69f760aacfb10d19f9de7d0031\
+             743da0fb4ce538a1871efb00e188ddd8",
+        ),
+        (
+            "tinfoil-tdx-v0.15.3-rc.1.igvm",
+            "ee12b6eefe090fb098818d593524651651a0b1aa3f7309fe7b485693fcde9099",
+            "cc56391d1066167bd93935f0e3232d8af092c12a6067ce13c0737ddf6dfbde6a\
+             efae8a4404a5b577c039e95934ad577d",
+        ),
+        (
+            "tinfoil-tdx-v0.15.3-rc.1+gpu.igvm",
+            "f5c91b2b4ba764dc63a3a4c86a11c572afc4f0554a68a48cba8b42148435e615",
+            "bf582997bf2145f275db3bc2542d703fdd889c85927b3ee199138298f8636317\
+             11f41b37d8d347d5aee18036ff02c16c",
+        ),
+    ];
+
+    /// Known answers against published releases: set `TDX_IGVM_DIR` to a
+    /// directory holding the images [`PUBLISHED`] names (from
+    /// `https://images.tinfoil.sh/cvm/<file name>`). Each image present must
+    /// hash to its manifest's record and reproduce its MRTD; at least one must
+    /// be present. Alternatively, `TDX_IGVM` names any one image and
+    /// `TDX_IGVM_MRTD` the MRTD its manifest states.
     #[test]
     fn published_release_mrtd_known_answer() {
-        let (Ok(path), Ok(expected)) = (std::env::var("TDX_IGVM"), std::env::var("TDX_IGVM_MRTD"))
-        else {
-            eprintln!("skipping: set TDX_IGVM and TDX_IGVM_MRTD to run");
+        if let (Ok(path), Ok(expected)) =
+            (std::env::var("TDX_IGVM"), std::env::var("TDX_IGVM_MRTD"))
+        {
+            let bytes = std::fs::read(path).unwrap();
+            assert_eq!(hex::encode(mrtd_from_igvm(&bytes).unwrap()), expected);
+        }
+        let Ok(dir) = std::env::var("TDX_IGVM_DIR") else {
+            eprintln!("skipping: set TDX_IGVM_DIR (or TDX_IGVM and TDX_IGVM_MRTD) to run");
             return;
         };
-        let bytes = std::fs::read(path).unwrap();
-        assert_eq!(hex::encode(mrtd_from_igvm(&bytes).unwrap()), expected);
+        let mut checked = 0;
+        for (name, sha256, mrtd) in PUBLISHED {
+            let Ok(bytes) = std::fs::read(std::path::Path::new(&dir).join(name)) else {
+                eprintln!("{name}: not in {dir}");
+                continue;
+            };
+            assert_eq!(hex::encode(Sha256::digest(&bytes)), *sha256, "{name}");
+            assert_eq!(
+                hex::encode(mrtd_from_igvm(&bytes).unwrap()),
+                *mrtd,
+                "{name}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no published image in {dir}");
     }
 }

@@ -8,7 +8,8 @@
 //!   and measured exactly as the gateway's own: the `eidola-server-engine`
 //!   image by digest, the weights hash and storage mode, the prompt-cache
 //!   retention, the gateway token's Argon2id hash. Its `cvm-version` pins the
-//!   platform release manifest inline (`X@sha256:<hex>`).
+//!   platform release manifest inline (`X+gpu@sha256:<hex>`: the release's GPU
+//!   image, which the `cuda` executor needs).
 //! - `deployment.json` — what a pin needs that the config does not determine:
 //!   the weights' provenance (`repo`, `revision`), the GPU count the
 //!   deployment presents evidence for, and the Intel TDX machine policy
@@ -237,7 +238,7 @@ mod tests {
 
     fn config(manifest_sha: &str) -> String {
         format!(
-            r#"cvm-version: 0.0.0-test@sha256:{manifest_sha}
+            r#"cvm-version: 0.0.0-test+gpu@sha256:{manifest_sha}
 cpus: 16
 memory: 65536
 gpus: 8
@@ -269,6 +270,7 @@ containers:
       - EIDOLA_ENGINE_KV_DEVICE_BYTES: "68719476736"
       - EIDOLA_ENGINE_KERNELS_DIR: "/opt/eidola/kernels"
       - EIDOLA_ENGINE_CUDA_GRAPHS: "on"
+      - EIDOLA_ENGINE_GPU_CC: "required"
       - EIDOLA_ENGINE_MAX_MODEL_LEN: "131072"
       - EIDOLA_ENGINE_MAX_SEQS: "64"
       - EIDOLA_ENGINE_MAX_BATCHED_TOKENS: "8192"
@@ -313,7 +315,7 @@ containers:
 
         assert_eq!(
             required_release(config.as_bytes()).unwrap(),
-            ("0.0.0-test".to_string(), release_sha.clone())
+            ("0.0.0-test+gpu".to_string(), release_sha.clone())
         );
         let entry = deployment_entry(
             "fixture-model",
@@ -333,7 +335,7 @@ containers:
             json!({
                 "config": PATH,
                 "config_sha256": config_sha,
-                "cvm_version": format!("0.0.0-test@sha256:{release_sha}"),
+                "cvm_version": format!("0.0.0-test+gpu@sha256:{release_sha}"),
                 "pin": {
                     "platform": {"tdx": {
                         "mrtd": mrtd,
@@ -510,8 +512,20 @@ containers:
         assert!(
             entry("fixture-model", &unstated, SIDECAR).contains("needs the config to attach GPUs")
         );
-        let two = good.replace("gpus: 8\n", "gpus: 2\n");
-        assert!(entry("fixture-model", &two, SIDECAR).contains("not an NVIDIA-CC shape"));
+        let nine = good.replace("gpus: 8\n", "gpus: 9\n");
+        assert!(entry("fixture-model", &nine, SIDECAR).contains("gpus must be between 0 and 8"));
+
+        // The CPU image under the cuda executor, and the node's GPU
+        // confidential-computing check switched off.
+        let cpu_image = good.replace("0.0.0-test+gpu@", "0.0.0-test@");
+        assert_ne!(cpu_image, good);
+        assert!(entry("fixture-model", &cpu_image, SIDECAR).contains("is not a GPU image"));
+        let no_cc = good.replace("GPU_CC: \"required\"", "GPU_CC: \"not-required\"");
+        assert_ne!(no_cc, good);
+        assert!(
+            entry("fixture-model", &no_cc, SIDECAR)
+                .contains("EIDOLA_ENGINE_GPU_CC is \"not-required\"")
+        );
 
         // A companion container, or an engine named by a tag.
         let companion = format!(
