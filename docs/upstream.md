@@ -1,67 +1,58 @@
-# Inference upstream
+# Inference engine
 
-The model itself does not run inside the Eidola server. It runs in a separate confidential-compute deployment operated by an inference provider (currently [Tinfoil](https://tinfoil.sh)), with its own attestation chain that the Eidola server verifies on every outbound connection.
+The model itself does not run inside the Eidola server. It runs on Eidola's own inference engine (`eidola-server-engine`), in separate confidential-compute deployments on GPU hosts, which the Eidola server attests on every outbound connection against deployments pinned in its own measured build.
 
 This page explains what runs where, what the user is trusting at this layer, and how the trust is anchored.
 
 ## Where the model runs
 
-The upstream inference provider:
+An engine deployment:
 
-- Runs an OpenAI-compatible API in a confidential-compute enclave (currently AMD SEV-SNP; Intel TDX values are tracked in releases but refused by Eidola's verifier — [gaps.md](gaps.md#tdx-acceptance)).
-- Publishes signed measurements of the running enclave through Sigstore (Fulcio identity + Rekor inclusion), tied to a public source repository.
-- Serves its TLS endpoint from inside the enclave and exposes the same self-contained v3 attestation envelope the Eidola server uses, binding a fresh challenge and the endpoint's TLS SPKI into a hardware report.
+- Runs Eidola's engine in an Intel TDX confidential VM with NVIDIA confidential-computing GPUs, deployed as a [Tinfoil](https://tinfoil.sh) Container, the same platform that hosts the Eidola server. The VM boots the platform's firmware-less IGVM image, and the guest refuses to start unless its GPUs come up in confidential-computing mode.
+- Is described by a committed configuration, `deploy/engine/<model-id>/<variant>/tinfoil-config.yml`: the engine image by digest, the read-only weights pack, the engine's whole environment, and the hash of the one secret it takes (the token the Eidola server presents). The configuration's SHA-256 is part of the VM's launch identity (MRCONFIGID), and the guest refuses to boot under any other configuration.
+- Serves its TLS endpoint from inside the VM and exposes the same self-contained v3 attestation envelope the Eidola server uses, binding a fresh challenge, the endpoint's TLS SPKI and the GPU evidence into a hardware report.
+- Serves exactly one model, from weights it hashes when it starts. Every request names the weights hash it expects, and a node serving other weights refuses the request before it is admitted.
 
-The Eidola server is a *client* of this enclave. It verifies the upstream's attestation on every TCP+TLS connection it opens to the inference endpoint, using the same `tinfoil-verifier` crate the Eidola client uses to verify the Eidola server.
+The Eidola server is a *client* of these deployments. It verifies each one's attestation on every TCP+TLS connection it opens, using the same `tinfoil-verifier` crate the Eidola client uses to verify the Eidola server.
+
+**No deployment is pinned yet.** Until the first one is measured and pinned, the server sells no models: `/v1/models` lists nothing, and every chat request is refused as an unknown model. A catalog row, its price and its pin land together, and the server's build refuses a row without a pin or a pin without a row.
+
+## What pins the engine
+
+The engine deployments a server build accepts are a build input, `releases/trust/engine-enclaves.json`, compiled into the server and therefore bound into its own enclave measurement, which the client pins. For each model it lists every accepted deployment's:
+
+- **Launch identity**: MRTD, which the TDX module measures over every page of the platform's release image, and MRCONFIGID, the SHA-256 of the deployment's committed configuration. `measure-enclave` recomputes MRTD from the platform's published image, checked against its release manifest, and the configuration hash from the committed bytes.
+- **Machine policy**, for the report fields an image cannot fix: allowed TDX modules, exact TD attributes (debug off), the TCB floors, and optionally the platform family. See [gaps.md § TDX acceptance](gaps.md#tdx-acceptance) for the full list and what is hand-supplied.
+- **GPU count**: how many NVIDIA GPU evidence items each handshake must carry.
+- **Weights**: the engine's weights hash, and the repository and revision the weights were taken from.
+
+Every server build re-derives that file from the committed configurations in both directions: a pin that disagrees with the configuration it names, or a committed deployment nobody pinned, fails the build. The same build check holds each configuration to what an engine needs (one container, pinned by digest, with exactly the engine's measured environment and no other secret).
+
+The set is **same-sha**: a server build accepts exactly the deployments committed in its own tree. Nothing widens it at runtime, there is no list of earlier measurements, and nothing is fetched to decide what to trust. Rolling a deployment forward is therefore ordered (new engines, then a server pinning them, then the client pinning that server), and is described in [`releases/README.md`](../releases/README.md#rolling-engine-deployments).
+
+Where engines are reachable is operational data the server reads from its database, and it is availability only: an address is used only if it names a deployment this build pins, and the attestation on every connection to it decides whether it is that deployment.
 
 ## What the user is trusting at this layer
 
 The user is trusting, in addition to the layers covered in [client.md](client.md) and [server.md](server.md):
 
-1. **That the model itself runs in confidential compute.** This is verifiable: the inference upstream attests to a measurement that the Eidola server checks against the set of measurements it currently trusts (resolved at runtime — see below).
-2. **That the model code's published measurements match the published source.** The inference provider publishes signed measurements via Sigstore against a specific source repository (e.g. `tinfoilsh/confidential-model-router`). The Eidola server verifies this provenance itself: it resolves the latest release's measurement and verifies its Sigstore attestation end-to-end before trusting it.
-3. **That the upstream provider's confidential-compute deployment is genuine.** This is the same trust as for the Eidola server's own enclave — ultimately rooted in the hardware vendor (AMD, Intel, or NVIDIA) and its attestation chain.
-
-## What pins the upstream measurement
-
-The set of allowed upstream enclave measurements is resolved **at runtime**, not baked into the binary. `inference.tinfoil.sh` is a *router* enclave that reverse-proxies to separate per-model GPU enclaves, and the router trusts those downstream enclaves via "the latest Sigstore-signed release of the repo" — so statically pinning the router's measurement (and gating changes on a human PR) bought little rigor over the upstream provider's own trust model while causing a fail-closed outage every time the provider shipped a router release. Instead, `crates/eidola-server-gateway/src/upstream_trust` matches the provider's actual model: on boot and every ~10 minutes it resolves the provider's latest release and verifies its Sigstore attestation end-to-end before trusting the measurement:
-
-- Fetches the latest release tag, its subject digest (`tinfoil.hash`), and the GitHub artifact attestation (a Sigstore `dsse`/in-toto bundle).
-- Verifies the Fulcio certificate chain to the pinned Sigstore trusted root (`releases/trust/sigstore-trusted-root.json`, the sole `releases/` input the server's `build.rs` embeds), the signing identity (GitHub Actions OIDC issuer + the expected repository **and exact tag**), the DSSE signature, and the Rekor transparency-log entry (SET + inclusion proof).
-- Reads the measurement from the signed `snp-tdx-multiplatform/v1` predicate and confirms the subject digest matches `tinfoil.hash`.
-
-The allowed set is a rolling window of the two most recently resolved measurements (so an in-progress rolling deploy still attests). This holds from the very first boot: bootstrap resolves the latest release (the fatal readiness gate) and also folds in the immediately-previous **published** release (best-effort — a missing or unverifiable previous release just logs a warning and boots latest-only), so a cold start landing mid-deploy attests the still-draining old router enclave rather than aborting startup. A resolution or verification failure never clears or widens trust — the server keeps its current set, and if it *can't* resolve a verified measurement at boot it refuses to start (there is no static fallback). This whole subsystem is transitional: when Eidola self-hosts inference it is replaced by a statically pinned measurement set.
+1. **That the model runs in confidential compute.** This is verifiable: each deployment attests a launch identity that the Eidola server checks against the pins in its own build, and the server's build is in turn pinned by the client.
+2. **That the deployment's confidential-compute hardware is genuine.** The same trust as for the Eidola server's own enclave, rooted in the hardware vendors (Intel for the CPU, NVIDIA for the GPUs) and their attestation chains.
+3. **That the GPUs are in confidential-computing mode.** The per-handshake GPU evidence is counted and bound to the handshake's nonce inside the CPU quote's signed report data, but it is not appraised against NVIDIA's certificate chain or reference measurements. What vouches for the GPUs is the measured guest, which refuses to start without them in confidential-computing mode ([privacy-guarantees.md §3.5](privacy-guarantees.md#3-content)).
+4. **That the platform's boot image is what its release says.** MRTD is recomputed from the platform's published image, but that image is not built through Eidola's source-bootstrapped flow ([gaps.md § Build chain opacity](gaps.md#build-chain-opacity)).
 
 ## What the user is *not* trusting
 
-- **Eidola is not trusting the upstream provider's policy.** The trust is in the running code's measurement, not in any contractual or operational commitment from the provider. A measurement is only trusted once its Sigstore provenance verifies against the expected repository identity; Eidola's server refuses to connect to any enclave whose measurement it hasn't resolved and verified this way.
-- **Eidola is not trusting the upstream provider's operators with cleartext inference data.** Cleartext inference data is *necessarily* visible to the enclave performing the inference — that's how the model reads your prompt and generates a response. The trust boundary at this layer is the enclave itself, not the provider's operations team: the same confidential-compute properties that seal the Eidola server enclave against Eidola's operators seal the inference enclave against the upstream provider's operators.
+- **Eidola does not trust a provider's release process for the inference code.** The engine is Eidola's code, in this repository, and the deployment it runs in is pinned by measurement in the server's own build. No enclave on the inference path is attested by anyone but Eidola.
+- **Eidola does not trust the hosting platform's operators with cleartext inference data.** Cleartext is *necessarily* visible to the VM performing the inference; that is how the model reads a prompt. The trust boundary at this layer is the confidential VM and its GPUs: the same properties that seal the Eidola server enclave against its operators seal the engine against the host's.
 
 ## Per-connection verification
 
-The Eidola server's outbound HTTPS client (constructed by `tinfoil-verifier::attesting_client`) re-verifies the upstream enclave on every new TCP+TLS handshake. The mechanics are the same as for the client→server path, because they use the same crate:
+The Eidola server's outbound HTTPS client for each engine (`tinfoil-verifier::attesting_client`, built over that engine's model's pins) re-verifies the deployment on every new TCP+TLS handshake. The mechanics are those of the client→server path, on the TDX branch:
 
 - Inline `GET /.well-known/tinfoil-attestation?nonce=<hex>` (a fresh random nonce per handshake) over the same TCP+TLS connection that will carry the application request.
-- Strict envelope/hash checks, nonce freshness, and endorsed TLS SPKI comparison with the peer cert.
-- Self-contained AMD VCEK chain and complete carried-CRL verification, entirely offline; SEV-SNP report verification with field hygiene (DEBUG/MIGRATE_MA policy bits, signer, ID-block); and TCB policy enforcement. A relay can replay an older AMD-signed CRL only while its signed validity interval remains current. (TDX presentations are refused outright — see [gaps.md](gaps.md#tdx-acceptance).)
-- Measurement check against the runtime-resolved allowed set (see [What pins the upstream measurement](#what-pins-the-upstream-measurement)).
-- Binding of the report's `REPORT_DATA` to the verifier nonce and exact endorsed-section hashes, where the crypto section's `tls` item equals `sha256(SPKI(peer_cert))`.
+- Strict envelope and hash checks, nonce freshness, and endorsed TLS SPKI comparison with the peer certificate.
+- TDX quote verification to the pinned Intel root with the Intel collateral the document carries, entirely offline, then the pinned launch identity (MRTD, MRCONFIGID, zero RTMRs) and machine policy.
+- Binding of the quote's `REPORT_DATA` to the verifier nonce and the exact endorsed-section hashes, then exactly the pinned number of GPU evidence items, each produced for this handshake's nonce.
 
-A failed attestation rejects the request before any inference data crosses the wire.
-
-## Why a separate enclave at all
-
-A reasonable question: why does the model run in a *different* enclave from the Eidola server? The full answer is partly structural and partly transitional.
-
-**Structurally**, confidential-compute infrastructure for serving large language models requires specialized hardware (GPUs with NVIDIA confidential compute) and operational expertise that dedicated inference providers can supply most cleanly. Eidola's role is the privacy and account layer around the inference, not the inference itself.
-
-**Transitionally**, the upstream-provider model has the appealing property that the user's trust chain at the inference layer ends at a measurement signed against the *upstream's* source — which that source can be audited against independently of Eidola.
-
-Two caveats apply to that second framing today:
-
-- Tinfoil's release process is robust — signed measurements, Sigstore provenance, public source — but it does not yet match Eidola's: in particular, Tinfoil's builds are not fully source-bootstrapped reproducible in the StageX sense, and release attestation rides on GitHub's CI attestations rather than per-release human attestations under named legal identities. So "independent" is true at the boundary (different code, different signers) but the audit surface on the upstream side is shaped differently than ours. And because the router forwards to per-model enclaves it trusts at *latest-signed-release* (which Eidola does not independently attest), the code actually running inference is trusted at Tinfoil's bar, not re-derived by Eidola — the full shape of this is catalogued in [gaps.md § Inference upstream](gaps.md#inference-upstream).
-- The long-term intent is to end the inference-layer trust chain where the rest of Eidola's does, by either of two paths (either suffices): **self-hosting inference** on GPU-enabled Tinfoil containers that Eidola controls, built through Eidola's own reproducible + human-attested flow so Eidola owns and statically pins the measurement (the goal regardless, but gated on GPU cost that is hard to justify pre-demand); or **Tinfoil adopting static-pinned upstreams** — if the router pins and publishes the specific downstream model-enclave measurements it forwards to, the downstream-review gap closes without Eidola self-hosting, and continuing to use Tinfoil's inference becomes the cheaper preferred long-term solution. Both are roadmap, not the current release.
-
-The cost of the current split is one additional verification step (Eidola server → upstream) on each inference, which adds a small per-handshake latency cost on top of the connection-pooled normal request path.
-
-The cvmimage / OVMF non-determinism caveat moved to [gaps.md#build-chain-opacity](gaps.md#build-chain-opacity), since it cuts across the whole server-side trust chain (not just inference upstream).
+A failed attestation rejects the request before any inference data crosses the wire. Before an engine takes traffic, and periodically after, the server also asks it (over an attested connection) which model and weights it serves, and refuses to route to one that reports anything but the pinned model, the pinned weights hash and read-only verified weights storage.

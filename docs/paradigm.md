@@ -19,16 +19,14 @@ The client is also designed to **fail safe**: if anything in the verification ch
 Your app's data — chat history, drafts, accounts — lives on your device. When a request does need remote computation, it is sent only to confidential-compute enclaves, with TLS terminated inside the enclave so that no host, operator, or network observer — us included — can read it in transit, and no system writes it to storage or logs.
 
 > [!WARNING]
-> The most meaningful limitation today is delegation to our upstream inference provider. The models themselves currently run in enclaves fully managed by Tinfoil — the same company hosting the confidential-compute machines that power Eidola. Their inference services make the same confidentiality promises as the rest of Eidola, but are held to a category-weaker discipline than our own: they are not yet reproducible and human-attested to the same standard, and their exact version is not pinned transitively from your client the way Eidola's server is.
->
-> Eidola verifies the upstream's hardware attestation on every connection, but does not yet re-derive or pin the code running inside it. Hosting inference ourselves — on the same reproducible, human-attested, client-pinned footing as the rest of Eidola — is the intended resolution, but this waits on enough real usage to justify the GPU cost. The full picture is in the [threat model](threat-model.md), [inference upstream](upstream.md), and [known gaps](gaps.md).
+> The models run on Eidola's own inference engine, in confidential VMs with NVIDIA confidential-computing GPUs, which the Eidola server attests on every connection against the deployments pinned in its own build, and which your client therefore pins transitively. Two limits remain at that layer: the GPUs' own attestation evidence is bound to each connection but not yet appraised against NVIDIA's roots (what vouches for the GPUs is the measured guest, which refuses to start without them in confidential-computing mode), and the VM's boot image is the hosting platform's, measured but not built through our source-bootstrapped flow. No engine deployment is pinned yet, so until the first one is, Eidola sells no models. The full picture is in the [threat model](threat-model.md), [inference engine](upstream.md), and [known gaps](gaps.md).
 
 ## 2. Code is the trust boundary, not policy
 
 Privacy guarantees in Eidola are properties of the *running code*, not of an operator's stated policy. The user can verify which code is running because:
 
 - **The source is public and reproducible.** Anyone can rebuild the released binaries from the committed source and bit-for-bit reproduce what we shipped. The expected values are stored under version control alongside the source and tested in CI, making this property structurally enforced and easily auditable.
-- **Servers run in confidential compute.** Today that means AMD SEV-SNP, Intel TDX, and NVIDIA confidential compute; the client verifies the enclave's hardware attestation on every TLS handshake (Eidola's verifier currently accepts SEV-SNP attestations only — see [gaps.md](gaps.md#tdx-acceptance)). The measurement it checks against is the one compiled into that client build. See [server.md](server.md) and [upstream.md](upstream.md).
+- **Servers run in confidential compute.** Today that means AMD SEV-SNP, Intel TDX, and NVIDIA confidential compute; the client verifies the server enclave's hardware attestation on every TLS handshake (it accepts SEV-SNP attestations only — see [gaps.md](gaps.md#tdx-acceptance)), and the server verifies each inference engine's the same way. The measurement each checks against is the one compiled into its own build. See [server.md](server.md) and [upstream.md](upstream.md).
 - **Releases are signed by humans, attesting under their own legal identity.** Every release [ships with a signed attestation](releases.md) whose exact wording the previous version of the app requires and verifies, certifying that the release meets the specific, versioned properties enumerated in [Privacy guarantees](privacy-guarantees.md). The cryptographic fingerprint for each officer is pinned in the prior client, ensuring an unbroken chain of authorized representation across releases.
 
 Collectively, these make the guarantees auditable — you don't have to trust that we *say* your chat history isn't logged when you can verify that the running code has no path to log it — and put a named human on the hook for the claims matching the code.
@@ -53,7 +51,7 @@ A note on these docs themselves: they are a map, not the territory. They will be
 - [Threat model](threat-model.md) — who you're trusting and who you're not.
 - [The client](client.md) — how local sovereignty is implemented.
 - [The server](server.md) — what runs in confidential compute, and what is deliberately kept apart from it.
-- [Inference upstream](upstream.md) — where models actually run.
+- [Inference engine](upstream.md) — where models actually run.
 - [Releases](releases.md) — how a new binary becomes trustable.
 - [Verification](verification.md) — payload, archive, envelope, installable, and the hashes a user checks.
 - [Known gaps](gaps.md) — what we don't yet defend against.
