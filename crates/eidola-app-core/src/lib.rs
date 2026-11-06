@@ -907,9 +907,15 @@ pub struct ChatResult {
     /// off before any answer text, whose reasoning is the work a continuation
     /// resumes. What must not happen is calling it finished, which is why this
     /// rides the result rather than being inferred by a surface counting
-    /// tokens. A truncated answer can be continued
-    /// ([`AppCore::continue_stream`]) where [`can_continue`] says so.
+    /// tokens.
     pub truncated: bool,
+    /// The answer this turn wrote can be continued ([`AppCore::continue_stream`])
+    /// — decided by the predicate the door applies, the one
+    /// [`PostNode::continuable`] reads, so a caller that suggests continuing
+    /// never suggests what the door refuses. Defaulted on the wire, so an older
+    /// app's result reads as not continuable.
+    #[serde(default)]
+    pub continuable: bool,
 }
 
 /// A turn that ended at the agent-side decline checkpoint (see [`decline`]).
@@ -7407,6 +7413,7 @@ impl Inner {
             // caller can mistake it for one and cascade off it.
             response_action_id: None,
             truncated: false,
+            continuable: false,
             declined: Some(DeclineOutcome {
                 reason,
                 action_id: decision_id,
@@ -7581,6 +7588,19 @@ impl Inner {
         Ok(())
     }
 
+    /// [`ChatResult::continuable`], from the door's own predicate: only an
+    /// answer that stopped at its ceiling is asked about, so an ordinary turn
+    /// reads nothing more.
+    async fn settle_continuable(&self, mut result: ChatResult) -> Result<ChatResult, AppError> {
+        if let (true, Some(id)) = (result.truncated, result.response_action_id.as_deref()) {
+            let db_conn = self.db_conn().await?;
+            result.continuable = continuation_basis(&db_conn, &result.space_id, id)
+                .await?
+                .is_some();
+        }
+        Ok(result)
+    }
+
     /// Has this endpoint rejected a request carrying a `tools` field during
     /// this process's lifetime? See the gate in `prepare_turn` for why this is
     /// learned rather than assumed from the backend's kind, and why the
@@ -7722,7 +7742,7 @@ impl Inner {
                     // The turn is committed and emitted; a branch that grew by
                     // this response is summarized behind it (see [`summaries`]).
                     self.spawn_branch_summaries(&result.space_id);
-                    return Ok(result);
+                    return self.settle_continuable(result).await;
                 }
                 RoundOutcome::ToolRound => continue,
             }
@@ -8118,6 +8138,7 @@ impl Inner {
                 response_action_id: None,
                 declined: None,
                 truncated,
+                continuable: false,
             }));
         }
 
@@ -8161,6 +8182,7 @@ impl Inner {
             response_action_id,
             declined: None,
             truncated,
+            continuable: false,
         }))
     }
 
@@ -8534,7 +8556,7 @@ impl Inner {
                     // The turn is committed and emitted; a branch that grew by
                     // this response is summarized behind it (see [`summaries`]).
                     self.spawn_branch_summaries(&result.space_id);
-                    return Ok(result);
+                    return self.settle_continuable(result).await;
                 }
                 RoundOutcome::ToolRound => continue,
             }
@@ -9131,6 +9153,7 @@ impl Inner {
                 response_action_id: None,
                 declined: None,
                 truncated,
+                continuable: false,
             }));
         }
 
@@ -9153,6 +9176,7 @@ impl Inner {
             response_action_id,
             declined: None,
             truncated,
+            continuable: false,
         }))
     }
 

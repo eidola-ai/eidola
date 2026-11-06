@@ -6170,6 +6170,7 @@ fn an_ordinary_turn_is_not_reported_as_truncated() {
             .block_on(core.chat("hello".into(), MODEL.into(), None))
             .expect("chat");
         assert!(!res.truncated);
+        assert!(!res.continuable);
 
         // Nor is the durable flag set on anything the turn wrote — "nobody set
         // it" and "it is false" have to be the same state on disk too.
@@ -6355,6 +6356,7 @@ fn a_cut_off_answer_continues_where_it_stopped() {
             .expect("the cut-off turn");
         let cut_id = cut.response_action_id.clone().unwrap();
         assert_eq!(cut.content, STREAM_CONTENT);
+        assert!(cut.continuable, "the result carries the door's verdict");
 
         let res = core
             .runtime()
@@ -6405,6 +6407,7 @@ fn a_continuation_that_stops_again_is_continued_again() {
         let (again, _, _) = continue_streaming(&core, &cut_id);
         let again = again.expect("the first continuation");
         assert!(again.truncated, "it stopped at the ceiling again");
+        assert!(again.continuable, "and its result says it can go on");
         let once = format!("{TRUNCATED_REASONING}{CONTINUED_REASONING}");
         let post = post_at(&core, &cut.space_id, 1);
         assert_eq!(block_thinking(&post), once);
@@ -6637,6 +6640,10 @@ fn an_answer_whose_request_the_record_cut_is_not_continuable() {
             .block_on(core.chat(long, MODEL.into(), None))
             .expect("the cut-off turn");
         assert!(cut.truncated);
+        assert!(
+            !cut.continuable,
+            "the result says so too, so a caller suggests no continuation"
+        );
         let answer = post_at(&core, &cut.space_id, 1);
         assert!(answer.truncated && !answer.continuable);
         let hits = mock.chat_hits();

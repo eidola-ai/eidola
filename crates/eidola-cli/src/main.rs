@@ -2034,11 +2034,12 @@ fn chat_summary(result: &eidola_app_core::ChatResult) -> String {
     if result.truncated {
         // Where the answer can be continued the warning names the command that
         // does it, with the post it acts on — the one id this run has that the
-        // reader could not otherwise find.
+        // reader could not otherwise find. `continuable` is the door's own
+        // verdict, so the command named is never one that would be refused.
         match result
             .response_action_id
             .as_deref()
-            .filter(|_| eidola_app_core::can_continue(Some(&result.model)))
+            .filter(|_| result.continuable)
         {
             Some(post) => out.push_str(&format!(
                 "warning: this answer stopped at the model's length limit, not because the \
@@ -2153,6 +2154,8 @@ mod tests {
             response_action_id: Some("a2".into()),
             declined: None,
             truncated,
+            // As the core reports it for a truncated answer it could continue.
+            continuable: truncated,
         }
     }
 
@@ -2183,10 +2186,11 @@ mod tests {
             cut_off.contains("`eidola chat --continue a2`"),
             "{cut_off:?}"
         );
-        // A local model's answer cannot be continued, so the warning offers
-        // no command that would be refused.
+        // An answer the core says cannot be continued (a local model's, one
+        // whose author left, one whose request the Record cut) gets no command
+        // that would be refused.
         let local = chat_summary(&eidola_app_core::ChatResult {
-            model: "gemma@local".into(),
+            continuable: false,
             ..finished_turn(true)
         });
         assert!(
@@ -3077,6 +3081,7 @@ mod tests {
                 response_action_id: None,
                 declined: None,
                 truncated: false,
+                continuable: false,
             },
         )]
     }

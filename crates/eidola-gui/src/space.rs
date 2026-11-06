@@ -3039,6 +3039,7 @@ impl Space {
                 action_id: "decision-1".into(),
             }),
             truncated: false,
+            continuable: false,
         };
         // The synthetic read covers everything announced so far, which is
         // what a real exit reload's watermark says (`bridge::get_space_tree`
