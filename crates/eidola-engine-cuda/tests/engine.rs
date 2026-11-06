@@ -645,12 +645,23 @@ fn a_host_tier_hit_equals_a_device_hit_and_a_recompute() {
         Some(e) => e.text.clone(),
         None => return,
     };
-    let prompt = text[..70].to_vec();
+    // Disjoint spans of the golden: the conversation, five others that push it off the
+    // device, and its continuation's new tokens.
+    const SPAN: usize = 50;
+    assert!(
+        text.len() >= 6 * SPAN + 5,
+        "the golden holds {} tokens; this test needs {}",
+        text.len(),
+        6 * SPAN + 5
+    );
+    let prompt = text[..SPAN].to_vec();
     let others: Vec<Vec<u32>> = (1..=5)
-        .map(|i| text[i * 40..i * 40 + 70].to_vec())
+        .map(|i| text[i * SPAN..(i + 1) * SPAN].to_vec())
         .collect();
+    let tail = &text[6 * SPAN..6 * SPAN + 5];
     let mut runs = Vec::new();
-    for (blocks, host) in [(256, 0), (24, 128)] {
+    // 16 blocks hold the conversation and three others' cached blocks, not six.
+    for (blocks, host) in [(256, 0), (16, 128)] {
         let Some(mut h) = Harness::with_host(blocks, host, 64, 1024) else {
             return;
         };
@@ -709,7 +720,7 @@ fn a_host_tier_hit_equals_a_device_hit_and_a_recompute() {
         }
         let mut next = prompt.clone();
         next.extend(&h.outputs[&1]);
-        next.extend(&text[400..405]);
+        next.extend(tail);
         run_alone(&mut h, 2, next.clone(), 1);
         if host > 0 {
             assert!(h.eng.kv().tier_stats().promoted_blocks > 0);
