@@ -669,6 +669,7 @@ fn step(
         positions.extend(context..context + n);
     }
     ex.execute(&StepInput {
+        kv_keys: Vec::new(),
         bucket: Bucket {
             max_seqs: 8,
             max_tokens: 2048,

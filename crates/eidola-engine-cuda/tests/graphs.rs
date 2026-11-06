@@ -142,6 +142,7 @@ fn step_of(seqs: Vec<SeqEntry>, tokens: Vec<u32>, updates: Vec<TableUpdate>) -> 
         .flat_map(|s| s.context_len..s.context_len + s.num_tokens)
         .collect();
     StepInput {
+        kv_keys: Vec::new(),
         bucket: Bucket {
             max_seqs: SLOTS,
             max_tokens: 512,

@@ -43,7 +43,7 @@ use eidola_engine::engine::{CacheScope, Engine, Event, FinishReason, Request, Sc
 use eidola_engine::executor::{Executor, SeqEntry, StepInput, TableUpdate};
 use eidola_engine::kv::CachePolicy;
 use eidola_engine::sampling::SamplingParams;
-use eidola_engine::secret::EngineSalt;
+use eidola_engine::secret::{BootKey, CacheKey, Lineage, SaltDeriver};
 use eidola_engine::spec::Bucket;
 use eidola_engine_cpu::{CpuExecutor, CpuExecutorConfig};
 use eidola_engine_cuda::{
@@ -187,8 +187,9 @@ fn sched(chunk: u32, speculative: bool) -> SchedulerConfig {
     }
 }
 
-fn salt(n: u8) -> EngineSalt {
-    EngineSalt::from_bytes([n; 32])
+/// The lineage of client key `[n; 32]` under a fixed boot key.
+fn salt(n: u8) -> Lineage {
+    SaltDeriver::with_boot_key(BootKey::from_bytes([0; 32])).lineage(&CacheKey::from_bytes([n; 32]))
 }
 
 /// One request of a workload, submitted at step `at`; `key` names a salt
@@ -709,6 +710,7 @@ fn graphs_and_eager_agree_with_drafting() {
         let c = u32::try_from(toks.len() - 1).unwrap();
         ex.set_decode_path(DecodePath::Eager);
         let step = StepInput {
+            kv_keys: Vec::new(),
             bucket: buckets()[1],
             maintenance: vec![],
             table_updates: if slot == 0 { updates.clone() } else { vec![] },
@@ -753,6 +755,7 @@ fn graphs_and_eager_agree_with_drafting() {
                 .collect();
             ex.set_decode_path(path);
             let step = StepInput {
+                kv_keys: Vec::new(),
                 bucket: buckets()[1],
                 maintenance: vec![],
                 table_updates: vec![],

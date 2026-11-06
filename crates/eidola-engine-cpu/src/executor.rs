@@ -231,6 +231,7 @@ pub struct CpuExecutor {
     states: Vec<SlotState>,
     records: Mutex<Vec<RowRecord>>,
     zero_log: Vec<(u64, u32, u32)>,
+    crypt_log: Vec<(u64, u32, u32, bool)>,
     steps: u64,
 }
 
@@ -362,6 +363,7 @@ impl CpuExecutor {
             states: vec![SlotState::zeroed(depths, mc.hidden_size); cfg.num_state_slots as usize],
             records: Mutex::new(Vec::new()),
             zero_log: Vec::new(),
+            crypt_log: Vec::new(),
             steps: 0,
             model,
             spec,
@@ -396,6 +398,22 @@ impl CpuExecutor {
     /// Whether every byte of a block (KV, drafter taps and tags) is zero.
     pub fn block_is_zero(&self, group: u32, block: u32) -> bool {
         self.pools[group as usize].block_is_zero(block)
+    }
+
+    /// Whether a block is held encrypted.
+    pub fn block_is_encrypted(&self, group: u32, block: u32) -> bool {
+        self.pools[group as usize].is_encrypted(block)
+    }
+
+    /// Every executed encrypt (`true`) or decrypt as `(step, group, block, encrypt)`.
+    pub fn crypt_log(&self) -> &[(u64, u32, u32, bool)] {
+        &self.crypt_log
+    }
+
+    /// A block's stored image as words (KV, tap, row tags, tap tag), as the encryption
+    /// covers it: plaintext or ciphertext, whichever the block holds.
+    pub fn block_image(&self, group: u32, block: u32) -> Vec<u32> {
+        self.pools[group as usize].image(block)
     }
 
     /// Whether a slot's per-sequence model state (the drafter's hidden states) is
@@ -866,6 +884,26 @@ impl Executor for CpuExecutor {
                     self.pools[group as usize].copy(src, dst);
                 }
                 Maintenance::ResetSlot { slot } => self.reset_slot(slot),
+                Maintenance::Encrypt {
+                    group,
+                    block,
+                    key,
+                    nonce,
+                }
+                | Maintenance::Decrypt {
+                    group,
+                    block,
+                    key,
+                    nonce,
+                } => {
+                    let encrypt = matches!(m, Maintenance::Encrypt { .. });
+                    let key = step
+                        .kv_keys
+                        .get(key as usize)
+                        .unwrap_or_else(|| panic!("maintenance names key {key}, not in the step"));
+                    self.pools[group as usize].crypt(block, key, &nonce, encrypt);
+                    self.crypt_log.push((self.steps, group, block, encrypt));
+                }
             }
         }
         for u in &step.table_updates {

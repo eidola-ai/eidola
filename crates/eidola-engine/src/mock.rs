@@ -12,11 +12,19 @@
 //!
 //! Writes assert that the target block is mapped by exactly one (slot, index) pair: blocks
 //! shared through the prefix cache are immutable.
+//!
+//! `Encrypt` and `Decrypt` really XOR a block's image (each entry's value as two
+//! little-endian words, then its position) with the [`crate::kv_cipher`] keystream, so a
+//! read of a block left encrypted fails like a read of a zeroed one. The mock also records
+//! which key encrypted each block (as a keystream fingerprint, not the key) and fails a
+//! step that decrypts under another key, decrypts a plaintext block or encrypts twice.
 
 use std::collections::HashMap;
 
 use crate::executor::{Executor, ExecutorError, Maintenance, SeqEntry, StepInput, StepOutput};
+use crate::kv_cipher::{KvKeystream, KvNonce};
 use crate::sampling::{self, SamplingParams, Stream, mix64};
+use crate::secret::KvKey;
 use crate::spec::{AttentionKind, Bucket, KvGroupSpec, KvRole, ModelSpec, NULL_BLOCK};
 
 /// Mock model parameters.
@@ -170,6 +178,14 @@ pub fn reference_generate(
     out
 }
 
+/// A stand-in for "which key": the first keystream words under a fixed nonce no block
+/// hash yields in practice. Test instrumentation only.
+fn fingerprint(key: &KvKey) -> u64 {
+    let mut w = [0u32; 2];
+    KvKeystream::new(key, &KvNonce::from_words([u32::MAX; 3])).apply_words(&mut w);
+    u64::from(w[0]) | (u64::from(w[1]) << 32)
+}
+
 /// The mock executor.
 #[derive(Debug)]
 pub struct MockExecutor {
@@ -182,6 +198,10 @@ pub struct MockExecutor {
     /// `[group]`: block -> number of (slot, index) mappings.
     mapped: Vec<HashMap<u32, u32>>,
     zero_log: Vec<(u64, u32, u32)>,
+    /// `[group][block]`: the fingerprint of the key the block is encrypted under.
+    encrypted: Vec<Vec<Option<u64>>>,
+    /// Every executed encrypt (`true`) or decrypt as `(step, group, block, encrypt)`.
+    crypt_log: Vec<(u64, u32, u32, bool)>,
     steps: u64,
     buckets_used: Vec<Bucket>,
     rows_used: Vec<Vec<SeqEntry>>,
@@ -202,6 +222,12 @@ impl MockExecutor {
             tables: vec![vec![vec![NULL_BLOCK; width]; groups]; spec.num_state_slots as usize],
             mapped: vec![HashMap::new(); groups],
             zero_log: Vec::new(),
+            encrypted: spec
+                .kv_groups
+                .iter()
+                .map(|g| vec![None; g.num_blocks as usize])
+                .collect(),
+            crypt_log: Vec::new(),
             steps: 0,
             buckets_used: Vec::new(),
             rows_used: Vec::new(),
@@ -213,6 +239,22 @@ impl MockExecutor {
     /// Every executed zero as `(step, group, block)`.
     pub fn zero_log(&self) -> &[(u64, u32, u32)] {
         &self.zero_log
+    }
+
+    /// Every executed encrypt (`true`) or decrypt as `(step, group, block, encrypt)`.
+    pub fn crypt_log(&self) -> &[(u64, u32, u32, bool)] {
+        &self.crypt_log
+    }
+
+    /// Whether a block is held encrypted.
+    pub fn block_is_encrypted(&self, group: u32, block: u32) -> bool {
+        self.encrypted[group as usize][block as usize].is_some()
+    }
+
+    /// The keystream fingerprint of the key a block is encrypted under (`None`: plaintext).
+    /// Equal fingerprints mean the same key.
+    pub fn encrypted_under(&self, group: u32, block: u32) -> Option<u64> {
+        self.encrypted[group as usize][block as usize]
     }
 
     /// Steps executed.
@@ -237,6 +279,51 @@ impl MockExecutor {
         self.memory[group as usize][start..start + bs]
             .iter()
             .all(|&(v, p)| v == 0 && p == 0)
+    }
+
+    /// XORs block `block` of `group` with its keystream, and checks and records its state.
+    fn crypt(
+        &mut self,
+        group: u32,
+        block: u32,
+        key: &KvKey,
+        nonce: &KvNonce,
+        encrypt: bool,
+    ) -> Result<(), ExecutorError> {
+        let print = fingerprint(key);
+        let state = &mut self.encrypted[group as usize][block as usize];
+        match (encrypt, *state) {
+            (true, None) => *state = Some(print),
+            (false, Some(p)) if p == print => *state = None,
+            (false, Some(_)) => {
+                return Err(ExecutorError(format!(
+                    "group {group} block {block}: decrypt under another key"
+                )));
+            }
+            (true, Some(_)) => {
+                return Err(ExecutorError(format!(
+                    "group {group} block {block}: encrypted twice"
+                )));
+            }
+            (false, None) => {
+                return Err(ExecutorError(format!(
+                    "group {group} block {block}: decrypt of a plaintext block"
+                )));
+            }
+        }
+        let bs = self.spec.block_size as usize;
+        let start = block as usize * bs;
+        let cells = &mut self.memory[group as usize][start..start + bs];
+        KvKeystream::new(key, nonce).range(3 * bs, |i, k| {
+            let (v, p) = &mut cells[i / 3];
+            match i % 3 {
+                0 => *v ^= u64::from(k),
+                1 => *v ^= u64::from(k) << 32,
+                _ => *p ^= k,
+            }
+        });
+        self.crypt_log.push((self.steps, group, block, encrypt));
+        Ok(())
     }
 
     fn set_table(&mut self, slot: u32, group: u32, index: u32, block: u32) {
@@ -387,7 +474,26 @@ impl Executor for MockExecutor {
                 Maintenance::Zero { group, block } => {
                     let start = block as usize * bs;
                     self.memory[group as usize][start..start + bs].fill((0, 0));
+                    self.encrypted[group as usize][block as usize] = None;
                     self.zero_log.push((self.steps, group, block));
+                }
+                Maintenance::Encrypt {
+                    group,
+                    block,
+                    key,
+                    nonce,
+                }
+                | Maintenance::Decrypt {
+                    group,
+                    block,
+                    key,
+                    nonce,
+                } => {
+                    let encrypt = matches!(m, Maintenance::Encrypt { .. });
+                    let key = step.kv_keys.get(key as usize).ok_or_else(|| {
+                        ExecutorError(format!("maintenance names key {key}, not in the step"))
+                    })?;
+                    self.crypt(group, block, key, &nonce, encrypt)?;
                 }
                 Maintenance::Copy { group, src, dst } => {
                     let g = &mut self.memory[group as usize];
@@ -395,6 +501,8 @@ impl Executor for MockExecutor {
                         src as usize * bs..(src as usize + 1) * bs,
                         dst as usize * bs,
                     );
+                    let e = &mut self.encrypted[group as usize];
+                    e[dst as usize] = e[src as usize];
                 }
                 Maintenance::ResetSlot { slot } => {
                     for g in 0..self.spec.kv_groups.len() {

@@ -131,7 +131,11 @@
     },
     {
       "path": "csrc/kernels.json",
-      "sha256": "8f94d86f6f47c1850568e6394ac9454ea4b0d3fc1281a76acc4d40f3f4418327"
+      "sha256": "e5382c905754fe833c6891e38dca05d79e0b552cfc8022cbe834d3e63a0bd5f4"
+    },
+    {
+      "path": "csrc/kv_cipher.cu",
+      "sha256": "598d31479050e0f6ee151a37fabdbf185cfc674eb8a57aff65b3b1a81784b4a5"
     },
     {
       "path": "csrc/rmsnorm.cu",
@@ -1091,6 +1095,66 @@
       }
     },
     {
+      "name": "kv_cipher",
+      "arch": "sm_100a",
+      "source": "csrc/kv_cipher.cu",
+      "profile": "own",
+      "file": "cubin/kv_cipher.sm_100a.cubin",
+      "sha256": "ab01c57ce1bab84a1ff8a01a6778628a1064d6dd177ac6b004a845881d8a68b8",
+      "size": 31840,
+      "entries": [
+        {
+          "symbol": "eidola_kv_chacha20",
+          "demangled": "eidola_kv_chacha20",
+          "meta": "eidola_kv_chacha20_meta"
+        }
+      ],
+      "meta": [
+        "eidola_kv_chacha20_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "kv_cipher",
+      "arch": "sm_100f",
+      "source": "csrc/kv_cipher.cu",
+      "profile": "own",
+      "file": "cubin/kv_cipher.sm_100f.cubin",
+      "sha256": "31548307901fb61702f501ce58659e5a0292a57fe2aaa0663f0608991b74416b",
+      "size": 31840,
+      "entries": [
+        {
+          "symbol": "eidola_kv_chacha20",
+          "demangled": "eidola_kv_chacha20",
+          "meta": "eidola_kv_chacha20_meta"
+        }
+      ],
+      "meta": [
+        "eidola_kv_chacha20_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "kv_cipher",
+      "arch": "sm_103a",
+      "source": "csrc/kv_cipher.cu",
+      "profile": "own",
+      "file": "cubin/kv_cipher.sm_103a.cubin",
+      "sha256": "b15e26ec4196c96c1c96873323f60073adee8ec5a6dba0e97e6f04482fa5d482",
+      "size": 31840,
+      "entries": [
+        {
+          "symbol": "eidola_kv_chacha20",
+          "demangled": "eidola_kv_chacha20",
+          "meta": "eidola_kv_chacha20_meta"
+        }
+      ],
+      "meta": [
+        "eidola_kv_chacha20_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
       "name": "rmsnorm",
       "arch": "sm_100a",
       "source": "csrc/rmsnorm.cu",
@@ -1285,6 +1349,16 @@
       "file": "fatbin/flashinfer_fa2_sink_paged.fatbin",
       "sha256": "55789bbd3af58bde637c9fcd0551ed30b21d5696cae919cbfe20e24aad053e02",
       "size": 914336,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "kv_cipher",
+      "file": "fatbin/kv_cipher.fatbin",
+      "sha256": "34de69d72b3be811d779c7604f939b132e2aa00281abc6f5f1badf0b8d4732b8",
+      "size": 63912,
       "archs": [
         "sm_100a",
         "sm_103a"

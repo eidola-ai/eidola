@@ -20,6 +20,7 @@ pub mod executor;
 pub mod gemm;
 pub mod graph;
 pub mod kv;
+pub mod kv_cipher;
 pub mod launch;
 pub mod model;
 pub mod module;

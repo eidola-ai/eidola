@@ -23,7 +23,7 @@ use common::setup;
 use eidola_engine::engine::{CacheScope, Engine, FinishReason, Request, SchedulerConfig};
 use eidola_engine::kv::CachePolicy;
 use eidola_engine::sampling::SamplingParams;
-use eidola_engine::secret::EngineSalt;
+use eidola_engine::secret::{BootKey, CacheKey, Lineage, SaltDeriver};
 use eidola_engine::spec::Bucket;
 use eidola_engine_cuda::{CudaExecutor, CudaExecutorConfig, CudaGraphs, KvBlocks, MtpHidden};
 use eidola_engine_model::safetensors::WeightSet;
@@ -99,8 +99,9 @@ fn sched(chunk: u32) -> SchedulerConfig {
     }
 }
 
-fn salt(n: u8) -> EngineSalt {
-    EngineSalt::from_bytes([n; 32])
+/// The lineage of client key `[n; 32]` under a fixed boot key.
+fn salt(n: u8) -> Lineage {
+    SaltDeriver::with_boot_key(BootKey::from_bytes([0; 32])).lineage(&CacheKey::from_bytes([n; 32]))
 }
 
 fn request(
@@ -270,6 +271,97 @@ impl Harness {
 
 fn greedy() -> SamplingParams {
     SamplingParams::greedy()
+}
+
+/// Idle prefix-cache KV is ciphertext on the device, and a hit decrypts it into exactly
+/// the bits a recompute writes. A keyed request runs (each block's bytes read back while a
+/// sequence maps it, or its encryption is still queued, which is its plaintext); once the
+/// engine flushes, every cached block on the device differs from that plaintext in
+/// essentially every word, the cipher's device item list (which carried the key) is zero,
+/// and the engine holds no key. The same request again hits and produces the same tokens
+/// as the first run and as a run under another key, which recomputes everything.
+#[test]
+fn idle_kv_is_ciphertext_on_the_device_and_a_hit_decrypts_it() {
+    let Some(mut h) = Harness::new(64, 64) else {
+        return;
+    };
+    let text = env().unwrap().text.clone();
+    let prompt = text[..70].to_vec();
+    h.submit(request(
+        1,
+        prompt.clone(),
+        greedy(),
+        8,
+        CacheScope::Keyed(salt(1)),
+    ));
+    let mut plain: HashMap<(u32, u32), Vec<u16>> = HashMap::new();
+    while h.eng.unfinished() > 0 {
+        h.step();
+        h.now += 1;
+        let kv = h.eng.kv();
+        let crypts = kv.pending_crypts();
+        let mut blocks: Vec<(u32, u32)> = kv
+            .sequence_blocks()
+            .into_iter()
+            .filter(|b| !crypts.contains_key(b))
+            .collect();
+        blocks.extend(crypts.iter().filter(|(_, e)| **e).map(|(b, _)| *b));
+        let ex = h.eng.executor();
+        for (g, b) in blocks {
+            plain.insert((g, b), ex.kv().read_block(ex.gpu(), g as usize, b).unwrap());
+        }
+    }
+    h.eng.flush().unwrap();
+    h.check();
+    let ex = h.eng.executor();
+    let cached = h.eng.kv().cache_blocks();
+    assert_eq!(h.eng.kv().idle_blocks(), cached);
+    for &(g, b) in &cached {
+        let c = ex.kv().read_block(ex.gpu(), g as usize, b).unwrap();
+        let p = &plain[&(g, b)];
+        let same = c
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(p.as_chunks::<2>().0)
+            .filter(|(x, y)| x == y)
+            .count();
+        assert!(
+            same * 1000 < c.len() / 2,
+            "group {g} block {b}: idle KV is not ciphertext ({same} words unchanged)"
+        );
+    }
+    assert!(
+        ex.kv()
+            .cipher()
+            .unwrap()
+            .read_items(ex.gpu())
+            .unwrap()
+            .iter()
+            .all(|i| *i == eidola_engine_cuda::kv_cipher::CipherItem::default()),
+        "the device item list still holds a key"
+    );
+    assert_eq!(h.eng.kv_keys_held(), 0);
+    h.submit(request(
+        2,
+        prompt.clone(),
+        greedy(),
+        8,
+        CacheScope::Keyed(salt(1)),
+    ));
+    h.submit(request(3, prompt, greedy(), 8, CacheScope::Keyed(salt(2))));
+    h.run();
+    assert_eq!(h.cached[&2], 64, "a hit on the decrypted prefix");
+    assert_eq!(h.cached[&3], 0);
+    assert_eq!(h.outputs[&2], h.outputs[&1], "the hit changed the output");
+    assert_eq!(
+        h.outputs[&3], h.outputs[&1],
+        "the recompute changed the output"
+    );
+    h.eng.flush().unwrap();
+    assert_eq!(h.eng.kv_keys_held(), 0);
+    let (n, _, worst) = h.check_outputs();
+    println!("idle encryption: {n} greedy tokens, worst trail {worst:.3}");
 }
 
 #[test]

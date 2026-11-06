@@ -193,6 +193,7 @@ fn main() {
     };
     // Rows `0..rows` at their positions with their next tokens.
     let decode = |pos: &[u32], tok: &[u32], updates: Vec<TableUpdate>| StepInput {
+        kv_keys: Vec::new(),
         bucket,
         maintenance: vec![],
         table_updates: updates,
@@ -227,6 +228,7 @@ fn main() {
                 for start in (0..context).step_by(512) {
                     let len = (context - start).min(512);
                     ex.execute(&StepInput {
+                        kv_keys: Vec::new(),
                         bucket,
                         maintenance: vec![],
                         table_updates: updates.take().unwrap_or_default(),

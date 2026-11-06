@@ -3,6 +3,7 @@
 //! * [`executor`] — the seam between the host engine and whatever runs the model.
 //! * [`spec`] — the model/memory description an executor reports.
 //! * [`kv`] — paged KV manager and salted prefix cache.
+//! * [`kv_cipher`] — the cipher idle prefix-cache KV is held under.
 //! * [`engine`] — the scheduler and request lifecycle.
 //! * [`sampling`] — CPU reference sampling and speculative acceptance.
 //! * [`secret`], [`hash`] — cache keys, salts, and the block-hash chain.
@@ -14,6 +15,7 @@ pub mod engine;
 pub mod executor;
 pub mod hash;
 pub mod kv;
+pub mod kv_cipher;
 pub mod mock;
 pub mod sampling;
 pub mod secret;

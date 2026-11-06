@@ -1,6 +1,7 @@
 //! The executor driven directly through the seam, without the scheduler: maintenance
-//! semantics (zero really zeroes, copy really copies), drafter state carried by boundary
-//! taps, batch-composition independence, and panics on contract violations.
+//! semantics (zero really zeroes, copy really copies, encrypt and decrypt round-trip),
+//! drafter state carried by boundary taps, batch-composition independence, and panics on
+//! contract violations.
 
 mod common;
 
@@ -8,7 +9,9 @@ use common::*;
 use eidola_engine::executor::{
     Executor, Maintenance, SeqEntry, Slot, StepInput, StepOutput, TableUpdate,
 };
+use eidola_engine::kv_cipher::KvNonce;
 use eidola_engine::sampling::SamplingParams;
+use eidola_engine::secret::KvKey;
 use eidola_engine::spec::NULL_BLOCK;
 use eidola_engine_cpu::{CpuExecutor, DenseRun};
 
@@ -43,6 +46,15 @@ struct Row {
 }
 
 fn step(rows: &[Row], maintenance: Vec<Maintenance>, table_updates: Vec<TableUpdate>) -> StepInput {
+    keyed_step(rows, maintenance, table_updates, Vec::new())
+}
+
+fn keyed_step(
+    rows: &[Row],
+    maintenance: Vec<Maintenance>,
+    table_updates: Vec<TableUpdate>,
+    kv_keys: Vec<KvKey>,
+) -> StepInput {
     let mut seqs = Vec::new();
     let mut token_ids = Vec::new();
     let mut positions = Vec::new();
@@ -65,6 +77,7 @@ fn step(rows: &[Row], maintenance: Vec<Maintenance>, table_updates: Vec<TableUpd
             max_tokens: 256,
         },
         maintenance,
+        kv_keys,
         table_updates,
         seqs,
         token_ids,
@@ -290,6 +303,153 @@ fn reading_a_zeroed_block_panics() {
         .collect();
     e.execute(&step(&[decode(0, 4, TOKS[4], 0)], zero, map(&e, 0, 1, 2)))
         .unwrap();
+}
+
+/// `Encrypt` or `Decrypt` of `block` in every group, under key index 0, with a nonce per
+/// group.
+fn crypt_all(e: &CpuExecutor, block: u32, encrypt: bool) -> Vec<Maintenance> {
+    (0..groups(e))
+        .map(|group| {
+            let nonce = KvNonce::from_words([group, block, 7]);
+            if encrypt {
+                Maintenance::Encrypt {
+                    group,
+                    block,
+                    key: 0,
+                    nonce,
+                }
+            } else {
+                Maintenance::Decrypt {
+                    group,
+                    block,
+                    key: 0,
+                    nonce,
+                }
+            }
+        })
+        .collect()
+}
+
+fn key(n: u8) -> KvKey {
+    KvKey::from_bytes([n; 32])
+}
+
+/// Encrypting a block changes essentially every stored word of it (KV, the drafter's tap,
+/// the row tags) and nothing else; another key gives other ciphertext; decrypting
+/// restores every bit, and the sequence then continues exactly as the dense oracle does.
+#[test]
+fn encrypt_then_decrypt_restores_every_bit_and_touches_nothing_else() {
+    let filled = || {
+        let mut e = executor();
+        let mut updates = map(&e, 0, 0, 1);
+        updates.extend(map(&e, 0, 1, 2));
+        e.execute(&step(&[prefill(0, &TOKS[..8])], vec![], updates))
+            .unwrap();
+        e
+    };
+    let mut e = filled();
+    let plain: Vec<(Vec<u32>, Vec<u32>)> = (0..groups(&e))
+        .map(|g| (e.block_image(g, 1), e.block_image(g, 2)))
+        .collect();
+    let enc = crypt_all(&e, 1, true);
+    e.execute(&keyed_step(&[], enc.clone(), vec![], vec![key(1)]))
+        .unwrap();
+    let mut other = filled();
+    other
+        .execute(&keyed_step(&[], enc, vec![], vec![key(2)]))
+        .unwrap();
+    for (g, (p1, p2)) in plain.iter().enumerate() {
+        let g = g as u32;
+        let c = e.block_image(g, 1);
+        assert!(e.block_is_encrypted(g, 1));
+        let same = c.iter().zip(p1).filter(|(a, b)| a == b).count();
+        assert!(
+            same * 1000 < c.len(),
+            "group {g}: {same} of {} words unchanged",
+            c.len()
+        );
+        assert_eq!(
+            &e.block_image(g, 2),
+            p2,
+            "group {g}: other blocks untouched"
+        );
+        let c2 = other.block_image(g, 1);
+        let same = c.iter().zip(&c2).filter(|(a, b)| a == b).count();
+        assert!(
+            same * 1000 < c.len(),
+            "group {g}: keys give distinct ciphertext"
+        );
+    }
+    e.execute(&keyed_step(
+        &[],
+        crypt_all(&e, 1, false),
+        vec![],
+        vec![key(1)],
+    ))
+    .unwrap();
+    for (g, (p1, _)) in plain.iter().enumerate() {
+        assert_eq!(&e.block_image(g as u32, 1), p1, "group {g}: bit-identical");
+        assert!(!e.block_is_encrypted(g as u32, 1));
+    }
+    let out = e
+        .execute(&step(&[decode(0, 8, TOKS[8], 2)], vec![], map(&e, 0, 2, 3)))
+        .unwrap();
+    let rec = e.take_records().pop().unwrap();
+    let d = dense(&rec.tokens);
+    for (pos, l) in &rec.target_logits {
+        assert_eq!(l.as_slice(), d.target(*pos));
+    }
+    for (depth, slot, l) in &rec.drafter_logits {
+        assert_eq!(Some(l.as_slice()), d.drafter(*depth, *slot));
+    }
+    assert!(!out.row(0).is_empty());
+}
+
+/// Zeroing an encrypted block leaves only zeros, and the block is plaintext again.
+#[test]
+fn zeroing_an_encrypted_block_scrubs_it() {
+    let mut e = executor();
+    e.execute(&step(&[prefill(0, &TOKS[..4])], vec![], map(&e, 0, 0, 1)))
+        .unwrap();
+    let mut m = crypt_all(&e, 1, true);
+    m.extend((0..groups(&e)).map(|group| Maintenance::Zero { group, block: 1 }));
+    e.execute(&keyed_step(&[], m, vec![], vec![key(1)]))
+        .unwrap();
+    for g in 0..groups(&e) {
+        assert!(e.block_is_zero(g, 1) && !e.block_is_encrypted(g, 1));
+    }
+}
+
+/// A read of a block left encrypted fails its tag check, like a read of a zeroed one.
+#[test]
+#[should_panic(expected = "zeroed or foreign")]
+fn reading_an_encrypted_block_panics() {
+    let mut e = executor();
+    e.execute(&step(&[prefill(0, &TOKS[..4])], vec![], map(&e, 0, 0, 1)))
+        .unwrap();
+    let enc = crypt_all(&e, 1, true);
+    e.execute(&keyed_step(
+        &[decode(0, 4, TOKS[4], 0)],
+        enc,
+        map(&e, 0, 1, 2),
+        vec![key(1)],
+    ))
+    .unwrap();
+}
+
+#[test]
+#[should_panic(expected = "decrypted twice")]
+fn decrypting_a_plaintext_block_panics() {
+    let mut e = executor();
+    e.execute(&step(&[prefill(0, &TOKS[..4])], vec![], map(&e, 0, 0, 1)))
+        .unwrap();
+    e.execute(&keyed_step(
+        &[],
+        crypt_all(&e, 1, false),
+        vec![],
+        vec![key(1)],
+    ))
+    .unwrap();
 }
 
 #[test]
