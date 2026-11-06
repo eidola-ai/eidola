@@ -78,6 +78,11 @@ pub struct OutputConfig {
     pub tools: Option<ToolSchemas>,
     /// Drop special tokens from the text (the OpenAI-compatible default).
     pub skip_special_tokens: bool,
+    /// The final message's field the prompt ended inside
+    /// ([`crate::RenderOptions::continue_final_message`]), so the output
+    /// continues it: `reasoning_content` starts inside the reasoning, any other
+    /// field in the answer. `None` for a new assistant turn.
+    pub continuing: Option<&'static str>,
 }
 
 impl OutputConfig {
@@ -86,7 +91,15 @@ impl OutputConfig {
             thinking: enable_thinking != Some(false),
             tools: tools.filter(|t| !t.is_empty()),
             skip_special_tokens: true,
+            continuing: None,
         }
+    }
+
+    /// The same configuration for the output of a prompt rendered with
+    /// `continue_final_message` set to `field`.
+    pub fn continuing_in(mut self, field: Option<&'static str>) -> OutputConfig {
+        self.continuing = field;
+        self
     }
 }
 
@@ -152,7 +165,10 @@ impl OutputParser {
     pub fn new(config: OutputConfig, ids: impl CallIdSource + 'static) -> OutputParser {
         OutputParser {
             detok: Detokenizer::new(config.skip_special_tokens),
-            reasoning: ReasoningParser::new(config.thinking),
+            reasoning: match config.continuing {
+                None => ReasoningParser::new(config.thinking),
+                Some(field) => ReasoningParser::resuming(field == "reasoning_content"),
+            },
             tools: config
                 .tools
                 .map(|schemas| ToolCallParser::new(schemas, ids)),

@@ -15,6 +15,13 @@
 //! With thinking disabled (`enable_thinking=false`, where the prompt already
 //! ends with an empty `<think></think>`), everything is content.
 //!
+//! A continued message's prompt ends where its generation stopped
+//! ([`crate::template::ChatTemplate::render`]), so its output starts in the
+//! same place ([`ReasoningParser::resuming`]): inside an open reasoning block,
+//! where it is reasoning until `</think>` or `<tool_call>` exactly as above but
+//! with no leading tag to remove, or inside the answer, where everything is
+//! content.
+//!
 //! Streaming yields the same split for any chunking: only a suffix that could
 //! still become `</think>` or `<tool_call>` (or, at the start, `<think>`) is
 //! held back.
@@ -52,6 +59,22 @@ impl ReasoningParser {
         ReasoningParser {
             mode: if thinking_enabled {
                 Mode::Start
+            } else {
+                Mode::Content
+            },
+            held: String::new(),
+        }
+    }
+
+    /// A splitter for the output of a continued message, which starts where
+    /// the prompt left off: inside the reasoning block (`in_reasoning`), so a
+    /// leading `<think>` is reasoning text rather than a tag and the first
+    /// `</think>` ends the reasoning; or in the answer, where everything is
+    /// content.
+    pub fn resuming(in_reasoning: bool) -> ReasoningParser {
+        ReasoningParser {
+            mode: if in_reasoning {
+                Mode::Reasoning
             } else {
                 Mode::Content
             },

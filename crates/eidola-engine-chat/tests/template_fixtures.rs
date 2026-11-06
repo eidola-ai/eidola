@@ -32,6 +32,28 @@ fn first_difference(a: &str, b: &str) -> String {
     )
 }
 
+/// A case's `apply_chat_template` keyword arguments. `continue_final_message`
+/// is recorded only on the cases that set it, as the reference received it:
+/// `true` (which `transformers` reads as `"content"`) or a field name.
+fn options(case: &serde_json::Value) -> RenderOptions {
+    let continue_final_message = match &case["continue_final_message"] {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(true) => Some("content"),
+        serde_json::Value::String(field) => Some(match field.as_str() {
+            "content" => "content",
+            "reasoning_content" => "reasoning_content",
+            "foo" => "foo",
+            other => panic!("{}: unexpected field {other}", case["name"]),
+        }),
+        other => panic!("{}: unexpected value {other}", case["name"]),
+    };
+    RenderOptions {
+        add_generation_prompt: case["add_generation_prompt"].as_bool().unwrap(),
+        enable_thinking: case["enable_thinking"].as_bool(),
+        continue_final_message,
+    }
+}
+
 #[test]
 fn renders_every_fixture_byte_exactly() {
     let text = std::fs::read_to_string(fixtures().join("template_cases.json")).unwrap();
@@ -44,15 +66,21 @@ fn renders_every_fixture_byte_exactly() {
     let cases = corpus["cases"].as_array().unwrap();
     let mut failures = Vec::new();
     let mut rendered = 0;
+    let mut continued = 0;
+    let mut continued_refusals = 0;
     for case in cases {
         let name = case["name"].as_str().unwrap();
-        let options = RenderOptions {
-            add_generation_prompt: case["add_generation_prompt"].as_bool().unwrap(),
-            enable_thinking: case["enable_thinking"].as_bool(),
-        };
+        let options = options(case);
         let result =
             ChatInput::from_json(case["messages"].as_str().unwrap(), case["tools"].as_str())
                 .and_then(|input| template.render(&input, options));
+        if options.continue_final_message.is_some() {
+            if case.get("expected").is_some() {
+                continued += 1;
+            } else {
+                continued_refusals += 1;
+            }
+        }
         match (case.get("expected").and_then(|e| e.as_str()), result) {
             (Some(expected), Ok(actual)) => {
                 rendered += 1;
@@ -74,6 +102,12 @@ fn renders_every_fixture_byte_exactly() {
         failures.join("\n")
     );
     assert!(rendered >= 200, "only {rendered} rendered fixtures");
+    // The continuation corpus is part of the sweep, both halves of it.
+    assert!(continued >= 60, "only {continued} continued fixtures");
+    assert!(
+        continued_refusals >= 8,
+        "only {continued_refusals} refused continuations"
+    );
 }
 
 /// Re-encodes every tool call's object `arguments` as the JSON string an OpenAI
@@ -154,10 +188,7 @@ fn normalized_string_arguments_render_like_python_objects() {
         if name.contains("unwrapped_call") {
             *per_wrapper.entry("bare").or_default() += 1;
         }
-        let options = RenderOptions {
-            add_generation_prompt: case["add_generation_prompt"].as_bool().unwrap(),
-            enable_thinking: case["enable_thinking"].as_bool(),
-        };
+        let options = options(case);
         let result = input
             .normalize_tool_call_arguments()
             .and_then(|()| template.render(&input, options));
