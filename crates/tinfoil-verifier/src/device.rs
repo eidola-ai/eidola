@@ -4,7 +4,9 @@
 //! The CPU measurement already vouches for boot code that refuses to start
 //! unless the GPUs attest in confidential-computing mode; this check adds the
 //! per-handshake half: the document must carry exactly that many GPU
-//! evidence items, each produced for this handshake's nonce. The items sit
+//! evidence items, each labelled with this handshake's nonce (the payload's
+//! `nonce` member, which the attestation shim writes beside NVIDIA's report;
+//! the nonce inside the signed SPDM report is not read). The items sit
 //! inside the endorsed `device_evidence` section, so the CPU quote's
 //! `REPORT_DATA` already binds their bytes. NVIDIA's certificate chain, the
 //! SPDM report signature and the reference measurements are not appraised.
