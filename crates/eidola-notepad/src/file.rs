@@ -38,6 +38,8 @@ impl Default for Format {
 pub enum LineEnding {
     Lf,
     CrLf,
+    /// A lone carriage return, the classic Mac convention.
+    Cr,
 }
 
 #[derive(Debug)]
@@ -51,7 +53,8 @@ pub enum DecodeError {
 ///
 /// The line ending is the file's *first* one: a file mixing both is saved
 /// back with the one it starts with, which is the conservative reading of
-/// what its author meant. A lone CR (classic Mac) is read as a line break.
+/// what its author meant. A lone CR (classic Mac) is a line break too, and
+/// is what such a file is saved back with.
 pub fn decode(bytes: &[u8]) -> Result<(String, Format), DecodeError> {
     let (bytes, bom) = match bytes.strip_prefix(b"\xEF\xBB\xBF") {
         Some(rest) => (rest, true),
@@ -61,6 +64,7 @@ pub fn decode(bytes: &[u8]) -> Result<(String, Format), DecodeError> {
 
     let line_ending = match raw.find(['\r', '\n']) {
         Some(i) if raw[i..].starts_with("\r\n") => LineEnding::CrLf,
+        Some(i) if raw[i..].starts_with('\r') => LineEnding::Cr,
         _ => LineEnding::Lf,
     };
     let mut text = raw.replace("\r\n", "\n").replace('\r', "\n");
@@ -87,8 +91,10 @@ pub fn encode(text: &str, format: Format) -> Vec<u8> {
     if format.trailing_newline && !body.is_empty() {
         body.push('\n');
     }
-    if format.line_ending == LineEnding::CrLf {
-        body = body.replace('\n', "\r\n");
+    match format.line_ending {
+        LineEnding::Lf => {}
+        LineEnding::CrLf => body = body.replace('\n', "\r\n"),
+        LineEnding::Cr => body = body.replace('\n', "\r"),
     }
     let mut out = Vec::with_capacity(body.len() + 3);
     if format.bom {
@@ -146,7 +152,11 @@ fn create_temp(
     static NEXT: AtomicU64 = AtomicU64::new(0);
     loop {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let temp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
+        let temp = dir.join(format!(
+            ".{}.{}.{n}.tmp",
+            temp_stem(name),
+            std::process::id()
+        ));
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -162,6 +172,22 @@ fn create_temp(
             Err(e) => return Err(e),
         }
     }
+}
+
+/// The document's name as it appears in a temporary file's: enough to tell
+/// whose it is, cut on a character boundary so the whole temporary name stays
+/// well inside the 255-byte limit most filesystems put on a name, however
+/// long the document's own is.
+fn temp_stem(name: &str) -> &str {
+    const MAX: usize = 128;
+    if name.len() <= MAX {
+        return name;
+    }
+    let mut end = MAX;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
 }
 
 /// The file `path` names, through any symlinks. `canonicalize` cannot see past
@@ -250,6 +276,32 @@ mod tests {
                 trailing_newline: true,
             }
         );
+    }
+
+    #[test]
+    fn a_classic_mac_file_saves_back_with_carriage_returns() {
+        assert_eq!(round_trip(b"title\rbody\r"), b"title\rbody\r");
+        let (text, format) = decode(b"title\rbody").unwrap();
+        assert_eq!(text, "title\nbody");
+        assert_eq!(format.line_ending, LineEnding::Cr);
+    }
+
+    #[test]
+    fn a_document_with_the_longest_name_a_filesystem_allows_still_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{}.md", "a".repeat(250)));
+        assert_eq!(path.file_name().unwrap().len(), 253);
+        std::fs::write(&path, "old\n").unwrap();
+        write_atomically(&path, b"new\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+    }
+
+    #[test]
+    fn a_long_name_is_cut_on_a_character_boundary() {
+        let name = "é".repeat(100);
+        let stem = temp_stem(&name);
+        assert!(stem.len() <= 128 && stem.chars().all(|c| c == 'é'));
+        assert_eq!(temp_stem("short.md"), "short.md");
     }
 
     #[test]
