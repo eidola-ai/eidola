@@ -229,16 +229,18 @@ impl DocumentView {
     /// Save the document — to its own path, or (untitled, or `save_as`) to
     /// one the reader picks. Resolves `true` once the bytes are on disk.
     ///
-    /// The text is read when the write starts, not when Save was chosen, and
-    /// writes are serialized: a second Save while one is in flight waits, then
-    /// writes the newer buffer, so an earlier save can never land last.
+    /// The text, and a plain Save's destination, are read when the write
+    /// starts, not when Save was chosen, and writes are serialized: a second
+    /// Save while one is in flight waits, then writes the newer buffer to
+    /// wherever the first one left the document, so an earlier save can never
+    /// land last or send a later one back to an old path.
     pub fn save(
         &mut self,
         save_as: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<bool> {
-        let target = self.path.clone().filter(|_| !save_as);
+        let ask = save_as || self.path.is_none();
         let directory = self
             .path
             .as_deref()
@@ -253,9 +255,9 @@ impl DocumentView {
         let lock = self.save_lock.clone();
 
         cx.spawn_in(window, async move |this, cx| {
-            let path = match target {
-                Some(path) => path,
-                None => {
+            let chosen = match ask {
+                false => None,
+                true => {
                     let Ok(chosen) =
                         cx.update(|_, cx| cx.prompt_for_new_path(&directory, Some(&suggested)))
                     else {
@@ -288,14 +290,21 @@ impl DocumentView {
                             return false;
                         }
                     }
-                    path
+                    Some(path)
                 }
             };
 
             let _writing = lock.lock().await;
-            let Ok((text, format)) = this.update(cx, |this, cx| {
-                (this.editor.read(cx).value().to_string(), this.format)
+            let Ok((path, text, format)) = this.update(cx, |this, cx| {
+                (
+                    chosen.or_else(|| this.path.clone()),
+                    this.editor.read(cx).value().to_string(),
+                    this.format,
+                )
             }) else {
+                return false;
+            };
+            let Some(path) = path else {
                 return false;
             };
             let bytes = file::encode(&text, format);

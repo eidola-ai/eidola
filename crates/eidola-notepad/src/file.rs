@@ -87,8 +87,9 @@ pub fn encode(text: &str, format: Format) -> Vec<u8> {
     let mut body = text.to_string();
     // `decode` took exactly one line ending off the end, so exactly one goes
     // back — even when the text already ends in one (a file ending in a
-    // blank line). An empty document stays an empty file.
-    if format.trailing_newline && !body.is_empty() {
+    // blank line), and when it is all the file held. A file that was empty
+    // records none and stays empty.
+    if format.trailing_newline {
         body.push('\n');
     }
     match format.line_ending {
@@ -279,6 +280,13 @@ mod tests {
     }
 
     #[test]
+    fn a_file_of_one_line_ending_saves_back_as_itself() {
+        for bytes in [&b"\n"[..], b"\r\n", b"\r", b""] {
+            assert_eq!(round_trip(bytes), bytes, "{bytes:?}");
+        }
+    }
+
+    #[test]
     fn a_classic_mac_file_saves_back_with_carriage_returns() {
         assert_eq!(round_trip(b"title\rbody\r"), b"title\rbody\r");
         let (text, format) = decode(b"title\rbody").unwrap();
@@ -313,7 +321,7 @@ mod tests {
     #[test]
     fn a_new_document_ends_in_a_newline() {
         assert_eq!(encode("hello", Format::default()), b"hello\n");
-        assert_eq!(encode("", Format::default()), b"");
+        assert_eq!(encode("", Format::default()), b"\n");
     }
 
     #[test]

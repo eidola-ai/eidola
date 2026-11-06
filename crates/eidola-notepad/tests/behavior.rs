@@ -187,6 +187,44 @@ fn saves_in_quick_succession_leave_the_newest_text(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_save_queued_behind_save_as_follows_the_document_to_its_new_path(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let old = note(dir.path(), "a.md", b"text\n");
+    let (view, cx) = open_file(&old, cx);
+    cx.simulate_keystrokes("cmd-down");
+
+    cx.dispatch_action(SaveAs);
+    cx.run_until_parked();
+    let new = dir.path().join("b.md");
+    cx.simulate_new_path_selection(|_| Some(new.clone()));
+    // Before the Save As has written, edit and save again.
+    cx.update(|window, cx| {
+        let editor = view.read(cx).editor().clone();
+        editor.update(cx, |editor, cx| {
+            editor.apply_event_for_test(
+                gpui_markdown_editor::EditorEvent::InsertText(" more".into()),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| view.save(false, window, cx))
+            .detach();
+    });
+    cx.run_until_parked();
+
+    assert_eq!(std::fs::read(&new).unwrap(), b"text more\n");
+    assert_eq!(
+        std::fs::read(&old).unwrap(),
+        b"text\n",
+        "the old file is left alone"
+    );
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).path().map(Path::to_path_buf)),
+        Some(new)
+    );
+    assert!(!dirty(&view, cx));
+}
+
+#[gpui::test]
 fn save_as_moves_a_titled_document(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let path = note(dir.path(), "old.md", b"text\n");
