@@ -6508,6 +6508,149 @@ fn a_continuation_that_calls_a_tool_continues_as_a_tool_round() {
     });
 }
 
+/// **A continuation sends the request its answer was written to**, not the
+/// conversation as it stands now. The question is edited after the answer was
+/// cut off; continuing the answer still sends the original question, byte for
+/// byte — the model finishes the answer it was writing, to the prompt it was
+/// writing it to, and the engine's cached prefix for that request still
+/// applies. The edited question belongs to a fresh answer (a regeneration).
+#[test]
+fn a_continuation_sends_the_request_its_answer_was_written_to() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Answer,
+                again: false,
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        let question = post_at(&core, &cut.space_id, 0).action_id;
+        core.runtime()
+            .block_on(core.edit_post(question, "Why is the sky blue?".into()))
+            .expect("edit the question after the cut");
+        let answer = post_at(&core, &cut.space_id, 1);
+        assert!(
+            answer.continuable,
+            "an edited question does not take the verb away"
+        );
+
+        core.runtime()
+            .block_on(core.continue_answer(answer.action_id))
+            .expect("the continuation");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        assert_continues(&bodies[0], &bodies[1], "content");
+        let sent = bodies[1].to_string();
+        assert!(sent.contains("How do tides work?"), "the original question");
+        assert!(!sent.contains("Why is the sky blue?"), "never the edit");
+    });
+}
+
+/// **Continue is offered exactly while the door would take it**: the author
+/// still answers in this space, with the model that wrote the answer. Change
+/// the author's model, or take the author out of the space, and the post stops
+/// being continuable — and the door refuses it before anything is sent.
+#[test]
+fn continue_is_offered_only_while_its_author_can_continue() {
+    for change in ["model", "membership"] {
+        run(move || {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: ChatBehavior::ContinueAfterLength {
+                    cut: Cut::Reasoning,
+                    again: false,
+                },
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            let cut = core
+                .runtime()
+                .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+                .expect("the cut-off turn");
+            let answer = post_at(&core, &cut.space_id, 1);
+            assert!(
+                answer.continuable,
+                "{change}: continuable before the change"
+            );
+            let author = core
+                .runtime()
+                .block_on(core.test_space_actions(cut.space_id.clone()))
+                .expect("raw actions")
+                .into_iter()
+                .find(|a| a.id == answer.action_id)
+                .expect("the answer")
+                .participant_id;
+            match change {
+                "model" => core
+                    .runtime()
+                    .block_on(core.update_space_participant(
+                        author,
+                        eidola_app_core::ParticipantUpdate {
+                            label: None,
+                            model_ref: Some(Some("another-model".into())),
+                            system_prompt: None,
+                            notify_policy: None,
+                        },
+                        eidola_app_core::ExpectedScope::Any,
+                    ))
+                    .expect("change the author's model"),
+                _ => {
+                    core.runtime()
+                        .block_on(core.remove_space_participant(cut.space_id.clone(), author))
+                        .expect("take the author out of the space");
+                }
+            }
+            let answer = post_at(&core, &cut.space_id, 1);
+            assert!(!answer.continuable, "{change}: no longer offered");
+            let hits = mock.chat_hits();
+            let (refused, _, _) = continue_streaming(&core, &answer.action_id);
+            assert!(
+                matches!(refused, Err(AppError::WrongPostKind { .. })),
+                "{change}: the door refuses it as what it is; got {refused:?}"
+            );
+            assert_eq!(mock.chat_hits(), hits, "{change}: nothing was sent");
+        });
+    }
+}
+
+/// An answer whose request the Record could not keep whole (past its retention
+/// cap) has no request to continue from, so it is not continuable — offered
+/// nowhere, refused at the door — rather than continued from a rebuilt prompt.
+#[test]
+fn an_answer_whose_request_the_record_cut_is_not_continuable() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Answer,
+                again: false,
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let long = "tide ".repeat((1 << 20) / 5 + 1024);
+        let cut = core
+            .runtime()
+            .block_on(core.chat(long, MODEL.into(), None))
+            .expect("the cut-off turn");
+        assert!(cut.truncated);
+        let answer = post_at(&core, &cut.space_id, 1);
+        assert!(answer.truncated && !answer.continuable);
+        let hits = mock.chat_hits();
+        let refused = core
+            .runtime()
+            .block_on(core.continue_answer(answer.action_id));
+        assert!(
+            matches!(refused, Err(AppError::WrongPostKind { .. })),
+            "got {refused:?}"
+        );
+        assert_eq!(mock.chat_hits(), hits);
+    });
+}
+
 /// The door refuses what it cannot continue **before anything is spent**: an
 /// answer that finished, and a post that is not an agent's answer at all. No
 /// request goes out, nothing is written, no credential moves.

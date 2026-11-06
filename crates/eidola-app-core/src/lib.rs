@@ -1529,10 +1529,13 @@ pub struct PostNode {
     /// because it was done — the durable fact a render marks the post with.
     /// Never true for a post that was not inferred.
     pub truncated: bool,
-    /// This generation can be continued ([`AppCore::continue_stream`]): it
-    /// stopped at its ceiling, and its model is one whose server honours a
-    /// continuation ([`can_continue`]). The rule the door itself applies, so a
-    /// surface offers the verb exactly where it would work.
+    /// This generation can be continued ([`AppCore::continue_stream`]) — by
+    /// the predicate the door itself applies (`continuation_basis`: it stopped
+    /// at its ceiling, its model is one whose server honours a continuation,
+    /// its author still answers in this space with that model, and the request
+    /// it was written to is in the Record whole), so a surface offers the verb
+    /// exactly where it would work. Settled by `get_space_tree`; the pure tree
+    /// build sets only the row-level half.
     pub continuable: bool,
     /// Edge relation to the structural parent (`reply`); `None` for a root.
     pub relation: Option<String>,
@@ -3819,7 +3822,18 @@ impl Inner {
                 message: format!("space not found: {space_id}"),
             })?;
         let data = db::get_space_tree_data(&db_conn, space_id).await?;
-        Ok(build_post_tree(data))
+        let mut tree = build_post_tree(data);
+        // `continuable` as the door decides it: the tree's own rows say which
+        // posts are candidates (truncated answers from Eidola's models), and
+        // the door's predicate settles each — its author still answering here
+        // with that model, its request in the Record whole. Only candidates are
+        // asked, so a tree with no cut-off answer reads nothing more.
+        for node in tree.iter_mut().filter(|n| n.continuable) {
+            node.continuable = continuation_basis(&db_conn, space_id, &node.action_id)
+                .await?
+                .is_some();
+        }
+        Ok(tree)
     }
 
     /// [`Self::references_to`], filtered to the referring posts
@@ -6361,30 +6375,21 @@ impl Inner {
         // Eidola engine is known to honour `continue_final_message` (a server
         // that ignored it would answer the partial message with a new turn,
         // written after it as though it were part of the same answer).
-        let continuation_source = match mode {
+        // The predicate is `continuation_basis`, the one `PostNode::continuable`
+        // reads, so a refusal here is never a verb a surface offered.
+        let continuation_basis = match mode {
             ResponseMode::Continue => {
-                let source = db::continuation_source(&db_conn, target_action_id)
+                let basis = continuation_basis(&db_conn, space_id, target_action_id)
                     .await?
-                    .ok_or_else(|| AppError::NotConfigured {
-                        message: format!("target action not found: {target_action_id}"),
+                    .filter(|b| backend_kind == BackendKind::Eidola && b.model == model)
+                    .ok_or_else(|| AppError::WrongPostKind {
+                        message: "this answer cannot be continued: only an answer that stopped \
+                                  at its length limit, from one of Eidola's models, whose author \
+                                  still answers here with that model and whose request the \
+                                  Record kept whole, can be"
+                            .into(),
                     })?;
-                if !source.truncated {
-                    return Err(AppError::WrongPostKind {
-                        message: "only an answer that stopped at its length limit can be continued"
-                            .into(),
-                    });
-                }
-                if !can_continue(source.model.as_deref())
-                    || backend_kind != BackendKind::Eidola
-                    || source.model.as_deref() != Some(model)
-                {
-                    return Err(AppError::WrongPostKind {
-                        message: "this answer cannot be continued: only an answer from one of \
-                                  Eidola's models, continued by the model that wrote it, can be"
-                            .into(),
-                    });
-                }
-                Some(source)
+                Some(basis)
             }
             ResponseMode::Reply | ResponseMode::Revise => None,
         };
@@ -7115,47 +7120,48 @@ impl Inner {
 
         // ---- The continued answer ------------------------------------------
         //
-        // A continuation's request is the request its target's last round
-        // sent, with the target's own output as the final message: the tool
-        // rounds that turn ran (replayed the way a later turn reads them back,
-        // which is where its loop had appended them — after the trailing
-        // message), then the reasoning and the answer as the partial assistant
-        // message the model is asked to continue. Nothing about it is a post
-        // rendering — no header line, nothing quoted, exactly the text the
-        // model wrote — because the model must read the very sequence it was
-        // generating, and the engine's prefix cache holds that sequence.
+        // **A continuation sends the request its target was written to, as it
+        // was sent**, followed by the target's own output as the final message
+        // (`continuation_basis`). Not the conversation as it stands now: an
+        // edit to a post the answer answered, a renamed participant, a new
+        // branch on the map or a changed charter would have the model continue
+        // an answer to one prompt while reading another, and would lose the
+        // prefix the engine cached for that request. The context assembled
+        // above is therefore not what this turn sends; it still supplies the
+        // tools a continued round can call, and the attached references the
+        // new generation carries forward. The record of what was fed is the
+        // target's own, plus the target.
         //
-        // The answer is continued once there is any; before there is, the
-        // reasoning is, and the prompt ends inside an open reasoning block.
-        // Reasoning is otherwise never sent upstream: this is the one message
-        // whose reasoning the model reads, because it is the model's own
-        // unfinished thought.
-        let continuation = match continuation_source {
+        // The partial message is the model's own text, exactly: no header line,
+        // nothing quoted. The answer is continued once there is any; before
+        // there is, the reasoning is, and the prompt ends inside an open
+        // reasoning block. Reasoning is otherwise never sent upstream — this is
+        // the one message whose reasoning the model reads, because it is the
+        // model's own unfinished thought.
+        let mut continued_tools: Option<Vec<serde_json::Value>> = None;
+        let continuation = match continuation_basis {
             None => None,
-            Some(source) => {
-                let blocks = db::assembly_trace_blocks(&db_conn, target_action_id).await?;
-                let (trace, trace_ids) = trace_messages(&blocks, &mut seen_traces);
-                messages.extend(trace);
-                for id in trace_ids {
-                    if !context_action_ids.contains(&id) {
-                        context_action_ids.push(id);
-                    }
-                }
-                let field = if source.text.is_empty() {
+            Some(basis) => {
+                messages = basis.messages;
+                context_action_ids = basis.context_action_ids;
+                continued_tools = Some(basis.tools);
+                let field = if basis.text.is_empty() {
                     ContinueField::ReasoningContent
                 } else {
                     ContinueField::Content
                 };
                 messages.push(serde_json::json!({
                     "role": "assistant",
-                    "reasoning_content": source.thinking,
-                    "content": source.text,
+                    "reasoning_content": basis.thinking,
+                    "content": basis.text,
                 }));
-                context_action_ids.push(target_action_id.to_string());
+                if !context_action_ids.iter().any(|id| id == target_action_id) {
+                    context_action_ids.push(target_action_id.to_string());
+                }
                 Some(Continuation {
                     field,
-                    reasoning: source.thinking,
-                    content: source.text,
+                    reasoning: basis.thinking,
+                    content: basis.text,
                 })
             }
         };
@@ -7267,7 +7273,9 @@ impl Inner {
         // rejects the tools field, `withdraw_auto_tools` re-derives this
         // array from the restored registry so the retry's estimate and body
         // agree again.
-        let tool_schemas = tool_registry.schemas();
+        // A continuation offers the tools its target's request offered, as
+        // that request spelled them, so its prefix is that request's.
+        let tool_schemas = continued_tools.unwrap_or_else(|| tool_registry.schemas());
 
         // The spend side runs only for eidola turns. Local and external
         // turns carry no charge estimate, no credential, and no ACT header
@@ -8340,11 +8348,14 @@ impl Inner {
         let (space_id, tip, guard) = self
             .begin_regeneration(action_id, "only an agent's answer can be continued")
             .await?;
+        // Asked here as well as in `prepare_turn`, so an author who has left
+        // the space is refused as what it is — an answer this door cannot
+        // continue — rather than as a participant resolution failing later.
         let db_conn = self.db_conn().await?;
-        let author = db::continuation_source(&db_conn, &tip)
+        let author = continuation_basis(&db_conn, &space_id, &tip)
             .await?
-            .ok_or_else(|| AppError::Internal {
-                message: format!("generation not found: {tip}"),
+            .ok_or_else(|| AppError::WrongPostKind {
+                message: "this answer cannot be continued".into(),
             })?
             .participant_id;
         Ok((space_id, tip, author, guard))
@@ -15814,6 +15825,116 @@ pub(crate) fn completion_ceiling(declared_max_output: Option<u64>, context_lengt
 /// door applies ([`PostNode::continuable`]).
 pub fn can_continue(model: Option<&str>) -> bool {
     model.is_some_and(|m| backends::parse_model_ref(m).backend_id == backends::EIDOLA_BACKEND_ID)
+}
+
+/// The canonical spelling of a model selection (`qualified_model_id` of its
+/// parse), so a participant's configured `model_ref` and the model a generation
+/// recorded compare as the same selection however each was written.
+fn canonical_model(selection: &str) -> String {
+    let r = backends::parse_model_ref(selection);
+    backends::qualified_model_id(&r.model, &r.backend_id)
+}
+
+/// What continuing a generation sends — or `None` when it cannot be continued.
+///
+/// **One predicate for the door and for the offer**: `prepare_turn` refuses a
+/// continuation exactly when this is `None`, and `PostNode::continuable` is
+/// whether it is `Some`, so a surface offers the verb exactly where it would
+/// work and the two cannot drift.
+#[derive(Debug)]
+struct ContinuationBasis {
+    /// The author, who writes the continuation.
+    participant_id: String,
+    /// The canonical model that wrote the generation.
+    model: String,
+    /// The generation's own reasoning and answer.
+    thinking: String,
+    text: String,
+    /// The `messages` and `tools` of the request that produced the generation,
+    /// as sent — its partial message removed when that request was itself a
+    /// continuation.
+    messages: Vec<serde_json::Value>,
+    tools: Vec<serde_json::Value>,
+    /// The actions that request's context assembly was fed, in order.
+    context_action_ids: Vec<String>,
+}
+
+/// The [`ContinuationBasis`] of `action_id` in `space_id`.
+///
+/// A generation can be continued when it is an agent's `inference` that
+/// stopped at its ceiling, its model is one whose server honours a
+/// continuation ([`can_continue`]), **its author is still an agent of this
+/// space answering with that model** (a member, by effective configuration —
+/// the selection `prepare_turn` would resolve for it), and **the request that
+/// produced it is in the Record whole**.
+///
+/// That last condition is what a continuation is built from. Its request is
+/// the generation's own request, byte for byte — the messages and tools that
+/// round sent, its tool rounds and trailing block among them — followed by the
+/// generation as a partial message. Rebuilt from the conversation as it stands
+/// now instead, an edit to a post the answer was written to, or to the
+/// author's charter, would have the model continue an answer to one prompt
+/// while reading another, and lose the prefix the engine cached for it. A body
+/// the Record kept only part of (past its retention cap) does not parse, and
+/// that generation is not continuable.
+async fn continuation_basis(
+    conn: &turso::Connection,
+    space_id: &str,
+    action_id: &str,
+) -> Result<Option<ContinuationBasis>, AppError> {
+    let Some(source) = db::continuation_source(conn, action_id).await? else {
+        return Ok(None);
+    };
+    let Some(model) = source.model.as_deref().map(canonical_model) else {
+        return Ok(None);
+    };
+    if source.action_type != "inference" || !source.truncated || !can_continue(Some(&model)) {
+        return Ok(None);
+    }
+    let author_answers_with_it = db::space_participants(conn, space_id)
+        .await?
+        .iter()
+        .find(|m| m.participant_id == source.participant_id)
+        .is_some_and(|m| {
+            m.kind == "agent"
+                && m.model_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .map(canonical_model)
+                    .as_deref()
+                    == Some(model.as_str())
+        });
+    if !author_answers_with_it {
+        return Ok(None);
+    }
+    let Some(body) = db::generation_request_body(conn, action_id).await? else {
+        return Ok(None);
+    };
+    let Ok(sent) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return Ok(None);
+    };
+    let Some(mut messages) = sent.get("messages").and_then(|m| m.as_array()).cloned() else {
+        return Ok(None);
+    };
+    if sent.get("continue_final_message").is_some() {
+        messages.pop();
+    }
+    let tools = sent
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let context_action_ids = db::context_assembly_actions(conn, action_id).await?;
+    Ok(Some(ContinuationBasis {
+        participant_id: source.participant_id,
+        model,
+        thinking: source.thinking,
+        text: source.text,
+        messages,
+        tools,
+        context_action_ids,
+    }))
 }
 
 #[cfg(test)]

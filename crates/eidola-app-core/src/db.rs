@@ -2277,6 +2277,7 @@ pub async fn turns_taken_in_space(conn: &Connection, space_id: &str) -> Result<i
 /// at most one of each).
 #[derive(Debug, Clone)]
 pub struct ContinuationSource {
+    pub action_type: String,
     pub participant_id: String,
     pub model: Option<String>,
     pub truncated: bool,
@@ -2291,7 +2292,7 @@ pub async fn continuation_source(
 ) -> Result<Option<ContinuationSource>, AppError> {
     let mut rows = conn
         .query(
-            "SELECT participant_id, model, truncated FROM action WHERE id = ?1",
+            "SELECT participant_id, model, truncated, action_type FROM action WHERE id = ?1",
             [Value::Text(action_id.to_string())],
         )
         .await
@@ -2300,6 +2301,7 @@ pub async fn continuation_source(
         return Ok(None);
     };
     let mut source = ContinuationSource {
+        action_type: row.get::<String>(3).map_err(AppError::db)?,
         participant_id: row.get::<String>(0).map_err(AppError::db)?,
         model: row.get::<Option<String>>(1).map_err(AppError::db)?,
         truncated: row.get::<i64>(2).map_err(AppError::db)? != 0,
@@ -2325,6 +2327,29 @@ pub async fn continuation_source(
         }
     }
     Ok(Some(source))
+}
+
+/// The request body the Record keeps for the chat completion that produced
+/// `action_id` — the generation's own request row, the last one when there is
+/// more than one. `None` when there is none.
+pub async fn generation_request_body(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<Vec<u8>>, AppError> {
+    let mut rows = conn
+        .query(
+            "SELECT request_body FROM request \
+             WHERE action_id = ?1 AND path = '/v1/chat/completions' \
+               AND request_body IS NOT NULL \
+             ORDER BY request_at DESC, id DESC LIMIT 1",
+            [Value::Text(action_id.to_string())],
+        )
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<Vec<u8>>(0).map_err(AppError::db)?)),
+    }
 }
 
 /// `(id, text)` of an action's first quotable ([`QUOTABLE_BLOCK_TYPE`]) content
