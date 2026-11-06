@@ -21,8 +21,8 @@ use tinfoil_verifier::AllowedMeasurement;
 use super::*;
 use crate::engine_trust::{PinnedWeights, PromptCachePolicy};
 use crate::types::{
-    Capability, Model, ModelCapabilities, ModelHosting, ModelPricing, OutputBudgetClass,
-    PinnedWeightsCapability, PromptCacheCapability, ScaledPrice,
+    Capability, Model, ModelCapabilities, ModelPricing, OutputBudgetClass, PinnedWeightsCapability,
+    PromptCacheCapability, ScaledPrice,
 };
 use eidola_common::engine_protocol::error_type as kind;
 
@@ -1103,14 +1103,18 @@ fn catalog_model() -> Model {
         context_length: 8192,
         max_output_tokens: None,
         output_budget_class: OutputBudgetClass::Standard,
-        hosting: ModelHosting::Eidola,
         capabilities: ModelCapabilities {
             tool_calling: Capability::new(true),
             reasoning: Capability::new(true),
             input_modalities: vec![],
             output_modalities: vec![],
             prompt_cache: PromptCacheCapability::unsupported(),
-            pinned_weights: PinnedWeightsCapability::unsupported(),
+            pinned_weights: PinnedWeightsCapability {
+                supported: true,
+                sha256: Some(WEIGHTS_A.into()),
+                repo: None,
+                revision: None,
+            },
         },
         pricing: ModelPricing {
             per_prompt_token: price(crate::backend::PRICING_SCALE_FACTOR),

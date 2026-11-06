@@ -17,7 +17,7 @@ use tracing::{error, warn};
 
 use crate::AppState;
 use crate::auth::{ActSpend, AuthContext, AuthMethod, TokenAuth};
-use crate::backend::{BackendStreamEvent, ChatBackend, PRICING_SCALE_FACTOR};
+use crate::backend::{BackendStreamEvent, PRICING_SCALE_FACTOR};
 use crate::credentials;
 use crate::db;
 use crate::engine_trust::protocol::ValidatedRequest;
@@ -28,8 +28,7 @@ use crate::response::{
     build_verification_metadata,
 };
 use crate::types::{
-    ChatCompletionChunk, ChatCompletionRequest, ErrorResponse, Model, ModelHosting, ModelsResponse,
-    Usage,
+    ChatCompletionChunk, ChatCompletionRequest, ErrorResponse, Model, ModelsResponse, Usage,
 };
 
 /// Health check endpoint.
@@ -51,18 +50,11 @@ pub async fn health() -> impl IntoResponse {
     path = "/v1/models",
     tag = "Public",
     responses(
-        (status = 200, description = "List of available models", body = ModelsResponse),
-        (status = 502, description = "Upstream provider error", body = ErrorResponse)
+        (status = 200, description = "List of available models", body = ModelsResponse)
     )
 )]
-pub async fn list_models(
-    State(state): State<AppState>,
-) -> Result<Json<ModelsResponse>, ServerError> {
-    let models = state.backend.list_models().await.map_err(|e| {
-        error!("Failed to list models: {}", e);
-        e
-    })?;
-    Ok(Json(models))
+pub async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
+    Json(state.catalog.list())
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +167,7 @@ fn actual_cost(
 
 /// What a completed request costs: its usage priced and clamped to the
 /// contract ([`actual_cost`]), or the whole charge when the upstream reported
-/// no usage. One rule for both hosting paths and both transports.
+/// no usage. One rule for both transports.
 pub(crate) fn settled_cost(
     usage: Option<&Usage>,
     model: &Model,
@@ -188,41 +180,25 @@ pub(crate) fn settled_cost(
         .unwrap_or(charge_credits)
 }
 
-/// Who answers a request for `model`, as its privacy metadata names them.
-fn provider_for(model: &Model) -> &'static str {
-    match model.hosting {
-        ModelHosting::Tinfoil => "tinfoil",
-        ModelHosting::Eidola => crate::engine_router::PROVIDER,
-    }
-}
-
-/// Send a non-streaming request to the upstream that hosts `model`.
+/// Send a non-streaming request to the engines that serve its model.
 async fn dispatch(
     state: &AppState,
     request: &ValidatedRequest,
-    model: &Model,
 ) -> Result<crate::backend::BackendResponse, ServerError> {
-    match model.hosting {
-        ModelHosting::Tinfoil => state.backend.send(request.request()).await,
-        ModelHosting::Eidola => engines(state)?.send(request).await,
-    }
+    engines(state)?.send(request).await
 }
 
-/// Send a streaming request to the upstream that hosts `model`.
+/// Send a streaming request to the engines that serve its model.
 async fn dispatch_stream(
     state: &AppState,
     request: &ValidatedRequest,
-    model: &Model,
 ) -> Result<mpsc::Receiver<Result<BackendStreamEvent, ServerError>>, ServerError> {
-    match model.hosting {
-        ModelHosting::Tinfoil => state.backend.send_stream(request.request()).await,
-        ModelHosting::Eidola => engines(state)?.send_stream(request).await,
-    }
+    engines(state)?.send_stream(request).await
 }
 
-/// The engine router. A build that lists an Eidola-hosted model pins it, and
-/// a gateway pinning any model starts with a router, so this refuses only
-/// what cannot be routed anyway.
+/// The engine router. Every catalog row is pinned, and a gateway pinning any
+/// model starts with a router, so this refuses only what cannot be routed
+/// anyway.
 fn engines(state: &AppState) -> Result<&crate::engine_router::EngineRouter, ServerError> {
     state.engines.as_ref().ok_or_else(|| {
         ServerError::ServiceUnavailable("no engine is available for this model".to_string())
@@ -355,7 +331,7 @@ fn validate_request(
     // Look up the model and validate pricing.
     let model =
         state
-            .backend
+            .catalog
             .lookup_model(&request.model)
             .ok_or_else(|| ServerError::BadRequest {
                 message: "unknown model".to_string(),
@@ -419,7 +395,7 @@ pub async fn chat_completions(
     // caller's string (the fixed-list rule bounding label cardinality):
     // resolve it up front, with anything unresolved collapsing to `other`.
     let model_label = state
-        .backend
+        .catalog
         .lookup_model(&request.model)
         .map(|m| m.id)
         .unwrap_or_else(|| "other".to_string());
@@ -519,7 +495,7 @@ async fn handle_non_streaming_request(
 
     // Make the backend request. On error, issue a full refund.
     let dispatched_at = Instant::now();
-    let backend_response = match dispatch(state, validated, model).await {
+    let backend_response = match dispatch(state, validated).await {
         Ok(resp) => resp,
         Err(e) => {
             // Known error — backend didn't charge. Full refund.
@@ -783,7 +759,7 @@ async fn handle_streaming_request(
     // arrival: everything before this point is our own verification work,
     // which the HTTP-level histogram already covers.
     let dispatched_at = Instant::now();
-    let mut upstream_rx = match dispatch_stream(&state, validated, model).await {
+    let mut upstream_rx = match dispatch_stream(&state, validated).await {
         Ok(rx) => rx,
         Err(e) => {
             // Known error — upstream didn't process any tokens. Full refund.
@@ -828,7 +804,7 @@ async fn handle_streaming_request(
     // over (the spawned task never sees the request itself).
     let chargeable_prompt = chargeable_prompt_tokens_for(request);
     let max_completion = effective_max_completion(request, model);
-    let provider = provider_for(model);
+    let provider = crate::engine_router::PROVIDER;
 
     tokio::spawn(async move {
         /// Re-parse the spend proof and issue a refund with the given amount.
@@ -1290,7 +1266,7 @@ pub(crate) mod tests {
         assert_eq!(status, bad);
     }
     use crate::types::{
-        Capability, Modality, ModelCapabilities, ModelHosting, ModelPricing, OutputBudgetClass,
+        Capability, Modality, ModelCapabilities, ModelPricing, OutputBudgetClass,
         PinnedWeightsCapability, PromptCacheCapability, ScaledPrice,
     };
 
@@ -1304,14 +1280,18 @@ pub(crate) mod tests {
             context_length: 8192,
             max_output_tokens: Some(4096),
             output_budget_class: OutputBudgetClass::Standard,
-            hosting: ModelHosting::Tinfoil,
             capabilities: ModelCapabilities {
                 tool_calling: Capability::new(true),
                 reasoning: Capability::new(false),
                 input_modalities: vec![Modality::Text],
                 output_modalities: vec![Modality::Text],
                 prompt_cache: PromptCacheCapability::unsupported(),
-                pinned_weights: PinnedWeightsCapability::unsupported(),
+                pinned_weights: PinnedWeightsCapability {
+                    supported: true,
+                    sha256: Some("3".repeat(64)),
+                    repo: Some("example/test-model".to_string()),
+                    revision: Some("4".repeat(40)),
+                },
             },
             pricing: ModelPricing {
                 per_prompt_token: ScaledPrice {

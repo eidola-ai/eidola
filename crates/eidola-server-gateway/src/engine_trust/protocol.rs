@@ -15,8 +15,8 @@
 //! (kept with its strict parse in a [`ValidatedRequest`], because the node
 //! renders the prompt from the original bytes), with the gateway's
 //! `stream_options` and the client's `cache_key` written over it
-//! ([`engine_request_body`]). The Tinfoil upstream never receives the key:
-//! the request type does not serialize it, and only this module writes it.
+//! ([`engine_request_body`]). Only this module writes the key: the request
+//! type does not serialize it.
 //!
 //! Which node serves a model, and the attested client that reaches it, are
 //! the router's concern (`crate::engine_router`), not this module's.
@@ -121,14 +121,13 @@ impl ValidatedRequest {
 /// key order, the one thing the parse loses that the prompt depends on, is
 /// kept from the client's bytes (a key repeated within an object keeps its
 /// first position and its last value, `serde_json`'s reading of it). The
-/// output is compact; the Tinfoil path forwards the same scalars and the same
-/// measures, with keys sorted.
+/// output is compact.
 ///
 /// Three top-level members are the gateway's to decide, and are written last:
 ///
 /// - `stream` / `stream_options`: for a streaming request, `"stream":true`
 ///   and `"stream_options":{"include_usage":true}` (usage is what the refund
-///   is computed from, as on the Tinfoil path); otherwise neither;
+///   is computed from); otherwise neither;
 /// - `cache_key`: re-encoded from the validated key, when there is one.
 ///
 /// The returned buffer is scrubbed when dropped, and so are the copies of the
@@ -159,9 +158,9 @@ pub fn engine_request_body(request: &ValidatedRequest) -> Zeroizing<Vec<u8>> {
             "stream" | "stream_options" => {}
             "cache_key" => value.scrub(),
             // The fields the strict type narrows (`f32` sampling values) are
-            // written from the typed request, exactly as the Tinfoil path
-            // serializes them, so both hosting paths receive the same scalar:
-            // `0.123456789` reaches either as the `f32` it parses to.
+            // written from the typed request, exactly as `serde_json`
+            // serializes them, so the engine receives the value the gateway
+            // parsed: `0.123456789` reaches it as the `f32` it parses to.
             "temperature" => member(&mut body, &key, &|out| {
                 serde_json::to_writer(&mut *out, &parsed.temperature).expect("a scalar serializes")
             }),
@@ -521,12 +520,10 @@ mod tests {
         assert_eq!(parsed.len(), distinct);
     }
 
-    /// The bytes forwarded are the bytes priced: each forwarded tool schema
-    /// and tool call is exactly as long as the pricing contract measured it,
-    /// and the forwarded body prices to the same prompt tokens as the request
-    /// the gateway charged for.
+    /// The sampling values the strict type narrows reach the engine as the
+    /// values the gateway parsed, never as the client's spelling.
     #[test]
-    fn both_hosting_paths_receive_the_same_sampling_values() {
+    fn the_engine_receives_the_parsed_sampling_values() {
         // Every field the strict type narrows: the two `f32` sampling values,
         // spelled with more precision than an `f32` holds.
         let raw = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
@@ -535,12 +532,11 @@ mod tests {
             ValidatedRequest::from_bytes(bytes::Bytes::from_static(raw.as_bytes())).unwrap();
         let engine: serde_json::Value =
             serde_json::from_slice(&engine_request_body(&request)).unwrap();
-        // What the Tinfoil path sends: the typed request, serialized to bytes
-        // (`.json(request)`), read back.
-        let tinfoil: serde_json::Value =
+        // The typed request, serialized to bytes, read back.
+        let typed: serde_json::Value =
             serde_json::from_slice(&serde_json::to_vec(request.request()).unwrap()).unwrap();
         for field in ["temperature", "top_p"] {
-            assert_eq!(engine[field], tinfoil[field], "{field}");
+            assert_eq!(engine[field], typed[field], "{field}");
         }
         let text = String::from_utf8(engine_request_body(&request).to_vec()).unwrap();
         assert!(text.contains(&format!(
@@ -550,6 +546,10 @@ mod tests {
         assert!(!text.contains("0.123456789,"), "{text}");
     }
 
+    /// The bytes forwarded are the bytes priced: each forwarded tool schema
+    /// and tool call is exactly as long as the pricing contract measured it,
+    /// and the forwarded body prices to the same prompt tokens as the request
+    /// the gateway charged for.
     #[test]
     fn the_engine_receives_exactly_what_was_priced() {
         let raw = r#"{"model":"m","messages":[

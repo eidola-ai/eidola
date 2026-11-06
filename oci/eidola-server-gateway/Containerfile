@@ -55,20 +55,13 @@ ARG CARGO_PROFILE=release
 
 COPY crates/ ./crates/
 
-# Trust-root build input: `eidola-server-gateway/build.rs` embeds the pinned Sigstore
-# trusted root (sigstore-trusted-root.json) that the runtime measurement
-# resolver (`src/upstream_trust`) verifies Tinfoil release attestations
-# against. We deliberately COPY only this one path rather than `releases/`
-# wholesale — other files in `releases/trust/` (notably `server-enclave.json`)
-# are functions of our own server image's digest and would create a circular
-# cache dependency if pulled in here. This file is external Sigstore public
-# material, so it introduces no such cycle.
-COPY releases/trust/sigstore-trusted-root.json ./releases/trust/sigstore-trusted-root.json
-
 # Engine trust inputs: `build.rs` embeds the engine deployments this gateway
 # accepts (`engine-enclaves.json`) after checking every pin against the
-# committed deployment configs under `deploy/engine/`. Neither depends on the
-# gateway's own digest, so they add no cycle either. A glob rather than
+# committed deployment configs under `deploy/engine/`. Only these paths are
+# copied, never `releases/` wholesale: other files in `releases/trust/`
+# (notably `server-enclave.json`) are functions of the gateway's own image
+# digest and would create a circular cache dependency if pulled in here, and
+# neither of these depends on that digest. A glob rather than
 # `deploy/engine/` so a tree without that directory still builds; the
 # build script then sees no deployments.
 COPY --parents releases/trust/engine-enclaves.json deploy/engine* ./

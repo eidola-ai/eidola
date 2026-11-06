@@ -117,7 +117,7 @@ pub struct AttestingClientConfig<'a> {
     /// entry is refused. Convert release records with
     /// `AllowedMeasurement::from(&record)`, which pins SEV-SNP only.
     pub allowed_measurements: &'a [AllowedMeasurement],
-    /// Base URL of the inference endpoint (e.g. `https://inference.tinfoil.sh/v1`).
+    /// Base URL of the attested endpoint (e.g. `https://enclave.example/v1`).
     /// The `/.well-known/tinfoil-attestation` endpoint is derived from the origin.
     pub inference_base_url: &'a str,
     /// TLS root store used for the attested inference endpoint. The verifier
