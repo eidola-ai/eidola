@@ -137,6 +137,13 @@ use serde_json::Value;
 /// is a caller bug and panics rather than reaching a server that would refuse
 /// it. The key is secret: the returned `Value` holds a copy the caller is
 /// responsible for, and nothing here scrubs it.
+///
+/// `continuation` asks the model to continue the final message rather than
+/// answer it ([`engine_protocol::check_continuation`]): it adds
+/// `"add_generation_prompt": false` and `"continue_final_message"`, spelled
+/// [`engine_protocol::ContinueField::wire_value`]. `None` adds neither, so an
+/// ordinary body is unchanged by the parameter.
+#[allow(clippy::too_many_arguments)]
 pub fn chat_completion_request_body(
     model: &str,
     messages: &[Value],
@@ -145,6 +152,7 @@ pub fn chat_completion_request_body(
     stream: bool,
     include_usage: bool,
     cache_key: Option<&str>,
+    continuation: Option<engine_protocol::ContinueField>,
 ) -> Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -166,6 +174,10 @@ pub fn chat_completion_request_body(
             "cache_key must be 32 bytes, base64url without padding"
         );
         body["cache_key"] = Value::String(key.to_owned());
+    }
+    if let Some(field) = continuation {
+        body["add_generation_prompt"] = Value::Bool(false);
+        body["continue_final_message"] = field.wire_value();
     }
     body
 }
@@ -218,7 +230,7 @@ pub fn chargeable_prompt_tokens(total_content_bytes: u64, message_count: u64) ->
 ///
 /// | Part of the request | Method | Counted as |
 /// | --- | --- | --- |
-/// | a `messages` entry | [`add_message`](Self::add_message) | one message + its `content` string's bytes |
+/// | a `messages` entry | [`add_message`](Self::add_message) | one message + its `content` and `reasoning_content` strings' bytes |
 /// | an assistant `tool_calls` entry | [`add_tool_call`](Self::add_tool_call) | the entry's compact JSON serialization, in bytes |
 /// | a request-level `tools` entry | [`add_tool_definition`](Self::add_tool_definition) | the entry's compact JSON serialization, in bytes |
 ///
@@ -379,6 +391,10 @@ pub fn json_text_bytes(value: &Value) -> u64 {
 ///   multimodal message's image parts carry no prompt text of their own);
 ///   absent or `null` contributes zero. Every entry counts as one message
 ///   regardless.
+/// * **`reasoning_content`** — a string contributes its UTF-8 bytes. A chat
+///   template renders an assistant message's reasoning into the prompt (the
+///   final message of a continuation carries the reasoning so far), so its
+///   bytes are prompt text like the content's.
 /// * **`tool_calls[]`** — each entry contributes [`json_text_bytes`] of the
 ///   whole entry.
 /// * **`tools[]`** — each entry contributes [`json_text_bytes`] of the whole
@@ -391,7 +407,11 @@ pub fn prompt_charge(messages: &[Value], tools: Option<&[Value]>) -> PromptCharg
     let mut charge = PromptCharge::new();
 
     for message in messages {
-        charge.add_message(content_bytes(message.get("content")));
+        let reasoning = message
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .map_or(0, |s| s.len() as u64);
+        charge.add_message(content_bytes(message.get("content")).saturating_add(reasoning));
         if let Some(calls) = message.get("tool_calls").and_then(|c| c.as_array()) {
             for call in calls {
                 charge.add_tool_call(json_text_bytes(call));
@@ -443,13 +463,13 @@ mod tests {
         let tools = vec![serde_json::json!({"type": "function", "function": {"name": "f"}})];
         let cases = [
             (
-                chat_completion_request_body("m", &messages, 256, &[], false, false, None),
+                chat_completion_request_body("m", &messages, 256, &[], false, false, None, None),
                 serde_json::json!({
                     "model": "m", "messages": messages, "max_completion_tokens": 256,
                 }),
             ),
             (
-                chat_completion_request_body("m", &messages, 256, &tools, true, true, None),
+                chat_completion_request_body("m", &messages, 256, &tools, true, true, None, None),
                 serde_json::json!({
                     "model": "m", "messages": messages, "max_completion_tokens": 256,
                     "tools": tools, "stream": true,
@@ -469,14 +489,57 @@ mod tests {
     fn a_cache_key_is_carried_as_given() {
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
-        let body = chat_completion_request_body("m", &messages, 1, &[], false, false, Some(key));
+        let body =
+            chat_completion_request_body("m", &messages, 1, &[], false, false, Some(key), None);
         assert_eq!(body["cache_key"], key);
+    }
+
+    /// A continuation adds exactly the two members vLLM and SGLang read, in the
+    /// spelling the shared rule accepts, and nothing else.
+    #[test]
+    fn a_continuation_asks_to_continue_the_final_message() {
+        use engine_protocol::{ContinueField, FinalContent, FinalMessage, check_continuation};
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "content": "", "reasoning_content": "hm"}),
+        ];
+        for field in [ContinueField::Content, ContinueField::ReasoningContent] {
+            let body = chat_completion_request_body(
+                "m",
+                &messages,
+                1,
+                &[],
+                false,
+                false,
+                None,
+                Some(field),
+            );
+            let mut plain =
+                chat_completion_request_body("m", &messages, 1, &[], false, false, None, None);
+            plain["add_generation_prompt"] = serde_json::json!(false);
+            plain["continue_final_message"] = field.wire_value();
+            assert_eq!(body, plain);
+            let last = FinalMessage {
+                is_assistant: true,
+                content: FinalContent::Text(""),
+                has_tool_calls: false,
+                reasoning_content: Some("hm"),
+            };
+            assert_eq!(
+                check_continuation(
+                    body.get("continue_final_message"),
+                    body["add_generation_prompt"].as_bool(),
+                    Some(last)
+                ),
+                Ok(Some(field))
+            );
+        }
     }
 
     #[test]
     #[should_panic(expected = "cache_key must be 32 bytes")]
     fn a_malformed_cache_key_is_a_caller_bug() {
-        chat_completion_request_body("m", &[], 1, &[], false, false, Some("short"));
+        chat_completion_request_body("m", &[], 1, &[], false, false, Some("short"), None);
     }
 
     #[test]
@@ -668,6 +731,30 @@ mod tests {
         let charge = prompt_charge(&messages, None);
         assert_eq!(charge.total_content_bytes(), 10 + 6);
         assert_eq!(charge.message_count(), 1);
+    }
+
+    /// The template renders an assistant message's reasoning into the prompt,
+    /// so its bytes are charged like the content's — on the message, beside
+    /// the content, with no second message counted.
+    #[test]
+    fn reasoning_content_is_charged_as_prompt_text() {
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "partial",
+            "reasoning_content": "thinking é",
+        })];
+        let charge = prompt_charge(&messages, None);
+        assert_eq!(charge.total_content_bytes(), 7 + 11);
+        assert_eq!(charge.message_count(), 1);
+        // Only a string is prompt text; anything else reaches no template.
+        for reasoning in [serde_json::json!(null), serde_json::json!(5)] {
+            let messages = vec![serde_json::json!({
+                "role": "assistant",
+                "content": "partial",
+                "reasoning_content": reasoning,
+            })];
+            assert_eq!(prompt_charge(&messages, None).total_content_bytes(), 7);
+        }
     }
 
     #[test]
