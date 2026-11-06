@@ -7,6 +7,9 @@ use eidola_notepad::actions::{CloseWindow, RevertToSaved, Save, SaveAs};
 use eidola_notepad::document::{Contents, DocumentView};
 use eidola_notepad::file;
 use gpui::{Entity, TestAppContext, VisualTestContext};
+// The editor's own actions rather than keystrokes, whose bindings differ
+// between macOS and Linux.
+use gpui_markdown_editor::{DocumentEnd, Undo};
 
 fn init(cx: &mut TestAppContext) {
     cx.update(|cx| {
@@ -68,12 +71,12 @@ fn typing_marks_the_document_edited_and_undo_takes_it_back(cx: &mut TestAppConte
     assert_eq!(cx.window_title().as_deref(), Some("a.md"));
     assert_eq!(cx.document_path(), Some(path.clone()));
 
-    cx.simulate_keystrokes("cmd-down");
+    cx.dispatch_action(DocumentEnd);
     cx.simulate_input("!");
     assert_eq!(value(&view, cx), "hello!");
     assert!(dirty(&view, cx), "an edit marks the document");
 
-    cx.simulate_keystrokes("cmd-z");
+    cx.dispatch_action(Undo);
     assert_eq!(value(&view, cx), "hello");
     assert!(
         !dirty(&view, cx),
@@ -87,7 +90,7 @@ fn save_writes_the_buffer_in_the_files_own_format(cx: &mut TestAppContext) {
     let path = note(dir.path(), "crlf.md", b"\xEF\xBB\xBFone\r\n\r\ntwo\r\n");
     let (view, cx) = open_file(&path, cx);
 
-    cx.simulate_keystrokes("cmd-down");
+    cx.dispatch_action(DocumentEnd);
     cx.simulate_input(" more");
     cx.dispatch_action(Save);
     cx.run_until_parked();
@@ -111,7 +114,7 @@ fn editing_the_body_leaves_frontmatter_alone(cx: &mut TestAppContext) {
     let path = note(dir.path(), "a.md", format!("{body}\n").as_bytes());
     let (view, cx) = open_file(&path, cx);
 
-    cx.simulate_keystrokes("cmd-down");
+    cx.dispatch_action(DocumentEnd);
     cx.simulate_input(" text");
 
     assert_eq!(value(&view, cx), format!("{body} text"));
@@ -173,7 +176,7 @@ fn saves_in_quick_succession_leave_the_newest_text(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let path = note(dir.path(), "a.md", b"text\n");
     let (view, cx) = open_file(&path, cx);
-    cx.simulate_keystrokes("cmd-down");
+    cx.dispatch_action(DocumentEnd);
 
     cx.simulate_input("1");
     cx.dispatch_action(Save);
@@ -191,7 +194,7 @@ fn a_save_queued_behind_save_as_follows_the_document_to_its_new_path(cx: &mut Te
     let dir = tempfile::tempdir().unwrap();
     let old = note(dir.path(), "a.md", b"text\n");
     let (view, cx) = open_file(&old, cx);
-    cx.simulate_keystrokes("cmd-down");
+    cx.dispatch_action(DocumentEnd);
 
     cx.dispatch_action(SaveAs);
     cx.run_until_parked();
@@ -266,7 +269,7 @@ fn the_close_button_on_an_edited_document_can_save_then_close(cx: &mut TestAppCo
     let dir = tempfile::tempdir().unwrap();
     let path = note(dir.path(), "a.md", b"text\n");
     let (_view, cx) = open_file(&path, cx);
-    cx.simulate_keystrokes("cmd-down");
+    cx.dispatch_action(DocumentEnd);
     cx.simulate_input("!");
 
     assert!(!cx.simulate_close(), "the window waits for the answer");
@@ -283,7 +286,7 @@ fn typing_during_the_close_time_save_keeps_the_window(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let path = note(dir.path(), "a.md", b"text\n");
     let (view, cx) = open_file(&path, cx);
-    cx.simulate_keystrokes("cmd-down");
+    cx.dispatch_action(DocumentEnd);
     cx.simulate_input("!");
 
     cx.dispatch_action(CloseWindow);
