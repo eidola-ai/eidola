@@ -19,6 +19,7 @@ target/
 
 # Local .app bundle output
 crates/eidola-gui/build/
+crates/eidola-notepad/build/
 
 # Test artifacts
 test-artifacts/
@@ -26,6 +27,7 @@ test-artifacts/
 # Visual snapshots from the gpui app — local-only debug aid, not regression
 # goldens. The harness regenerates them; cross-machine pixels aren't stable.
 crates/eidola-gui/tests/snapshots/
+crates/eidola-notepad/tests/snapshots/
 
 # macOS
 .DS_Store

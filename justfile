@@ -34,7 +34,7 @@ db-reset:
 
 # --- Build (local toolchain, fast iteration) ---
 
-# Build a system: server, cli, gui, or www
+# Build a system: server, cli, gui, notepad, or www
 build system:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -55,12 +55,20 @@ build system:
           ./scripts/package-gui-app.sh debug
         fi
         ;;
+      notepad)
+        # A personal markdown editor on Eidola's writing surface; bundled
+        # on macOS for the same reasons as the GUI, plus its document types.
+        cargo build -p eidola-notepad
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+          ./scripts/package-notepad-app.sh debug
+        fi
+        ;;
       www)
         # Build the website to target/www (drafts excluded, as deployed).
         cargo run -q -p eidola-www -- build
         ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, www)" >&2
+        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, notepad, www)" >&2
         exit 1
         ;;
     esac
@@ -81,7 +89,7 @@ engine-kernels *args:
 engine:
     nix build .#llama-server -o crates/eidola-gui/build/llama-server
 
-# Build and run a system: server, cli, gui, or www
+# Build and run a system: server, cli, gui, notepad, or www
 run system *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -106,13 +114,21 @@ run system *args:
           cargo run -p eidola-gui -- {{ args }}
         fi
         ;;
+      notepad)
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+          just build notepad
+          open -W "crates/eidola-notepad/build/Eidola Notepad.app" --args {{ args }}
+        else
+          cargo run -p eidola-notepad -- {{ args }}
+        fi
+        ;;
       www)
         # Dev server at http://127.0.0.1:8000 — drafts included, rebuilds
         # on change. Pass --addr <host:port> to override.
         cargo run -q -p eidola-www -- serve {{ args }}
         ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, www)" >&2
+        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, notepad, www)" >&2
         exit 1
         ;;
     esac
