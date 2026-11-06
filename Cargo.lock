@@ -1428,6 +1428,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
+ "cipher 0.5.2",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
 ]
@@ -2955,6 +2956,7 @@ dependencies = [
 name = "eidola-engine"
 version = "0.1.0"
 dependencies = [
+ "chacha20 0.10.2",
  "getrandom 0.4.3",
  "hmac 0.13.0",
  "sha2 0.11.0",
@@ -2994,6 +2996,7 @@ dependencies = [
  "eidola-engine-kernels",
  "eidola-engine-model",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

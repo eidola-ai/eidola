@@ -17,8 +17,9 @@
 //! [`Executor::execute`] runs exactly this sequence, with no host interaction in between:
 //!
 //! 1. `maintenance`, in order ([`Maintenance::Copy`], [`Maintenance::Zero`],
-//!    [`Maintenance::ResetSlot`]). Every zero completes before any later write to that
-//!    block, including writes by this step's forward.
+//!    [`Maintenance::ResetSlot`], [`Maintenance::Encrypt`], [`Maintenance::Decrypt`]).
+//!    Every zero completes before any later write to that block, and every decrypt before
+//!    any read of it, including this step's forward.
 //! 2. `table_updates`, in order: `table[slot][group][index] = block`.
 //! 3. The forward: for each [`SeqEntry`], its host tokens occupy positions
 //!    `context_len .. context_len + num_tokens`. KV for every query position is written
@@ -49,6 +50,26 @@
 //! A step reads only the KV of its own sequences' slots and never writes a block it was not
 //! directed to by the tables. Blocks the host shares between sequences (prefix-cache hits)
 //! are never written: the host never schedules a query position inside a shared block.
+//!
+//! # Idle encryption
+//!
+//! A prefix-cache block that no sequence maps (an *idle* entry's block) is held encrypted
+//! ([`crate::kv_cipher`]: ChaCha20 under the lineage's [`KvKey`], with the nonce the host
+//! derived from the block's hash and group). The host issues [`Maintenance::Encrypt`]
+//! when the last sequence mapping a cached block lets go of it and the cache keeps it,
+//! and [`Maintenance::Decrypt`] before a sequence maps an encrypted block again; the keys
+//! those operations name travel in [`StepInput::kv_keys`] for that step only. The
+//! executor encrypts every byte of the block that [`Maintenance::Zero`] would zero (all
+//! of the group's layers, and a drafter block's boundary tap), as the ranges of an image
+//! whose order it documents. Encrypting is an XOR with the keystream, so decrypting is
+//! the same operation; they are distinct operations so that each can be checked.
+//!
+//! Between two steps the host names a block in at most one encrypt or decrypt, and never
+//! in both one of those and a zero or copy, so an executor may run all of a step's
+//! encryptions together (one launch); it must still finish them before the forward reads.
+//! An executor keeps no key past the step: whatever device or host copy it makes of
+//! [`StepInput::kv_keys`] is zeroed before `execute` returns or by stream-ordered work
+//! queued before the forward.
 //!
 //! # Graph capture
 //!
@@ -117,7 +138,9 @@
 //! construction, the CUDA executor by a batch-invariant forward (one reduction order per
 //! row, whatever the step holds: `eidola-engine-cuda/AGENTS.md` → Batch invariance).
 
+use crate::kv_cipher::KvNonce;
 use crate::sampling::SamplingParams;
+use crate::secret::KvKey;
 use crate::spec::{Bucket, ModelSpec};
 
 /// A state slot: one row of the executor's per-sequence device tables.
@@ -150,6 +173,31 @@ pub enum Maintenance {
     ResetSlot {
         /// Slot to reset.
         slot: Slot,
+    },
+    /// Encrypt `block` of `group` in place: XOR every byte [`Maintenance::Zero`] would
+    /// zero with the ChaCha20 keystream of `kv_keys[key]` and `nonce`
+    /// ([`crate::kv_cipher`]). Issued when a cached block becomes idle.
+    Encrypt {
+        /// KV group index.
+        group: u32,
+        /// Block to encrypt.
+        block: u32,
+        /// Index into [`StepInput::kv_keys`].
+        key: u32,
+        /// The block's nonce.
+        nonce: KvNonce,
+    },
+    /// Decrypt `block` of `group` in place (the same keystream XOR as
+    /// [`Maintenance::Encrypt`]). Issued before an idle block is mapped again.
+    Decrypt {
+        /// KV group index.
+        group: u32,
+        /// Block to decrypt.
+        block: u32,
+        /// Index into [`StepInput::kv_keys`].
+        key: u32,
+        /// The block's nonce.
+        nonce: KvNonce,
     },
 }
 
@@ -196,6 +244,9 @@ pub struct StepInput {
     pub bucket: Bucket,
     /// Executed first, in order.
     pub maintenance: Vec<Maintenance>,
+    /// The keys this step's [`Maintenance::Encrypt`] and [`Maintenance::Decrypt`] name,
+    /// by index; each zeroed when the step is dropped.
+    pub kv_keys: Vec<KvKey>,
     /// Executed second, in order.
     pub table_updates: Vec<TableUpdate>,
     /// Sequence rows (at most `bucket.max_seqs`).

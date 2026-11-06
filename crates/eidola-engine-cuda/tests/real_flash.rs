@@ -138,6 +138,7 @@ fn step(
         .flat_map(|s| s.context_len..s.context_len + s.num_tokens)
         .collect();
     StepInput {
+        kv_keys: Vec::new(),
         bucket: Bucket {
             max_seqs: 4,
             max_tokens: 512,

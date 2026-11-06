@@ -8,7 +8,7 @@ use eidola_engine::engine::{CacheScope, Engine, FinishReason, Request, Scheduler
 use eidola_engine::kv::CachePolicy;
 use eidola_engine::mock::{MockConfig, MockExecutor, mimo_like_spec, reference_generate};
 use eidola_engine::sampling::{SamplingParams, mix64};
-use eidola_engine::secret::EngineSalt;
+use eidola_engine::secret::{BootKey, CacheKey, Lineage, SaltDeriver};
 use eidola_engine::spec::ModelSpec;
 
 /// Deterministic test RNG (SplitMix64).
@@ -34,8 +34,9 @@ impl TestRng {
     }
 }
 
-pub fn salt(n: u8) -> EngineSalt {
-    EngineSalt::from_bytes([n; 32])
+/// The lineage of client key `[n; 32]` under a fixed boot key.
+pub fn salt(n: u8) -> Lineage {
+    SaltDeriver::with_boot_key(BootKey::from_bytes([0; 32])).lineage(&CacheKey::from_bytes([n; 32]))
 }
 
 pub struct Harness {
@@ -89,6 +90,33 @@ impl Harness {
                 );
             }
         }
+        // Idle blocks are ciphertext on the executor and mapped ones plaintext, once the
+        // queued encryptions and decryptions have run.
+        let idle = kv.idle_blocks();
+        let crypts = kv.pending_crypts();
+        for (g, b) in kv.cache_blocks().union(&kv.sequence_blocks()) {
+            let want = idle.contains(&(*g, *b));
+            let device = self.eng.executor().block_is_encrypted(*g, *b);
+            match crypts.get(&(*g, *b)) {
+                Some(&encrypt) => assert!(
+                    encrypt == want && device != want,
+                    "block {g}/{b}: queued crypt disagrees with its state"
+                ),
+                None => assert_eq!(
+                    device,
+                    want,
+                    "block {g}/{b}: {} on the executor while {}",
+                    if device { "encrypted" } else { "plaintext" },
+                    if want { "idle" } else { "mapped" }
+                ),
+            }
+        }
+    }
+
+    /// Runs pending maintenance (as a caller does when the last request ends) and checks.
+    pub fn flush(&mut self) {
+        self.eng.flush().expect("flush");
+        self.check();
     }
 
     pub fn step(&mut self) {

@@ -1,6 +1,8 @@
-//! Prefix-cache secrets: the client's cache key, the per-boot key, and the engine salt.
+//! Prefix-cache secrets: the client's cache key, the per-boot key, and the two values
+//! derived from them for one lineage (one client key): the engine salt that names its
+//! cache entries and the key its idle KV is encrypted under.
 //!
-//! All three are content-class values. They never appear in `Debug` output (every type here
+//! All of them are content-class values. They never appear in `Debug` output (every type here
 //! prints a fixed redaction marker), are never compared in variable time by this crate, and
 //! have no `Display`, serialization, or byte accessor outside this crate.
 //!
@@ -19,6 +21,9 @@ use zeroize::Zeroize;
 
 /// Domain-separation label for deriving an engine salt from a client cache key.
 pub const SALT_DERIVATION_LABEL: &[u8] = b"eidola/kv/v1";
+
+/// Domain-separation label for deriving the idle-KV encryption key from a client cache key.
+pub const KV_KEY_DERIVATION_LABEL: &[u8] = b"eidola/kv-enc/v1";
 
 /// Length in bytes of every secret in this module.
 pub const SECRET_LEN: usize = 32;
@@ -73,6 +78,19 @@ redacted_secret!(
 );
 
 redacted_secret!(
+    /// The ChaCha20 key a lineage's idle prefix-cache KV is encrypted under
+    /// ([`crate::kv_cipher`]).
+    ///
+    /// Derived from the client's key (with the boot key), never from anything that
+    /// outlives a request (the salt, block hashes, the cache map), so it exists only while
+    /// a request of the lineage does: it travels with the request, and with the step that
+    /// runs that request's encryptions and decryptions, and is zeroed when the last of
+    /// them is dropped. Between requests an idle entry is ciphertext that nothing in the
+    /// engine can decrypt.
+    KvKey
+);
+
+redacted_secret!(
     /// A random key generated once per process; salts derived under it mean nothing after
     /// a restart, exactly as the cache itself does not survive one.
     BootKey
@@ -118,6 +136,76 @@ impl EngineSalt {
     }
 }
 
+impl KvKey {
+    /// A fresh random key, for a request without a client key (its entries are its own).
+    pub fn fresh() -> Self {
+        Self(random_secret())
+    }
+
+    /// Constructs a key from raw bytes. Test and cross-check use only; production keys
+    /// come from [`SaltDeriver::lineage`] or [`Lineage::fresh`].
+    pub fn from_bytes(bytes: [u8; SECRET_LEN]) -> Self {
+        Self::copy_from(&bytes)
+    }
+
+    /// Writes the key's eight little-endian words into `out`. The one way the key's bytes
+    /// leave this crate: an executor staging it for the device scrubs `out` (and every copy
+    /// it makes) once the step's encryptions have been queued.
+    pub fn words_into(&self, out: &mut [u32; 8]) {
+        for (w, b) in out.iter_mut().zip(self.expose().as_chunks::<4>().0) {
+            *w = u32::from_le_bytes(*b);
+        }
+    }
+
+    /// Constant-time equality.
+    pub fn ct_eq(&self, other: &Self) -> bool {
+        let mut acc = 0u8;
+        for (a, b) in self.0.iter().zip(other.0.iter()) {
+            acc |= a ^ b;
+        }
+        acc == 0
+    }
+}
+
+/// Constant time, so a [`crate::executor::StepInput`] compares without a timing channel on
+/// the keys it carries.
+impl PartialEq for KvKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.ct_eq(other)
+    }
+}
+
+/// What a request carries for the prefix cache: the salt that names its entries and the
+/// key their idle KV is encrypted under, derived together from one client key (or drawn
+/// together at random for a request without one). There is no other constructor, so the
+/// entries a salt finds are always the ones its key decrypts.
+#[derive(Clone, Debug)]
+pub struct Lineage {
+    salt: EngineSalt,
+    kv_key: KvKey,
+}
+
+impl Lineage {
+    /// A fresh random salt and key: a request without a client key can only ever hit
+    /// blocks it computed itself (after a preemption), never anyone else's.
+    pub fn fresh() -> Self {
+        Self {
+            salt: EngineSalt::fresh(),
+            kv_key: KvKey::fresh(),
+        }
+    }
+
+    /// The salt.
+    pub fn salt(&self) -> &EngineSalt {
+        &self.salt
+    }
+
+    /// The idle-KV key.
+    pub fn kv_key(&self) -> &KvKey {
+        &self.kv_key
+    }
+}
+
 impl BootKey {
     /// A fresh random per-boot key.
     pub fn generate() -> Self {
@@ -130,9 +218,15 @@ impl BootKey {
     }
 }
 
-/// Derives engine salts from client cache keys under one per-boot key.
+/// Derives engine salts and idle-KV keys from client cache keys under one per-boot key.
 ///
-/// `engine_salt = HMAC-SHA256(boot_key, "eidola/kv/v1" ‖ client_key)`.
+/// ```text
+/// engine_salt = HMAC-SHA256(boot_key, "eidola/kv/v1"     ‖ client_key)
+/// kv_key      = HMAC-SHA256(boot_key, "eidola/kv-enc/v1" ‖ client_key)
+/// ```
+///
+/// Neither output yields the other or the client key, so a salt (or a block hash chained
+/// from it) left in memory after a request says nothing about the key.
 #[derive(Debug)]
 pub struct SaltDeriver {
     boot_key: BootKey,
@@ -151,15 +245,35 @@ impl SaltDeriver {
 
     /// Derives the engine salt for `key`.
     pub fn derive(&self, key: &CacheKey) -> EngineSalt {
+        let mut salt = EngineSalt(Box::new([0u8; SECRET_LEN]));
+        self.hmac(SALT_DERIVATION_LABEL, key, &mut salt.0);
+        salt
+    }
+
+    /// Derives the idle-KV key for `key`.
+    pub fn derive_kv_key(&self, key: &CacheKey) -> KvKey {
+        let mut kv_key = KvKey(Box::new([0u8; SECRET_LEN]));
+        self.hmac(KV_KEY_DERIVATION_LABEL, key, &mut kv_key.0);
+        kv_key
+    }
+
+    /// The lineage of `key`: its salt and its idle-KV key.
+    pub fn lineage(&self, key: &CacheKey) -> Lineage {
+        Lineage {
+            salt: self.derive(key),
+            kv_key: self.derive_kv_key(key),
+        }
+    }
+
+    /// `HMAC-SHA256(boot_key, label ‖ key)`, written straight into `out`.
+    fn hmac(&self, label: &[u8], key: &CacheKey, out: &mut [u8; SECRET_LEN]) {
         let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(self.boot_key.expose())
             .expect("HMAC accepts any key length");
-        mac.update(SALT_DERIVATION_LABEL);
+        mac.update(label);
         mac.update(key.expose());
-        let mut out = mac.finalize().into_bytes();
-        let mut salt = EngineSalt(Box::new([0u8; SECRET_LEN]));
-        salt.0.copy_from_slice(&out);
-        out.as_mut_slice().zeroize();
-        salt
+        let mut tag = mac.finalize().into_bytes();
+        out.copy_from_slice(&tag);
+        tag.as_mut_slice().zeroize();
     }
 
     /// Resolves the salt for a request: derived when a key is present, fresh otherwise.
@@ -167,6 +281,14 @@ impl SaltDeriver {
         match key {
             Some(k) => self.derive(k),
             None => EngineSalt::fresh(),
+        }
+    }
+
+    /// Resolves the lineage for a request: derived when a key is present, fresh otherwise.
+    pub fn lineage_for(&self, key: Option<&CacheKey>) -> Lineage {
+        match key {
+            Some(k) => self.lineage(k),
+            None => Lineage::fresh(),
         }
     }
 }
@@ -207,11 +329,15 @@ mod tests {
         let s = EngineSalt::from_bytes([0xCD; 32]);
         let b = BootKey::from_bytes([0xEF; 32]);
         let d = SaltDeriver::with_boot_key(BootKey::from_bytes([0x11; 32]));
+        let e = KvKey::from_bytes([0xAB; 32]);
+        let l = d.lineage(&k);
         for text in [
             format!("{k:?}"),
             format!("{s:?}"),
             format!("{b:?}"),
             format!("{d:?}"),
+            format!("{e:?}"),
+            format!("{l:?}"),
         ] {
             assert!(text.contains("<redacted>"), "{text}");
             for needle in [
@@ -243,6 +369,32 @@ mod tests {
         mac.update(&msg);
         let expected = mac.finalize().into_bytes();
         assert_eq!(d.derive(&k).expose().as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn kv_key_derivation_matches_hmac_definition_and_is_separated() {
+        let d = SaltDeriver::with_boot_key(BootKey::from_bytes([3; 32]));
+        let k = CacheKey::from_bytes([9; 32]);
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&[3; 32]).unwrap();
+        let mut msg = KV_KEY_DERIVATION_LABEL.to_vec();
+        msg.extend_from_slice(&[9; 32]);
+        mac.update(&msg);
+        let expected = mac.finalize().into_bytes();
+        let kv = d.derive_kv_key(&k);
+        assert_eq!(kv.expose().as_slice(), expected.as_slice());
+        // Domain separation: the key is not the salt, and a lineage holds both.
+        let l = d.lineage(&k);
+        assert_ne!(kv.expose(), d.derive(&k).expose());
+        assert!(l.kv_key().ct_eq(&kv) && l.salt().ct_eq(&d.derive(&k)));
+        let mut words = [0u32; 8];
+        kv.words_into(&mut words);
+        assert_eq!(words[0].to_le_bytes(), expected[..4]);
+        assert_eq!(words[7].to_le_bytes(), expected[28..]);
+        // Keyed by the boot key and the client key.
+        let d2 = SaltDeriver::with_boot_key(BootKey::from_bytes([4; 32]));
+        assert!(!d2.derive_kv_key(&k).ct_eq(&kv));
+        assert!(!d.derive_kv_key(&CacheKey::from_bytes([8; 32])).ct_eq(&kv));
+        assert!(!Lineage::fresh().kv_key().ct_eq(Lineage::fresh().kv_key()));
     }
 
     /// Moving a secret, including through the rehashes of a growing `HashMap`, never

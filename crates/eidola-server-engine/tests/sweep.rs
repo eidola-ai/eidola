@@ -7,7 +7,7 @@ use eidola_engine::engine::{CacheScope, Request, SchedulerConfig};
 use eidola_engine::kv::CachePolicy;
 use eidola_engine::mock::{MockConfig, MockExecutor, mimo_like_spec};
 use eidola_engine::sampling::SamplingParams;
-use eidola_engine::secret::EngineSalt;
+use eidola_engine::secret::{BootKey, CacheKey, Lineage, SaltDeriver};
 use eidola_server_engine::worker::{self, Admission, Output, Stats};
 
 fn wait_for(handle: &worker::EngineHandle, pred: impl Fn(&Stats) -> bool) -> Stats {
@@ -23,6 +23,10 @@ fn wait_for(handle: &worker::EngineHandle, pred: impl Fn(&Stats) -> bool) -> Sta
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn lineage(n: u8) -> Lineage {
+    SaltDeriver::with_boot_key(BootKey::from_bytes([0; 32])).lineage(&CacheKey::from_bytes([n; 32]))
 }
 
 fn request(handle: &worker::EngineHandle, prompt: Vec<u32>, cache: CacheScope) -> Request {
@@ -66,11 +70,7 @@ fn commands_faster_than_the_sweep_interval_do_not_postpone_it() {
     // A keyed request leaves whole prompt blocks in the prefix cache.
     let (guard, mut events) = handle
         .submit(
-            request(
-                &handle,
-                (1..=17).collect(),
-                CacheScope::Keyed(EngineSalt::from_bytes([7; 32])),
-            ),
+            request(&handle, (1..=17).collect(), CacheScope::Keyed(lineage(7))),
             admission.try_acquire().unwrap(),
         )
         .unwrap();

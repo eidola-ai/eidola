@@ -441,6 +441,7 @@ fn logprobs(
                     (Vec::new(), Vec::new())
                 };
                 let step = StepInput {
+                    kv_keys: Vec::new(),
                     bucket: *ex.config().buckets.last().expect("a bucket"),
                     maintenance,
                     table_updates,

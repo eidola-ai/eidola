@@ -2,8 +2,9 @@
 //!
 //! In: the chat crate renders the prompt with the model's own template (byte-exact),
 //! tokenizes it, and the request becomes an engine [`Request`] with checked
-//! [`SamplingParams`] and a [`CacheScope`]: the client's key turned into an engine salt
-//! by the per-boot HMAC, or [`CacheScope::Private`] without one.
+//! [`SamplingParams`] and a [`CacheScope`]: the client's key turned into its lineage (the
+//! engine salt and the idle-KV key, by the per-boot HMAC) and dropped, or
+//! [`CacheScope::Private`] without one.
 //!
 //! Out: engine tokens go through the chat crate's streaming detokenizer, then the stop
 //! sequences (applied here, to the decoded text, since the core leaves them to its
@@ -61,7 +62,7 @@ pub fn prepare(
     )
     .map_err(|e| ApiError::invalid(e.to_string()))?;
     let cache = match &cache_key {
-        Some(key) => CacheScope::Keyed(salts.derive(key)),
+        Some(key) => CacheScope::Keyed(salts.lineage(key)),
         None => CacheScope::Private,
     };
     drop(cache_key);

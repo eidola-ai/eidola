@@ -60,12 +60,41 @@
 //! Sequences admitted with `retain = false` (no client cache key; a fresh random salt)
 //! still seal blocks, so a preempted sequence can resume from its own KV, but every entry
 //! they created is purged when they finish.
+//!
+//! # Idle blocks are encrypted
+//!
+//! A block that a cache entry holds and no sequence maps is *idle*, and is kept encrypted
+//! under its lineage's [`KvKey`] ([`crate::kv_cipher`]). Every block is either free (zero,
+//! or a zero queued), mapped by at least one sequence (plaintext), or idle (ciphertext),
+//! and the host tracks which; a block moves between mapped and idle only through a
+//! sequence, which holds its lineage's key:
+//!
+//! - when the last sequence mapping a held block lets go of it (finish, preemption, or its
+//!   window sliding past a retained point), a [`Maintenance::Encrypt`] is queued;
+//! - when a sequence maps an idle block (a prefix-cache hit), a [`Maintenance::Decrypt`]
+//!   is queued, so concurrent sequences of one lineage share plaintext while any of them
+//!   runs;
+//! - a block whose entry is evicted or expires while idle is zeroed like any other freed
+//!   block, and one whose entry is detached while in use is zeroed when its last user
+//!   releases it, never encrypted and kept.
+//!
+//! Every lineage's blocks are covered alike, whatever the group: full-attention blocks,
+//! sliding-window blocks attached at branch, regeneration and continuation points, and the
+//! drafter group's blocks with their boundary taps. Requests without a client key get a
+//! fresh random key, so even their blocks held across a preemption are ciphertext.
+//!
+//! Queued encryptions and decryptions are kept per block until the next
+//! [`KvManager::take_pending`], so a block is named in at most one of them per step: an
+//! encrypt and a decrypt of the same block cancel, and a zero cancels either. Each holds
+//! an index into the step's keys, which are copies of the sequences' own and are dropped
+//! (zeroed) with the step.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::executor::{Maintenance, Slot, TableUpdate};
 use crate::hash::{BlockHash, extend_chain};
-use crate::secret::EngineSalt;
+use crate::kv_cipher::KvNonce;
+use crate::secret::{KvKey, Lineage};
 use crate::spec::{AttentionKind, ModelSpec, NULL_BLOCK};
 
 /// Milliseconds on a monotonic clock supplied by the caller.
@@ -109,6 +138,12 @@ pub enum Release {
 struct Pool {
     free: Vec<u32>,
     refs: Vec<u32>,
+    /// The cache entry holding each block, or [`NO_ENTRY`]. At most one entry holds a
+    /// block (it covers one logical index of one chain).
+    holder: Vec<EntryId>,
+    /// Whether each block is encrypted once the queued maintenance has run: exactly the
+    /// idle blocks (held by an entry, mapped by no sequence).
+    encrypted: Vec<bool>,
 }
 
 impl Pool {
@@ -118,11 +153,42 @@ impl Pool {
         Self {
             free,
             refs: vec![0; num_blocks as usize],
+            holder: vec![NO_ENTRY; num_blocks as usize],
+            encrypted: vec![false; num_blocks as usize],
         }
+    }
+
+    /// Held by an entry and mapped by no sequence.
+    fn idle(&self, b: u32) -> bool {
+        let b = b as usize;
+        self.holder[b] != NO_ENTRY && self.refs[b] == 1
     }
 }
 
 type EntryId = u64;
+
+/// [`Pool::holder`] of a block no entry holds (entry ids start at 1).
+const NO_ENTRY: EntryId = 0;
+
+/// A queued encryption or decryption of one block.
+#[derive(Clone, Copy, Debug)]
+struct PendingCrypt {
+    encrypt: bool,
+    key: u32,
+    nonce: KvNonce,
+}
+
+/// What [`KvManager::take_pending`] hands to the next step.
+#[derive(Debug, Default)]
+pub struct PendingWork {
+    /// Maintenance, in order: zeros, copies and slot resets as queued, then the
+    /// encryptions and decryptions (each naming a block no other operation here names).
+    pub maintenance: Vec<Maintenance>,
+    /// Table updates, in order.
+    pub table_updates: Vec<TableUpdate>,
+    /// The keys the encryptions and decryptions name, by index.
+    pub kv_keys: Vec<KvKey>,
+}
 
 #[derive(Debug)]
 struct Entry {
@@ -140,7 +206,7 @@ struct Entry {
 #[derive(Debug)]
 struct SeqKv {
     slot: Slot,
-    salt: EngineSalt,
+    lineage: Lineage,
     retain: bool,
     hashes: Vec<BlockHash>,
     entries: Vec<EntryId>,
@@ -171,6 +237,8 @@ pub struct KvManager {
     free_slots: Vec<Slot>,
     pending_maint: Vec<Maintenance>,
     pending_tables: Vec<TableUpdate>,
+    pending_crypt: BTreeMap<(u32, u32), PendingCrypt>,
+    pending_keys: Vec<KvKey>,
 }
 
 impl KvManager {
@@ -194,6 +262,8 @@ impl KvManager {
             free_slots: (0..spec.num_state_slots).rev().collect(),
             pending_maint: Vec::new(),
             pending_tables: Vec::new(),
+            pending_crypt: BTreeMap::new(),
+            pending_keys: Vec::new(),
         }
     }
 
@@ -202,18 +272,56 @@ impl KvManager {
         self.policy
     }
 
-    /// Takes the maintenance and table updates accumulated since the last call; they must
-    /// be handed to the executor, in order, before or with the next step.
-    pub fn take_pending(&mut self) -> (Vec<Maintenance>, Vec<TableUpdate>) {
-        (
-            std::mem::take(&mut self.pending_maint),
-            std::mem::take(&mut self.pending_tables),
-        )
+    /// Takes the maintenance, table updates and keys accumulated since the last call; they
+    /// must be handed to the executor, in order, before or with the next step. Only the
+    /// keys a queued operation still names are handed on; the rest are dropped here.
+    pub fn take_pending(&mut self) -> PendingWork {
+        let mut maintenance = std::mem::take(&mut self.pending_maint);
+        let keys = std::mem::take(&mut self.pending_keys);
+        let mut used: Vec<Option<u32>> = vec![None; keys.len()];
+        let mut kv_keys = Vec::new();
+        for ((group, block), p) in std::mem::take(&mut self.pending_crypt) {
+            let key = *used[p.key as usize].get_or_insert_with(|| {
+                kv_keys.push(keys[p.key as usize].clone());
+                kv_keys.len() as u32 - 1
+            });
+            let nonce = p.nonce;
+            maintenance.push(if p.encrypt {
+                Maintenance::Encrypt {
+                    group,
+                    block,
+                    key,
+                    nonce,
+                }
+            } else {
+                Maintenance::Decrypt {
+                    group,
+                    block,
+                    key,
+                    nonce,
+                }
+            });
+        }
+        PendingWork {
+            maintenance,
+            table_updates: std::mem::take(&mut self.pending_tables),
+            kv_keys,
+        }
     }
 
-    /// Whether any maintenance is waiting for the executor.
+    /// Whether any maintenance (or a key that only a maintenance step drops) is waiting
+    /// for the executor.
     pub fn has_pending_maintenance(&self) -> bool {
         !self.pending_maint.is_empty()
+            || !self.pending_crypt.is_empty()
+            || !self.pending_keys.is_empty()
+    }
+
+    /// Idle-KV keys this manager holds: one per live sequence, and those waiting for the
+    /// next step's encryptions and decryptions. Zero once every sequence has released and
+    /// the pending work has been taken.
+    pub fn kv_keys_held(&self) -> usize {
+        self.seqs.len() + self.pending_keys.len()
     }
 
     /// Free blocks in `group` (not counting evictable cache entries).
@@ -244,10 +352,13 @@ impl KvManager {
     /// `prompt_len` is the length of the original prompt (it fixes the regeneration hit
     /// point whose window is retained). A keyed sequence (`retain`) whose chain matches
     /// cached blocks beyond its hit also records that boundary as its branch point.
+    ///
+    /// Hit blocks that were idle are decrypted (queued) under `lineage`'s key, which the
+    /// sequence holds until it is released.
     pub fn admit(
         &mut self,
         id: SeqId,
-        salt: EngineSalt,
+        lineage: Lineage,
         retain: bool,
         tokens: &[u32],
         prompt_len: u32,
@@ -261,7 +372,7 @@ impl KvManager {
         let bs = self.block_size;
         let mut seq = SeqKv {
             slot,
-            salt,
+            lineage,
             retain,
             hashes: Vec::new(),
             entries: Vec::new(),
@@ -277,7 +388,7 @@ impl KvManager {
             let cap_blocks = (tokens.len() as u32 - 1) / bs;
             let mut hashes = Vec::new();
             extend_chain(
-                &seq.salt,
+                seq.lineage.salt(),
                 &tokens[..(cap_blocks * bs) as usize],
                 bs as usize,
                 &mut hashes,
@@ -313,6 +424,7 @@ impl KvManager {
                     };
                     if b != NULL_BLOCK {
                         self.pools[g].refs[b as usize] += 1;
+                        self.settle(g, b, Some(seq.lineage.kv_key()));
                         self.pending_tables.push(TableUpdate {
                             slot,
                             group: g as u32,
@@ -438,8 +550,10 @@ impl KvManager {
                 continue;
             }
             entry.blocks[g] = NULL_BLOCK;
+            self.pools[g].holder[b as usize] = NO_ENTRY;
             freed |= self.pools[g].refs[b as usize] == 1;
             self.decref(g, b);
+            self.settle(g, b, None);
         }
         freed
     }
@@ -473,7 +587,7 @@ impl KvManager {
         let sealable = computed / bs;
         if self.policy.enabled && !seq.chain_broken {
             extend_chain(
-                &seq.salt,
+                seq.lineage.salt(),
                 &tokens[..(sealable * bs) as usize],
                 bs as usize,
                 &mut seq.hashes,
@@ -515,7 +629,10 @@ impl KvManager {
         self.seqs.insert(id, seq);
     }
 
-    /// Releases a sequence's slot and blocks. See [`Release`].
+    /// Releases a sequence's slot and blocks. See [`Release`]. Blocks the cache keeps and no
+    /// other sequence maps are encrypted (queued) under the sequence's key. The sequence's
+    /// lineage is dropped here; the copy of its key those encryptions carry goes with the
+    /// next step.
     pub fn release(&mut self, id: SeqId, kind: Release, now: Millis) {
         let groups = self.pools.len();
         let seq = self.seqs.remove(&id).expect("live sequence");
@@ -532,6 +649,7 @@ impl KvManager {
                 let b = seq.blocks[g][idx];
                 if b != NULL_BLOCK {
                     self.decref(g, b);
+                    self.settle(g, b, Some(seq.lineage.kv_key()));
                 }
             }
         }
@@ -617,6 +735,29 @@ impl KvManager {
             }
         }
         out
+    }
+
+    /// Blocks held by a cache entry and mapped by no sequence, as `(group, block)` pairs:
+    /// the ones held encrypted (testing).
+    pub fn idle_blocks(&self) -> BTreeSet<(u32, u32)> {
+        let mut out = BTreeSet::new();
+        for (g, p) in self.pools.iter().enumerate() {
+            for b in 1..p.refs.len() as u32 {
+                if p.idle(b) {
+                    out.insert((g as u32, b));
+                }
+            }
+        }
+        out
+    }
+
+    /// Queued, not yet executed encryptions (`true`) and decryptions (`false`) by
+    /// `(group, block)` (testing).
+    pub fn pending_crypts(&self) -> BTreeMap<(u32, u32), bool> {
+        self.pending_crypt
+            .iter()
+            .map(|(&k, p)| (k, p.encrypt))
+            .collect()
     }
 
     /// Blocks with a queued, not yet executed zero, as `(group, block)` pairs (testing).
@@ -710,6 +851,27 @@ impl KvManager {
                     "group {g}: block {b} leaked (unreferenced, not free)"
                 );
             }
+            let mut holders = vec![NO_ENTRY; pool.refs.len()];
+            for (&eid, e) in &self.entries {
+                if e.blocks[g] != NULL_BLOCK {
+                    holders[e.blocks[g] as usize] = eid;
+                }
+            }
+            assert_eq!(holders, pool.holder, "group {g}: block holders disagree");
+            for b in 1..pool.refs.len() as u32 {
+                assert_eq!(
+                    pool.encrypted[b as usize],
+                    pool.idle(b),
+                    "group {g}: block {b} is not encrypted exactly while idle"
+                );
+            }
+        }
+        for (&(g, b), p) in &self.pending_crypt {
+            assert_eq!(
+                self.pools[g as usize].encrypted[b as usize], p.encrypt,
+                "group {g}: a queued crypt disagrees with block {b}'s state"
+            );
+            assert!((p.key as usize) < self.pending_keys.len(), "dangling key");
         }
         let mut users: HashMap<EntryId, u32> = HashMap::new();
         for s in self.seqs.values() {
@@ -788,19 +950,71 @@ impl KvManager {
             block: NULL_BLOCK,
         });
         self.decref(g, b);
+        self.settle(g, b, Some(seq.lineage.kv_key()));
     }
 
     fn decref(&mut self, g: usize, b: u32) {
-        let r = &mut self.pools[g].refs[b as usize];
+        let pool = &mut self.pools[g];
+        let r = &mut pool.refs[b as usize];
         assert!(*r > 0, "group {g}: decref of free block {b}");
         *r -= 1;
         if *r == 0 {
-            self.pools[g].free.push(b);
+            assert_eq!(
+                pool.holder[b as usize], NO_ENTRY,
+                "group {g}: block {b} freed while an entry holds it"
+            );
+            pool.free.push(b);
+            // A zeroed block holds nothing to encrypt or decrypt: drop any queued crypt.
+            pool.encrypted[b as usize] = false;
+            self.pending_crypt.remove(&(g as u32, b));
             self.pending_maint.push(Maintenance::Zero {
                 group: g as u32,
                 block: b,
             });
         }
+    }
+
+    /// Brings block `b`'s encryption in line with its ownership after a reference changed:
+    /// encrypted exactly while idle. A block becomes idle or mapped again only through a
+    /// sequence, whose lineage key `key` is; changes on the entry side (an entry dropping
+    /// a block a sequence still maps, or a free) never need one.
+    fn settle(&mut self, g: usize, b: u32, key: Option<&KvKey>) {
+        let pool = &self.pools[g];
+        let want = pool.idle(b);
+        if pool.encrypted[b as usize] == want {
+            return;
+        }
+        let key = key.expect("only a sequence moves a block between idle and mapped");
+        self.pools[g].encrypted[b as usize] = want;
+        if let Some(p) = self.pending_crypt.remove(&(g as u32, b)) {
+            // The opposite operation was queued and has not run: the device is already
+            // in the wanted state.
+            debug_assert_ne!(p.encrypt, want);
+            return;
+        }
+        // The nonce comes from the holding entry now, while one holds the block (a decrypt
+        // may run after the entry was detached).
+        let holder = self.pools[g].holder[b as usize];
+        assert_ne!(
+            holder, NO_ENTRY,
+            "group {g}: block {b} changes encryption with no entry holding it"
+        );
+        let nonce = self.entries[&holder].hash.kv_nonce(g as u32);
+        let key = match self.pending_keys.iter().position(|k| k.ct_eq(key)) {
+            Some(i) => i as u32,
+            None => {
+                self.pending_keys.push(key.clone());
+                self.pending_keys.len() as u32 - 1
+            }
+        };
+        self.pending_crypt.insert(
+            (g as u32, b),
+            PendingCrypt {
+                encrypt: want,
+                key,
+                nonce,
+            },
+        );
     }
 
     fn alloc_block(&mut self, g: usize) -> Option<u32> {
@@ -876,7 +1090,10 @@ impl KvManager {
                     && entry.blocks[g] == NULL_BLOCK
                 {
                     entry.blocks[g] = b;
-                    self.pools[g].refs[b as usize] += 1;
+                    let pool = &mut self.pools[g];
+                    debug_assert_eq!(pool.holder[b as usize], NO_ENTRY);
+                    pool.holder[b as usize] = eid;
+                    pool.refs[b as usize] += 1;
                     attached.push((eid, g, b));
                 }
             }
@@ -933,7 +1150,9 @@ impl KvManager {
         }
         for (g, &b) in e.blocks.iter().enumerate() {
             if b != NULL_BLOCK {
+                self.pools[g].holder[b as usize] = NO_ENTRY;
                 self.decref(g, b);
+                self.settle(g, b, None);
             }
         }
         if let Some(p) = e.parent
@@ -974,17 +1193,20 @@ impl KvManager {
             }
         }
         let groups = self.pools.len();
+        let eid = self.next_entry;
+        self.next_entry += 1;
         let mut blocks = vec![NULL_BLOCK; groups];
         for (g, slot) in blocks.iter_mut().enumerate() {
             if self.attention[g] == AttentionKind::Full {
                 let b = seq.blocks[g][idx];
                 debug_assert_ne!(b, NULL_BLOCK);
-                self.pools[g].refs[b as usize] += 1;
+                let pool = &mut self.pools[g];
+                debug_assert_eq!(pool.holder[b as usize], NO_ENTRY);
+                pool.holder[b as usize] = eid;
+                pool.refs[b as usize] += 1;
                 *slot = b;
             }
         }
-        let eid = self.next_entry;
-        self.next_entry += 1;
         self.entries.insert(
             eid,
             Entry {
@@ -1017,8 +1239,14 @@ mod tests {
     use super::*;
     use crate::mock::mimo_like_spec;
 
-    fn salt() -> EngineSalt {
-        EngineSalt::from_bytes([9; 32])
+    fn salt() -> Lineage {
+        lineage(9)
+    }
+
+    fn lineage(n: u8) -> Lineage {
+        use crate::secret::{BootKey, CacheKey, SaltDeriver};
+        SaltDeriver::with_boot_key(BootKey::from_bytes([0; 32]))
+            .lineage(&CacheKey::from_bytes([n; 32]))
     }
 
     #[test]
@@ -1032,7 +1260,11 @@ mod tests {
         assert!(kv.allocate(1, 17));
         kv.take_pending();
         kv.commit(1, 17, &tokens, 0);
-        let (maint, tables) = kv.take_pending();
+        let PendingWork {
+            maintenance: maint,
+            table_updates: tables,
+            ..
+        } = kv.take_pending();
         let zeroed: Vec<(u32, u32)> = maint
             .iter()
             .filter_map(|m| match *m {

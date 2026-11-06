@@ -55,7 +55,7 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
     /// The client's prefix-cache key: 32 bytes, base64url without padding. Content-class:
-    /// never logged, and turned into an engine salt as soon as it is decoded. Its text is
+    /// never logged, and turned into the engine's lineage as soon as it is decoded. Its text is
     /// scrubbed whenever it is dropped, including when a later field fails to parse and
     /// serde drops the partly built request.
     #[serde(default)]

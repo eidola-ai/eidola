@@ -22,7 +22,8 @@
 use std::cell::Cell;
 use std::sync::Arc;
 
-use crate::module::KernelDir;
+use crate::kv_cipher::KvCipher;
+use crate::module::{ImageSource, KernelDir, KernelModule};
 use eidola_engine::executor::{Executor, ExecutorError, StepInput, StepOutput};
 use eidola_engine::sampling::Stream;
 use eidola_engine::spec::{AttentionKind, Bucket, KvGroupSpec, KvRole, ModelSpec};
@@ -369,13 +370,19 @@ impl CudaExecutor {
             .checked_mul(depths as usize)
             .and_then(|x| x.checked_mul(hidden))
             .ok_or_else(|| CudaError::new("drafter state overflows"))?;
-        let kv = KvStore::new(
+        let mut kv = KvStore::new(
             &gpu,
             geometry,
             cfg.num_state_slots,
             spec.max_blocks_per_seq(),
             state_width,
         )?;
+        kv.set_cipher(KvCipher::from_module(KernelModule::load_from(
+            &gpu,
+            kernels_dir,
+            KvCipher::IMAGE,
+            ImageSource::Cubin(image),
+        )?)?);
         let model = GpuModel::new(
             &gpu,
             weights,
@@ -599,7 +606,9 @@ impl CudaExecutor {
         // they lead to computed, with nothing applied), the rows are checked
         // against those staged tables, and the forward's input against the
         // model; only then is the staged work committed.
-        let staged = self.kv.stage(&step.maintenance, &step.table_updates);
+        let staged =
+            self.kv
+                .stage_keyed(&step.maintenance, step.kv_keys.len(), &step.table_updates);
         let tables = staged.mirror();
 
         // Validate rows; gather token-level inputs, KV targets and plans.
@@ -710,7 +719,7 @@ impl CudaExecutor {
         self.model.check_input(&self.kv, &input)?;
 
         // 1-2. Maintenance, then table updates.
-        self.kv.commit(&self.gpu, staged)?;
+        self.kv.commit(&self.gpu, staged, &step.kv_keys)?;
 
         // 3. The forward.
         self.model.forward(&self.gpu, &self.kv, &input)?;
@@ -860,7 +869,7 @@ impl CudaExecutor {
         )?;
 
         // 1-2. Maintenance, then table updates.
-        self.kv.commit(&self.gpu, staged)?;
+        self.kv.commit(&self.gpu, staged, &step.kv_keys)?;
         // 3-4. The forward and sampling, over the padded step.
         decode.upload(&self.gpu, &packed)?;
         let direct = self.decode_path.get() == DecodePath::Direct;
@@ -992,7 +1001,9 @@ impl CudaExecutor {
     /// work lists) before anything takes effect.
     fn draft_step(&mut self, step: &StepInput) -> Result<StepOutput> {
         use crate::draft::{Load, Row, RowOut};
-        let staged = self.kv.stage(&step.maintenance, &step.table_updates);
+        let staged =
+            self.kv
+                .stage_keyed(&step.maintenance, step.kv_keys.len(), &step.table_updates);
         let d = self.draft.as_ref().expect("drafting");
         let depths = d.ctx.depths;
         let bs = self.spec.block_size;
@@ -1145,7 +1156,7 @@ impl CudaExecutor {
         let words = crate::draft::pack(&built, &layout, &ctx)?;
 
         // 1-2. Maintenance, then table updates.
-        self.kv.commit(&self.gpu, staged)?;
+        self.kv.commit(&self.gpu, staged, &step.kv_keys)?;
         // 3-4. The step's launches, then its one read-back.
         let s = self.gpu.stream().clone();
         let d = self.draft.as_mut().expect("drafting");

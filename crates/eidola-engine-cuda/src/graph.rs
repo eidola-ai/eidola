@@ -935,6 +935,7 @@ mod tests {
 
     fn step_of(seqs: Vec<SeqEntry>) -> StepInput {
         StepInput {
+            kv_keys: Vec::new(),
             bucket: bucket(8, 64),
             maintenance: vec![],
             table_updates: vec![],

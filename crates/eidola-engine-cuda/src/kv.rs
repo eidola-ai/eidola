@@ -38,14 +38,29 @@
 //! they lead to without touching the device or the mirror, and
 //! [`KvStore::commit`] then queues the device work and installs that mirror.
 //! A malformed step panics or errs in `stage`, leaving everything as it was.
+//!
+//! `Encrypt` and `Decrypt` XOR a block's image with its ChaCha20 keystream
+//! ([`crate::kv_cipher`]): the image is the block's pieces in
+//! [`GroupGeometry::block_ranges`] order (a target block's one range; a
+//! drafter block's rows in each layer's K and V planes, then its tap), each
+//! read as little-endian 32-bit words from a fresh keystream block, exactly
+//! the bytes `Zero` would clear. Consecutive encryptions and decryptions run
+//! as one launch, queued in maintenance order between the memsets and copies;
+//! the seam names a block in at most one of them per step and never in one of
+//! them and a zero or copy too, which `stage` checks, so a launch's ranges are
+//! disjoint.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use cudarc::driver::sys;
 use cudarc::driver::{CudaSlice, CudaStream};
 use eidola_engine::executor::{Maintenance, Slot, TableUpdate};
+use eidola_engine::kv_cipher::KvNonce;
+use eidola_engine::secret::KvKey;
 use eidola_engine::spec::NULL_BLOCK;
 
+use crate::kv_cipher::{CipherItem, KvCipher, next_counter};
 use crate::launch::dptr;
 use crate::{CudaError, Gpu, Result};
 
@@ -368,6 +383,16 @@ enum DeviceOp {
     ResetState {
         slot: usize,
     },
+    /// XOR `words` words at byte `offset` of `mem` with key `key`'s keystream
+    /// from block `counter`.
+    Crypt {
+        mem: Mem,
+        offset: usize,
+        words: u32,
+        counter: u32,
+        key: usize,
+        nonce: KvNonce,
+    },
 }
 
 /// A step's maintenance and table updates, validated, with the mirror they
@@ -387,6 +412,7 @@ impl Staged {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stage(
     geometry: &[GroupGeometry],
     max_blocks: usize,
@@ -394,12 +420,39 @@ fn stage(
     current: &TableMirror,
     generation: u64,
     maintenance: &[Maintenance],
+    kv_keys: usize,
     updates: &[TableUpdate],
 ) -> Staged {
     let mut mirror = current.clone();
     let mut ops = Vec::new();
     let mut dirty: Vec<(usize, usize)> = Vec::new();
     let slots = mirror.tables.len();
+    // A block may be named by at most one encrypt or decrypt, and not also by a
+    // zero or copy: the encryptions of a run of maintenance share one launch.
+    let mut crypted = BTreeSet::new();
+    let mut touched = BTreeSet::new();
+    for m in maintenance {
+        match *m {
+            Maintenance::Encrypt { group, block, .. }
+            | Maintenance::Decrypt { group, block, .. } => {
+                assert!(
+                    crypted.insert((group, block)),
+                    "group {group} block {block}: encrypted or decrypted twice in one step"
+                );
+            }
+            Maintenance::Zero { group, block } => {
+                touched.insert((group, block));
+            }
+            Maintenance::Copy { group, src, dst } => {
+                touched.extend([(group, src), (group, dst)]);
+            }
+            Maintenance::ResetSlot { .. } => {}
+        }
+    }
+    assert!(
+        crypted.is_disjoint(&touched),
+        "a block is encrypted or decrypted and also zeroed or copied in one step"
+    );
     for m in maintenance {
         match *m {
             Maintenance::Zero { group, block } => {
@@ -420,6 +473,41 @@ fn stage(
                         dst,
                         bytes,
                     });
+                }
+            }
+            Maintenance::Encrypt {
+                group,
+                block,
+                key,
+                nonce,
+            }
+            | Maintenance::Decrypt {
+                group,
+                block,
+                key,
+                nonce,
+            } => {
+                assert!(
+                    (key as usize) < kv_keys,
+                    "maintenance names key {key}, not in the step"
+                );
+                let (g, ranges) = block_ranges(geometry, group, block);
+                let mut counter = 0;
+                for r in ranges {
+                    let (offset, bytes) = r.bytes();
+                    assert!(bytes % 4 == 0, "a block's pieces are whole words");
+                    let words =
+                        u32::try_from(bytes / 4).expect("validated: a block's words fit u32");
+                    ops.push(DeviceOp::Crypt {
+                        mem: mem_of(g, r),
+                        offset,
+                        words,
+                        counter,
+                        key: key as usize,
+                        nonce,
+                    });
+                    counter =
+                        next_counter(counter, words).expect("a block's image fits the counter");
                 }
             }
             Maintenance::ResetSlot { slot } => {
@@ -509,6 +597,8 @@ pub struct KvStore {
     /// empty when nothing is drafted).
     state: CudaSlice<f32>,
     state_width: usize,
+    /// The idle-KV cipher; a step with encryptions or decryptions needs it.
+    cipher: Option<KvCipher>,
 }
 
 impl KvStore {
@@ -556,7 +646,18 @@ impl KvStore {
             geometry,
             pools,
             taps,
+            cipher: None,
         })
+    }
+
+    /// Install the idle-KV cipher (the executor loads it with its other kernels).
+    pub fn set_cipher(&mut self, cipher: KvCipher) {
+        self.cipher = Some(cipher);
+    }
+
+    /// The idle-KV cipher, if installed (tests read its zeroed item list).
+    pub fn cipher(&self) -> Option<&KvCipher> {
+        self.cipher.as_ref()
     }
 
     /// A planar group's taps: `pool_blocks × taps` rows of `hidden` f32.
@@ -609,6 +710,17 @@ impl KvStore {
     /// group, block or index out of range) panics here, before anything has
     /// changed.
     pub fn stage(&self, maintenance: &[Maintenance], updates: &[TableUpdate]) -> Staged {
+        self.stage_keyed(maintenance, 0, updates)
+    }
+
+    /// [`KvStore::stage`] for a step carrying `kv_keys` keys, which its
+    /// encryptions and decryptions name by index.
+    pub fn stage_keyed(
+        &self,
+        maintenance: &[Maintenance],
+        kv_keys: usize,
+        updates: &[TableUpdate],
+    ) -> Staged {
         stage(
             &self.geometry,
             self.max_blocks,
@@ -616,22 +728,54 @@ impl KvStore {
             &self.mirror,
             self.generation,
             maintenance,
+            kv_keys,
             updates,
         )
     }
 
     /// Queue a staged step's device work on the stream (ahead of the
     /// forward), upload the table rows it changed, and install its mirror.
-    pub fn commit(&mut self, gpu: &Gpu, staged: Staged) -> Result<()> {
+    /// `kv_keys` are the step's keys, which its encryptions and decryptions
+    /// name.
+    pub fn commit(&mut self, gpu: &Gpu, staged: Staged, kv_keys: &[KvKey]) -> Result<()> {
         assert_eq!(
             staged.generation, self.generation,
             "a staged step applies only to the state it was validated against"
         );
+        let crypts = staged
+            .ops
+            .iter()
+            .any(|op| matches!(op, DeviceOp::Crypt { .. }));
+        if crypts && self.cipher.is_none() {
+            return Err(CudaError::new(
+                "a step encrypts or decrypts KV but no cipher is loaded",
+            ));
+        }
         let s = gpu.stream();
         // The raw driver calls below need this thread's current context.
         gpu.context().bind_to_thread()?;
+        let mut batch: Vec<CipherItem> = Vec::new();
         for op in &staged.ops {
+            if let DeviceOp::Crypt {
+                mem,
+                offset,
+                words,
+                counter,
+                key,
+                nonce,
+            } = *op
+            {
+                let base = self.mem_base(s, mem) + offset as u64;
+                batch.push(CipherItem::new(base, words, counter, &kv_keys[key], &nonce));
+                continue;
+            }
+            if !batch.is_empty() {
+                let cipher = self.cipher.as_mut().expect("checked above");
+                cipher.apply(gpu, &mut batch)?;
+                gpu.context().bind_to_thread()?;
+            }
             match *op {
+                DeviceOp::Crypt { .. } => unreachable!("batched above"),
                 DeviceOp::Zero { mem, offset, bytes } => {
                     let base = self.mem_base(s, mem) + offset as u64;
                     // SAFETY: `stage` held the range inside the buffer.
@@ -664,6 +808,10 @@ impl KvStore {
                 }
             }
         }
+        if !batch.is_empty() {
+            let cipher = self.cipher.as_mut().expect("checked above");
+            cipher.apply(gpu, &mut batch)?;
+        }
         self.mirror = staged.mirror;
         self.generation += 1;
         for &(sl, g) in &staged.dirty {
@@ -680,8 +828,19 @@ impl KvStore {
         maintenance: &[Maintenance],
         updates: &[TableUpdate],
     ) -> Result<()> {
-        let staged = self.stage(maintenance, updates);
-        self.commit(gpu, staged)
+        self.apply_keyed(gpu, maintenance, &[], updates)
+    }
+
+    /// [`KvStore::apply`] with the step's keys.
+    pub fn apply_keyed(
+        &mut self,
+        gpu: &Gpu,
+        maintenance: &[Maintenance],
+        kv_keys: &[KvKey],
+        updates: &[TableUpdate],
+    ) -> Result<()> {
+        let staged = self.stage_keyed(maintenance, kv_keys.len(), updates);
+        self.commit(gpu, staged, kv_keys)
     }
 
     fn mem_base(&self, s: &Arc<CudaStream>, mem: Mem) -> u64 {
@@ -883,6 +1042,113 @@ mod tests {
             ..drafter(16, 7)
         };
         assert!(no_tap.validate().is_err());
+    }
+
+    /// [`super::stage`] for a step that carries no keys.
+    fn stage(
+        geometry: &[GroupGeometry],
+        max_blocks: usize,
+        state_width: usize,
+        current: &TableMirror,
+        generation: u64,
+        maintenance: &[Maintenance],
+        updates: &[TableUpdate],
+    ) -> Staged {
+        super::stage(
+            geometry,
+            max_blocks,
+            state_width,
+            current,
+            generation,
+            maintenance,
+            0,
+            updates,
+        )
+    }
+
+    /// An encrypt covers exactly the bytes a zero clears, piece by piece in
+    /// `block_ranges` order, each piece from a fresh keystream block; a block
+    /// named twice, or encrypted and zeroed in one step, or a key the step
+    /// lacks, is refused at staging.
+    #[test]
+    fn crypt_covers_the_block_and_refuses_overlap() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let geometry = vec![geom(16, 8), drafter(16, 8)];
+        let current = TableMirror::new(&geometry, 2, 4);
+        let nonce = KvNonce::from_words([1, 2, 3]);
+        let enc = |group, block, key| Maintenance::Encrypt {
+            group,
+            block,
+            key,
+            nonce,
+        };
+        for group in 0..2u32 {
+            let staged = super::stage(&geometry, 4, 0, &current, 0, &[enc(group, 3, 0)], 1, &[]);
+            let zero = stage(
+                &geometry,
+                4,
+                0,
+                &current,
+                0,
+                &[Maintenance::Zero { group, block: 3 }],
+                &[],
+            );
+            assert_eq!(staged.ops.len(), zero.ops.len());
+            let mut counter = 0;
+            for (c, z) in staged.ops.iter().zip(&zero.ops) {
+                let (
+                    DeviceOp::Crypt {
+                        mem,
+                        offset,
+                        words,
+                        counter: at,
+                        key,
+                        ..
+                    },
+                    DeviceOp::Zero {
+                        mem: zm,
+                        offset: zo,
+                        bytes,
+                    },
+                ) = (*c, *z)
+                else {
+                    panic!("{c:?} {z:?}");
+                };
+                assert_eq!((mem, offset, words as usize * 4, key), (zm, zo, bytes, 0));
+                assert_eq!(at, counter);
+                counter = next_counter(counter, words).unwrap();
+            }
+        }
+        let bad: [&[Maintenance]; 4] = [
+            &[enc(0, 3, 0), enc(0, 3, 0)],
+            &[enc(1, 2, 0), Maintenance::Zero { group: 1, block: 2 }],
+            &[
+                Maintenance::Copy {
+                    group: 0,
+                    src: 2,
+                    dst: 4,
+                },
+                enc(0, 4, 0),
+            ],
+            &[enc(0, 3, 1)],
+        ];
+        for m in bad {
+            let r = catch_unwind(AssertUnwindSafe(|| {
+                super::stage(&geometry, 4, 0, &current, 0, m, 1, &[])
+            }));
+            assert!(r.is_err(), "{m:?}");
+        }
+        // Distinct blocks, and the same block in two groups, are fine.
+        super::stage(
+            &geometry,
+            4,
+            0,
+            &current,
+            0,
+            &[enc(0, 3, 0), enc(1, 3, 0), enc(0, 4, 0)],
+            1,
+            &[],
+        );
     }
 
     /// Zero and copy of a drafter block touch exactly its plane rows and its
