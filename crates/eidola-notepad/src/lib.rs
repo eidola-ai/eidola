@@ -22,9 +22,9 @@ use std::path::{Path, PathBuf};
 
 use futures::StreamExt;
 use gpui::{
-    App, AppContext, Bounds, Global, KeyBinding, Menu, MenuItem, OsAction, PathPromptOptions,
-    Pixels, PromptButton, PromptLevel, WeakEntity, WindowBounds, WindowHandle, WindowKind,
-    WindowOptions, point, px, size,
+    App, AppContext, Bounds, EntityId, Global, KeyBinding, Menu, MenuItem, OsAction,
+    PathPromptOptions, Pixels, PromptButton, PromptLevel, WeakEntity, WindowBounds, WindowHandle,
+    WindowKind, WindowOptions, point, px, size,
 };
 use gpui_component::Root;
 use gpui_kit_assets::Assets;
@@ -412,11 +412,12 @@ fn prompt_open(cx: &mut App) {
 
 /// ⌘Q: every edited document is settled first — saved, or discarded on the
 /// reader's word — and one Cancel keeps the app open.
+///
+/// Windows stay editable while a sheet is up, so the list is taken again
+/// after each round: a document edited since it was settled, or since the
+/// round began, is reviewed again before the app quits.
 pub fn quit(cx: &mut App) {
-    let dirty: Vec<_> = live_documents(cx)
-        .into_iter()
-        .filter(|(_, view)| view.upgrade().is_some_and(|v| v.read(cx).is_dirty()))
-        .collect();
+    let dirty = unsettled_documents(&[], cx);
     if dirty.is_empty() {
         cx.quit();
         return;
@@ -453,18 +454,51 @@ pub fn quit(cx: &mut App) {
                 _ => return,
             }
         }
-        for (handle, view) in dirty {
-            let review = handle.update(cx, |_, window, cx| {
-                view.update(cx, |view, cx| view.review_unsaved(window, cx))
-            });
-            let Ok(Ok(review)) = review else { continue };
-            if !review.await {
-                return;
+        // What each document held when the reader settled it.
+        let mut settled: Vec<(EntityId, String)> = Vec::new();
+        let mut pending = dirty;
+        while !pending.is_empty() {
+            for (handle, view) in pending {
+                let review = handle.update(cx, |_, window, cx| {
+                    view.update(cx, |view, cx| view.review_unsaved(window, cx))
+                });
+                let Ok(Ok(review)) = review else { continue };
+                if !review.await {
+                    return;
+                }
+                if let Some(view) = view.upgrade() {
+                    let text = cx.update(|cx| view.read(cx).editor().read(cx).value().to_string());
+                    settled.retain(|(id, _)| *id != view.entity_id());
+                    settled.push((view.entity_id(), text));
+                }
             }
+            pending = cx.update(|cx| unsettled_documents(&settled, cx));
         }
         cx.update(|cx| cx.quit());
     })
     .detach();
+}
+
+/// Edited documents the quit review still has to ask about: any not yet
+/// settled, and any whose text moved on since it was.
+fn unsettled_documents(
+    settled: &[(EntityId, String)],
+    cx: &mut App,
+) -> Vec<(WindowHandle<Root>, WeakEntity<DocumentView>)> {
+    live_documents(cx)
+        .into_iter()
+        .filter(|(_, view)| {
+            let Some(view) = view.upgrade() else {
+                return false;
+            };
+            let document = view.read(cx);
+            let text = document.editor().read(cx).value();
+            document.is_dirty()
+                && !settled
+                    .iter()
+                    .any(|(id, settled)| *id == view.entity_id() && settled.as_str() == text)
+        })
+        .collect()
 }
 
 fn open_about(cx: &mut App) {

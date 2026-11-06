@@ -102,11 +102,14 @@ pub fn encode(text: &str, format: Format) -> Vec<u8> {
 /// contents go to a sibling temporary file that is renamed over the target,
 /// so a crash or a full disk leaves either the old file or the new one.
 ///
-/// An existing file's permissions carry over to its replacement. A symlink is
-/// written *through* rather than replaced, so a note symlinked into a vault
-/// stays a symlink.
+/// An existing file's permissions carry over to its replacement, and the
+/// temporary file has them before it holds a byte, so a private note is never
+/// readable through its sibling. A symlink is written *through* rather than
+/// replaced, so a note symlinked into a vault stays a symlink — even when the
+/// file it points at has gone, which the write then recreates.
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target = resolve_links(path);
+    let existing = fs::metadata(&target).ok().map(|meta| meta.permissions());
     let dir = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -115,28 +118,13 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "document".into());
-    // Unique per write, and created exclusively: two saves in flight never
-    // share, truncate or rename each other's temporary file.
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let (temp, mut file) = loop {
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let temp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-        {
-            Ok(file) => break (temp, file),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    };
+    let (temp, mut file) = create_temp(dir, &name, existing.as_ref())?;
 
     let result = (|| {
         file.write_all(bytes)?;
         file.sync_all()?;
-        if let Ok(meta) = fs::metadata(&target) {
-            fs::set_permissions(&temp, meta.permissions())?;
+        if let Some(permissions) = existing {
+            fs::set_permissions(&temp, permissions)?;
         }
         fs::rename(&temp, &target)
     })();
@@ -144,6 +132,57 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// A new temporary file beside the target. Unique per write, and created
+/// exclusively, so two saves in flight never share, truncate or rename each
+/// other's; created with the target's permissions, so it is never more
+/// readable than the file it will replace.
+fn create_temp(
+    dir: &Path,
+    name: &str,
+    permissions: Option<&fs::Permissions>,
+) -> io::Result<(PathBuf, fs::File)> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let temp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(permissions) = permissions {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            options.mode(permissions.mode() & 0o777);
+        }
+        #[cfg(not(unix))]
+        let _ = permissions;
+        match options.open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// The file `path` names, through any symlinks. `canonicalize` cannot see past
+/// a link whose target is missing, so such a chain is followed by hand rather
+/// than treating the link itself as the file to replace.
+fn resolve_links(path: &Path) -> PathBuf {
+    if let Ok(resolved) = fs::canonicalize(path) {
+        return resolved;
+    }
+    let mut current = path.to_path_buf();
+    // The same bound the kernel puts on a chain of links.
+    for _ in 0..40 {
+        let Ok(next) = fs::read_link(&current) else {
+            break;
+        };
+        current = match current.parent() {
+            Some(dir) => dir.join(next),
+            None => next,
+        };
+    }
+    current
 }
 
 /// The path a Save As lands on: what the panel returned, with `.md` added
@@ -286,6 +325,45 @@ mod tests {
             );
         }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_file_is_never_readable_through_its_temporary_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private.md");
+        std::fs::write(&path, "secret\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let existing = std::fs::metadata(&path).unwrap().permissions();
+        let (temp, _file) = create_temp(dir.path(), "private.md", Some(&existing)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&temp).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "private before a byte is written"
+        );
+        std::fs::remove_file(&temp).unwrap();
+
+        write_atomically(&path, b"still secret\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_whose_file_has_gone_is_written_through_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        let real = vault.join("note.md");
+        let link = dir.path().join("note.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_atomically(&link, b"back\n").unwrap();
+
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"back\n");
     }
 
     #[test]

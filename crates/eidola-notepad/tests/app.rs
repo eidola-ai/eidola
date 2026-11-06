@@ -98,3 +98,51 @@ fn quitting_with_unsaved_work_asks_and_cancel_stays(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(titles(cx), ["Untitled"], "the app and its document stay");
 }
+
+#[gpui::test]
+fn a_document_edited_during_the_quit_review_is_asked_about_too(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    start(cx, dir.path());
+    for name in ["a.md", "b.md"] {
+        let path = note(dir.path(), name);
+        cx.update(|cx| eidola_notepad::open_paths(vec![path], cx));
+        cx.run_until_parked();
+    }
+    let doc = |name: &str, cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            eidola_notepad::documents(cx)
+                .into_iter()
+                .find(|d| d.read(cx).name() == name)
+                .unwrap()
+        })
+    };
+    let edit = |doc: &gpui::Entity<eidola_notepad::document::DocumentView>,
+                cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            doc.read(cx)
+                .editor()
+                .clone()
+                .update(cx, |editor, cx| editor.append_at_end(" more", cx))
+        });
+    };
+    let (a, b) = (doc("a.md", cx), doc("b.md", cx));
+    edit(&a, cx);
+
+    cx.update(eidola_notepad::quit);
+    cx.run_until_parked();
+    let (message, _) = cx.pending_prompt().expect("a.md is reviewed");
+    assert!(message.contains("a.md"), "{message}");
+
+    edit(&b, cx);
+    cx.simulate_prompt_answer("Don’t Save");
+    cx.run_until_parked();
+    let (message, _) = cx
+        .pending_prompt()
+        .expect("b.md, edited while a.md's sheet was up, is asked about before quitting");
+    assert!(message.contains("b.md"), "{message}");
+
+    // Settled documents are not asked about again unless they change.
+    cx.simulate_prompt_answer("Don’t Save");
+    cx.run_until_parked();
+    assert!(cx.pending_prompt().is_none(), "nothing left to review");
+}
