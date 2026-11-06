@@ -159,7 +159,9 @@ fn the_kernel_matches_the_reference_byte_for_byte() {
                 )
             })
             .collect();
-        cipher.apply(&su.gpu, &mut items).unwrap();
+        // SAFETY: every case's range lies inside `buf`, which outlives the launch (the
+        // read-back below synchronizes), and the cases do not overlap.
+        unsafe { cipher.apply(&su.gpu, &mut items).unwrap() };
         assert!(items.is_empty(), "the host item list is consumed");
         let got = s.clone_dtoh(&buf).unwrap();
         for (i, c) in cs.iter().enumerate() {

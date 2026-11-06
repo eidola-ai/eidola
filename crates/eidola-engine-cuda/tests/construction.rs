@@ -196,6 +196,32 @@ fn refusals_come_before_device_memory() {
         "a kernel image error, not a weight one: {e}"
     );
 
+    // Every image but the idle-KV cipher's: still refused as a kernel image error
+    // before any weight is read (the cipher is loaded with the other kernels).
+    let partial = std::env::temp_dir().join(format!("eidola-no-cipher-{}", std::process::id()));
+    let src = std::path::PathBuf::from(std::env::var_os("EIDOLA_ENGINE_KERNELS_DIR").unwrap());
+    for sub in ["cubin", "fatbin"] {
+        std::fs::create_dir_all(partial.join(sub)).unwrap();
+        for entry in std::fs::read_dir(src.join(sub)).unwrap() {
+            let name = entry.unwrap().file_name();
+            if !name.to_string_lossy().starts_with("kv_cipher") {
+                std::fs::copy(src.join(sub).join(&name), partial.join(sub).join(&name)).unwrap();
+            }
+        }
+    }
+    let e = CudaExecutor::new(
+        open(),
+        &KernelDir::new(&partial),
+        store.clone(),
+        None,
+        config(),
+    )
+    .unwrap_err();
+    assert!(
+        e.to_string().contains("kv_cipher"),
+        "the missing cipher image, not a weight error: {e}"
+    );
+
     // A device the forced image cannot run: refused as a device requirement,
     // before the (empty) kernel directory is even read.
     let mut cfg = config();

@@ -213,14 +213,22 @@ impl KvCipher {
 
     /// XORs every item's range with its keystream, on the stream, and scrubs the items:
     /// `items` is left empty and its key words zeroed, and the device copy is zeroed by a
-    /// memset queued right after the launch. The ranges must be valid device memory, 4-byte
-    /// aligned and disjoint.
-    pub fn apply(&mut self, gpu: &Gpu, items: &mut CipherItems) -> Result<()> {
+    /// memset queued right after the launch. Only word alignment is checked here (a
+    /// misaligned range is refused before anything launches).
+    ///
+    /// # Safety
+    ///
+    /// Each item's `base .. base + 4 * words` must lie inside one live device allocation
+    /// of this context, and stay allocated, with nothing else reading or writing it,
+    /// until the launch has completed on `gpu`'s stream (stream order covers later work
+    /// queued there); no two items' ranges may overlap.
+    pub unsafe fn apply(&mut self, gpu: &Gpu, items: &mut CipherItems) -> Result<()> {
         let result = self.launch(gpu, items.as_slice());
         items.clear();
         result
     }
 
+    /// The launch [`KvCipher::apply`] makes; its safety contract is `apply`'s.
     fn launch(&mut self, gpu: &Gpu, items: &[CipherItem]) -> Result<()> {
         if items.is_empty() {
             return Ok(());

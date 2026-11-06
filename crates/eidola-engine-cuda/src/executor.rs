@@ -358,6 +358,12 @@ impl CudaExecutor {
         } = Self::plan(&store, keep_layers, &cfg)?;
         let image = check_device(gpu.info(), &config, cfg.image)?;
         let kernels = Kernels::load(&gpu, kernels_dir, Some(image))?;
+        let cipher = KvCipher::from_module(KernelModule::load_from(
+            &gpu,
+            kernels_dir,
+            KvCipher::IMAGE,
+            ImageSource::Cubin(image),
+        )?)?;
         let depths = cfg.draft_tokens;
         let hidden = config.hidden_size;
         let weights = ModelWeights::load(&gpu, &kernels, store, config, depths as usize)?;
@@ -377,12 +383,7 @@ impl CudaExecutor {
             spec.max_blocks_per_seq(),
             state_width,
         )?;
-        kv.set_cipher(KvCipher::from_module(KernelModule::load_from(
-            &gpu,
-            kernels_dir,
-            KvCipher::IMAGE,
-            ImageSource::Cubin(image),
-        )?)?);
+        kv.set_cipher(cipher);
         let model = GpuModel::new(
             &gpu,
             weights,

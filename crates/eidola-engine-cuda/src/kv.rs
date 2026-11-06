@@ -774,7 +774,12 @@ impl KvStore {
             }
             if !batch.is_empty() {
                 let cipher = self.cipher.as_mut().expect("checked above");
-                cipher.apply(gpu, &mut batch)?;
+                // SAFETY: every item is a piece of one block that `stage` bounded inside
+                // its group's pool (`block_ranges` of a block id below `num_blocks`); the
+                // pools live as long as the store; the seam names a block in at most one
+                // crypt per step and `stage` refuses one also zeroed or copied, so the
+                // ranges are disjoint and nothing else queued in this run touches them.
+                unsafe { cipher.apply(gpu, &mut batch)? };
                 gpu.context().bind_to_thread()?;
             }
             match *op {
@@ -813,7 +818,12 @@ impl KvStore {
         }
         if !batch.is_empty() {
             let cipher = self.cipher.as_mut().expect("checked above");
-            cipher.apply(gpu, &mut batch)?;
+            // SAFETY: every item is a piece of one block that `stage` bounded inside
+            // its group's pool (`block_ranges` of a block id below `num_blocks`); the
+            // pools live as long as the store; the seam names a block in at most one
+            // crypt per step and `stage` refuses one also zeroed or copied, so the
+            // ranges are disjoint and nothing else queued in this run touches them.
+            unsafe { cipher.apply(gpu, &mut batch)? };
         }
         self.mirror = staged.mirror;
         self.generation += 1;
