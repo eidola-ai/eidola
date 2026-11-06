@@ -19,7 +19,7 @@ use eidola_engine_cuda::{
 use eidola_engine_model::safetensors::WeightSet;
 
 use crate::BootError;
-use crate::config::{CacheConfig, Sizing, env};
+use crate::config::{CacheConfig, GpuCc, Sizing, env};
 use crate::http::DeviceReport;
 use crate::model::LoadedModel;
 
@@ -216,7 +216,8 @@ impl Prepared {
 
 /// The refusals that need no device, in order (the executor's own preflight of the model,
 /// its MTP layers for the draft width, and the step shape; the KV derivation and the
-/// derived geometry), then the device. Nothing is allocated on the device here.
+/// derived geometry), then, with `gpu_cc` required, the GPUs' confidential-computing state
+/// (`crate::gpu_cc`), then the device. Nothing is allocated on the device here.
 pub fn prepare(
     model: &LoadedModel,
     sizing: &Sizing,
@@ -224,6 +225,7 @@ pub fn prepare(
     kernels_dir: &Path,
     kv_device_bytes: u64,
     graphs: CudaGraphs,
+    gpu_cc: GpuCc,
 ) -> Result<Prepared, BootError> {
     let refused = |e: eidola_engine_cuda::CudaError| {
         BootError(format!("the engine refused its configuration: {e}"))
@@ -255,6 +257,25 @@ pub fn prepare(
         .map_err(|_| BootError("the model's hidden size does not fit u32".into()))?;
     config.num_blocks = derive_kv_blocks(&spec, hidden, kv_device_bytes, sizing, cache)?;
     CudaExecutor::preflight(model.store(), None, &config).map_err(refused)?;
+
+    // No device is opened, and nothing reaches one, until the driver reports the GPUs in
+    // confidential-computing mode and accepting work.
+    match gpu_cc {
+        GpuCc::Required => crate::gpu_cc::query()
+            .and_then(|state| crate::gpu_cc::check(&state))
+            .map_err(|e| {
+                BootError(format!(
+                    "{} is required, but the GPUs are not in production confidential-computing \
+                     mode: {e}",
+                    env::GPU_CC
+                ))
+            })?,
+        GpuCc::NotRequired => tracing::warn!(
+            "{} is not-required: the GPUs' confidential-computing mode is not checked \
+             (development only; no gateway pins this configuration)",
+            env::GPU_CC
+        ),
+    }
 
     let gpu = Gpu::open(DEVICE_ORDINAL).map_err(refused)?;
     let info = gpu.info();
