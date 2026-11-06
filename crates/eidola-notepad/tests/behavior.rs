@@ -143,6 +143,50 @@ fn saving_an_untitled_document_asks_where_and_names_the_window(cx: &mut TestAppC
 }
 
 #[gpui::test]
+fn a_save_name_that_gains_an_extension_asks_before_replacing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let existing = note(dir.path(), "Idea.md", b"keep me\n");
+    let (view, cx) = open(Contents::Untitled(1), cx);
+    cx.simulate_input("new");
+
+    for (answer, expected) in [("Cancel", &b"keep me\n"[..]), ("Replace", &b"new\n"[..])] {
+        cx.dispatch_action(Save);
+        cx.run_until_parked();
+        let typed = dir.path().join("Idea");
+        cx.simulate_new_path_selection(|_| Some(typed.clone()));
+        cx.run_until_parked();
+        let (message, _) = cx.pending_prompt().expect("replacing Idea.md asks");
+        assert!(message.contains("Idea.md"), "{message}");
+        cx.simulate_prompt_answer(answer);
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read(&existing).unwrap(),
+            expected,
+            "after {answer}"
+        );
+    }
+    assert!(!dirty(&view, cx));
+}
+
+#[gpui::test]
+fn saves_in_quick_succession_leave_the_newest_text(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = note(dir.path(), "a.md", b"text\n");
+    let (view, cx) = open_file(&path, cx);
+    cx.simulate_keystrokes("cmd-down");
+
+    cx.simulate_input("1");
+    cx.dispatch_action(Save);
+    cx.simulate_input("2");
+    cx.dispatch_action(Save);
+    cx.run_until_parked();
+
+    assert_eq!(std::fs::read(&path).unwrap(), b"text12\n");
+    assert!(!dirty(&view, cx));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[gpui::test]
 fn save_as_moves_a_titled_document(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let path = note(dir.path(), "old.md", b"text\n");
@@ -194,6 +238,37 @@ fn the_close_button_on_an_edited_document_can_save_then_close(cx: &mut TestAppCo
 
     assert_eq!(std::fs::read(&path).unwrap(), b"text!\n");
     assert!(cx.windows().is_empty(), "saved, then closed");
+}
+
+#[gpui::test]
+fn typing_during_the_close_time_save_keeps_the_window(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = note(dir.path(), "a.md", b"text\n");
+    let (view, cx) = open_file(&path, cx);
+    cx.simulate_keystrokes("cmd-down");
+    cx.simulate_input("!");
+
+    cx.dispatch_action(CloseWindow);
+    cx.run_until_parked();
+    // Step the save until its bytes are down, then type before it reports
+    // back: the edit is newer than what was written.
+    cx.simulate_prompt_answer("Save");
+    while std::fs::read(&path).unwrap() != b"text!\n" {
+        assert!(cx.executor().tick(), "the save stalled");
+    }
+    cx.update(|_, cx| {
+        view.read(cx).editor().clone().update(cx, |editor, cx| {
+            editor.apply_event_for_test(
+                gpui_markdown_editor::EditorEvent::InsertText("?".into()),
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+
+    assert!(dirty(&view, cx), "the newer edit is unsaved");
+    assert_eq!(cx.windows().len(), 1, "so the window stayed");
+    assert_eq!(value(&view, cx), "text!?");
 }
 
 #[gpui::test]

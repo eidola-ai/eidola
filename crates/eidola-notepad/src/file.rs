@@ -11,6 +11,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The on-disk shape a document was read in, restored on save.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,10 +115,24 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "document".into());
-    let temp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    // Unique per write, and created exclusively: two saves in flight never
+    // share, truncate or rename each other's temporary file.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let (temp, mut file) = loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let temp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => break (temp, file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
 
     let result = (|| {
-        let mut file = fs::File::create(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         if let Ok(meta) = fs::metadata(&target) {
@@ -246,6 +261,33 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn overlapping_atomic_writes_each_land_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        for _ in 0..20 {
+            let writers: Vec<_> = [b"first\n".repeat(4096), b"second\n".repeat(4096)]
+                .into_iter()
+                .map(|bytes| {
+                    let path = path.clone();
+                    std::thread::spawn(move || write_atomically(&path, &bytes))
+                })
+                .collect();
+            for writer in writers {
+                writer
+                    .join()
+                    .unwrap()
+                    .expect("neither write is spoiled by the other");
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                text == "first\n".repeat(4096) || text == "second\n".repeat(4096),
+                "the file is one write or the other, never a mix"
+            );
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
     #[test]
     fn an_atomic_write_through_a_symlink_keeps_the_link() {
         let dir = tempfile::tempdir().unwrap();

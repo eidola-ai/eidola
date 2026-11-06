@@ -70,6 +70,8 @@ pub struct DocumentView {
     reviewing: bool,
     /// The external-change check is waiting on the reader.
     asking_about_disk: bool,
+    /// Held across each write, so saves land one at a time and in order.
+    save_lock: Rc<futures::lock::Mutex<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -121,6 +123,7 @@ impl DocumentView {
             reveal_caret: Rc::new(Cell::new(false)),
             reviewing: false,
             asking_about_disk: false,
+            save_lock: Rc::default(),
             _subscriptions: subscriptions,
         };
         view.sync_window(window);
@@ -225,14 +228,16 @@ impl DocumentView {
 
     /// Save the document — to its own path, or (untitled, or `save_as`) to
     /// one the reader picks. Resolves `true` once the bytes are on disk.
+    ///
+    /// The text is read when the write starts, not when Save was chosen, and
+    /// writes are serialized: a second Save while one is in flight waits, then
+    /// writes the newer buffer, so an earlier save can never land last.
     pub fn save(
         &mut self,
         save_as: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<bool> {
-        let text = self.editor.read(cx).value().to_string();
-        let format = self.format;
         let target = self.path.clone().filter(|_| !save_as);
         let directory = self
             .path
@@ -245,6 +250,7 @@ impl DocumentView {
             Some(_) => self.name(),
             None => format!("{}.md", self.name()),
         };
+        let lock = self.save_lock.clone();
 
         cx.spawn_in(window, async move |this, cx| {
             let path = match target {
@@ -255,11 +261,42 @@ impl DocumentView {
                     else {
                         return false;
                     };
-                    match chosen.await {
-                        Ok(Ok(Some(path))) => file::with_default_extension(path),
-                        _ => return false,
+                    let Ok(Ok(Some(chosen))) = chosen.await else {
+                        return false;
+                    };
+                    let path = file::with_default_extension(chosen.clone());
+                    // The panel confirmed replacing what the reader typed, not
+                    // the name the extension turned it into.
+                    if path != chosen && path.exists() {
+                        let message = format!(
+                            "“{}” already exists. Do you want to replace it?",
+                            file::display_name(Some(&path), 0)
+                        );
+                        let answer = cx.update(|window, cx| {
+                            window.prompt(
+                                PromptLevel::Warning,
+                                &message,
+                                Some("Replacing it will overwrite its current contents."),
+                                &[PromptButton::ok("Replace"), PromptButton::cancel("Cancel")],
+                                cx,
+                            )
+                        });
+                        let Ok(answer) = answer else {
+                            return false;
+                        };
+                        if answer.await != Ok(0) {
+                            return false;
+                        }
                     }
+                    path
                 }
+            };
+
+            let _writing = lock.lock().await;
+            let Ok((text, format)) = this.update(cx, |this, cx| {
+                (this.editor.read(cx).value().to_string(), this.format)
+            }) else {
+                return false;
             };
             let bytes = file::encode(&text, format);
             let written = path.clone();
@@ -452,10 +489,14 @@ impl DocumentView {
         cx.spawn_in(window, async move |this, cx| {
             let settled = match answer.await {
                 Ok(0) => {
-                    match this.update_in(cx, |this, window, cx| this.save(false, window, cx)) {
-                        Ok(save) => save.await,
-                        Err(_) => false,
-                    }
+                    let saved =
+                        match this.update_in(cx, |this, window, cx| this.save(false, window, cx)) {
+                            Ok(save) => save.await,
+                            Err(_) => false,
+                        };
+                    // Typing while the bytes went down leaves newer text than
+                    // was saved; the window stays rather than dropping it.
+                    saved && this.update(cx, |this, _| !this.dirty).unwrap_or(false)
                 }
                 Ok(1) => true,
                 _ => false,
