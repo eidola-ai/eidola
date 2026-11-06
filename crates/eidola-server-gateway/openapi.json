@@ -1024,6 +1024,13 @@
           "messages"
         ],
         "properties": {
+          "add_generation_prompt": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the prompt ends with the header of a new assistant turn. Omit\nit, or send `false` with `continue_final_message` (vLLM's convention:\nits default is `true`, and it refuses the two together)."
+          },
           "cache_key": {
             "type": [
               "string",
@@ -1033,6 +1040,17 @@
             "maxLength": 43,
             "minLength": 43,
             "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+          },
+          "continue_final_message": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ContinueFinalMessage",
+                "description": "Continue the final assistant message instead of answering it: the\nprompt ends inside that message, so the model resumes exactly where it\nstopped. `true` (or `\"content\"`) continues its `content`;\n`\"reasoning_content\"` continues its `reasoning_content`, for a message\nthat stopped before any answer. The members and their meaning are\nvLLM's and SGLang's, and the field name is `transformers`'\n`apply_chat_template` argument; the rules are\n`eidola_common::engine_protocol::check_continuation`."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "max_completion_tokens": {
             "type": [
@@ -1334,6 +1352,17 @@
           }
         ],
         "description": "A content part within a multimodal message."
+      },
+      "ContinueFinalMessage": {
+        "oneOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "string"
+          }
+        ],
+        "description": "What `continue_final_message` may carry: a flag, or the name of the final\nmessage's field to continue."
       },
       "CreateAccountResponse": {
         "type": "object",
@@ -1781,6 +1810,13 @@
               "null"
             ],
             "description": "An optional name for the participant."
+          },
+          "reasoning_content": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An assistant message's reasoning, which the model's chat template\nrenders before its content: what a continuation of a message that\nstopped mid-reasoning carries, and charged as prompt text\n(`eidola_common::prompt_charge`)."
           },
           "role": {
             "$ref": "#/components/schemas/Role",
