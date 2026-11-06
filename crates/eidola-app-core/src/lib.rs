@@ -8293,7 +8293,7 @@ impl Inner {
     /// Reasoning shape: we accept both `delta.reasoning_content` (OpenAI-style
     /// extension used by some providers) and `delta.reasoning` (vLLM's
     /// extension). Either form is forwarded as `ReasoningDelta`. Unknown
-    /// fields are ignored — if Tinfoil's upstream uses a third spelling, the
+    /// fields are ignored — if an endpoint uses a third spelling, the
     /// thinking section will simply stay empty until we adapt.
     ///
     /// Tool-call shape: `delta.tool_calls` arrives in pieces (id and function
