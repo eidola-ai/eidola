@@ -688,16 +688,6 @@
                 }
               }
             }
-          },
-          "502": {
-            "description": "Upstream provider error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
           }
         }
       }
@@ -1039,7 +1029,7 @@
               "string",
               "null"
             ],
-            "description": "The client's prefix-cache key: 32 bytes, base64url without padding\n(`eidola_common::engine_protocol`). An Eidola-hosted engine scopes\nprefix-cache reuse to requests carrying the same key; without one,\nnothing a request computes is reused by any other.\n\n**Secret, and never serialized.** It is held decoded in a\nscrubbed-on-drop buffer, prints redacted, and `Serialize` skips it, so\nre-serializing a request for the Tinfoil upstream (which has no use\nfor it) cannot carry it there. The one writer is\n`engine_trust::protocol::engine_request_body`.",
+            "description": "The client's prefix-cache key: 32 bytes, base64url without padding\n(`eidola_common::engine_protocol`). The engine scopes prefix-cache\nreuse to requests carrying the same key; without one, nothing a\nrequest computes is reused by any other.\n\n**Secret, and never serialized.** It is held decoded in a\nscrubbed-on-drop buffer, prints redacted, and `Serialize` skips it, so\nno re-serialization of a request (the pricing walk's, say) can carry\nit anywhere. The one writer is\n`engine_trust::protocol::engine_request_body`.",
             "maxLength": 43,
             "minLength": 43,
             "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
@@ -1846,7 +1836,6 @@
           "description",
           "context_length",
           "output_budget_class",
-          "hosting",
           "capabilities",
           "pricing"
         ],
@@ -1864,10 +1853,6 @@
           "description": {
             "type": "string",
             "description": "Short description of the model's capabilities."
-          },
-          "hosting": {
-            "$ref": "#/components/schemas/ModelHosting",
-            "description": "Who runs the inference for this model."
           },
           "id": {
             "type": "string",
@@ -1898,7 +1883,7 @@
       },
       "ModelCapabilities": {
         "type": "object",
-        "description": "What a model can do, as the catalog declares it.\n\nOnly axes that actually vary across the models this server sells are\ncarried. An axis every model shares tells a client nothing and is one more\nassertion that has to stay true. `prompt_cache` and `pinned_weights` are\nthe axes on which an Eidola-hosted row differs from a Tinfoil-hosted one.",
+        "description": "What a model can do, as the catalog declares it.\n\nOnly axes that actually vary across the models this server sells are\ncarried. An axis every model shares tells a client nothing and is one more\nassertion that has to stay true. `prompt_cache` and `pinned_weights` are\nwhat each model's engine pin fixes.",
         "required": [
           "tool_calling",
           "reasoning",
@@ -1939,14 +1924,6 @@
             "description": "Whether the model accepts a `tools` request field.\n\nNamed after the wire rather than after an adjective: the question a\nclient actually has is \"will this request be accepted\", and a field\nname answers it where \"supports tool use\" does not."
           }
         }
-      },
-      "ModelHosting": {
-        "type": "string",
-        "description": "Who runs a model's inference, as the catalog declares it.",
-        "enum": [
-          "tinfoil",
-          "eidola"
-        ]
       },
       "ModelPricing": {
         "type": "object",

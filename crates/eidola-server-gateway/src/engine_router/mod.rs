@@ -36,9 +36,8 @@
 //! (`eidola_common::engine_protocol::refused_before_admission`: a
 //! misconfiguration, or `overloaded`). Any other answer, an error included,
 //! may come after the engine ran the request, and is returned.
-//! The response comes back in the same shapes the Tinfoil backend produces
-//! (`BackendResponse`, `BackendStreamEvent`), so billing settles it the same
-//! way: usage → charge.
+//! The response comes back as a `BackendResponse` or a stream of
+//! `BackendStreamEvent`s, which billing settles: usage → charge.
 
 use std::collections::BTreeMap;
 use std::future::Future;

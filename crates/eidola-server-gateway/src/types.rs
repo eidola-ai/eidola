@@ -66,14 +66,14 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<serde_json::Value>,
 
     /// The client's prefix-cache key: 32 bytes, base64url without padding
-    /// (`eidola_common::engine_protocol`). An Eidola-hosted engine scopes
-    /// prefix-cache reuse to requests carrying the same key; without one,
-    /// nothing a request computes is reused by any other.
+    /// (`eidola_common::engine_protocol`). The engine scopes prefix-cache
+    /// reuse to requests carrying the same key; without one, nothing a
+    /// request computes is reused by any other.
     ///
     /// **Secret, and never serialized.** It is held decoded in a
     /// scrubbed-on-drop buffer, prints redacted, and `Serialize` skips it, so
-    /// re-serializing a request for the Tinfoil upstream (which has no use
-    /// for it) cannot carry it there. The one writer is
+    /// no re-serialization of a request (the pricing walk's, say) can carry
+    /// it anywhere. The one writer is
     /// `engine_trust::protocol::engine_request_body`.
     // `skip_serializing_if` with a predicate that always skips, rather than
     // `skip_serializing`, so the OpenAPI schema (which drops a
@@ -527,9 +527,6 @@ pub struct Model {
     /// Which public output-budget ladder this model draws from.
     pub output_budget_class: OutputBudgetClass,
 
-    /// Who runs the inference for this model.
-    pub hosting: ModelHosting,
-
     /// What this model can do.
     pub capabilities: ModelCapabilities,
 
@@ -553,17 +550,6 @@ impl Capability {
     pub const fn new(supported: bool) -> Self {
         Self { supported }
     }
-}
-
-/// Who runs a model's inference, as the catalog declares it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelHosting {
-    /// Tinfoil's inference service, reached through its router enclave.
-    Tinfoil,
-    /// Eidola's own inference engine, in deployments this gateway build pins
-    /// by measurement and by weights hash.
-    Eidola,
 }
 
 /// Prompt-cache reuse across requests.
@@ -620,18 +606,6 @@ pub struct PinnedWeightsCapability {
     pub revision: Option<String>,
 }
 
-impl PinnedWeightsCapability {
-    /// Weights this gateway does not pin.
-    pub const fn unsupported() -> Self {
-        Self {
-            supported: false,
-            sha256: None,
-            repo: None,
-            revision: None,
-        }
-    }
-}
-
 /// A kind of content a model accepts or produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -662,7 +636,7 @@ pub enum OutputBudgetClass {
 /// Only axes that actually vary across the models this server sells are
 /// carried. An axis every model shares tells a client nothing and is one more
 /// assertion that has to stay true. `prompt_cache` and `pinned_weights` are
-/// the axes on which an Eidola-hosted row differs from a Tinfoil-hosted one.
+/// what each model's engine pin fixes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ModelCapabilities {
     /// Whether the model accepts a `tools` request field.
@@ -1361,9 +1335,9 @@ mod tests {
         assert!(!printed.contains(CACHE_KEY));
     }
 
-    /// The request re-serializes for the Tinfoil upstream without the key:
-    /// `backend.rs` forwards `.json(request)`, and the key is not something
-    /// that upstream may see.
+    /// The request re-serializes without the key: the pricing walk and
+    /// anything else that serializes a parsed request never carry it, and
+    /// the only writer is `engine_request_body`.
     #[test]
     fn a_cache_key_is_never_serialized() {
         let request: ChatCompletionRequest =

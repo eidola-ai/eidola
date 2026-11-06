@@ -1,7 +1,8 @@
 //! Eidola Server - A privacy-transparent AI proxy.
 //!
 //! This server accepts requests in OpenAI Chat Completions API format and
-//! proxies them to Tinfoil's confidential inference enclaves, enriching
+//! routes them to Eidola's own inference engines, in confidential VMs it
+//! attests against the deployments pinned in its own build, enriching
 //! responses with inline privacy metadata and cryptographic verification.
 
 use std::net::SocketAddr;
@@ -11,7 +12,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use eidola_server_gateway::AppState;
-use eidola_server_gateway::backend::TinfoilBackend;
+use eidola_server_gateway::backend::Catalog;
 use eidola_server_gateway::credentials;
 use eidola_server_gateway::helpers::EpochConfig;
 use eidola_server_gateway::stripe::StripeClient;
@@ -20,9 +21,6 @@ use eidola_server_gateway::telemetry;
 /// Server configuration.
 struct Config {
     bind_addr: SocketAddr,
-    tinfoil_api_key: String,
-    tinfoil_base_url: Option<String>,
-    tinfoil_repo: String,
     database_url: String,
     database_password: Option<String>,
     database_ssl_cert: Option<String>,
@@ -39,8 +37,6 @@ struct Config {
     terms_feed_base_url: Option<String>,
     /// How often the terms feed re-polls.
     terms_refresh: std::time::Duration,
-    /// How often `src/upstream_trust` re-checks Tinfoil's latest release.
-    upstream_refresh: std::time::Duration,
     /// The bearer token Eidola's inference nodes verify (`ENGINE_TOKEN`).
     /// Required when this build pins an engine deployment.
     engine_token: Option<String>,
@@ -54,16 +50,6 @@ impl Config {
             .unwrap_or_else(|_| "127.0.0.1:8443".to_string())
             .parse()
             .map_err(|e| format!("invalid BIND_ADDR: {}", e))?;
-
-        let tinfoil_api_key = std::env::var("TINFOIL_API_KEY")
-            .map_err(|_| "TINFOIL_API_KEY environment variable is required")?;
-
-        let tinfoil_base_url = std::env::var("TINFOIL_BASE_URL").ok();
-
-        // Source repo whose signed releases drive the runtime measurement
-        // allowlist for the upstream enclave.
-        let tinfoil_repo = std::env::var("TINFOIL_REPO")
-            .unwrap_or_else(|_| "tinfoilsh/confidential-model-router".to_string());
 
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| "DATABASE_URL environment variable is required")?;
@@ -135,7 +121,6 @@ impl Config {
         // injected secrets to the measurement without exposing them in the config.
         verify_measured_secrets(&[
             ("CREDENTIAL_MASTER_KEY", &credential_master_key_hex),
-            ("TINFOIL_API_KEY", &tinfoil_api_key),
             (
                 "DATABASE_PASSWORD",
                 database_password.as_deref().unwrap_or(""),
@@ -173,16 +158,12 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(|s| s.trim_end_matches('/').to_string());
 
-        // Both refresh periods go through the same guard: each drives a
+        // Every refresh period goes through the same guard: each drives a
         // detached loop where zero is a live-process failure (a panicked
         // ticker, or a poll with no sleep between passes), so it is refused
         // here instead.
         let terms_refresh =
             eidola_server_gateway::helpers::refresh_secs_from_env("TERMS_REFRESH_SECS", 600)?;
-        let upstream_refresh = eidola_server_gateway::helpers::refresh_secs_from_env(
-            "TINFOIL_MEASUREMENT_REFRESH_SECS",
-            eidola_server_gateway::upstream_trust::DEFAULT_REFRESH_SECS,
-        )?;
         let engine_placement_refresh = eidola_server_gateway::helpers::refresh_secs_from_env(
             "ENGINE_PLACEMENT_REFRESH_SECS",
             30,
@@ -237,9 +218,6 @@ impl Config {
 
         Ok(Config {
             bind_addr,
-            tinfoil_api_key,
-            tinfoil_base_url,
-            tinfoil_repo,
             database_url,
             database_password,
             database_ssl_cert,
@@ -250,7 +228,6 @@ impl Config {
             terms_seed,
             terms_feed_base_url,
             terms_refresh,
-            upstream_refresh,
             engine_token,
             engine_placement_refresh,
         })
@@ -341,113 +318,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let credential_key_cache: credentials::KeyCache = Default::default();
     let epoch_config = EpochConfig::default();
 
-    // Build the attesting client. Verification happens per-handshake inside
-    // the connector, so this call performs no network I/O — the first real
-    // request through the client is also the first attestation. We make a
-    // tiny smoke-test request immediately after construction to fail fast at
-    // startup if the upstream is misconfigured.
-    info!("Building Tinfoil attesting client...");
-    let default_base_url = "https://inference.tinfoil.sh/v1".to_string();
-    let inference_base_url = config
-        .tinfoil_base_url
-        .as_deref()
-        .unwrap_or(&default_base_url);
-    // The observer feeds the OTel SNP_ATTESTATIONS counter for every report
-    // whose signature verifies, including reports the policy then rejects.
-    // It runs on the handshake hot path, so it performs one allocation-free
-    // counter increment.
-    let snp_observer: tinfoil_verifier::SevSnpObserver =
-        std::sync::Arc::new(|observation: &tinfoil_verifier::SevSnpTcbObservation| {
-            telemetry::metrics::SNP_ATTESTATIONS.add(
-                1,
-                &[opentelemetry::KeyValue::new(
-                    "bucket",
-                    observation.as_metric_label(),
-                )],
-            );
-        });
-    // The server runs `FROM scratch` inside an enclave with no system trust
-    // store, so trust roots come from the bundled Mozilla list. Tinfoil's
-    // production cert chains under public WebPKI. We deliberately do not
-    // pull in `rustls-native-certs` here.
-    let mut tls_roots = rustls::RootCertStore::empty();
-    tls_roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    // The allowed upstream measurements are resolved at *runtime* from
-    // Tinfoil's latest router release (see `src/upstream_trust` for why).
-    // This factory rebuilds the attesting client whenever that set changes;
-    // all the `attesting_client` wiring (TLS roots, TCB policy, telemetry
-    // observers) lives here so `upstream_trust` stays
-    // free of a telemetry dependency. `attesting_client` does no network
-    // I/O, so rebuilding is cheap.
-    let client_factory: eidola_server_gateway::upstream_trust::AttestingClientFactory = {
-        let inference_base_url = inference_base_url.to_string();
-        std::sync::Arc::new(move |allowed: Vec<tinfoil_verifier::EnclaveMeasurement>| {
-            let inference_base_url = inference_base_url.clone();
-            let tls_roots = tls_roots.clone();
-            let snp_observer = snp_observer.clone();
-            Box::pin(async move {
-                // The router's release records pin SEV-SNP only.
-                let allowed: Vec<tinfoil_verifier::AllowedMeasurement> = allowed
-                    .iter()
-                    .map(tinfoil_verifier::AllowedMeasurement::from)
-                    .collect();
-                tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-                    allowed_measurements: allowed.as_slice(),
-                    inference_base_url: &inference_base_url,
-                    trusted_ark_der: None,
-                    trusted_ask_der: None,
-                    snp_min_tcb: None,
-                    snp_observer: Some(snp_observer),
-                    attestation_observer: None,
-                    tls_roots,
-                })
-                .await
-                .map_err(|e| e.to_string())
-            })
-        })
-    };
-
-    // Bootstrap the runtime trust: resolve + verify the latest release's
-    // measurement, build the initial attesting client, and start the periodic
-    // refresh task. There is no static fallback — if the measurement can't be
-    // resolved and verified at boot, the server refuses to start.
-    info!("Resolving Tinfoil upstream measurement and building attesting client...");
-    let upstream = eidola_server_gateway::upstream_trust::UpstreamTrust::bootstrap(
-        config.tinfoil_repo.clone(),
-        client_factory,
-    )
-    .await
-    .map_err(|e| {
-        error!("Upstream trust bootstrap failed: {e}");
-        e
-    })?;
-    let client_cell = upstream.client_cell();
-    std::sync::Arc::clone(&upstream).spawn_refresh(config.upstream_refresh);
-
-    // Readiness: attest the enclave once through the current client, failing
-    // fast at startup if the upstream is misconfigured or attestation fails.
-    info!("Smoke-testing Tinfoil enclave attestation via {inference_base_url}/models...");
-    client_cell
-        .load()
-        .get(format!("{inference_base_url}/models"))
-        .header(
-            "authorization",
-            format!("Bearer {}", config.tinfoil_api_key),
-        )
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Tinfoil attestation smoke test failed: {e}");
-            e
-        })?
-        .error_for_status()
-        .map_err(|e| {
-            error!("Tinfoil attestation smoke test returned non-success: {e}");
-            e
-        })?;
-    info!("Tinfoil attestation smoke test succeeded");
-
     // The router to Eidola-hosted engines, when this build pins any. Each
     // upstream's client attests against its model's compiled-in pins; the
     // placement table only says where engines are. A first placement read and
@@ -493,12 +363,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Create shared state
     let state = AppState::new(
-        TinfoilBackend::new(
-            client_cell,
-            config.tinfoil_api_key.clone(),
-            config.tinfoil_base_url.clone(),
-            config.pricing_markup,
-        ),
+        Catalog::new(config.pricing_markup),
         engines,
         db_pool,
         stripe,

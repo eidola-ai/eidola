@@ -196,10 +196,8 @@
             # consume pinned trust data from `releases/`:
             #   * eidola-app-core → all of `releases/trust/*.json` +
             #     `releases/schema/*.json` (client trust root)
-            #   * eidola-server-gateway → `releases/trust/sigstore-trusted-root.json`
-            #     (pinned Sigstore root; the runtime measurement resolver
-            #     verifies Tinfoil release attestations against it) and
-            #     `releases/trust/engine-enclaves.json` (the engine pins)
+            #   * eidola-server-gateway → `releases/trust/engine-enclaves.json`
+            #     (the engine pins)
             # Included only when either crate is built, so unrelated crates
             # do not cache-bust on every manifest regeneration.
             # `artifact-manifest.json` (at the root, not under `releases/`)
