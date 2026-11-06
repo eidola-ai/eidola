@@ -55,6 +55,15 @@ Some operations stay local even when they could be moved to the server, because 
 - **Anonymous credential issuance** is split across the client and server: the client generates the blinding factor, holds the unblinded token, and submits it on each inference request. The server never sees the unblinded token paired with the account that requested it.
 - **Trust-chain verification** for self-update runs entirely in the client. The verifier fetches release artifacts, hashes them locally, and checks every signature locally against the embedded trust root. No server-side "is this release safe?" call exists.
 
+## Prefix-cache keys
+
+An Eidola-hosted inference engine can reuse the computation behind a prompt prefix it has already processed, which makes each turn of a long conversation cheaper and faster. Reuse is scoped by a `cache_key` the client sends: requests carrying the same key may share cached computation, and no other requests do. Because a key links the requests it rides on, the client treats it as the thing to minimize ([Privacy guarantees §2.7](privacy-guarantees.md#2-unlinkability)):
+
+- **When one is sent.** Only for a model whose catalog entry declares an engine prefix cache (`prompt_cache` with `supported: true` and both retention bounds). Any other model gets a request byte-for-byte the one it would get if keys did not exist. Requests made through the client's local inference proxy never carry one.
+- **What it is.** 32 bytes from the operating system's random number generator, scoped to one *lineage* — one participant answering in one space, that conversation's branches and regenerations included — and to the server endpoint and trust configuration it was created under. It is never sent for another space, another participant, or to another endpoint or trust configuration.
+- **When it rotates.** A fresh key replaces it before any request that would come after the lineage has been idle for the declared idle TTL since its last request that may have been delivered, after the key reaches the declared maximum age, after the participant's model changes, or when the clock reads earlier than the key's recorded times. The key is judged at the moment the request body is written to an attested connection, so a slow connection or a suspended process cannot carry it past those bounds; a request that failed before anything was sent does not count as a use.
+- **Where it lives.** Only in the local database. It is overwritten there before being replaced or deleted, and deleted when its conversation is archived, its participant leaves or is retired, or the endpoint or trust configuration changes. It is never logged or displayed, and the request record keeps it as withheld.
+
 ## Two surfaces: GUI and CLI, one core
 
 The Eidola client ships as a native GUI app (gpui, on macOS and Linux/Wayland) and a cross-platform CLI binary, both built on the same shared core crate (`crates/eidola-app-core/`). The split exists for UX reasons, not trust reasons:
