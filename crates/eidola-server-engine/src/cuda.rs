@@ -58,6 +58,82 @@ const RETENTION_POINTS: u64 = 3;
 /// on every node. Its least accepted budget is
 /// `eidola_common::engine_deployment::cuda_kv_min_bytes`, which the gateway's build
 /// holds every pinned deployment to; the two are kept equal by a test here.
+/// The executor's bytes per block of group `g` (`GroupGeometry::block_bytes`: BF16 K and
+/// V of every layer, and a drafter block's boundary tap of `hidden` f32 per depth).
+fn group_block_bytes(g: &KvGroupSpec, sizing: &Sizing, hidden: u32) -> Result<u64, BootError> {
+    let geometry = GroupGeometry {
+        num_layers: g.num_layers,
+        num_kv_heads: g.num_kv_heads,
+        head_dim_qk: g.head_dim_qk,
+        head_dim_v: g.head_dim_v,
+        block_size: sizing.kv_block_size,
+        num_blocks: 2,
+        // A drafter block holds a tap of every depth's level beside its KV.
+        layout: match g.role {
+            KvRole::Target => KvLayout::Blocked,
+            KvRole::Drafter => KvLayout::Planar {
+                taps: g.num_layers,
+                hidden,
+            },
+        },
+    };
+    geometry
+        .validate()
+        .map_err(|e| BootError(format!("the engine refused its configuration: {e}")))?;
+    u64::try_from(geometry.block_bytes())
+        .map_err(|_| BootError(format!("{} overflows the KV sizing", env::KV_DEVICE_BYTES)))
+}
+
+/// Derives the host tier's per-group block counts from `kv_host_bytes`: the device
+/// pools' mix (`device`, as [`derive_kv_blocks`] gave it) scaled to the budget, so each
+/// group `g` with `n_g` device blocks of `b_g` bytes gets `floor(n_g × H / Σ n_h b_h)`
+/// host blocks (`H` = `kv_host_bytes`), the null block among them. The blocks' bytes then
+/// sum to at most `H`, which the gateway's build charges to the VM's memory
+/// (`engine_deployment::check_resources`). The host tier takes what the device pools hold
+/// when they run short, in the same mix. 0 gives no host tier; a budget too small for two
+/// blocks in every group is refused.
+pub fn derive_host_blocks(
+    spec: &ModelSpec,
+    hidden: u32,
+    kv_host_bytes: u64,
+    sizing: &Sizing,
+    device: &KvBlocks,
+) -> Result<KvBlocks, BootError> {
+    if kv_host_bytes == 0 {
+        return Ok(KvBlocks::default());
+    }
+    let count = |g: &KvGroupSpec| -> u64 {
+        u64::from(match (g.attention, g.role) {
+            (AttentionKind::Full, _) => device.global,
+            (AttentionKind::Sliding { .. }, KvRole::Target) => device.sliding,
+            (AttentionKind::Sliding { .. }, KvRole::Drafter) => device.drafter,
+        })
+    };
+    let mut device_bytes = 0u128;
+    for g in &spec.kv_groups {
+        device_bytes += u128::from(count(g)) * u128::from(group_block_bytes(g, sizing, hidden)?);
+    }
+    let mut host = KvBlocks::default();
+    for g in &spec.kv_groups {
+        let n = u128::from(count(g)) * u128::from(kv_host_bytes) / device_bytes.max(1);
+        if n < 2 {
+            return Err(BootError(format!(
+                "{} ({kv_host_bytes}) gives the {} KV group fewer than two host blocks",
+                env::KV_HOST_BYTES,
+                g.name
+            )));
+        }
+        // Past `i32::MAX` no block id fits the executor's tables; the count stops there.
+        let n = u32::try_from(n.min(i32::MAX as u128)).expect("capped");
+        match (g.attention, g.role) {
+            (AttentionKind::Full, _) => host.global = n,
+            (AttentionKind::Sliding { .. }, KvRole::Target) => host.sliding = n,
+            (AttentionKind::Sliding { .. }, KvRole::Drafter) => host.drafter = n,
+        }
+    }
+    Ok(host)
+}
+
 pub fn derive_kv_blocks(
     spec: &ModelSpec,
     hidden: u32,
@@ -78,28 +154,7 @@ pub fn derive_kv_blocks(
     }
     let b = u64::from(sizing.kv_block_size);
     let overflow = || BootError(format!("{} overflows the KV sizing", env::KV_DEVICE_BYTES));
-    let block_bytes = |g: &KvGroupSpec| -> Result<u64, BootError> {
-        let geometry = GroupGeometry {
-            num_layers: g.num_layers,
-            num_kv_heads: g.num_kv_heads,
-            head_dim_qk: g.head_dim_qk,
-            head_dim_v: g.head_dim_v,
-            block_size: sizing.kv_block_size,
-            num_blocks: 2,
-            // A drafter block holds a tap of every depth's level beside its KV.
-            layout: match g.role {
-                KvRole::Target => KvLayout::Blocked,
-                KvRole::Drafter => KvLayout::Planar {
-                    taps: g.num_layers,
-                    hidden,
-                },
-            },
-        };
-        geometry
-            .validate()
-            .map_err(|e| BootError(format!("the engine refused its configuration: {e}")))?;
-        u64::try_from(geometry.block_bytes()).map_err(|_| overflow())
-    };
+    let block_bytes = |g: &KvGroupSpec| group_block_bytes(g, sizing, hidden);
     let points = if cache.enabled { RETENTION_POINTS } else { 0 };
 
     let (mut global, mut sliding, mut drafter) = (None, None, None);
@@ -223,6 +278,7 @@ pub fn prepare(
     cache: &CacheConfig,
     kernels_dir: &Path,
     kv_device_bytes: u64,
+    kv_host_bytes: u64,
     graphs: CudaGraphs,
 ) -> Result<Prepared, BootError> {
     let refused = |e: eidola_engine_cuda::CudaError| {
@@ -237,6 +293,7 @@ pub fn prepare(
             sliding: 2,
             drafter: if drafting { 2 } else { 0 },
         },
+        host_blocks: KvBlocks::default(),
         num_state_slots: sizing.max_seqs,
         max_model_len: sizing.max_model_len,
         buckets: vec![Bucket {
@@ -254,6 +311,8 @@ pub fn prepare(
     let hidden = u32::try_from(model.config().hidden_size)
         .map_err(|_| BootError("the model's hidden size does not fit u32".into()))?;
     config.num_blocks = derive_kv_blocks(&spec, hidden, kv_device_bytes, sizing, cache)?;
+    config.host_blocks =
+        derive_host_blocks(&spec, hidden, kv_host_bytes, sizing, &config.num_blocks)?;
     CudaExecutor::preflight(model.store(), None, &config).map_err(refused)?;
 
     let gpu = Gpu::open(DEVICE_ORDINAL).map_err(refused)?;
@@ -297,6 +356,7 @@ mod tests {
             head_dim_qk: 192,
             head_dim_v: 128,
             num_blocks: 2,
+            host_blocks: 0,
         }
     }
 
@@ -351,6 +411,60 @@ mod tests {
             enabled,
             idle_ttl_secs: 900,
             max_age_secs: 7200,
+        }
+    }
+
+    /// The host tier takes the device pools' mix scaled to its budget, its bytes never
+    /// past the budget; 0 is none, and too small a budget is refused.
+    #[test]
+    fn host_blocks_scale_the_device_mix_to_the_budget() {
+        let hidden = 4096;
+        for k in [0u32, 3] {
+            let spec = flash_drafting(k);
+            let s = Sizing {
+                draft_tokens: k,
+                ..sizing()
+            };
+            let device = derive_kv_blocks(&spec, hidden, 8 << 30, &s, &cache(true)).unwrap();
+            assert_eq!(
+                derive_host_blocks(&spec, hidden, 0, &s, &device).unwrap(),
+                KvBlocks::default()
+            );
+            let bytes = |b: &KvBlocks| -> u64 {
+                spec.kv_groups
+                    .iter()
+                    .map(|g| {
+                        let n = match (g.attention, g.role) {
+                            (AttentionKind::Full, _) => b.global,
+                            (_, KvRole::Target) => b.sliding,
+                            (_, KvRole::Drafter) => b.drafter,
+                        };
+                        u64::from(n) * group_block_bytes(g, &s, hidden).unwrap()
+                    })
+                    .sum()
+            };
+            let on_device = bytes(&device);
+            for budget in [on_device, 3 * on_device, 64 << 30, (64 << 30) + 12345] {
+                let host = derive_host_blocks(&spec, hidden, budget, &s, &device).unwrap();
+                assert!(bytes(&host) <= budget, "k {k} budget {budget}");
+                // Each group's share follows the device's, within a block.
+                let ratio = budget as f64 / on_device as f64;
+                for (h, d) in [
+                    (host.global, device.global),
+                    (host.sliding, device.sliding),
+                    (host.drafter, device.drafter),
+                ] {
+                    let want = f64::from(d) * ratio;
+                    assert!((f64::from(h) - want).abs() <= 1.0, "{h} vs {want}");
+                }
+                assert_eq!(host.drafter == 0, k == 0);
+            }
+            assert_eq!(
+                derive_host_blocks(&spec, hidden, on_device, &s, &device).unwrap(),
+                device
+            );
+            let e = derive_host_blocks(&spec, hidden, 1 << 20, &s, &device).unwrap_err();
+            assert!(e.0.contains(env::KV_HOST_BYTES), "{e}");
         }
     }
 

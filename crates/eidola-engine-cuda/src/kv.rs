@@ -46,15 +46,32 @@
 //! read as little-endian 32-bit words from a fresh keystream block, exactly
 //! the bytes `Zero` would clear. Consecutive encryptions and decryptions run
 //! as one launch, queued in maintenance order between the memsets and copies;
-//! the seam names a block in at most one of them per step and never in one of
-//! them and a zero or copy too, which `stage` checks, so a launch's ranges are
-//! disjoint.
+//! the seam names a block in at most one of them per step, never copies a
+//! block it encrypts or decrypts, and never lists a zero after one, which
+//! `stage` checks, so a launch's ranges are disjoint and every launch sees
+//! what the operations before it left.
+//!
+//! **The host tier** ([`KvStore::set_host_tier`]) is one page-locked host
+//! allocation per group (`cuMemHostAlloc`: pinned, so the kernel never pages
+//! it out, and DMA-able), zeroed when allocated, of `host_blocks` blocks. A
+//! host block is a block's image: its [`GroupGeometry::block_ranges`] pieces
+//! back to back, `block_bytes` long. `Demote` is one `cuMemcpyDtoHAsync` per
+//! piece and `Promote` one `cuMemcpyHtoDAsync` per piece, on the step's
+//! stream in maintenance order, so a demote reads the block before the zero
+//! queued after it and a promote lands before the decryption that follows
+//! it. The core only ever moves ciphertext this way; nothing here reads a
+//! host block otherwise. `ZeroHost` is applied by the host CPU once the
+//! stream has drained ([`KvStore::finish_host`], which the executor calls
+//! before `execute` returns), so it never races a copy still reading the
+//! block. Under confidential computing every one of these copies passes
+//! through the driver's encrypted staging buffer: the host sees their sizes
+//! and timing, never their contents.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use cudarc::driver::sys;
-use cudarc::driver::{CudaSlice, CudaStream};
+use cudarc::driver::{CudaSlice, CudaStream, PinnedHostSlice};
 use eidola_engine::executor::{Maintenance, Slot, TableUpdate};
 use eidola_engine::kv_cipher::KvNonce;
 use eidola_engine::secret::KvKey;
@@ -383,6 +400,31 @@ enum DeviceOp {
     ResetState {
         slot: usize,
     },
+    /// Copy `bytes` at byte `offset` of `mem` to byte `at` of group `group`'s
+    /// host tier.
+    ToHost {
+        mem: Mem,
+        offset: usize,
+        bytes: usize,
+        group: usize,
+        at: usize,
+    },
+    /// Copy `bytes` at byte `at` of group `group`'s host tier to byte `offset`
+    /// of `mem`.
+    FromHost {
+        mem: Mem,
+        offset: usize,
+        bytes: usize,
+        group: usize,
+        at: usize,
+    },
+    /// Zero `bytes` at byte `at` of group `group`'s host tier (once the
+    /// stream has drained: [`KvStore::finish_host`]).
+    ZeroHost {
+        group: usize,
+        at: usize,
+        bytes: usize,
+    },
     /// XOR `words` words at byte `offset` of `mem` with key `key`'s keystream
     /// from block `counter`.
     Crypt {
@@ -412,9 +454,78 @@ impl Staged {
     }
 }
 
+/// Checks the order rules of one step's maintenance (the module docs), in
+/// order: a block is encrypted or decrypted at most once and never also
+/// copied; nothing zeroes or promotes into a block after its encryption or
+/// decryption; a demote reads a block nothing earlier in the step changed.
+fn check_order(maintenance: &[Maintenance]) {
+    let mut crypted = BTreeSet::new();
+    let mut copied = BTreeSet::new();
+    let mut changed = BTreeSet::new();
+    for m in maintenance {
+        match *m {
+            Maintenance::Encrypt { group, block, .. }
+            | Maintenance::Decrypt { group, block, .. } => {
+                assert!(
+                    crypted.insert((group, block)),
+                    "group {group} block {block}: encrypted or decrypted twice in one step"
+                );
+                assert!(
+                    !copied.contains(&(group, block)),
+                    "group {group} block {block}: copied and encrypted or decrypted in one step"
+                );
+            }
+            Maintenance::Zero { group, block } | Maintenance::Promote { group, block, .. } => {
+                assert!(
+                    !crypted.contains(&(group, block)),
+                    "group {group} block {block}: zeroed or promoted into after its encryption \
+                     or decryption"
+                );
+                changed.insert((group, block));
+            }
+            Maintenance::Copy { group, src, dst } => {
+                for b in [src, dst] {
+                    assert!(
+                        !crypted.contains(&(group, b)),
+                        "group {group} block {b}: copied and encrypted or decrypted in one step"
+                    );
+                    copied.insert((group, b));
+                }
+            }
+            Maintenance::Demote { group, block, .. } => {
+                let b = (group, block);
+                assert!(
+                    !crypted.contains(&b) && !copied.contains(&b) && !changed.contains(&b),
+                    "group {group} block {block}: demoted after an earlier operation of the \
+                     step changed it"
+                );
+            }
+            Maintenance::ResetSlot { .. } | Maintenance::ZeroHost { .. } => {}
+        }
+    }
+}
+
+/// The group and byte offset of host block `host`; panics on a group without
+/// a host tier or a block outside it (or the null block).
+fn host_at(
+    geometry: &[GroupGeometry],
+    host_blocks: &[u32],
+    group: u32,
+    host: u32,
+) -> (usize, usize) {
+    let g = group as usize;
+    let n = host_blocks.get(g).copied().unwrap_or(0);
+    assert!(
+        host != NULL_BLOCK && host < n,
+        "host block {host} outside group {group}'s host tier"
+    );
+    (g, host as usize * geometry[g].block_bytes())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stage(
     geometry: &[GroupGeometry],
+    host_blocks: &[u32],
     max_blocks: usize,
     state_width: usize,
     current: &TableMirror,
@@ -427,32 +538,7 @@ fn stage(
     let mut ops = Vec::new();
     let mut dirty: Vec<(usize, usize)> = Vec::new();
     let slots = mirror.tables.len();
-    // A block may be named by at most one encrypt or decrypt, and not also by a
-    // zero or copy: the encryptions of a run of maintenance share one launch.
-    let mut crypted = BTreeSet::new();
-    let mut touched = BTreeSet::new();
-    for m in maintenance {
-        match *m {
-            Maintenance::Encrypt { group, block, .. }
-            | Maintenance::Decrypt { group, block, .. } => {
-                assert!(
-                    crypted.insert((group, block)),
-                    "group {group} block {block}: encrypted or decrypted twice in one step"
-                );
-            }
-            Maintenance::Zero { group, block } => {
-                touched.insert((group, block));
-            }
-            Maintenance::Copy { group, src, dst } => {
-                touched.extend([(group, src), (group, dst)]);
-            }
-            Maintenance::ResetSlot { .. } => {}
-        }
-    }
-    assert!(
-        crypted.is_disjoint(&touched),
-        "a block is encrypted or decrypted and also zeroed or copied in one step"
-    );
+    check_order(maintenance);
     for m in maintenance {
         match *m {
             Maintenance::Zero { group, block } => {
@@ -509,6 +595,44 @@ fn stage(
                     counter =
                         next_counter(counter, words).expect("a block's image fits the counter");
                 }
+            }
+            Maintenance::Demote { group, block, host } => {
+                let (g, ranges) = block_ranges(geometry, group, block);
+                let (_, mut at) = host_at(geometry, host_blocks, group, host);
+                for r in ranges {
+                    let (offset, bytes) = r.bytes();
+                    ops.push(DeviceOp::ToHost {
+                        mem: mem_of(g, r),
+                        offset,
+                        bytes,
+                        group: g,
+                        at,
+                    });
+                    at += bytes;
+                }
+            }
+            Maintenance::Promote { group, host, block } => {
+                let (g, ranges) = block_ranges(geometry, group, block);
+                let (_, mut at) = host_at(geometry, host_blocks, group, host);
+                for r in ranges {
+                    let (offset, bytes) = r.bytes();
+                    ops.push(DeviceOp::FromHost {
+                        mem: mem_of(g, r),
+                        offset,
+                        bytes,
+                        group: g,
+                        at,
+                    });
+                    at += bytes;
+                }
+            }
+            Maintenance::ZeroHost { group, host } => {
+                let (g, at) = host_at(geometry, host_blocks, group, host);
+                ops.push(DeviceOp::ZeroHost {
+                    group: g,
+                    at,
+                    bytes: geometry[g].block_bytes(),
+                });
             }
             Maintenance::ResetSlot { slot } => {
                 let sl = slot as usize;
@@ -599,6 +723,20 @@ pub struct KvStore {
     state_width: usize,
     /// The idle-KV cipher; a step with encryptions or decryptions needs it.
     cipher: Option<KvCipher>,
+    /// The host tier, one pinned allocation per group (empty without one).
+    host: Vec<HostTier>,
+    /// Host blocks per group (empty without a host tier).
+    host_blocks: Vec<u32>,
+    /// Host ranges a committed step zeroes once the stream drains, as
+    /// `(group, byte offset, bytes)`.
+    host_zeros: Vec<(usize, usize, usize)>,
+}
+
+/// One group's host tier: a page-locked allocation of `blocks` block images.
+struct HostTier {
+    mem: PinnedHostSlice<u8>,
+    /// The allocation's address (kept as an integer so the store stays `Send`).
+    base: usize,
 }
 
 impl KvStore {
@@ -647,7 +785,85 @@ impl KvStore {
             pools,
             taps,
             cipher: None,
+            host: Vec::new(),
+            host_blocks: Vec::new(),
+            host_zeros: Vec::new(),
         })
+    }
+
+    /// Allocate the host tier: for each group, `host_blocks[g]` block images
+    /// (the null block 0 included) of page-locked host memory, zeroed. All
+    /// zero leaves the store without one.
+    pub fn set_host_tier(&mut self, gpu: &Gpu, host_blocks: &[u32]) -> Result<()> {
+        assert_eq!(host_blocks.len(), self.geometry.len(), "a count per group");
+        if host_blocks.iter().all(|&n| n == 0) {
+            return Ok(());
+        }
+        let mut host = Vec::with_capacity(host_blocks.len());
+        for (g, &n) in host_blocks.iter().enumerate() {
+            if n < 2 {
+                return Err(CudaError::new(format!(
+                    "host tier of group {g}: {n} blocks, at least 2 (the null block and one more)"
+                )));
+            }
+            let bytes = self.geometry[g]
+                .block_bytes()
+                .checked_mul(n as usize)
+                .filter(|&b| b < isize::MAX as usize)
+                .ok_or_else(|| CudaError::new(format!("host tier of group {g} overflows")))?;
+            // SAFETY: the memory is zeroed below, before anything reads it.
+            let mut mem = unsafe { gpu.context().alloc_pinned_with_flags::<u8>(bytes, 0) }?;
+            let base = mem.as_mut_ptr()?;
+            // SAFETY: `base` is the start of the `bytes`-long allocation just made,
+            // which nothing else references yet.
+            unsafe { std::ptr::write_bytes(base, 0, bytes) };
+            host.push(HostTier {
+                mem,
+                base: base as usize,
+            });
+        }
+        self.host = host;
+        self.host_blocks = host_blocks.to_vec();
+        Ok(())
+    }
+
+    /// Host blocks per group (empty without a host tier).
+    pub fn host_blocks(&self) -> &[u32] {
+        &self.host_blocks
+    }
+
+    /// Apply the host zeros committed steps queued, once every copy queued
+    /// before them has completed: synchronizes the stream (only when there
+    /// are any), then overwrites the ranges. The executor calls this before a
+    /// step returns, so a host block is zero by the time the next step can
+    /// write it.
+    pub fn finish_host(&mut self, gpu: &Gpu) -> Result<()> {
+        if self.host_zeros.is_empty() {
+            return Ok(());
+        }
+        gpu.stream().synchronize()?;
+        for (g, at, bytes) in std::mem::take(&mut self.host_zeros) {
+            let tier = &self.host[g];
+            assert!(at + bytes <= tier.mem.len(), "staged inside the host tier");
+            // SAFETY: the range lies inside the group's live pinned allocation
+            // (checked above), and the stream has drained, so no copy reads it.
+            unsafe { std::ptr::write_bytes((tier.base + at) as *mut u8, 0, bytes) };
+        }
+        Ok(())
+    }
+
+    /// One host block's image (tests and diagnostics), after the stream has
+    /// drained: its pieces in [`GroupGeometry::block_ranges`] order, as bytes.
+    pub fn read_host_block(&self, gpu: &Gpu, group: usize, host: u32) -> Result<Vec<u8>> {
+        gpu.stream().synchronize()?;
+        let bytes = self.geometry[group].block_bytes();
+        let at = host as usize * bytes;
+        let tier = &self.host[group];
+        assert!(at + bytes <= tier.mem.len(), "a block inside the host tier");
+        // SAFETY: the range lies inside the live pinned allocation and the
+        // stream has drained.
+        let s = unsafe { std::slice::from_raw_parts((tier.base + at) as *const u8, bytes) };
+        Ok(s.to_vec())
     }
 
     /// Install the idle-KV cipher (the executor loads it with its other kernels).
@@ -723,6 +939,7 @@ impl KvStore {
     ) -> Staged {
         stage(
             &self.geometry,
+            &self.host_blocks,
             self.max_blocks,
             self.state_width,
             &self.mirror,
@@ -814,6 +1031,46 @@ impl KvStore {
                     // SAFETY: `stage` held the slot inside the state buffer.
                     unsafe { sys::cuMemsetD8Async(base, 0, w * 4, s.cu_stream()) }.result()?;
                 }
+                DeviceOp::ToHost {
+                    mem,
+                    offset,
+                    bytes,
+                    group,
+                    at,
+                } => {
+                    let src = self.mem_base(s, mem) + offset as u64;
+                    let dst = self.host_ptr(group, at, bytes);
+                    // SAFETY: `stage` held the device range inside its buffer and
+                    // `host_ptr` the host range inside the pinned allocation, which
+                    // lives as long as the store; nothing on the host touches it
+                    // until the stream drains.
+                    unsafe { sys::cuMemcpyDtoHAsync_v2(dst.cast(), src, bytes, s.cu_stream()) }
+                        .result()?;
+                }
+                DeviceOp::FromHost {
+                    mem,
+                    offset,
+                    bytes,
+                    group,
+                    at,
+                } => {
+                    let dst = self.mem_base(s, mem) + offset as u64;
+                    let src = self.host_ptr(group, at, bytes);
+                    // SAFETY: as for `ToHost`, in the other direction.
+                    unsafe {
+                        sys::cuMemcpyHtoDAsync_v2(
+                            dst,
+                            src.cast_const().cast(),
+                            bytes,
+                            s.cu_stream(),
+                        )
+                    }
+                    .result()?;
+                }
+                DeviceOp::ZeroHost { group, at, bytes } => {
+                    self.host_ptr(group, at, bytes);
+                    self.host_zeros.push((group, at, bytes));
+                }
             }
         }
         if !batch.is_empty() {
@@ -866,6 +1123,21 @@ impl KvStore {
                 s,
             ),
         }
+    }
+
+    /// The address of `bytes` at byte `at` of group `group`'s host tier;
+    /// panics outside it.
+    fn host_ptr(&self, group: usize, at: usize, bytes: usize) -> *mut u8 {
+        let tier = self
+            .host
+            .get(group)
+            .expect("a host-tier operation needs a host tier");
+        assert!(
+            at.checked_add(bytes)
+                .is_some_and(|end| end <= tier.mem.len()),
+            "a range inside the host tier"
+        );
+        (tier.base + at) as *mut u8
     }
 
     fn upload_row(&mut self, s: &Arc<CudaStream>, slot: usize, group: usize) -> Result<()> {
@@ -1069,6 +1341,7 @@ mod tests {
     ) -> Staged {
         super::stage(
             geometry,
+            &[],
             max_blocks,
             state_width,
             current,
@@ -1096,7 +1369,17 @@ mod tests {
             nonce,
         };
         for group in 0..2u32 {
-            let staged = super::stage(&geometry, 4, 0, &current, 0, &[enc(group, 3, 0)], 1, &[]);
+            let staged = super::stage(
+                &geometry,
+                &[],
+                4,
+                0,
+                &current,
+                0,
+                &[enc(group, 3, 0)],
+                1,
+                &[],
+            );
             let zero = stage(
                 &geometry,
                 4,
@@ -1147,13 +1430,14 @@ mod tests {
         ];
         for m in bad {
             let r = catch_unwind(AssertUnwindSafe(|| {
-                super::stage(&geometry, 4, 0, &current, 0, m, 1, &[])
+                super::stage(&geometry, &[], 4, 0, &current, 0, m, 1, &[])
             }));
             assert!(r.is_err(), "{m:?}");
         }
         // Distinct blocks, and the same block in two groups, are fine.
         super::stage(
             &geometry,
+            &[],
             4,
             0,
             &current,
@@ -1162,6 +1446,183 @@ mod tests {
             1,
             &[],
         );
+    }
+
+    /// A demote copies every piece of a block, in `block_ranges` order, back to
+    /// back into its host block's image, and a promote copies the same pieces
+    /// back; a host zero covers the whole image. Out-of-range host blocks, a
+    /// missing host tier, and orders that would copy the wrong bytes are refused
+    /// at staging; the orders the core queues are accepted.
+    #[test]
+    fn host_tier_staging_moves_whole_block_images() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let geometry = vec![geom(16, 8), drafter(16, 8)];
+        let hosts = [4u32, 4];
+        let current = TableMirror::new(&geometry, 2, 4);
+        let run = |m: &[Maintenance], hosts: &[u32]| {
+            super::stage(&geometry, hosts, 4, 0, &current, 0, m, 1, &[])
+        };
+        for group in 0..2u32 {
+            let g = group as usize;
+            let bb = geometry[g].block_bytes();
+            let ranges = geometry[g].block_ranges(3);
+            let down = run(
+                &[Maintenance::Demote {
+                    group,
+                    block: 3,
+                    host: 2,
+                }],
+                &hosts,
+            );
+            let up = run(
+                &[Maintenance::Promote {
+                    group,
+                    host: 2,
+                    block: 3,
+                }],
+                &hosts,
+            );
+            assert_eq!(down.ops.len(), ranges.len());
+            assert_eq!(up.ops.len(), ranges.len());
+            let mut at = 2 * bb;
+            for ((d, u), r) in down.ops.iter().zip(&up.ops).zip(&ranges) {
+                let (offset, bytes) = r.bytes();
+                let want = (mem_of(g, *r), offset, bytes, g, at);
+                let DeviceOp::ToHost {
+                    mem,
+                    offset: o,
+                    bytes: b,
+                    group: hg,
+                    at: a,
+                } = *d
+                else {
+                    panic!("{d:?}")
+                };
+                assert_eq!((mem, o, b, hg, a), want);
+                let DeviceOp::FromHost {
+                    mem,
+                    offset: o,
+                    bytes: b,
+                    group: hg,
+                    at: a,
+                } = *u
+                else {
+                    panic!("{u:?}")
+                };
+                assert_eq!((mem, o, b, hg, a), want);
+                at += bytes;
+            }
+            assert_eq!(at, 3 * bb, "the image is the whole block");
+            let zero = run(&[Maintenance::ZeroHost { group, host: 2 }], &hosts);
+            let [
+                DeviceOp::ZeroHost {
+                    group: hg,
+                    at,
+                    bytes,
+                },
+            ] = zero.ops[..]
+            else {
+                panic!("{:?}", zero.ops)
+            };
+            assert_eq!((hg, at, bytes), (g, 2 * bb, bb));
+        }
+        let nonce = KvNonce::from_words([1, 2, 3]);
+        let dec = Maintenance::Decrypt {
+            group: 1,
+            block: 2,
+            key: 0,
+            nonce,
+        };
+        let enc = Maintenance::Encrypt {
+            group: 0,
+            block: 3,
+            key: 0,
+            nonce,
+        };
+        // What the core queues: a demote before its block's zero, and a zero, a
+        // promote and a decrypt of one reused block, in that order.
+        run(
+            &[
+                Maintenance::Demote {
+                    group: 1,
+                    block: 2,
+                    host: 1,
+                },
+                Maintenance::Zero { group: 1, block: 2 },
+                Maintenance::Promote {
+                    group: 1,
+                    host: 3,
+                    block: 2,
+                },
+                dec,
+                Maintenance::ZeroHost { group: 1, host: 3 },
+            ],
+            &hosts,
+        );
+        let bad: [(&[Maintenance], &[u32]); 7] = [
+            (
+                &[Maintenance::Demote {
+                    group: 0,
+                    block: 3,
+                    host: 0,
+                }],
+                &hosts,
+            ),
+            (
+                &[Maintenance::Demote {
+                    group: 0,
+                    block: 3,
+                    host: 4,
+                }],
+                &hosts,
+            ),
+            (
+                &[Maintenance::Promote {
+                    group: 0,
+                    host: 1,
+                    block: 3,
+                }],
+                &[],
+            ),
+            (&[Maintenance::ZeroHost { group: 1, host: 9 }], &hosts),
+            (
+                &[
+                    Maintenance::Zero { group: 0, block: 3 },
+                    Maintenance::Demote {
+                        group: 0,
+                        block: 3,
+                        host: 1,
+                    },
+                ],
+                &hosts,
+            ),
+            (
+                &[
+                    enc,
+                    Maintenance::Demote {
+                        group: 0,
+                        block: 3,
+                        host: 1,
+                    },
+                ],
+                &hosts,
+            ),
+            (
+                &[
+                    dec,
+                    Maintenance::Promote {
+                        group: 1,
+                        host: 1,
+                        block: 2,
+                    },
+                ],
+                &hosts,
+            ),
+        ];
+        for (m, h) in bad {
+            let r = catch_unwind(AssertUnwindSafe(|| run(m, h)));
+            assert!(r.is_err(), "{m:?}");
+        }
     }
 
     /// Zero and copy of a drafter block touch exactly its plane rows and its

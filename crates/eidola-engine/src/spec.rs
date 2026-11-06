@@ -62,6 +62,10 @@ pub struct KvGroupSpec {
     /// Physical blocks the executor allocated for this group, including the reserved null
     /// block 0. The host may hand out ids `1..num_blocks`.
     pub num_blocks: u32,
+    /// Blocks of this group the executor keeps in host memory for idle prefix-cache
+    /// entries demoted from `num_blocks` (the host tier), including a reserved null
+    /// block 0; 0 when there is no host tier. Every group has a host tier or none does.
+    pub host_blocks: u32,
 }
 
 /// A captured step shape: the executor can run any batch with at most `max_seqs`
@@ -138,6 +142,11 @@ impl ModelSpec {
         Logits::new(row, self.sampleable_vocab_size)
     }
 
+    /// Whether the executor keeps a host tier for idle prefix-cache entries.
+    pub fn has_host_tier(&self) -> bool {
+        self.kv_groups.iter().all(|g| g.host_blocks > 1)
+    }
+
     /// Smallest bucket that fits a batch, if any.
     pub fn bucket_for(&self, seqs: u32, tokens: u32) -> Option<Bucket> {
         self.buckets
@@ -176,6 +185,16 @@ impl ModelSpec {
             {
                 return Err(format!("group {} has a zero window", g.name));
             }
+        }
+        let tiered = self.kv_groups.iter().filter(|g| g.host_blocks > 0).count();
+        if tiered != 0 && tiered != self.kv_groups.len() {
+            return Err("either every KV group has a host tier or none does".into());
+        }
+        if let Some(g) = self.kv_groups.iter().find(|g| g.host_blocks == 1) {
+            return Err(format!(
+                "group {} needs at least one allocatable host block",
+                g.name
+            ));
         }
         if self.num_state_slots == 0 {
             return Err("num_state_slots must be non-zero".into());

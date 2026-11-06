@@ -19,6 +19,12 @@
 //! block left encrypted fails its tag check like a read of a zeroed one, and an idle block
 //! holds no token or position in the clear. The pool also records which blocks are
 //! encrypted, as instrumentation beside the tags.
+//!
+//! **The host tier** is a second pool per group of the same layout. [`Pool::transfer`]
+//! copies a block's whole image (data, tap, tags and the encrypted flag) between a
+//! device pool and a host pool; the executor demotes only encrypted blocks and promotes
+//! only into zeroed ones, and panics otherwise. A host pool's buffers are locked into
+//! memory ([`Pool::lock`], `mlock`) and unlocked when it is dropped.
 
 use eidola_engine::kv_cipher::{KvKeystream, KvNonce};
 use eidola_engine::secret::KvKey;
@@ -62,6 +68,21 @@ pub(crate) struct Pool {
     tap_tags: Vec<u32>,
     /// Per block: whether it is held encrypted (instrumentation).
     encrypted: Vec<bool>,
+    /// Whether the buffers are locked into memory (unlocked on drop).
+    locked: bool,
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        if self.locked {
+            for (ptr, len) in self.buffers() {
+                // SAFETY: the range is this pool's own live allocation, locked by `lock`.
+                // An error leaves the pages locked until the allocation is released, which
+                // is harmless.
+                let _ = unsafe { rustix::mm::munlock(ptr, len) };
+            }
+        }
+    }
 }
 
 impl Pool {
@@ -76,11 +97,79 @@ impl Pool {
             layout,
             block_size,
             num_blocks,
+            locked: false,
         }
+    }
+
+    /// The buffers holding block contents, as `(address, bytes)`; empty ones left out.
+    fn buffers(&mut self) -> Vec<(*mut std::ffi::c_void, usize)> {
+        fn range<T>(v: &mut [T]) -> (*mut std::ffi::c_void, usize) {
+            (v.as_mut_ptr().cast(), std::mem::size_of_val(v))
+        }
+        [
+            range(&mut self.data),
+            range(&mut self.tags),
+            range(&mut self.taps),
+            range(&mut self.tap_tags),
+        ]
+        .into_iter()
+        .filter(|&(_, len)| len > 0)
+        .collect()
+    }
+
+    /// Locks every buffer holding block contents into memory, so none of it can be
+    /// paged out to swap. The buffers are never reallocated, so the lock holds for the
+    /// pool's life. Fails, leaving nothing locked, if the system refuses.
+    pub fn lock(&mut self) -> std::io::Result<()> {
+        let buffers = self.buffers();
+        for (i, &(ptr, len)) in buffers.iter().enumerate() {
+            // SAFETY: the range is this pool's own live allocation.
+            if let Err(e) = unsafe { rustix::mm::mlock(ptr, len) } {
+                for &(p, l) in &buffers[..i] {
+                    // SAFETY: locked just above.
+                    let _ = unsafe { rustix::mm::munlock(p, l) };
+                }
+                return Err(e.into());
+            }
+        }
+        self.locked = true;
+        Ok(())
+    }
+
+    /// Copies block `src` of `from` over block `dst` of `to`, its whole image: data,
+    /// tap, row tags, tap tag, and the encrypted flag. The pools have the same layout.
+    pub fn transfer(from: &Pool, src: u32, to: &mut Pool, dst: u32) {
+        assert_eq!(
+            from.layout, to.layout,
+            "transfer between pools of one layout"
+        );
+        assert_eq!(from.block_size, to.block_size);
+        let (rpb, w, tw) = (
+            from.rows_per_block(),
+            from.layout.row_width(),
+            from.layout.tap_width,
+        );
+        let (s, d) = (src as usize, dst as usize);
+        to.data[d * rpb * w..(d + 1) * rpb * w]
+            .copy_from_slice(&from.data[s * rpb * w..(s + 1) * rpb * w]);
+        to.tags[d * rpb..(d + 1) * rpb].copy_from_slice(&from.tags[s * rpb..(s + 1) * rpb]);
+        to.taps[d * tw..(d + 1) * tw].copy_from_slice(&from.taps[s * tw..(s + 1) * tw]);
+        to.tap_tags[d] = from.tap_tags[s];
+        to.encrypted[d] = from.encrypted[s];
     }
 
     pub fn num_blocks(&self) -> usize {
         self.num_blocks
+    }
+
+    /// Bytes one block takes: its data, tap, row tags, tap tag and encrypted flag.
+    pub fn block_bytes(&self) -> usize {
+        let rows = self.rows_per_block();
+        rows * self.layout.row_width() * 4
+            + self.layout.tap_width * 4
+            + rows * std::mem::size_of::<Tag>()
+            + 4
+            + 1
     }
 
     fn row_index(&self, block: u32, layer: usize, offset: usize) -> usize {

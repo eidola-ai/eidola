@@ -88,6 +88,7 @@ fn executor(fx: &Fixture, blocks: u32, buckets: Vec<Bucket>) -> Option<CudaExecu
     let su = setup()?;
     let cfg = CudaExecutorConfig {
         block_size: BS,
+        host_blocks: eidola_engine_cuda::KvBlocks::default(),
         num_blocks: KvBlocks {
             global: blocks,
             sliding: blocks,

@@ -94,6 +94,7 @@ pub fn env_map() -> HashMap<&'static str, String> {
         (env::PREFIX_CACHE, "true".into()),
         (env::CACHE_IDLE_TTL_SECS, "900".into()),
         (env::CACHE_MAX_AGE_SECS, "7200".into()),
+        (env::KV_HOST_BYTES, "0".into()),
     ])
 }
 

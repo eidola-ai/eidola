@@ -69,6 +69,7 @@ fn truncated_flash_through_the_engine_matches_the_dense_forward() {
     let cfg = CpuExecutorConfig {
         block_size: 16,
         num_blocks: 32,
+        host_blocks: 0,
         num_state_slots: 4,
         max_model_len: 4096,
         buckets: vec![

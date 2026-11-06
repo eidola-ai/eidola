@@ -81,6 +81,7 @@ fn executor(
 ) -> CudaExecutor {
     let cfg = CudaExecutorConfig {
         block_size: BS,
+        host_blocks: eidola_engine_cuda::KvBlocks::default(),
         num_blocks: KvBlocks {
             global: 128,
             sliding: 128,

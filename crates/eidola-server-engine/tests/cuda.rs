@@ -212,6 +212,20 @@ fn wide_drafts_and_a_small_kv_budget_are_refused_before_the_device() {
     let err = boot_err(&map);
     assert!(err.contains(env::KV_DEVICE_BYTES), "{err}");
 
+    // A host tier too small for two blocks in every group is refused before the device
+    // (where the guest's swap does not refuse the boot first).
+    let mut map = cuda_env(dir, hash);
+    map.insert(env::KV_HOST_BYTES, (1u64 << 20).to_string());
+    let err = boot_err(&map);
+    let swap = eidola_server_engine::swap::check_no_swap(Path::new(
+        eidola_server_engine::swap::PROC_SWAPS,
+    ));
+    if !cfg!(target_os = "linux") || swap.is_ok() {
+        assert!(err.contains(env::KV_HOST_BYTES), "{err}");
+    } else {
+        assert!(err.contains("swap"), "{err}");
+    }
+
     // A block size the executor could not index never reaches it.
     let mut map = cuda_env(dir, hash);
     map.insert(env::KV_BLOCK_SIZE, "16777217".into());
@@ -283,7 +297,12 @@ async fn real_flash_serves_what_the_executor_computes() {
     );
     map.insert(env::KV_DEVICE_BYTES, (32u64 << 30).to_string());
     map.insert(env::MAX_MODEL_LEN, "4096".into());
+    // A host tier when the run asks for one (bytes), none otherwise.
+    if let Ok(bytes) = std::env::var("EIDOLA_TEST_KV_HOST_BYTES") {
+        map.insert(env::KV_HOST_BYTES, bytes);
+    }
     let config = config_from(&map).unwrap();
+    let kv_host_bytes = config.kv_host_bytes;
     let (sizing, cache) = (config.sizing, config.cache);
     let (kernels_dir, kv_device_bytes, graphs) = match &config.executor {
         ExecutorConfig::Cuda {
@@ -442,6 +461,7 @@ async fn real_flash_serves_what_the_executor_computes() {
             &cache,
             &kernels_dir,
             kv_device_bytes,
+            kv_host_bytes,
             graphs,
         )
         .unwrap()

@@ -70,6 +70,7 @@ pub fn exec_config(blocks: u32, mtp_depths: Vec<usize>) -> CpuExecutorConfig {
     CpuExecutorConfig {
         block_size: 4,
         num_blocks: blocks,
+        host_blocks: 0,
         num_state_slots: 32,
         max_model_len: 512,
         buckets: vec![
@@ -339,7 +340,39 @@ impl Harness {
         // queued encryptions and decryptions have run.
         let idle = kv.idle_blocks();
         let crypts = kv.pending_crypts();
+        let transfers = kv.pending_transfers();
+        let landing: std::collections::BTreeSet<(u32, u32)> = transfers
+            .iter()
+            .filter(|t| !t.3)
+            .map(|t| (t.0, t.1))
+            .collect();
+        let demoting: std::collections::BTreeSet<(u32, u32)> = transfers
+            .iter()
+            .filter(|t| t.3)
+            .map(|t| (t.0, t.2))
+            .collect();
+        // The host tier: free host blocks zero or with a zero queued, held ones ciphertext.
+        let host_zeros = kv.pending_host_zeros();
+        for (g, hb) in kv.free_host_set() {
+            if !host_zeros.contains(&(g, hb)) {
+                assert!(
+                    self.eng.executor().host_block_is_zero(g, hb),
+                    "free host block {g}/{hb} holds data with no zero pending"
+                );
+            }
+        }
+        for (g, hb) in kv.host_cache_blocks() {
+            if !demoting.contains(&(g, hb)) {
+                assert!(
+                    self.eng.executor().host_block_is_encrypted(g, hb),
+                    "held host block {g}/{hb} holds no ciphertext"
+                );
+            }
+        }
         for (g, b) in kv.cache_blocks().union(&kv.sequence_blocks()) {
+            if landing.contains(&(*g, *b)) {
+                continue;
+            }
             let want = idle.contains(&(*g, *b));
             let device = self.eng.executor().block_is_encrypted(*g, *b);
             match crypts.get(&(*g, *b)) {

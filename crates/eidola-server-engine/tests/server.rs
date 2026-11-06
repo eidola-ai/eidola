@@ -56,6 +56,7 @@ fn direct_greedy(prompt: Vec<u32>, max_tokens: u32) -> (Vec<u32>, FinishReason) 
         CpuExecutorConfig {
             block_size: 16,
             num_blocks: 256,
+            host_blocks: 0,
             num_state_slots: 4,
             max_model_len: 1024,
             buckets: vec![Bucket {
@@ -793,6 +794,63 @@ async fn cache_key_reuses_the_prefix_only_for_the_same_key() {
         chunks.last().unwrap()["usage"]["prompt_tokens_details"]["cached_tokens"],
         hit
     );
+}
+
+/// With a host tier, a conversation pushed off small KV pools by other keys' requests
+/// keeps its cached prefix (demoted to host memory, promoted back) and its output; without
+/// one, the same traffic drops it. The tier is sized from the executor's own block bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_tier_keeps_a_conversation_through_kv_pressure() {
+    use base64::Engine as _;
+    let b64 = |byte: u8| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32]);
+    let keyed = |key: u8| {
+        let mut b = request(LONG_TEXT, 4);
+        b["cache_key"] = b64(key).into();
+        b
+    };
+    let cached = |v: &Value| {
+        v["usage"]["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap()
+    };
+    let model = loaded();
+    let probe = CpuExecutorConfig {
+        block_size: 16,
+        num_blocks: 2,
+        host_blocks: 0,
+        num_state_slots: 4,
+        max_model_len: 1024,
+        buckets: vec![Bucket {
+            max_seqs: 4,
+            max_tokens: 256,
+        }],
+        mtp_depths: vec![0, 1],
+        mtp_hidden: MtpHidden::Normed,
+        sampleable_vocab_size: model.tokenizer().vocab_size() as u32,
+        pad_batches: false,
+        record: false,
+    };
+    let per_block = CpuExecutor::kv_block_bytes(model.reference().unwrap(), &probe);
+    let host_bytes = (128 * per_block).to_string();
+    let mut runs = Vec::new();
+    for host in ["0", host_bytes.as_str()] {
+        let node = TestNode::start(&[(env::KV_BLOCKS, "16"), (env::KV_HOST_BYTES, host)]).await;
+        let (_, first) = node.chat_json(&keyed(1)).await;
+        let (_, hit) = node.chat_json(&keyed(1)).await;
+        assert!(cached(&hit) > 0);
+        for other in 2..14u8 {
+            let (status, _) = node.chat_json(&keyed(other)).await;
+            assert_eq!(status, 200);
+        }
+        let (_, after) = node.chat_json(&keyed(1)).await;
+        assert_eq!(after["choices"], first["choices"]);
+        runs.push((cached(&hit), cached(&after)));
+    }
+    assert_eq!(
+        runs[0].1, 0,
+        "without a host tier the pressure drops the conversation"
+    );
+    assert_eq!(runs[1].1, runs[1].0, "with one it keeps the whole prefix");
 }
 
 #[tokio::test(flavor = "multi_thread")]

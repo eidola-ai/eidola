@@ -91,6 +91,7 @@ fn main() {
     let global = 4 * (longest / BS + 2) + 8;
     let cfg = CudaExecutorConfig {
         block_size: BS,
+        host_blocks: eidola_engine_cuda::KvBlocks::default(),
         num_blocks: KvBlocks {
             global,
             sliding: 512,

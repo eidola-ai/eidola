@@ -59,6 +59,11 @@ pub struct CudaExecutorConfig {
     pub block_size: u32,
     /// Physical blocks per KV group, by kind.
     pub num_blocks: KvBlocks,
+    /// Host-tier blocks per KV group for demoted idle prefix-cache entries, by
+    /// kind, each including the null block 0 (page-locked host memory; see
+    /// `kv.rs`). All zero (the default): no host tier; otherwise every group in
+    /// use has at least two.
+    pub host_blocks: KvBlocks,
     pub num_state_slots: u32,
     pub max_model_len: u32,
     /// Captured step shapes; the last bounds every step.
@@ -99,9 +104,32 @@ impl KvBlocks {
         keys: &[AttentionSpec],
         drafting: bool,
     ) -> std::result::Result<Vec<u32>, Unsupported> {
+        self.resolve_as("num_blocks", keys, drafting)
+    }
+
+    /// The host-tier block count of every group, the drafter's last when
+    /// drafting: all zero for none.
+    pub fn resolve_host(
+        &self,
+        keys: &[AttentionSpec],
+        drafting: bool,
+    ) -> std::result::Result<Vec<u32>, Unsupported> {
+        let mut counts = self.resolve_as("host_blocks", keys, drafting)?;
+        if drafting {
+            counts.push(self.drafter);
+        }
+        Ok(counts)
+    }
+
+    fn resolve_as(
+        &self,
+        name: &str,
+        keys: &[AttentionSpec],
+        drafting: bool,
+    ) -> std::result::Result<Vec<u32>, Unsupported> {
         if !drafting && self.drafter != 0 {
             return Err(Unsupported {
-                field: "num_blocks.drafter".into(),
+                field: format!("{name}.drafter"),
                 found: self.drafter.to_string(),
                 required: "0 (nothing is drafted)".into(),
             });
@@ -110,13 +138,14 @@ impl KvBlocks {
             keys.iter()
                 .any(|k| (k.kind == ModelAttention::Global) == global)
         };
-        for (name, global, n) in [
+        let prefix = name;
+        for (group, global, n) in [
             ("global", true, self.global),
             ("sliding", false, self.sliding),
         ] {
             if n != 0 && !used(global) {
                 return Err(Unsupported {
-                    field: format!("num_blocks.{name}"),
+                    field: format!("{prefix}.{group}"),
                     found: n.to_string(),
                     required: "0 (no retained layer uses this group)".into(),
                 });
@@ -224,6 +253,8 @@ struct Plan {
     config: eidola_engine_model::ModelConfig,
     layer_kv: Vec<crate::model::LayerKv>,
     geometry: Vec<crate::kv::GroupGeometry>,
+    /// Host-tier blocks per group, in group order (all zero for none).
+    host_blocks: Vec<u32>,
     spec: ModelSpec,
 }
 
@@ -255,6 +286,7 @@ impl CudaExecutor {
         check_context(cfg.max_model_len, &config)?;
         let (keys, layer_kv) = group_layers(&config);
         let num_blocks = cfg.num_blocks.resolve(&keys, depths > 0)?;
+        let host_blocks = cfg.host_blocks.resolve_host(&keys, depths > 0)?;
         let mut geometry = group_geometry(&keys, &layer_kv, cfg.block_size, &num_blocks)?;
         if depths > 0 {
             // The drafter group: one plane pair per depth, and a tap of
@@ -298,6 +330,7 @@ impl CudaExecutor {
                     head_dim_qk: geometry[g].head_dim_qk,
                     head_dim_v: geometry[g].head_dim_v,
                     num_blocks: geometry[g].num_blocks,
+                    host_blocks: host_blocks[g],
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -316,6 +349,7 @@ impl CudaExecutor {
                 head_dim_qk: g.head_dim_qk,
                 head_dim_v: g.head_dim_v,
                 num_blocks: g.num_blocks,
+                host_blocks: host_blocks[keys.len()],
             });
         }
         let spec = ModelSpec {
@@ -333,6 +367,7 @@ impl CudaExecutor {
             config,
             layer_kv,
             geometry,
+            host_blocks,
             spec,
         })
     }
@@ -354,6 +389,7 @@ impl CudaExecutor {
             config,
             layer_kv,
             geometry,
+            host_blocks,
             spec,
         } = Self::plan(&store, keep_layers, &cfg)?;
         let image = check_device(gpu.info(), &config, cfg.image)?;
@@ -383,6 +419,7 @@ impl CudaExecutor {
             spec.max_blocks_per_seq(),
             state_width,
         )?;
+        kv.set_host_tier(&gpu, &host_blocks)?;
         kv.set_cipher(cipher);
         let model = GpuModel::new(
             &gpu,
@@ -581,6 +618,15 @@ impl CudaExecutor {
         Ok(self
             .kv
             .read_block(&self.gpu, group as usize, block)?
+            .iter()
+            .all(|&x| x == 0))
+    }
+
+    /// Whether every byte of a host-tier block is zero (tests and diagnostics).
+    pub fn host_block_is_zero(&self, group: u32, host: u32) -> Result<bool> {
+        Ok(self
+            .kv
+            .read_host_block(&self.gpu, group as usize, host)?
             .iter()
             .all(|&x| x == 0))
     }
@@ -1318,7 +1364,13 @@ impl Executor for CudaExecutor {
 
     fn execute(&mut self, step: &StepInput) -> std::result::Result<StepOutput, ExecutorError> {
         self.steps += 1;
-        self.step(step).map_err(|e| ExecutorError(e.to_string()))
+        let out = self.step(step).map_err(|e| ExecutorError(e.to_string()))?;
+        // Host-tier zeros wait for the copies queued before them; they are done
+        // before the step returns.
+        self.kv
+            .finish_host(&self.gpu)
+            .map_err(|e| ExecutorError(e.to_string()))?;
+        Ok(out)
     }
 }
 
@@ -1360,5 +1412,31 @@ mod tests {
         assert_eq!(drafter.resolve(&keys(&[0, 1]), true).unwrap(), vec![10, 20]);
         let e = drafter.resolve(&keys(&[0, 1]), false).unwrap_err();
         assert_eq!(e.field, "num_blocks.drafter");
+    }
+
+    /// Host-tier counts follow the same keying, the drafter's last, and none at
+    /// all is all zeros.
+    #[test]
+    fn host_counts_are_keyed_by_kind() {
+        let none = KvBlocks::default();
+        assert_eq!(
+            none.resolve_host(&keys(&[0, 1]), true).unwrap(),
+            vec![0, 0, 0]
+        );
+        let b = KvBlocks {
+            global: 100,
+            sliding: 40,
+            drafter: 40,
+        };
+        assert_eq!(
+            b.resolve_host(&keys(&[0, 1]), true).unwrap(),
+            vec![100, 40, 40]
+        );
+        let e = b.resolve_host(&keys(&[0, 1]), false).unwrap_err();
+        assert_eq!(e.field, "host_blocks.drafter");
+        let e = KvBlocks { drafter: 0, ..b }
+            .resolve_host(&keys(&[1, 2]), false)
+            .unwrap_err();
+        assert_eq!(e.field, "host_blocks.global");
     }
 }

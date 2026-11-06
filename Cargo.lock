@@ -2982,6 +2982,7 @@ dependencies = [
  "eidola-engine",
  "eidola-engine-model",
  "rayon",
+ "rustix 1.1.5",
  "serde_json",
 ]
 
