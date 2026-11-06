@@ -175,6 +175,7 @@ fn render(model: &str, tasks: &str, out: &str) {
                     RenderOptions {
                         add_generation_prompt: true,
                         enable_thinking: t.get("enable_thinking").and_then(Value::as_bool),
+                        continue_final_message: None,
                     },
                 )
                 .unwrap();

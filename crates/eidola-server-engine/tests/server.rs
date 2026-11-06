@@ -42,6 +42,7 @@ fn prompt_tokens(text: &str) -> Vec<u32> {
             RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: None,
+                continue_final_message: None,
             },
         )
         .unwrap();
@@ -106,8 +107,21 @@ fn direct_greedy(prompt: Vec<u32>, max_tokens: u32) -> (Vec<u32>, FinishReason) 
 
 /// What the chat layer makes of `tokens` (the EOS that ends a `Stop` is not text).
 fn expected_output(tokens: &[u32], finish: FinishReason) -> (ChatDelta, &'static str) {
+    expected_output_in(tokens, finish, None)
+}
+
+/// [`expected_output`] for the output of a prompt that ended inside the final message's
+/// `continuing` field.
+fn expected_output_in(
+    tokens: &[u32],
+    finish: FinishReason,
+    continuing: Option<&'static str>,
+) -> (ChatDelta, &'static str) {
     let model = loaded();
-    let mut parser = OutputParser::new(OutputConfig::new(None, None), PrefixedCallIds("c".into()));
+    let mut parser = OutputParser::new(
+        OutputConfig::new(None, None).continuing_in(continuing),
+        PrefixedCallIds("c".into()),
+    );
     let mut all = ChatDelta::default();
     let mut text_tokens = tokens;
     if finish == FinishReason::Stop {
@@ -131,6 +145,40 @@ fn expected_output(tokens: &[u32], finish: FinishReason) -> (ChatDelta, &'static
 
 fn text_of(message: &Value, key: &str) -> String {
     message[key].as_str().unwrap_or("").to_string()
+}
+
+/// A request continuing an assistant message (`content` so far, after `reasoning`) to
+/// `LONG_TEXT`, asking for `field` the way a client does.
+fn continued(content: &str, reasoning: &str, field: Value) -> Value {
+    json!({
+        "model": MODEL_ID,
+        "messages": [
+            {"role": "user", "content": LONG_TEXT},
+            {"role": "assistant", "reasoning_content": reasoning, "content": content},
+        ],
+        "max_completion_tokens": 6,
+        "temperature": 0.0,
+        "add_generation_prompt": false,
+        "continue_final_message": field,
+    })
+}
+
+/// The prompt tokens the chat crate renders for `body`'s messages, continuing `field`.
+fn continued_prompt_tokens(body: &Value, field: &'static str) -> Vec<u32> {
+    let model = loaded();
+    let input = ChatInput::from_json(&body["messages"].to_string(), None).unwrap();
+    let prompt = model
+        .template()
+        .render(
+            &input,
+            RenderOptions {
+                add_generation_prompt: false,
+                enable_thinking: None,
+                continue_final_message: Some(field),
+            },
+        )
+        .unwrap();
+    model.tokenizer().encode(&prompt).unwrap()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -336,6 +384,29 @@ async fn strict_schema_refuses_what_it_does_not_name() {
             b["seed"] = 7.into();
             b
         },
+        // Continuations outside the rule: another field, a value of another type, a
+        // generation prompt asked for as well, one turned off with nothing continued,
+        // a final message that is not an assistant's, one that called tools, and a
+        // reasoning continued past an answer.
+        with("continue_final_message", "tool_calls".into()),
+        with("continue_final_message", 1.into()),
+        {
+            let mut b = continued("partial", "", json!(true));
+            b["add_generation_prompt"] = true.into();
+            b
+        },
+        with("add_generation_prompt", false.into()),
+        with("continue_final_message", true.into()),
+        {
+            let mut b = continued("partial", "", json!(true));
+            b["messages"][1]["tool_calls"] = json!([{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}]);
+            b
+        },
+        continued("an answer", "thinking", json!("reasoning_content")),
+        with(
+            "messages",
+            json!([{"role": "assistant", "content": "x", "reasoning": "vLLM's spelling"}]),
+        ),
     ];
     for body in &cases {
         let (status, v) = node.chat_json(body).await;
@@ -1054,6 +1125,109 @@ async fn tool_choice_none_renders_without_tools() {
         none["choices"], plain["choices"],
         "the same prompt, the same greedy output"
     );
+}
+
+/// A continuation is the engine driven directly on the chat crate's continued prompt:
+/// the node renders the prompt ending inside the field it continues (the answer, or an
+/// open reasoning block), and parses the output from there, token for token, in both
+/// spellings of a content continuation and with the generation prompt omitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continuation_resumes_inside_the_final_message() {
+    let node = TestNode::start(&[]).await;
+    let cases = [
+        (
+            continued("The answer so far", "a thought", json!(true)),
+            "content",
+        ),
+        (
+            continued("The answer so far", "a thought", json!("content")),
+            "content",
+        ),
+        (
+            continued("", "Still reasoning about", json!("reasoning_content")),
+            "reasoning_content",
+        ),
+        (
+            {
+                let mut b = continued("", "Still reasoning", json!("reasoning_content"));
+                b.as_object_mut().unwrap().remove("add_generation_prompt");
+                b["messages"][1].as_object_mut().unwrap().remove("content");
+                b
+            },
+            "reasoning_content",
+        ),
+    ];
+    for (body, field) in &cases {
+        let prompt = continued_prompt_tokens(body, field);
+        let n_prompt = prompt.len();
+        let (tokens, finish) = direct_greedy(prompt, 6);
+        let (expected, reason) = expected_output_in(&tokens, finish, Some(field));
+
+        let (status, v) = node.chat_json(body).await;
+        assert_eq!(status, 200, "{body}: {v}");
+        let choice = &v["choices"][0];
+        assert_eq!(choice["finish_reason"], reason, "{body}");
+        let message = &choice["message"];
+        assert_eq!(
+            text_of(message, "reasoning_content"),
+            expected.reasoning_content,
+            "{body}"
+        );
+        assert_eq!(text_of(message, "content"), expected.content, "{body}");
+        assert_eq!(v["usage"]["prompt_tokens"], n_prompt, "{body}");
+        assert_eq!(v["usage"]["completion_tokens"], tokens.len(), "{body}");
+    }
+}
+
+/// A continuation under the key its generation ran with reuses the prefix that
+/// generation left: more than its prompt alone, since the continued prompt carries the
+/// generated text after it. Under another key it reuses nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continuation_reuses_what_its_generation_cached() {
+    let node = TestNode::start(&[]).await;
+    use base64::Engine as _;
+    let key = |byte: u8| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32]);
+    let cached = |v: &Value| {
+        v["usage"]["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap()
+    };
+
+    let mut first = request(LONG_TEXT, 40);
+    first["cache_key"] = key(7).into();
+    let (status, answered) = node.chat_json(&first).await;
+    assert_eq!(status, 200, "{answered}");
+    let original_prompt = answered["usage"]["prompt_tokens"].as_u64().unwrap();
+    let message = &answered["choices"][0]["message"];
+    let (reasoning, content) = (
+        text_of(message, "reasoning_content"),
+        text_of(message, "content"),
+    );
+    let field = if content.is_empty() {
+        json!("reasoning_content")
+    } else {
+        json!(true)
+    };
+
+    let mut next = continued(&content, &reasoning, field);
+    next["cache_key"] = key(7).into();
+    let (status, resumed) = node.chat_json(&next).await;
+    assert_eq!(status, 200, "{resumed}");
+    let prompt = resumed["usage"]["prompt_tokens"].as_u64().unwrap();
+    assert!(prompt > original_prompt, "{prompt} vs {original_prompt}");
+    // At least the original prompt's whole blocks; the generation's own blocks too where
+    // its text re-encodes to the tokens it was sampled as (the dev model's gibberish
+    // need not, so the test asks only for the floor).
+    let floor = (original_prompt - 1) / 16 * 16;
+    assert!(
+        cached(&resumed) >= floor,
+        "{} cached of {prompt}, floor {floor}",
+        cached(&resumed)
+    );
+
+    next["cache_key"] = key(8).into();
+    let (_, other) = node.chat_json(&next).await;
+    assert_eq!(cached(&other), 0, "another key shares nothing");
 }
 
 /// No multimodal key can ride along on a text part: every part variant denies unknown

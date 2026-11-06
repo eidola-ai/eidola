@@ -49,6 +49,7 @@ pub fn prepare(
         top_p,
         stop,
         cache_key,
+        continuation,
         ..
     } = req;
     let defaults = model.defaults();
@@ -75,9 +76,13 @@ pub fn prepare(
     input
         .normalize_tool_call_arguments()
         .map_err(|e| ApiError::invalid(e.to_string()))?;
+    // A continuation's prompt ends inside the final message, at the field it continues,
+    // and its output is parsed from there; otherwise the prompt opens a new turn.
+    let continuing = continuation.map(|field| field.field());
     let options = RenderOptions {
-        add_generation_prompt: true,
+        add_generation_prompt: continuing.is_none(),
         enable_thinking: None,
+        continue_final_message: continuing,
     };
     let prompt = model
         .template()
@@ -106,7 +111,7 @@ pub fn prepare(
             cache,
         },
         prompt_tokens,
-        output: OutputConfig::new(options.enable_thinking, schemas),
+        output: OutputConfig::new(options.enable_thinking, schemas).continuing_in(continuing),
         stop,
     })
 }

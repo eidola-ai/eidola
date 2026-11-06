@@ -432,6 +432,7 @@ async fn real_flash_serves_what_the_executor_computes() {
                 RenderOptions {
                     add_generation_prompt: true,
                     enable_thinking: None,
+                    continue_final_message: None,
                 },
             )
             .unwrap();
