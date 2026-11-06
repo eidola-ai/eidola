@@ -7,15 +7,19 @@
 //!                 [--prefix 1024,4096,16384,65536] [--iters N] [--chunk N]
 //! ```
 //!
-//! The device's global pool holds one prefix of the longest length (and the running
-//! request), so a second lineage pushes the first to the host tier. For each prefix length
+//! The device's global pool holds `L / block_size + 8` blocks for the longest prefix `L`:
+//! one sequence of the displacing request's length (below) and a few blocks more, never two
+//! prefixes. So whatever the prefix length, the displacing request cannot fit beside A's
+//! cached blocks and must demote them, and A's hit must demote the displacer's. For each
+//! prefix length
 //! `P` (rounded up to whole blocks) and each of `--iters` runs (default 5), under fresh
 //! keys each run:
 //!
 //! - **cold**: lineage A's request of `P + 1` prompt tokens and one output token,
 //!   prefilled in chunks of `--chunk` (default 2048), then flushed (its blocks encrypted);
-//! - **displaced**: lineage B's request of as many other tokens, which demotes A's blocks
-//!   to the host tier to make room;
+//! - **displaced**: lineage B's request of `L + 4 × block_size` other tokens (the same at
+//!   every prefix length, so its time does not follow `P`), which demotes A's blocks to the
+//!   host tier to make room;
 //! - **host hit**: A's request again: `P` positions hit, promoted back to the device (which
 //!   demotes B in turn), decrypted, and one position computed;
 //! - **device hit**: A's request once more, its blocks now on the device: only decrypted;
@@ -106,9 +110,17 @@ fn main() {
     assert!(iters >= 1 && chunk >= 1 && !prefixes.is_empty());
 
     let longest = *prefixes.iter().max().unwrap();
-    let max_model_len = (longest + 2).next_multiple_of(BS) + BS;
-    // One cached prefix of the longest length and the request running beside it.
-    let global = 2 * (longest / BS + 2) + 8;
+    // The displacer: four blocks past the longest prefix, so with A's `P >= 3` blocks
+    // cached it cannot fit (its `L / BS + 5` blocks against `L / BS + 7 - P / BS` free), and
+    // its own cached blocks leave A's hit only three free blocks.
+    let displacer = longest + 4 * BS;
+    let max_model_len = (displacer + 2).next_multiple_of(BS) + BS;
+    // One sequence of the displacer's length and a few blocks more: never two prefixes.
+    let global = longest / BS + 8;
+    assert!(
+        prefixes.iter().all(|&p| p / BS >= 3),
+        "every prefix spans three blocks"
+    );
     let host = 4 * (longest / BS + 2) + 8;
     let cfg = CudaExecutorConfig {
         block_size: BS,
@@ -191,7 +203,7 @@ fn main() {
     );
     for &p in &prefixes {
         let prompt = tokens(u64::from(p), p + 1);
-        let other = tokens(u64::from(p) ^ 0xb0b, p + 1);
+        let other = tokens(u64::from(p) ^ 0xb0b, displacer + 1);
         let (mut cold, mut displaced, mut host_hit, mut device_hit, mut miss) =
             (vec![], vec![], vec![], vec![], vec![]);
         let mut promoted = 0;

@@ -141,6 +141,7 @@ run system *args:
         EIDOLA_ENGINE_PREFIX_CACHE=true \
         EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS=900 \
         EIDOLA_ENGINE_CACHE_MAX_AGE_SECS=7200 \
+        EIDOLA_ENGINE_KV_HOST_BYTES=0 \
           cargo run -p eidola-server-engine -- {{ args }}
         ;;
       *)
