@@ -5,9 +5,12 @@
 //! Keys reach the device only inside the item list, which [`KvCipher::apply`] uploads,
 //! launches over, and zeroes on the stream right behind the launch; the host copy is
 //! scrubbed once the upload has returned (a copy from pageable memory has left it by
-//! then). Not covered: the driver's own staging of that copy (under confidential
-//! computing, a bounce buffer inside the encrypted VM), as `eidola-engine` leaves the
-//! HMAC's transient stack state uncovered.
+//! then). The host list is a [`CipherItems`], never a bare `Vec`: growing a `Vec` frees
+//! its old allocation with the keys still in it, so the list scrubs every allocation it
+//! leaves (and the store sizes it for the whole step up front). Not covered: an item's
+//! transient stack copies while it is built, and the driver's own staging of the upload
+//! (under confidential computing, a bounce buffer inside the encrypted VM), as
+//! `eidola-engine` leaves the HMAC's transient stack state uncovered.
 
 use cudarc::driver::sys;
 use cudarc::driver::{CudaSlice, DeviceRepr, ValidAsZeroBits};
@@ -67,6 +70,87 @@ impl CipherItem {
         self.key.zeroize();
         self.nonce.zeroize();
     }
+}
+
+/// A host list of [`CipherItem`]s, which carry keys, that never leaves a copy of one in
+/// memory it gives back: it grows only by moving its items into a larger allocation and
+/// scrubbing the old one before freeing it (a plain `Vec` would free the old allocation
+/// with the keys in it), and it scrubs its items when cleared or dropped.
+#[derive(Debug, Default)]
+pub struct CipherItems(Vec<CipherItem>);
+
+impl CipherItems {
+    /// An empty list with room for `n` items before it first grows.
+    pub fn with_capacity(n: usize) -> Self {
+        CipherItems(Vec::with_capacity(n))
+    }
+
+    /// Appends an item. `Vec::push` with spare capacity never reallocates, so the only
+    /// reallocation is [`regrow`]'s, which scrubs what it leaves behind.
+    pub fn push(&mut self, item: CipherItem) {
+        if self.0.len() == self.0.capacity() {
+            let cap = (2 * self.0.capacity()).max(16);
+            let old = std::mem::take(&mut self.0);
+            self.0 = regrow(old, cap);
+        }
+        debug_assert!(self.0.len() < self.0.capacity());
+        self.0.push(item);
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn as_slice(&self) -> &[CipherItem] {
+        &self.0
+    }
+
+    /// Scrubs every item and empties the list, keeping its allocation.
+    pub fn clear(&mut self) {
+        for item in &mut self.0 {
+            item.scrub();
+        }
+        self.0.clear();
+    }
+}
+
+impl Drop for CipherItems {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+impl FromIterator<CipherItem> for CipherItems {
+    fn from_iter<I: IntoIterator<Item = CipherItem>>(iter: I) -> Self {
+        let mut items = CipherItems::default();
+        for item in iter {
+            items.push(item);
+        }
+        items
+    }
+}
+
+/// Moves `old`'s items into a new allocation of `cap` items and scrubs `old`'s before
+/// it is freed.
+fn regrow(mut old: Vec<CipherItem>, cap: usize) -> Vec<CipherItem> {
+    let new = copy_and_scrub(&mut old, cap);
+    drop(old);
+    new
+}
+
+/// The copy half of [`regrow`]: `old`'s items in a new allocation of `cap`, and `old`
+/// left allocated but scrubbed (separate so a test can look at what is freed).
+fn copy_and_scrub(old: &mut [CipherItem], cap: usize) -> Vec<CipherItem> {
+    let mut new = Vec::with_capacity(cap.max(old.len()));
+    new.extend_from_slice(old);
+    for item in old.iter_mut() {
+        item.scrub();
+    }
+    new
 }
 
 /// The keystream block after a range of `words` words starting at `counter`: every range
@@ -131,11 +215,8 @@ impl KvCipher {
     /// `items` is left empty and its key words zeroed, and the device copy is zeroed by a
     /// memset queued right after the launch. The ranges must be valid device memory, 4-byte
     /// aligned and disjoint.
-    pub fn apply(&mut self, gpu: &Gpu, items: &mut Vec<CipherItem>) -> Result<()> {
-        let result = self.launch(gpu, items);
-        for item in items.iter_mut() {
-            item.scrub();
-        }
+    pub fn apply(&mut self, gpu: &Gpu, items: &mut CipherItems) -> Result<()> {
+        let result = self.launch(gpu, items.as_slice());
         items.clear();
         result
     }
@@ -204,6 +285,34 @@ mod tests {
         assert_eq!(next_counter(3, 32).unwrap(), 5);
         assert_eq!(next_counter(3, 33).unwrap(), 6);
         assert!(next_counter(u32::MAX, 1).is_err());
+    }
+
+    /// Growing the list scrubs the allocation it leaves: the old buffer holds no key word
+    /// once its items have moved, and the list keeps every item.
+    #[test]
+    fn growth_scrubs_the_allocation_it_leaves() {
+        let key = KvKey::from_bytes([0x5a; 32]);
+        let item = |i: u64| CipherItem::new(4 * i, 1, 0, &key, &KvNonce::from_words([1, 2, 3]));
+        let mut old: Vec<CipherItem> = (0..5).map(item).collect();
+        let new = copy_and_scrub(&mut old, 10);
+        assert!(old.iter().all(|i| i.key == [0; 8] && i.nonce == [0; 3]));
+        assert_eq!(new.len(), 5);
+        assert!(new.iter().all(|i| i.key == [0x5a5a_5a5a; 8]));
+        // Through the list: past several growths every item is kept, in order.
+        let mut items = CipherItems::with_capacity(1);
+        for i in 0..100 {
+            items.push(item(i));
+        }
+        assert_eq!(items.len(), 100);
+        assert!(
+            items
+                .as_slice()
+                .iter()
+                .enumerate()
+                .all(|(i, it)| it.base == 4 * i as u64)
+        );
+        items.clear();
+        assert!(items.is_empty());
     }
 
     #[test]

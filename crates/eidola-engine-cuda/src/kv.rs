@@ -60,7 +60,7 @@ use eidola_engine::kv_cipher::KvNonce;
 use eidola_engine::secret::KvKey;
 use eidola_engine::spec::NULL_BLOCK;
 
-use crate::kv_cipher::{CipherItem, KvCipher, next_counter};
+use crate::kv_cipher::{CipherItem, CipherItems, KvCipher, next_counter};
 use crate::launch::dptr;
 use crate::{CudaError, Gpu, Result};
 
@@ -745,8 +745,9 @@ impl KvStore {
         let crypts = staged
             .ops
             .iter()
-            .any(|op| matches!(op, DeviceOp::Crypt { .. }));
-        if crypts && self.cipher.is_none() {
+            .filter(|op| matches!(op, DeviceOp::Crypt { .. }))
+            .count();
+        if crypts > 0 && self.cipher.is_none() {
             return Err(CudaError::new(
                 "a step encrypts or decrypts KV but no cipher is loaded",
             ));
@@ -754,7 +755,9 @@ impl KvStore {
         let s = gpu.stream();
         // The raw driver calls below need this thread's current context.
         gpu.context().bind_to_thread()?;
-        let mut batch: Vec<CipherItem> = Vec::new();
+        // Key-bearing items: sized for every crypt of the step at once, and in a list that
+        // scrubs whatever allocation it gives back.
+        let mut batch = CipherItems::with_capacity(crypts);
         for op in &staged.ops {
             if let DeviceOp::Crypt {
                 mem,

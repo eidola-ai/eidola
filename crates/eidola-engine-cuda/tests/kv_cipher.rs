@@ -16,7 +16,7 @@ use eidola_engine::executor::Maintenance;
 use eidola_engine::kv_cipher::{KvKeystream, KvNonce};
 use eidola_engine::secret::KvKey;
 use eidola_engine_cuda::kv::{GroupGeometry, KvLayout, KvStore};
-use eidola_engine_cuda::kv_cipher::{CipherItem, KvCipher};
+use eidola_engine_cuda::kv_cipher::{CipherItem, CipherItems, KvCipher};
 use eidola_engine_cuda::launch::dptr;
 
 struct Case {
@@ -147,7 +147,7 @@ fn the_kernel_matches_the_reference_byte_for_byte() {
         let mut cipher = KvCipher::from_module(su.module(KvCipher::IMAGE, arch)).unwrap();
         let buf = s.clone_htod(&host).unwrap();
         let base = dptr(&buf, s);
-        let mut items: Vec<CipherItem> = cs
+        let mut items: CipherItems = cs
             .iter()
             .map(|c| {
                 CipherItem::new(
