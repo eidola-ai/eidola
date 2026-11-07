@@ -372,7 +372,16 @@ impl CpuExecutor {
                 .map(|p| {
                     let mut host = Pool::new(p.layout.clone(), bs, cfg.host_blocks as usize);
                     host.lock().unwrap_or_else(|e| {
-                        panic!("the host tier's KV cannot be locked into memory: {e}")
+                        let limit = rustix::process::getrlimit(rustix::process::Resource::Memlock);
+                        let shown =
+                            |v: Option<u64>| v.map_or("unlimited".into(), |b| b.to_string());
+                        panic!(
+                            "the host tier's KV ({} bytes in this group) cannot be locked into \
+                             memory: {e}; RLIMIT_MEMLOCK is {} bytes (hard {})",
+                            host.block_bytes() * host.num_blocks(),
+                            shown(limit.current),
+                            shown(limit.maximum)
+                        )
                     });
                     host
                 })

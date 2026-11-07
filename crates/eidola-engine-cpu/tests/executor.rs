@@ -494,7 +494,9 @@ fn drafts_at_position_zero_panic() {
         .unwrap();
 }
 
+/// Eight host blocks (about 0.4 MB locked); the soft memory-lock limit raised first.
 fn tiered_executor() -> CpuExecutor {
+    allow_memlock();
     let mut cfg = exec_config(16, vec![0, 1]);
     cfg.num_state_slots = 4;
     cfg.host_blocks = 8;

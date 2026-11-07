@@ -42,6 +42,34 @@ impl TestRng {
     }
 }
 
+/// Raises this process's soft memory-lock limit to its hard limit, so the host tier's
+/// `mlock`ed pools fit where the soft limit is small (CI runners often allow 8 MiB or
+/// less). Never lowers it. The host-tier tests also keep their pools small and run one
+/// at a time ([`memlock_guard`]); an executor that still cannot lock its tier refuses
+/// to start with a message naming the limit.
+pub fn allow_memlock() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let l = getrlimit(Resource::Memlock);
+    if l.current.is_some() && l.current != l.maximum {
+        let _ = setrlimit(
+            Resource::Memlock,
+            Rlimit {
+                current: l.maximum,
+                maximum: l.maximum,
+            },
+        );
+    }
+}
+
+/// Serializes the tests of one binary that build executors with a host tier, so their
+/// locked pools never add up past a small limit; also raises the limit
+/// ([`allow_memlock`]).
+pub fn memlock_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    allow_memlock();
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The lineage of client key `[n; 32]` under a fixed boot key.
 pub fn salt(n: u8) -> Lineage {
     SaltDeriver::with_boot_key(BootKey::from_bytes([0; 32])).lineage(&CacheKey::from_bytes([n; 32]))

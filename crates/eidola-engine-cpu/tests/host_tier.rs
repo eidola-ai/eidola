@@ -19,6 +19,11 @@ fn keyed(n: u8) -> CacheScope {
     CacheScope::Keyed(salt(n))
 }
 
+/// Host-tier blocks per group in these tests: room for the pushed-out lineages, about
+/// 2.6 MB locked (53 KB a block of every group on the fixture), well under an 8 MiB
+/// memory-lock limit even at a time.
+const HOST: u32 = 48;
+
 /// A harness over the fixture with `device` blocks per group and `host` host-tier blocks.
 fn tiered(device: u32, host: u32, spec_on: bool, cache: bool) -> Harness {
     let mut cfg = exec_config(device, vec![0, 1]);
@@ -74,8 +79,9 @@ fn push_out(h: &mut Harness, rng: &mut TestRng) {
 
 #[test]
 fn a_host_hit_is_bit_exact_and_the_host_holds_only_ciphertext() {
+    let _locked = memlock_guard();
     for spec_on in [false, true] {
-        let mut h = tiered(24, 128, spec_on, true);
+        let mut h = tiered(24, HOST, spec_on, true);
         let mut rng = TestRng(70);
         let prompt = rng.tokens(30, VOCAB);
         let g = SamplingParams::greedy();
@@ -154,13 +160,14 @@ fn a_host_hit_is_bit_exact_and_the_host_holds_only_ciphertext() {
 /// cache off: byte-identical outputs, sampled and greedy.
 #[test]
 fn a_host_hit_equals_a_device_hit_and_a_recompute() {
+    let _locked = memlock_guard();
     for spec_on in [false, true] {
         for params in [
             SamplingParams::greedy(),
             SamplingParams::random(0.8, 9).unwrap(),
         ] {
             let mut outs = Vec::new();
-            for (device, host, cache) in [(512, 0, true), (24, 128, true), (512, 0, false)] {
+            for (device, host, cache) in [(512, 0, true), (24, HOST, true), (512, 0, false)] {
                 let mut h = tiered(device, host, spec_on, cache);
                 let mut rng = TestRng(71);
                 let prompt = rng.tokens(30, VOCAB);
@@ -186,6 +193,7 @@ fn a_host_hit_equals_a_device_hit_and_a_recompute() {
 /// pressure, every harness check after every step, every row bit-exact.
 #[test]
 fn randomized_traffic_with_a_host_tier_is_bit_exact() {
+    let _locked = memlock_guard();
     for seed in 0..3u64 {
         let spec_on = seed % 2 == 0;
         let mut h = tiered(32, 24, spec_on, true);

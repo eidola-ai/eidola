@@ -831,14 +831,34 @@ async fn a_host_tier_keeps_a_conversation_through_kv_pressure() {
         record: false,
     };
     let per_block = CpuExecutor::kv_block_bytes(model.reference().unwrap(), &probe);
-    let host_bytes = (128 * per_block).to_string();
+    // Room for the pushed-out conversations and small enough to lock under an 8 MiB
+    // memory-lock limit; the soft limit is raised to the hard one first.
+    let host_bytes = (24 * per_block).to_string();
+    assert!(
+        24 * per_block < 6 << 20,
+        "the host tier ({} bytes) stays under small memory-lock limits",
+        24 * per_block
+    );
+    {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        let l = getrlimit(Resource::Memlock);
+        if l.current.is_some() && l.current != l.maximum {
+            let _ = setrlimit(
+                Resource::Memlock,
+                Rlimit {
+                    current: l.maximum,
+                    maximum: l.maximum,
+                },
+            );
+        }
+    }
     let mut runs = Vec::new();
     for host in ["0", host_bytes.as_str()] {
         let node = TestNode::start(&[(env::KV_BLOCKS, "16"), (env::KV_HOST_BYTES, host)]).await;
         let (_, first) = node.chat_json(&keyed(1)).await;
         let (_, hit) = node.chat_json(&keyed(1)).await;
         assert!(cached(&hit) > 0);
-        for other in 2..14u8 {
+        for other in 2..9u8 {
             let (status, _) = node.chat_json(&keyed(other)).await;
             assert_eq!(status, 200);
         }
