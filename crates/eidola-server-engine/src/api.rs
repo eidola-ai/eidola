@@ -3,7 +3,9 @@
 //! The request is the server's strict chat-completions subset (`eidola-server`'s
 //! `types.rs`: the same fields, nullability and `deny_unknown_fields`), plus one field the
 //! gateway adds, `cache_key`. Anything else is refused, so the engine's own parameter
-//! surface is not reachable from outside.
+//! surface is not reachable from outside. A continuation (`continue_final_message`, with
+//! `add_generation_prompt: false`) is part of the subset: its prompt ends inside the
+//! final assistant message, at the field it continues.
 //!
 //! The strict types only *validate* `messages` and `tools`. The prompt is rendered from
 //! the same body parsed again by the chat crate's order-preserving JSON parser, because
@@ -12,8 +14,8 @@
 
 use base64::Engine as _;
 use eidola_common::engine_protocol::{
-    CACHE_KEY_BYTES, CACHE_KEY_TEXT_LEN, SubsetError, ToolChoice, check_max_completion_tokens,
-    check_stop, check_tool_choice,
+    CACHE_KEY_BYTES, CACHE_KEY_TEXT_LEN, ContinueField, FinalContent, FinalMessage, SubsetError,
+    ToolChoice, check_continuation, check_max_completion_tokens, check_stop, check_tool_choice,
 };
 use eidola_engine::secret::CacheKey;
 use eidola_engine_chat::json::{self as chat_json, Json};
@@ -54,6 +56,14 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// Whether the prompt ends with a new assistant turn; with a continuation it may only
+    /// be `false` (`eidola_common::engine_protocol::check_continuation`).
+    #[serde(default)]
+    pub add_generation_prompt: Option<bool>,
+    /// Continue the final assistant message rather than answer it: `true` (its content)
+    /// or the name of the field to continue. Read by `check_continuation`.
+    #[serde(default)]
+    pub continue_final_message: Option<serde_json::Value>,
     /// The client's prefix-cache key: 32 bytes, base64url without padding. Content-class:
     /// never logged, and turned into the engine's lineage as soon as it is decoded. Its text is
     /// scrubbed whenever it is dropped, including when a later field fails to parse and
@@ -118,6 +128,25 @@ pub struct Message {
     pub tool_calls: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// An assistant message's reasoning, which the template renders before its content.
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
+}
+
+impl Message {
+    /// This message as the continuation rule reads a final message.
+    fn as_final(&self) -> FinalMessage<'_> {
+        FinalMessage {
+            is_assistant: self.role == Role::Assistant,
+            content: match &self.content {
+                None => FinalContent::Absent,
+                Some(MessageContent::Text(text)) => FinalContent::Text(text),
+                Some(MessageContent::Parts(_)) => FinalContent::Parts,
+            },
+            has_tool_calls: self.tool_calls.as_ref().is_some_and(|c| !c.is_empty()),
+            reasoning_content: self.reasoning_content.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -169,6 +198,9 @@ pub struct ValidRequest {
     pub include_usage: bool,
     pub stop: Vec<String>,
     pub cache_key: Option<CacheKey>,
+    /// The final message's field the prompt continues, or `None` for a new assistant
+    /// turn.
+    pub continuation: Option<ContinueField>,
 }
 
 impl std::fmt::Debug for ValidRequest {
@@ -219,6 +251,12 @@ pub fn parse_request(body: &[u8], model_id: &str) -> Result<ValidRequest, ApiErr
     // "none" is honoured by not showing the model any tools (below), so there is
     // nothing to parse either.
     let parse_tools = tool_choice == ToolChoice::Auto && tools_given;
+    let continuation = check_continuation(
+        req.continue_final_message.as_ref(),
+        req.add_generation_prompt,
+        req.messages.last().map(Message::as_final),
+    )
+    .map_err(invalid)?;
 
     // The same body, parsed order-preserving for the template.
     let text = std::str::from_utf8(body).map_err(|_| ApiError::invalid("body is not UTF-8"))?;
@@ -256,6 +294,7 @@ pub fn parse_request(body: &[u8], model_id: &str) -> Result<ValidRequest, ApiErr
         include_usage: req.stream_options.is_some_and(|o| o.include_usage),
         stop,
         cache_key,
+        continuation,
     })
 }
 

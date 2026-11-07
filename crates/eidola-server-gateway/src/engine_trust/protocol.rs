@@ -551,6 +551,32 @@ mod tests {
     /// and the forwarded body prices to the same prompt tokens as the request
     /// the gateway charged for.
     #[test]
+    fn a_continuation_reaches_the_engine_as_sent_and_priced() {
+        let raw = r#"{"model":"m","messages":[
+            {"role":"user","content":"hi"},
+            {"role":"assistant","reasoning_content":"weighing é","content":""}],
+          "add_generation_prompt":false,"continue_final_message":"reasoning_content"}"#;
+        let request =
+            ValidatedRequest::from_bytes(bytes::Bytes::from_static(raw.as_bytes())).unwrap();
+        let body = engine_request_body(&request);
+        let forwarded: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(forwarded["add_generation_prompt"], false);
+        assert_eq!(forwarded["continue_final_message"], "reasoning_content");
+        assert_eq!(forwarded["messages"][1]["reasoning_content"], "weighing é");
+
+        // The reasoning is priced on both sides of the hop, by the one walk.
+        let priced = crate::handlers::chargeable_prompt_tokens_for(request.request());
+        let received =
+            eidola_common::prompt_charge(forwarded["messages"].as_array().unwrap(), None);
+        assert_eq!(received.chargeable_prompt_tokens(), priced);
+        assert_eq!(
+            received.total_content_bytes(),
+            2 + "weighing é".len() as u64,
+            "the reasoning's bytes are charged"
+        );
+    }
+
+    #[test]
     fn the_engine_receives_exactly_what_was_priced() {
         let raw = r#"{"model":"m","messages":[
             {"role":"user","content":"\u0068i"},

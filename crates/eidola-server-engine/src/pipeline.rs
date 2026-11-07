@@ -30,6 +30,10 @@ pub struct Prepared {
     pub prompt_tokens: u32,
     pub output: OutputConfig,
     pub stop: Vec<String>,
+    /// The completion limit is the room left in the context window rather than the
+    /// request's own `max_completion_tokens`: an ending there leaves no room for a
+    /// continuation's prompt, so it is never reported continuable.
+    pub window_bound: bool,
 }
 
 /// Renders, tokenizes and builds the engine request. CPU work: run it off the async
@@ -50,6 +54,7 @@ pub fn prepare(
         top_p,
         stop,
         cache_key,
+        continuation,
         ..
     } = req;
     let defaults = model.defaults();
@@ -76,9 +81,13 @@ pub fn prepare(
     input
         .normalize_tool_call_arguments()
         .map_err(|e| ApiError::invalid(e.to_string()))?;
+    // A continuation's prompt ends inside the final message, at the field it continues,
+    // and its output is parsed from there; otherwise the prompt opens a new turn.
+    let continuing = continuation.map(|field| field.field());
     let options = RenderOptions {
-        add_generation_prompt: true,
+        add_generation_prompt: continuing.is_none(),
         enable_thinking: None,
+        continue_final_message: continuing,
     };
     let prompt = model
         .template()
@@ -97,6 +106,9 @@ pub fn prepare(
     }
     let room = max_model_len - prompt_tokens;
     let max_tokens = max_completion_tokens.map_or(room, |m| m.min(room));
+    // `>=`: a cut exactly at the room leaves a continuation prompt of the whole
+    // window, which `prepare` refuses as well.
+    let window_bound = max_completion_tokens.is_none_or(|m| m >= room);
     Ok(Prepared {
         request: Request {
             id,
@@ -107,8 +119,9 @@ pub fn prepare(
             cache,
         },
         prompt_tokens,
-        output: OutputConfig::new(options.enable_thinking, schemas),
+        output: OutputConfig::new(options.enable_thinking, schemas).continuing_in(continuing),
         stop,
+        window_bound,
     })
 }
 
@@ -133,6 +146,9 @@ pub struct Step {
     pub finish: Option<FinishReason>,
     /// A stop sequence matched: the caller must cancel the engine request.
     pub stopped_by_sequence: bool,
+    /// On a `length` finish, whether the response can be continued exactly from what
+    /// it gave out (`OutputParser::resumes_exactly`); `None` on any other ending.
+    pub continuable: Option<bool>,
 }
 
 /// Turns one request's engine tokens into OpenAI deltas.
@@ -143,6 +159,7 @@ pub struct Decoder {
     parser: OutputParser,
     completion_tokens: u32,
     done: bool,
+    window_bound: bool,
 }
 
 impl Decoder {
@@ -159,7 +176,16 @@ impl Decoder {
             parser: OutputParser::new(output, PrefixedCallIds(call_prefix)),
             completion_tokens: 0,
             done: false,
+            window_bound: false,
         }
+    }
+
+    /// Whether the engine's limit for this request is the context window's room
+    /// ([`Prepared::window_bound`]): a `length` ending there is reported not
+    /// continuable, since no room is left for a continuation.
+    pub fn window_bound(mut self, bound: bool) -> Self {
+        self.window_bound = bound;
+        self
     }
 
     /// Completion tokens consumed so far (through the token that completed a stop
@@ -205,17 +231,35 @@ impl Decoder {
                     return Err(ApiError::Internal("the request was cancelled"));
                 }
             };
+            if self.detok.pending_len() > 0 {
+                // The final character is incomplete and flushes lossily.
+                self.parser.mark_lossy();
+            }
             let rest = self.detok.finish();
             let (released, matched) = self.stop.push(&rest);
             append(&mut step.delta, self.parser.push_text(&released));
+            let mut stop_held = false;
             let cause = if matched {
                 StopCause::StopSequence
             } else {
-                append(&mut step.delta, self.parser.push_text(&self.stop.flush()));
+                let held = self.stop.flush();
+                // A possible partial stop sequence, given out as text: a resumed
+                // request's matcher starts with nothing held and would miss one
+                // spanning the cut.
+                stop_held = !held.is_empty();
+                append(&mut step.delta, self.parser.push_text(&held));
                 cause
             };
             let (tail, reason) = self.parser.finish(cause);
             append(&mut step.delta, tail);
+            if reason == FinishReason::Length {
+                // Continuable only where a continuation would be exact and could
+                // run: not at the context window (no room is left for one), not
+                // inside a held stop sequence, and only where the chat layer says
+                // what it gave out renders the generated text and resumes its parse.
+                step.continuable =
+                    Some(!self.window_bound && !stop_held && self.parser.resumes_exactly());
+            }
             step.finish = Some(reason);
             self.done = true;
         }

@@ -358,11 +358,10 @@ impl DelegationFailure {
             | AppError::NotJoined { .. }
             | AppError::DrivenConversation { .. }
             | AppError::SpaceArchived { .. } => Self::Configuration,
-            // A truncation is the sharpest case of "ran, produced no answer",
-            // and a regeneration collision cannot reach a driven room at all
-            // (the driver never revises) — both land in the honest catch-all.
-            AppError::ResponseTruncated { .. }
-            | AppError::RegenerationInFlight { .. }
+            // A regeneration collision cannot reach a driven room at all (the
+            // driver never revises or continues) — it lands in the honest
+            // catch-all.
+            AppError::RegenerationInFlight { .. }
             | AppError::ToolLoop { .. }
             | AppError::Internal { .. }
             | AppError::Database { .. }
@@ -1567,9 +1566,16 @@ impl Inner {
         // reader here to show a marker to, which is exactly why the fact has to
         // travel: the only surface a delegated room ever gets is its report,
         // and an ending that claims the room ran to a stop is a claim about an
-        // answer that stopped mid-thought. (A turn cut off before writing *any*
-        // answer never reaches here — that is `AppError::ResponseTruncated`,
-        // which stops the walk as a failure like any other.)
+        // answer that stopped mid-thought — or before its answer began, which
+        // is written and marked the same way.
+        //
+        // **A driven turn that stops at its ceiling is not continued here.**
+        // Each driven turn is one request bounded by one ceiling, and the
+        // walk's turn budget counts turns, so what a delegation can spend
+        // unattended is a product of the two. Continuing on the reader's
+        // behalf would make every turn a loop with no bound of its own; the
+        // mark travels instead, and a reader who joins the room continues the
+        // answer as they would anywhere else.
         Ok(result.response_action_id.map(|id| (id, result.truncated)))
     }
 

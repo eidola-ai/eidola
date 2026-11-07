@@ -918,29 +918,42 @@ async fn an_overloaded_or_vanished_engine_passes_the_request_on() {
 async fn a_request_outside_the_node_subset_never_reaches_an_engine() {
     let a = engine(Identity::of(MODEL_A)).await;
     let router = router_for(&[&a], models());
-    let refused = ValidatedRequest::from_bytes(bytes::Bytes::from(request_text(
-        MODEL_A,
-        None,
-        false,
+    // The extras each put a parsed request outside the node's subset: a
+    // tool choice it cannot honour, and continuations its rule refuses (a
+    // final message that is not an assistant's, a generation prompt turned
+    // off with nothing continued, a field it does not continue).
+    let refusals = [
         r#","tool_choice":"required""#,
-    )))
-    .unwrap();
-    assert!(matches!(
-        router.send(&refused).await,
-        Err(ServerError::BadRequest { .. })
-    ));
+        r#","continue_final_message":true"#,
+        r#","add_generation_prompt":false"#,
+        r#","continue_final_message":"tool_calls""#,
+    ]
+    .map(|extra| {
+        ValidatedRequest::from_bytes(bytes::Bytes::from(request_text(
+            MODEL_A, None, false, extra,
+        )))
+        .unwrap()
+    });
+    for refused in &refusals {
+        assert!(matches!(
+            router.send(refused).await,
+            Err(ServerError::BadRequest { .. })
+        ));
+    }
     router
         .apply_placement(&[a.row(MODEL_A, DEPLOYMENT_A)])
         .await;
     router.probe_due().await;
-    assert!(matches!(
-        router.send(&refused).await,
-        Err(ServerError::BadRequest { .. })
-    ));
-    assert!(matches!(
-        router.send_stream(&refused).await,
-        Err(ServerError::BadRequest { .. })
-    ));
+    for refused in &refusals {
+        assert!(matches!(
+            router.send(refused).await,
+            Err(ServerError::BadRequest { .. })
+        ));
+        assert!(matches!(
+            router.send_stream(refused).await,
+            Err(ServerError::BadRequest { .. })
+        ));
+    }
     assert!(a.chats().is_empty());
 }
 

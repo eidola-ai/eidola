@@ -319,6 +319,7 @@ mod tests {
             false,
             false,
             Some(key),
+            None,
         );
         let kept = String::from_utf8(recorded_request(&keyed)).unwrap();
         assert!(!kept.contains(key), "{kept}");
@@ -335,6 +336,7 @@ mod tests {
             &[],
             false,
             false,
+            None,
             None,
         );
         assert_eq!(recorded_request(&keyless), keyless.to_string().into_bytes());
@@ -358,6 +360,7 @@ mod tests {
             false,
             false,
             Some(key),
+            None,
         );
         let sent = keyed.to_string().len();
         let kept = String::from_utf8_lossy(&recorded_request(&keyed)).into_owned();
@@ -385,6 +388,7 @@ mod tests {
             false,
             false,
             Some(key),
+            None,
         );
         let kept = String::from_utf8(recorded_request(&keyed)).unwrap();
         assert_eq!(kept.len(), keyed.to_string().len());

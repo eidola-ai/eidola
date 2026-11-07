@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 13;
+const LATEST_VERSION: i64 = 14;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -2271,6 +2271,91 @@ pub async fn turns_taken_in_space(conn: &Connection, space_id: &str) -> Result<i
     }
 }
 
+/// What a continuation extends: the generation's author and model, whether it
+/// stopped at its completion ceiling, and the reasoning and answer it wrote —
+/// each its `thinking` / `text` blocks joined in ordinal order (a turn writes
+/// at most one of each).
+#[derive(Debug, Clone)]
+pub struct ContinuationSource {
+    pub action_type: String,
+    pub participant_id: String,
+    pub model: Option<String>,
+    pub truncated: bool,
+    /// Its text is exactly what the model generated (`action.resumable`).
+    pub resumable: bool,
+    pub thinking: String,
+    pub text: String,
+}
+
+/// The [`ContinuationSource`] of `action_id`, or `None` for no such action.
+pub async fn continuation_source(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<ContinuationSource>, AppError> {
+    let mut rows = conn
+        .query(
+            "SELECT participant_id, model, truncated, action_type, resumable FROM action \
+             WHERE id = ?1",
+            [Value::Text(action_id.to_string())],
+        )
+        .await
+        .map_err(AppError::db)?;
+    let Some(row) = rows.next().await.map_err(AppError::db)? else {
+        return Ok(None);
+    };
+    let mut source = ContinuationSource {
+        action_type: row.get::<String>(3).map_err(AppError::db)?,
+        participant_id: row.get::<String>(0).map_err(AppError::db)?,
+        model: row.get::<Option<String>>(1).map_err(AppError::db)?,
+        truncated: row.get::<i64>(2).map_err(AppError::db)? != 0,
+        resumable: row.get::<i64>(4).map_err(AppError::db)? != 0,
+        thinking: String::new(),
+        text: String::new(),
+    };
+    drop(rows);
+    let mut blocks = conn
+        .query(
+            "SELECT block_type, text_content FROM content_block \
+             WHERE action_id = ?1 AND block_type IN ('thinking', 'text') \
+               AND text_content IS NOT NULL \
+             ORDER BY ordinal ASC",
+            [Value::Text(action_id.to_string())],
+        )
+        .await
+        .map_err(AppError::db)?;
+    while let Some(row) = blocks.next().await.map_err(AppError::db)? {
+        let text = row.get::<String>(1).map_err(AppError::db)?;
+        match row.get::<String>(0).map_err(AppError::db)?.as_str() {
+            "thinking" => source.thinking.push_str(&text),
+            _ => source.text.push_str(&text),
+        }
+    }
+    Ok(Some(source))
+}
+
+/// The request body the Record keeps for the chat completion that produced
+/// `action_id` — the generation's own request row, the last one when there is
+/// more than one. `None` when there is none.
+pub async fn generation_request_body(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<Vec<u8>>, AppError> {
+    let mut rows = conn
+        .query(
+            "SELECT request_body FROM request \
+             WHERE action_id = ?1 AND path = '/v1/chat/completions' \
+               AND request_body IS NOT NULL \
+             ORDER BY request_at DESC, id DESC LIMIT 1",
+            [Value::Text(action_id.to_string())],
+        )
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<Vec<u8>>(0).map_err(AppError::db)?)),
+    }
+}
+
 /// `(id, text)` of an action's first quotable ([`QUOTABLE_BLOCK_TYPE`]) content
 /// block — what a driver quotes when it attaches a post to a turn it is about
 /// to run. `None` for an action with no text block (a decline, a trace).
@@ -3040,6 +3125,7 @@ async fn spawn_subspace_tx_body(
             output_tokens: None,
             credits_consumed: None,
             truncated: false,
+            resumable: false,
             created_at: plan.now,
         },
     )
@@ -5805,6 +5891,9 @@ pub struct ActionEntry {
     /// than because the model was done. Only an `inference` may set it (the
     /// schema CHECKs that); every other writer passes `false`.
     pub truncated: bool,
+    /// A truncated generation whose text is exactly what the model generated, so
+    /// it can be continued (the schema CHECKs it implies `truncated`).
+    pub resumable: bool,
     pub created_at: i64,
 }
 
@@ -5936,6 +6025,7 @@ async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<PostOutc
             output_tokens: None,
             credits_consumed: None,
             truncated: false,
+            resumable: false,
             created_at: plan.created_at,
         },
     )
@@ -6041,6 +6131,7 @@ async fn edit_post_tx_body(conn: &Connection, plan: &EditPostPlan<'_>) -> Result
             output_tokens: None,
             credits_consumed: None,
             truncated: false,
+            resumable: false,
             created_at: plan.created_at,
         },
     )
@@ -6078,9 +6169,9 @@ pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(),
         "INSERT INTO action (id, space_id, participant_id, participant_scope, item_id, \
          supersedes_action_id, supersedes_item_id, action_type, status, \
          intent, model, input_tokens, output_tokens, credits_consumed, truncated, \
-         created_at) \
+         resumable, created_at) \
          VALUES (?1, ?2, ?3, (SELECT scope FROM participant WHERE id = ?3), \
-                 ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                 ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         (
             Value::Text(entry.id.clone()),
             Value::Text(entry.space_id.clone()),
@@ -6111,6 +6202,7 @@ pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(),
                 None => Value::Null,
             },
             Value::Integer(i64::from(entry.truncated)),
+            Value::Integer(i64::from(entry.resumable)),
             Value::Integer(entry.created_at),
         ),
     )
@@ -10228,6 +10320,7 @@ mod tests {
                 output_tokens: None,
                 credits_consumed: None,
                 truncated: false,
+                resumable: false,
                 created_at,
             },
         )
@@ -10502,6 +10595,7 @@ mod tests {
                 output_tokens: None,
                 credits_consumed: None,
                 truncated: false,
+                resumable: false,
                 created_at,
             },
         )
@@ -10551,6 +10645,7 @@ mod tests {
                 output_tokens: None,
                 credits_consumed: None,
                 truncated: false,
+                resumable: false,
                 created_at,
             },
         )
@@ -10857,6 +10952,7 @@ mod tests {
                 output_tokens: None,
                 credits_consumed: None,
                 truncated: false,
+                resumable: false,
                 created_at: 4_000,
             },
         )
@@ -11050,6 +11146,7 @@ mod tests {
                     output_tokens: None,
                     credits_consumed: credits,
                     truncated: false,
+                    resumable: false,
                     created_at: at,
                 },
             )
@@ -11202,6 +11299,7 @@ mod tests {
             output_tokens: None,
             credits_consumed: None,
             truncated: false,
+            resumable: false,
             created_at: 1_000,
         };
 
@@ -11293,6 +11391,7 @@ mod tests {
                 output_tokens: Some(480),
                 credits_consumed: Some(700),
                 truncated: false,
+                resumable: false,
                 created_at: 2_200,
             },
         )

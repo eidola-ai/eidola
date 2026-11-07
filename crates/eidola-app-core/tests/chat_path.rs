@@ -155,6 +155,7 @@ fn assert_shared_request_body(body: &serde_json::Value, expected_stream: bool) {
             expected_stream,
             include_usage,
             None,
+            None,
         ),
         "dispatch must send exactly the shared chat request body"
     );
@@ -5849,13 +5850,23 @@ async fn collect_deltas(
     (content, reasoning)
 }
 
-/// The reported defect, in the blocking transport: a reasoning model spends the
-/// whole completion budget thinking and never starts the answer. Everything
-/// about the response reads like success — 200, parseable, honest usage, a real
-/// `thinking` block — and recording it as an ordinary completed inference is
-/// exactly the lie. No generation is written; the raw exchange is kept.
+/// A post's reasoning — its `thinking` blocks joined.
+fn block_thinking(node: &eidola_app_core::PostNode) -> String {
+    node.blocks
+        .iter()
+        .filter(|b| b.block_type == "thinking")
+        .filter_map(|b| b.text.clone())
+        .collect()
+}
+
+/// A reasoning model spends the whole completion budget thinking and never
+/// starts the answer. The reasoning is real work, and the turn that stopped
+/// there is written like any turn that stopped at its ceiling: an `inference`
+/// carrying the reasoning and no answer, marked truncated, and continuable —
+/// so a continuation can resume the thought rather than start it over. The
+/// exchange is the generation's own request row.
 #[test]
-fn a_ceiling_exit_with_no_answer_writes_no_generation_blocking() {
+fn a_ceiling_exit_before_any_answer_is_written_and_marked_blocking() {
     run(|| {
         let (mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::ReasoningOnlyLength,
@@ -5864,32 +5875,34 @@ fn a_ceiling_exit_with_no_answer_writes_no_generation_blocking() {
         with_account(&core);
         let mut rx = core.subscribe_changes();
 
-        let err = core
+        let res = core
             .runtime()
             .block_on(core.chat("think about it".into(), MODEL.into(), None))
-            .expect_err("a turn with no answer in it must not succeed");
-        let space_id = only_space(&core);
-        assert!(
-            matches!(
-                err,
-                AppError::ResponseTruncated {
-                    output_tokens: Some(4096)
-                }
-            ),
-            "expected a typed truncation carrying the ceiling it hit, got {err:?}"
-        );
+            .expect("a turn cut off before its answer is still a turn");
+        assert!(res.truncated, "the ceiling bound it, and it must say so");
+        assert_eq!(res.content, "", "there is no answer text yet");
         assert_eq!(mock.chat_hits(), 1);
+        let answer = res
+            .response_action_id
+            .clone()
+            .expect("the reasoning is written as a generation");
 
-        // The post survives; nothing was written as an answer.
-        let actions = core
+        let tree = core
             .runtime()
-            .block_on(core.test_space_actions(space_id.clone()))
-            .expect("raw actions");
-        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
-        assert_eq!(kinds, vec!["user_input"], "no inference generation");
+            .block_on(core.get_space_tree(res.space_id.clone()))
+            .expect("tree");
+        assert_eq!(tree.len(), 2, "the question and the cut-off answer");
+        let post = &tree[1];
+        assert_eq!(post.action_id, answer);
+        assert_eq!(post.action_type, "inference");
+        assert!(
+            post.truncated && post.continuable,
+            "marked, and continuable"
+        );
+        assert_eq!(block_thinking(post), TRUNCATED_REASONING);
+        assert_eq!(block_text(post), "", "no answer block");
 
-        // The reasoning the model did produce is not lost — it is in the
-        // Record, attached to no action.
+        // The exchange is the generation's own, not an unattached row.
         let requests = core
             .runtime()
             .block_on(core.list_requests(10, 0))
@@ -5904,7 +5917,7 @@ fn a_ceiling_exit_with_no_answer_writes_no_generation_blocking() {
             .block_on(core.request_detail(chat_rows[0].id.clone()))
             .expect("request detail")
             .expect("the row is there");
-        assert!(detail.action_id.is_none(), "attached to no action");
+        assert_eq!(detail.action_id.as_deref(), Some(answer.as_str()));
         let body = String::from_utf8(detail.response_body.expect("a recorded response body"))
             .expect("utf-8");
         assert!(
@@ -5912,20 +5925,18 @@ fn a_ceiling_exit_with_no_answer_writes_no_generation_blocking() {
             "the reason the turn ended is in the trail: {body}"
         );
 
+        // The ordinary success emissions.
         let changes = drain(&mut rx);
-        assert!(
-            changes.contains(&Change::Space(space_id)),
-            "got {changes:?}"
-        );
-        assert!(changes.contains(&Change::Record), "got {changes:?}");
+        for expected in [Change::Space(res.space_id), Change::Wallet, Change::Record] {
+            assert!(changes.contains(&expected), "{expected:?} in {changes:?}");
+        }
     });
 }
 
-/// The streaming twin: same upstream, same verdict. The deltas the reader
-/// already watched arrive are still delivered — the reasoning was real — but
-/// the turn still fails, because there is no answer under it.
+/// The streaming twin: same upstream, same verdict. The reasoning streams as it
+/// arrives, and the generation it streamed into is written and marked.
 #[test]
-fn a_ceiling_exit_with_no_answer_writes_no_generation_streaming() {
+fn a_ceiling_exit_before_any_answer_is_written_and_marked_streaming() {
     run(|| {
         let (mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::ReasoningOnlyLength,
@@ -5940,26 +5951,22 @@ fn a_ceiling_exit_with_no_answer_writes_no_generation_streaming() {
             (res, content, reasoning)
         });
 
-        let err = res.expect_err("a stream with no answer in it must not succeed");
+        let res = res.expect("a stream cut off before its answer is still a turn");
         assert!(
-            matches!(
-                err,
-                AppError::ResponseTruncated {
-                    output_tokens: Some(4096)
-                }
-            ),
-            "blocking and streaming must classify a ceiling exit alike, got {err:?}"
+            res.truncated,
+            "blocking and streaming classify a ceiling exit alike"
         );
         assert!(content.is_empty(), "there was no answer to stream");
-        assert_eq!(reasoning, "still working through it…");
+        assert_eq!(reasoning, TRUNCATED_REASONING);
 
-        let space_id = only_space(&core);
-        let actions = core
+        let tree = core
             .runtime()
-            .block_on(core.test_space_actions(space_id))
-            .expect("raw actions");
-        let kinds: Vec<&str> = actions.iter().map(|a| a.action_type.as_str()).collect();
-        assert_eq!(kinds, vec!["user_input"], "no inference generation");
+            .block_on(core.get_space_tree(res.space_id))
+            .expect("tree");
+        let post = &tree[1];
+        assert_eq!(Some(&post.action_id), res.response_action_id.as_ref());
+        assert!(post.truncated && post.continuable);
+        assert_eq!(block_thinking(post), TRUNCATED_REASONING);
 
         // The hold is settled exactly as a turn that produced text settles it:
         // the tokens were spent whether or not they became an answer.
@@ -5967,12 +5974,13 @@ fn a_ceiling_exit_with_no_answer_writes_no_generation_streaming() {
     });
 }
 
-/// The case the defect was reported from: regenerating an answer, and the new
-/// generation never arrives. The **old generation must survive** — a
-/// regeneration supersedes, so writing the truncated turn would have replaced a
-/// readable answer with an empty one.
+/// Regenerating an answer, and the new generation stops before its answer
+/// begins. It is a generation like any other — written, marked, current — and
+/// **the answer it superseded is one step back**: regeneration is
+/// append-only, so the readable answer is still the item's earlier generation
+/// (what the switcher shows), and the new one can be continued to its own.
 #[test]
-fn a_regeneration_cut_off_at_the_ceiling_keeps_the_answer_it_would_replace() {
+fn a_regeneration_cut_off_before_its_answer_keeps_the_old_answer_one_generation_back() {
     run(|| {
         let (_mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::OkThenReasoningOnlyLength,
@@ -5999,22 +6007,43 @@ fn a_regeneration_cut_off_at_the_ceiling_keeps_the_answer_it_would_replace() {
             let (res, _) = tokio::join!(regen, collect_deltas(events_rx));
             res
         });
-        assert!(
-            matches!(res, Err(AppError::ResponseTruncated { .. })),
-            "got {res:?}"
-        );
+        let res = res.expect("a regeneration cut off before its answer is a generation");
+        assert!(res.truncated);
 
         let tree = core
             .runtime()
-            .block_on(core.get_space_tree(first.space_id))
+            .block_on(core.get_space_tree(first.space_id.clone()))
             .expect("tree");
-        assert_eq!(tree.len(), 2, "no successor post; got {tree:#?}");
-        assert_eq!(tree[1].action_id, answer, "the tip did not move");
-        assert_eq!(block_text(&tree[1]), original, "the answer is intact");
         assert_eq!(
-            tree[1].generation_count, 1,
-            "the refused turn is not a generation"
+            tree.len(),
+            2,
+            "a new generation, not a new post; got {tree:#?}"
         );
+        let tip = &tree[1];
+        assert_ne!(
+            tip.action_id, answer,
+            "the regeneration is the current generation"
+        );
+        assert_eq!(tip.generation_count, 2);
+        assert!(tip.truncated && tip.continuable);
+        assert_eq!(block_text(tip), "");
+
+        // The superseded answer is intact, one generation back.
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(first.space_id))
+            .expect("raw actions");
+        let old = actions
+            .iter()
+            .find(|a| a.id == answer)
+            .expect("the superseded generation is kept");
+        let old_text: String = old
+            .blocks
+            .iter()
+            .filter(|b| b.block_type == "text")
+            .filter_map(|b| b.text_content.clone())
+            .collect();
+        assert_eq!(old_text, original, "the answer is intact");
     });
 }
 
@@ -6141,6 +6170,7 @@ fn an_ordinary_turn_is_not_reported_as_truncated() {
             .block_on(core.chat("hello".into(), MODEL.into(), None))
             .expect("chat");
         assert!(!res.truncated);
+        assert!(!res.continuable);
 
         // Nor is the durable flag set on anything the turn wrote — "nobody set
         // it" and "it is false" have to be the same state on disk too.
@@ -6149,6 +6179,694 @@ fn an_ordinary_turn_is_not_reported_as_truncated() {
             .block_on(core.get_space_tree(res.space_id))
             .expect("tree");
         assert!(tree.iter().all(|p| !p.truncated), "got {tree:#?}");
+    });
+}
+
+// ===========================================================================
+// Continuing an answer that stopped at the ceiling
+// ===========================================================================
+
+use chat_harness::{
+    CEILING_TOKENS, CONTINUED_ANSWER, CONTINUED_REASONING, CONTINUED_TAIL, Cut, STREAM_CONTENT,
+    TRUNCATED_REASONING,
+};
+
+/// The item's current generation in `space_id`'s tree, at `index`.
+fn post_at(core: &AppCore, space_id: &str, index: usize) -> eidola_app_core::PostNode {
+    core.runtime()
+        .block_on(core.get_space_tree(space_id.to_string()))
+        .expect("tree")
+        .swap_remove(index)
+}
+
+/// Continue `action_id` on the streaming door, collecting what streamed.
+fn continue_streaming(
+    core: &AppCore,
+    action_id: &str,
+) -> (
+    Result<eidola_app_core::ChatResult, AppError>,
+    String,
+    String,
+) {
+    let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+    core.runtime().block_on(async {
+        let cont = core.continue_stream(action_id.to_string(), tx);
+        let (res, (content, reasoning)) = tokio::join!(cont, collect_deltas(events_rx));
+        (res, content, reasoning)
+    })
+}
+
+/// The request a continuation sends is the request its answer's turn sent,
+/// with that answer as a final partial assistant message the model is asked to
+/// continue — every earlier message byte for byte, the same tools and ceiling,
+/// and the two members vLLM and SGLang read. Held to the shared construction
+/// and to the server's strict request type.
+fn assert_continues(original: &serde_json::Value, continued: &serde_json::Value, field: &str) {
+    let sent = original["messages"].as_array().expect("messages");
+    let messages = continued["messages"].as_array().expect("messages");
+    assert_eq!(
+        &messages[..messages.len() - 1],
+        sent.as_slice(),
+        "the prompt the answer was written to, unchanged"
+    );
+    let partial = messages.last().expect("a final message");
+    assert_eq!(partial["role"], "assistant");
+    assert_eq!(continued["add_generation_prompt"], false);
+    let expected_field = match field {
+        "content" => serde_json::json!(true),
+        other => serde_json::json!(other),
+    };
+    assert_eq!(continued["continue_final_message"], expected_field);
+    assert_eq!(continued["tools"], original["tools"]);
+    assert_eq!(
+        continued["max_completion_tokens"],
+        original["max_completion_tokens"]
+    );
+    let tools = continued["tools"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let stream = continued["stream"] == true;
+    let continuation = match field {
+        "content" => eidola_common::engine_protocol::ContinueField::Content,
+        _ => eidola_common::engine_protocol::ContinueField::ReasoningContent,
+    };
+    assert_eq!(
+        continued,
+        &eidola_common::chat_completion_request_body(
+            MODEL,
+            messages,
+            u32::try_from(continued["max_completion_tokens"].as_u64().unwrap()).unwrap(),
+            tools,
+            stream,
+            continued
+                .get("stream_options")
+                .and_then(|o| o.get("include_usage"))
+                == Some(&serde_json::json!(true)),
+            None,
+            Some(continuation),
+        ),
+        "the shared construction, and nothing else"
+    );
+    eidola_server_gateway::types::test_chat_completion_request_is_accepted(continued.clone())
+        .expect("the server's strict request type accepts a continuation");
+}
+
+/// **The reasoning-only answer, continued**, on the streaming door: the
+/// request ends inside the reasoning (`"reasoning_content"`, the answer so far
+/// empty), the stream opens with the reasoning being continued and then
+/// carries the rest, and what is written is one new generation of the same post
+/// — the reasoning whole, the answer it reached, no longer truncated.
+#[test]
+fn a_reasoning_only_answer_continues_from_inside_its_reasoning() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Reasoning,
+                again: false,
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        assert!(cut.truncated);
+        let cut_id = cut.response_action_id.clone().unwrap();
+
+        let mut rx = core.subscribe_changes();
+        let (res, content, reasoning) = continue_streaming(&core, &cut_id);
+        let res = res.expect("the continuation");
+        assert!(!res.truncated, "the continuation finished");
+        assert_eq!(res.content, CONTINUED_ANSWER);
+        let whole_reasoning = format!("{TRUNCATED_REASONING}{CONTINUED_REASONING}");
+        assert_eq!(
+            reasoning, whole_reasoning,
+            "the stream opens with what it continues"
+        );
+        assert_eq!(content, CONTINUED_ANSWER);
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        assert_continues(&bodies[0], &bodies[1], "reasoning_content");
+        let partial = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(partial["reasoning_content"], TRUNCATED_REASONING);
+        assert_eq!(partial["content"], "");
+
+        let post = post_at(&core, &cut.space_id, 1);
+        assert_ne!(post.action_id, cut_id, "a new generation");
+        assert_eq!(Some(&post.action_id), res.response_action_id.as_ref());
+        assert_eq!(post.generation_count, 2, "of the same post");
+        assert_eq!(block_thinking(&post), whole_reasoning);
+        assert_eq!(block_text(&post), CONTINUED_ANSWER);
+        assert!(!post.truncated && !post.continuable);
+
+        // A paid turn's emissions, like any other.
+        let changes = drain(&mut rx);
+        for expected in [Change::Space(cut.space_id), Change::Wallet, Change::Record] {
+            assert!(changes.contains(&expected), "{expected:?} in {changes:?}");
+        }
+    });
+}
+
+/// **The cut-off answer, continued**, on the blocking door: the request
+/// continues the content (`true`, with the reasoning before it), and the new
+/// generation is the old answer followed by the rest — the rest unstripped,
+/// since its first line is mid-answer.
+#[test]
+fn a_cut_off_answer_continues_where_it_stopped() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Answer,
+                again: false,
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        let cut_id = cut.response_action_id.clone().unwrap();
+        assert_eq!(cut.content, STREAM_CONTENT);
+        assert!(cut.continuable, "the result carries the door's verdict");
+
+        let res = core
+            .runtime()
+            .block_on(core.continue_answer(cut_id.clone()))
+            .expect("the continuation");
+        let whole = format!("{STREAM_CONTENT}{CONTINUED_TAIL}");
+        assert_eq!(res.content, whole, "the continued answer, whole");
+        assert!(!res.truncated);
+
+        let bodies = mock.chat_bodies();
+        assert_continues(&bodies[0], &bodies[1], "content");
+        let partial = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(partial["content"], STREAM_CONTENT);
+        assert_eq!(partial["reasoning_content"], TRUNCATED_REASONING);
+
+        let post = post_at(&core, &cut.space_id, 1);
+        assert_eq!(block_text(&post), whole);
+        assert_eq!(block_thinking(&post), TRUNCATED_REASONING);
+        assert_eq!(post.generation_count, 2);
+    });
+}
+
+/// A continuation can stop at the ceiling too — still before its answer — and
+/// is then continued again, from the whole reasoning so far: each continuation
+/// a generation, each request the one before it extended.
+#[test]
+fn a_continuation_that_stops_again_is_continued_again() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Reasoning,
+                again: true,
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        let cut_id = cut.response_action_id.clone().unwrap();
+
+        let (again, _, _) = continue_streaming(&core, &cut_id);
+        let again = again.expect("the first continuation");
+        assert!(again.truncated, "it stopped at the ceiling again");
+        assert!(again.continuable, "and its result says it can go on");
+        let once = format!("{TRUNCATED_REASONING}{CONTINUED_REASONING}");
+        let post = post_at(&core, &cut.space_id, 1);
+        assert_eq!(block_thinking(&post), once);
+        assert_eq!(block_text(&post), "");
+        assert!(post.truncated && post.continuable, "and can be continued");
+
+        let (done, content, reasoning) = continue_streaming(&core, &post.action_id);
+        let done = done.expect("the second continuation");
+        assert!(!done.truncated);
+        let twice = format!("{once}{CONTINUED_REASONING}");
+        assert_eq!(reasoning, twice);
+        assert_eq!(content, CONTINUED_ANSWER);
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        assert_continues(&bodies[0], &bodies[1], "reasoning_content");
+        assert_continues(&bodies[0], &bodies[2], "reasoning_content");
+        let partial = bodies[2]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(partial["reasoning_content"], once);
+
+        let post = post_at(&core, &cut.space_id, 1);
+        assert_eq!(post.generation_count, 3);
+        assert_eq!(block_thinking(&post), twice);
+        assert_eq!(block_text(&post), CONTINUED_ANSWER);
+    });
+}
+
+/// A continuation that calls a tool: the round that answered the continuation
+/// is a tool round whose narration is the continued reasoning, and the request
+/// after it is an **ordinary** one — the partial message replaced by the call,
+/// as any tool round replays it, and no continuation members — whose answer is
+/// the post's new generation.
+#[test]
+fn a_continuation_that_calls_a_tool_continues_as_a_tool_round() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueIntoToolRound,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("Echo something.".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        assert!(cut.truncated);
+        let cut_id = cut.response_action_id.clone().unwrap();
+
+        let (res, content, _) = continue_streaming(&core, &cut_id);
+        let res = res.expect("the continuation");
+        assert_eq!(res.content, TOOL_FINAL_CONTENT);
+        assert!(content.ends_with(TOOL_FINAL_CONTENT));
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.len(),
+            3,
+            "the cut, the continuation, the round after it"
+        );
+        assert_continues(&bodies[0], &bodies[1], "reasoning_content");
+        let after = &bodies[2];
+        assert!(after.get("continue_final_message").is_none());
+        assert!(after.get("add_generation_prompt").is_none());
+        let sent = bodies[0]["messages"].as_array().unwrap();
+        let messages = after["messages"].as_array().unwrap();
+        assert_eq!(&messages[..sent.len()], sent.as_slice());
+        assert_eq!(messages.len(), sent.len() + 2, "the call and its result");
+        assert_eq!(messages[sent.len()]["role"], "assistant");
+        assert!(messages[sent.len()].get("tool_calls").is_some());
+        assert!(
+            messages[sent.len()].get("reasoning_content").is_none(),
+            "the partial message is gone"
+        );
+        assert_eq!(messages[sent.len() + 1]["role"], "tool");
+
+        // The round's trace carries the continued narration.
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(cut.space_id.clone()))
+            .expect("raw actions");
+        let round = actions
+            .iter()
+            .find(|a| a.action_type == "tool_call")
+            .expect("the continued round's trace");
+        let narration: String = round
+            .blocks
+            .iter()
+            .filter(|b| b.block_type == "thinking")
+            .filter_map(|b| b.text_content.clone())
+            .collect();
+        assert_eq!(narration, TRUNCATED_REASONING);
+
+        let post = post_at(&core, &cut.space_id, 1);
+        assert_eq!(block_text(&post), TOOL_FINAL_CONTENT);
+        assert_eq!(post.generation_count, 2);
+    });
+}
+
+/// **A continuation sends the request its answer was written to**, not the
+/// conversation as it stands now. The question is edited after the answer was
+/// cut off; continuing the answer still sends the original question, byte for
+/// byte — the model finishes the answer it was writing, to the prompt it was
+/// writing it to, and the engine's cached prefix for that request still
+/// applies. The edited question belongs to a fresh answer (a regeneration).
+#[test]
+fn a_continuation_sends_the_request_its_answer_was_written_to() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Answer,
+                again: false,
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        let question = post_at(&core, &cut.space_id, 0).action_id;
+        core.runtime()
+            .block_on(core.edit_post(question, "Why is the sky blue?".into()))
+            .expect("edit the question after the cut");
+        let answer = post_at(&core, &cut.space_id, 1);
+        assert!(
+            answer.continuable,
+            "an edited question does not take the verb away"
+        );
+
+        core.runtime()
+            .block_on(core.continue_answer(answer.action_id))
+            .expect("the continuation");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        assert_continues(&bodies[0], &bodies[1], "content");
+        let sent = bodies[1].to_string();
+        assert!(sent.contains("How do tides work?"), "the original question");
+        assert!(!sent.contains("Why is the sky blue?"), "never the edit");
+    });
+}
+
+/// **Continue is offered exactly while the door would take it**: the author
+/// still answers in this space, with the model that wrote the answer. Change
+/// the author's model, or take the author out of the space, and the post stops
+/// being continuable — and the door refuses it before anything is sent.
+#[test]
+fn continue_is_offered_only_while_its_author_can_continue() {
+    for change in ["model", "membership"] {
+        run(move || {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: ChatBehavior::ContinueAfterLength {
+                    cut: Cut::Reasoning,
+                    again: false,
+                },
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            let cut = core
+                .runtime()
+                .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+                .expect("the cut-off turn");
+            let answer = post_at(&core, &cut.space_id, 1);
+            assert!(
+                answer.continuable,
+                "{change}: continuable before the change"
+            );
+            let author = core
+                .runtime()
+                .block_on(core.test_space_actions(cut.space_id.clone()))
+                .expect("raw actions")
+                .into_iter()
+                .find(|a| a.id == answer.action_id)
+                .expect("the answer")
+                .participant_id;
+            match change {
+                "model" => core
+                    .runtime()
+                    .block_on(core.update_space_participant(
+                        author,
+                        eidola_app_core::ParticipantUpdate {
+                            label: None,
+                            model_ref: Some(Some("another-model".into())),
+                            system_prompt: None,
+                            notify_policy: None,
+                        },
+                        eidola_app_core::ExpectedScope::Any,
+                    ))
+                    .expect("change the author's model"),
+                _ => {
+                    core.runtime()
+                        .block_on(core.remove_space_participant(cut.space_id.clone(), author))
+                        .expect("take the author out of the space");
+                }
+            }
+            let answer = post_at(&core, &cut.space_id, 1);
+            assert!(!answer.continuable, "{change}: no longer offered");
+            let hits = mock.chat_hits();
+            let (refused, _, _) = continue_streaming(&core, &answer.action_id);
+            assert!(
+                matches!(refused, Err(AppError::WrongPostKind { .. })),
+                "{change}: the door refuses it as what it is; got {refused:?}"
+            );
+            assert_eq!(mock.chat_hits(), hits, "{change}: nothing was sent");
+        });
+    }
+}
+
+/// An answer whose request the Record could not keep whole (past its retention
+/// cap) has no request to continue from, so it is not continuable — offered
+/// nowhere, refused at the door — rather than continued from a rebuilt prompt.
+#[test]
+fn an_answer_whose_request_the_record_cut_is_not_continuable() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Answer,
+                again: false,
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let long = "tide ".repeat((1 << 20) / 5 + 1024);
+        let cut = core
+            .runtime()
+            .block_on(core.chat(long, MODEL.into(), None))
+            .expect("the cut-off turn");
+        assert!(cut.truncated);
+        assert!(
+            !cut.continuable,
+            "the result says so too, so a caller suggests no continuation"
+        );
+        let answer = post_at(&core, &cut.space_id, 1);
+        assert!(answer.truncated && !answer.continuable);
+        let hits = mock.chat_hits();
+        let refused = core
+            .runtime()
+            .block_on(core.continue_answer(answer.action_id));
+        assert!(
+            matches!(refused, Err(AppError::WrongPostKind { .. })),
+            "got {refused:?}"
+        );
+        assert_eq!(mock.chat_hits(), hits);
+    });
+}
+
+/// **Continue is offered only where the stored text is exactly what the model
+/// generated.** An engine that cut the answer off inside something its parser
+/// drops (an unfinished tool call) says so (`continuable: false`): the answer is
+/// still written and marked, but not continuable — offered nowhere, refused at
+/// the door — on both transports, since continuing it would resume before the
+/// dropped text rather than where generation stopped.
+#[test]
+fn an_answer_cut_inside_what_the_engine_dropped_is_not_continuable() {
+    for streamed in [false, true] {
+        run(move || {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: ChatBehavior::ContinueAfterLength {
+                    cut: Cut::Dropped,
+                    again: false,
+                },
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            let cut = if streamed {
+                let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+                core.runtime().block_on(async {
+                    let chat =
+                        core.chat_stream("How do tides work?".into(), MODEL.into(), None, tx);
+                    let (res, _) = tokio::join!(chat, collect_deltas(events_rx));
+                    res
+                })
+            } else {
+                core.runtime()
+                    .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            }
+            .expect("the cut-off turn");
+            assert!(cut.truncated, "streamed {streamed}");
+            assert!(!cut.continuable, "streamed {streamed}");
+            let answer = post_at(&core, &cut.space_id, 1);
+            assert!(
+                answer.truncated && !answer.continuable,
+                "streamed {streamed}"
+            );
+            let hits = mock.chat_hits();
+            let refused = core
+                .runtime()
+                .block_on(core.continue_answer(answer.action_id));
+            assert!(
+                matches!(refused, Err(AppError::WrongPostKind { .. })),
+                "streamed {streamed}: got {refused:?}"
+            );
+            assert_eq!(mock.chat_hits(), hits, "nothing was sent");
+        });
+    }
+}
+
+/// A header-shaped first line this app strips from an answer makes the stored
+/// text differ from what was generated, so that answer is not continuable
+/// either, whatever the engine said of its own output.
+#[test]
+fn an_answer_whose_header_line_was_stripped_is_not_continuable() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::HeaderThenLength,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        assert!(cut.truncated && !cut.continuable);
+        assert!(!post_at(&core, &cut.space_id, 1).continuable);
+    });
+}
+
+/// The door refuses what it cannot continue **before anything is spent**: an
+/// answer that finished, and a post that is not an agent's answer at all. No
+/// request goes out, nothing is written, no credential moves.
+#[test]
+fn only_an_answer_that_stopped_at_its_ceiling_can_be_continued() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        let res = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(res.space_id.clone()))
+            .expect("tree");
+        assert!(tree.iter().all(|p| !p.continuable));
+        let hits = mock.chat_hits();
+        let mut rx = core.subscribe_changes();
+
+        for target in [tree[1].action_id.clone(), tree[0].action_id.clone()] {
+            let (refused, _, _) = continue_streaming(&core, &target);
+            assert!(
+                matches!(refused, Err(AppError::WrongPostKind { .. })),
+                "got {refused:?}"
+            );
+            let refused = core.runtime().block_on(core.continue_answer(target));
+            assert!(
+                matches!(refused, Err(AppError::WrongPostKind { .. })),
+                "got {refused:?}"
+            );
+        }
+        assert_eq!(mock.chat_hits(), hits, "no request went out");
+        let after = core
+            .runtime()
+            .block_on(core.get_space_tree(res.space_id))
+            .expect("tree");
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[1].generation_count, 1, "nothing was written");
+        let changes = drain(&mut rx);
+        assert!(!changes.contains(&Change::Wallet), "got {changes:?}");
+    });
+}
+
+/// A continuation is paid like any turn: its own hold, sized by the shared
+/// pricing contract over what it sends — the partial message's reasoning
+/// included — at the same completion ceiling, and settled.
+#[test]
+fn a_continuation_is_held_over_what_it_sends() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Answer,
+                again: false,
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        core.runtime()
+            .block_on(core.continue_answer(cut.response_action_id.unwrap()))
+            .expect("the continuation");
+
+        let bodies = mock.chat_bodies();
+        let charges = mock.chat_charges();
+        assert_eq!(charges.len(), 2, "each request held its own credential");
+        // The harness's rates are 1 credit a prompt token and 1 a completion
+        // token, so a hold is the contract's prompt tokens plus the ceiling.
+        for (body, charge) in bodies.iter().zip(&charges) {
+            let messages = body["messages"].as_array().unwrap();
+            let prompt = eidola_common::prompt_charge(messages, None).chargeable_prompt_tokens();
+            let ceiling = body["max_completion_tokens"].as_u64().unwrap();
+            assert_eq!(*charge, Some(u128::from(prompt + ceiling)), "{body}");
+        }
+        let partial = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let without_reasoning = {
+            let mut m = partial.clone();
+            m.as_object_mut().unwrap().remove("reasoning_content");
+            m
+        };
+        assert!(
+            eidola_common::prompt_charge(std::slice::from_ref(&partial), None)
+                .total_content_bytes()
+                > eidola_common::prompt_charge(&[without_reasoning], None).total_content_bytes(),
+            "the reasoning it sends is charged"
+        );
+    });
+}
+
+/// The completion ceiling is the model's own declared output limit when its
+/// catalog row declares one, rather than a fixed 4096, and the hold covers it.
+/// Undeclared, it stays at the fallback, which the truncating behaviours
+/// report as the budget spent ([`CEILING_TOKENS`]).
+#[test]
+fn the_ceiling_is_the_models_declared_output_limit() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            declared_max_output: Some(6_000),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat");
+        let body = mock.chat_bodies().pop().unwrap();
+        assert_eq!(body["max_completion_tokens"], 6_000);
+
+        // The catalog's context window bounds it.
+        let (mock, core, _dir) = setup(MockConfig {
+            declared_max_output: Some(100_000),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat");
+        assert_eq!(
+            mock.chat_bodies().pop().unwrap()["max_completion_tokens"],
+            8192
+        );
+
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat");
+        assert_eq!(
+            mock.chat_bodies().pop().unwrap()["max_completion_tokens"],
+            CEILING_TOKENS
+        );
     });
 }
 
@@ -6518,19 +7236,19 @@ fn a_reply_written_during_a_regeneration_rethreads_onto_the_answer_it_never_saw(
 ///
 /// Supersession is only half an ending: a regeneration that succeeds leaves a
 /// new generation for a surface to notice, but one that fails leaves nothing a
-/// transcript read can see — no action row, and for a ceiling truncation only a
-/// Record entry attached to nothing. A surface refused by the claim would
+/// transcript read can see — no action row, at most a Record entry attached to
+/// nothing. A surface refused by the claim would
 /// therefore go on saying "already being regenerated" for the life of the
 /// window. The claim's release is the fact that ends it, and it is published
 /// rather than inferred.
 #[test]
 fn a_failed_regeneration_still_settles_its_claim() {
     run(|| {
-        // The regeneration answers with reasoning up to the ceiling and no
-        // answer at all — a failure that writes no successor, which is exactly
-        // the ending supersession cannot provide.
+        // The regeneration's stream ends without ever saying it finished — a
+        // failure that writes no successor, which is exactly the ending
+        // supersession cannot provide.
         let (_mock, core, _dir) = setup(MockConfig {
-            chat: ChatBehavior::OkThenReasoningOnlyLength,
+            chat: ChatBehavior::OkThenStreamEndsWithoutDone,
             chat_delay_ms: 2_000,
             ..MockConfig::default()
         });
@@ -6598,7 +7316,7 @@ fn a_failed_regeneration_still_settles_its_claim() {
         let (early, parked) = early;
 
         assert!(
-            matches!(regen, Err(AppError::ResponseTruncated { .. })),
+            matches!(regen, Err(AppError::Network { .. })),
             "the regeneration failed without writing anything; got {regen:?}"
         );
         assert!(
@@ -7851,6 +8569,7 @@ fn assert_shared_keyed_body(body: &serde_json::Value, stream: bool, key: &str) {
             stream,
             include_usage,
             Some(key),
+            None,
         ),
         "the shared body, plus the key and nothing else"
     );
@@ -7931,6 +8650,7 @@ fn a_model_without_a_declared_prefix_cache_is_sent_the_body_it_always_was() {
                     stream,
                     include_usage,
                     None,
+                    None,
                 );
                 assert_eq!(
                     sent,
@@ -8009,6 +8729,39 @@ fn a_branch_and_a_regeneration_inherit_the_lineage_key() {
             sent.iter().all(|k| k.as_deref() == Some(key.as_str())),
             "the branch and the regeneration carry the lineage's key: {sent:?}"
         );
+    });
+}
+
+/// A continuation is the lineage's next request in the most literal sense — its
+/// prompt is the previous request's prompt plus that request's own output — so
+/// it carries the lineage's key, which is what lets the engine serve all of it
+/// from the prefix its generation left. Otherwise its body is the shared
+/// construction a continuation is everywhere.
+#[test]
+fn a_continuation_carries_the_lineage_key() {
+    run(|| {
+        let (mock, core, _dir) = cache_setup(ChatBehavior::ContinueAfterLength {
+            cut: Cut::Reasoning,
+            again: false,
+        });
+        let cut = turn(&core, "How do tides work?", None, None);
+        assert!(cut.truncated);
+        let (res, _, _) = continue_streaming(&core, &cut.response_action_id.unwrap());
+        res.expect("the continuation");
+
+        let sent = keys(&mock);
+        assert_eq!(sent.len(), 2);
+        let key = sent[0].clone().expect("a key");
+        assert_eq!(sent[1].as_deref(), Some(key.as_str()), "the lineage's key");
+        let bodies: Vec<serde_json::Value> = mock
+            .chat_bodies()
+            .into_iter()
+            .map(|mut b| {
+                b.as_object_mut().unwrap().remove("cache_key");
+                b
+            })
+            .collect();
+        assert_continues(&bodies[0], &bodies[1], "reasoning_content");
     });
 }
 

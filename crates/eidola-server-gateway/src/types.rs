@@ -65,6 +65,23 @@ pub struct ChatCompletionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
 
+    /// Whether the prompt ends with the header of a new assistant turn. Omit
+    /// it, or send `false` with `continue_final_message` (vLLM's convention:
+    /// its default is `true`, and it refuses the two together).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_generation_prompt: Option<bool>,
+
+    /// Continue the final assistant message instead of answering it: the
+    /// prompt ends inside that message, so the model resumes exactly where it
+    /// stopped. `true` (or `"content"`) continues its `content`;
+    /// `"reasoning_content"` continues its `reasoning_content`, for a message
+    /// that stopped before any answer. The members and their meaning are
+    /// vLLM's and SGLang's, and the field name is `transformers`'
+    /// `apply_chat_template` argument; the rules are
+    /// `eidola_common::engine_protocol::check_continuation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continue_final_message: Option<ContinueFinalMessage>,
+
     /// The client's prefix-cache key: 32 bytes, base64url without padding
     /// (`eidola_common::engine_protocol`). The engine scopes prefix-cache
     /// reuse to requests carrying the same key; without one, nothing a
@@ -86,6 +103,25 @@ pub struct ChatCompletionRequest {
 /// The `skip_serializing_if` predicate of a member that is never serialized.
 fn never_serialized<T>(_: &T) -> bool {
     true
+}
+
+/// What `continue_final_message` may carry: a flag, or the name of the final
+/// message's field to continue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum ContinueFinalMessage {
+    Flag(bool),
+    Field(String),
+}
+
+impl ContinueFinalMessage {
+    /// The member as the shared continuation rule reads it.
+    pub fn to_value(&self) -> serde_json::Value {
+        match self {
+            ContinueFinalMessage::Flag(b) => serde_json::Value::Bool(*b),
+            ContinueFinalMessage::Field(s) => serde_json::Value::String(s.clone()),
+        }
+    }
 }
 
 /// A client's decoded prefix-cache key.
@@ -229,9 +265,31 @@ pub struct Message {
     /// The id of the tool call this message answers (`role: "tool"` only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+
+    /// An assistant message's reasoning, which the model's chat template
+    /// renders before its content: what a continuation of a message that
+    /// stopped mid-reasoning carries, and charged as prompt text
+    /// (`eidola_common::prompt_charge`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl Message {
+    /// This message as the continuation rule reads a final message.
+    pub fn as_final(&self) -> eidola_common::engine_protocol::FinalMessage<'_> {
+        use eidola_common::engine_protocol::{FinalContent, FinalMessage};
+        FinalMessage {
+            is_assistant: self.role == Role::Assistant,
+            content: match &self.content {
+                None => FinalContent::Absent,
+                Some(MessageContent::Text(text)) => FinalContent::Text(text),
+                Some(MessageContent::Parts(_)) => FinalContent::Parts,
+            },
+            has_tool_calls: self.tool_calls.as_ref().is_some_and(|c| !c.is_empty()),
+            reasoning_content: self.reasoning_content.as_deref(),
+        }
+    }
+
     /// UTF-8 byte length of the message's text content — 0 when the content
     /// is absent or `null` (an assistant message that only called tools).
     pub fn content_byte_len(&self) -> usize {
@@ -361,6 +419,13 @@ pub struct Choice {
 
     /// The reason the model stopped generating.
     pub finish_reason: Option<FinishReason>,
+
+    /// On a `length` ending from an Eidola engine: whether the reasoning and
+    /// content given out can be sent back as a continued final message
+    /// (`continue_final_message`) that renders exactly the text the model
+    /// generated. A client offers continuation only where it is `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuable: Option<bool>,
 }
 
 /// An assistant message in a response.
@@ -459,6 +524,13 @@ pub struct ChunkChoice {
 
     /// The reason the model stopped generating (only in final chunk).
     pub finish_reason: Option<FinishReason>,
+
+    /// On a `length` ending from an Eidola engine: whether the reasoning and
+    /// content given out can be sent back as a continued final message
+    /// (`continue_final_message`) that renders exactly the text the model
+    /// generated. A client offers continuation only where it is `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuable: Option<bool>,
 }
 
 /// A delta update in a streaming response.
@@ -904,6 +976,7 @@ mod tests {
                     tool_calls: None,
                 },
                 finish_reason: Some(FinishReason::Stop),
+                continuable: None,
             }],
             usage: Some(Usage {
                 prompt_tokens: 10,
@@ -935,6 +1008,7 @@ mod tests {
                     tool_calls: None,
                 },
                 finish_reason: None,
+                continuable: None,
             }],
             usage: None,
         };
@@ -1005,14 +1079,6 @@ mod tests {
                 false,
                 false,
                 None,
-            ),
-            eidola_common::chat_completion_request_body(
-                "test-model",
-                &plain_messages,
-                256,
-                &[],
-                true,
-                false,
                 None,
             ),
             eidola_common::chat_completion_request_body(
@@ -1021,7 +1087,18 @@ mod tests {
                 256,
                 &[],
                 true,
+                false,
+                None,
+                None,
+            ),
+            eidola_common::chat_completion_request_body(
+                "test-model",
+                &plain_messages,
+                256,
+                &[],
                 true,
+                true,
+                None,
                 None,
             ),
             eidola_common::chat_completion_request_body(
@@ -1032,6 +1109,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             ),
             eidola_common::chat_completion_request_body(
                 "test-model",
@@ -1041,6 +1119,7 @@ mod tests {
                 true,
                 false,
                 None,
+                None,
             ),
             eidola_common::chat_completion_request_body(
                 "test-model",
@@ -1049,14 +1128,79 @@ mod tests {
                 &tools,
                 true,
                 true,
+                None,
                 None,
             ),
         ];
+        // A continuation of each kind: the partial answer, and the reasoning
+        // of an answer not yet begun, last.
+        let continued = |reasoning: &str, content: &str| {
+            let mut messages = plain_messages.clone();
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "reasoning_content": reasoning,
+                "content": content,
+            }));
+            messages
+        };
+        let continuations = [
+            (
+                continued("weighing it", "Hello to"),
+                eidola_common::engine_protocol::ContinueField::Content,
+            ),
+            (
+                continued("weighing it", ""),
+                eidola_common::engine_protocol::ContinueField::ReasoningContent,
+            ),
+        ]
+        .map(|(messages, field)| {
+            eidola_common::chat_completion_request_body(
+                "test-model",
+                &messages,
+                256,
+                &tools,
+                true,
+                false,
+                None,
+                Some(field),
+            )
+        });
 
-        for body in bodies {
+        for body in bodies.into_iter().chain(continuations) {
             serde_json::from_value::<ChatCompletionRequest>(body)
                 .expect("the body app-core sends must remain accepted by the strict server type");
         }
+    }
+
+    /// An engine's `continuable` verdict on a `length` ending reaches the
+    /// client through the relay, in both shapes, and is absent where the engine
+    /// sent none.
+    #[test]
+    fn a_length_endings_continuable_verdict_is_relayed() {
+        let blocking = serde_json::json!({
+            "id": "c", "object": "chat.completion", "created": 1, "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi "},
+                         "finish_reason": "length", "continuable": false}],
+        });
+        let parsed: ChatCompletionResponse = serde_json::from_value(blocking).unwrap();
+        let back = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(back["choices"][0]["continuable"], false);
+
+        let chunk = serde_json::json!({
+            "id": "c", "object": "chat.completion.chunk", "created": 1, "model": "m",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length", "continuable": true}],
+        });
+        let parsed: ChatCompletionChunk = serde_json::from_value(chunk).unwrap();
+        let back = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(back["choices"][0]["continuable"], true);
+
+        let plain = serde_json::json!({
+            "id": "c", "object": "chat.completion.chunk", "created": 1, "model": "m",
+            "choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": null}],
+        });
+        let parsed: ChatCompletionChunk = serde_json::from_value(plain).unwrap();
+        let back = serde_json::to_value(&parsed).unwrap();
+        assert!(back["choices"][0].get("continuable").is_none());
     }
 
     // -----------------------------------------------------------------
@@ -1379,6 +1523,7 @@ mod tests {
             true,
             true,
             Some(CACHE_KEY),
+            None,
         );
         let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
         assert!(request.cache_key.is_some());

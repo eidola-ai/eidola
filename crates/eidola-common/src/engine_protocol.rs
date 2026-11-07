@@ -21,7 +21,8 @@
 //!   is what bounds them; the gateway refuses the same bodies first.
 //! - **The rules of the node's accepted subset** that are not a matter of the
 //!   request type ([`check_tool_choice`], [`check_stop`],
-//!   [`check_max_completion_tokens`], [`SubsetError`]): the gateway refuses a
+//!   [`check_max_completion_tokens`], [`check_continuation`] with its
+//!   [`ContinueField`], [`SubsetError`]): the gateway refuses a
 //!   request bound for a node by the same functions the node applies, so a
 //!   request the gateway routes is never one the node refuses for its shape.
 //! - **The node's error types** ([`error_type`]) and which refusals precede
@@ -462,6 +463,14 @@ pub enum SubsetError {
     /// `tool_choice` other than `"auto"` or `"none"` (a node has no
     /// constrained decoding, so `"required"` and named functions are refused).
     UnsupportedToolChoice,
+    /// `continue_final_message` other than a boolean, `"content"` or
+    /// `"reasoning_content"`.
+    UnsupportedContinuation,
+    /// `add_generation_prompt` contradicting `continue_final_message`.
+    GenerationPromptMismatch,
+    /// A continuation whose final message cannot be continued
+    /// ([`check_continuation`]).
+    UncontinuableFinalMessage,
 }
 
 impl core::fmt::Display for SubsetError {
@@ -483,6 +492,18 @@ impl core::fmt::Display for SubsetError {
             SubsetError::UnsupportedToolChoice => {
                 f.write_str("tool_choice supports only \"auto\" and \"none\"")
             }
+            SubsetError::UnsupportedContinuation => f.write_str(
+                "continue_final_message must be a boolean, \"content\" or \"reasoning_content\"",
+            ),
+            SubsetError::GenerationPromptMismatch => f.write_str(
+                "add_generation_prompt must be false with continue_final_message and true \
+                 without it",
+            ),
+            SubsetError::UncontinuableFinalMessage => f.write_str(
+                "continue_final_message needs a final assistant message without tool calls, \
+                 with string content to continue the content, or with string \
+                 reasoning_content and no content to continue the reasoning",
+            ),
         }
     }
 }
@@ -520,6 +541,126 @@ pub fn check_max_completion_tokens(limit: Option<u32>) -> Result<(), SubsetError
         return Err(SubsetError::ZeroMaxCompletionTokens);
     }
     Ok(())
+}
+
+/// Which field of the final assistant message a continuation extends.
+///
+/// The request members are vLLM's and SGLang's (`continue_final_message`, with
+/// `add_generation_prompt: false`), and their meaning is the one
+/// `transformers.apply_chat_template` gives its own `continue_final_message`
+/// argument: `true` continues the message's `content`, and a string names the
+/// field to continue. [`ContinueField::wire_value`] is that argument's value,
+/// so a node renders exactly what the reference renders for the same request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContinueField {
+    /// The answer: the prompt ends inside the message's `content`.
+    Content,
+    /// The reasoning: the prompt ends inside the message's `reasoning_content`,
+    /// with its reasoning block still open, for a message that stopped before
+    /// any answer.
+    ReasoningContent,
+}
+
+impl ContinueField {
+    /// The message field the continuation extends.
+    pub const fn field(self) -> &'static str {
+        match self {
+            ContinueField::Content => "content",
+            ContinueField::ReasoningContent => "reasoning_content",
+        }
+    }
+
+    /// The `continue_final_message` value a client sends: `true` for the
+    /// content (the spelling every OpenAI-compatible server that has the member
+    /// accepts), the field's name for the reasoning.
+    pub fn wire_value(self) -> serde_json::Value {
+        match self {
+            ContinueField::Content => serde_json::Value::Bool(true),
+            ContinueField::ReasoningContent => serde_json::Value::String(self.field().to_owned()),
+        }
+    }
+}
+
+/// The shape of a request's final message, as [`check_continuation`] reads it.
+/// Both sides fill it from their own typed request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FinalMessage<'a> {
+    /// `role` is `assistant`.
+    pub is_assistant: bool,
+    pub content: FinalContent<'a>,
+    /// `tool_calls` is present and non-empty.
+    pub has_tool_calls: bool,
+    /// `reasoning_content`, when present and a string.
+    pub reasoning_content: Option<&'a str>,
+}
+
+/// A final message's `content`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinalContent<'a> {
+    /// Absent or `null`.
+    Absent,
+    Text(&'a str),
+    /// An array of content parts.
+    Parts,
+}
+
+/// The node's continuation rule: what `continue_final_message` and
+/// `add_generation_prompt` may say, and of which final message.
+///
+/// - `continue_final_message` absent or `false` asks for a new assistant turn;
+///   `true` or `"content"` continues the content, and `"reasoning_content"` the
+///   reasoning. Any other value is refused.
+/// - `add_generation_prompt` may be omitted. When given it must agree:
+///   `false` with a continuation (vLLM refuses the pair `true`/`true`, and
+///   requires `false` because its default is `true`), `true` without one. A
+///   node has no use for a prompt that ends after a closed final message, so
+///   `false` alone is refused rather than rendered.
+/// - The message continued is the last one, and it must be an assistant's,
+///   without tool calls (their markup follows the content in the prompt, so
+///   continuing the content would silently drop them). Continuing the content
+///   needs a string content (`""` included); continuing the reasoning needs a
+///   string `reasoning_content` and no content (`""` included), since an
+///   answer after the reasoning would otherwise be dropped from the prompt.
+///
+/// Returns the field to continue, or `None` for an ordinary request.
+pub fn check_continuation(
+    continue_final_message: Option<&serde_json::Value>,
+    add_generation_prompt: Option<bool>,
+    final_message: Option<FinalMessage<'_>>,
+) -> Result<Option<ContinueField>, SubsetError> {
+    use serde_json::Value;
+    let field = match continue_final_message {
+        None | Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => Some(ContinueField::Content),
+        Some(Value::String(s)) if s == "content" => Some(ContinueField::Content),
+        Some(Value::String(s)) if s == "reasoning_content" => Some(ContinueField::ReasoningContent),
+        Some(_) => return Err(SubsetError::UnsupportedContinuation),
+    };
+    match (field, add_generation_prompt) {
+        (Some(_), Some(true)) | (None, Some(false)) => {
+            return Err(SubsetError::GenerationPromptMismatch);
+        }
+        _ => {}
+    }
+    let Some(field) = field else {
+        return Ok(None);
+    };
+    let Some(last) = final_message else {
+        return Err(SubsetError::UncontinuableFinalMessage);
+    };
+    let shaped = last.is_assistant
+        && !last.has_tool_calls
+        && match field {
+            ContinueField::Content => matches!(last.content, FinalContent::Text(_)),
+            ContinueField::ReasoningContent => {
+                last.reasoning_content.is_some()
+                    && matches!(last.content, FinalContent::Absent | FinalContent::Text(""))
+            }
+        };
+    if !shaped {
+        return Err(SubsetError::UncontinuableFinalMessage);
+    }
+    Ok(Some(field))
 }
 
 #[cfg(test)]
@@ -605,6 +746,112 @@ mod tests {
         assert_eq!(
             SubsetError::UnsupportedToolChoice.to_string(),
             "tool_choice supports only \"auto\" and \"none\""
+        );
+    }
+
+    #[test]
+    fn the_continuation_rule_accepts_and_refuses_at_its_bounds() {
+        use serde_json::json;
+        let answer = |content| FinalMessage {
+            is_assistant: true,
+            content,
+            has_tool_calls: false,
+            reasoning_content: Some("thinking"),
+        };
+        let partial = Some(answer(FinalContent::Text("so far")));
+        let reasoning_only = Some(answer(FinalContent::Absent));
+
+        // An ordinary request, however the two members spell it.
+        for (cont, agp) in [(None, None), (Some(json!(false)), None), (None, Some(true))] {
+            assert_eq!(check_continuation(cont.as_ref(), agp, partial), Ok(None));
+        }
+        // Continuing the content, in both spellings, with the generation prompt
+        // omitted or turned off.
+        for cont in [json!(true), json!("content")] {
+            for agp in [None, Some(false)] {
+                assert_eq!(
+                    check_continuation(Some(&cont), agp, partial),
+                    Ok(Some(ContinueField::Content))
+                );
+            }
+        }
+        // An empty content is still a content to continue.
+        assert_eq!(
+            check_continuation(
+                Some(&json!(true)),
+                None,
+                Some(answer(FinalContent::Text("")))
+            ),
+            Ok(Some(ContinueField::Content))
+        );
+        // Continuing the reasoning, with no answer after it.
+        for content in [FinalContent::Absent, FinalContent::Text("")] {
+            assert_eq!(
+                check_continuation(
+                    Some(&json!("reasoning_content")),
+                    None,
+                    Some(answer(content))
+                ),
+                Ok(Some(ContinueField::ReasoningContent))
+            );
+        }
+
+        for cont in [json!("tool_calls"), json!(1), json!(null), json!("CONTENT")] {
+            assert_eq!(
+                check_continuation(Some(&cont), None, partial),
+                Err(SubsetError::UnsupportedContinuation),
+                "{cont}"
+            );
+        }
+        assert_eq!(
+            check_continuation(Some(&json!(true)), Some(true), partial),
+            Err(SubsetError::GenerationPromptMismatch)
+        );
+        assert_eq!(
+            check_continuation(None, Some(false), partial),
+            Err(SubsetError::GenerationPromptMismatch)
+        );
+
+        let uncontinuable = [
+            (json!(true), None),
+            (json!(true), reasoning_only),
+            (
+                json!(true),
+                Some(FinalMessage {
+                    is_assistant: false,
+                    ..answer(FinalContent::Text("a user's words"))
+                }),
+            ),
+            (
+                json!(true),
+                Some(FinalMessage {
+                    has_tool_calls: true,
+                    ..answer(FinalContent::Text("calling"))
+                }),
+            ),
+            (json!(true), Some(answer(FinalContent::Parts))),
+            // The answer after it would be dropped from the prompt.
+            (json!("reasoning_content"), partial),
+            (
+                json!("reasoning_content"),
+                Some(FinalMessage {
+                    reasoning_content: None,
+                    ..answer(FinalContent::Absent)
+                }),
+            ),
+        ];
+        for (cont, last) in uncontinuable {
+            assert_eq!(
+                check_continuation(Some(&cont), None, last),
+                Err(SubsetError::UncontinuableFinalMessage),
+                "{cont} {last:?}"
+            );
+        }
+
+        assert_eq!(ContinueField::Content.wire_value(), json!(true));
+        assert_eq!(
+            ContinueField::ReasoningContent.wire_value(),
+            json!("reasoning_content")
         );
     }
 
