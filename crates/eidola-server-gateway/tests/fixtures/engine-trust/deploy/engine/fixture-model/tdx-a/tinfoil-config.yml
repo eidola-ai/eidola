@@ -44,6 +44,7 @@ containers:
       - EIDOLA_ENGINE_PREFIX_CACHE: "true"
       - EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS: "900"
       - EIDOLA_ENGINE_CACHE_MAX_AGE_SECS: "7200"
+      - EIDOLA_ENGINE_KV_HOST_BYTES: "34359738368"
 
 shim:
   upstream-port: 8080

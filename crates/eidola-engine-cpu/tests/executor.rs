@@ -493,3 +493,141 @@ fn drafts_at_position_zero_panic() {
     e.execute(&step(&[decode(0, 0, 5, 1)], vec![], map(&e, 0, 0, 1)))
         .unwrap();
 }
+
+/// Eight host blocks (about 0.4 MB locked); the soft memory-lock limit raised first.
+fn tiered_executor() -> CpuExecutor {
+    allow_memlock();
+    let mut cfg = exec_config(16, vec![0, 1]);
+    cfg.num_state_slots = 4;
+    cfg.host_blocks = 8;
+    CpuExecutor::new(fixture(), cfg)
+}
+
+/// `op(group)` in every group.
+fn all_groups(e: &CpuExecutor, op: impl Fn(u32) -> Maintenance) -> Vec<Maintenance> {
+    (0..groups(e)).map(op).collect()
+}
+
+/// Demote then promote moves a block's ciphertext out and back word for word (KV, the
+/// drafter's tap and the row tags), in every group; zeroing the device block between them
+/// and then the host block leaves zeros; decrypting the promoted block restores the
+/// plaintext bit for bit, and the sequence then continues exactly as the dense oracle.
+#[test]
+fn demote_and_promote_round_trip_the_ciphertext_and_decrypt_restores_it() {
+    let mut e = tiered_executor();
+    let mut updates = map(&e, 0, 0, 1);
+    updates.extend(map(&e, 0, 1, 2));
+    e.execute(&step(&[prefill(0, &TOKS[..8])], vec![], updates))
+        .unwrap();
+    let plain: Vec<Vec<u32>> = (0..groups(&e)).map(|g| e.block_image(g, 1)).collect();
+    e.execute(&keyed_step(
+        &[],
+        crypt_all(&e, 1, true),
+        vec![],
+        vec![key(1)],
+    ))
+    .unwrap();
+    let cipher: Vec<Vec<u32>> = (0..groups(&e)).map(|g| e.block_image(g, 1)).collect();
+    // Demote block 1 to host block 3, and zero it (the order the core queues them in).
+    let mut m = all_groups(&e, |group| Maintenance::Demote {
+        group,
+        block: 1,
+        host: 3,
+    });
+    m.extend(all_groups(&e, |group| Maintenance::Zero {
+        group,
+        block: 1,
+    }));
+    e.execute(&step(&[], m, vec![])).unwrap();
+    for g in 0..groups(&e) {
+        assert_eq!(
+            e.host_block_image(g, 3),
+            cipher[g as usize],
+            "group {g}: copied"
+        );
+        assert!(e.host_block_is_encrypted(g, 3));
+        assert!(
+            e.block_is_zero(g, 1),
+            "group {g}: the device block is zeroed"
+        );
+        let same = e
+            .host_block_image(g, 3)
+            .iter()
+            .zip(&plain[g as usize])
+            .filter(|(a, b)| a == b)
+            .count();
+        assert!(
+            same * 1000 < plain[g as usize].len(),
+            "group {g}: plaintext on the host"
+        );
+    }
+    // Promote it into block 1 again, decrypt, zero the host block.
+    let mut m = all_groups(&e, |group| Maintenance::Promote {
+        group,
+        host: 3,
+        block: 1,
+    });
+    m.extend(crypt_all(&e, 1, false));
+    m.extend(all_groups(&e, |group| Maintenance::ZeroHost {
+        group,
+        host: 3,
+    }));
+    e.execute(&keyed_step(&[], m, vec![], vec![key(1)]))
+        .unwrap();
+    for g in 0..groups(&e) {
+        assert_eq!(
+            e.block_image(g, 1),
+            plain[g as usize],
+            "group {g}: bit-identical"
+        );
+        assert!(e.host_block_is_zero(g, 3) && !e.host_block_is_encrypted(g, 3));
+    }
+    e.execute(&step(&[decode(0, 8, TOKS[8], 2)], vec![], map(&e, 0, 2, 4)))
+        .unwrap();
+    let rec = e.take_records().pop().unwrap();
+    let d = dense(&rec.tokens);
+    for (pos, l) in &rec.target_logits {
+        assert_eq!(l.as_slice(), d.target(*pos));
+    }
+    for (depth, slot, l) in &rec.drafter_logits {
+        assert_eq!(Some(l.as_slice()), d.drafter(*depth, *slot));
+    }
+}
+
+/// Demoting a block that is not encrypted is a host bug the executor refuses.
+#[test]
+#[should_panic(expected = "demote of a plaintext block")]
+fn demoting_a_plaintext_block_panics() {
+    let mut e = tiered_executor();
+    e.execute(&step(&[prefill(0, &TOKS[..4])], vec![], map(&e, 0, 0, 1)))
+        .unwrap();
+    let m = all_groups(&e, |group| Maintenance::Demote {
+        group,
+        block: 1,
+        host: 1,
+    });
+    let _ = e.execute(&step(&[], m, vec![]));
+}
+
+/// Promoting into a block that still holds data (its zero not run first) is refused.
+#[test]
+#[should_panic(expected = "promote into a block that is not zero")]
+fn promoting_into_a_block_with_data_panics() {
+    let mut e = tiered_executor();
+    e.execute(&step(&[prefill(0, &TOKS[..4])], vec![], map(&e, 0, 0, 1)))
+        .unwrap();
+    let mut m = crypt_all(&e, 1, true);
+    m.extend(all_groups(&e, |group| Maintenance::Demote {
+        group,
+        block: 1,
+        host: 2,
+    }));
+    e.execute(&keyed_step(&[], m, vec![], vec![key(1)]))
+        .unwrap();
+    let m = all_groups(&e, |group| Maintenance::Promote {
+        group,
+        host: 2,
+        block: 1,
+    });
+    let _ = e.execute(&step(&[], m, vec![]));
+}

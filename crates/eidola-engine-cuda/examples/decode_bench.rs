@@ -104,6 +104,7 @@ fn main() {
     let store = Arc::new(WeightSet::open_dir(Path::new(model)).unwrap());
     let mut cfg = CudaExecutorConfig {
         block_size: BS,
+        host_blocks: eidola_engine_cuda::KvBlocks::default(),
         num_blocks: KvBlocks {
             global: 2,
             sliding: 2,

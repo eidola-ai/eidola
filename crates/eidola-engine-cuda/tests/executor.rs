@@ -93,6 +93,7 @@ fn seam_contract_on_the_truncated_checkpoint() {
     let store = Arc::new(WeightSet::open_dir(&dir).unwrap());
     let cfg = CudaExecutorConfig {
         block_size: BS,
+        host_blocks: eidola_engine_cuda::KvBlocks::default(),
         num_blocks: KvBlocks {
             global: 32,
             sliding: 32,

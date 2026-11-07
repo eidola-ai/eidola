@@ -137,10 +137,20 @@ impl Harness {
     }
 
     fn with_len(blocks: u32, chunk: u32, max_model_len: u32) -> Option<Harness> {
+        Harness::with_host(blocks, 0, chunk, max_model_len)
+    }
+
+    /// With `host` host-tier blocks per group (0: none).
+    fn with_host(blocks: u32, host: u32, chunk: u32, max_model_len: u32) -> Option<Harness> {
         let env = env()?;
         let su = setup()?;
         let cfg = CudaExecutorConfig {
             block_size: 16,
+            host_blocks: KvBlocks {
+                global: host,
+                sliding: host,
+                drafter: 0,
+            },
             num_blocks: KvBlocks {
                 global: blocks,
                 sliding: blocks,
@@ -193,6 +203,16 @@ impl Harness {
                 assert!(
                     self.eng.executor().block_is_zero(g, b).unwrap(),
                     "free block {g}/{b} holds data with no zero pending"
+                );
+                self.zero_checks += 1;
+            }
+        }
+        let host_zeros = kv.pending_host_zeros();
+        for (g, hb) in kv.free_host_set() {
+            if !host_zeros.contains(&(g, hb)) {
+                assert!(
+                    self.eng.executor().host_block_is_zero(g, hb).unwrap(),
+                    "free host block {g}/{hb} holds data with no zero pending"
                 );
                 self.zero_checks += 1;
             }
@@ -597,4 +617,127 @@ fn randomized_workload() {
         "randomized: {} requests, {n} greedy tokens, {exact} the reference argmax, worst trail {worst:.3}; {} zero checks",
         id, h.zero_checks
     );
+}
+
+/// Runs request `id` alone to completion and flushes.
+fn run_alone(h: &mut Harness, id: u64, prompt: Vec<u32>, key: u8) {
+    h.submit(request(
+        id,
+        prompt,
+        greedy(),
+        8,
+        CacheScope::Keyed(salt(key)),
+    ));
+    h.run();
+    h.eng.flush().unwrap();
+    h.check();
+}
+
+/// The host tier on the device: a conversation pushed off small device pools
+/// by others is demoted (its blocks reach host memory as ciphertext: not the
+/// plaintext a sequence read while mapping them), and its continuation is
+/// served from promoted, decrypted blocks with the same tokens as a run whose
+/// cache never left the device and as a recompute under another key. Every
+/// free host block is zero after every step (the harness's check).
+#[test]
+fn a_host_tier_hit_equals_a_device_hit_and_a_recompute() {
+    let text = match env() {
+        Some(e) => e.text.clone(),
+        None => return,
+    };
+    // Disjoint spans of the golden: the conversation, five others that push it off the
+    // device, and its continuation's new tokens.
+    const SPAN: usize = 50;
+    assert!(
+        text.len() >= 6 * SPAN + 5,
+        "the golden holds {} tokens; this test needs {}",
+        text.len(),
+        6 * SPAN + 5
+    );
+    let prompt = text[..SPAN].to_vec();
+    let others: Vec<Vec<u32>> = (1..=5)
+        .map(|i| text[i * SPAN..(i + 1) * SPAN].to_vec())
+        .collect();
+    let tail = &text[6 * SPAN..6 * SPAN + 5];
+    let mut runs = Vec::new();
+    // 16 blocks hold the conversation and three others' cached blocks, not six.
+    for (blocks, host) in [(256, 0), (16, 128)] {
+        let Some(mut h) = Harness::with_host(blocks, host, 64, 1024) else {
+            return;
+        };
+        let mut plain: HashMap<(u32, u32), Vec<u16>> = HashMap::new();
+        h.submit(request(
+            1,
+            prompt.clone(),
+            greedy(),
+            8,
+            CacheScope::Keyed(salt(1)),
+        ));
+        while h.eng.unfinished() > 0 {
+            h.step();
+            h.now += 1;
+            let kv = h.eng.kv();
+            let crypts = kv.pending_crypts();
+            let mut blocks: Vec<(u32, u32)> = kv
+                .sequence_blocks()
+                .into_iter()
+                .filter(|b| !crypts.contains_key(b))
+                .collect();
+            blocks.extend(crypts.iter().filter(|(_, e)| **e).map(|(b, _)| *b));
+            let ex = h.eng.executor();
+            for (g, b) in blocks {
+                plain.insert((g, b), ex.kv().read_block(ex.gpu(), g as usize, b).unwrap());
+            }
+        }
+        h.eng.flush().unwrap();
+        h.check();
+        let first: Vec<(u32, u32)> = h.eng.kv().cache_blocks().into_iter().collect();
+        for (i, p) in others.iter().enumerate() {
+            let i = u8::try_from(i).unwrap();
+            run_alone(&mut h, 10 + u64::from(i), p.clone(), 10 + i);
+        }
+        if host > 0 {
+            let tier = h.eng.kv().tier_stats();
+            assert!(
+                tier.demoted_blocks > 0 && tier.device_drops == 0,
+                "{tier:?}"
+            );
+            let ex = h.eng.executor();
+            for (g, hb) in h.eng.kv().host_cache_blocks() {
+                let img = ex.kv().read_host_block(ex.gpu(), g as usize, hb).unwrap();
+                for &(pg, pb) in &first {
+                    if pg != g {
+                        continue;
+                    }
+                    let p: Vec<u8> = plain[&(pg, pb)]
+                        .iter()
+                        .flat_map(|w| w.to_le_bytes())
+                        .collect();
+                    let same = img.iter().zip(&p).filter(|(a, b)| a == b).count();
+                    assert!(same * 64 < img.len(), "group {g}: plaintext on the host");
+                }
+            }
+        }
+        let mut next = prompt.clone();
+        next.extend(&h.outputs[&1]);
+        next.extend(tail);
+        run_alone(&mut h, 2, next.clone(), 1);
+        if host > 0 {
+            assert!(h.eng.kv().tier_stats().promoted_blocks > 0);
+        }
+        run_alone(&mut h, 3, next, 99);
+        assert_eq!(h.cached[&3], 0);
+        assert_eq!(
+            h.outputs[&3], h.outputs[&2],
+            "a recompute gives the same tokens"
+        );
+        let (n, _, worst) = h.check_outputs();
+        println!(
+            "host {host}: cached {} tokens; {n} greedy tokens, worst trail {worst:.3}",
+            h.cached[&2]
+        );
+        runs.push((h.outputs[&2].clone(), h.cached[&2]));
+    }
+    assert_eq!(runs[0], runs[1], "a host-tier hit equals a device hit");
+    assert!(runs[0].1 > 0);
 }

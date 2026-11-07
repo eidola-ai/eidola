@@ -32,6 +32,7 @@ fn tensorless_checkpoint() -> Arc<WeightSet> {
 fn config() -> CudaExecutorConfig {
     CudaExecutorConfig {
         block_size: 16,
+        host_blocks: eidola_engine_cuda::KvBlocks::default(),
         num_blocks: KvBlocks {
             global: 8,
             sliding: 8,

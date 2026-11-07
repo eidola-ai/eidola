@@ -35,6 +35,10 @@ pub struct CpuExecutorConfig {
     pub block_size: u32,
     /// Physical blocks per group, including the null block 0.
     pub num_blocks: u32,
+    /// Host-tier blocks per group for demoted idle prefix-cache entries, including the
+    /// null block 0; 0 for no host tier. The host pools are locked into memory, and the
+    /// executor refuses to start (panics) if that fails.
+    pub host_blocks: u32,
     /// Per-sequence state rows.
     pub num_state_slots: u32,
     /// Longest sequence.
@@ -67,6 +71,7 @@ impl CpuExecutorConfig {
         Self {
             block_size: 16,
             num_blocks: 256,
+            host_blocks: 0,
             num_state_slots: 16,
             max_model_len: model.weights.config.max_position_embeddings as u32,
             buckets: vec![
@@ -219,6 +224,8 @@ pub struct CpuExecutor {
     spec: ModelSpec,
     cfg: CpuExecutorConfig,
     pools: Vec<Pool>,
+    /// The host tier, one pool per group (empty without one).
+    host_pools: Vec<Pool>,
     /// Per target layer: `(group, layer within group)`.
     target_kv: Vec<(usize, usize)>,
     drafter_group: Option<usize>,
@@ -232,6 +239,8 @@ pub struct CpuExecutor {
     records: Mutex<Vec<RowRecord>>,
     zero_log: Vec<(u64, u32, u32)>,
     crypt_log: Vec<(u64, u32, u32, bool)>,
+    transfer_log: Vec<(u64, u32, u32, u32, bool)>,
+    host_zero_log: Vec<(u64, u32, u32)>,
     steps: u64,
 }
 
@@ -321,6 +330,7 @@ impl CpuExecutor {
                 head_dim_qk: a.head_dim_qk as u32,
                 head_dim_v: a.head_dim_v as u32,
                 num_blocks: cfg.num_blocks,
+                host_blocks: cfg.host_blocks,
             });
             pools.push(Pool::new(layout_of(a, group_layers[g], 0), bs, nb));
         }
@@ -335,6 +345,7 @@ impl CpuExecutor {
                 head_dim_qk: a.head_dim_qk as u32,
                 head_dim_v: a.head_dim_v as u32,
                 num_blocks: cfg.num_blocks,
+                host_blocks: cfg.host_blocks,
             });
             pools.push(Pool::new(
                 layout_of(a, depths, depths * mc.hidden_size),
@@ -355,6 +366,29 @@ impl CpuExecutor {
             buckets: cfg.buckets.clone(),
         };
         spec.validate().expect("valid model spec");
+        let host_pools: Vec<Pool> = if cfg.host_blocks > 0 {
+            pools
+                .iter()
+                .map(|p| {
+                    let mut host = Pool::new(p.layout.clone(), bs, cfg.host_blocks as usize);
+                    host.lock().unwrap_or_else(|e| {
+                        let limit = rustix::process::getrlimit(rustix::process::Resource::Memlock);
+                        let shown =
+                            |v: Option<u64>| v.map_or("unlimited".into(), |b| b.to_string());
+                        panic!(
+                            "the host tier's KV ({} bytes in this group) cannot be locked into \
+                             memory: {e}; RLIMIT_MEMLOCK is {} bytes (hard {})",
+                            host.block_bytes() * host.num_blocks(),
+                            shown(limit.current),
+                            shown(limit.maximum)
+                        )
+                    });
+                    host
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let width = spec.max_blocks_per_seq() as usize;
         let groups = spec.kv_groups.len();
         Self {
@@ -364,6 +398,9 @@ impl CpuExecutor {
             records: Mutex::new(Vec::new()),
             zero_log: Vec::new(),
             crypt_log: Vec::new(),
+            transfer_log: Vec::new(),
+            host_zero_log: Vec::new(),
+            host_pools,
             steps: 0,
             model,
             spec,
@@ -373,6 +410,19 @@ impl CpuExecutor {
             drafter_group,
             full_group,
         }
+    }
+
+    /// Bytes one block of every group takes together, for `model` under `cfg` (its
+    /// block counts aside): what each block of a host tier costs. Builds a two-block
+    /// executor to measure it.
+    pub fn kv_block_bytes(model: &Arc<ReferenceModel>, cfg: &CpuExecutorConfig) -> u64 {
+        let mut probe = cfg.clone();
+        probe.num_blocks = 2;
+        probe.host_blocks = 0;
+        probe.num_state_slots = 1;
+        probe.record = false;
+        let e = CpuExecutor::new(model.clone(), probe);
+        e.pools.iter().map(|p| p.block_bytes() as u64).sum()
     }
 
     /// The model.
@@ -408,6 +458,31 @@ impl CpuExecutor {
     /// Every executed encrypt (`true`) or decrypt as `(step, group, block, encrypt)`.
     pub fn crypt_log(&self) -> &[(u64, u32, u32, bool)] {
         &self.crypt_log
+    }
+
+    /// Every executed demote (`true`) or promote as `(step, group, block, host, demote)`.
+    pub fn transfer_log(&self) -> &[(u64, u32, u32, u32, bool)] {
+        &self.transfer_log
+    }
+
+    /// Every executed host zero as `(step, group, host)`.
+    pub fn host_zero_log(&self) -> &[(u64, u32, u32)] {
+        &self.host_zero_log
+    }
+
+    /// A host-tier block's stored image as words, in [`CpuExecutor::block_image`]'s order.
+    pub fn host_block_image(&self, group: u32, host: u32) -> Vec<u32> {
+        self.host_pools[group as usize].image(host)
+    }
+
+    /// Whether every byte of a host-tier block is zero.
+    pub fn host_block_is_zero(&self, group: u32, host: u32) -> bool {
+        self.host_pools[group as usize].block_is_zero(host)
+    }
+
+    /// Whether a host-tier block holds ciphertext.
+    pub fn host_block_is_encrypted(&self, group: u32, host: u32) -> bool {
+        self.host_pools[group as usize].is_encrypted(host)
     }
 
     /// A block's stored image as words (KV, tap, row tags, tap tag), as the encryption
@@ -903,6 +978,34 @@ impl Executor for CpuExecutor {
                         .unwrap_or_else(|| panic!("maintenance names key {key}, not in the step"));
                     self.pools[group as usize].crypt(block, key, &nonce, encrypt);
                     self.crypt_log.push((self.steps, group, block, encrypt));
+                }
+                Maintenance::Demote { group, block, host } => {
+                    let g = group as usize;
+                    assert!(
+                        self.pools[g].is_encrypted(block),
+                        "group {group} block {block}: demote of a plaintext block"
+                    );
+                    Pool::transfer(&self.pools[g], block, &mut self.host_pools[g], host);
+                    self.transfer_log
+                        .push((self.steps, group, block, host, true));
+                }
+                Maintenance::Promote { group, host, block } => {
+                    let g = group as usize;
+                    assert!(
+                        self.host_pools[g].is_encrypted(host),
+                        "group {group} host block {host}: promote of a block holding no ciphertext"
+                    );
+                    assert!(
+                        self.pools[g].block_is_zero(block) && !self.pools[g].is_encrypted(block),
+                        "group {group} block {block}: promote into a block that is not zero"
+                    );
+                    Pool::transfer(&self.host_pools[g], host, &mut self.pools[g], block);
+                    self.transfer_log
+                        .push((self.steps, group, block, host, false));
+                }
+                Maintenance::ZeroHost { group, host } => {
+                    self.host_pools[group as usize].zero(host);
+                    self.host_zero_log.push((self.steps, group, host));
                 }
             }
         }

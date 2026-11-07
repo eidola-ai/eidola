@@ -179,6 +179,7 @@ pub fn check_deployment(
         &measured.sizing,
         &measured.cache,
         &measured.executor,
+        measured.kv_host_bytes,
         weights_bytes,
         c.memory,
         c.gpus.unwrap_or(0),

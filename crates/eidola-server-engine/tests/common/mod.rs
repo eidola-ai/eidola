@@ -94,7 +94,27 @@ pub fn env_map() -> HashMap<&'static str, String> {
         (env::PREFIX_CACHE, "true".into()),
         (env::CACHE_IDLE_TTL_SECS, "900".into()),
         (env::CACHE_MAX_AGE_SECS, "7200".into()),
+        (env::KV_HOST_BYTES, "0".into()),
     ])
+}
+
+/// A swap list naming no active area, for tests that boot a node the swap check applies
+/// to and assert what happens after it.
+pub fn no_swap_list() -> &'static std::path::Path {
+    static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let p = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("no-swap-{}", std::process::id()));
+        std::fs::write(&p, "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n").unwrap();
+        p
+    })
+}
+
+/// Boots `config` past the swap check ([`no_swap_list`]).
+pub fn boot_without_swap(
+    config: Config,
+) -> Result<eidola_server_engine::Node, eidola_server_engine::BootError> {
+    eidola_server_engine::boot_with_swap_list(config, no_swap_list())
 }
 
 pub fn config_from(map: &HashMap<&'static str, String>) -> Result<Config, String> {

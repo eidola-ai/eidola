@@ -53,6 +53,12 @@ pub mod env {
     /// Whether the CUDA executor replays captured graphs for decode steps:
     /// `on` or `off` (`cuda` only).
     pub const CUDA_GRAPHS: &str = "EIDOLA_ENGINE_CUDA_GRAPHS";
+    /// Host memory for the prefix cache's host tier, in bytes: page-locked
+    /// memory of the confidential VM where idle entries evicted from the KV
+    /// pools under pressure are kept (as ciphertext) instead of dropped. 0
+    /// disables the tier; a non-zero value needs the prefix cache. The node
+    /// derives the per-group host block counts from it.
+    pub const KV_HOST_BYTES: &str = "EIDOLA_ENGINE_KV_HOST_BYTES";
     /// Whether the node requires its GPUs in confidential-computing mode
     /// before it opens one: `required` (production; checked through NVML) or
     /// `not-required` (development on a GPU without it) (`cuda` only).
@@ -94,6 +100,7 @@ pub mod env {
         KV_DEVICE_BYTES,
         KERNELS_DIR,
         CUDA_GRAPHS,
+        KV_HOST_BYTES,
         GPU_CC,
         MAX_MODEL_LEN,
         MAX_SEQS,
@@ -135,6 +142,11 @@ pub mod caps {
     /// deployment may give the pools, beside its weights and the executor's
     /// own reserve, is held separately ([`super::check_resources`]).
     pub const KV_DEVICE_BYTES: u64 = super::SUPPORTED_GPU_MEMORY_BYTES - 1;
+    /// Host memory for the prefix cache's host tier: at most the largest VM
+    /// memory a deployment may have ([`super::MAX_MEMORY_MIB`], 2 TiB). What
+    /// a pinned deployment's VM must hold besides is held separately
+    /// ([`super::check_resources`]).
+    pub const KV_HOST_BYTES: u64 = super::MAX_MEMORY_MIB << 20;
     /// Blocks per KV group (the `cpu` executor's): the device block tables are `i32`
     /// (`kv::GroupGeometry::validate`). The device bytes they cost are held
     /// to the attached GPUs separately ([`super::check_resources`]).
@@ -486,18 +498,22 @@ pub fn cuda_kv_min_bytes(sizing: &Sizing, cache: &CacheConfig) -> u64 {
 
 /// Whether the deployment's VM and GPUs hold what its configuration
 /// allocates, as far as configuration alone fixes it. Host memory (`memory`,
-/// MiB) holds [`host_memory_bytes`], plus, for the `cpu` executor, its KV
-/// cache (`KV_BLOCKS` × `KV_BLOCK_SIZE` × [`KV_BYTES_PER_POSITION`]). For the
+/// MiB) holds [`host_memory_bytes`], the prefix cache's host tier
+/// (`kv_host_bytes`, `KV_HOST_BYTES`: page-locked, so it can never be paged
+/// out to make room), plus, for the `cpu` executor, its KV cache
+/// (`KV_BLOCKS` × `KV_BLOCK_SIZE` × [`KV_BYTES_PER_POSITION`]). For the
 /// `cuda` executor, which runs on one [`SUPPORTED_GPU`], the VM has a GPU,
 /// `KV_DEVICE_BYTES` holds at least [`cuda_kv_min_bytes`], and
 /// `KV_DEVICE_BYTES` + `weights_bytes` + [`cuda_device_reserve_bytes`] fit
 /// [`SUPPORTED_GPU_MEMORY_BYTES`]. `weights_bytes` bounds the weights' device
 /// footprint from above: the pack's data size ([`artifact_data_bytes`]),
 /// every file of it, whether the node loads it or not.
+#[allow(clippy::too_many_arguments)]
 pub fn check_resources(
     sizing: &Sizing,
     cache: &CacheConfig,
     executor: &ExecutorSettings,
+    kv_host_bytes: u64,
     weights_bytes: u64,
     memory_mib: u64,
     gpus: u64,
@@ -508,12 +524,15 @@ pub fn check_resources(
             .saturating_mul(KV_BYTES_PER_POSITION),
         ExecutorSettings::Cuda { .. } => 0,
     };
-    let host = host_memory_bytes(sizing).saturating_add(host_kv);
+    let host = host_memory_bytes(sizing)
+        .saturating_add(host_kv)
+        .saturating_add(kv_host_bytes);
     let host_limit = memory_mib.saturating_mul(1 << 20);
     if host > host_limit {
         return Err(format!(
-            "the node's request pools, block tables, host KV and headroom need {host} bytes, \
-             more than the VM's {host_limit} (memory)"
+            "the node's request pools, block tables, host KV, host tier ({}) and headroom \
+             need {host} bytes, more than the VM's {host_limit} (memory)",
+            env::KV_HOST_BYTES
         ));
     }
     if let ExecutorSettings::Cuda {
@@ -717,6 +736,8 @@ pub struct MeasuredConfig {
     pub bind_addr: core::net::SocketAddr,
     pub sizing: Sizing,
     pub cache: CacheConfig,
+    /// Host memory for the prefix cache's host tier, in bytes (0: none).
+    pub kv_host_bytes: u64,
 }
 
 /// A refused configuration. Names the variable and the problem, never its
@@ -978,6 +999,29 @@ pub fn parse_measured(
             env::CACHE_MAX_AGE_SECS
         )));
     }
+    let kv_host_bytes = get(env::KV_HOST_BYTES)?.parse::<u64>().map_err(|_| {
+        ConfigError(format!(
+            "{} must be a non-negative number of bytes",
+            env::KV_HOST_BYTES
+        ))
+    })?;
+    if kv_host_bytes > caps::KV_HOST_BYTES {
+        return Err(ConfigError(format!(
+            "{} must be at most {}",
+            env::KV_HOST_BYTES,
+            caps::KV_HOST_BYTES
+        )));
+    }
+    // A host tier holds prefix-cache entries: without the cache it would
+    // hold nothing, and the measured configuration never shows a value that
+    // does nothing.
+    if kv_host_bytes > 0 && !cache.enabled {
+        return Err(ConfigError(format!(
+            "{} must be 0 when {} is false",
+            env::KV_HOST_BYTES,
+            env::PREFIX_CACHE
+        )));
+    }
 
     Ok(MeasuredConfig {
         model_id,
@@ -989,6 +1033,7 @@ pub fn parse_measured(
         bind_addr,
         sizing,
         cache,
+        kv_host_bytes,
     })
 }
 
@@ -1620,7 +1665,7 @@ mod tests {
             max_age_secs: 3600,
         };
         let kv = cuda(64 << 30);
-        assert!(check_resources(&sizing, &cache, &kv, FIXTURE_PACK, 65_536, 8).is_ok());
+        assert!(check_resources(&sizing, &cache, &kv, 0, FIXTURE_PACK, 65_536, 8).is_ok());
         // A request slot is 645,922,816 bytes at the caps: a 32 MiB body read
         // with both parses (3 × 32 MiB of text, 512 bytes for each of 2^18
         // values) and admitted with its tree (32 MiB of text, 160 bytes a
@@ -1653,13 +1698,13 @@ mod tests {
             ..sizing
         };
         // Six slots, the headroom and the tables fit 8 GiB; eight do not.
-        assert!(check_resources(&near(6), &cache, &kv, FIXTURE_PACK, 8192, 8).is_ok());
-        assert!(check_resources(&near(8), &cache, &kv, FIXTURE_PACK, 8192, 8).is_err());
+        assert!(check_resources(&near(6), &cache, &kv, 0, FIXTURE_PACK, 8192, 8).is_ok());
+        assert!(check_resources(&near(8), &cache, &kv, 0, FIXTURE_PACK, 8192, 8).is_err());
         // Near the limit: 99 slots fit 64 GiB; 100 do not.
-        assert!(check_resources(&near(99), &cache, &kv, FIXTURE_PACK, 65_536, 8).is_ok());
-        assert!(check_resources(&near(100), &cache, &kv, FIXTURE_PACK, 65_536, 8).is_err());
+        assert!(check_resources(&near(99), &cache, &kv, 0, FIXTURE_PACK, 65_536, 8).is_ok());
+        assert!(check_resources(&near(100), &cache, &kv, 0, FIXTURE_PACK, 65_536, 8).is_err());
         // The cuda executor needs a GPU.
-        assert!(check_resources(&sizing, &cache, &kv, FIXTURE_PACK, 65_536, 0).is_err());
+        assert!(check_resources(&sizing, &cache, &kv, 0, FIXTURE_PACK, 65_536, 0).is_err());
         // Block size 1 at the longest model length: 2^20 entries per slot.
         let tables = Sizing {
             kv_block_size: 1,
@@ -1667,12 +1712,14 @@ mod tests {
             max_seqs: caps::MAX_SEQS,
             ..sizing
         };
-        assert!(check_resources(&tables, &cache, &kv, FIXTURE_PACK, 16_384, 8).is_err());
+        assert!(check_resources(&tables, &cache, &kv, 0, FIXTURE_PACK, 16_384, 8).is_err());
         // The cpu executor's KV is host memory: 2^20 blocks of 16 positions
         // are 3.4 TiB.
         let cpu = |kv_blocks| ExecutorSettings::Cpu { kv_blocks };
-        assert!(check_resources(&sizing, &cache, &cpu(1024), FIXTURE_PACK, 65_536, 0).is_ok());
-        assert!(check_resources(&sizing, &cache, &cpu(1 << 20), FIXTURE_PACK, 65_536, 0).is_err());
+        assert!(check_resources(&sizing, &cache, &cpu(1024), 0, FIXTURE_PACK, 65_536, 0).is_ok());
+        assert!(
+            check_resources(&sizing, &cache, &cpu(1 << 20), 0, FIXTURE_PACK, 65_536, 0).is_err()
+        );
     }
 
     #[test]
@@ -1710,8 +1757,17 @@ mod tests {
             );
         }
         let min = cuda_kv_min_bytes(&sizing, &cache(true));
-        let fits =
-            |bytes| check_resources(&sizing, &cache(true), &cuda(bytes), FIXTURE_PACK, 65_536, 1);
+        let fits = |bytes| {
+            check_resources(
+                &sizing,
+                &cache(true),
+                &cuda(bytes),
+                0,
+                FIXTURE_PACK,
+                65_536,
+                1,
+            )
+        };
         assert!(fits(min).is_ok());
         assert!(fits(min - 1).is_err());
     }
@@ -1795,13 +1851,13 @@ mod tests {
         let drafting_reserve = cuda_device_reserve_bytes(&drafting);
         assert!(cuda_kv_min_bytes(&drafting, &cache) < 64 << 30);
         let fits_drafting =
-            |kv: u64| check_resources(&drafting, &cache, &cuda(kv), FLASH_PACK, 65_536, 8);
+            |kv: u64| check_resources(&drafting, &cache, &cuda(kv), 0, FLASH_PACK, 65_536, 8);
         assert!(fits_drafting(64 << 30).is_ok());
         let room = SUPPORTED_GPU_MEMORY_BYTES - FLASH_PACK - drafting_reserve;
         assert!(fits_drafting(room).is_ok());
         assert!(fits_drafting(room + 1).is_err());
         let fits = |kv: u64, weights: u64, gpus: u64| {
-            check_resources(&sizing, &cache, &cuda(kv), weights, 65_536, gpus)
+            check_resources(&sizing, &cache, &cuda(kv), 0, weights, 65_536, gpus)
         };
         // A realistic Flash deployment: 64 GiB of KV beside the checkpoint.
         assert!(fits(64 << 30, FLASH_PACK, 1).is_ok());
@@ -2149,12 +2205,69 @@ mod tests {
             (env::PREFIX_CACHE, "true"),
             (env::CACHE_IDLE_TTL_SECS, "900"),
             (env::CACHE_MAX_AGE_SECS, "3600"),
+            (env::KV_HOST_BYTES, "34359738368"),
         ]
         .into_iter()
         .map(|(k, v)| (k, v.to_string()))
         .collect()
     }
 
+    /// The host tier's size is required, a number of bytes up to its cap,
+    /// bound into the measured configuration as given, refused with the
+    /// prefix cache off unless 0, and charged to the VM's memory.
+    #[cfg(feature = "argon2")]
+    #[test]
+    fn the_host_tier_size_is_measured_and_charged_to_the_vm() {
+        let base = cuda_env();
+        assert_eq!(parse_map(&base).unwrap().kv_host_bytes, 32 << 30);
+        let mut map = base.clone();
+        map.remove(env::KV_HOST_BYTES);
+        assert!(parse_map(&map).unwrap_err().contains(env::KV_HOST_BYTES));
+        for bad in ["", "-1", "1.5", "32GiB", " 1", "0x10"] {
+            let mut map = base.clone();
+            map.insert(env::KV_HOST_BYTES, bad.into());
+            assert!(
+                parse_map(&map).unwrap_err().contains(env::KV_HOST_BYTES),
+                "{bad:?}"
+            );
+        }
+        let mut map = base.clone();
+        map.insert(env::KV_HOST_BYTES, caps::KV_HOST_BYTES.to_string());
+        assert_eq!(parse_map(&map).unwrap().kv_host_bytes, caps::KV_HOST_BYTES);
+        map.insert(env::KV_HOST_BYTES, (caps::KV_HOST_BYTES + 1).to_string());
+        assert!(parse_map(&map).unwrap_err().contains(env::KV_HOST_BYTES));
+        // Without the prefix cache only 0 parses.
+        let mut map = base.clone();
+        map.insert(env::PREFIX_CACHE, "false".into());
+        let err = parse_map(&map).unwrap_err();
+        assert!(
+            err.contains(env::KV_HOST_BYTES) && err.contains(env::PREFIX_CACHE),
+            "{err}"
+        );
+        map.insert(env::KV_HOST_BYTES, "0".into());
+        assert_eq!(parse_map(&map).unwrap().kv_host_bytes, 0);
+        assert!(env::MEASURED.contains(&env::KV_HOST_BYTES));
+
+        // The VM must hold the tier besides everything else: exactly.
+        let m = parse_map(&base).unwrap();
+        let rest = host_memory_bytes(&m.sizing);
+        let mib = |bytes: u64| bytes.div_ceil(1 << 20);
+        let fits = |host: u64, memory: u64| {
+            check_resources(
+                &m.sizing,
+                &m.cache,
+                &m.executor,
+                host,
+                FIXTURE_PACK,
+                memory,
+                8,
+            )
+        };
+        let room = 65_536u64 << 20;
+        assert!(fits(room - rest, mib(room)).is_ok());
+        let err = fits(room - rest + 1, mib(room)).unwrap_err();
+        assert!(err.contains(env::KV_HOST_BYTES), "{err}");
+    }
     /// The settings only the cuda executor takes.
     #[cfg(feature = "argon2")]
     const CUDA_SETTINGS: [&str; 4] = [

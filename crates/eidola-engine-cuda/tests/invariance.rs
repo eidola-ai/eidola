@@ -727,6 +727,7 @@ fn executor_logits_are_batch_invariant() {
     let blocks = 1 + 8 * SEQ_BLOCKS;
     let cfg = CudaExecutorConfig {
         block_size: BS,
+        host_blocks: eidola_engine_cuda::KvBlocks::default(),
         num_blocks: KvBlocks {
             global: blocks,
             sliding: blocks,
