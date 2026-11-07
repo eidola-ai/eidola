@@ -150,10 +150,12 @@ fn a_generation_cut_after_any_token_continues_into_the_same_output() {
             let (prompt, field) = continued_prompt(&template, question, &r, &c);
             // **The invariant continuation is offered under**: the parser says
             // the cut can be continued exactly when the continued prompt is the
-            // original prompt followed by precisely the cut text.
+            // original prompt followed by precisely the cut text — except right
+            // after the lone opening `<think>`, where nothing has been said and
+            // the splitter is still where a further `<think>` is stripped.
             assert_eq!(
                 exact,
-                prompt == format!("{original}{cut_text}"),
+                prompt == format!("{original}{cut_text}") && cut_text != "<think>",
                 "cut after {k} tokens of {generation:?}"
             );
             assert!(
@@ -300,6 +302,11 @@ fn a_cut_that_says_it_continues_exactly_resumes_into_the_uninterrupted_parse() {
         "<think>Reasoning that mentions </thi as text, then </think>An answer.",
         "<think>Calling straight from thought<tool_call><function=get_weather></function></tool_call>",
         "<think>Ok.</think>Prose mentioning <tool_ as text, and more prose.",
+        // Leading tags: repeated, empty, and after leading whitespace.
+        "<think><think>A doubled opener.</think>Then the answer.",
+        "<think></think>Straight to the answer.",
+        " <think>After a space.</think>The answer.",
+        "\n<think>After a newline.</think>The answer.",
     ];
     let delimiters = ["<think>", "</think>", "<tool_call>"];
     let (mut continuable, mut inside) = (0, 0);

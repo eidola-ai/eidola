@@ -82,6 +82,13 @@ impl ReasoningParser {
         }
     }
 
+    /// Whether the splitter is inside the reasoning — past any leading `<think>`
+    /// and before its end: the mode [`ReasoningParser::resuming`] starts a
+    /// continued reasoning in.
+    pub fn in_reasoning(&self) -> bool {
+        self.mode == Mode::Reasoning
+    }
+
     /// Whether reasoning has ended (or never applied).
     pub fn in_content(&self) -> bool {
         self.mode == Mode::Content

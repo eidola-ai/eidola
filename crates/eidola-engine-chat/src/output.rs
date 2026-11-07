@@ -209,15 +209,30 @@ impl OutputParser {
     /// added. A tool call, an unfinished tool-call block the parser drops, a
     /// lossy final character, a repeated or missing `<think>`, reasoning ended
     /// by `<tool_call>` instead of `</think>`, a `</think>` with no answer after
-    /// it, or an ending inside a possible delimiter (`</thi`, `<tool_`: text
-    /// byte-exact, but a resumed parser would not know it is mid-delimiter) each
-    /// make it false — so a resumed parse of the rest splits exactly as an
+    /// it, an ending inside a possible delimiter (`</thi`, `<tool_`: text
+    /// byte-exact, but a resumed parser would not know it is mid-delimiter), or
+    /// a splitter in another mode than a resumed one starts in (still at the
+    /// start, right after a lone `<think>`) each make it false — so a resumed parse of the rest splits exactly as an
     /// uninterrupted one would.
     pub fn resumes_exactly(&self) -> bool {
         if self.tool_calls_emitted || self.lossy || self.cut_in_delimiter {
             return false;
         }
         let (r, c) = (&self.emitted_reasoning, &self.emitted_content);
+        // **The splitter must be in the mode a resumed one starts in**: the
+        // answer once there is any (a resumed parser in content), the reasoning
+        // before (a resumed parser inside the reasoning). Right after a lone
+        // `<think>` the splitter is still at the start, where a further `<think>`
+        // is a tag to strip, and with thinking off it is in the answer although
+        // nothing has been said: neither is where a continuation would resume.
+        let resumed_mode = if c.is_empty() {
+            self.reasoning.in_reasoning()
+        } else {
+            self.reasoning.in_content()
+        };
+        if !resumed_mode {
+            return false;
+        }
         let after_reasoning = |open: &str| {
             if c.is_empty() {
                 format!("{open}{r}")
@@ -436,6 +451,14 @@ mod tests {
         assert!(!ends(None, true, &["<think>done</think>"]));
         // No opening `<think>`: the continued prompt would add one.
         assert!(!ends(None, true, &["straight into it"]));
+        // Right after a lone `<think>` the splitter is still at the start, where
+        // a further `<think>` is stripped; a resumed reasoning would keep it. And
+        // with thinking off and nothing said, the splitter is in the answer while
+        // a client would continue the (empty) reasoning.
+        assert!(!ends(None, true, &["<think>"]));
+        assert!(!ends(None, true, &["<think><think>"]));
+        assert!(!ends(Some(false), true, &[""]));
+        assert!(ends(None, true, &["<think>\n"]));
         // Inside a delimiter written out of ordinary tokens: the text is
         // byte-exact, but a resumed parser would not know it is mid-delimiter.
         assert!(!ends(None, true, &["<think>plan</thi"]));
