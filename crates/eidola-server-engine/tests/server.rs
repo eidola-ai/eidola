@@ -42,6 +42,7 @@ fn prompt_tokens(text: &str) -> Vec<u32> {
             RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: None,
+                continue_final_message: None,
             },
         )
         .unwrap();
@@ -106,8 +107,21 @@ fn direct_greedy(prompt: Vec<u32>, max_tokens: u32) -> (Vec<u32>, FinishReason) 
 
 /// What the chat layer makes of `tokens` (the EOS that ends a `Stop` is not text).
 fn expected_output(tokens: &[u32], finish: FinishReason) -> (ChatDelta, &'static str) {
+    expected_output_in(tokens, finish, None)
+}
+
+/// [`expected_output`] for the output of a prompt that ended inside the final message's
+/// `continuing` field.
+fn expected_output_in(
+    tokens: &[u32],
+    finish: FinishReason,
+    continuing: Option<&'static str>,
+) -> (ChatDelta, &'static str) {
     let model = loaded();
-    let mut parser = OutputParser::new(OutputConfig::new(None, None), PrefixedCallIds("c".into()));
+    let mut parser = OutputParser::new(
+        OutputConfig::new(None, None).continuing_in(continuing),
+        PrefixedCallIds("c".into()),
+    );
     let mut all = ChatDelta::default();
     let mut text_tokens = tokens;
     if finish == FinishReason::Stop {
@@ -131,6 +145,40 @@ fn expected_output(tokens: &[u32], finish: FinishReason) -> (ChatDelta, &'static
 
 fn text_of(message: &Value, key: &str) -> String {
     message[key].as_str().unwrap_or("").to_string()
+}
+
+/// A request continuing an assistant message (`content` so far, after `reasoning`) to
+/// `LONG_TEXT`, asking for `field` the way a client does.
+fn continued(content: &str, reasoning: &str, field: Value) -> Value {
+    json!({
+        "model": MODEL_ID,
+        "messages": [
+            {"role": "user", "content": LONG_TEXT},
+            {"role": "assistant", "reasoning_content": reasoning, "content": content},
+        ],
+        "max_completion_tokens": 6,
+        "temperature": 0.0,
+        "add_generation_prompt": false,
+        "continue_final_message": field,
+    })
+}
+
+/// The prompt tokens the chat crate renders for `body`'s messages, continuing `field`.
+fn continued_prompt_tokens(body: &Value, field: &'static str) -> Vec<u32> {
+    let model = loaded();
+    let input = ChatInput::from_json(&body["messages"].to_string(), None).unwrap();
+    let prompt = model
+        .template()
+        .render(
+            &input,
+            RenderOptions {
+                add_generation_prompt: false,
+                enable_thinking: None,
+                continue_final_message: Some(field),
+            },
+        )
+        .unwrap();
+    model.tokenizer().encode(&prompt).unwrap()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -336,6 +384,29 @@ async fn strict_schema_refuses_what_it_does_not_name() {
             b["seed"] = 7.into();
             b
         },
+        // Continuations outside the rule: another field, a value of another type, a
+        // generation prompt asked for as well, one turned off with nothing continued,
+        // a final message that is not an assistant's, one that called tools, and a
+        // reasoning continued past an answer.
+        with("continue_final_message", "tool_calls".into()),
+        with("continue_final_message", 1.into()),
+        {
+            let mut b = continued("partial", "", json!(true));
+            b["add_generation_prompt"] = true.into();
+            b
+        },
+        with("add_generation_prompt", false.into()),
+        with("continue_final_message", true.into()),
+        {
+            let mut b = continued("partial", "", json!(true));
+            b["messages"][1]["tool_calls"] = json!([{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}]);
+            b
+        },
+        continued("an answer", "thinking", json!("reasoning_content")),
+        with(
+            "messages",
+            json!([{"role": "assistant", "content": "x", "reasoning": "vLLM's spelling"}]),
+        ),
     ];
     for body in &cases {
         let (status, v) = node.chat_json(body).await;
@@ -587,6 +658,141 @@ async fn max_tokens_ends_with_length() {
         "stop"
     };
     assert_eq!(v["choices"][0]["finish_reason"], expected);
+}
+
+/// A `length` ending says whether it can be continued exactly: the choice's
+/// `continuable` is the chat layer's verdict over the very tokens the engine
+/// generated (`OutputParser::resumes_exactly`, the decoder's lossy flush
+/// included), on both transports, and absent on any other ending.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_length_ending_says_whether_it_can_be_continued_exactly() {
+    let node = TestNode::start(&[]).await;
+    let model = loaded();
+    let mut checked = 0;
+    for max in [1u32, 2, 3, 5, 8, 13] {
+        let (tokens, finish) = direct_greedy(prompt_tokens(LONG_TEXT), max);
+        let (_, v) = node.chat_json(&request(LONG_TEXT, max)).await;
+        let choice = &v["choices"][0];
+        if finish != FinishReason::Length {
+            assert!(choice.get("continuable").is_none(), "{v}");
+            continue;
+        }
+        let mut detok = eidola_engine_chat::Detokenizer::new(true);
+        let mut parser =
+            OutputParser::new(OutputConfig::new(None, None), PrefixedCallIds("c".into()));
+        for &t in &tokens {
+            parser.push_text(&detok.push(model.tokenizer(), t).unwrap());
+        }
+        if detok.pending_len() > 0 {
+            parser.mark_lossy();
+        }
+        parser.push_text(&detok.finish());
+        parser.finish(StopCause::MaxTokens);
+        let expected = parser.resumes_exactly();
+        assert_eq!(choice["continuable"], expected, "max {max}: {v}");
+
+        let mut body = request(LONG_TEXT, max);
+        body["stream"] = true.into();
+        let (chunks, _) = parse_chunks(&node.chat_stream(&body).await);
+        let finish_choice = chunks
+            .iter()
+            .filter_map(|c| c["choices"].get(0))
+            .find(|c| c["finish_reason"] == "length")
+            .expect("a finishing chunk");
+        assert_eq!(finish_choice["continuable"], expected, "max {max} streamed");
+        checked += 1;
+    }
+    assert!(checked > 0, "some ceiling must cut the dev model off");
+}
+
+/// The chat layer's verdict over `tokens` generated after a prompt that ended inside
+/// the final message's `continuing` field — what the node reports when nothing else of
+/// its own makes a continuation impossible.
+fn parser_verdict(tokens: &[u32], continuing: Option<&'static str>) -> bool {
+    let model = loaded();
+    let mut detok = eidola_engine_chat::Detokenizer::new(true);
+    let mut parser = OutputParser::new(
+        OutputConfig::new(None, None).continuing_in(continuing),
+        PrefixedCallIds("c".into()),
+    );
+    for &t in tokens {
+        parser.push_text(&detok.push(model.tokenizer(), t).unwrap());
+    }
+    if detok.pending_len() > 0 {
+        parser.mark_lossy();
+    }
+    parser.push_text(&detok.finish());
+    parser.finish(StopCause::MaxTokens);
+    parser.resumes_exactly()
+}
+
+/// A `length` ending at the **context window** is never continuable: a
+/// continuation's prompt would be the whole window or more, which the node refuses
+/// (`context_length_exceeded`). Only a request whose own `max_completion_tokens`
+/// stopped it below the window's room can be. Run on a continuation of an answer
+/// (whose output needs no opening `<think>`, so the dev model's text can be
+/// exact), with the window just past its prompt: no limit, and a limit at or past
+/// the room, each end at the window and report `false` although the chat layer's
+/// own verdict over the same tokens is `true`; a limit below the room reports the
+/// chat layer's verdict. The continuation the client would then send is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_length_ending_at_the_context_window_is_not_continuable() {
+    let base = continued("The answer so far", "a thought", json!(true));
+    let prompt = continued_prompt_tokens(&base, "content");
+    let room = 6u32;
+    let len = (prompt.len() as u32 + room).to_string();
+    let node = TestNode::start(&[(env::MAX_MODEL_LEN, len.as_str())]).await;
+    let (tokens, finish) = direct_greedy(prompt.clone(), room);
+    assert_eq!(
+        finish,
+        FinishReason::Length,
+        "the dev model runs to the window here"
+    );
+    assert!(
+        parser_verdict(&tokens, Some("content")),
+        "the chat layer alone would call this cut exact, so only the window can refuse it"
+    );
+
+    let with_limit = |limit: Option<u32>| {
+        let mut b = base.clone();
+        match limit {
+            Some(m) => b["max_completion_tokens"] = m.into(),
+            None => {
+                b.as_object_mut().unwrap().remove("max_completion_tokens");
+            }
+        }
+        b
+    };
+    for limit in [None, Some(room), Some(100)] {
+        let (status, v) = node.chat_json(&with_limit(limit)).await;
+        assert_eq!(status, 200, "{v}");
+        let choice = &v["choices"][0];
+        assert_eq!(choice["finish_reason"], "length", "{limit:?}: {v}");
+        assert_eq!(choice["continuable"], false, "{limit:?}: {v}");
+
+        let mut next = base.clone();
+        let message = &choice["message"];
+        next["messages"][1]["content"] = json!(format!(
+            "The answer so far{}",
+            message["content"].as_str().unwrap_or("")
+        ));
+        next["max_completion_tokens"] = 4.into();
+        let (status, v) = node.chat_json(&next).await;
+        assert_eq!(
+            status, 400,
+            "the continuation it did not offer is refused: {v}"
+        );
+        assert_eq!(v["error"]["type"], "context_length_exceeded");
+    }
+
+    // Below the room, the request's own limit stopped it: the chat layer decides.
+    let (below, _) = direct_greedy(prompt, room - 2);
+    let (_, v) = node.chat_json(&with_limit(Some(room - 2))).await;
+    assert_eq!(
+        v["choices"][0]["continuable"],
+        parser_verdict(&below, Some("content")),
+        "{v}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1055,6 +1261,109 @@ async fn tool_choice_none_renders_without_tools() {
         none["choices"], plain["choices"],
         "the same prompt, the same greedy output"
     );
+}
+
+/// A continuation is the engine driven directly on the chat crate's continued prompt:
+/// the node renders the prompt ending inside the field it continues (the answer, or an
+/// open reasoning block), and parses the output from there, token for token, in both
+/// spellings of a content continuation and with the generation prompt omitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continuation_resumes_inside_the_final_message() {
+    let node = TestNode::start(&[]).await;
+    let cases = [
+        (
+            continued("The answer so far", "a thought", json!(true)),
+            "content",
+        ),
+        (
+            continued("The answer so far", "a thought", json!("content")),
+            "content",
+        ),
+        (
+            continued("", "Still reasoning about", json!("reasoning_content")),
+            "reasoning_content",
+        ),
+        (
+            {
+                let mut b = continued("", "Still reasoning", json!("reasoning_content"));
+                b.as_object_mut().unwrap().remove("add_generation_prompt");
+                b["messages"][1].as_object_mut().unwrap().remove("content");
+                b
+            },
+            "reasoning_content",
+        ),
+    ];
+    for (body, field) in &cases {
+        let prompt = continued_prompt_tokens(body, field);
+        let n_prompt = prompt.len();
+        let (tokens, finish) = direct_greedy(prompt, 6);
+        let (expected, reason) = expected_output_in(&tokens, finish, Some(field));
+
+        let (status, v) = node.chat_json(body).await;
+        assert_eq!(status, 200, "{body}: {v}");
+        let choice = &v["choices"][0];
+        assert_eq!(choice["finish_reason"], reason, "{body}");
+        let message = &choice["message"];
+        assert_eq!(
+            text_of(message, "reasoning_content"),
+            expected.reasoning_content,
+            "{body}"
+        );
+        assert_eq!(text_of(message, "content"), expected.content, "{body}");
+        assert_eq!(v["usage"]["prompt_tokens"], n_prompt, "{body}");
+        assert_eq!(v["usage"]["completion_tokens"], tokens.len(), "{body}");
+    }
+}
+
+/// A continuation under the key its generation ran with reuses the prefix that
+/// generation left: more than its prompt alone, since the continued prompt carries the
+/// generated text after it. Under another key it reuses nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continuation_reuses_what_its_generation_cached() {
+    let node = TestNode::start(&[]).await;
+    use base64::Engine as _;
+    let key = |byte: u8| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32]);
+    let cached = |v: &Value| {
+        v["usage"]["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap()
+    };
+
+    let mut first = request(LONG_TEXT, 40);
+    first["cache_key"] = key(7).into();
+    let (status, answered) = node.chat_json(&first).await;
+    assert_eq!(status, 200, "{answered}");
+    let original_prompt = answered["usage"]["prompt_tokens"].as_u64().unwrap();
+    let message = &answered["choices"][0]["message"];
+    let (reasoning, content) = (
+        text_of(message, "reasoning_content"),
+        text_of(message, "content"),
+    );
+    let field = if content.is_empty() {
+        json!("reasoning_content")
+    } else {
+        json!(true)
+    };
+
+    let mut next = continued(&content, &reasoning, field);
+    next["cache_key"] = key(7).into();
+    let (status, resumed) = node.chat_json(&next).await;
+    assert_eq!(status, 200, "{resumed}");
+    let prompt = resumed["usage"]["prompt_tokens"].as_u64().unwrap();
+    assert!(prompt > original_prompt, "{prompt} vs {original_prompt}");
+    // At least the original prompt's whole blocks; the generation's own blocks too where
+    // its text re-encodes to the tokens it was sampled as (the dev model's gibberish
+    // need not, so the test asks only for the floor).
+    let floor = (original_prompt - 1) / 16 * 16;
+    assert!(
+        cached(&resumed) >= floor,
+        "{} cached of {prompt}, floor {floor}",
+        cached(&resumed)
+    );
+
+    next["cache_key"] = key(8).into();
+    let (_, other) = node.chat_json(&next).await;
+    assert_eq!(cached(&other), 0, "another key shares nothing");
 }
 
 /// No multimodal key can ride along on a text part: every part variant denies unknown

@@ -1625,6 +1625,7 @@ fn probe_post(action_id: &str, text: &str) -> PostNode {
         references: Vec::new(),
         created_at: 0,
         truncated: false,
+        continuable: false,
     }
 }
 
@@ -8344,7 +8345,7 @@ fn a_conversations_turn_states_speak_the_readers_language(cx: &mut TestAppContex
         &entries,
         "space/post/2/cut-off",
         gpui::Role::Label,
-        "Cette réponse a atteint sa limite de longueur et s’interrompt en pleine pensée.",
+        "Cette réponse s’est arrêtée à sa limite de longueur.",
     );
     assert_probe(
         &entries,
@@ -10354,5 +10355,106 @@ fn a_proxy_bound_off_loopback_says_what_that_costs(cx: &mut TestAppContext) {
         warning.1.label
     );
 
+    probe::set_probes_enabled(false);
+}
+
+/// **A cut-off answer offers Continue exactly where it can be continued.** The
+/// verb rides the cut-off mark as a real button whose accessible name is the
+/// action in full, in the reader's language; an answer that stopped short but
+/// cannot be continued (its model is not one of Eidola's) carries the mark
+/// alone. An accepted press starts the continuation in place — "Continuing…"
+/// over the answer it extends — and the verb goes with the mutation it started,
+/// so nothing is left looking live.
+#[gpui::test]
+fn a_cut_off_answer_offers_continue_where_it_can_be_continued(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let agent = || PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    let mut continuable = probe_post("a1", "The tides are driven by");
+    continuable.action_type = "inference".into();
+    continuable.participant = agent();
+    continuable.truncated = true;
+    continuable.continuable = true;
+    let mut local = probe_post("a2", "A local model's answer that ran out of");
+    local.action_type = "inference".into();
+    local.parent_action_id = Some("a1".into());
+    local.participant = agent();
+    local.truncated = true;
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![continuable, local], cx)
+        });
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/0/continue",
+        gpui::Role::Button,
+        "Continue this answer from where it stopped",
+    );
+    assert_probe(
+        &entries,
+        "space/post/0/cut-off",
+        gpui::Role::Label,
+        "This answer stopped at its length limit.",
+    );
+    assert!(
+        entries.iter().any(|(n, _)| n == "space/post/1/cut-off"),
+        "the uncontinuable answer is still marked"
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n == "space/post/1/continue"),
+        "but offers no verb that could only be refused"
+    );
+
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/0/continue",
+        gpui::Role::Button,
+        "Poursuivre cette réponse là où elle s’est arrêtée",
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.continue_answer(&"a1".into(), &"a1".into(), window, cx)
+        });
+    })
+    .unwrap();
+    let seq = space.read_with(cx, |s, _| {
+        let seq = s
+            .revising_seq("a1")
+            .expect("the continuation is pending on its post");
+        assert!(
+            s.streams()
+                .iter()
+                .any(|t| t.seq == seq && t.revising && t.continuing),
+            "a revision that continues"
+        );
+        assert!(!s.accepts_mutation());
+        seq
+    });
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        &format!("space/streaming/{seq}/continuing"),
+        gpui::Role::Label,
+        "Poursuite de la réponse…",
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n.ends_with("/continue")),
+        "the verb is gone while its continuation runs"
+    );
     probe::set_probes_enabled(false);
 }

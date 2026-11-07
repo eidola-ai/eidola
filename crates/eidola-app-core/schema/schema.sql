@@ -582,6 +582,14 @@ CREATE TABLE action (
     -- inference may carry the flag.
     truncated       INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
 
+    -- A truncated generation whose text is exactly what the model generated
+    -- after its prompt, so it can be continued: sent back as a continued final
+    -- message, it renders that very text. The serving engine says so on the
+    -- ending (`continuable`); a parser that dropped an unfinished construct,
+    -- a lossy final character, or this app's own header strip makes it 0. Only
+    -- a truncated generation can carry it.
+    resumable       INTEGER NOT NULL DEFAULT 0 CHECK (resumable IN (0, 1)),
+
     intent          TEXT,
     model           TEXT,
 
@@ -596,6 +604,7 @@ CREATE TABLE action (
     -- is this row's own, and the referenced (action, item) pair must
     -- really exist — so a generation chain cannot hop items.
     CHECK (truncated = 0 OR action_type = 'inference'),
+    CHECK (resumable = 0 OR truncated = 1),
     CHECK ((supersedes_action_id IS NULL) = (supersedes_item_id IS NULL)),
     CHECK (supersedes_item_id IS NULL OR supersedes_item_id = item_id),
     FOREIGN KEY (supersedes_action_id, supersedes_item_id)

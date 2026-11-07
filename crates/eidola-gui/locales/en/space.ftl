@@ -51,10 +51,6 @@ space-footnote-delegation-failed = stopped: { $reason ->
 # word of the new answer arrives, so this is often the only thing on screen for
 # a long while — it says the request is out, not that anything is nearly done.
 space-regenerating = Regenerating…
-# Shown in the conversation's recovery notice when a response used its whole
-# length allowance on its own reasoning and never began an answer. Nothing was
-# recorded and nothing was replaced, so the answer already there is untouched.
-space-error-response-truncated = The model used its whole length allowance thinking and never started an answer. No answer was added or replaced — try again, or ask a shorter question.
 # Shown in the conversation's recovery notice when the model this turn would
 # have used is no longer in its backend's catalog — a row retired there, while
 # whoever answers here still names it. Two things carry the sentence, and both
@@ -71,8 +67,19 @@ space-error-model-unavailable = { $model } is no longer offered by its backend, 
 # the first one is still going, and its result will arrive here.
 space-regenerating-elsewhere = This response is already being regenerated.
 # A quiet marker beneath an answer that stopped because it reached its length
-# allowance rather than because the model was finished.
-space-answer-cut-off = This answer reached its length limit and stops mid-thought.
+# allowance rather than because the model was finished — reasoning that never
+# reached an answer included. Where the answer can be continued the marker
+# carries Continue beside it, so it states the fact and the way on is the verb.
+space-answer-cut-off = This answer stopped at its length limit.
+# The verb beside that marker: asks the same model to pick up exactly where the
+# answer stopped, mid-sentence or mid-thought, as a new version of the same
+# answer. Short, because it sits on the marker's line.
+space-continue-answer = Continue
+# What a screen reader announces for that verb — the action in full.
+space-continue-answer-label = Continue this answer from where it stopped
+# Shown above an answer while it is being continued, from the frame the press
+# was accepted in, until the continued text starts arriving.
+space-continuing = Continuing…
 # The source-highlight picker (src/space_view/references.rs): the popover that
 # opens when a clicked passage was quoted by more than one post, listing each
 # so the reader chooses the target rather than the app guessing.

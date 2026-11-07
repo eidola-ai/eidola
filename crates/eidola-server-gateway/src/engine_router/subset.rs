@@ -20,7 +20,7 @@
 //! the error is log-safe as well as client-facing.
 
 use eidola_common::engine_protocol::{
-    SubsetError, check_max_completion_tokens, check_stop, check_tool_choice,
+    SubsetError, check_continuation, check_max_completion_tokens, check_stop, check_tool_choice,
 };
 use serde::Deserialize;
 
@@ -45,6 +45,16 @@ pub fn check(request: &ValidatedRequest) -> Result<(), ServerError> {
         Some(StopSequence::Multiple(v)) => check_stop(v).map_err(refuse)?,
     }
     check_tool_choice(parsed.tool_choice.as_ref()).map_err(refuse)?;
+    check_continuation(
+        parsed
+            .continue_final_message
+            .as_ref()
+            .map(|c| c.to_value())
+            .as_ref(),
+        parsed.add_generation_prompt,
+        parsed.messages.last().map(|m| m.as_final()),
+    )
+    .map_err(refuse)?;
     check_sampling(parsed.temperature, parsed.top_p)
 }
 

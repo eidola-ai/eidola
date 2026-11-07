@@ -301,6 +301,11 @@ pub enum Call {
         model: Option<String>,
         space_id: Option<String>,
     },
+    /// `AppCore::continue_stream` — continue an answer that stopped at its
+    /// length limit, streamed like `chat.stream`: the text being continued
+    /// first, then what the model adds, with the finished
+    /// [`crate::ChatResult`] as its `end`.
+    ChatContinue { action_id: String },
 }
 
 /// Every verb this build serves, in the order they appear in [`Call`].
@@ -332,6 +337,7 @@ pub const VERBS: &[&str] = &[
     "update.check",
     "chat.default_model",
     "chat.stream",
+    "chat.continue",
 ];
 
 /// Parameters of `spaces.list`.
@@ -350,6 +356,12 @@ pub struct ChatStreamParams {
     pub model: Option<String>,
     #[serde(default)]
     pub space_id: Option<String>,
+}
+
+/// Parameters of `chat.continue`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatContinueParams {
+    pub action_id: String,
 }
 
 /// Parameters of `spaces.archive`.
@@ -436,6 +448,7 @@ impl Call {
             Call::UpdateCheck => "update.check",
             Call::ChatDefaultModel => "chat.default_model",
             Call::ChatStream { .. } => "chat.stream",
+            Call::ChatContinue { .. } => "chat.continue",
         }
     }
 
@@ -482,6 +495,7 @@ impl Call {
                 "model": model,
                 "space_id": space_id,
             }),
+            Call::ChatContinue { action_id } => serde_json::json!({ "action_id": action_id }),
         }
     }
 
@@ -654,6 +668,12 @@ impl Call {
                     prompt: p.prompt,
                     model: p.model,
                     space_id: p.space_id,
+                })
+            }
+            "chat.continue" => {
+                let p: ChatContinueParams = of(verb, params)?;
+                Ok(Call::ChatContinue {
+                    action_id: p.action_id,
                 })
             }
             other => Err(ProtocolError::UnknownVerb {
@@ -1103,10 +1123,6 @@ impl WireError {
             AppError::LocalModel { message } => ("LocalModel", json!({ "message": message })),
             AppError::Update { message } => ("Update", json!({ "message": message })),
             AppError::ToolLoop { message } => ("ToolLoop", json!({ "message": message })),
-            AppError::ResponseTruncated { output_tokens } => (
-                "ResponseTruncated",
-                json!({ "output_tokens": output_tokens }),
-            ),
             AppError::RegenerationInFlight { item_id } => {
                 ("RegenerationInFlight", json!({ "item_id": item_id }))
             }
@@ -1197,9 +1213,6 @@ impl WireError {
             "LocalModel" => AppError::LocalModel { message: msg() },
             "Update" => AppError::Update { message: msg() },
             "ToolLoop" => AppError::ToolLoop { message: msg() },
-            "ResponseTruncated" => AppError::ResponseTruncated {
-                output_tokens: i("output_tokens"),
-            },
             "RegenerationInFlight" => AppError::RegenerationInFlight {
                 item_id: s("item_id")?,
             },
@@ -1785,6 +1798,9 @@ mod tests {
                 model: Some("m@b".into()),
                 space_id: Some("sp".into()),
             },
+            Call::ChatContinue {
+                action_id: "a".into(),
+            },
         ];
         for call in &calls {
             let req = Request::new(1, call);
@@ -1920,12 +1936,6 @@ mod tests {
             AppError::NotAParticipant {
                 participant_id: "p".into(),
                 action_id: "a".into(),
-            },
-            AppError::ResponseTruncated {
-                output_tokens: Some(99),
-            },
-            AppError::ResponseTruncated {
-                output_tokens: None,
             },
             AppError::SpaceArchived {
                 space_id: "sp".into(),

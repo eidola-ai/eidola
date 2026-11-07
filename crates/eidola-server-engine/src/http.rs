@@ -207,6 +207,7 @@ async fn chat(state: Arc<AppState>, request: Request) -> Result<Response, ApiErr
         prompt_tokens,
         output,
         stop,
+        window_bound,
     } = prepared;
 
     let (guard, mut events) = state
@@ -226,23 +227,19 @@ async fn chat(state: Arc<AppState>, request: Request) -> Result<Response, ApiErr
         prompt_tokens,
     };
     let call_prefix = pipeline::random_id("call_");
+    let decoder =
+        Decoder::new(state.model.clone(), output, stop, call_prefix).window_bound(window_bound);
     let run = Run {
-        state,
+        _state: state,
         guard,
         events,
         response,
         cached_prompt_tokens: 0,
     };
     if stream {
-        Ok(stream_response(
-            run,
-            output,
-            stop,
-            call_prefix,
-            include_usage,
-        ))
+        Ok(stream_response(run, decoder, include_usage))
     } else {
-        complete_response(run, output, stop, call_prefix).await
+        complete_response(run, decoder).await
     }
 }
 
@@ -279,7 +276,8 @@ struct ResponseMeta {
 
 /// One admitted request in flight.
 struct Run {
-    state: Arc<AppState>,
+    /// Held for the life of the request, so the node it runs in outlives it.
+    _state: Arc<AppState>,
     guard: RequestGuard,
     events: mpsc::Receiver<Output>,
     response: ResponseMeta,
@@ -335,15 +333,9 @@ impl Run {
     }
 }
 
-async fn complete_response(
-    mut run: Run,
-    output: eidola_engine_chat::OutputConfig,
-    stop: Vec<String>,
-    call_prefix: String,
-) -> Result<Response, ApiError> {
-    let mut decoder = Decoder::new(run.state.model.clone(), output, stop, call_prefix);
+async fn complete_response(mut run: Run, mut decoder: Decoder) -> Result<Response, ApiError> {
     let mut all = ChatDelta::default();
-    let reason = loop {
+    let (reason, continuable) = loop {
         match run.next(&mut decoder).await {
             Polled::Step(step) => {
                 all.reasoning_content
@@ -351,7 +343,7 @@ async fn complete_response(
                 all.content.push_str(&step.delta.content);
                 all.tool_calls.extend(step.delta.tool_calls);
                 if let Some(reason) = step.finish {
-                    break reason;
+                    break (reason, step.continuable);
                 }
             }
             Polled::Failed(e) => return Err(e),
@@ -383,10 +375,21 @@ async fn complete_response(
         "object": "chat.completion",
         "created": r.created,
         "model": r.model,
-        "choices": [{"index": 0, "message": message, "finish_reason": reason.as_str()}],
+        "choices": [finish_choice(json!({"index": 0, "message": message, "finish_reason": reason.as_str()}), continuable)],
         "usage": usage(r.prompt_tokens, decoder.completion_tokens(), run.cached_prompt_tokens),
     }))
     .into_response())
+}
+
+/// A finishing choice, carrying `continuable` on a `length` ending: whether the
+/// reasoning and content it gave out can be sent back as a continued final message
+/// that renders exactly the text the model generated (`OutputParser::resumes_exactly`).
+/// A client offers continuation only where it is `true`.
+fn finish_choice(mut choice: Value, continuable: Option<bool>) -> Value {
+    if let Some(c) = continuable {
+        choice["continuable"] = Value::Bool(c);
+    }
+    choice
 }
 
 fn chunk(r: &ResponseMeta, choices: Value, usage: Option<Value>) -> Event {
@@ -407,13 +410,7 @@ fn chunk(r: &ResponseMeta, choices: Value, usage: Option<Value>) -> Event {
 /// (`choices: []`) when `stream_options.include_usage`, then `[DONE]`. Dropping the
 /// stream (the client went away) drops the request's guard, which cancels it in the
 /// engine.
-fn stream_response(
-    run: Run,
-    output: eidola_engine_chat::OutputConfig,
-    stop: Vec<String>,
-    call_prefix: String,
-    include_usage: bool,
-) -> Response {
+fn stream_response(run: Run, decoder: Decoder, include_usage: bool) -> Response {
     struct S {
         run: Run,
         decoder: Decoder,
@@ -421,7 +418,6 @@ fn stream_response(
         finished: bool,
         include_usage: bool,
     }
-    let decoder = Decoder::new(run.state.model.clone(), output, stop, call_prefix);
     let state = S {
         run,
         decoder,
@@ -456,7 +452,10 @@ fn stream_response(
                 if let Some(reason) = step.finish {
                     out.push(chunk(
                         &s.run.response,
-                        json!([{"index": 0, "delta": {}, "finish_reason": reason.as_str()}]),
+                        json!([finish_choice(
+                            json!({"index": 0, "delta": {}, "finish_reason": reason.as_str()}),
+                            step.continuable
+                        )]),
                         None,
                     ));
                     if s.include_usage {

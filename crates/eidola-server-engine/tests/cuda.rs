@@ -13,7 +13,9 @@
 //! With a device (`EIDOLA_TEST_CUDA_WEIGHTS` and `EIDOLA_ENGINE_KERNELS_DIR`): the node
 //! booted on real MiMo-V2.6-Flash weights answers a chat request end to end, and its
 //! output equals, token for token, the engine core driven directly over a CUDA executor
-//! built from the same configuration.
+//! built from the same configuration; and a generation cut off at a small ceiling, in its
+//! reasoning and in its answer, continues into exactly the uninterrupted output, served
+//! from the prefix the cut-off request cached.
 
 #![cfg(feature = "cuda")]
 
@@ -500,6 +502,7 @@ async fn real_flash_serves_what_the_executor_computes() {
                 RenderOptions {
                     add_generation_prompt: true,
                     enable_thinking: None,
+                    continue_final_message: None,
                 },
             )
             .unwrap();
@@ -578,4 +581,201 @@ async fn real_flash_serves_what_the_executor_computes() {
     assert_eq!(node_content, delta.content);
     assert_eq!(node_finish, finish);
     assert_eq!(node_completion, completion);
+}
+
+/// **A continuation on the real model resumes exactly where its generation stopped.**
+/// Greedy request A runs to its end; B is A cut off at a small ceiling, once inside the
+/// reasoning and once inside the answer; C continues B (`continue_final_message`: the
+/// reasoning while B had no answer, the answer after, with `add_generation_prompt:
+/// false`). Greedy decoding over a batch-invariant engine makes B's text joined to C's
+/// equal A's byte for byte, and C under B's cache key is served from the prefix B left:
+/// at least everything B fed the engine up to its last sealed block. Same environment as
+/// [`real_flash_serves_what_the_executor_computes`]; skipped without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn real_flash_continues_a_cut_off_generation_exactly() {
+    let (Some(weights), Some(kernels)) = (
+        std::env::var_os("EIDOLA_TEST_CUDA_WEIGHTS"),
+        std::env::var_os("EIDOLA_ENGINE_KERNELS_DIR"),
+    ) else {
+        eprintln!(
+            "skipped: set EIDOLA_TEST_CUDA_WEIGHTS and EIDOLA_ENGINE_KERNELS_DIR to run on a GPU"
+        );
+        return;
+    };
+    let weights = PathBuf::from(weights);
+    let hash = match std::env::var("EIDOLA_TEST_CUDA_WEIGHTS_SHA256") {
+        Ok(h) => h.to_ascii_lowercase(),
+        Err(_) => fixture::weights_hash_of(&weights),
+    };
+    let mut map = cuda_env(&weights, &hash);
+    map.insert(
+        env::KERNELS_DIR,
+        PathBuf::from(kernels).display().to_string(),
+    );
+    map.insert(env::KV_DEVICE_BYTES, (32u64 << 30).to_string());
+    map.insert(env::MAX_MODEL_LEN, "4096".into());
+    let config = config_from(&map).unwrap();
+    let block = u64::from(config.sizing.kv_block_size);
+    let model = {
+        let (w, h) = (weights.clone(), hash.clone());
+        tokio::task::spawn_blocking(move || {
+            eidola_server_engine::model::LoadedModel::load(
+                &w,
+                &h,
+                WeightsStorage::DevWritable,
+                ExecutorKind::Cuda,
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap()
+    };
+    let model = Arc::new(model);
+    let node = {
+        let model = model.clone();
+        tokio::task::spawn_blocking(move || eidola_server_engine::start(config, model))
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    let engine_stopped = node.engine_stopped;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = node.router;
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = http_client();
+
+    let question = "Why is the sky blue? Explain in two short sentences.";
+    let n: u64 = 1024;
+    let send = |body: Value| {
+        let request = client
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(TOKEN)
+            .header("x-eidola-weights-sha256", &hash)
+            .json(&body);
+        async move {
+            let r = request.send().await.unwrap();
+            let status = r.status().as_u16();
+            let v: Value = r.json().await.unwrap();
+            assert_eq!(status, 200, "{v}");
+            v
+        }
+    };
+    let text_of = |v: &Value, key: &str| {
+        v["choices"][0]["message"][key]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    let key = |byte: u8| {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32])
+    };
+
+    // A: the whole answer, greedy, with no key so it shares nothing with B or C.
+    let a = send(json!({
+        "model": MODEL_ID,
+        "messages": [{"role": "user", "content": question}],
+        "max_completion_tokens": n,
+        "temperature": 0.0,
+    }))
+    .await;
+    eprintln!("A: {a}");
+    assert_eq!(
+        a["choices"][0]["finish_reason"], "stop",
+        "A must finish: {a}"
+    );
+    let (a_reasoning, a_content) = (text_of(&a, "reasoning_content"), text_of(&a, "content"));
+    let a_prompt = a["usage"]["prompt_tokens"].as_u64().unwrap();
+    let reasoning_tokens = model.tokenizer().encode(&a_reasoning).unwrap().len() as u64;
+    let content_tokens = model.tokenizer().encode(&a_content).unwrap().len() as u64;
+    assert!(
+        reasoning_tokens >= 8 && content_tokens >= 8,
+        "A needs reasoning and an answer to cut inside: {reasoning_tokens}/{content_tokens}"
+    );
+
+    // Generated tokens are `<think>`, the reasoning, `</think>`, the answer: cut in the
+    // middle of the reasoning, then in the middle of the answer.
+    let cuts = [
+        ("reasoning", 1 + reasoning_tokens / 2, 1u8),
+        ("answer", 2 + reasoning_tokens + content_tokens / 2, 2u8),
+    ];
+    for (place, k, key_byte) in cuts {
+        let cache_key = key(key_byte);
+        let b = send(json!({
+            "model": MODEL_ID,
+            "messages": [{"role": "user", "content": question}],
+            "max_completion_tokens": k,
+            "temperature": 0.0,
+            "cache_key": cache_key,
+        }))
+        .await;
+        eprintln!("B ({place}, k={k}): {b}");
+        assert_eq!(b["choices"][0]["finish_reason"], "length", "{place}: {b}");
+        assert_eq!(
+            b["choices"][0]["continuable"], true,
+            "{place}: a clean cut says it can be continued exactly: {b}"
+        );
+        let (b_reasoning, b_content) = (text_of(&b, "reasoning_content"), text_of(&b, "content"));
+        let field = match place {
+            "reasoning" => {
+                assert!(b_content.is_empty(), "the cut is inside the reasoning: {b}");
+                json!("reasoning_content")
+            }
+            _ => {
+                assert!(!b_content.is_empty(), "the cut is inside the answer: {b}");
+                json!(true)
+            }
+        };
+
+        let c = send(json!({
+            "model": MODEL_ID,
+            "messages": [
+                {"role": "user", "content": question},
+                {"role": "assistant", "reasoning_content": b_reasoning, "content": b_content},
+            ],
+            "max_completion_tokens": n - k,
+            "temperature": 0.0,
+            "add_generation_prompt": false,
+            "continue_final_message": field,
+            "cache_key": cache_key,
+        }))
+        .await;
+        eprintln!("C ({place}): {c}");
+        assert_eq!(c["choices"][0]["finish_reason"], "stop", "{place}: {c}");
+        assert_eq!(
+            format!("{b_reasoning}{}", text_of(&c, "reasoning_content")),
+            a_reasoning,
+            "{place}: the reasoning resumes exactly"
+        );
+        assert_eq!(
+            format!("{b_content}{}", text_of(&c, "content")),
+            a_content,
+            "{place}: the answer resumes exactly"
+        );
+
+        // B fed the engine its prompt and all but its last sampled token; the
+        // continuation is served from B's last sealed block at least.
+        let cached = c["usage"]["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap();
+        let c_prompt = c["usage"]["prompt_tokens"].as_u64().unwrap();
+        let sealed = (a_prompt + k - 1) / block * block;
+        eprintln!("{place}: cached {cached} of {c_prompt}; B sealed {sealed}");
+        assert!(c_prompt >= a_prompt + k - 1, "{place}: {c_prompt}");
+        assert!(
+            cached >= sealed,
+            "{place}: {cached} cached, expected at least {sealed}"
+        );
+    }
+
+    drop(client);
+    server.abort();
+    let _ = server.await;
+    drop(node.engine);
+    drop(node.admission);
+    tokio::time::timeout(Duration::from_secs(120), engine_stopped)
+        .await
+        .expect("the engine thread stops once nothing can reach it")
+        .ok();
 }

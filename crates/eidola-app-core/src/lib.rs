@@ -33,6 +33,7 @@ use anonymous_credit_tokens::{
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use eidola_common::engine_protocol::ContinueField;
 use rand_core::OsRng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -902,12 +903,19 @@ pub struct ChatResult {
     /// where the completion ceiling bound it, not where the model was done.
     ///
     /// The turn is otherwise ordinary: the partial answer is real text a reader
-    /// wants, so it is kept and persisted like any other. What must not happen
-    /// is calling it finished, which is why this rides the result rather than
-    /// being inferred by a surface counting tokens. A turn cut off *before any
-    /// answer text* never reaches here at all — that is
-    /// [`AppError::ResponseTruncated`], and it writes no generation.
+    /// wants, so it is kept and persisted like any other — and so is a turn cut
+    /// off before any answer text, whose reasoning is the work a continuation
+    /// resumes. What must not happen is calling it finished, which is why this
+    /// rides the result rather than being inferred by a surface counting
+    /// tokens.
     pub truncated: bool,
+    /// The answer this turn wrote can be continued ([`AppCore::continue_stream`])
+    /// — decided by the predicate the door applies, the one
+    /// [`PostNode::continuable`] reads, so a caller that suggests continuing
+    /// never suggests what the door refuses. Defaulted on the wire, so an older
+    /// app's result reads as not continuable.
+    #[serde(default)]
+    pub continuable: bool,
 }
 
 /// A turn that ended at the agent-side decline checkpoint (see [`decline`]).
@@ -947,6 +955,14 @@ pub enum ResponseMode {
     /// A new *generation* of the target's item (regenerate / agent revise):
     /// shares the target's `item_id`, supersedes it, replicates its reply edge.
     Revise,
+    /// A new generation of the target's item that **continues** it: attached
+    /// exactly as a `Revise` is, with the context a `Revise` is given, but the
+    /// request ends with the target's own reasoning and answer as a partial
+    /// assistant message the model is asked to continue
+    /// (`continue_final_message`), and the generation written is the target's
+    /// text followed by what the model added. The target is an answer that
+    /// stopped at its completion ceiling ([`AppCore::continue_stream`]).
+    Continue,
 }
 
 /// Which participant should respond in a turn — the Participants-v1 input that
@@ -1519,6 +1535,14 @@ pub struct PostNode {
     /// because it was done — the durable fact a render marks the post with.
     /// Never true for a post that was not inferred.
     pub truncated: bool,
+    /// This generation can be continued ([`AppCore::continue_stream`]) — by
+    /// the predicate the door itself applies (`continuation_basis`: it stopped
+    /// at its ceiling, its model is one whose server honours a continuation,
+    /// its author still answers in this space with that model, and the request
+    /// it was written to is in the Record whole), so a surface offers the verb
+    /// exactly where it would work. Settled by `get_space_tree`; the pure tree
+    /// build sets only the row-level half.
+    pub continuable: bool,
     /// Edge relation to the structural parent (`reply`); `None` for a root.
     pub relation: Option<String>,
     /// Indent level: `0` is the spine; `> 0` is an indented branch.
@@ -3804,7 +3828,18 @@ impl Inner {
                 message: format!("space not found: {space_id}"),
             })?;
         let data = db::get_space_tree_data(&db_conn, space_id).await?;
-        Ok(build_post_tree(data))
+        let mut tree = build_post_tree(data);
+        // `continuable` as the door decides it: the tree's own rows say which
+        // posts are candidates (truncated answers from Eidola's models), and
+        // the door's predicate settles each — its author still answering here
+        // with that model, its request in the Record whole. Only candidates are
+        // asked, so a tree with no cut-off answer reads nothing more.
+        for node in tree.iter_mut().filter(|n| n.continuable) {
+            node.continuable = continuation_basis(&db_conn, space_id, &node.action_id)
+                .await?
+                .is_some();
+        }
+        Ok(tree)
     }
 
     /// [`Self::references_to`], filtered to the referring posts
@@ -6338,6 +6373,33 @@ impl Inner {
         };
         let model = canonical_model.as_str();
 
+        // **A continuation is asked of the model that wrote what it continues,
+        // and refused before anything acts if it cannot be.** The generation is
+        // read here, beside the model the turn resolved to, so every refusal
+        // costs one query: the request it would send ends inside that model's
+        // own output, which only means something to that model, and only an
+        // Eidola engine is known to honour `continue_final_message` (a server
+        // that ignored it would answer the partial message with a new turn,
+        // written after it as though it were part of the same answer).
+        // The predicate is `continuation_basis`, the one `PostNode::continuable`
+        // reads, so a refusal here is never a verb a surface offered.
+        let continuation_basis = match mode {
+            ResponseMode::Continue => {
+                let basis = continuation_basis(&db_conn, space_id, target_action_id)
+                    .await?
+                    .filter(|b| backend_kind == BackendKind::Eidola && b.model == model)
+                    .ok_or_else(|| AppError::WrongPostKind {
+                        message: "this answer cannot be continued: only an answer that stopped \
+                                  at its length limit, from one of Eidola's models, whose author \
+                                  still answers here with that model and whose request the \
+                                  Record kept whole, can be"
+                            .into(),
+                    })?;
+                Some(basis)
+            }
+            ResponseMode::Reply | ResponseMode::Revise => None,
+        };
+
         let mut engine_lease: Option<local_models::EngineLease> = None;
         let (
             provider_id,
@@ -6349,6 +6411,7 @@ impl Inner {
             external_auth,
             tool_policy,
             cache_scope,
+            declared_max_output,
         ) = match backend_kind {
             BackendKind::Local | BackendKind::LlamaCpp => {
                 // A request *is* the load trigger: an unloaded engine is
@@ -6401,6 +6464,7 @@ impl Inner {
                     None,
                     ToolPolicy::Learned,
                     None,
+                    None,
                 )
             }
             BackendKind::OpenAi => {
@@ -6415,7 +6479,7 @@ impl Inner {
                 let client = self.completion_client()?;
                 let auth = backend.api_key.as_ref().map(|k| format!("Bearer {k}"));
                 // Context length is unknown for a generic server — 0
-                // resolves to the 4096 completion default below.
+                // resolves to the fallback completion ceiling below.
                 (
                     provider_id,
                     client,
@@ -6425,6 +6489,7 @@ impl Inner {
                     None,
                     auth,
                     ToolPolicy::Learned,
+                    None,
                     None,
                 )
             }
@@ -6499,6 +6564,9 @@ impl Inner {
                             policy,
                             trust_domain: eidola.cache_trust_domain(),
                         }),
+                    // The largest completion the catalog says this model may
+                    // be asked for — what the turn's ceiling is, below.
+                    model_entry.max_output_tokens,
                 )
             }
         };
@@ -6536,11 +6604,7 @@ impl Inner {
             ToolPolicy::Learned => !self.model_rejects_tools(&backend.id, &wire_model),
         };
 
-        let max_completion_tokens = if context_length == 0 {
-            4096
-        } else {
-            context_length.min(4096) as u32
-        };
+        let max_completion_tokens = completion_ceiling(declared_max_output, context_length);
 
         // The target (the post being replied to / the generation being revised)
         // must belong to this space — otherwise a caller could splice another
@@ -6605,7 +6669,7 @@ impl Inner {
                 None,
                 Some(target_action_id.to_string()),
             ),
-            ResponseMode::Revise => {
+            ResponseMode::Revise | ResponseMode::Continue => {
                 let (item_id, _sp) = db::action_item_and_space(&db_conn, target_action_id)
                     .await?
                     .ok_or_else(|| AppError::NotConfigured {
@@ -6630,12 +6694,15 @@ impl Inner {
         // thread, exactly the target's branch on a branched space (sibling
         // branches never leak into the context); a Revise (regenerate) walks
         // from the generation being replaced *exclusive*, so the model never
-        // sees its own prior output or anything downstream of it.
+        // sees its own prior output or anything downstream of it. A Continue
+        // walks the same thread a Revise does — the conversation the target
+        // answered — and gets the target back as the partial message it
+        // continues, below, rather than as a post in the transcript.
         let mut context_rows: Vec<db::SpaceActionRow> = match mode {
             ResponseMode::Reply => {
                 db::get_upstream_context(&db_conn, target_action_id, true).await?
             }
-            ResponseMode::Revise => {
+            ResponseMode::Revise | ResponseMode::Continue => {
                 db::get_upstream_context(&db_conn, target_action_id, false).await?
             }
         };
@@ -6684,8 +6751,10 @@ impl Inner {
         // withholds the generation being replaced from the context, so without
         // this the model would be asked to re-word a report on a finding it was
         // never shown.
+        // A continuation carries them forward for the same reasons: it is the
+        // same answer, finished.
         let mut attached = directive.attached.clone();
-        if mode == ResponseMode::Revise {
+        if matches!(mode, ResponseMode::Revise | ResponseMode::Continue) {
             for r in db::reference_antecedents(&db_conn, target_action_id).await? {
                 attached.push(AttachedReference {
                     // The ordinal it already had — stable across generations,
@@ -6748,8 +6817,10 @@ impl Inner {
         // A Revise turn must not learn about the generation it replaces (nor
         // anything downstream of it) — the same rule `get_upstream_context`
         // applies to the messages, applied to the map.
+        // A Continue is shown the map its target was shown, which did not yet
+        // hold the target.
         let map_exclude = match mode {
-            ResponseMode::Revise => Some(target_action_id),
+            ResponseMode::Revise | ResponseMode::Continue => Some(target_action_id),
             ResponseMode::Reply => None,
         };
         let forks = thread.spine_forks(&spine, map_exclude);
@@ -7053,6 +7124,54 @@ impl Inner {
             messages.push(serde_json::json!({"role": "user", "content": trailing}));
         }
 
+        // ---- The continued answer ------------------------------------------
+        //
+        // **A continuation sends the request its target was written to, as it
+        // was sent**, followed by the target's own output as the final message
+        // (`continuation_basis`). Not the conversation as it stands now: an
+        // edit to a post the answer answered, a renamed participant, a new
+        // branch on the map or a changed charter would have the model continue
+        // an answer to one prompt while reading another, and would lose the
+        // prefix the engine cached for that request. The context assembled
+        // above is therefore not what this turn sends; it still supplies the
+        // tools a continued round can call, and the attached references the
+        // new generation carries forward. The record of what was fed is the
+        // target's own, plus the target.
+        //
+        // The partial message is the model's own text, exactly: no header line,
+        // nothing quoted. The answer is continued once there is any; before
+        // there is, the reasoning is, and the prompt ends inside an open
+        // reasoning block. Reasoning is otherwise never sent upstream — this is
+        // the one message whose reasoning the model reads, because it is the
+        // model's own unfinished thought.
+        let mut continued_tools: Option<Vec<serde_json::Value>> = None;
+        let continuation = match continuation_basis {
+            None => None,
+            Some(basis) => {
+                messages = basis.messages;
+                context_action_ids = basis.context_action_ids;
+                continued_tools = Some(basis.tools);
+                let field = if basis.text.is_empty() {
+                    ContinueField::ReasoningContent
+                } else {
+                    ContinueField::Content
+                };
+                messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "reasoning_content": basis.thinking,
+                    "content": basis.text,
+                }));
+                if !context_action_ids.iter().any(|id| id == target_action_id) {
+                    context_action_ids.push(target_action_id.to_string());
+                }
+                Some(Continuation {
+                    field,
+                    reasoning: basis.thinking,
+                    content: basis.text,
+                })
+            }
+        };
+
         // Snapshot the tool registry for this turn (see `tools`). An empty
         // registry sends no `tools` field at all, so today's requests stay
         // byte-identical.
@@ -7160,7 +7279,9 @@ impl Inner {
         // rejects the tools field, `withdraw_auto_tools` re-derives this
         // array from the restored registry so the retry's estimate and body
         // agree again.
-        let tool_schemas = tool_registry.schemas();
+        // A continuation offers the tools its target's request offered, as
+        // that request spelled them, so its prefix is that request's.
+        let tool_schemas = continued_tools.unwrap_or_else(|| tool_registry.schemas());
 
         // The spend side runs only for eidola turns. Local and external
         // turns carry no charge estimate, no credential, and no ACT header
@@ -7207,6 +7328,7 @@ impl Inner {
             wire_model,
             model_participant_id,
             max_completion_tokens,
+            continuation,
             inf_item_id,
             inf_supersedes,
             inf_reply_to,
@@ -7291,6 +7413,7 @@ impl Inner {
             // caller can mistake it for one and cascade off it.
             response_action_id: None,
             truncated: false,
+            continuable: false,
             declined: Some(DeclineOutcome {
                 reason,
                 action_id: decision_id,
@@ -7465,6 +7588,19 @@ impl Inner {
         Ok(())
     }
 
+    /// [`ChatResult::continuable`], from the door's own predicate: only an
+    /// answer that stopped at its ceiling is asked about, so an ordinary turn
+    /// reads nothing more.
+    async fn settle_continuable(&self, mut result: ChatResult) -> Result<ChatResult, AppError> {
+        if let (true, Some(id)) = (result.truncated, result.response_action_id.as_deref()) {
+            let db_conn = self.db_conn().await?;
+            result.continuable = continuation_basis(&db_conn, &result.space_id, id)
+                .await?
+                .is_some();
+        }
+        Ok(result)
+    }
+
     /// Has this endpoint rejected a request carrying a `tools` field during
     /// this process's lifetime? See the gate in `prepare_turn` for why this is
     /// learned rather than assumed from the backend's kind, and why the
@@ -7606,7 +7742,7 @@ impl Inner {
                     // The turn is committed and emitted; a branch that grew by
                     // this response is summarized behind it (see [`summaries`]).
                     self.spawn_branch_summaries(&result.space_id);
-                    return Ok(result);
+                    return self.settle_continuable(result).await;
                 }
                 RoundOutcome::ToolRound => continue,
             }
@@ -7625,47 +7761,6 @@ impl Inner {
     ///
     /// Emissions stay here, at the transport's exit points — extracting the
     /// round from `run_turn` moved the code, not the contract.
-    /// End a round that reached the completion ceiling **before writing any
-    /// answer** — shared by both transports so they cannot disagree about what
-    /// a truncation costs.
-    ///
-    /// Nothing is persisted as an action. That is the point: an `inference`
-    /// written here would be a current generation with no readable content —
-    /// a reply could attach beneath it, a regeneration would have replaced a
-    /// real answer with it, and every surface would call it complete. The raw
-    /// exchange still lands in the Record attached to no action (the same shape
-    /// a structurally unusable tool call takes), so the forensic trail keeps
-    /// the reasoning the model did produce and the `finish_reason` that
-    /// explains it.
-    ///
-    /// The credential is already settled by the caller — the tokens were spent
-    /// whether or not they became an answer — so the emissions here are the
-    /// unattached-request pair, and the error carries the ceiling it hit.
-    #[allow(clippy::too_many_arguments)]
-    async fn end_round_truncated(
-        &self,
-        prep: &TurnPrep,
-        output_tokens: Option<i64>,
-        request_body_json: &serde_json::Value,
-        request_at: i64,
-        response_at: i64,
-        http_status: u16,
-        response_body: Vec<u8>,
-    ) -> Result<RoundOutcome, AppError> {
-        prep.insert_unattached_request(
-            request_body_json,
-            request_at,
-            response_at,
-            http_status,
-            response_body,
-            None,
-        )
-        .await?;
-        self.bus.emit(Change::Space(prep.space_id.clone()));
-        self.bus.emit(Change::Record);
-        Err(AppError::ResponseTruncated { output_tokens })
-    }
-
     async fn run_turn_round(
         &self,
         prep: &mut TurnPrep,
@@ -7842,14 +7937,19 @@ impl Inner {
 
         // Strip-on-receipt: a model that mimicked the per-message header
         // scaffolding gets that line removed before it is persisted or
-        // reported (see `strip_leading_header`).
-        let response_content = strip_leading_header(
-            message
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or(""),
-        )
-        .to_string();
+        // reported (see `strip_leading_header`). Not from the rest of an
+        // answer a continuation resumes: its first line is mid-answer.
+        let raw_content = message
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        let response_content = if prep.continues_an_answer() {
+            raw_content.to_string()
+        } else {
+            strip_leading_header(raw_content).to_string()
+        };
+        // The stored text is the generated text only if the strip took nothing.
+        let text_is_generated = response_content == raw_content;
 
         // The blocking twin of the streaming path's reasoning capture: the
         // same two non-standard spellings, on the aggregated `message` object
@@ -7893,6 +7993,10 @@ impl Inner {
 
         if !tool_calls.is_empty() {
             // --- a tool round -------------------------------------------
+            // A continuation that turned into a tool call wrote its narration
+            // after the text it continued, so that is the round's narration.
+            let (response_reasoning, response_content) =
+                prep.round_text(&response_reasoning, &response_content);
             prep.persist_tool_call_action(
                 &tool_calls,
                 &response_reasoning,
@@ -7982,23 +8086,27 @@ impl Inner {
         // (so a reopened space still shows the mark) and returned on
         // `ChatResult` (so the window marking the live turn cannot disagree
         // with the row it will reload).
+        //
+        // **Every ending at the ceiling is written, whatever it holds.** An
+        // answer cut off mid-sentence, reasoning that never reached an answer,
+        // and output with nothing visible in it are one fact — the model was
+        // still going — and each is a generation a reader can continue,
+        // regenerate, or switch away from (the generation it superseded stays
+        // one step back in the switcher).
         let truncated = stopped_at_ceiling(finish_reason.as_deref());
-
-        if status.is_success()
-            && truncated_before_any_answer(finish_reason.as_deref(), &response_content)
-        {
-            return self
-                .end_round_truncated(
-                    prep,
-                    output_tokens,
-                    &request_body_json,
-                    request_at,
-                    response_at,
-                    status.as_u16(),
-                    response_record.clone(),
-                )
-                .await;
-        }
+        // **Continuable only when the text written is exactly what the model
+        // generated**: the engine says so of its own output (`continuable` on
+        // the ending — a parser that dropped an unfinished construct or a lossy
+        // final character makes it false, and a server that does not say so is
+        // never trusted), and this side's header strip must have taken nothing.
+        let resumable = truncated && choice_continuable(&body) == Some(true) && text_is_generated;
+        // The generation a successful continuation writes is the continued
+        // text; a refused one wrote nothing of it.
+        let (response_reasoning, response_content) = if status.is_success() {
+            prep.round_text(&response_reasoning, &response_content)
+        } else {
+            (response_reasoning, response_content)
+        };
 
         #[cfg(feature = "test-support")]
         if prep.mechanical {
@@ -8012,6 +8120,7 @@ impl Inner {
                     "error"
                 },
                 truncated,
+                resumable,
                 input_tokens,
                 output_tokens,
                 &response_reasoning,
@@ -8038,6 +8147,7 @@ impl Inner {
                 response_action_id: None,
                 declined: None,
                 truncated,
+                continuable: false,
             }));
         }
 
@@ -8081,6 +8191,7 @@ impl Inner {
             response_action_id,
             declined: None,
             truncated,
+            continuable: false,
         }))
     }
 
@@ -8166,6 +8277,7 @@ impl Inner {
     async fn begin_regeneration(
         &self,
         action_id: &str,
+        refusal: &str,
     ) -> Result<(String, String, RegenerationGuard), AppError> {
         let db_conn = self.db_conn().await?;
         let (item_id, space_id) = db::action_item_and_space(&db_conn, action_id)
@@ -8203,16 +8315,81 @@ impl Inner {
         // renders in the assistant slot, so a surface offering Regenerate by
         // role would offer it): the brief is the contract the room is working
         // from, and there is no attempt to repeat.
-        require_post_kind(
-            &db_conn,
-            &tip,
-            "inference",
-            "only an agent's answer can be regenerated",
-        )
-        .await?;
+        require_post_kind(&db_conn, &tip, "inference", refusal).await?;
         drop(db_conn);
 
         Ok((space_id, tip, guard))
+    }
+
+    /// Continue an answer that stopped at its completion ceiling: a new
+    /// generation of its item, written by the participant that wrote it, whose
+    /// text is the answer's followed by what the model adds when asked to pick
+    /// up exactly where it stopped ([`ResponseMode::Continue`]).
+    ///
+    /// **It is a regeneration in everything but its context**, and takes
+    /// regeneration's door: the same target resolution (any generation of the
+    /// item names its current one), the same human gate, the same process-wide
+    /// claim — a continuation supersedes the tip as a regeneration does, so the
+    /// two must not run against one item at once, and a second press is
+    /// [`AppError::RegenerationInFlight`] before it spends — and the same kind
+    /// gate. What it adds is decided where the generation is read
+    /// (`prepare_turn`): the tip must have stopped at its ceiling, on Eidola's
+    /// backend, and its author must still answer with the model that wrote it.
+    async fn continue_stream(
+        &self,
+        action_id: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, AppError> {
+        let (space_id, tip, author, _guard) = self.begin_continuation(action_id).await?;
+        self.run_turn_stream(
+            &space_id,
+            TurnSelector::Participant(author),
+            &tip,
+            ResponseMode::Continue,
+            None,
+            &TurnDirective::default(),
+            sender,
+        )
+        .await
+    }
+
+    /// The blocking twin of [`Self::continue_stream`], as [`Self::regenerate`]
+    /// is of its streaming door: the same gates and the same context, one
+    /// JSON body.
+    async fn continue_answer(&self, action_id: &str) -> Result<ChatResult, AppError> {
+        let (space_id, tip, author, _guard) = self.begin_continuation(action_id).await?;
+        self.run_turn(
+            &space_id,
+            TurnSelector::Participant(author),
+            &tip,
+            ResponseMode::Continue,
+            None,
+            &TurnDirective::default(),
+        )
+        .await
+    }
+
+    /// Regeneration's door ([`Self::begin_regeneration`]), plus the author
+    /// of the generation it found: a continuation is written by whoever wrote
+    /// what it continues.
+    async fn begin_continuation(
+        &self,
+        action_id: &str,
+    ) -> Result<(String, String, String, RegenerationGuard), AppError> {
+        let (space_id, tip, guard) = self
+            .begin_regeneration(action_id, "only an agent's answer can be continued")
+            .await?;
+        // Asked here as well as in `prepare_turn`, so an author who has left
+        // the space is refused as what it is — an answer this door cannot
+        // continue — rather than as a participant resolution failing later.
+        let db_conn = self.db_conn().await?;
+        let author = continuation_basis(&db_conn, &space_id, &tip)
+            .await?
+            .ok_or_else(|| AppError::WrongPostKind {
+                message: "this answer cannot be continued".into(),
+            })?
+            .participant_id;
+        Ok((space_id, tip, author, guard))
     }
 
     /// Regenerate an inference: append a new generation of its item (agent
@@ -8220,7 +8397,9 @@ impl Inner {
     /// model-picker compat path (`TurnSelector::Model`), so the same agent
     /// participant (matched by model) authors the new generation.
     async fn regenerate(&self, action_id: &str, model: &str) -> Result<ChatResult, AppError> {
-        let (space_id, tip, _guard) = self.begin_regeneration(action_id).await?;
+        let (space_id, tip, _guard) = self
+            .begin_regeneration(action_id, "only an agent's answer can be regenerated")
+            .await?;
         self.run_turn(
             &space_id,
             TurnSelector::Model(model.to_string()),
@@ -8239,8 +8418,8 @@ impl Inner {
     /// after the release has already happened is not left waiting for an event
     /// that is over. Otherwise it holds until the guard drops, **however the
     /// turn ended**: the sender's liveness is the claim, so a success, a
-    /// network error, a `ResponseTruncated` and a panicked task all release and
-    /// announce in the same act.
+    /// network error, a refusal and a panicked task all release and announce in
+    /// the same act.
     async fn regeneration_settled(&self, item_id: &str) {
         let subscription = {
             let registry = self
@@ -8272,7 +8451,9 @@ impl Inner {
         model: &str,
         sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
     ) -> Result<ChatResult, AppError> {
-        let (space_id, tip, _guard) = self.begin_regeneration(action_id).await?;
+        let (space_id, tip, _guard) = self
+            .begin_regeneration(action_id, "only an agent's answer can be regenerated")
+            .await?;
         self.run_turn_stream(
             &space_id,
             TurnSelector::Model(model.to_string()),
@@ -8348,6 +8529,22 @@ impl Inner {
         ))
         .await?;
 
+        // **A continuation's stream begins with the text it continues.** The
+        // generation being written is the target's text followed by what the
+        // model adds, so a consumer that accumulates the stream — a window
+        // drawing it in place, a terminal printing it — ends holding exactly
+        // that generation without having to find the target's text itself.
+        if let Some(continuation) = &prep.continuation {
+            if !continuation.reasoning.is_empty() {
+                let _ = sender.send(ChatStreamEvent::ReasoningDelta(
+                    continuation.reasoning.clone(),
+                ));
+            }
+            if !continuation.content.is_empty() {
+                let _ = sender.send(ChatStreamEvent::ContentDelta(continuation.content.clone()));
+            }
+        }
+
         for round in 1..=MAX_TURN_ROUNDS {
             let mut outcome = Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await;
             // Degrade-on-rejection — see the blocking twin. A rejected request
@@ -8368,7 +8565,7 @@ impl Inner {
                     // The turn is committed and emitted; a branch that grew by
                     // this response is summarized behind it (see [`summaries`]).
                     self.spawn_branch_summaries(&result.space_id);
-                    return Ok(result);
+                    return self.settle_continuable(result).await;
                 }
                 RoundOutcome::ToolRound => continue,
             }
@@ -8541,8 +8738,14 @@ impl Inner {
         let mut buf: Vec<u8> = Vec::new();
         let mut full_content = String::new();
         // Strip-on-receipt for the *live* stream: what the caller watches
-        // arrive is what will be persisted (see `LeadingHeaderFilter`).
-        let mut header_filter = LeadingHeaderFilter::default();
+        // arrive is what will be persisted (see `LeadingHeaderFilter`). The
+        // rest of an answer a continuation resumes has no first line to judge.
+        let continues_an_answer = prep.continues_an_answer();
+        let mut header_filter = if continues_an_answer {
+            LeadingHeaderFilter::passing()
+        } else {
+            LeadingHeaderFilter::default()
+        };
         let mut full_reasoning = String::new();
         let mut tool_call_acc: std::collections::BTreeMap<u64, StreamingToolCall> =
             std::collections::BTreeMap::new();
@@ -8558,6 +8761,8 @@ impl Inner {
         // chunk or on a trailing one with an empty delta — so it is read off
         // every chunk, before the delta gate, and the last one named wins.
         let mut finish_reason: Option<String> = None;
+        // The engine's verdict on a `length` ending (see the blocking twin).
+        let mut continuable: Option<bool> = None;
         // The raw bytes for the request log, kept to the retention cap.
         let mut raw = recorded::RecordedBody::default();
         // **The refund the server closed the stream with**, if it sent one —
@@ -8651,6 +8856,9 @@ impl Inner {
 
                     if let Some(reason) = choice_finish_reason(&json) {
                         finish_reason = Some(reason.to_string());
+                    }
+                    if let Some(c) = choice_continuable(&json) {
+                        continuable = Some(c);
                     }
 
                     let Some(delta) = json
@@ -8792,7 +9000,13 @@ impl Inner {
         // this is the same strip applied to the accumulated text at persist
         // time — what lands in the durable trail (and in `ChatResult`) is what
         // the reader watched arrive.
-        let full_content = strip_leading_header(&full_content).to_string();
+        let (full_content, text_is_generated) = if continues_an_answer {
+            (full_content, true)
+        } else {
+            let stripped = strip_leading_header(&full_content).to_string();
+            let same = stripped == full_content;
+            (stripped, same)
+        };
 
         // **A stream that stopped without ever saying it was over is a
         // transport failure, not an answer.** The body ended: no `[DONE]`, and
@@ -8811,10 +9025,10 @@ impl Inner {
         // — but it is not this ending's to set. That flag records the
         // *upstream's own* ceiling verdict, and a connection that died issued
         // no verdict at all; writing it here would say "the model reached its
-        // length limit" about a dropped socket, which is a different lie told
-        // in the same place `ResponseTruncated` exists to keep empty. Two rules
-        // would also mean the classification depended on who asked rather than
-        // on what happened.
+        // length limit" about a dropped socket — and offer to continue an
+        // answer from a point the model never stopped at. Two rules would also
+        // mean the classification depended on who asked rather than on what
+        // happened.
         //
         // Reported as `Network` because that is what it is, which also puts it
         // in `DelegationFailure::Upstream` for a delegated room and leaves it
@@ -8866,6 +9080,9 @@ impl Inner {
 
         if !tool_calls.is_empty() {
             // --- a tool round -------------------------------------------
+            // As the blocking twin: a continued round's narration is the
+            // continued text.
+            let (full_reasoning, full_content) = prep.round_text(&full_reasoning, &full_content);
             prep.persist_tool_call_action(
                 &tool_calls,
                 &full_reasoning,
@@ -8916,21 +9133,11 @@ impl Inner {
         // (so a reopened space still shows the mark) and returned on
         // `ChatResult` (so the window marking the live turn cannot disagree
         // with the row it will reload).
+        // Every ending at the ceiling is written, whatever it holds (see the
+        // blocking twin).
         let truncated = stopped_at_ceiling(finish_reason.as_deref());
-
-        if truncated_before_any_answer(finish_reason.as_deref(), &full_content) {
-            return self
-                .end_round_truncated(
-                    prep,
-                    output_tokens,
-                    &request_body_json,
-                    request_at,
-                    response_at,
-                    status.as_u16(),
-                    response_buf,
-                )
-                .await;
-        }
+        let resumable = truncated && continuable == Some(true) && text_is_generated;
+        let (full_reasoning, full_content) = prep.round_text(&full_reasoning, &full_content);
 
         #[cfg(feature = "test-support")]
         if prep.mechanical {
@@ -8940,6 +9147,7 @@ impl Inner {
             .persist_turn(
                 "complete",
                 truncated,
+                resumable,
                 input_tokens,
                 output_tokens,
                 &full_reasoning,
@@ -8963,6 +9171,7 @@ impl Inner {
                 response_action_id: None,
                 declined: None,
                 truncated,
+                continuable: false,
             }));
         }
 
@@ -8985,6 +9194,7 @@ impl Inner {
             response_action_id,
             declined: None,
             truncated,
+            continuable: false,
         }))
     }
 
@@ -12093,6 +12303,44 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// **Continue an answer that stopped at its length limit** — a new
+    /// generation of its post, written by the participant and the model that
+    /// wrote it, that picks up exactly where it stopped (mid-reasoning
+    /// included) instead of starting over. `action_id` is any generation of
+    /// the post; its current one must be an answer that stopped at its
+    /// completion ceiling ([`PostNode::continuable`] says which can be).
+    ///
+    /// The stream **begins with the text being continued** and then carries
+    /// what the model adds, so what a consumer accumulates is the generation
+    /// that will be written: the old text, then the new. The result may stop
+    /// at the ceiling again ([`ChatResult::truncated`]), and continue again.
+    ///
+    /// It is a paid request like any turn, held and settled per round, under
+    /// the post's own prefix-cache lineage, and it shares regeneration's
+    /// process-wide claim on the post ([`AppError::RegenerationInFlight`]).
+    /// Refused with [`AppError::WrongPostKind`], before anything is spent,
+    /// for a post that did not stop at its ceiling or cannot be continued.
+    pub async fn continue_stream(
+        &self,
+        action_id: String,
+        sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.continue_stream(&action_id, sender).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The blocking twin of [`Self::continue_stream`].
+    pub async fn continue_answer(&self, action_id: String) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.continue_answer(&action_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
     /// **When the regeneration of `item_id` ends** — the other half of the fact
     /// [`AppError::RegenerationInFlight`] reports. Resolves immediately if
     /// nothing is running against that item.
@@ -12100,8 +12348,8 @@ impl AppCore {
     /// A surface refused by the claim has to be able to stop saying so, and
     /// nothing durable can tell it when: a regeneration that *succeeds* leaves
     /// a new generation to notice, but one that fails leaves no trace a
-    /// transcript read can see — no action row, and (for a truncation) only a
-    /// Record entry attached to nothing. So the end is published rather than
+    /// transcript read can see — no action row, at most a Record entry
+    /// attached to nothing. So the end is published rather than
     /// inferred, from the one place that knows it. It is a wait, not a poll:
     /// the claim's own `Drop` wakes it.
     ///
@@ -12912,6 +13160,27 @@ fn one_use_key() -> Result<prefix_cache::CacheKey, std::io::Error> {
         .ok_or_else(|| std::io::Error::other("the operating system supplied no randomness"))
 }
 
+/// The answer a continuation extends, and how the request asks for it.
+#[derive(Debug)]
+struct Continuation {
+    /// Which field of the partial message the prompt ends inside.
+    field: ContinueField,
+    /// The target's reasoning and answer, exactly as persisted.
+    reasoning: String,
+    content: String,
+}
+
+impl Continuation {
+    /// The continued generation: what the target wrote, followed by what the
+    /// round that continued it returned.
+    fn extend(&self, reasoning: &str, content: &str) -> (String, String) {
+        (
+            format!("{}{reasoning}", self.reasoning),
+            format!("{}{content}", self.content),
+        )
+    }
+}
+
 // ============================================================================
 // Refund processing helpers
 // ============================================================================
@@ -12965,6 +13234,12 @@ struct TurnPrep {
     /// `db::insert_action`'s own statement rather than carried here.
     model_participant_id: String,
     max_completion_tokens: u32,
+    /// The partial answer a [`ResponseMode::Continue`] turn's next request
+    /// continues, which is the last entry of `messages` while it is set. Taken
+    /// by the round that answers it ([`Continuation::extend`]): whatever that
+    /// round writes is the continued text, and a later round of the same turn
+    /// is an ordinary one.
+    continuation: Option<Continuation>,
     /// The inference's attach plan (Reply → fresh item; Revise → a new
     /// generation superseding the target).
     inf_item_id: String,
@@ -13173,7 +13448,32 @@ impl TurnPrep {
             stream,
             stream && self.spend.is_none(),
             self.cache_scope.as_ref().map(|_| CACHE_KEY_PLACEHOLDER),
+            self.continuation.as_ref().map(|c| c.field),
         )
+    }
+
+    /// The text a round writes: its reasoning and answer, or — for the round
+    /// that answers a continuation — the continued answer, the target's text
+    /// followed by the round's. Taking the continuation is what makes it this
+    /// round's alone: its partial message leaves `messages` with it, so a tool
+    /// round that follows replays only the call, as any tool round does, and
+    /// the round after that is an ordinary request.
+    /// Whether this round's request continues an answer already begun (rather
+    /// than reasoning, or nothing), so its content is the rest of that answer.
+    fn continues_an_answer(&self) -> bool {
+        self.continuation
+            .as_ref()
+            .is_some_and(|c| c.field == ContinueField::Content)
+    }
+
+    fn round_text(&mut self, reasoning: &str, content: &str) -> (String, String) {
+        match self.continuation.take() {
+            None => (reasoning.to_string(), content.to_string()),
+            Some(continuation) => {
+                self.messages.pop();
+                continuation.extend(reasoning, content)
+            }
+        }
     }
 
     /// Attach `body` to `request`: as JSON, exactly as before keys existed,
@@ -13488,6 +13788,7 @@ impl TurnPrep {
                 // request, so each round's action carries its own charge.
                 credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
                 truncated: false,
+                resumable: false,
                 created_at: now_ms(),
             },
         )
@@ -13622,6 +13923,7 @@ impl TurnPrep {
                 // Tools run locally — no inference was purchased.
                 credits_consumed: None,
                 truncated: false,
+                resumable: false,
                 created_at: now_ms(),
             },
         )
@@ -13726,6 +14028,7 @@ impl TurnPrep {
                 output_tokens: None,
                 credits_consumed: None,
                 truncated: false,
+                resumable: false,
                 created_at: now_ms(),
             },
         )
@@ -13798,6 +14101,7 @@ impl TurnPrep {
         &mut self,
         action_status: &str,
         truncated: bool,
+        resumable: bool,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
         reasoning: &str,
@@ -13813,6 +14117,7 @@ impl TurnPrep {
             .persist_turn_body(
                 action_status,
                 truncated,
+                resumable,
                 input_tokens,
                 output_tokens,
                 reasoning,
@@ -13878,6 +14183,7 @@ impl TurnPrep {
         &mut self,
         action_status: &str,
         truncated: bool,
+        resumable: bool,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
         reasoning: &str,
@@ -13925,6 +14231,7 @@ impl TurnPrep {
                 // Local turns record no charge (`None`), not a fake zero.
                 credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
                 truncated,
+                resumable: truncated && resumable,
                 created_at: now_ms(),
             },
         )
@@ -15518,6 +15825,18 @@ fn choice_finish_reason(value: &serde_json::Value) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
+/// The engine's `continuable` verdict on the first choice, if it gave one: on a
+/// `length` ending, whether what it gave out can be continued exactly. Read off a
+/// whole chunk or a whole completion body, like [`choice_finish_reason`].
+fn choice_continuable(value: &serde_json::Value) -> Option<bool> {
+    value
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("continuable"))
+        .and_then(|v| v.as_bool())
+}
+
 /// The upstream stopped at the completion ceiling (`finish_reason: "length"`).
 /// Both transports read the same key, so this is the one place the spelling is
 /// written down.
@@ -15525,22 +15844,195 @@ fn stopped_at_ceiling(finish_reason: Option<&str>) -> bool {
     finish_reason == Some("length")
 }
 
-/// Whether a finished round is a **truncation with nothing to read**: the
-/// upstream stopped at the completion ceiling and the round produced no answer
-/// text at all.
+/// The completion ceiling a request asks for when nothing else decides it: the
+/// app's own turns, and a proxied request that named none.
+pub(crate) const FALLBACK_MAX_COMPLETION_TOKENS: u32 = 4096;
+
+/// The completion ceiling a turn asks for (`max_completion_tokens`): the
+/// largest completion the backend declares the model may be asked for, or
+/// [`FALLBACK_MAX_COMPLETION_TOKENS`] where it declares none, never past the
+/// model's context window when that is known (`context_length` 0 means it is
+/// not).
 ///
-/// This is the reasoning model's failure mode — it can spend the entire budget
-/// thinking and never start the answer — and the reason it needs its own rule
-/// is that every other signal reads like success: the HTTP status is 200, the
-/// body parses, the usage is honest, and a `thinking` block is genuinely there
-/// to persist. Only the pair (ceiling reached, nothing readable) says the turn
-/// has no answer in it.
+/// **The declared figure, not a guess at the room left.** It is a per-model
+/// constant the catalog publishes, so the value on the wire says nothing about
+/// this conversation; and the room after the prompt is the serving node's to
+/// apply — it clamps the request to what is left of its window, knowing the
+/// prompt's real token count, where this side has only the pricing contract's
+/// estimate, which is deliberately an over-count and would cut answers short
+/// exactly when a conversation is long. What a larger ceiling costs is a larger
+/// hold: the completion side of the charge estimate is this many tokens at the
+/// completion rate, held for the request and refunded down to what was
+/// generated. An answer that still reaches it is continued
+/// ([`AppCore::continue_stream`]) rather than lost.
+pub(crate) fn completion_ceiling(declared_max_output: Option<u64>, context_length: u64) -> u32 {
+    let declared = declared_max_output.unwrap_or(u64::from(FALLBACK_MAX_COMPLETION_TOKENS));
+    let ceiling = if context_length == 0 {
+        declared
+    } else {
+        declared.min(context_length)
+    };
+    u32::try_from(ceiling).unwrap_or(u32::MAX).max(1)
+}
+
+/// Whether an answer recorded under `model` can be continued: it was served
+/// by Eidola's backend, whose engines honour `continue_final_message` and
+/// whose catalog is the only one this app knows to. Elsewhere — a local
+/// llama.cpp engine, an arbitrary OpenAI-compatible server — a request ending
+/// in a partial assistant message may be answered with a new turn instead,
+/// and that answer would be written as the rest of this one.
 ///
-/// Callers apply it **after** tool calls are assembled: a round that requested
-/// tools has content the loop can act on even with an empty message, and
-/// stopping there would abandon a tool round mid-turn.
-fn truncated_before_any_answer(finish_reason: Option<&str>, content: &str) -> bool {
-    stopped_at_ceiling(finish_reason) && content.trim().is_empty()
+/// Pure, so a surface can decide to offer the verb with exactly the rule the
+/// door applies ([`PostNode::continuable`]).
+pub fn can_continue(model: Option<&str>) -> bool {
+    model.is_some_and(|m| backends::parse_model_ref(m).backend_id == backends::EIDOLA_BACKEND_ID)
+}
+
+/// The canonical spelling of a model selection (`qualified_model_id` of its
+/// parse), so a participant's configured `model_ref` and the model a generation
+/// recorded compare as the same selection however each was written.
+fn canonical_model(selection: &str) -> String {
+    let r = backends::parse_model_ref(selection);
+    backends::qualified_model_id(&r.model, &r.backend_id)
+}
+
+/// What continuing a generation sends — or `None` when it cannot be continued.
+///
+/// **One predicate for the door and for the offer**: `prepare_turn` refuses a
+/// continuation exactly when this is `None`, and `PostNode::continuable` is
+/// whether it is `Some`, so a surface offers the verb exactly where it would
+/// work and the two cannot drift.
+#[derive(Debug)]
+struct ContinuationBasis {
+    /// The author, who writes the continuation.
+    participant_id: String,
+    /// The canonical model that wrote the generation.
+    model: String,
+    /// The generation's own reasoning and answer.
+    thinking: String,
+    text: String,
+    /// The `messages` and `tools` of the request that produced the generation,
+    /// as sent — its partial message removed when that request was itself a
+    /// continuation.
+    messages: Vec<serde_json::Value>,
+    tools: Vec<serde_json::Value>,
+    /// The actions that request's context assembly was fed, in order.
+    context_action_ids: Vec<String>,
+}
+
+/// The [`ContinuationBasis`] of `action_id` in `space_id`.
+///
+/// A generation can be continued when it is an agent's `inference` that
+/// stopped at its ceiling, its model is one whose server honours a
+/// continuation ([`can_continue`]), **its author is still an agent of this
+/// space answering with that model** (a member, by effective configuration —
+/// the selection `prepare_turn` would resolve for it), and **the request that
+/// produced it is in the Record whole**.
+///
+/// That last condition is what a continuation is built from. Its request is
+/// the generation's own request, byte for byte — the messages and tools that
+/// round sent, its tool rounds and trailing block among them — followed by the
+/// generation as a partial message. Rebuilt from the conversation as it stands
+/// now instead, an edit to a post the answer was written to, or to the
+/// author's charter, would have the model continue an answer to one prompt
+/// while reading another, and lose the prefix the engine cached for it. A body
+/// the Record kept only part of (past its retention cap) does not parse, and
+/// that generation is not continuable.
+async fn continuation_basis(
+    conn: &turso::Connection,
+    space_id: &str,
+    action_id: &str,
+) -> Result<Option<ContinuationBasis>, AppError> {
+    let Some(source) = db::continuation_source(conn, action_id).await? else {
+        return Ok(None);
+    };
+    let Some(model) = source.model.as_deref().map(canonical_model) else {
+        return Ok(None);
+    };
+    if source.action_type != "inference"
+        || !source.truncated
+        || !source.resumable
+        || !can_continue(Some(&model))
+    {
+        return Ok(None);
+    }
+    let author_answers_with_it = db::space_participants(conn, space_id)
+        .await?
+        .iter()
+        .find(|m| m.participant_id == source.participant_id)
+        .is_some_and(|m| {
+            m.kind == "agent"
+                && m.model_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .map(canonical_model)
+                    .as_deref()
+                    == Some(model.as_str())
+        });
+    if !author_answers_with_it {
+        return Ok(None);
+    }
+    let Some(body) = db::generation_request_body(conn, action_id).await? else {
+        return Ok(None);
+    };
+    let Ok(sent) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return Ok(None);
+    };
+    let Some(mut messages) = sent.get("messages").and_then(|m| m.as_array()).cloned() else {
+        return Ok(None);
+    };
+    if sent.get("continue_final_message").is_some() {
+        messages.pop();
+    }
+    let tools = sent
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let context_action_ids = db::context_assembly_actions(conn, action_id).await?;
+    Ok(Some(ContinuationBasis {
+        participant_id: source.participant_id,
+        model,
+        thinking: source.thinking,
+        text: source.text,
+        messages,
+        tools,
+        context_action_ids,
+    }))
+}
+
+#[cfg(test)]
+mod ceiling_and_continuation_tests {
+    use super::*;
+
+    #[test]
+    fn the_ceiling_is_the_declared_output_limit_within_the_window() {
+        // Declared: the declaration, bounded by a known window.
+        assert_eq!(completion_ceiling(Some(32_768), 262_144), 32_768);
+        assert_eq!(completion_ceiling(Some(32_768), 8_192), 8_192);
+        assert_eq!(completion_ceiling(Some(32_768), 0), 32_768);
+        // Undeclared: the fallback, bounded the same way.
+        assert_eq!(completion_ceiling(None, 0), FALLBACK_MAX_COMPLETION_TOKENS);
+        assert_eq!(
+            completion_ceiling(None, 1_000_000),
+            FALLBACK_MAX_COMPLETION_TOKENS
+        );
+        assert_eq!(completion_ceiling(None, 2_048), 2_048);
+        // Never zero, never past a `u32`.
+        assert_eq!(completion_ceiling(Some(0), 0), 1);
+        assert_eq!(completion_ceiling(Some(u64::MAX), 0), u32::MAX);
+    }
+
+    #[test]
+    fn only_eidola_answers_can_be_continued() {
+        assert!(can_continue(Some("mimo-v2.6-flash")));
+        assert!(can_continue(Some("mimo-v2.6-flash@eidola")));
+        for other in ["gemma@local", "qwen@my-llama", "gpt@openai-compat"] {
+            assert!(!can_continue(Some(other)), "{other}");
+        }
+        assert!(!can_continue(None), "a post with no model was not inferred");
+    }
 }
 
 /// Strip-on-receipt: models mimic visible per-message scaffolding, so a leading
@@ -15612,6 +16104,16 @@ enum HeaderFilterState {
 }
 
 impl LeadingHeaderFilter {
+    /// A filter that passes everything: for the rest of an answer that has
+    /// already begun (a continuation's), whose first line is not this
+    /// stream's to judge.
+    fn passing() -> Self {
+        LeadingHeaderFilter {
+            state: HeaderFilterState::Passing,
+            held: String::new(),
+        }
+    }
+
     /// Feed one delta; returns what the caller should see (often the delta
     /// itself, and never more than what was fed).
     fn feed(&mut self, delta: &str) -> String {
@@ -16070,6 +16572,9 @@ fn build_post_tree(data: db::SpaceTreeData) -> Vec<PostNode> {
             model: row.model.clone(),
             credits_consumed: row.credits_consumed,
             truncated: row.truncated,
+            continuable: row.truncated
+                && row.action_type == "inference"
+                && can_continue(row.model.as_deref()),
             relation: reply_parent.get(&action_id).map(|_| "reply".to_string()),
             depth,
             is_branch,
@@ -17780,6 +18285,7 @@ mod tests {
             is_current: true,
             model: None,
             credits_consumed: None,
+            continuable: false,
             relation: parent.map(|_| "reply".to_string()),
             depth: 0,
             is_branch: false,

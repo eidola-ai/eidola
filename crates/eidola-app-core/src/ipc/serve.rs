@@ -826,31 +826,7 @@ async fn answer(
                 Some(model) => model,
                 None => core.default_model().await.map_err(failed)?,
             };
-            let (tx, mut rx) = mpsc::unbounded_channel::<crate::ChatStreamEvent>();
-            let chunks = out.clone();
-            // Drains to the end even when the peer has stopped listening: the
-            // turn is running and paid for either way, and a receiver dropped
-            // under it would only turn a finished turn into a torn one.
-            let mut pump = AbortOnDrop::new(tokio::spawn(async move {
-                'events: while let Some(event) = rx.recv().await {
-                    // A delta's size is the backend's decision, not this app's,
-                    // so it goes out through `chunk_lines` — which splits an
-                    // oversized one into frames that fit rather than refusing
-                    // it. Several frames concatenate to exactly what one would
-                    // have said, and they leave in order through this one
-                    // outbox.
-                    for line in chunk_lines(id, &event, MAX_RESPONSE_BYTES) {
-                        // Awaited, so a reader that has fallen behind slows the
-                        // turn's delivery instead of being queued at. A writer
-                        // that has gone away ends the pump: there is nobody to
-                        // deliver to, and the turn itself is unaffected either
-                        // way.
-                        if chunks.send(line).await.is_err() {
-                            break 'events;
-                        }
-                    }
-                }
-            }));
+            let (tx, mut pump) = forward_turn_events(id, out);
             // Detached by construction: `chat_stream` spawns the turn on the
             // core's runtime, so a caller that disappears mid-turn stops being
             // written to and the turn still lands. That is deliberate — see
@@ -864,5 +840,45 @@ async fn answer(
             pump.join().await;
             ok(result.map_err(failed)?)
         }
+        Call::ChatContinue { action_id } => {
+            // The same delivery as `chat.stream`, for the same reasons.
+            let (tx, mut pump) = forward_turn_events(id, out);
+            let result = core.continue_stream(action_id, tx).await;
+            pump.join().await;
+            ok(result.map_err(failed)?)
+        }
     }
+}
+
+/// A turn's event sender, and the task forwarding what it sends to the
+/// caller as `chunk` frames for request `id`.
+///
+/// The forwarder drains to the end even when the peer has stopped listening:
+/// the turn is running and paid for either way, and a receiver dropped under it
+/// would only turn a finished turn into a torn one.
+fn forward_turn_events(
+    id: u64,
+    out: &mpsc::Sender<Vec<u8>>,
+) -> (mpsc::UnboundedSender<crate::ChatStreamEvent>, AbortOnDrop) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<crate::ChatStreamEvent>();
+    let chunks = out.clone();
+    let pump = AbortOnDrop::new(tokio::spawn(async move {
+        'events: while let Some(event) = rx.recv().await {
+            // A delta's size is the backend's decision, not this app's, so it
+            // goes out through `chunk_lines` — which splits an oversized one
+            // into frames that fit rather than refusing it. Several frames
+            // concatenate to exactly what one would have said, and they leave
+            // in order through this one outbox.
+            for line in chunk_lines(id, &event, MAX_RESPONSE_BYTES) {
+                // Awaited, so a reader that has fallen behind slows the turn's
+                // delivery instead of being queued at. A writer that has gone
+                // away ends the pump: there is nobody to deliver to, and the
+                // turn itself is unaffected either way.
+                if chunks.send(line).await.is_err() {
+                    break 'events;
+                }
+            }
+        }
+    }));
+    (tx, pump)
 }
