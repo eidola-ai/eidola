@@ -705,71 +705,94 @@ async fn a_length_ending_says_whether_it_can_be_continued_exactly() {
     assert!(checked > 0, "some ceiling must cut the dev model off");
 }
 
+/// The chat layer's verdict over `tokens` generated after a prompt that ended inside
+/// the final message's `continuing` field — what the node reports when nothing else of
+/// its own makes a continuation impossible.
+fn parser_verdict(tokens: &[u32], continuing: Option<&'static str>) -> bool {
+    let model = loaded();
+    let mut detok = eidola_engine_chat::Detokenizer::new(true);
+    let mut parser = OutputParser::new(
+        OutputConfig::new(None, None).continuing_in(continuing),
+        PrefixedCallIds("c".into()),
+    );
+    for &t in tokens {
+        parser.push_text(&detok.push(model.tokenizer(), t).unwrap());
+    }
+    if detok.pending_len() > 0 {
+        parser.mark_lossy();
+    }
+    parser.push_text(&detok.finish());
+    parser.finish(StopCause::MaxTokens);
+    parser.resumes_exactly()
+}
+
 /// A `length` ending at the **context window** is never continuable: a
 /// continuation's prompt would be the whole window or more, which the node refuses
 /// (`context_length_exceeded`). Only a request whose own `max_completion_tokens`
-/// stopped it below the window's room can be. Both ways of reaching the window are
-/// covered — no limit at all, and a limit at or past the room — and the
-/// continuation the client would send is shown to be refused.
+/// stopped it below the window's room can be. Run on a continuation of an answer
+/// (whose output needs no opening `<think>`, so the dev model's text can be
+/// exact), with the window just past its prompt: no limit, and a limit at or past
+/// the room, each end at the window and report `false` although the chat layer's
+/// own verdict over the same tokens is `true`; a limit below the room reports the
+/// chat layer's verdict. The continuation the client would then send is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_length_ending_at_the_context_window_is_not_continuable() {
-    let prompt = prompt_tokens("Hello there").len() as u32;
+    let base = continued("The answer so far", "a thought", json!(true));
+    let prompt = continued_prompt_tokens(&base, "content");
     let room = 6u32;
-    let len = (prompt + room).to_string();
+    let len = (prompt.len() as u32 + room).to_string();
     let node = TestNode::start(&[(env::MAX_MODEL_LEN, len.as_str())]).await;
-    let (_, finish) = direct_greedy(prompt_tokens("Hello there"), room);
+    let (tokens, finish) = direct_greedy(prompt.clone(), room);
     assert_eq!(
         finish,
         FinishReason::Length,
         "the dev model runs to the window here"
     );
-    let mut no_limit = request("Hello there", 1);
-    no_limit
-        .as_object_mut()
-        .unwrap()
-        .remove("max_completion_tokens");
-    for body in [
-        no_limit,
-        request("Hello there", room),
-        request("Hello there", 100),
-    ] {
-        let (status, v) = node.chat_json(&body).await;
+    assert!(
+        parser_verdict(&tokens, Some("content")),
+        "the chat layer alone would call this cut exact, so only the window can refuse it"
+    );
+
+    let with_limit = |limit: Option<u32>| {
+        let mut b = base.clone();
+        match limit {
+            Some(m) => b["max_completion_tokens"] = m.into(),
+            None => {
+                b.as_object_mut().unwrap().remove("max_completion_tokens");
+            }
+        }
+        b
+    };
+    for limit in [None, Some(room), Some(100)] {
+        let (status, v) = node.chat_json(&with_limit(limit)).await;
         assert_eq!(status, 200, "{v}");
         let choice = &v["choices"][0];
-        assert_eq!(choice["finish_reason"], "length", "{body}: {v}");
-        assert_eq!(choice["continuable"], false, "{body}: {v}");
+        assert_eq!(choice["finish_reason"], "length", "{limit:?}: {v}");
+        assert_eq!(choice["continuable"], false, "{limit:?}: {v}");
 
+        let mut next = base.clone();
         let message = &choice["message"];
-        let content = message["content"].as_str().unwrap_or("");
-        let field = if content.is_empty() {
-            json!("reasoning_content")
-        } else {
-            json!(true)
-        };
-        let continuation = json!({
-            "model": MODEL_ID,
-            "messages": [
-                {"role": "user", "content": "Hello there"},
-                {"role": "assistant",
-                 "reasoning_content": message["reasoning_content"].as_str().unwrap_or(""),
-                 "content": content},
-            ],
-            "max_completion_tokens": 4,
-            "temperature": 0.0,
-            "add_generation_prompt": false,
-            "continue_final_message": field,
-        });
-        let (status, v) = node.chat_json(&continuation).await;
+        next["messages"][1]["content"] = json!(format!(
+            "The answer so far{}",
+            message["content"].as_str().unwrap_or("")
+        ));
+        next["max_completion_tokens"] = 4.into();
+        let (status, v) = node.chat_json(&next).await;
         assert_eq!(
             status, 400,
             "the continuation it did not offer is refused: {v}"
         );
         assert_eq!(v["error"]["type"], "context_length_exceeded");
     }
-    // Below the room, the request's own limit stopped it, and the verdict is the
-    // chat layer's (asserted in `a_length_ending_says_whether_it_can_be_continued_exactly`).
-    let (_, v) = node.chat_json(&request("Hello there", room - 2)).await;
-    assert!(v["choices"][0]["continuable"].is_boolean(), "{v}");
+
+    // Below the room, the request's own limit stopped it: the chat layer decides.
+    let (below, _) = direct_greedy(prompt, room - 2);
+    let (_, v) = node.chat_json(&with_limit(Some(room - 2))).await;
+    assert_eq!(
+        v["choices"][0]["continuable"],
+        parser_verdict(&below, Some("content")),
+        "{v}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
