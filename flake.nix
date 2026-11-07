@@ -197,7 +197,8 @@
             #   * eidola-app-core → all of `releases/trust/*.json` +
             #     `releases/schema/*.json` (client trust root)
             #   * eidola-server-gateway → `releases/trust/engine-enclaves.json`
-            #     (the engine pins)
+            #     (the engine pins), and the platform endorsements and Sigstore
+            #     trusted root their machine policy is re-derived from
             # Included only when either crate is built, so unrelated crates
             # do not cache-bust on every manifest regeneration.
             # `artifact-manifest.json` (at the root, not under `releases/`)
@@ -205,6 +206,13 @@
             # itself, so including it would create a self-reference that
             # prevents the build from reaching a fixed point.
             isTrustRootPath = relPath == "/releases" || pkgs.lib.hasPrefix "/releases/" relPath;
+            # The vendored platform endorsements, from which the gateway's
+            # build re-derives each engine pin's machine policy. Only the
+            # gateway reads them, so app-core-only packages leave them out
+            # and do not rebuild when a new release is vendored.
+            isPlatformEndorsementsPath =
+              relPath == "/releases/trust/platform-endorsements"
+              || pkgs.lib.hasPrefix "/releases/trust/platform-endorsements/" relPath;
             # `eidola-server-gateway/build.rs` also checks every engine pin in
             # `releases/trust/engine-enclaves.json` against the committed
             # deployment configs it names.
@@ -213,7 +221,8 @@
               || relPath == "/deploy/engine"
               || pkgs.lib.hasPrefix "/deploy/engine/" relPath;
           in
-          ((crateInSet "eidola-app-core" || crateInSet "eidola-server-gateway") && isTrustRootPath)
+          (crateInSet "eidola-app-core" && isTrustRootPath && !isPlatformEndorsementsPath)
+          || (crateInSet "eidola-server-gateway" && isTrustRootPath)
           || (crateInSet "eidola-server-gateway" && isEngineDeployPath)
           # Test fixtures and data of a crate being built: a package build
           # runs that crate's tests (`doCheck`), and the workspace checks run

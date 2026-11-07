@@ -48,10 +48,14 @@ apple=false
 markdown=false
 oci=true' crates/eidola-apple/src/lib.rs
 # The gateway's build checks the engine pins against the committed engine
-# deployments, so a change to either must run the cargo gates (and, with
-# them, the OCI rehearsal).
+# deployments, and re-derives their machine policy from the vendored platform
+# endorsements, so a change to any of them must run the cargo gates (and,
+# with them, the OCI rehearsal).
 for engine_trust_path in \
   releases/trust/engine-enclaves.json \
+  releases/trust/sigstore-trusted-root.json \
+  releases/trust/platform-endorsements/platform-v0.1.11/platform-endorsements.json \
+  releases/trust/platform-endorsements/platform-v0.1.11/attestation.sigstore.json \
   deploy/engine/some-model/some-variant/tinfoil-config.yml \
   deploy/engine/some-model/some-variant/deployment.json; do
   assert_scope 'rust=true

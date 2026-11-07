@@ -6413,6 +6413,7 @@ name = "measure-enclave"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "clap",
  "eidola-common",
  "hex",
@@ -11145,6 +11146,7 @@ name = "tinfoil-verifier"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "const-oid 0.9.6",
  "dcap-qvl",
  "der 0.7.10",
  "getrandom 0.4.3",
@@ -11153,6 +11155,8 @@ dependencies = [
  "httparse",
  "hyper",
  "hyper-util",
+ "p256 0.13.2",
+ "p384 0.13.1",
  "pem",
  "reqwest",
  "rsa",
@@ -11161,6 +11165,8 @@ dependencies = [
  "serde_json",
  "sev",
  "sha2 0.10.9",
+ "signature 2.2.0",
+ "spki 0.7.3",
  "thiserror 2.0.21",
  "tokio",
  "tower 0.5.3",

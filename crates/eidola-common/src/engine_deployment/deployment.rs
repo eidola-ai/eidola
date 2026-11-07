@@ -17,8 +17,6 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::Value as Json;
-
 use super::{
     CacheConfig, ExecutorSettings, GpuCc, MeasuredConfig, ModelPack, WeightsStorage,
     artifact_data_bytes, check_container_gpu_access, check_cvm_image, check_env_names,
@@ -47,8 +45,59 @@ pub struct Deployment {
     pub weights_revision: String,
     /// The GPU evidence items a pin must require, if any.
     pub expected_gpus: Option<u64>,
-    /// The Intel TDX machine policy a pin carries, when the deployment is TDX.
-    pub tdx_policy: Option<Json>,
+    /// Where the Intel TDX machine policy comes from, when the deployment is
+    /// TDX.
+    pub tdx: Option<TdxMachines>,
+}
+
+/// The machines a TDX deployment runs on: one policy of a platform
+/// endorsements release, which gives the machine policy and the machines'
+/// PPIDs, plus the PCK platform flags the endorsements do not carry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TdxMachines {
+    /// The release tag, `platform-vX.Y.Z`.
+    pub release: String,
+    /// The SHA-256 of the release's endorsements file (lowercase hex).
+    pub sha256: String,
+    /// The endorsements' policy name, e.g. `tdx-b300-prod`.
+    pub policy: String,
+    pub dynamic_platform: PckFlag,
+    pub cached_keys: PckFlag,
+    pub smt_enabled: PckFlag,
+}
+
+/// Where the platform provider's platform endorsements are vendored,
+/// relative to the workspace root: one directory per release tag.
+pub const PLATFORM_ENDORSEMENTS_ROOT: &str = "releases/trust/platform-endorsements";
+
+/// The committed Sigstore trusted root the endorsements' attestation is
+/// verified against.
+pub const SIGSTORE_TRUSTED_ROOT: &str = "releases/trust/sigstore-trusted-root.json";
+
+/// The vendored files of release `tag`: `(endorsements, Sigstore bundle)`,
+/// relative to the workspace root. `tag` must satisfy
+/// [`is_platform_release_tag`].
+pub fn platform_endorsement_files(tag: &str) -> (String, String) {
+    (
+        format!("{PLATFORM_ENDORSEMENTS_ROOT}/{tag}/platform-endorsements.json"),
+        format!("{PLATFORM_ENDORSEMENTS_ROOT}/{tag}/attestation.sigstore.json"),
+    )
+}
+
+/// `platform-vX.Y.Z`, each number decimal without a leading zero: the tag
+/// grammar of the provider's release workflow, and a safe path component.
+pub fn is_platform_release_tag(tag: &str) -> bool {
+    let Some(version) = tag.strip_prefix("platform-v") else {
+        return false;
+    };
+    let parts: Vec<&str> = version.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.len() <= 9
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && (p.len() == 1 || !p.starts_with('0'))
+        })
 }
 
 /// Check one deployment of `model_id`: its config (`config_path`, read as
@@ -191,7 +240,7 @@ pub fn check_deployment(
         weights_repo: side.repo,
         weights_revision: side.revision,
         expected_gpus: side.expected_gpus,
-        tdx_policy: side.tdx_policy,
+        tdx: side.tdx,
     })
 }
 
@@ -559,7 +608,7 @@ struct Sidecar {
     repo: String,
     revision: String,
     expected_gpus: Option<u64>,
-    tdx_policy: Option<Json>,
+    tdx: Option<TdxMachines>,
 }
 
 // The typed shape of `deployment.json`. Every level refuses unknown members,
@@ -575,7 +624,7 @@ struct SidecarFile {
     #[serde(default, deserialize_with = "present")]
     expected_gpus: Option<u32>,
     #[serde(default, deserialize_with = "present")]
-    tdx_policy: Option<TdxPolicy>,
+    tdx: Option<SidecarTdx>,
 }
 
 /// An optional member that, when present, holds a value: absent is `None`,
@@ -596,33 +645,40 @@ struct SidecarWeights {
     revision: String,
 }
 
-/// The machine-side Intel TDX policy, in the attesting client's shape
-/// (`tinfoil_verifier::TdxPolicy`, member for member): the shape is held
-/// here, and the values (widths, MR_SEAM non-empty, safe attributes) by the
-/// client's own pin compiler, which the gateway's build runs over the pin.
-#[derive(serde::Deserialize, serde::Serialize)]
+/// The TDX machines: a platform endorsements policy, and the PCK platform
+/// flags. The machine policy itself (MR_SEAM, attributes, XFAM, TCB floors,
+/// QE vendor, PPIDs) is derived from the signed endorsements by whoever
+/// reads this (`tinfoil_verifier::platform_endorsements`), never written
+/// here.
+#[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TdxPolicy {
-    mr_seam: Vec<String>,
-    td_attributes: String,
-    xfam: String,
-    minimum_tee_tcb_svn: String,
-    minimum_tcb_evaluation_data_number: u32,
-    qe_vendor_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    fmspc: Option<Vec<String>>,
+struct SidecarTdx {
+    platform_endorsements: SidecarEndorsements,
     dynamic_platform: PckFlag,
     cached_keys: PckFlag,
     smt_enabled: PckFlag,
 }
 
-/// A PCK certificate platform flag's expected value
-/// (`tinfoil_verifier::PckFlag`).
-#[derive(serde::Deserialize, serde::Serialize)]
+/// One policy of one platform endorsements release, and the hash of the
+/// release's endorsements file.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SidecarEndorsements {
+    release: String,
+    sha256: String,
+    policy: String,
+}
+
+/// A PCK certificate platform flag's expected value, which the pin states
+/// (`tinfoil_verifier::PckFlag`, value for value).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum PckFlag {
+pub enum PckFlag {
+    /// The certificate asserts the flag.
     True,
+    /// The certificate denies the flag.
     False,
+    /// The certificate omits the flag (a single-package platform).
     Undefined,
 }
 
@@ -640,15 +696,42 @@ impl Sidecar {
                 "{path}: weights.revision must be 40 lowercase hex digits"
             ));
         }
-        let tdx_policy = file
-            .tdx_policy
-            .map(|p| serde_json::to_value(p).map_err(|e| format!("{path}: tdx_policy: {e}")))
+        let tdx = file
+            .tdx
+            .map(|t| {
+                let e = t.platform_endorsements;
+                if !is_platform_release_tag(&e.release) {
+                    return Err(format!(
+                        "{path}: tdx.platform_endorsements.release must be a platform-vX.Y.Z \
+                         release tag"
+                    ));
+                }
+                if !is_lower_hex(&e.sha256, 32) {
+                    return Err(format!(
+                        "{path}: tdx.platform_endorsements.sha256 must be 64 lowercase hex digits"
+                    ));
+                }
+                if !is_safe_component(&e.policy) {
+                    return Err(format!(
+                        "{path}: tdx.platform_endorsements.policy must match \
+                         [a-z0-9][a-z0-9._-]*"
+                    ));
+                }
+                Ok(TdxMachines {
+                    release: e.release,
+                    sha256: e.sha256,
+                    policy: e.policy,
+                    dynamic_platform: t.dynamic_platform,
+                    cached_keys: t.cached_keys,
+                    smt_enabled: t.smt_enabled,
+                })
+            })
             .transpose()?;
         Ok(Self {
             repo: file.weights.repo,
             revision: file.weights.revision,
             expected_gpus: file.expected_gpus.map(u64::from),
-            tdx_policy,
+            tdx,
         })
     }
 }

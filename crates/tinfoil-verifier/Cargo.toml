@@ -75,8 +75,23 @@ serde_json = { version = "1", features = ["raw_value"] }
 # Error handling
 thiserror = "2"
 
+# `platform_endorsements` (feature `platform-endorsements`): offline
+# verification of the platform provider's Sigstore-signed platform
+# endorsements — Fulcio chain and identity, DSSE signature, Rekor SET and
+# inclusion proof — for the pin-authoring tools (`measure-enclave`, the
+# gateway's build). The same crates and versions the updater verifies our own
+# releases with; none is linked into a build without the feature.
+const-oid = { version = "0.9", features = ["db"], optional = true }
+spki = { version = "0.7", optional = true }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"], optional = true }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"], optional = true }
+signature = { version = "2", optional = true }
+
 # Logging
 tracing = "0.1"
+
+[features]
+platform-endorsements = ["dep:const-oid", "dep:spki", "dep:p256", "dep:p384", "dep:signature"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

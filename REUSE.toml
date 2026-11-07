@@ -118,3 +118,17 @@ path = [
 precedence = "closest"
 SPDX-FileCopyrightText = "© 2026 Phala Network"
 SPDX-License-Identifier = "MIT"
+
+# Verbatim release data of the platform provider (tinfoilsh/cvmimage, declared
+# AGPL-3.0): its signed platform endorsements and their Sigstore attestation
+# bundles, vendored as trust inputs; and two of its attestation bundles kept
+# as test fixtures (one from tinfoilsh/confidential-model-router, declared
+# AGPL-3.0).
+[[annotations]]
+path = [
+    "releases/trust/platform-endorsements/**",
+    "crates/measure-enclave/tests/fixtures/platform-endorsements/*.sigstore.json",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "© Tinfoil contributors"
+SPDX-License-Identifier = "AGPL-3.0-only"

@@ -36,6 +36,11 @@ pub enum Error {
     #[error("TDX policy violation: {0}")]
     TdxPolicy(String),
 
+    /// A platform endorsements release, or its Sigstore attestation, did
+    /// not verify, or does not define what a pin asks of it.
+    #[error("platform endorsements refused: {0}")]
+    PlatformEndorsements(String),
+
     /// Device evidence does not satisfy the pinned entry's requirement.
     #[error("device evidence rejected: {0}")]
     DeviceEvidence(String),

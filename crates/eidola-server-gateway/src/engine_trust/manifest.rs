@@ -7,8 +7,8 @@
 //! function over fixtures. It therefore uses nothing from the crate and only
 //! dependencies that are both build- and dev-dependencies (`serde_json`,
 //! `sha2`, `eidola-common` with its `deployment` feature, and
-//! `tinfoil-verifier`, whose pin compiler is the one the attesting client
-//! runs).
+//! `tinfoil-verifier` with its `platform-endorsements` feature, whose pin
+//! compiler is the one the attesting client runs).
 //!
 //! # What is checked
 //!
@@ -22,9 +22,19 @@
 //!   check `measure-enclave` runs before it emits a pin. Every rule about
 //!   what the config may say lives there.
 //! - The pin agrees with that deployment: release, weights (hash, repo,
-//!   revision), prompt-cache retention, GPU evidence count, TDX policy, and a
-//!   TDX MRCONFIGID equal to the config's hash; and the attesting client's
-//!   own pin compiler accepts it.
+//!   revision), prompt-cache retention, GPU evidence count, and a TDX
+//!   MRCONFIGID equal to the config's hash; and the attesting client's own
+//!   pin compiler accepts it.
+//! - **A TDX pin's machine policy is re-derived from the signed platform
+//!   endorsements the sidecar names**: the vendored release file and its
+//!   Sigstore bundle (`releases/trust/platform-endorsements/<tag>/`) are
+//!   verified offline against the committed Sigstore trusted root
+//!   (`tinfoil_verifier::platform_endorsements::verify`: the provider's
+//!   release workflow at exactly that tag, the file's hash the one the
+//!   sidecar records), the named policy and every machine mapped to it are
+//!   derived, the sidecar's PCK flags added, and the pin's policy must be
+//!   exactly that. `measure-enclave` makes the same two calls over the same
+//!   bytes when it emits the pin.
 //! - Every deployment of one model agrees on its weights and prompt-cache
 //!   policy, since the gateway publishes one of each per model:
 //!   `deployment::check_model_agreement`, which `measure-enclave` also runs
@@ -366,9 +376,18 @@ fn check_deployment(
                 ));
             }
             object(&tdx["policy"], &format!("{at}: pin.platform.tdx.policy"))?;
-            if checked.tdx_policy.as_ref() != Some(&tdx["policy"]) {
+            let machines = checked.tdx.as_ref().ok_or_else(|| {
+                format!("{at}: a TDX pin, but {sidecar_path} states no tdx machines")
+            })?;
+            let derived = derive_tdx_policy(machines, read)
+                .map_err(|e| format!("{at}: {sidecar_path}: tdx.platform_endorsements: {e}"))?;
+            let derived = serde_json::to_value(&derived)
+                .map_err(|e| format!("{at}: serializing the derived policy: {e}"))?;
+            if tdx["policy"] != derived {
                 return Err(format!(
-                    "{at}: pin.platform.tdx.policy differs from {sidecar_path}'s tdx_policy"
+                    "{at}: pin.platform.tdx.policy is not the policy derived from {sidecar_path}'s \
+                     platform endorsements ({} {}): expected {derived}",
+                    machines.release, machines.policy
                 ));
             }
         }
@@ -385,9 +404,9 @@ fn check_deployment(
                 48,
                 &format!("{at}: pin.platform.sev_snp.measurement"),
             )?;
-            if checked.tdx_policy.is_some() {
+            if checked.tdx.is_some() {
                 return Err(format!(
-                    "{at}: a SEV-SNP pin, but {sidecar_path} states a tdx_policy"
+                    "{at}: a SEV-SNP pin, but {sidecar_path} states tdx machines"
                 ));
             }
         }
@@ -408,6 +427,40 @@ fn check_deployment(
         .map_err(|e| format!("{at}: the attesting client refuses this pin: {e}"))?;
 
     Ok((config_path.to_owned(), weights, prompt_cache))
+}
+
+/// The machine policy `machines` names, from the committed platform
+/// endorsements and Sigstore trusted root, verified offline.
+fn derive_tdx_policy(
+    machines: &deployment::TdxMachines,
+    read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
+) -> Result<tinfoil_verifier::TdxPolicy, String> {
+    use tinfoil_verifier::PckFlag;
+    use tinfoil_verifier::platform_endorsements::{PckFlags, verify};
+    let flag = |f: deployment::PckFlag| match f {
+        deployment::PckFlag::True => PckFlag::True,
+        deployment::PckFlag::False => PckFlag::False,
+        deployment::PckFlag::Undefined => PckFlag::Undefined,
+    };
+    let (file, bundle) = deployment::platform_endorsement_files(&machines.release);
+    let verified = verify(
+        &read(&file)?,
+        &read(&bundle)?,
+        &read(deployment::SIGSTORE_TRUSTED_ROOT)?,
+        &machines.release,
+        &machines.sha256,
+    )
+    .map_err(|e| e.to_string())?;
+    verified
+        .tdx_policy(
+            &machines.policy,
+            PckFlags {
+                dynamic_platform: flag(machines.dynamic_platform),
+                cached_keys: flag(machines.cached_keys),
+                smt_enabled: flag(machines.smt_enabled),
+            },
+        )
+        .map_err(|e| e.to_string())
 }
 
 fn object<'a>(value: &'a serde_json::Value, at: &str) -> Result<&'a Object, String> {
