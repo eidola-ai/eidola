@@ -158,6 +158,8 @@ pub struct OutputParser {
     emitted_reasoning: String,
     emitted_content: String,
     lossy: bool,
+    /// The output ended inside a possible delimiter a splitter was holding back.
+    cut_in_delimiter: bool,
     thinking: bool,
     continuing: Option<&'static str>,
 }
@@ -186,6 +188,7 @@ impl OutputParser {
             emitted_reasoning: String::new(),
             emitted_content: String::new(),
             lossy: false,
+            cut_in_delimiter: false,
             thinking: config.thinking,
             continuing: config.continuing,
         }
@@ -205,10 +208,13 @@ impl OutputParser {
     /// text the model generated after the prompt — nothing dropped, nothing
     /// added. A tool call, an unfinished tool-call block the parser drops, a
     /// lossy final character, a repeated or missing `<think>`, reasoning ended
-    /// by `<tool_call>` instead of `</think>`, or a `</think>` with no answer
-    /// after it each make it false.
+    /// by `<tool_call>` instead of `</think>`, a `</think>` with no answer after
+    /// it, or an ending inside a possible delimiter (`</thi`, `<tool_`: text
+    /// byte-exact, but a resumed parser would not know it is mid-delimiter) each
+    /// make it false — so a resumed parse of the rest splits exactly as an
+    /// uninterrupted one would.
     pub fn resumes_exactly(&self) -> bool {
-        if self.tool_calls_emitted || self.lossy {
+        if self.tool_calls_emitted || self.lossy || self.cut_in_delimiter {
             return false;
         }
         let (r, c) = (&self.emitted_reasoning, &self.emitted_content);
@@ -282,11 +288,19 @@ impl OutputParser {
         let tail = self.detok.finish();
         let mut delta = self.push_text(&tail);
         let held = self.reasoning.finish().reasoning;
+        // What a splitter held back is a possible partial delimiter (`</thi`,
+        // `<tool_`): given out as text here, but a parser resumed from it starts
+        // with nothing held and would read the rest of the delimiter as text.
+        self.cut_in_delimiter |= !held.is_empty();
         self.emitted_reasoning.push_str(&held);
         delta.reasoning_content.push_str(&held);
         if let Some(parser) = &mut self.tools {
+            // Past a block, the parser no longer reads text as it does before one,
+            // and a resumed parser would start before any.
+            self.cut_in_delimiter |= !parser.before_any_block();
             let rest = parser.finish();
             self.tool_calls_emitted |= !rest.calls.is_empty();
+            self.cut_in_delimiter |= !rest.content.is_empty();
             self.emitted_content.push_str(&rest.content);
             delta.content.push_str(&rest.content);
             delta.tool_calls.extend(rest.calls);
@@ -422,6 +436,18 @@ mod tests {
         assert!(!ends(None, true, &["<think>done</think>"]));
         // No opening `<think>`: the continued prompt would add one.
         assert!(!ends(None, true, &["straight into it"]));
+        // Inside a delimiter written out of ordinary tokens: the text is
+        // byte-exact, but a resumed parser would not know it is mid-delimiter.
+        assert!(!ends(None, true, &["<think>plan</thi"]));
+        assert!(!ends(Some(false), true, &["Hi <tool_"]));
+        assert!(!ends(None, false, &["<thi"]));
+        // Past an undeclared function's block, returned to the answer as text:
+        // the parser no longer reads as it does before any block.
+        assert!(!ends(
+            Some(false),
+            true,
+            &["<tool_call><function=unknown></function></tool_call>"]
+        ));
         // An incomplete final character is flushed lossily.
         let mut p = parser(Some(false), false);
         run(&mut p, &["ok"], StopCause::MaxTokens);

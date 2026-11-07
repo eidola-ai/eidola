@@ -242,3 +242,100 @@ fn a_continued_render_leaves_its_input_alone() {
     assert_eq!(input.messages, before);
     assert!(matches!(input.messages, Json::Array(_)));
 }
+
+/// The weather tool, offered to every parse in the delimiter sweep below.
+fn weather_tools() -> eidola_engine_chat::ToolSchemas {
+    eidola_engine_chat::ToolSchemas::from_tools(
+        &eidola_engine_chat::json::parse(
+            r#"[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]"#,
+        )
+        .unwrap(),
+    )
+}
+
+/// A parse with the tools offered: reasoning, content, the calls as
+/// `(name, arguments)`, and the verdict.
+fn parse_with_tools(
+    output: &str,
+    continuing: Option<&'static str>,
+) -> (String, String, Vec<(String, String)>, bool) {
+    let config = OutputConfig::new(None, Some(weather_tools())).continuing_in(continuing);
+    let mut parser = OutputParser::new(config, PrefixedCallIds("call_".into()));
+    let mut delta = parser.push_text(output);
+    let (tail, _) = parser.finish(StopCause::MaxTokens);
+    delta.reasoning_content.push_str(&tail.reasoning_content);
+    delta.content.push_str(&tail.content);
+    delta.tool_calls.extend(tail.tool_calls);
+    let calls = delta
+        .tool_calls
+        .iter()
+        .map(|c| (c.name.clone(), c.arguments.clone()))
+        .collect();
+    (
+        delta.reasoning_content,
+        delta.content,
+        calls,
+        parser.resumes_exactly(),
+    )
+}
+
+/// **Continuable means the rest parses as if nothing had stopped.** Cut every
+/// generation after every character — inside `<think>`, `</think>`,
+/// `<tool_call>` and the call's own markup included, as a model writing those
+/// delimiters out of ordinary tokens would — with the tools offered. Wherever
+/// the parser says the cut can be continued exactly, the continued prompt is
+/// the original prompt followed by precisely the cut text, and a parser
+/// resumed from where that prompt ends turns the rest of the generation into
+/// exactly what an uninterrupted parse gives: the same reasoning, the same
+/// answer, the same tool calls. The sweep also requires that some cuts are
+/// continuable and that every cut inside a delimiter is not.
+#[test]
+fn a_cut_that_says_it_continues_exactly_resumes_into_the_uninterrupted_parse() {
+    let template = template();
+    let question = "Explain the tides.";
+    let original = original_prompt(&template, question);
+    let generations = [
+        "<think>plan the call</think>Checking.<tool_call><function=get_weather><parameter=city>Oslo</parameter></function></tool_call>",
+        "<think>Weighing it.\n</think>The tides follow the moon, mostly.",
+        "<think>Reasoning that mentions </thi as text, then </think>An answer.",
+        "<think>Calling straight from thought<tool_call><function=get_weather></function></tool_call>",
+        "<think>Ok.</think>Prose mentioning <tool_ as text, and more prose.",
+    ];
+    let delimiters = ["<think>", "</think>", "<tool_call>"];
+    let (mut continuable, mut inside) = (0, 0);
+    for generation in generations {
+        let (reasoning, content, calls, _) = parse_with_tools(generation, None);
+        for (i, _) in generation.char_indices().skip(1) {
+            let (cut, rest) = generation.split_at(i);
+            let (r1, c1, calls1, exact) = parse_with_tools(cut, None);
+            let in_delimiter = delimiters
+                .iter()
+                .any(|d| (1..d.len()).any(|k| cut.ends_with(&d[..k]) && rest.starts_with(&d[k..])));
+            if in_delimiter {
+                inside += 1;
+                assert!(!exact, "cut inside a delimiter at {i} of {generation:?}");
+            }
+            if !exact {
+                continue;
+            }
+            continuable += 1;
+            assert!(calls1.is_empty(), "a call is never a continued answer");
+            let (prompt, field) = continued_prompt(&template, question, &r1, &c1);
+            assert_eq!(
+                prompt,
+                format!("{original}{cut}"),
+                "cut at {i} of {generation:?}"
+            );
+            let (r2, c2, calls2, _) = parse_with_tools(rest, Some(field));
+            assert_eq!(
+                format!("{r1}{r2}"),
+                reasoning,
+                "cut at {i} of {generation:?}"
+            );
+            assert_eq!(format!("{c1}{c2}"), content, "cut at {i} of {generation:?}");
+            assert_eq!(calls2, calls, "cut at {i} of {generation:?}");
+        }
+    }
+    assert!(continuable > 50, "only {continuable} continuable cuts");
+    assert!(inside > 10, "only {inside} cuts inside a delimiter");
+}

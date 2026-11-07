@@ -705,6 +705,73 @@ async fn a_length_ending_says_whether_it_can_be_continued_exactly() {
     assert!(checked > 0, "some ceiling must cut the dev model off");
 }
 
+/// A `length` ending at the **context window** is never continuable: a
+/// continuation's prompt would be the whole window or more, which the node refuses
+/// (`context_length_exceeded`). Only a request whose own `max_completion_tokens`
+/// stopped it below the window's room can be. Both ways of reaching the window are
+/// covered — no limit at all, and a limit at or past the room — and the
+/// continuation the client would send is shown to be refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_length_ending_at_the_context_window_is_not_continuable() {
+    let prompt = prompt_tokens("Hello there").len() as u32;
+    let room = 6u32;
+    let len = (prompt + room).to_string();
+    let node = TestNode::start(&[(env::MAX_MODEL_LEN, len.as_str())]).await;
+    let (_, finish) = direct_greedy(prompt_tokens("Hello there"), room);
+    assert_eq!(
+        finish,
+        FinishReason::Length,
+        "the dev model runs to the window here"
+    );
+    let mut no_limit = request("Hello there", 1);
+    no_limit
+        .as_object_mut()
+        .unwrap()
+        .remove("max_completion_tokens");
+    for body in [
+        no_limit,
+        request("Hello there", room),
+        request("Hello there", 100),
+    ] {
+        let (status, v) = node.chat_json(&body).await;
+        assert_eq!(status, 200, "{v}");
+        let choice = &v["choices"][0];
+        assert_eq!(choice["finish_reason"], "length", "{body}: {v}");
+        assert_eq!(choice["continuable"], false, "{body}: {v}");
+
+        let message = &choice["message"];
+        let content = message["content"].as_str().unwrap_or("");
+        let field = if content.is_empty() {
+            json!("reasoning_content")
+        } else {
+            json!(true)
+        };
+        let continuation = json!({
+            "model": MODEL_ID,
+            "messages": [
+                {"role": "user", "content": "Hello there"},
+                {"role": "assistant",
+                 "reasoning_content": message["reasoning_content"].as_str().unwrap_or(""),
+                 "content": content},
+            ],
+            "max_completion_tokens": 4,
+            "temperature": 0.0,
+            "add_generation_prompt": false,
+            "continue_final_message": field,
+        });
+        let (status, v) = node.chat_json(&continuation).await;
+        assert_eq!(
+            status, 400,
+            "the continuation it did not offer is refused: {v}"
+        );
+        assert_eq!(v["error"]["type"], "context_length_exceeded");
+    }
+    // Below the room, the request's own limit stopped it, and the verdict is the
+    // chat layer's (asserted in `a_length_ending_says_whether_it_can_be_continued_exactly`).
+    let (_, v) = node.chat_json(&request("Hello there", room - 2)).await;
+    assert!(v["choices"][0]["continuable"].is_boolean(), "{v}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn client_disconnect_cancels_in_the_engine() {
     let node = TestNode::start(&[]).await;
