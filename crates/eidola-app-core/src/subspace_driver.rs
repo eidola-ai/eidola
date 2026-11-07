@@ -344,6 +344,9 @@ impl DelegationFailure {
             | AppError::Credential { .. } => Self::Upstream,
             AppError::NoAccount
             | AppError::InsufficientBalance { .. }
+            // The turn could not be paid for: its hold is past what one
+            // credential carries.
+            | AppError::HoldExceedsDenomination { .. }
             | AppError::ProvisioningTimeout { .. }
             | AppError::TermsAcceptanceRequired { .. } => Self::Funding,
             AppError::NotConfigured { .. }

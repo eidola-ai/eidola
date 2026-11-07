@@ -62,6 +62,12 @@ space-regenerating = Regenerating…
 # TRANSLATORS: $model is the selection exactly as it was saved, an id rather
 # than a display name. Leave it verbatim; it is what the reader looks for.
 space-error-model-unavailable = { $model } is no longer offered by its backend, and nothing will answer in its place. Nothing was sent and nothing was charged — pick a different model, then try again.
+# Shown in the conversation's recovery notice when the turn's worst-case cost
+# is larger than one anonymous credential holds, so it was refused before
+# anything was sent or charged. It is not a balance problem — adding credit
+# does not lift it — so the copy must not point at buying more; a shorter
+# conversation or a different model is what lets the next press through.
+space-error-hold-exceeds-denomination = This reply could cost more than a single request is allowed to hold, so nothing was sent and nothing was charged. Adding credit won’t change that — try a shorter conversation or a different model.
 # A quiet marker beneath a response a regeneration was asked for while one was
 # already running against it somewhere this window cannot see. Not a failure:
 # the first one is still going, and its result will arrive here.

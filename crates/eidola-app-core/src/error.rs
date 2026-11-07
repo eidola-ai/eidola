@@ -118,6 +118,21 @@ pub enum AppError {
     #[error("insufficient balance: {required} credits required, {available} available")]
     InsufficientBalance { available: i64, required: i64 },
 
+    /// A request's worst-case hold is larger than the one credential size
+    /// this client issues (`CREDENTIAL_DENOMINATION`), so no credential can
+    /// carry it and issuing a larger one would link the issuance to the
+    /// request. Refused before any credential is touched or any request is
+    /// sent. The gateway bounds every model it sells far below this, so the
+    /// refusal means a catalog declaring more than that bound allows — or a
+    /// prompt counted at many times its model's window. Not a balance
+    /// problem: adding credit does not lift it; a shorter conversation or a
+    /// different model does.
+    #[error(
+        "this request's worst-case hold of {required} credits is larger than one \
+         credential ({denomination} credits)"
+    )]
+    HoldExceedsDenomination { required: i64, denomination: i64 },
+
     /// The wallet-level ACT provisioning queue timed out waiting for an
     /// in-flight credential refund to free spendable balance for a concurrent
     /// turn. Distinct from [`AppError::InsufficientBalance`] (which is a true

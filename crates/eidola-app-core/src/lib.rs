@@ -1808,26 +1808,11 @@ pub struct SpendTrailEntry {
     pub linkability: Option<String>,
 }
 
-/// Default number of credits to allocate into a fresh anonymous credential
-/// when a chat needs one and the account has balance available
-/// (auto-provisioning). The actual amount is
-/// `min(available, max(DEFAULT_ALLOCATION_CREDITS, required))` — see
-/// [`auto_allocation_amount`].
-///
-/// Why 1,000,000: credits are micro-USD-denominated (the server's
-/// `PRICING_SCALE_FACTOR` is 1e6 — `usd_per_M_tokens × markup` becomes
-/// credits-per-token directly, e.g. gemma4-31b output $1.00/M × 1.5 markup
-/// = 1.5 credits/token). A single chat turn's worst-case hold is
-/// `chargeable_prompt_tokens(bytes, msgs) × prompt_rate + 4096 ×
-/// completion_rate` (the shared `eidola-common` contract): ≈6,200 credits
-/// for the default gemma4-31b, ≈32,000 for the most expensive catalog
-/// models (output 7.875 credits/token) — mostly refunded after the actual
-/// usage settles. 1,000,000 credits ($1.00 of balance) therefore covers
-/// ~30 worst-case holds or 100+ typical turns: small enough that only a
-/// sliver of the account balance is parked in one unlinkable credential
-/// at a time, large enough that re-allocation (an account-linked,
-/// timing-correlatable operation) stays infrequent.
-pub const DEFAULT_ALLOCATION_CREDITS: i64 = 1_000_000;
+/// The face value of every credential auto-provisioning issues: the shared
+/// contract's [`eidola_common::CREDENTIAL_DENOMINATION`] (`D`), whose doc
+/// carries the sizing rationale and the leak it closes. Issuance is never
+/// sized from the request that triggered it — see [`auto_allocation_amount`].
+pub const CREDENTIAL_DENOMINATION: i64 = eidola_common::CREDENTIAL_DENOMINATION as i64;
 
 /// How long the ACT provisioning queue waits for an in-flight credential
 /// refund (a concurrent turn's recovery) to free spendable balance before
@@ -1840,21 +1825,34 @@ const PROVISION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 const PROVISION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Decide how many credits to auto-allocate, given the account's available
-/// balance and the credits required for the operation that triggered
-/// provisioning. Pure function so the decision logic is unit-testable
-/// without HTTP.
+/// balance and the hold of the request that triggered provisioning. Pure so
+/// the decision is unit-testable without HTTP.
 ///
-/// Returns [`AppError::InsufficientBalance`] when the balance cannot cover
-/// even the required amount; otherwise the chunk size:
-/// `min(available, max(DEFAULT_ALLOCATION_CREDITS, required))`.
+/// **The amount is one public denomination, never a function of the
+/// request**: [`CREDENTIAL_DENOMINATION`], or the whole available balance
+/// when that is less. The issuance is recorded against the account, and the
+/// spend that follows presents its hold anonymously; an issuance of exactly
+/// that hold would link the two. `required` only decides *whether* to
+/// allocate:
+///
+/// - past the denomination → [`AppError::HoldExceedsDenomination`]: no
+///   credential this client issues can carry it, and issuing a larger one
+///   would be the leak;
+/// - past the available balance → [`AppError::InsufficientBalance`].
 fn auto_allocation_amount(available: i64, required: i64) -> Result<i64, AppError> {
+    if required > CREDENTIAL_DENOMINATION {
+        return Err(AppError::HoldExceedsDenomination {
+            required,
+            denomination: CREDENTIAL_DENOMINATION,
+        });
+    }
     if available < required {
         return Err(AppError::InsufficientBalance {
             available,
             required,
         });
     }
-    Ok(available.min(DEFAULT_ALLOCATION_CREDITS.max(required)))
+    Ok(available.min(CREDENTIAL_DENOMINATION))
 }
 
 /// Incremental events emitted by `AppCore::chat_stream`. The terminal
@@ -6129,13 +6127,18 @@ impl Inner {
     /// the first flips it to `spending` inside the lock; the second, entering
     /// next, no longer sees it as spendable.
     ///
+    /// The charge is at most [`CREDENTIAL_DENOMINATION`]: [`Inner::acquire_spend`]
+    /// refuses a larger one before calling this.
+    ///
     /// Resolution order (retried in a bounded loop):
-    /// 1. An active local credential with enough credits → use it.
+    /// 1. An active local credential with enough credits → use it (the
+    ///    smallest that covers the charge; nothing is ever sized from a
+    ///    credential's balance).
     /// 2. No usable credential and no account configured →
     ///    [`AppError::NoAccount`] (the UI routes to account creation).
     /// 3. Account exists and the available balance covers a fresh allocation →
-    ///    allocate `min(available, max(DEFAULT_ALLOCATION_CREDITS, charge))`
-    ///    (the pool) and retry.
+    ///    allocate one denomination, `min(available, CREDENTIAL_DENOMINATION)`
+    ///    ([`auto_allocation_amount`]), and retry.
     /// 4. Balance can't cover another allocation but a mid-spend credential
     ///    whose own `credits` cover the charge exists (a concurrent turn holds
     ///    usable coverage) → wait bounded for its refund recovery to write a
@@ -7448,9 +7451,26 @@ impl Inner {
         // once can never both spend the same credential. The gate is held only
         // through `insert_pre_credential_refund` below (the point the
         // credential becomes `spending`); the HTTP request runs outside it.
+        // **No hold past one credential.** Every credential auto-provisioning
+        // issues is worth one denomination, and the gateway bounds every model
+        // it sells to a sixteenth of that, so a larger hold means a catalog
+        // this client should not have been handed — or a prompt counted past
+        // many windows. Refused before any credential is touched: a larger
+        // credential the profile already holds (an explicit allocation) would
+        // cover it, and spending one would publish that the hold came from
+        // one of the few credentials not of the common size.
+        let charge = match i64::try_from(charge_credits) {
+            Ok(charge) if charge <= CREDENTIAL_DENOMINATION => charge,
+            _ => {
+                return Err(AppError::HoldExceedsDenomination {
+                    required: i64::try_from(charge_credits).unwrap_or(i64::MAX),
+                    denomination: CREDENTIAL_DENOMINATION,
+                });
+            }
+        };
         let _spend_guard = self.spend_gate.lock().await;
         let cred = self
-            .ensure_spendable_credential(cfg, db_conn, charge_credits as i64)
+            .ensure_spendable_credential(cfg, db_conn, charge)
             .await?;
 
         let credit_token =
@@ -7500,7 +7520,7 @@ impl Inner {
             &cred.nonce,
             &cred.issuer_key_id,
             &pre_refund_cbor,
-            charge_credits as i64,
+            charge,
             &spend_proof_cbor,
             now,
         )
@@ -14863,12 +14883,15 @@ fn estimate_charge_credits(
             value.div_ceil(scale_factor)
         };
     }
-    let sf = pricing.scale_factor;
     let chargeable_prompt =
         eidola_common::prompt_charge(messages, Some(tool_schemas)).chargeable_prompt_tokens();
-    let prompt_credits = (chargeable_prompt as u128 * pricing.prompt_rate).div_ceil(sf);
-    let completion_credits = (max_completion_tokens as u128 * pricing.completion_rate).div_ceil(sf);
-    prompt_credits + completion_credits
+    eidola_common::token_hold_credits(
+        chargeable_prompt as u128,
+        max_completion_tokens as u128,
+        pricing.prompt_rate,
+        pricing.completion_rate,
+        pricing.scale_factor,
+    )
 }
 
 #[cfg(test)]
@@ -18132,28 +18155,96 @@ mod tests {
     // --- Auto-provisioning decision logic ---------------------------------
 
     #[test]
-    fn auto_allocation_uses_default_chunk_when_balance_is_plentiful() {
-        // Plenty of balance, small charge → allocate the default chunk,
-        // leaving the rest of the balance in the account.
-        let amount = auto_allocation_amount(10 * DEFAULT_ALLOCATION_CREDITS, 6_200).unwrap();
-        assert_eq!(amount, DEFAULT_ALLOCATION_CREDITS);
+    fn auto_allocation_issues_one_denomination_when_balance_is_plentiful() {
+        // Plenty of balance, small charge → one denomination, leaving the
+        // rest of the balance in the account.
+        let amount = auto_allocation_amount(10 * CREDENTIAL_DENOMINATION, 6_200).unwrap();
+        assert_eq!(amount, CREDENTIAL_DENOMINATION);
     }
 
     #[test]
     fn auto_allocation_is_capped_by_available_balance() {
-        // Balance covers the charge but is below the default chunk →
-        // allocate everything that's available.
+        // Balance covers the charge but is below one denomination → allocate
+        // everything that's available: the last issuance an account makes.
         let amount = auto_allocation_amount(50_000, 6_200).unwrap();
         assert_eq!(amount, 50_000);
     }
 
+    /// REGRESSION: **an issuance never carries the hold it was made for.** A
+    /// charge past the old default chunk was issued for exactly, so the
+    /// account's ledger row named the hold the anonymous spend presented a
+    /// moment later. Past one denomination it is now refused, typed, before
+    /// anything is issued.
     #[test]
-    fn auto_allocation_grows_to_cover_a_large_charge() {
-        // A single charge larger than the default chunk must still fit in
-        // one credential (spends draw from exactly one credential).
-        let required = DEFAULT_ALLOCATION_CREDITS + 500_000;
-        let amount = auto_allocation_amount(10 * DEFAULT_ALLOCATION_CREDITS, required).unwrap();
-        assert_eq!(amount, required);
+    fn a_charge_past_one_denomination_is_refused_not_issued_for() {
+        let required = CREDENTIAL_DENOMINATION + 500_000;
+        match auto_allocation_amount(10 * CREDENTIAL_DENOMINATION, required) {
+            Err(AppError::HoldExceedsDenomination {
+                required: r,
+                denomination,
+            }) => {
+                assert_eq!(r, required);
+                assert_eq!(denomination, CREDENTIAL_DENOMINATION);
+            }
+            other => panic!("expected HoldExceedsDenomination, got {other:?}"),
+        }
+        // A denomination exactly is still one credential's worth.
+        assert_eq!(
+            auto_allocation_amount(10 * CREDENTIAL_DENOMINATION, CREDENTIAL_DENOMINATION).unwrap(),
+            CREDENTIAL_DENOMINATION
+        );
+    }
+
+    /// **The amount is a function of the balance alone.** Over a sweep of
+    /// balances and charges — the edges and a deterministic pseudo-random
+    /// spread — every successful allocation is the denomination or the whole
+    /// balance below it, so two charges against one balance allocate the same
+    /// amount, and an issuance equals the hold only where the hold happens to
+    /// be one of those two numbers, never because it was asked for.
+    #[test]
+    fn the_allocation_never_depends_on_the_charge() {
+        let d = CREDENTIAL_DENOMINATION;
+        let mut values = vec![
+            0,
+            1,
+            2,
+            6_200,
+            eidola_common::MAX_DECLARED_HOLD as i64,
+            d / 2,
+            d - 1,
+            d,
+            d + 1,
+            2 * d,
+            10 * d,
+            i64::MAX,
+        ];
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..200 {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            values.push(((x >> 33) % (3 * d as u64)) as i64);
+        }
+        for &available in &values {
+            let expected = available.min(d);
+            for &required in &values {
+                match auto_allocation_amount(available, required) {
+                    Ok(amount) => {
+                        assert_eq!(
+                            amount, expected,
+                            "available {available}, required {required}"
+                        );
+                        assert!(required <= amount, "the allocation covers the charge");
+                        if required != d && required != available {
+                            assert_ne!(amount, required, "available {available}");
+                        }
+                    }
+                    Err(AppError::HoldExceedsDenomination { .. }) => assert!(required > d),
+                    Err(AppError::InsufficientBalance { .. }) => {
+                        assert!(required <= d && available < required)
+                    }
+                    Err(other) => panic!("unexpected {other:?}"),
+                }
+            }
+        }
     }
 
     #[test]

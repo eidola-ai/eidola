@@ -2916,6 +2916,12 @@ fn error_copy(e: &AppError, cx: &gpui::App) -> String {
         AppError::InsufficientBalance { .. } => {
             "Not enough credits to send. Add credits to continue.".to_string()
         }
+        // Not a balance problem, and the copy must not send the reader to buy
+        // credit that would not help: the request's worst case is past what
+        // one credential holds, so what lifts it is a smaller request.
+        AppError::HoldExceedsDenomination { .. } => {
+            crate::i18n::msg::space_error_hold_exceeds_denomination(cx).to_string()
+        }
         AppError::SpaceArchived { .. } => crate::i18n::msg::space_error_archived(cx).to_string(),
         AppError::NotJoined { .. } => crate::i18n::msg::space_error_not_joined(cx).to_string(),
         // The model this turn would have used has left its backend's catalog.

@@ -3491,6 +3491,171 @@ fn insufficient_balance_persists_post_then_fails_routing_to_plans() {
 }
 
 // ===========================================================================
+// The credential denomination: issuance is never sized from a hold
+// ===========================================================================
+
+/// The one credential size auto-provisioning issues
+/// (`eidola_common::CREDENTIAL_DENOMINATION`).
+const DENOMINATION: i64 = eidola_common::CREDENTIAL_DENOMINATION as i64;
+
+/// **A hold past one credential is refused before anything is issued or
+/// sent.** The mock prices [`MODEL`]'s completion at 1,000 credits a token,
+/// so the turn's fallback ceiling of 4,096 tokens alone holds ~4.1M credits —
+/// four credentials' worth, from a catalog no gateway would build. Issuing
+/// for it would have written that exact hold onto the account's ledger row
+/// seconds before the spend presented it; instead the turn fails typed, the
+/// account is never asked for a credential, and the completion endpoint
+/// never hears of the turn. The post survives, as every funding refusal
+/// leaves it.
+#[test]
+fn a_hold_past_one_credential_is_refused_before_anything_is_issued() {
+    run(|| {
+        let config = MockConfig {
+            completion_rate: 1_000,
+            ..MockConfig::default()
+        };
+        let issued = config.issued.clone();
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect_err("a hold past one credential must be refused");
+        match err {
+            AppError::HoldExceedsDenomination {
+                required,
+                denomination,
+            } => {
+                assert_eq!(denomination, DENOMINATION);
+                assert!(required > DENOMINATION, "required {required}");
+            }
+            other => panic!("expected HoldExceedsDenomination, got {other:?}"),
+        }
+
+        assert!(
+            issued.lock().unwrap().is_empty(),
+            "nothing was issued for the hold"
+        );
+        assert_eq!(mock.chat_hits(), 0, "nothing was sent");
+        let wallet = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert!(wallet.is_empty(), "no credential was touched: {wallet:?}");
+
+        let space_id = only_space(&core);
+        let changes = drain(&mut rx);
+        assert!(
+            changes.contains(&Change::Space(space_id.clone())),
+            "the post persisted and was announced; got {changes:?}"
+        );
+        assert!(changes.contains(&Change::SpaceIndex), "got {changes:?}");
+        assert!(
+            !changes.contains(&Change::Record)
+                && !changes.contains(&Change::Wallet)
+                && !changes.contains(&Change::Account),
+            "no spend, no issuance; got {changes:?}"
+        );
+    });
+}
+
+/// **A credential larger than the denomination does not let a larger hold
+/// through.** An explicit `account_allocate` issues whatever it is asked for,
+/// so the wallet can hold a credential that would cover a four-credential
+/// hold — and spending it would tell the server the hold came from one of the
+/// few credentials not of the common size. The refusal therefore comes
+/// before the wallet is consulted, and the credential is left as it was.
+#[test]
+fn a_larger_credential_in_the_wallet_does_not_let_a_larger_hold_through() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            completion_rate: 1_000,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(5 * DENOMINATION))
+            .expect("an explicit allocation of five denominations");
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect_err("still refused");
+        assert!(
+            matches!(err, AppError::HoldExceedsDenomination { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(mock.chat_hits(), 0, "nothing was sent");
+        let wallet = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert_eq!(wallet.len(), 1, "{wallet:?}");
+        assert_eq!(
+            wallet[0].credits,
+            5 * DENOMINATION,
+            "the credential is untouched"
+        );
+        assert_eq!(wallet[0].generation, 0, "and was never spent: {wallet:?}");
+    });
+}
+
+/// **A large hold within one credential is issued one denomination, not the
+/// hold.** At 200 credits a completion token the turn holds ~819K credits —
+/// well past the old issue-what-you-need threshold's typical chunk, yet one
+/// credential still carries it — and the account is asked for exactly one
+/// denomination, whatever the hold.
+#[test]
+fn a_large_hold_is_issued_one_denomination_not_its_own_size() {
+    run(|| {
+        let config = MockConfig {
+            completion_rate: 200,
+            ..MockConfig::default()
+        };
+        let issued = config.issued.clone();
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect("a hold within one credential succeeds");
+        assert_eq!(mock.chat_hits(), 1);
+        assert_eq!(
+            *issued.lock().unwrap(),
+            vec![DENOMINATION],
+            "one issuance, of the public denomination"
+        );
+    });
+}
+
+/// **Every auto-provisioned issuance across ordinary turns is the one public
+/// size.** Two turns at the default price: the first issues, the second
+/// spends the first's successor, and the only amount the account ever sees
+/// is the denomination.
+#[test]
+fn ordinary_turns_issue_only_the_denomination() {
+    run(|| {
+        let config = MockConfig::default();
+        let issued = config.issued.clone();
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        for prompt in ["first", "second"] {
+            core.runtime()
+                .block_on(core.chat(prompt.into(), MODEL.into(), None))
+                .expect("chat");
+        }
+        let issued = issued.lock().unwrap().clone();
+        assert!(!issued.is_empty(), "the first turn issued");
+        assert!(
+            issued.iter().all(|&credits| credits == DENOMINATION),
+            "every issuance is one denomination: {issued:?}"
+        );
+    });
+}
+
+// ===========================================================================
 // Typed failure: network error after send (connection dropped)
 // ===========================================================================
 
@@ -8309,7 +8474,15 @@ fn a_long_answer_is_kept_whole_and_recorded_as_the_truncation_it_is() {
 #[test]
 fn an_enormous_prompt_is_recorded_as_the_truncation_it_is() {
     run(|| {
-        let (mock, core, _dir) = setup(MockConfig::default());
+        // The pricing contract counts a 2 MiB prompt at ~1.4M tokens, a hold
+        // no credential carries at any nonzero prompt rate (a request that
+        // size is refused locally — see
+        // `a_hold_past_one_credential_is_refused_before_anything_is_issued`).
+        // What this pins is the Record, so the prompt is priced at nothing.
+        let (mock, core, _dir) = setup(MockConfig {
+            prompt_rate: 0,
+            ..MockConfig::default()
+        });
         with_account(&core);
         let prompt = "x".repeat(2 * 1024 * 1024);
         core.runtime()

@@ -264,16 +264,132 @@ const _: () =
         panic!("{}", problem);
     };
 
+/// Why a catalog row's declared worst-case hold is past
+/// [`eidola_common::MAX_DECLARED_HOLD`] at `markup`, if one is.
+///
+/// A row's declared worst case is the hold of a request that fills its
+/// context window with prompt and asks for its whole output ceiling, or its
+/// flat price when it is priced per request — computed from the scaled
+/// integer prices the row publishes, so the number is the one a client
+/// holds. Every hold a client makes for a request whose contract-counted
+/// prompt fits the window is at most this, and the bound keeps it to one
+/// `HOLDS_PER_CREDENTIAL`-th of a credential (see `eidola_common`).
+///
+/// A `const` so the production catalog at the default markup is checked by
+/// the compiler (the assertion below); [`Catalog::new`] runs the same rule
+/// over the published prices, so a runtime markup or `PRICING_OVERRIDES`
+/// entry that breaks it refuses the boot. A row the bound refuses lowers its
+/// ceiling: `max_output ≤ (D / k − context_length × prompt_rate) /
+/// completion_rate`.
+const fn hold_bound_problem(catalog: &[CatalogEntry], markup: f64) -> Option<&'static str> {
+    let mut i = 0;
+    while i < catalog.len() {
+        let entry = &catalog[i];
+        let per_request = if entry.per_request_usd > 0.0 {
+            Some(usd_per_req_to_scaled_credits(entry.per_request_usd, markup))
+        } else {
+            None
+        };
+        let declared = declared_hold(
+            entry.context_length,
+            entry.max_output_tokens,
+            usd_per_m_to_scaled_credits(entry.input_per_m, markup),
+            usd_per_m_to_scaled_credits(entry.output_per_m, markup),
+            per_request,
+        );
+        match declared {
+            None => {
+                return Some(
+                    "a token-priced catalog row declares no max_output_tokens, so its hold is unbounded",
+                );
+            }
+            Some(hold) if hold > eidola_common::MAX_DECLARED_HOLD as u128 => {
+                return Some(
+                    "a catalog row's worst-case hold exceeds eidola_common::MAX_DECLARED_HOLD; lower its \
+                     max_output_tokens to (D/k - context_length * prompt_rate) / completion_rate",
+                );
+            }
+            Some(_) => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A row's declared worst-case hold in credits, from its scaled integer
+/// prices (scale [`PRICING_SCALE_FACTOR`]): the flat price when the row is
+/// priced per request, otherwise a full window of prompt plus the full output
+/// ceiling. `None` for a token-priced row with no output ceiling, whose hold
+/// nothing bounds.
+const fn declared_hold(
+    context_length: u64,
+    max_output_tokens: Option<u64>,
+    prompt_value: u64,
+    completion_value: u64,
+    per_request_value: Option<u64>,
+) -> Option<u128> {
+    let sf = PRICING_SCALE_FACTOR as u128;
+    if let Some(value) = per_request_value {
+        return Some((value as u128).div_ceil(sf));
+    }
+    match max_output_tokens {
+        Some(max_output) => Some(eidola_common::token_hold_credits(
+            context_length as u128,
+            max_output as u128,
+            prompt_value as u128,
+            completion_value as u128,
+            sf,
+        )),
+        None => None,
+    }
+}
+
+/// The compile-time hold bound: every row this build sells declares, at the
+/// default markup, a worst case within `eidola_common::MAX_DECLARED_HOLD`.
+const _: () = if let Some(problem) = hold_bound_problem(MODEL_CATALOG, DEFAULT_PRICING_MARKUP) {
+    panic!("{}", problem);
+};
+
+/// The same bound over a published list — prices after the runtime markup
+/// and every `PRICING_OVERRIDES` entry — naming the model and the numbers.
+fn published_hold_bound_problem(models: &[Model]) -> Option<String> {
+    let bound = eidola_common::MAX_DECLARED_HOLD as u128;
+    models.iter().find_map(|model| {
+        let pricing = &model.pricing;
+        let declared = declared_hold(
+            model.context_length,
+            model.max_output_tokens,
+            pricing.per_prompt_token.value,
+            pricing.per_completion_token.value,
+            pricing.per_request.as_ref().map(|p| p.value),
+        );
+        match declared {
+            None => Some(format!(
+                "{} is priced per token and declares no max_output_tokens, so its hold is unbounded",
+                model.id
+            )),
+            Some(hold) if hold > bound => Some(format!(
+                "{}'s worst-case hold is {hold} credits, past the {bound}-credit bound (one \
+                 credential of {} credits over {} holds); lower its price or its max_output_tokens",
+                model.id,
+                eidola_common::CREDENTIAL_DENOMINATION,
+                eidola_common::HOLDS_PER_CREDENTIAL,
+            )),
+            Some(_) => None,
+        }
+    })
+}
+
 /// Convert USD per million tokens to scaled integer credits, applying markup.
 ///
 /// The 1e6 (USD→µ$) and /1e6 (per-M→per-token) factors cancel, leaving:
 /// `scaled = usd_per_million * markup * PRICING_SCALE_FACTOR`
-fn usd_per_m_to_scaled_credits(usd_per_million: f64, markup: f64) -> u64 {
+const fn usd_per_m_to_scaled_credits(usd_per_million: f64, markup: f64) -> u64 {
     (usd_per_million * markup * PRICING_SCALE_FACTOR as f64).ceil() as u64
 }
 
 /// Convert USD per request to scaled integer credits, applying markup.
-fn usd_per_req_to_scaled_credits(usd_per_request: f64, markup: f64) -> u64 {
+const fn usd_per_req_to_scaled_credits(usd_per_request: f64, markup: f64) -> u64 {
     // credits/request = USD * 1e6 (USD→µ$) * markup
     // scaled = credits/request * PRICING_SCALE_FACTOR
     (usd_per_request * 1e6 * markup * PRICING_SCALE_FACTOR as f64).ceil() as u64
@@ -304,11 +420,21 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    pub fn new(pricing_markup: Option<f64>) -> Self {
+    /// The published catalog at `pricing_markup` (the default when `None`)
+    /// with `PRICING_OVERRIDES` applied — refused when any row's worst-case
+    /// hold at those prices is past `eidola_common::MAX_DECLARED_HOLD`, so a
+    /// runtime price the compile-time check cannot see refuses the boot.
+    pub fn new(pricing_markup: Option<f64>) -> Result<Self, String> {
         let markup = pricing_markup.unwrap_or(DEFAULT_PRICING_MARKUP);
         let overrides = Self::parse_pricing_overrides();
-        Self {
-            models: Self::build_model_list(markup, &overrides),
+        Self::checked(Self::build_model_list(markup, &overrides))
+    }
+
+    /// The bound every published list is held to.
+    fn checked(models: Vec<Model>) -> Result<Self, String> {
+        match published_hold_bound_problem(&models) {
+            Some(problem) => Err(problem),
+            None => Ok(Self { models }),
         }
     }
 
@@ -568,15 +694,15 @@ mod tests {
             id: "engine-fixture",
             name: "Engine Fixture",
             description: "A synthetic reasoning model with tool calling and image input",
-            context_length: 1_048_576,
+            context_length: 262_144,
             tool_calling: true,
             reasoning: true,
             input_modalities: &[Modality::Text, Modality::Image],
             output_modalities: &[Modality::Text],
             max_output_tokens: Some(32_768),
             output_budget_class: OutputBudgetClass::Reasoning,
-            input_per_m: 1.80,
-            output_per_m: 5.75,
+            input_per_m: 0.10,
+            output_per_m: 0.30,
             per_request_usd: 0.0,
         },
         CatalogEntry {
@@ -882,7 +1008,7 @@ mod tests {
     /// so `/v1/models` is empty and every chat request is refused.
     #[test]
     fn the_shipped_catalog_lists_only_its_pinned_rows() {
-        let catalog = Catalog::new(Some(DEFAULT_PRICING_MARKUP));
+        let catalog = Catalog::new(Some(DEFAULT_PRICING_MARKUP)).expect("the shipped catalog");
         let listed = catalog.list().data;
         assert_eq!(listed.len(), MODEL_CATALOG.len());
         for model in &listed {
@@ -927,6 +1053,104 @@ mod tests {
             catalog_binding_problem(&[], &[ENGINE_PIN])
                 .is_some_and(|p| p.contains("has no catalog row"))
         );
+    }
+
+    /// The production catalog is checked by the compiler; this is the same
+    /// function holding the fixtures and refusing each way a row can break
+    /// the hold bound.
+    #[test]
+    fn every_row_declares_a_hold_within_a_sixteenth_of_a_credential() {
+        assert_eq!(
+            hold_bound_problem(MODEL_CATALOG, DEFAULT_PRICING_MARKUP),
+            None
+        );
+        for catalog in [FIXTURE_CATALOG, PER_REQUEST_FIXTURE] {
+            assert_eq!(hold_bound_problem(catalog, DEFAULT_PRICING_MARKUP), None);
+        }
+
+        // A frontier-priced row with a long window: refused.
+        let expensive = [CatalogEntry {
+            input_per_m: 3.0,
+            output_per_m: 15.0,
+            context_length: 200_000,
+            max_output_tokens: Some(32_768),
+            ..row("engine-fixture")
+        }];
+        assert!(
+            hold_bound_problem(&expensive, DEFAULT_PRICING_MARKUP)
+                .is_some_and(|p| p.contains("MAX_DECLARED_HOLD"))
+        );
+
+        // A token-priced row with no ceiling has no bounded hold at all.
+        let unbounded = [CatalogEntry {
+            max_output_tokens: None,
+            ..row("engine-fixture")
+        }];
+        assert!(
+            hold_bound_problem(&unbounded, DEFAULT_PRICING_MARKUP)
+                .is_some_and(|p| p.contains("no max_output_tokens"))
+        );
+
+        // A flat price past the bound: refused, whatever its window.
+        let flat = [CatalogEntry {
+            per_request_usd: 0.05,
+            ..PER_REQUEST_FIXTURE[0]
+        }];
+        assert!(hold_bound_problem(&flat, DEFAULT_PRICING_MARKUP).is_some());
+    }
+
+    /// The derived cap is exactly where the bound sits: a row at
+    /// `(D/k − context × prompt_rate) / completion_rate` passes, and one
+    /// token more is refused.
+    #[test]
+    fn the_derived_output_cap_is_the_bound() {
+        let base = row("engine-fixture");
+        let sf = PRICING_SCALE_FACTOR as u128;
+        let prompt = usd_per_m_to_scaled_credits(base.input_per_m, DEFAULT_PRICING_MARKUP) as u128;
+        let completion =
+            usd_per_m_to_scaled_credits(base.output_per_m, DEFAULT_PRICING_MARKUP) as u128;
+        let prompt_side = (base.context_length as u128 * prompt).div_ceil(sf);
+        let room = eidola_common::MAX_DECLARED_HOLD as u128 - prompt_side;
+        let cap = (room * sf / completion) as u64;
+        let at_cap = [CatalogEntry {
+            max_output_tokens: Some(cap),
+            ..row("engine-fixture")
+        }];
+        assert_eq!(hold_bound_problem(&at_cap, DEFAULT_PRICING_MARKUP), None);
+        let past_cap = [CatalogEntry {
+            max_output_tokens: Some(cap + 1),
+            ..row("engine-fixture")
+        }];
+        assert!(hold_bound_problem(&past_cap, DEFAULT_PRICING_MARKUP).is_some());
+    }
+
+    /// The runtime half: a markup or an override the compile-time check
+    /// could not see is refused by the catalog the boot builds, naming the
+    /// model.
+    #[test]
+    fn a_runtime_price_past_the_bound_refuses_the_catalog() {
+        let fixtures =
+            || Catalog::build_list_from(FIXTURE_CATALOG, FIXTURE_PINS, 1.5, &HashMap::new());
+        assert!(Catalog::checked(fixtures()).is_ok());
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "engine-fixture".to_string(),
+            PricingOverride {
+                input: Some(1.80),
+                output: Some(5.75),
+                request: None,
+            },
+        );
+        let overridden = Catalog::build_list_from(FIXTURE_CATALOG, FIXTURE_PINS, 1.5, &overrides);
+        let refused = Catalog::checked(overridden)
+            .err()
+            .expect("an override past the bound");
+        assert!(refused.contains("engine-fixture"), "{refused}");
+
+        let marked_up =
+            Catalog::build_list_from(FIXTURE_CATALOG, FIXTURE_PINS, 10.0, &HashMap::new());
+        assert!(Catalog::checked(marked_up).is_err());
     }
 
     /// A row publishes its pin's weights and prompt-cache retention.

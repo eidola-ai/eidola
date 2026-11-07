@@ -292,6 +292,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         e
     })?;
 
+    // The published catalog, before anything else is built: a runtime markup
+    // or price override that puts a model's worst-case hold past the bound
+    // every credential is sized against refuses the boot here.
+    let catalog = Catalog::new(config.pricing_markup).map_err(|e| {
+        error!("Catalog error: {}", e);
+        e
+    })?;
+
     info!("Starting Eidola server on {}", config.bind_addr);
 
     // Create database connection pool
@@ -363,7 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Create shared state
     let state = AppState::new(
-        Catalog::new(config.pricing_markup),
+        catalog,
         engines,
         db_pool,
         stripe,

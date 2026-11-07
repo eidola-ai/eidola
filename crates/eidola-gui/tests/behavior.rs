@@ -17509,6 +17509,67 @@ async fn a_stale_model_selection_says_which_model_and_substitutes_none(
     cx.update(|cx| eidola_gui::i18n::apply("en", cx));
 }
 
+/// **A hold past one credential is the request's problem, and the notice says
+/// so in the reader's language.**
+///
+/// App-core refuses a turn whose worst-case cost is larger than the one
+/// credential size it issues (`AppError::HoldExceedsDenomination`). Adding
+/// credit cannot lift that, so the copy must not route the reader to buy any:
+/// it says nothing was sent or charged and names what does help. Switched to
+/// French without re-emitting, as every localized arm is pinned.
+#[gpui::test]
+async fn a_hold_past_one_credential_is_explained_without_offering_to_sell_credit(
+    cx: &mut gpui::TestAppContext,
+) {
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the only post")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::HoldExceedsDenomination {
+                    required: 4_100_000,
+                    denomination: 1_000_000,
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let english = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+    assert!(
+        english.contains("nothing was sent and nothing was charged"),
+        "{english}"
+    );
+    assert!(
+        english.contains("Adding credit won’t change that"),
+        "{english}"
+    );
+    assert!(
+        !english.contains("credits") && !english.contains("4100000"),
+        "neither the raw Display nor the figures reach the reader: {english}"
+    );
+
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    cx.run_until_parked();
+    let french = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+    assert!(french.contains("Ajouter du crédit"), "{french}");
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+}
+
 /// **An affordance that cannot succeed is worse than none.**
 ///
 /// Archival is what closes a conversation and there is no unarchive door

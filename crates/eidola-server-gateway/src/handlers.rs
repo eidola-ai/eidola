@@ -119,18 +119,16 @@ fn worst_case_cost(request: &ChatCompletionRequest, model: &Model) -> u128 {
         return (per_req.value as u128).div_ceil(per_req.scale_factor as u128);
     }
 
-    let sf = PRICING_SCALE_FACTOR as u128;
-
-    // Prompt: the shared contract formula.
-    let prompt_rate = model.pricing.per_prompt_token.value as u128;
-    let prompt_credits = (chargeable_prompt_tokens_for(request) as u128 * prompt_rate).div_ceil(sf);
-
-    // Completion: use max_completion_tokens or fall back to context_length.
-    let completion_rate = model.pricing.per_completion_token.value as u128;
-    let completion_credits =
-        (effective_max_completion(request, model) as u128 * completion_rate).div_ceil(sf);
-
-    prompt_credits + completion_credits
+    // Prompt: the shared contract formula. Completion: max_completion_tokens,
+    // or context_length when the request names none. The sum is the shared
+    // hold arithmetic the client and the catalog bound use too.
+    eidola_common::token_hold_credits(
+        chargeable_prompt_tokens_for(request) as u128,
+        effective_max_completion(request, model) as u128,
+        model.pricing.per_prompt_token.value as u128,
+        model.pricing.per_completion_token.value as u128,
+        PRICING_SCALE_FACTOR as u128,
+    )
 }
 
 /// Compute the actual cost in credits from usage data, clamped to the
@@ -1536,6 +1534,55 @@ pub(crate) mod tests {
             total_tokens: 2_000_000,
         };
         assert_eq!(actual_cost(&usage, &model, 1, 1), 5);
+    }
+
+    /// **A request's charge never depends on whether its prompt was served
+    /// from an engine's prefix cache.** Two usage reports in the exact shape
+    /// an Eidola engine sends (`eidola-server-engine`'s `usage()`), alike but
+    /// for `prompt_tokens_details.cached_tokens` — none of the prompt cached,
+    /// and nearly all of it — settle to one charge, for a token-priced model
+    /// and a per-request-priced one, with and without the contract's clamp
+    /// biting. A discount for a cache hit would make the charge, which the
+    /// refund reveals, say whether this prompt's prefix was seen before.
+    #[test]
+    fn the_settled_charge_ignores_prefix_cache_hits() {
+        let engine_usage = |cached: u32| -> Usage {
+            serde_json::from_value(serde_json::json!({
+                "prompt_tokens": 900,
+                "completion_tokens": 250,
+                "total_tokens": 1_150,
+                "prompt_tokens_details": {"cached_tokens": cached},
+            }))
+            .expect("the engine's usage shape parses")
+        };
+        let cold = engine_usage(0);
+        let warm = engine_usage(896);
+
+        let token_priced = test_model();
+        let mut per_request = test_model();
+        per_request.pricing.per_request = Some(ScaledPrice {
+            value: 7 * PRICING_SCALE_FACTOR,
+            scale_factor: PRICING_SCALE_FACTOR,
+        });
+        for model in [&token_priced, &per_request] {
+            // Chargeable prompt above the reported count (the usual case) and
+            // below it (the clamp charging the contract's figure).
+            for chargeable in [2_000, 500] {
+                let settle =
+                    |usage: &Usage| settled_cost(Some(usage), model, chargeable, 4_096, 99_999);
+                assert_eq!(
+                    settle(&cold),
+                    settle(&warm),
+                    "{} with chargeable {chargeable}",
+                    model.id
+                );
+            }
+        }
+        // And the figure is the full price of every prompt token reported.
+        assert_eq!(
+            settled_cost(Some(&warm), &token_priced, 2_000, 4_096, 99_999),
+            900 + 2 * 250
+        );
     }
 
     /// Tripwire against client/server drift: the client sizes its hold from

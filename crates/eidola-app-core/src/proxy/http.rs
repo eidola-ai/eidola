@@ -559,6 +559,18 @@ pub(crate) fn app_error_response(error: &AppError) -> Response<ProxyBody> {
             None,
             Disclosure::Detail,
         ),
+        // **The request, not the funding.** Its worst case is larger than one
+        // credential, so no balance would let it through and the caller's way
+        // out is a smaller request. The figures stay home: the denomination is
+        // public, but the hold is this profile's.
+        AppError::HoldExceedsDenomination { .. } => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            Some("request_too_large"),
+            Disclosure::Fixed(
+                "This request's worst-case cost is larger than one request may hold.",
+            ),
+        ),
         AppError::NotConfigured { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             "invalid_request_error",
@@ -773,6 +785,14 @@ mod tests {
                 required: 1,
             }),
             StatusCode::PAYMENT_REQUIRED
+        );
+        assert_eq!(
+            status(AppError::HoldExceedsDenomination {
+                required: 2_000_000,
+                denomination: 1_000_000,
+            }),
+            StatusCode::BAD_REQUEST,
+            "no balance lifts it, so it is not a funding refusal"
         );
         assert_eq!(
             status(AppError::Server {

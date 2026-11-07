@@ -497,6 +497,39 @@ fn a_completion_refused_before_sending_is_still_recorded() {
     });
 }
 
+/// **A proxied request whose hold is past one credential is refused before
+/// anything is issued or sent — as the request's problem, not the funding's.**
+/// The mock prices [`MODEL`]'s completion so the fallback ceiling alone holds
+/// four credentials' worth. The tool is told its request is too large (no
+/// balance would lift it, so `insufficient_quota` would send it the wrong
+/// way), the account is never asked for a credential, and the Record keeps
+/// the refusal like any other preflight exit.
+#[test]
+fn a_hold_past_one_credential_is_refused_before_anything_is_sent() {
+    run(|| {
+        let config = MockConfig {
+            completion_rate: 1_000,
+            ..MockConfig::default()
+        };
+        let issued = config.issued.clone();
+        let (mock, core, _dir) = core_for(config);
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        for (status, body) in ask_both_ways(&core, &key, MODEL) {
+            assert_eq!(status, 400, "{body}");
+            assert!(body.contains("request_too_large"), "{body}");
+            assert!(
+                !body.contains("1000000") && !body.contains("1,000,000"),
+                "the figures stay home: {body}"
+            );
+        }
+        assert_eq!(mock.chat_hits(), 0, "nothing reached the upstream");
+        assert!(issued.lock().unwrap().is_empty(), "nothing was issued");
+        assert_refused_before_sending(&core, 2, MODEL);
+    });
+}
+
 #[test]
 fn a_flat_priced_model_is_held_at_its_flat_price() {
     run(|| {
@@ -2298,7 +2331,16 @@ fn an_oversized_complete_event_is_refused_rather_than_forwarded() {
 #[test]
 fn an_enormous_prompt_is_recorded_as_the_truncation_it_is() {
     run(|| {
-        let (mock, core, _dir) = core_for(MockConfig::default());
+        // The pricing contract counts a 2 MiB prompt at ~1.4M tokens, a hold
+        // no credential carries at any nonzero prompt rate, so a request that
+        // size is refused before it is sent
+        // (`a_hold_past_one_credential_is_refused_before_anything_is_sent`,
+        // above). What this pins is the
+        // Record, so the prompt is priced at nothing.
+        let (mock, core, _dir) = core_for(MockConfig {
+            prompt_rate: 0,
+            ..MockConfig::default()
+        });
         with_account(&core);
         let key = armed(&core);
         let core = Arc::new(core);

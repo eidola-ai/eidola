@@ -624,7 +624,22 @@ pub struct MockConfig {
     /// answers instantly, which makes an in-flight turn unobservable, so a test
     /// about *concurrency* asks for a window it can act inside.
     pub chat_delay_ms: u64,
+    /// Credits per completion token `GET /v1/models` prices [`MODEL`] at
+    /// (scale factor 1). `1` by default; a test raises it to make a turn's
+    /// worst-case hold large without growing its prompt.
+    pub completion_rate: u64,
+    /// Credits per prompt token `GET /v1/models` prices [`MODEL`] at (scale
+    /// factor 1). `1` by default; `0` lets a test send a prompt far larger
+    /// than one credential could hold at any nonzero rate.
+    pub prompt_rate: u64,
+    /// The `credits` of every `POST /v1/account/credentials` the mock
+    /// answered, in arrival order — what each auto-provisioned issuance asked
+    /// the account for. Shared, so a test reads it after the turn.
+    pub issued: IssuedCredits,
 }
+
+/// See [`MockConfig::issued`].
+pub type IssuedCredits = Arc<std::sync::Mutex<Vec<i64>>>;
 
 impl Default for MockConfig {
     fn default() -> Self {
@@ -643,6 +658,9 @@ impl Default for MockConfig {
             close_switch: CloseSwitch::default(),
             list_flat_model: false,
             chat_delay_ms: 0,
+            completion_rate: 1,
+            prompt_rate: 1,
+            issued: IssuedCredits::default(),
         }
     }
 }
@@ -1333,6 +1351,7 @@ async fn handle_conn(
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
             let ir = parsed.get("issuance_request").and_then(|v| v.as_str());
             let credits = parsed.get("credits").and_then(|v| v.as_i64()).unwrap_or(0);
+            config.issued.lock().unwrap().push(credits);
             match ir.and_then(|ir| issuer.issue(ir, credits)) {
                 Some(issuance_response) => {
                     let body = serde_json::json!({
@@ -2957,8 +2976,8 @@ fn models_body(config: &MockConfig) -> String {
         "id": MODEL,
         "context_length": 8192u64,
         "pricing": {
-            "per_prompt_token": { "value": 1u64, "scale_factor": 1u64 },
-            "per_completion_token": { "value": 1u64, "scale_factor": 1u64 }
+            "per_prompt_token": { "value": config.prompt_rate, "scale_factor": 1u64 },
+            "per_completion_token": { "value": config.completion_rate, "scale_factor": 1u64 }
         }
     });
     if let Some(supported) = config.declared_tool_calling {

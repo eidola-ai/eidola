@@ -60,6 +60,16 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 
 **Future.** The set grows with the user base. If population per window stays small, the epoch length can be raised (a release-visible constant change) to trade key-rotation hygiene for coarser partitions.
 
+### Stranded credential residuals
+
+**Current behavior.** Each anonymous credential is issued at one public denomination, `D` = 1,000,000 credits, and every request spends from exactly one credential, held at the request's worst case and refunded down to its actual cost ([server.md § Anonymity set](server.md#anonymity-set)). A credential whose remainder is smaller than the next hold the client needs is left with that remainder: the client never shapes a request to fit what a credential has left, and never pays one request from two credentials, because a request sized from a balance would reveal the balance and let the server reconstruct the credential's history by subset sum. The remainder is still spendable by a later, smaller request, but nothing guarantees one comes.
+
+**What constrains it today.** Every model the server sells declares a worst-case hold of at most `D / 16`, enforced when the server is built and again when it starts, so for any request whose counted prompt fits its model's window the stranded remainder is under 62,500 credits — 6.25% of a credential.
+
+**Related.** The last credential an account issues is the account's whole remaining balance when that is less than `D`, so its issuance amount is not of the common size. Its spends are cryptographically indistinguishable from any other, but a hold that happens to equal that amount is a coincidence the server could notice. Credentials issued explicitly with `eidola account allocate <credits>` take whatever size is asked for and leave the common size the same way.
+
+**Future.** A way to return an unused remainder to the account would recover it, but returning it is itself a linked event carrying the remainder's size, so it needs the same care as issuance.
+
 ### Multi-jurisdiction attestant distribution
 
 **Current behavior.** Attestants share a small operational surface and may share a jurisdiction.
