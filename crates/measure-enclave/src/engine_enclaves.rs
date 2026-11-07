@@ -566,7 +566,9 @@ containers:
                 .contains("may not set \"TOKIO_WORKER_THREADS\"")
         );
         let tiny = good.replace("memory: 65536", "memory: 1");
-        assert!(entry("fixture-model", &tiny, SIDECAR).contains("memory must be a power of two"));
+        assert!(
+            entry("fixture-model", &tiny, SIDECAR).contains("memory must be a whole number of GiB")
+        );
         let tagged = good.replace(&format!("@sha256:{}", "2".repeat(64)), ":v1");
         assert!(entry("fixture-model", &tagged, SIDECAR).contains("exactly one container"));
 

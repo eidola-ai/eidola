@@ -1396,12 +1396,12 @@ fn the_vm_is_a_launchable_shape() {
         (
             "memory: 65536",
             "memory: 1",
-            "memory must be a power of two",
+            "memory must be a whole number of GiB",
         ),
         (
             "memory: 65536",
             "memory: 65000",
-            "memory must be a power of two",
+            "memory must be a whole number of GiB",
         ),
         ("cpus: 16", "cpus: 0", "cpus must be from"),
         ("cpus: 16", "cpus: 1000", "cpus must be from"),

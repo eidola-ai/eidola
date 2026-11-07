@@ -576,21 +576,24 @@ pub const MIN_MEMORY_MIB: u64 = 8192;
 /// Largest VM memory, in MiB.
 pub const MAX_MEMORY_MIB: u64 = 2 * 1024 * 1024;
 
-/// Whether the VM's `cpus` and `memory` (MiB) are a shape the platform
-/// launches: `cpus` from [`MIN_CPUS`] to [`MAX_CPUS`], and `memory` a power of
-/// two from [`MIN_MEMORY_MIB`] (8 GiB) to [`MAX_MEMORY_MIB`] (2 TiB), the sizes
-/// the platform provider's deployment accepts. Tinfoil's published checks
-/// (`measure-image-action`) require only positive values, so these bounds are
-/// ours; the same rule holds for every `cvm-version` an engine pins.
+/// Whether the VM's `cpus` and `memory` (MiB) are a shape worth pinning:
+/// `cpus` from [`MIN_CPUS`] to [`MAX_CPUS`], and `memory` a whole number of
+/// GiB from [`MIN_MEMORY_MIB`] (8 GiB) to [`MAX_MEMORY_MIB`] (2 TiB). The
+/// platform's production GPU shapes include sizes that are not powers of two
+/// (768 GiB), so the rule asks only for whole GiB. These bounds are ours: they
+/// keep an obviously unlaunchable shape from being pinned, and are not a
+/// security property, since `memory` is part of the measured configuration
+/// either way. The same rule holds for every `cvm-version` an engine pins.
 pub fn check_vm_resources(cpus: u64, memory_mib: u64) -> Result<(), String> {
     if !(MIN_CPUS..=MAX_CPUS).contains(&cpus) {
         return Err(format!(
             "cpus must be from {MIN_CPUS} to {MAX_CPUS} (got {cpus})"
         ));
     }
-    if !memory_mib.is_power_of_two() || !(MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&memory_mib) {
+    if !memory_mib.is_multiple_of(1024) || !(MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&memory_mib)
+    {
         return Err(format!(
-            "memory must be a power of two from {MIN_MEMORY_MIB} to {MAX_MEMORY_MIB} MiB (got {memory_mib})"
+            "memory must be a whole number of GiB from {MIN_MEMORY_MIB} to {MAX_MEMORY_MIB} MiB (got {memory_mib})"
         ));
     }
     Ok(())
@@ -2026,12 +2029,18 @@ mod tests {
         assert!(check_vm_resources(16, 65536).is_ok());
         assert!(check_vm_resources(1, 8192).is_ok());
         assert!(check_vm_resources(MAX_CPUS, MAX_MEMORY_MIB).is_ok());
+        // The platform's 768 GiB GPU shape, and other whole-GiB sizes.
+        assert!(check_vm_resources(32, 786_432).is_ok());
+        assert!(check_vm_resources(16, 9216).is_ok());
         for (cpus, memory) in [
             (0, 65536),
             (MAX_CPUS + 1, 65536),
             (16, 1),
             (16, 4096),
+            (16, 7168),
             (16, 65535),
+            (16, 65000),
+            (16, MAX_MEMORY_MIB + 1024),
             (16, MAX_MEMORY_MIB * 2),
         ] {
             assert!(check_vm_resources(cpus, memory).is_err(), "{cpus} {memory}");
