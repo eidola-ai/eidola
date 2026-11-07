@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use crate::bundle::Platform;
 use crate::measurement::MatchedMeasurement;
 
 #[derive(Debug, Error)]
@@ -13,12 +14,31 @@ pub enum Error {
     #[error("invalid SEV-SNP report: {0}")]
     Report(String),
 
+    /// The evidence came from a platform the caller pinned no measurement
+    /// for. Raised before the evidence is authenticated: the document's
+    /// author chooses the platform, so an unpinned platform is never a
+    /// branch the verifier will take.
     #[error(
-        "TDX attestation refused: MRTD/RTMR0 policy checks are not implemented, and \
-         RTMR1/RTMR2 alone are replayable by guest firmware — only SEV-SNP attestations \
-         are accepted (see docs/gaps.md § TDX acceptance)"
+        "{platform} attestation refused: no {platform} measurement is pinned for this \
+         endpoint (only pinned platforms are accepted; see docs/gaps.md § TDX acceptance)"
     )]
-    TdxNotAccepted,
+    PlatformNotPinned { platform: Platform },
+
+    /// An allowed-measurement entry is malformed or unsafe.
+    #[error("invalid allowed measurement: {0}")]
+    InvalidPin(String),
+
+    /// Intel TDX quote or collateral verification failed.
+    #[error("TDX quote verification failed: {0}")]
+    Quote(String),
+
+    /// An authenticated TDX quote does not satisfy the pinned policy.
+    #[error("TDX policy violation: {0}")]
+    TdxPolicy(String),
+
+    /// Device evidence does not satisfy the pinned entry's requirement.
+    #[error("device evidence rejected: {0}")]
+    DeviceEvidence(String),
 
     #[error("VCEK certificate chain verification failed: {0}")]
     CertChain(String),

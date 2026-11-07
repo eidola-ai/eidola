@@ -16,3 +16,22 @@ license = "MIT OR Apache-2.0"
 # `preserve_order` cannot skew the measure, and the crate docs for the rule
 # that governs any future dependency here.
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# The Argon2id rule of `engine_deployment` (`parse_gateway_token_hash`). Optional,
+# so it enters only the graphs of the two consumers that enable it — the node
+# and the gateway — and both already depend on `argon2 0.6` themselves.
+argon2 = { version = "0.6", optional = true }
+
+# `engine_deployment::deployment`: one engine deployment's config and sidecar,
+# checked whole. Optional, enabled only by the gateway's build and tests and by
+# `measure-enclave`, each of which already reads YAML deployment configs.
+serde_yaml = { version = "0.9", optional = true }
+# The typed mirror of Tinfoil's config schema in the same module.
+serde = { version = "1", features = ["derive"], optional = true }
+# The parser `serde_yaml` is built on, read for its event stream (anchors,
+# aliases, tags, key styles) in the same module; already in the graph of every
+# consumer of `serde_yaml`.
+unsafe-libyaml = { version = "0.2.11", optional = true }
+
+[features]
+argon2 = ["dep:argon2"]
+deployment = ["argon2", "dep:serde_yaml", "dep:serde", "dep:unsafe-libyaml"]

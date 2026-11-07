@@ -444,6 +444,110 @@ def python_error_cases():
     return [case(f"error/{name}", msgs, None, True, None, reject=True) for name, msgs in bad.items()]
 
 
+def continuation_cases():
+    """`continue_final_message`: the prompt ends inside the final message's
+    content (`True`) or reasoning (`"reasoning_content"`) rather than after it,
+    as vLLM and SGLang render it for a continued answer."""
+    out = []
+    question = {"role": "user", "content": "Explain the tides."}
+    partials = {
+        "answer": {"role": "assistant", "reasoning_content": "The moon pulls.", "content": "The tides are driven by"},
+        "answer_no_reasoning": {"role": "assistant", "content": "Partial answer"},
+        "answer_empty": {"role": "assistant", "reasoning_content": "Done thinking.", "content": ""},
+        "answer_trailing_space": {"role": "assistant", "reasoning_content": "r", "content": "ends with a space "},
+        "answer_trailing_newlines": {"role": "assistant", "reasoning_content": "r", "content": "a paragraph\n\n"},
+        "answer_leading_space": {"role": "assistant", "content": "  indented"},
+        "answer_parts": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "first part, "}, {"type": "text", "text": "second part"}],
+        },
+        "reasoning": {"role": "assistant", "reasoning_content": "Let me think about the moon and", "content": ""},
+        "reasoning_no_content": {"role": "assistant", "reasoning_content": "Let me think"},
+        "reasoning_null_content": {"role": "assistant", "reasoning_content": "Let me think", "content": None},
+        "reasoning_empty": {"role": "assistant", "reasoning_content": "", "content": ""},
+        "reasoning_trailing_newline": {"role": "assistant", "reasoning_content": "Step one.\n", "content": ""},
+    }
+    fields = {
+        "answer": True,
+        "answer_no_reasoning": True,
+        "answer_empty": True,
+        "answer_trailing_space": True,
+        "answer_trailing_newlines": True,
+        "answer_leading_space": True,
+        "answer_parts": True,
+        "reasoning": "reasoning_content",
+        "reasoning_no_content": "reasoning_content",
+        "reasoning_null_content": "reasoning_content",
+        "reasoning_empty": "reasoning_content",
+        "reasoning_trailing_newline": "reasoning_content",
+    }
+    for name, msg in partials.items():
+        for thinking in (None, False):
+            out.append(
+                case(
+                    f"continue/{name}/thinking={thinking}",
+                    [question, msg],
+                    None,
+                    False,
+                    thinking,
+                    continue_final_message=fields[name],
+                )
+            )
+    # The spelling `"content"` is `True`.
+    out.append(case("continue/content_by_name", [question, partials["answer"]], None, False, None, continue_final_message="content"))
+    # Unicode and special-token text in the partial message.
+    for i, sample in enumerate(s for s in UNICODE_SAMPLES if s.strip()):
+        msg = {"role": "assistant", "reasoning_content": sample, "content": sample}
+        out.append(case(f"continue/unicode_{i}/content", [question, msg], None, False, None, continue_final_message=True))
+        msg = {"role": "assistant", "reasoning_content": sample, "content": ""}
+        out.append(case(f"continue/unicode_{i}/reasoning", [question, msg], None, False, None, continue_final_message="reasoning_content"))
+    # The sentinel's own text in the message: the reference cuts at the last one.
+    tagged = {"role": "assistant", "content": "says CONTINUE_FINAL_MESSAGE_TAG here"}
+    out.append(case("continue/sentinel_text", [question, tagged], None, False, None, continue_final_message=True))
+    # A whole conversation: tools, a system message, a tool round, earlier
+    # reasoning, and the partial answer last.
+    history = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Weather in Paris?"},
+        {"role": "assistant", "content": "", "reasoning_content": "Call the tool.", "tool_calls": [tool_call("get_weather", {"city": "Paris"}, "c1")]},
+        {"role": "tool", "content": "18C, cloudy", "tool_call_id": "c1"},
+        {"role": "assistant", "reasoning_content": "It is mild.", "content": "It is 18°C in Paris and"},
+    ]
+    for tools in (None, [WEATHER_TOOL]):
+        label = "tools" if tools else "no_tools"
+        out.append(case(f"continue/conversation/{label}/content", history, tools, False, None, continue_final_message=True))
+        reasoning_history = history[:-1] + [{"role": "assistant", "reasoning_content": "It is mild, so", "content": ""}]
+        out.append(
+            case(f"continue/conversation/{label}/reasoning", reasoning_history, tools, False, None, continue_final_message="reasoning_content")
+        )
+    # The reference continues a message of any role; a node continues only an
+    # assistant's, but the renderer is held to the reference here too.
+    out.append(case("continue/user_message", [{"role": "user", "content": "Finish this sentence:"}], None, False, None, continue_final_message=True))
+    return out
+
+
+def continuation_error_cases():
+    """`continue_final_message` inputs the reference refuses."""
+    question = {"role": "user", "content": "q"}
+    bad = {
+        "content_null": ([question, {"role": "assistant", "content": None}], True),
+        "content_missing": ([question, {"role": "assistant", "reasoning_content": "r"}], True),
+        "reasoning_missing": ([question, {"role": "assistant", "content": "x"}], "reasoning_content"),
+        "reasoning_null": ([question, {"role": "assistant", "content": "", "reasoning_content": None}], "reasoning_content"),
+        "reasoning_number": ([question, {"role": "assistant", "content": "", "reasoning_content": 7}], "reasoning_content"),
+        "field_not_in_template": ([question, {"role": "assistant", "content": "x", "foo": "y"}], "foo"),
+        "parts_without_text": ([question, {"role": "assistant", "content": [{"type": "image"}]}], True),
+    }
+    out = [
+        case(f"continue_error/{name}", msgs, None, False, None, reject=True, continue_final_message=field)
+        for name, (msgs, field) in bad.items()
+    ]
+    # A generation prompt asked for as well.
+    answer = {"role": "assistant", "content": "partial"}
+    out.append(case("continue_error/with_generation_prompt", [question, answer], None, True, None, reject=True, continue_final_message=True))
+    return out
+
+
 def random_cases(n):
     rng = random.Random(SEED)
     roles_pool = ["system", "user", "assistant", "tool"]
@@ -548,21 +652,24 @@ def tokenizer_strings(n):
 # ---------------------------------------------------------------- driver
 
 
-def case(name, messages, tools, add_generation_prompt, enable_thinking, reject=False):
+def case(name, messages, tools, add_generation_prompt, enable_thinking, reject=False, continue_final_message=None):
     return {
         "name": name,
         "messages": copy.deepcopy(messages),
         "tools": copy.deepcopy(tools),
         "add_generation_prompt": add_generation_prompt,
         "enable_thinking": enable_thinking,
+        "continue_final_message": continue_final_message,
         "reject": reject,
     }
 
 
-def render(tokenizer, messages, tools, agp, thinking):
+def render(tokenizer, messages, tools, agp, thinking, continue_final_message=None):
     kwargs = {}
     if thinking is not None:
         kwargs["enable_thinking"] = thinking
+    if continue_final_message is not None:
+        kwargs["continue_final_message"] = continue_final_message
     return tokenizer.apply_chat_template(
         messages, tools=tools, tokenize=False, add_generation_prompt=agp, **kwargs
     )
@@ -593,6 +700,8 @@ def main():
         + rejected_cases()
         + python_error_cases()
         + random_cases(60)
+        + continuation_cases()
+        + continuation_error_cases()
     )
     names = [c["name"] for c in cases]
     if len(names) != len(set(names)):
@@ -614,8 +723,18 @@ def main():
             "add_generation_prompt": c["add_generation_prompt"],
             "enable_thinking": c["enable_thinking"],
         }
+        # Only on the cases that set it, so the rest of the corpus is unchanged.
+        if c["continue_final_message"] is not None:
+            entry["continue_final_message"] = c["continue_final_message"]
         try:
-            rendered = render(tokenizer, messages, tools, c["add_generation_prompt"], c["enable_thinking"])
+            rendered = render(
+                tokenizer,
+                messages,
+                tools,
+                c["add_generation_prompt"],
+                c["enable_thinking"],
+                c["continue_final_message"],
+            )
         except Exception as e:  # noqa: BLE001 - recorded as the expected outcome
             if not c["reject"]:
                 sys.exit(f"{c['name']}: reference raised {e!r}")

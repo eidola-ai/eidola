@@ -46,7 +46,17 @@ pub struct RenderOptions {
     /// `enable_thinking`; `None` leaves it undefined in the template, which
     /// for MiMo means thinking is on. Only `Some(false)` changes the prompt.
     pub enable_thinking: Option<bool>,
+    /// `continue_final_message`, normalized the way `transformers` normalizes
+    /// it: the name of the final message's field the prompt ends inside
+    /// (`True` there is `"content"`), or `None` to end after the conversation.
+    /// See [`ChatTemplate::render`].
+    pub continue_final_message: Option<&'static str>,
 }
+
+/// The sentinel `transformers` appends to the field being continued and then
+/// cuts the rendered prompt at (`render_jinja_template`'s
+/// `continue_final_message_tag`).
+const CONTINUE_FINAL_MESSAGE_TAG: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
 
 /// OpenAI-shaped chat input: the `messages` array and the optional `tools`
 /// array of a chat-completions request.
@@ -146,6 +156,9 @@ impl ChatInput {
 pub struct ChatTemplate {
     env: Environment<'static>,
     sha256: String,
+    /// The template's source, which `transformers` searches for the name of
+    /// the field a continuation extends.
+    source: String,
 }
 
 impl std::fmt::Debug for ChatTemplate {
@@ -186,9 +199,13 @@ impl ChatTemplate {
         env.add_filter("tojson", tojson_filter);
         env.add_test("iterable", is_iterable);
         env.add_function("raise_exception", raise_exception);
-        env.add_template_owned(TEMPLATE_NAME, source)
+        env.add_template_owned(TEMPLATE_NAME, source.clone())
             .map_err(|e| ChatError::Template(e.to_string()))?;
-        Ok(ChatTemplate { env, sha256 })
+        Ok(ChatTemplate {
+            env,
+            sha256,
+            source,
+        })
     }
 
     /// Hex SHA-256 of the template source.
@@ -197,14 +214,68 @@ impl ChatTemplate {
     }
 
     /// Renders the prompt text.
+    ///
+    /// With [`RenderOptions::continue_final_message`] set, the prompt ends
+    /// inside the final message's field rather than after the conversation,
+    /// exactly where `transformers` 5.19's `render_jinja_template` ends it: the
+    /// sentinel [`CONTINUE_FINAL_MESSAGE_TAG`] is appended to the field (to the
+    /// last content part with a `text` when the field is a list), the
+    /// conversation is rendered, and the result is cut at the last occurrence
+    /// of the sentinel, keeping trailing whitespace when the template wrote the
+    /// sentinel whole and `rstrip`ping it otherwise. The reference's refusals
+    /// stay refusals: a generation prompt asked for as well (refused by
+    /// `apply_chat_template` itself), a field that is absent or `null`, a field name the
+    /// template never mentions, a list with no `text` part, a value that
+    /// cannot be concatenated with a string, and a render in which the field's
+    /// text or the sentinel does not appear.
+    ///
+    /// For the pinned template, continuing `content` ends the prompt after the
+    /// partial answer (`…<think>R</think>C`), and continuing
+    /// `reasoning_content` ends it inside an open reasoning block
+    /// (`…<think>R`). Either is the original request's prompt followed by the
+    /// text the model generated for it, so a continuation resumes exactly
+    /// where generation stopped.
     pub fn render(&self, input: &ChatInput, options: RenderOptions) -> Result<String, ChatError> {
         validate(input)?;
+        let Some(field) = options.continue_final_message else {
+            return self.render_messages(&input.messages, input, options);
+        };
+        if options.add_generation_prompt {
+            return Err(ChatError::InvalidInput(
+                "continue_final_message and add_generation_prompt are not compatible".into(),
+            ));
+        }
+        let (messages, final_text) = continued_messages(&input.messages, field, &self.source)?;
+        let rendered = self.render_messages(&messages, input, options)?;
+        let tag = CONTINUE_FINAL_MESSAGE_TAG.trim_end();
+        if !rendered.contains(crate::pysem::py_strip(&final_text)) || !rendered.contains(tag) {
+            return Err(ChatError::InvalidInput(
+                "continue_final_message is set but the final message does not appear in the \
+                 chat after applying the chat template"
+                    .into(),
+            ));
+        }
+        let at = rendered.rfind(tag).expect("checked above");
+        let prompt = if rendered[at..].starts_with(CONTINUE_FINAL_MESSAGE_TAG) {
+            &rendered[..at]
+        } else {
+            rendered[..at].trim_end_matches(crate::pysem::is_py_space)
+        };
+        Ok(prompt.to_string())
+    }
+
+    fn render_messages(
+        &self,
+        messages: &Json,
+        input: &ChatInput,
+        options: RenderOptions,
+    ) -> Result<String, ChatError> {
         let template = self
             .env
             .get_template(TEMPLATE_NAME)
             .map_err(|e| ChatError::Template(e.to_string()))?;
         let mut context: Vec<(&str, Value)> = vec![
-            ("messages", to_value(&input.messages)),
+            ("messages", to_value(messages)),
             (
                 "tools",
                 input
@@ -228,6 +299,77 @@ impl ChatTemplate {
             .render(context)
             .map_err(|e| ChatError::Template(format!("{e:#}")))
     }
+}
+
+/// The conversation with the sentinel appended to the final message's
+/// `field`, and the text the reference looks for afterwards (the field's value
+/// before the sentinel, or the chosen part's `text`).
+fn continued_messages(
+    messages: &Json,
+    field: &str,
+    source: &str,
+) -> Result<(Json, String), ChatError> {
+    let invalid = |m: String| Err(ChatError::InvalidInput(m));
+    let mut messages = messages.clone();
+    let Json::Array(items) = &mut messages else {
+        return invalid("messages must be an array".into());
+    };
+    let Some(Json::Object(last)) = items.last_mut() else {
+        return invalid("messages must not be empty".into());
+    };
+    let value = match last.iter_mut().find(|(k, _)| k == field) {
+        Some((_, v)) if !matches!(v, Json::Null) => v,
+        _ => {
+            return invalid(format!(
+                "continue_final_message is set but the final message has no \"{field}\" to \
+                 continue"
+            ));
+        }
+    };
+    if !source.contains(field) {
+        return invalid(format!(
+            "continue_final_message is set to \"{field}\" but this is not an accepted field in \
+             the chat_template"
+        ));
+    }
+    let text = match value {
+        Json::Str(text) => text,
+        Json::Array(parts) => {
+            // Python's `"text" in block` over the parts in reverse: a key test
+            // on an object, a substring test on a string (whose `block["text"]`
+            // then raises).
+            let mut chosen = None;
+            for part in parts.iter_mut().rev() {
+                match part {
+                    Json::Object(members) => {
+                        if let Some((_, text)) = members.iter_mut().find(|(k, _)| k == "text") {
+                            chosen = Some(text);
+                            break;
+                        }
+                    }
+                    Json::Str(s) if s.contains("text") => {
+                        return invalid("a string content part cannot be continued".into());
+                    }
+                    _ => {}
+                }
+            }
+            match chosen {
+                Some(Json::Str(text)) => text,
+                Some(_) => return invalid("a content part's text must be a string".into()),
+                None => {
+                    return invalid(
+                        "continue_final_message is set but we could not find any text to \
+                         continue in the final message"
+                            .into(),
+                    );
+                }
+            }
+        }
+        _ => return invalid(format!("the final message's \"{field}\" is not a string")),
+    };
+    let original = text.clone();
+    text.push_str(CONTINUE_FINAL_MESSAGE_TAG);
+    Ok((messages, original))
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {

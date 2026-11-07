@@ -12,3 +12,6 @@ getrandom = "0.4"
 hmac = "0.13"
 sha2 = "0.11"
 zeroize = "1"
+
+[dev-dependencies]
+chacha20 = { version = "0.10", default-features = false, features = ["cipher"] }

@@ -11,6 +11,23 @@
 //! that the row it lands on was written for the position it expects, so a wrong block
 //! table, a premature free, a missing window or an unexecuted zero panics instead of
 //! silently attending to the wrong keys. Zero and copy treat tags like data.
+//!
+//! **Encryption** ([`Pool::crypt`]) XORs a block's whole image with the ChaCha20 keystream
+//! of `eidola_engine::kv_cipher`, as four ranges in this order, each from a fresh keystream
+//! block: the data (every layer's rows, `f32` bits), the tap (`f32` bits), the row tags
+//! (`pos + 1` then token, per row) and the tap tag. Tags are encrypted too, so a read of a
+//! block left encrypted fails its tag check like a read of a zeroed one, and an idle block
+//! holds no token or position in the clear. The pool also records which blocks are
+//! encrypted, as instrumentation beside the tags.
+//!
+//! **The host tier** is a second pool per group of the same layout. [`Pool::transfer`]
+//! copies a block's whole image (data, tap, tags and the encrypted flag) between a
+//! device pool and a host pool; the executor demotes only encrypted blocks and promotes
+//! only into zeroed ones, and panics otherwise. A host pool's buffers are locked into
+//! memory ([`Pool::lock`], `mlock`) and unlocked when it is dropped.
+
+use eidola_engine::kv_cipher::{KvKeystream, KvNonce};
+use eidola_engine::secret::KvKey;
 
 /// Shape of one KV group.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +66,23 @@ pub(crate) struct Pool {
     tags: Vec<Tag>,
     taps: Vec<f32>,
     tap_tags: Vec<u32>,
+    /// Per block: whether it is held encrypted (instrumentation).
+    encrypted: Vec<bool>,
+    /// Whether the buffers are locked into memory (unlocked on drop).
+    locked: bool,
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        if self.locked {
+            for (ptr, len) in self.buffers() {
+                // SAFETY: the range is this pool's own live allocation, locked by `lock`.
+                // An error leaves the pages locked until the allocation is released, which
+                // is harmless.
+                let _ = unsafe { rustix::mm::munlock(ptr, len) };
+            }
+        }
+    }
 }
 
 impl Pool {
@@ -59,14 +93,83 @@ impl Pool {
             tags: vec![Tag::default(); rows],
             taps: vec![0.0; num_blocks * layout.tap_width],
             tap_tags: vec![0; num_blocks],
+            encrypted: vec![false; num_blocks],
             layout,
             block_size,
             num_blocks,
+            locked: false,
         }
+    }
+
+    /// The buffers holding block contents, as `(address, bytes)`; empty ones left out.
+    fn buffers(&mut self) -> Vec<(*mut std::ffi::c_void, usize)> {
+        fn range<T>(v: &mut [T]) -> (*mut std::ffi::c_void, usize) {
+            (v.as_mut_ptr().cast(), std::mem::size_of_val(v))
+        }
+        [
+            range(&mut self.data),
+            range(&mut self.tags),
+            range(&mut self.taps),
+            range(&mut self.tap_tags),
+        ]
+        .into_iter()
+        .filter(|&(_, len)| len > 0)
+        .collect()
+    }
+
+    /// Locks every buffer holding block contents into memory, so none of it can be
+    /// paged out to swap. The buffers are never reallocated, so the lock holds for the
+    /// pool's life. Fails, leaving nothing locked, if the system refuses.
+    pub fn lock(&mut self) -> std::io::Result<()> {
+        let buffers = self.buffers();
+        for (i, &(ptr, len)) in buffers.iter().enumerate() {
+            // SAFETY: the range is this pool's own live allocation.
+            if let Err(e) = unsafe { rustix::mm::mlock(ptr, len) } {
+                for &(p, l) in &buffers[..i] {
+                    // SAFETY: locked just above.
+                    let _ = unsafe { rustix::mm::munlock(p, l) };
+                }
+                return Err(e.into());
+            }
+        }
+        self.locked = true;
+        Ok(())
+    }
+
+    /// Copies block `src` of `from` over block `dst` of `to`, its whole image: data,
+    /// tap, row tags, tap tag, and the encrypted flag. The pools have the same layout.
+    pub fn transfer(from: &Pool, src: u32, to: &mut Pool, dst: u32) {
+        assert_eq!(
+            from.layout, to.layout,
+            "transfer between pools of one layout"
+        );
+        assert_eq!(from.block_size, to.block_size);
+        let (rpb, w, tw) = (
+            from.rows_per_block(),
+            from.layout.row_width(),
+            from.layout.tap_width,
+        );
+        let (s, d) = (src as usize, dst as usize);
+        to.data[d * rpb * w..(d + 1) * rpb * w]
+            .copy_from_slice(&from.data[s * rpb * w..(s + 1) * rpb * w]);
+        to.tags[d * rpb..(d + 1) * rpb].copy_from_slice(&from.tags[s * rpb..(s + 1) * rpb]);
+        to.taps[d * tw..(d + 1) * tw].copy_from_slice(&from.taps[s * tw..(s + 1) * tw]);
+        to.tap_tags[d] = from.tap_tags[s];
+        to.encrypted[d] = from.encrypted[s];
     }
 
     pub fn num_blocks(&self) -> usize {
         self.num_blocks
+    }
+
+    /// Bytes one block takes: its data, tap, row tags, tap tag and encrypted flag.
+    pub fn block_bytes(&self) -> usize {
+        let rows = self.rows_per_block();
+        rows * self.layout.row_width() * 4
+            + self.layout.tap_width * 4
+            + rows * std::mem::size_of::<Tag>()
+            + 4
+            + 1
     }
 
     fn row_index(&self, block: u32, layer: usize, offset: usize) -> usize {
@@ -133,6 +236,71 @@ impl Pool {
         self.tags[b * rpb..(b + 1) * rpb].fill(Tag::default());
         self.taps[b * tw..(b + 1) * tw].fill(0.0);
         self.tap_tags[b] = 0;
+        self.encrypted[b] = false;
+    }
+
+    /// Encrypts (`encrypt`) or decrypts the block in place: one keystream XOR over its
+    /// image (see the module docs). Panics on encrypting an encrypted block or decrypting
+    /// a plaintext one: the host tracks which blocks are encrypted, so either is a host bug.
+    pub fn crypt(&mut self, block: u32, key: &KvKey, nonce: &KvNonce, encrypt: bool) {
+        let b = block as usize;
+        assert_ne!(
+            self.encrypted[b],
+            encrypt,
+            "block {block}: {} twice",
+            if encrypt { "encrypted" } else { "decrypted" }
+        );
+        self.encrypted[b] = encrypt;
+        let (rpb, w, tw) = (
+            self.rows_per_block(),
+            self.layout.row_width(),
+            self.layout.tap_width,
+        );
+        let mut ks = KvKeystream::new(key, nonce);
+        let data = &mut self.data[b * rpb * w..(b + 1) * rpb * w];
+        ks.range(data.len(), |i, k| {
+            data[i] = f32::from_bits(data[i].to_bits() ^ k)
+        });
+        let taps = &mut self.taps[b * tw..(b + 1) * tw];
+        ks.range(taps.len(), |i, k| {
+            taps[i] = f32::from_bits(taps[i].to_bits() ^ k)
+        });
+        let tags = &mut self.tags[b * rpb..(b + 1) * rpb];
+        ks.range(2 * tags.len(), |i, k| {
+            let t = &mut tags[i / 2];
+            if i % 2 == 0 {
+                t.pos_plus_one ^= k;
+            } else {
+                t.token ^= k;
+            }
+        });
+        let tap_tag = &mut self.tap_tags[b];
+        ks.range(1, |_, k| *tap_tag ^= k);
+    }
+
+    /// Whether the block is held encrypted.
+    pub fn is_encrypted(&self, block: u32) -> bool {
+        self.encrypted[block as usize]
+    }
+
+    /// The block's image as words, in [`Pool::crypt`]'s order (tests).
+    pub fn image(&self, block: u32) -> Vec<u32> {
+        let (rpb, w, tw) = (
+            self.rows_per_block(),
+            self.layout.row_width(),
+            self.layout.tap_width,
+        );
+        let b = block as usize;
+        let mut out: Vec<u32> = self.data[b * rpb * w..(b + 1) * rpb * w]
+            .iter()
+            .map(|x| x.to_bits())
+            .collect();
+        out.extend(self.taps[b * tw..(b + 1) * tw].iter().map(|x| x.to_bits()));
+        for t in &self.tags[b * rpb..(b + 1) * rpb] {
+            out.extend([t.pos_plus_one, t.token]);
+        }
+        out.push(self.tap_tags[b]);
+        out
     }
 
     pub fn copy(&mut self, src: u32, dst: u32) {
@@ -147,6 +315,7 @@ impl Pool {
         self.tags.copy_within(s * rpb..(s + 1) * rpb, d * rpb);
         self.taps.copy_within(s * tw..(s + 1) * tw, d * tw);
         self.tap_tags[d] = self.tap_tags[s];
+        self.encrypted[d] = self.encrypted[s];
     }
 
     /// Whether every byte of the block (data, tap, and tags) is zero.

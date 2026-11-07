@@ -146,6 +146,9 @@ pub const EXPECTED_ARTIFACTS: &[(&str, &str, &str)] = &[
     ("eidola-cli-macos-universal", "nix", "darwin/universal"),
     ("eidola-gui-macos-universal", "nix", "darwin/universal"),
     ("eidola-postgres", "oci", "linux/amd64"),
+    // The gateway image (`ghcr.io/eidola-ai/eidola-server-gateway`). The key
+    // is deliberately not the crate's name: changing it is an artifact-set
+    // rotation like the Linux Nix row's, not a rename in place.
     ("eidola-server", "oci", "linux/amd64"),
 ];
 

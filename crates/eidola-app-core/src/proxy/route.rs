@@ -57,13 +57,6 @@ use crate::{
     parse_server_error_message, process_refund, recover_refund,
 };
 
-/// The completion ceiling a request that named none gets.
-///
-/// The same number the app's own turns fall back to when a backend declares no
-/// context length — one rule, so a proxied request and an in-app one ask for
-/// the same budget from the same model.
-const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 4096;
-
 /// How long one backend has to answer `/v1/models` before it is treated as
 /// unavailable for this listing.
 ///
@@ -402,6 +395,13 @@ pub struct ProxyChatRequest {
     /// object, because the outer shape expresses exactly this one option and
     /// the allowlist discipline says a key nobody decided to send is not sent.
     pub include_usage: bool,
+    /// `continue_final_message` and `add_generation_prompt`, as sent: the
+    /// OpenAI-compatible convention (vLLM's, SGLang's) for asking the model to
+    /// continue the final assistant message, which the Eidola server accepts.
+    /// Forwarded rather than judged here — the server and its engines hold
+    /// them to their rule, and an external backend to its own.
+    pub continue_final_message: Option<Value>,
+    pub add_generation_prompt: Option<Value>,
 }
 
 impl ProxyChatRequest {
@@ -458,6 +458,8 @@ impl ProxyChatRequest {
                 .and_then(|options| options.get("include_usage"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            continue_final_message: object.get("continue_final_message").cloned(),
+            add_generation_prompt: object.get("add_generation_prompt").cloned(),
         })
     }
 
@@ -1049,14 +1051,16 @@ impl Inner {
     /// otherwise computes a hold nothing in the wallet can cover, and fails as
     /// a funding error rather than as the arithmetic mistake it is. An
     /// undeclared ceiling is never read as a zero, so nothing is clamped where
-    /// nothing was declared.
+    /// nothing was declared. A request that named none asks for what the app's
+    /// own turns ask for ([`crate::completion_ceiling`]) — one rule, so a
+    /// proxied request and an in-app one ask the same model for the same budget.
     fn proxy_completion_budget(
         request: &ProxyChatRequest,
         declared_max_output: Option<u64>,
     ) -> u32 {
-        let asked = request
-            .max_completion_tokens
-            .unwrap_or(DEFAULT_MAX_COMPLETION_TOKENS);
+        let Some(asked) = request.max_completion_tokens else {
+            return crate::completion_ceiling(declared_max_output, 0);
+        };
         match declared_max_output {
             Some(declared) => asked.min(u32::try_from(declared).unwrap_or(u32::MAX)),
             None => asked,
@@ -1100,6 +1104,16 @@ impl Inner {
             // upstream for its own refunds — asking or not asking changes
             // nothing there.)
             stream && request.include_usage,
+            // **No prefix-cache key, ever.** A proxied request has no lineage
+            // — no space, no participant — for an app-minted key to be scoped
+            // to, and `cache_key` is not a body field this proxy reads from a
+            // caller: a value a downstream tool picks and never rotates would
+            // link every request it rides on, which is `traceparent`'s reason
+            // for being stripped too.
+            None,
+            // A caller's continuation is forwarded as it spelled it, below,
+            // like the other members it chose to send.
+            None,
         );
         if let Some(object) = body.as_object_mut() {
             for (key, value) in [
@@ -1107,6 +1121,8 @@ impl Inner {
                 ("top_p", &request.top_p),
                 ("stop", &request.stop),
                 ("tool_choice", &request.tool_choice),
+                ("add_generation_prompt", &request.add_generation_prompt),
+                ("continue_final_message", &request.continue_final_message),
             ] {
                 if let Some(value) = value {
                     object.insert(key.to_string(), value.clone());
@@ -1283,7 +1299,7 @@ impl Inner {
             &request.model,
             request
                 .max_completion_tokens
-                .unwrap_or(DEFAULT_MAX_COMPLETION_TOKENS),
+                .unwrap_or(crate::FALLBACK_MAX_COMPLETION_TOKENS),
             stream,
         );
         let refused_at = now_ms();
@@ -1672,7 +1688,7 @@ impl Inner {
             // failure after the nullifier is recorded — request validation,
             // `send_stream`, a spend-proof re-encode — answers with a
             // refund-bearing JSON error body rather than an SSE stream
-            // (`eidola-server/src/handlers.rs`: `error_response_with_refund`).
+            // (`eidola-server-gateway/src/handlers.rs`: `error_response_with_refund`).
             // Persisting that token for recovery is best-effort there, so the
             // in-band value is again the only one that can answer for the arm
             // where persistence failed. Third door, same rule: the refund the
@@ -1837,7 +1853,6 @@ impl Inner {
                     break;
                 }
             };
-            raw.push(&bytes);
             buf.extend_from_slice(&bytes);
             let mut oversized = false;
             while let Some((pos, boundary_len)) = find_event_boundary(&buf) {
@@ -1849,6 +1864,12 @@ impl Inner {
                 }
                 let event: Vec<u8> = buf.drain(..pos).collect();
                 let terminator: Vec<u8> = buf.drain(..boundary_len).collect();
+                // Recorded event by event, so the server's stream padding is
+                // counted rather than kept (`RecordedBody::push_event`). It is
+                // still forwarded: the caller is on this machine, where there
+                // is no network observer for it to hide anything from, and
+                // every server-sent-events reader already ignores it.
+                raw.push_event(&event, &terminator);
                 let (mut out, refund) = forward_sse_event(&event, &route.canonical);
                 if refund.is_some() {
                     inline_refund = refund;
@@ -1893,6 +1914,8 @@ impl Inner {
                 // Refused, so not forwarded: the tail below exists to hand a
                 // downstream parser the bytes the upstream really sent, and
                 // these are the bytes this app has just declined to accept.
+                // They did arrive, so the Record keeps them.
+                raw.push_event(&buf, &[]);
                 buf.clear();
                 break;
             }
@@ -1907,6 +1930,7 @@ impl Inner {
         // is the same fact: an unterminated tail nobody received is not a
         // complete delivery, and discarding the result sealed the row as one.
         if !buf.is_empty() {
+            raw.push_event(&buf, &[]);
             let (out, refund) = forward_sse_event(&buf, &route.canonical);
             if refund.is_some() {
                 inline_refund = refund;
@@ -2419,6 +2443,8 @@ mod tests {
             "stream": true,
             "stream_options": {"include_usage": true, "something_else": 1},
             "max_tokens": 128,
+            "add_generation_prompt": false,
+            "continue_final_message": "reasoning_content",
             "logit_bias": {"1": 2},
             "x-vendor-extension": "whatever a future SDK sends"
         });
@@ -2437,6 +2463,8 @@ mod tests {
         assert_eq!(
             keys,
             vec![
+                "add_generation_prompt",
+                "continue_final_message",
                 "max_completion_tokens",
                 "messages",
                 "model",
@@ -2450,6 +2478,10 @@ mod tests {
             ],
             "no downstream key this app did not decide to send"
         );
+        // A continuation travels as the caller spelled it: the server and its
+        // engines hold it to their rule.
+        assert_eq!(object["add_generation_prompt"], false);
+        assert_eq!(object["continue_final_message"], "reasoning_content");
         assert_eq!(
             object["model"], "m",
             "the backend's own id goes on the wire"
@@ -3152,8 +3184,13 @@ mod tests {
         };
         assert_eq!(
             Inner::proxy_completion_budget(&asking(None), None),
-            DEFAULT_MAX_COMPLETION_TOKENS,
+            crate::FALLBACK_MAX_COMPLETION_TOKENS,
             "a request that named none gets the app's own fallback"
+        );
+        assert_eq!(
+            Inner::proxy_completion_budget(&asking(None), Some(32_768)),
+            32_768,
+            "and where the model declares a ceiling, the app's own turn's ceiling"
         );
         assert_eq!(
             Inner::proxy_completion_budget(&asking(Some(100)), Some(500)),

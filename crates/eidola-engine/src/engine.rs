@@ -36,9 +36,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::executor::{Executor, ExecutorError, SeqEntry, StepInput};
-use crate::kv::{CachePolicy, KvManager, Millis, Release};
+use crate::kv::{CachePolicy, KvManager, Millis, PendingWork, Release};
 use crate::sampling::SamplingParams;
-use crate::secret::EngineSalt;
+use crate::secret::Lineage;
 use crate::spec::{AttentionKind, Bucket, ModelSpec};
 
 /// Caller-chosen request identifier.
@@ -47,10 +47,11 @@ pub type RequestId = u64;
 /// Prefix-cache scope of a request.
 #[derive(Debug)]
 pub enum CacheScope {
-    /// A salt derived from the client's conversation key: blocks are shared with later
-    /// requests carrying the same salt, within the cache lifetime.
-    Keyed(EngineSalt),
-    /// No key: a fresh random salt, and everything the request sealed is purged when it
+    /// The lineage derived from the client's conversation key: blocks are shared with
+    /// later requests carrying the same lineage, within the cache lifetime, and held
+    /// encrypted under its key while no request uses them.
+    Keyed(Lineage),
+    /// No key: a fresh random lineage, and everything the request sealed is purged when it
     /// finishes.
     Private,
 }
@@ -172,8 +173,11 @@ impl Default for SchedulerConfig {
 
 #[derive(Debug)]
 struct Sequence {
+    /// The request; its `cache` is moved into `lineage` and `keyed` at submission.
     req: Request,
-    salt: EngineSalt,
+    /// The request's lineage, dropped (its salt and key zeroed) when the request ends.
+    lineage: Lineage,
+    keyed: bool,
     tokens: Vec<u32>,
     generated: u32,
     arrival: u64,
@@ -301,6 +305,19 @@ impl<E: Executor> Engine<E> {
         self.seqs.len()
     }
 
+    /// Idle-KV keys the engine holds: one per unfinished request (a waiting one included),
+    /// one per running sequence, and those of the encryptions and decryptions waiting for
+    /// the next step. Zero once every request has ended and pending maintenance has run
+    /// ([`Engine::flush`]); the executor keeps none past a step.
+    pub fn kv_keys_held(&self) -> usize {
+        self.seqs.len() + self.kv.kv_keys_held()
+    }
+
+    /// Whether maintenance is waiting for a step ([`Engine::flush`] runs it).
+    pub fn has_pending_maintenance(&self) -> bool {
+        self.kv.has_pending_maintenance()
+    }
+
     /// Cached prompt tokens at a request's first admission (informational; never priced).
     pub fn cached_prompt_tokens(&self, id: RequestId) -> Option<u32> {
         self.seqs.get(&id).and_then(|s| s.cached_prompt_tokens)
@@ -326,7 +343,7 @@ impl<E: Executor> Engine<E> {
     }
 
     /// Queues a request.
-    pub fn submit(&mut self, req: Request) -> Result<(), SubmitError> {
+    pub fn submit(&mut self, mut req: Request) -> Result<(), SubmitError> {
         if req.prompt.is_empty() {
             return Err(SubmitError::EmptyPrompt);
         }
@@ -357,9 +374,9 @@ impl<E: Executor> Engine<E> {
         {
             return Err(SubmitError::ExceedsCapacity);
         }
-        let salt = match &req.cache {
-            CacheScope::Keyed(s) => s.clone(),
-            CacheScope::Private => EngineSalt::fresh(),
+        let (lineage, keyed) = match std::mem::replace(&mut req.cache, CacheScope::Private) {
+            CacheScope::Keyed(l) => (l, true),
+            CacheScope::Private => (Lineage::fresh(), false),
         };
         let arrival = self.next_arrival;
         self.next_arrival += 1;
@@ -369,7 +386,8 @@ impl<E: Executor> Engine<E> {
             id,
             Sequence {
                 req,
-                salt,
+                lineage,
+                keyed,
                 tokens,
                 generated: 0,
                 arrival,
@@ -385,8 +403,7 @@ impl<E: Executor> Engine<E> {
     pub fn cancel(&mut self, id: RequestId, now: Millis) -> Option<Event> {
         let seq = self.seqs.remove(&id)?;
         if self.running.remove(&seq.arrival).is_some() {
-            self.kv
-                .release(id, Release::Finish, seq.req.prompt.len() as u32, now);
+            self.kv.release(id, Release::Finish, now);
         } else {
             self.waiting.remove(&seq.arrival);
             self.kv.forget(id);
@@ -405,11 +422,24 @@ impl<E: Executor> Engine<E> {
     pub fn sweep(&mut self, now: Millis) -> Result<(), ExecutorError> {
         self.kv.sweep(now);
         self.last_sweep = Some(now);
+        self.flush()
+    }
+
+    /// Runs a maintenance-only step if any maintenance is pending: what a caller does
+    /// when the last request ends (or is cancelled) and no step follows, so the blocks it
+    /// left idle are encrypted, the ones it freed zeroed, and the keys those operations
+    /// carried dropped, without waiting for traffic or the next sweep.
+    pub fn flush(&mut self) -> Result<(), ExecutorError> {
         if self.kv.has_pending_maintenance() {
-            let (maintenance, table_updates) = self.kv.take_pending();
+            let PendingWork {
+                maintenance,
+                table_updates,
+                kv_keys,
+            } = self.kv.take_pending();
             let step = StepInput {
                 bucket: self.spec.buckets[0],
                 maintenance,
+                kv_keys,
                 table_updates,
                 seqs: Vec::new(),
                 token_ids: Vec::new(),
@@ -428,8 +458,7 @@ impl<E: Executor> Engine<E> {
         self.waiting.insert(seq.arrival, id);
         seq.preemptions += 1;
         self.stats.preemptions += 1;
-        let prompt_len = seq.req.prompt.len() as u32;
-        self.kv.release(id, Release::Preempt, prompt_len, now);
+        self.kv.release(id, Release::Preempt, now);
     }
 
     /// Plans and executes one step. Returns the events it produced (empty when idle).
@@ -497,8 +526,8 @@ impl<E: Executor> Engine<E> {
                 let seq = &self.seqs[&id];
                 let Some(cached) = self.kv.admit(
                     id,
-                    seq.salt.clone(),
-                    matches!(seq.req.cache, CacheScope::Keyed(_)),
+                    seq.lineage.clone(),
+                    seq.keyed,
                     &seq.tokens,
                     seq.req.prompt.len() as u32,
                     now,
@@ -506,22 +535,12 @@ impl<E: Executor> Engine<E> {
                     break;
                 };
                 let Some((mut entry, mut cost)) = self.plan_row(id, budget, k) else {
-                    self.kv.release(
-                        id,
-                        Release::Preempt,
-                        self.seqs[&id].req.prompt.len() as u32,
-                        now,
-                    );
+                    self.kv.release(id, Release::Preempt, now);
                     break;
                 };
                 if !self.allocate_row(id, &mut entry, &mut cost, &mut planned, &mut budget, &mut k)
                 {
-                    self.kv.release(
-                        id,
-                        Release::Preempt,
-                        self.seqs[&id].req.prompt.len() as u32,
-                        now,
-                    );
+                    self.kv.release(id, Release::Preempt, now);
                     if self.running.is_empty() && planned.is_empty() {
                         // Nothing else holds memory: it can never be admitted.
                         self.waiting.remove(&arrival);
@@ -558,8 +577,7 @@ impl<E: Executor> Engine<E> {
     fn finish_now(&mut self, id: RequestId, reason: FinishReason, now: Millis) -> Event {
         let seq = self.seqs.remove(&id).expect("running sequence");
         self.running.remove(&seq.arrival);
-        self.kv
-            .release(id, Release::Finish, seq.req.prompt.len() as u32, now);
+        self.kv.release(id, Release::Finish, now);
         Event {
             id,
             tokens: Vec::new(),
@@ -583,9 +601,9 @@ impl<E: Executor> Engine<E> {
     ///    all-or-nothing rule (a row drafts `k` or nothing) and makes a step under
     ///    pressure a uniform plain decode.
     /// 2. **The prefill chunk**, cut to the minimum progress unit.
-    /// 3. **This sequence's regeneration pins** ([`KvManager::unpin`]): retention of the
-    ///    prompt's last window for a future regeneration hit, which the sequence itself
-    ///    never needs.
+    /// 3. **This sequence's retention** ([`KvManager::unpin`]): the windows it keeps at its
+    ///    branch and regeneration points for later requests' hits, which the sequence
+    ///    itself never needs.
     ///
     /// Only when the minimum progress unit still does not fit does this return false;
     /// the caller then preempts the newest peer and retries, and a sequence that is
@@ -633,7 +651,7 @@ impl<E: Executor> Engine<E> {
                 return true;
             }
         }
-        // 3. This sequence's regeneration pins.
+        // 3. This sequence's branch and regeneration retention.
         self.kv.unpin(id) && fits(&mut self.kv, entry)
     }
 
@@ -710,10 +728,15 @@ impl<E: Executor> Engine<E> {
             .spec
             .bucket_for(rows, query)
             .expect("budgets keep every batch within the largest bucket");
-        let (maintenance, table_updates) = self.kv.take_pending();
+        let PendingWork {
+            maintenance,
+            table_updates,
+            kv_keys,
+        } = self.kv.take_pending();
         let step = StepInput {
             bucket,
             maintenance,
+            kv_keys,
             table_updates,
             seqs: planned.iter().map(|p| p.entry).collect(),
             token_ids,
@@ -767,10 +790,9 @@ impl<E: Executor> Engine<E> {
                 computed += accepted_drafts;
             }
             let computed = computed.min(seq.tokens.len() as u32 - 1).max(e.context_len);
-            let prompt_len = seq.req.prompt.len() as u32;
             self.kv.commit(id, computed, &seq.tokens, now);
             if let Some(reason) = finish {
-                self.kv.release(id, Release::Finish, prompt_len, now);
+                self.kv.release(id, Release::Finish, now);
                 let seq = self.seqs.remove(&id).expect("sequence");
                 self.running.remove(&seq.arrival);
                 events.push(Event {

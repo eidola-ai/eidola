@@ -14,7 +14,7 @@ For an explanation of how Eidola works, what it commits to, and what it doesn't 
 
 - [Privacy guarantees](docs/privacy-guarantees.md) — the specific properties human attestants commit to with every release.
 - [Threat model](docs/threat-model.md) — who Eidola defends against, who it doesn't.
-- [The client](docs/client.md), [server](docs/server.md), and [inference upstream](docs/upstream.md) — design pieces.
+- [The client](docs/client.md), [server](docs/server.md), and [inference engine](docs/engine.md) — design pieces.
 - [Releases](docs/releases.md) and [trust root spec](docs/trust-root.md) — how new code becomes trustable.
 - [Known gaps](docs/gaps.md) — what we don't yet defend against.
 
@@ -46,7 +46,7 @@ docker compose logs -f       # follow logs
 just down                    # stop everything
 ```
 
-**2. Host-mode server** — postgres, the tinfoil shim mock, and stripe-cli run in containers; the server runs on the host with cargo. The shim is configured to forward to `host.docker.internal:8080`, so requests from the shim and Stripe webhooks all flow into the cargo-built server. This is the recommended inner loop while iterating on `eidola-server`:
+**2. Host-mode server** — postgres, the tinfoil shim mock, and stripe-cli run in containers; the server runs on the host with cargo. The shim is configured to forward to `host.docker.internal:8080`, so requests from the shim and Stripe webhooks all flow into the cargo-built server. This is the recommended inner loop while iterating on `eidola-server-gateway`:
 
 ```bash
 # Bring up postgres + shim + stripe-cli; captures the Stripe webhook secret
@@ -59,12 +59,12 @@ just services
 set -a; source .env; source .env.local; set +a
 
 # Run the server on the host machine with cargo
-cargo run -p eidola-server
+cargo run -p eidola-server-gateway
 
 # -- OR --
 
 # Run and automatically recompile/reload the server on the host machine with bacon
-bacon run-long -- -p eidola-server
+bacon run-long -- -p eidola-server-gateway
 
 # When you're done:
 just down

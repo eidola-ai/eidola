@@ -45,7 +45,7 @@ So every executable that ships is copied: the macOS `.app` copies `llama-server`
 
 Start from a **verified** release (manifest signature + human attestations, [releases.md](releases.md)). Copying a hash off an unverified page does not establish trust.
 
-**OCI.** `crane digest` / registry digest against `digest`.
+**OCI.** `crane digest` / registry digest against `digest`. The `eidola-server` row is the gateway image, published as `ghcr.io/eidola-ai/eidola-server-gateway`; releases before that name was adopted pushed it to `ghcr.io/eidola-ai/eidola-server`. An image digest does not depend on the repository it is pulled from, so the row's key and the check are the same either way — the key stays `eidola-server` because installed clients compare the artifact set by key.
 
 **The measured files are attached to the release.** From the next release tag on, the release workflow fetches the exact files the artifact workflow built and measured, re-hashes each one against the signed manifest, and refuses to attach anything that does not match — the identity across those two workflows is checked, not assumed. Each asset is named after the manifest key that records it, so there is no guessing which row covers which download, and a recorded artifact with no published file fails the release too. One recorded file is deliberately *not* attached: the unsigned macOS shipping zip, because the macOS installable is the Developer ID-signed one.
 

@@ -70,6 +70,9 @@ toml = "1"
 turso = { git = "https://github.com/eidola-ai/turso", branch = "fix-concurrent-view-expansion-guard", default-features = false, features = ["pure-rust-crypto"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 x509-cert = "0.2"
+# Scrubs the prefix-cache key (`prefix_cache`) wherever this crate holds it.
+# Already in this crate's graph through the credential and TLS crates.
+zeroize = "1"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [build-dependencies]
@@ -83,7 +86,7 @@ sha2 = "0.11"
 eidola-app-core = { path = ".", features = ["test-support"] }
 # Strict chat-request acceptance bridge for the real HTTP harness captures.
 # Test-only: app-core's production dependency graph must not include server.
-eidola-server = { path = "../eidola-server", features = ["test-support"] }
+eidola-server-gateway = { path = "../eidola-server-gateway", features = ["test-support"] }
 libc = "0.2"
 tempfile = "3"
 # Building the containers the install fixtures download. Same crate and
