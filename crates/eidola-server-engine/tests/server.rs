@@ -1216,7 +1216,7 @@ fn concurrent_dev_model_builders_never_unpublish_each_other() {
 fn verified_readonly_refuses_a_writable_weights_directory() {
     let mut map = env_map();
     map.insert(env::WEIGHTS_STORAGE, "verified-readonly".into());
-    let err = eidola_server_engine::boot(config_from(&map).unwrap()).unwrap_err();
+    let err = boot_without_swap(config_from(&map).unwrap()).unwrap_err();
     assert!(err.to_string().contains("read-only mount"), "{err}");
     let err = eidola_server_engine::start(config_from(&map).unwrap(), loaded()).unwrap_err();
     assert!(err.to_string().contains("storage"), "{err}");
@@ -1236,10 +1236,46 @@ fn verified_readonly_checks_storage_before_parsing() {
     let mut map = env_map();
     map.insert(env::WEIGHTS_STORAGE, "verified-readonly".into());
     map.insert(env::WEIGHTS_DIR, dir.path().display().to_string());
-    let err = eidola_server_engine::boot(config_from(&map).unwrap()).unwrap_err();
+    let err = boot_without_swap(config_from(&map).unwrap()).unwrap_err();
     assert!(err.to_string().contains("read-only mount"), "{err}");
     // The same directory in development mode does get parsed (and fails there).
     map.insert(env::WEIGHTS_STORAGE, "dev-writable".into());
-    let err = eidola_server_engine::boot(config_from(&map).unwrap()).unwrap_err();
+    let err = boot_without_swap(config_from(&map).unwrap()).unwrap_err();
     assert!(err.to_string().contains("cannot open the weights"), "{err}");
+}
+
+/// `boot` itself, which the binary calls, reads the machine's own `/proc/swaps`: a
+/// `verified-readonly` node on a writable directory is refused for swap exactly where the
+/// real list names an active area (Linux), and for its storage otherwise. With a list that
+/// names one (injected), the swap refusal comes first on Linux.
+#[test]
+fn boot_reads_the_machines_own_swap_list() {
+    let mut map = env_map();
+    map.insert(env::WEIGHTS_STORAGE, "verified-readonly".into());
+    let err = eidola_server_engine::boot(config_from(&map).unwrap())
+        .unwrap_err()
+        .to_string();
+    let real = eidola_server_engine::swap::check_no_swap(std::path::Path::new(
+        eidola_server_engine::swap::PROC_SWAPS,
+    ));
+    if cfg!(target_os = "linux") && real.is_err() {
+        assert!(err.contains("active swap"), "{err}");
+    } else {
+        assert!(err.contains("read-only mount"), "{err}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let swapping = dir.path().join("swaps");
+    std::fs::write(
+        &swapping,
+        "Filename Type Size Used Priority\n/swapfile file 4194300 0 -2\n",
+    )
+    .unwrap();
+    let err = eidola_server_engine::boot_with_swap_list(config_from(&map).unwrap(), &swapping)
+        .unwrap_err()
+        .to_string();
+    if cfg!(target_os = "linux") {
+        assert!(err.contains("1 active swap area"), "{err}");
+    } else {
+        assert!(err.contains("read-only mount"), "{err}");
+    }
 }

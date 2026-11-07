@@ -166,7 +166,14 @@ pub async fn os_shutdown_signal() {
 /// (and, for the CPU executor, the reference model), then the executor ([`start`]); a
 /// refusal at any step ends the boot with nothing served.
 pub fn boot(config: Config) -> Result<Node, BootError> {
-    swap::check_guest(config.weights_storage, config.kv_host_bytes)?;
+    boot_with_swap_list(config, std::path::Path::new(swap::PROC_SWAPS))
+}
+
+/// [`boot`] with the swap check reading the list at `swaps` instead of
+/// [`swap::PROC_SWAPS`]: for tests whose machine has swap (CI runners do) and that check
+/// what boot does after it. The node itself only ever calls [`boot`].
+pub fn boot_with_swap_list(config: Config, swaps: &std::path::Path) -> Result<Node, BootError> {
+    swap::check_guest_at(config.weights_storage, config.kv_host_bytes, swaps)?;
     let model = LoadedModel::load(
         &config.weights_dir,
         &config.expected_weights_sha256,

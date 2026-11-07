@@ -85,8 +85,9 @@ fn flash_shaped_dir() -> &'static (PathBuf, String) {
     })
 }
 
+/// Boots past the swap check (`no_swap_list`): what these tests check comes after it.
 fn boot_err(map: &HashMap<&'static str, String>) -> String {
-    match eidola_server_engine::boot(config_from(map).unwrap()) {
+    match boot_without_swap(config_from(map).unwrap()) {
         Ok(_) => panic!("a cuda boot that cannot have a usable executor succeeded"),
         Err(e) => e.to_string(),
     }
@@ -242,19 +243,11 @@ fn wide_drafts_and_a_small_kv_budget_are_refused_before_the_device() {
     let err = boot_err(&map);
     assert!(err.contains(env::KV_DEVICE_BYTES), "{err}");
 
-    // A host tier too small for two blocks in every group is refused before the device
-    // (where the guest's swap does not refuse the boot first).
+    // A host tier too small for two blocks in every group is refused before the device.
     let mut map = cuda_env(dir, hash);
     map.insert(env::KV_HOST_BYTES, (1u64 << 20).to_string());
     let err = boot_err(&map);
-    let swap = eidola_server_engine::swap::check_no_swap(Path::new(
-        eidola_server_engine::swap::PROC_SWAPS,
-    ));
-    if !cfg!(target_os = "linux") || swap.is_ok() {
-        assert!(err.contains(env::KV_HOST_BYTES), "{err}");
-    } else {
-        assert!(err.contains("swap"), "{err}");
-    }
+    assert!(err.contains(env::KV_HOST_BYTES), "{err}");
 
     // A block size the executor could not index never reaches it.
     let mut map = cuda_env(dir, hash);

@@ -86,14 +86,24 @@ pub fn check_no_swap(path: &Path) -> Result<(), BootError> {
 }
 
 /// The boot check (see the module docs): on Linux, for a `verified-readonly` node or one
-/// with a host tier (`kv_host_bytes` > 0), refuses active swap.
+/// with a host tier (`kv_host_bytes` > 0), refuses active swap in [`PROC_SWAPS`].
 pub fn check_guest(storage: WeightsStorage, kv_host_bytes: u64) -> Result<(), BootError> {
+    check_guest_at(storage, kv_host_bytes, Path::new(PROC_SWAPS))
+}
+
+/// [`check_guest`] over the swap list at `swaps` (tests point it at a fixture; the node
+/// boots through [`crate::boot`], which reads [`PROC_SWAPS`]).
+pub fn check_guest_at(
+    storage: WeightsStorage,
+    kv_host_bytes: u64,
+    swaps: &Path,
+) -> Result<(), BootError> {
     #[cfg(target_os = "linux")]
     if storage == WeightsStorage::VerifiedReadonly || kv_host_bytes > 0 {
-        check_no_swap(Path::new(PROC_SWAPS))?;
+        check_no_swap(swaps)?;
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = (storage, kv_host_bytes);
+    let _ = (storage, kv_host_bytes, swaps);
     Ok(())
 }
 
