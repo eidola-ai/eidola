@@ -3,8 +3,9 @@
 //! This crate holds the small pieces of pure logic that MUST be bit-identical
 //! on both sides of a contract boundary — the anonymous-credit pricing
 //! contract for chat-completion prompt holds ([`chargeable_prompt_tokens`]),
-//! outer chat-request construction ([`chat_completion_request_body`]), the
-//! wire contract shared by clients, the gateway and the inference nodes
+//! the credential denomination every hold is bounded against
+//! ([`CREDENTIAL_DENOMINATION`], [`MAX_DECLARED_HOLD`]), outer chat-request
+//! construction ([`chat_completion_request_body`]), the wire contract shared by clients, the gateway and the inference nodes
 //! ([`engine_protocol`]: the prefix-cache key's shape and the weights
 //! header), and the embed-marker recognition rule shared between the
 //! markdown editor's embed plugin and app-core's upstream quote expansion
@@ -220,6 +221,89 @@ pub fn chargeable_prompt_tokens(total_content_bytes: u64, message_count: u64) ->
     let total = byte_term + message_term + PER_REQUEST_TOKENS as u128;
     u64::try_from(total).unwrap_or(u64::MAX)
 }
+
+/// The hold, in credits, for a token-priced request: `prompt_tokens` at
+/// `prompt_rate` plus `completion_tokens` at `completion_rate`, each rate in
+/// units of `1 / scale_factor` credits per token, and each side rounded up on
+/// its own.
+///
+/// The arithmetic both halves of a hold share: the client sizes its spend
+/// with it, the server's pre-flight minimum is the same sum over the same
+/// request, and the gateway's catalog bound ([`MAX_DECLARED_HOLD`]) evaluates
+/// it over a whole context window and a whole output ceiling. A `const fn`
+/// so that bound is checked by the compiler. `scale_factor` must be nonzero.
+pub const fn token_hold_credits(
+    prompt_tokens: u128,
+    completion_tokens: u128,
+    prompt_rate: u128,
+    completion_rate: u128,
+    scale_factor: u128,
+) -> u128 {
+    (prompt_tokens * prompt_rate).div_ceil(scale_factor)
+        + (completion_tokens * completion_rate).div_ceil(scale_factor)
+}
+
+/// The face value, in credits, of every anonymous credential the client
+/// issues itself from an account balance: the credential **denomination**,
+/// written `D` below.
+///
+/// Issuance is on the account-linked surface, and the ledger records its
+/// amount; a spend is on the unlinked surface, and the server sees its hold.
+/// An issuance sized from the request it was made for would carry that
+/// request's hold onto the account's ledger row, seconds before the spend
+/// presents the same number anonymously — a direct account-to-request link.
+/// So the amount is never a function of any request: it is `D`, or the whole
+/// remaining balance when that is less than `D` (the last issuance an account
+/// makes, whose size is its balance, which the server already holds).
+///
+/// Why 1,000,000: credits are micro-USD, so `D` is $1.00 of balance — small
+/// enough that one unlinkable credential holds a sliver of an account at a
+/// time, and with [`HOLDS_PER_CREDENTIAL`] large enough that re-issuance (an
+/// account-linked, timing-correlatable event) happens at most once per
+/// sixteen worst-case turns. Changing it partitions issuances by client
+/// version, so it moves only with a release that means to.
+pub const CREDENTIAL_DENOMINATION: u64 = 1_000_000;
+
+/// How many worst-case holds one credential of [`CREDENTIAL_DENOMINATION`]
+/// must cover: `k` in the bound `max hold ≤ D / k`.
+///
+/// Why 16. Three things scale with it, and 16 balances them:
+///
+/// - **Re-issuance cadence.** A fresh credential pays for at least `k` turns
+///   on any model the gateway sells before the account surface is touched
+///   again.
+/// - **Stranded residual.** The client never sizes a request from a
+///   credential's balance (that would publish the balance and let the server
+///   reconstruct a credential's history by subset sum), so a credential whose
+///   remainder covers no further hold is left with that remainder. It is
+///   below the largest hold the wallet asks for, which for any request whose
+///   contract-counted prompt fits the model's window is at most `D / k`:
+///   6.25% of a credential at `k = 16`.
+/// - **Headroom for the contract's overcount.** The bound's prompt term is
+///   `context_length` tokens, while a hold counts the prompt by
+///   [`chargeable_prompt_tokens`], which charges two tokens per three content
+///   bytes. A prompt filling the window at four bytes a token (prose) is
+///   counted at about 2.7 window lengths. On a row within the bound, a hold
+///   exceeds `D` — and is then refused locally rather than issued for — only
+///   when the counted prompt is more than `k` window lengths, which for a
+///   prompt that fits the window takes an average above 24 bytes per token
+///   at `k = 16`: no prompt a tokenizer actually produces.
+///
+/// A power of two, so `D / k` is exact for any `D` the release picks.
+pub const HOLDS_PER_CREDENTIAL: u64 = 16;
+
+/// The largest worst-case hold any model the gateway sells may declare:
+/// `D / k`, in credits (62,500 today).
+///
+/// A catalog row's declared worst case is a whole window of prompt at its
+/// prompt rate plus its whole output ceiling at its completion rate
+/// ([`token_hold_credits`]), or its flat price for a model priced per
+/// request — markup included in both, and with every runtime price override
+/// applied. The gateway refuses to build, and refuses to boot, with a row
+/// past it. Where a row's ceiling is what breaks the bound, the row lowers
+/// its ceiling: `max_output ≤ (D / k − context_length × prompt_rate) /
+/// completion_rate`.
+pub const MAX_DECLARED_HOLD: u64 = CREDENTIAL_DENOMINATION / HOLDS_PER_CREDENTIAL;
 
 /// The gathered inputs of the prompt-hold pricing contract for one
 /// chat-completion request.
@@ -683,6 +767,52 @@ mod tests {
             charge.chargeable_prompt_tokens(),
             chargeable_prompt_tokens(u64::MAX, 1)
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Holds and the credential denomination
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_token_hold_rounds_each_side_up_on_its_own() {
+        // 3 × 1/2 = 1.5 → 2 and 5 × 1/2 = 2.5 → 3: five, where rounding the
+        // sum once would give four.
+        assert_eq!(token_hold_credits(3, 5, 1, 1, 2), 5);
+        assert_eq!(token_hold_credits(0, 0, 7, 7, 1_000_000), 0);
+        assert_eq!(
+            token_hold_credits(1_000, 2_000, 1_500_000, 4_500_000, 1_000_000),
+            1_500 + 9_000
+        );
+    }
+
+    #[test]
+    fn the_declared_hold_bound_divides_the_denomination_exactly() {
+        assert_eq!(
+            MAX_DECLARED_HOLD * HOLDS_PER_CREDENTIAL,
+            CREDENTIAL_DENOMINATION
+        );
+        assert_eq!(MAX_DECLARED_HOLD, 62_500);
+    }
+
+    /// The overcount headroom the [`HOLDS_PER_CREDENTIAL`] doc claims: a row
+    /// sitting exactly on the bound, given a prompt that fills its window at
+    /// 23 bytes per token, still holds no more than one credential — and at
+    /// 25 it does not, so the headroom is the one the doc states.
+    #[test]
+    fn a_window_filling_prompt_on_a_row_at_the_bound_fits_one_credential() {
+        let context: u64 = 262_144;
+        // All of the bound on the prompt side: the overcount's worst case.
+        let prompt_rate = (MAX_DECLARED_HOLD as u128 * 1_000_000) / context as u128;
+        let hold_at = |bytes_per_token: u64| {
+            let counted = chargeable_prompt_tokens(context * bytes_per_token, 2);
+            token_hold_credits(counted as u128, 0, prompt_rate, 0, 1_000_000)
+        };
+        assert!(
+            hold_at(23) <= CREDENTIAL_DENOMINATION as u128,
+            "a 23-bytes-per-token window holds {}, past one credential",
+            hold_at(23)
+        );
+        assert!(hold_at(25) > CREDENTIAL_DENOMINATION as u128);
     }
 
     // -----------------------------------------------------------------

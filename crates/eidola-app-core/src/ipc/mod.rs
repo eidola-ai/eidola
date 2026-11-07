@@ -1101,6 +1101,13 @@ impl WireError {
                 "InsufficientBalance",
                 json!({ "available": available, "required": required }),
             ),
+            AppError::HoldExceedsDenomination {
+                required,
+                denomination,
+            } => (
+                "HoldExceedsDenomination",
+                json!({ "required": required, "denomination": denomination }),
+            ),
             AppError::ProvisioningTimeout { message } => {
                 ("ProvisioningTimeout", json!({ "message": message }))
             }
@@ -1193,6 +1200,10 @@ impl WireError {
             "InsufficientBalance" => AppError::InsufficientBalance {
                 available: i("available")?,
                 required: i("required")?,
+            },
+            "HoldExceedsDenomination" => AppError::HoldExceedsDenomination {
+                required: i("required")?,
+                denomination: i("denomination")?,
             },
             "ProvisioningTimeout" => AppError::ProvisioningTimeout { message: msg() },
             "TermsAcceptanceRequired" => AppError::TermsAcceptanceRequired { message: msg() },
@@ -1920,6 +1931,10 @@ mod tests {
             AppError::InsufficientBalance {
                 available: 12,
                 required: 34,
+            },
+            AppError::HoldExceedsDenomination {
+                required: 1_000_001,
+                denomination: 1_000_000,
             },
             AppError::DatabaseInUse {
                 pid: Some(4242),
