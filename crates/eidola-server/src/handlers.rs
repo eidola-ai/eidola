@@ -187,6 +187,37 @@ async fn issue_refund_async(
     issuer_key_hash: &[u8; 32],
     refund_credits: u128,
 ) -> Result<RefundInfo, ServerError> {
+    let refund_cbor = mint_refund(state, spend_proof, issuer_key_hash, refund_credits).await?;
+
+    // Best-effort store in DB for client recovery. Failure here is not fatal
+    // — the refund is still returned in the response, and the row keeps the
+    // provisional refund recorded with the nullifier.
+    let key_id = hex::encode(issuer_key_hash);
+    let nullifier_bytes = spend_proof.nullifier().as_bytes().to_vec();
+    if let Err(e) =
+        db::store_refund_token(&state.db_pool, &key_id, &nullifier_bytes, &refund_cbor).await
+    {
+        warn!("Failed to store refund token for recovery: {e}");
+    }
+
+    Ok(RefundInfo {
+        refund: URL_SAFE_NO_PAD.encode(&refund_cbor),
+        issuer_key_id: key_id,
+    })
+}
+
+/// Sign a refund of `refund_credits` for `spend_proof`, without storing it.
+///
+/// Every refund of one spend mints a successor with the **same** nullifier
+/// (it is fixed by the spend proof), so a client holding two of them can
+/// spend only one: issuing a provisional refund ahead of the settled one
+/// never mints extra value.
+async fn mint_refund(
+    state: &AppState,
+    spend_proof: &SpendProof<128>,
+    issuer_key_hash: &[u8; 32],
+    refund_credits: u128,
+) -> Result<Vec<u8>, ServerError> {
     let t = credit_to_scalar::<128>(refund_credits)
         .map_err(|e| ServerError::Internal(format!("invalid refund amount: {e:?}")))?;
 
@@ -200,24 +231,9 @@ async fn issue_refund_async(
         .refund(&key.params, spend_proof, t, OsRng)
         .map_err(|e| ServerError::Internal(format!("refund issuance failed: {e:?}")))?;
 
-    let refund_cbor = refund
+    refund
         .to_cbor()
-        .map_err(|e| ServerError::Internal(format!("refund CBOR encoding failed: {e:?}")))?;
-
-    // Best-effort store in DB for client recovery. Failure here is not fatal
-    // — the refund is still returned in the response.
-    let key_id = hex::encode(issuer_key_hash);
-    let nullifier_bytes = spend_proof.nullifier().as_bytes().to_vec();
-    if let Err(e) =
-        db::store_refund_token(&state.db_pool, &key_id, &nullifier_bytes, &refund_cbor).await
-    {
-        warn!("Failed to store refund token for recovery: {e}");
-    }
-
-    Ok(RefundInfo {
-        refund: URL_SAFE_NO_PAD.encode(&refund_cbor),
-        issuer_key_id: key_id,
-    })
+        .map_err(|e| ServerError::Internal(format!("refund CBOR encoding failed: {e:?}")))
 }
 
 /// Build an HTTP error response that includes a refund token.
@@ -408,10 +424,21 @@ async fn chat_completions_phases(
 
     // Phase 2: Record the nullifier. After this succeeds, the credential is
     // consumed and we MUST issue a refund on every subsequent code path.
+    //
+    // It is recorded **with** a provisional zero refund (the blind remaining
+    // value c - s), in one statement, so the spend is recoverable from the
+    // instant it exists: a request that never reaches settlement — a blocking
+    // answer the client abandons, a restart mid-flight — leaves this for
+    // `POST /v1/credentials/refund` instead of a row recovery can never serve.
+    // Settlement overwrites it with the real refund. Zero is the rule the
+    // stream already applies when the cost is unknown.
     let key_id = hex::encode(act.issuer_key_hash);
     let nullifier = act.spend_proof.nullifier();
     let nullifier_bytes = nullifier.as_bytes().to_vec();
-    let recorded = db::record_nullifier(&state.db_pool, &key_id, &nullifier_bytes).await?;
+    let provisional = mint_refund(state, &act.spend_proof, &act.issuer_key_hash, 0).await?;
+    let recorded =
+        db::record_nullifier_with_refund(&state.db_pool, &key_id, &nullifier_bytes, &provisional)
+            .await?;
     if !recorded {
         return Err(ServerError::Conflict {
             message: "credential already spent (duplicate nullifier)".to_string(),

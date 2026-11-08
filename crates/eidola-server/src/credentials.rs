@@ -915,6 +915,47 @@ mod tests {
         let _params = Params::new(DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION);
     }
 
+    /// Two refunds of one spend mint two successors, but the successor's
+    /// nullifier is fixed by the spend proof, not by the refund: they share
+    /// it, so only one of them can ever be spent. That is what makes handing
+    /// out a provisional refund before the final one safe — the client keeps
+    /// the better of the two, never both.
+    #[test]
+    fn every_refund_of_one_spend_mints_the_same_successor_nullifier() {
+        use anonymous_credit_tokens::{PreIssuance, Refund};
+        let params = Params::new(DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION);
+        let key = PrivateKey::random(OsRng);
+        let ctx = Scalar::from(42u128);
+        let pre = PreIssuance::random(OsRng);
+        let request = pre.request(&params, OsRng);
+        let response = key
+            .issue::<128>(&params, &request, Scalar::from(1_000u128), ctx, OsRng)
+            .unwrap();
+        let token = pre
+            .to_credit_token::<128>(&params, key.public(), &request, &response)
+            .unwrap();
+        let (spend, pre_refund) = token
+            .prove_spend::<128>(&params, Scalar::from(100u128), OsRng)
+            .unwrap();
+
+        let successor = |t: u128| {
+            let refund: Refund = key.refund(&params, &spend, Scalar::from(t), OsRng).unwrap();
+            pre_refund
+                .to_credit_token(&params, &spend, &refund, key.public())
+                .unwrap()
+        };
+        let (provisional, settled) = (successor(0), successor(60));
+        assert_eq!(provisional.credits(), Scalar::from(900u128));
+        assert_eq!(settled.credits(), Scalar::from(960u128));
+        let nullifier_of = |t: &anonymous_credit_tokens::CreditToken| {
+            t.prove_spend::<128>(&params, Scalar::from(1u128), OsRng)
+                .unwrap()
+                .0
+                .nullifier()
+        };
+        assert_eq!(nullifier_of(&provisional), nullifier_of(&settled));
+    }
+
     // -----------------------------------------------------------------------
     // Refund recovery (require running postgres: just db && just db-reset)
     // -----------------------------------------------------------------------
@@ -924,13 +965,21 @@ mod tests {
     }
 
     async fn recovery_state_under(epoch: crate::helpers::EpochConfig) -> (AppState, [u8; 32]) {
+        recovery_state_at(epoch, None).await
+    }
+
+    /// `upstream` is the base URL chat requests are forwarded to.
+    async fn recovery_state_at(
+        epoch: crate::helpers::EpochConfig,
+        upstream: Option<String>,
+    ) -> (AppState, [u8; 32]) {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
         let pool = db::create_pool(&url, None, None).expect("failed to create test pool");
         let backend = crate::backend::TinfoilBackend::new(
             Arc::new(arc_swap::ArcSwap::from_pointee(reqwest::Client::new())),
             String::new(),
-            None,
+            upstream,
             None,
         );
         let master_key = [7u8; 32];
@@ -1203,5 +1252,102 @@ mod tests {
             matches!(result, Err(ServerError::Unauthorized { .. })),
             "a pruned spend must not verify again, got {result:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // A spend whose request never finishes (require running postgres)
+    // -----------------------------------------------------------------------
+
+    /// An upstream that accepts a request and never answers it.
+    async fn upstream_that_never_answers() -> String {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0u8; 8192];
+                let _ = socket.read(&mut request).await;
+                held.push(socket);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The `Authorization` value the client sends for `act`.
+    fn authorization(act: &crate::auth::ActSpend) -> String {
+        let mut bytes = ACT_TOKEN_TYPE.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&act.challenge_digest);
+        bytes.extend_from_slice(&act.issuer_key_hash);
+        bytes.extend_from_slice(&act.spend_proof.to_cbor().unwrap());
+        format!("PrivateToken token=\"{}\"", URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    /// Recording the nullifier spends the whole credential, and the refund
+    /// is its successor. A request that never reaches settlement (the client
+    /// gives up on a blocking answer, or the process restarts mid-flight)
+    /// must still leave something for `POST /v1/credentials/refund` to return.
+    /// Otherwise recovery answers "retry shortly" forever, and the credential's
+    /// whole value is gone, not just its hold.
+    #[tokio::test]
+    #[ignore]
+    async fn a_spend_whose_request_never_finishes_is_still_recoverable() {
+        let upstream = upstream_that_never_answers().await;
+        let (state, key_hash) =
+            recovery_state_at(crate::helpers::EpochConfig::default(), Some(upstream)).await;
+        let (act, pre_refund) = spend_under(&state, key_hash, None, 1_000_000, 100_000).await;
+
+        let (router, _) = crate::build_router()
+            .with_state(state.clone())
+            .split_for_parts();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        // A blocking ask the client abandons, as Ctrl-C on `eidola chat` does.
+        let abandoned = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("authorization", authorization(&act))
+            .json(&serde_json::json!({
+                "model": "glm-5-3-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": 16,
+            }))
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await;
+        assert!(abandoned.is_err(), "the upstream never answers");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            nullifier_rows(&state, &act).await,
+            1,
+            "the credential was spent"
+        );
+
+        let recovered = recover_refund(TokenAuth(copy_of(&act)), State(state.clone()))
+            .await
+            .map(|Json(r)| r.refund);
+        let refund = match recovered {
+            Ok(refund) => refund,
+            Err(e) => panic!("the spent credential must be recoverable, got {e:?}"),
+        };
+        let cache = state.credential_key_cache.read().await;
+        let key = cache.get(&key_hash).unwrap();
+        let refund = anonymous_credit_tokens::Refund::from_cbor(
+            &URL_SAFE_NO_PAD.decode(refund.refund).unwrap(),
+        )
+        .unwrap();
+        let successor = pre_refund
+            .to_credit_token(
+                &key.params,
+                &act.spend_proof,
+                &refund,
+                key.secret_key.public(),
+            )
+            .expect("refund applies");
+        // Nothing settled the request, so its hold is charged in full (the
+        // stream's own rule for a request whose cost is unknown); the rest of
+        // the credential comes back.
+        assert_eq!(successor.credits(), Scalar::from(900_000u128));
     }
 }
