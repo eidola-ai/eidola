@@ -514,6 +514,17 @@
         "summary": "Create a chat completion.",
         "description": "Requires an ACT (Anonymous Credit Token) for authorization. The spend proof\nis verified, the nullifier is recorded, and a refund token is issued with\nany unspent credits.",
         "operationId": "chat_completions",
+        "parameters": [
+          {
+            "name": "x-eidola-refund-key",
+            "in": "header",
+            "description": "The client's refund recovery key for this spend, 64 lowercase hex digits: the stored copy of the refund is sealed under it, and recovery must present it again",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -536,7 +547,7 @@
             }
           },
           "400": {
-            "description": "Invalid request",
+            "description": "Invalid request, or a missing or malformed refund recovery key (refused before the credential is spent)",
             "content": {
               "application/json": {
                 "schema": {
@@ -604,8 +615,19 @@
           "Unlinked"
         ],
         "summary": "Recover a refund token for a previously spent ACT.",
-        "description": "If the ACT's nullifier was already recorded (the server received and\nprocessed the original request), the stored refund token is returned.\n\nIf the nullifier was NOT recorded (the original request never arrived),\nthe server verifies the spend proof, records the nullifier, issues a\nfull refund (no credits consumed), stores it, and returns it.\n\nIn both cases, the client gets a refund token it can combine with its\nlocal `PreRefund` state to reconstruct a credential.",
+        "description": "If the ACT's nullifier was already recorded (the server received and\nprocessed the original request), the stored refund token is returned.\n\nIf the nullifier was NOT recorded (the original request never arrived),\nthe server verifies the spend proof, records the nullifier, issues a\nfull refund (no credits consumed), stores it, and returns it.\n\nIn both cases, the client gets a refund token it can combine with its\nlocal `PreRefund` state to reconstruct a credential.\n\nThe stored token is sealed under the refund recovery key the client sent\nwith the spend, so recovery must present the same key: a different one\nopens nothing and is answered as no token stored (404).",
         "operationId": "recover_refund",
+        "parameters": [
+          {
+            "name": "x-eidola-refund-key",
+            "in": "header",
+            "description": "The refund recovery key sent with the spend: 64 lowercase hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Refund token recovered or issued",
@@ -613,6 +635,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RefundRecoveryResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed refund recovery key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -628,7 +660,7 @@
             }
           },
           "404": {
-            "description": "Nullifier found but refund token not yet available",
+            "description": "Nullifier found but no refund token is available for this key yet",
             "content": {
               "application/json": {
                 "schema": {

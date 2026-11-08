@@ -432,6 +432,42 @@ fn blocking_chat_recovers_refund_when_no_inline_refund() {
     });
 }
 
+/// **Recovery opens the stored refund only with the key the spend carried.**
+/// The server seals the refund it stores under the spend's refund recovery
+/// key and refuses a spend without one; the mock holds both rules, answering
+/// a recovery that presents any other key with the real endpoint's 404. So a
+/// successor here means the spend sent a key and the recovery rebuilt the
+/// same one.
+#[test]
+fn recovery_presents_the_refund_key_its_spend_carried() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat should succeed");
+
+        assert_eq!(mock.chat_hits(), 1);
+        assert_eq!(mock.keyed_spends(), 1, "the spend carried its refund key");
+        assert!(
+            mock.refund_hits() >= 1,
+            "no inline refund, so recovery was asked"
+        );
+        let creds = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert!(
+            !creds.is_empty(),
+            "recovery presented the spend's own key, so the stored refund opened"
+        );
+    });
+}
+
 // ===========================================================================
 // Happy path — streaming chat
 // ===========================================================================

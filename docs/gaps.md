@@ -60,6 +60,14 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 
 **Future.** The set grows with the user base. If population per window stays small, the epoch length can be raised (a release-visible constant change) to trade key-rotation hygiene for coarser partitions.
 
+### Spend timing at the database
+
+**Current behavior.** A spend writes its nullifier row twice: the nullifier when the request is accepted, and the sealed refund when the request completes ([server.md § Unlinkability](server.md#unlinkability)). The row carries no timestamp, but Postgres runs outside the enclave, so whoever can watch it live — or read its write-ahead log, a replica, or a backup, whose commit records are timed — can see when each write happened, and so how long each request took. Duration follows the length of the answer, so this is a coarse, per-request content-size signal in the operator's hands, and the same database holds per-account issuance timestamps in the credit ledger.
+
+**What constrains it today.** The refund amount itself is stored sealed under a key that needs the client's own secret, at a fixed length; nothing written names an account; and the timing is the signal a network observer of the server already has from each response's total duration ([Passive traffic analysis](#passive-traffic-analysis)). The database is treated as adversarial, so this is a real gap rather than a theoretical one.
+
+**Future.** Decouple the second write from completion: hold completed refunds in enclave memory and write them in batches on a fixed interval, so a write says only which interval a request finished in. Recording the nullifier only at completion would hide the start too, but gives up refusing a double spend before it is served once more than one gateway instance shares the database, and is not planned.
+
 ### Multi-jurisdiction attestant distribution
 
 **Current behavior.** Attestants share a small operational surface and may share a jurisdiction.

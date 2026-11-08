@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tracing::{error, warn};
 
 use crate::AppState;
-use crate::auth::{ActSpend, AuthContext, AuthMethod, TokenAuth};
+use crate::auth::{ActSpend, AuthContext, AuthMethod, RefundKey, TokenAuth};
 use crate::backend::{BackendStreamEvent, PRICING_SCALE_FACTOR};
 use crate::credentials;
 use crate::db;
@@ -210,12 +210,14 @@ fn engines(state: &AppState) -> Result<&crate::engine_router::EngineRouter, Serv
 /// `refund_credits` is the number of credits to return (i.e., the `t` parameter
 /// in the ACT spec — the resulting token will have `c - s + t` credits).
 ///
-/// The refund token is also stored in the nullifier row so the client can
-/// recover it via `POST /v1/credentials/refund` if the response is lost.
+/// The refund token is also stored in the nullifier row, sealed under the
+/// client's `refund_key`, so the client can recover it via
+/// `POST /v1/credentials/refund` if the response is lost.
 async fn issue_refund_async(
     state: &AppState,
     spend_proof: &SpendProof<128>,
     issuer_key_hash: &[u8; 32],
+    refund_key: &RefundKey,
     refund_credits: u128,
 ) -> Result<RefundInfo, ServerError> {
     let t = credit_to_scalar::<128>(refund_credits)
@@ -235,13 +237,23 @@ async fn issue_refund_async(
         .to_cbor()
         .map_err(|e| ServerError::Internal(format!("refund CBOR encoding failed: {e:?}")))?;
 
-    // Best-effort store in DB for client recovery. Failure here is not fatal
-    // — the refund is still returned in the response.
+    // Best-effort store in DB for client recovery, sealed under the client's
+    // key: the token carries the refund amount, and Postgres is outside the
+    // enclave. Failure here is not fatal — the refund is still returned in the
+    // response.
     let key_id = hex::encode(issuer_key_hash);
     let nullifier_bytes = spend_proof.nullifier().as_bytes().to_vec();
-    if let Err(e) =
-        db::store_refund_token(&state.db_pool, &key_id, &nullifier_bytes, &refund_cbor).await
-    {
+    let stored = async {
+        let sealed = crate::credentials::seal_refund_token(
+            &state.credential_master_key,
+            refund_key,
+            &key_id,
+            &nullifier_bytes,
+            &refund_cbor,
+        )?;
+        db::store_refund_token(&state.db_pool, &key_id, &nullifier_bytes, &sealed).await
+    };
+    if let Err(e) = stored.await {
         warn!("Failed to store refund token for recovery: {e}");
     }
 
@@ -375,9 +387,12 @@ fn check_sufficient_charge(
     path = "/v1/chat/completions",
     tag = "Unlinked",
     request_body = ChatCompletionRequest,
+    params(
+        ("x-eidola-refund-key" = String, Header, description = "The client's refund recovery key for this spend, 64 lowercase hex digits: the stored copy of the refund is sealed under it, and recovery must present it again")
+    ),
     responses(
         (status = 200, description = "Chat completion response with privacy and verification metadata", body = EidolaResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 400, description = "Invalid request, or a missing or malformed refund recovery key (refused before the credential is spent)", body = ErrorResponse),
         (status = 401, description = "Authentication failed", body = ErrorResponse),
         (status = 402, description = "Insufficient charge amount", body = ErrorResponse),
         (status = 409, description = "Credential already spent", body = ErrorResponse),
@@ -465,6 +480,7 @@ async fn chat_completions_phases(
                 state,
                 &act.spend_proof,
                 &act.issuer_key_hash,
+                &act.refund_key,
                 refund_credits,
             )
             .await;
@@ -504,6 +520,7 @@ async fn handle_non_streaming_request(
                 state,
                 &act.spend_proof,
                 &act.issuer_key_hash,
+                &act.refund_key,
                 charge_credits,
             )
             .await;
@@ -545,6 +562,7 @@ async fn handle_non_streaming_request(
         state,
         &act.spend_proof,
         &act.issuer_key_hash,
+        &act.refund_key,
         refund_credits,
     )
     .await
@@ -553,7 +571,15 @@ async fn handle_non_streaming_request(
         Err(e) => {
             error!("CRITICAL: failed to issue refund: {}", e);
             // We were charged, so fall back to refunding 0 (blind remaining value).
-            match issue_refund_async(state, &act.spend_proof, &act.issuer_key_hash, 0).await {
+            match issue_refund_async(
+                state,
+                &act.spend_proof,
+                &act.issuer_key_hash,
+                &act.refund_key,
+                0,
+            )
+            .await
+            {
                 Ok(info) => Some(info),
                 Err(e2) => {
                     error!("CRITICAL: failed to issue fallback zero refund: {}", e2);
@@ -768,6 +794,7 @@ async fn handle_streaming_request(
                 &state,
                 &act.spend_proof,
                 &act.issuer_key_hash,
+                &act.refund_key,
                 charge_credits,
             )
             .await;
@@ -781,6 +808,7 @@ async fn handle_streaming_request(
 
     // Clone/copy values for the spawned task.
     let issuer_key_hash = act.issuer_key_hash;
+    let refund_key = act.refund_key.clone();
     // We need to serialize the spend proof for the spawned task.
     let spend_proof_cbor = match act.spend_proof.to_cbor() {
         Ok(cbor) => cbor,
@@ -791,6 +819,7 @@ async fn handle_streaming_request(
                 &state,
                 &act.spend_proof,
                 &act.issuer_key_hash,
+                &act.refund_key,
                 charge_credits,
             )
             .await;
@@ -813,6 +842,7 @@ async fn handle_streaming_request(
             state: &AppState,
             spend_proof_cbor: &[u8],
             issuer_key_hash: &[u8; 32],
+            refund_key: &RefundKey,
             refund_credits: u128,
         ) -> Option<RefundInfo> {
             let proof = match SpendProof::<128>::from_cbor(spend_proof_cbor) {
@@ -822,7 +852,9 @@ async fn handle_streaming_request(
                     return None;
                 }
             };
-            match issue_refund_async(state, &proof, issuer_key_hash, refund_credits).await {
+            match issue_refund_async(state, &proof, issuer_key_hash, refund_key, refund_credits)
+                .await
+            {
                 Ok(info) => Some(info),
                 Err(e) => {
                     // No amount in the log: `refund_credits` is a function
@@ -835,7 +867,7 @@ async fn handle_streaming_request(
                     );
                     // Fall back to a zero refund (returns blind remaining value
                     // c - s) so the client doesn't lose the credential entirely.
-                    match issue_refund_async(state, &proof, issuer_key_hash, 0).await {
+                    match issue_refund_async(state, &proof, issuer_key_hash, refund_key, 0).await {
                         Ok(info) => Some(info),
                         Err(e2) => {
                             error!("CRITICAL: failed to issue fallback zero refund: {}", e2);
@@ -882,7 +914,9 @@ async fn handle_streaming_request(
                         // receive this, but we issue it for consistency.
                         warn!("Client disconnected mid-stream, issuing zero refund");
                         timing.finish("client_disconnect", None, at);
-                        let _ = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
+                        let _ =
+                            try_refund(&state, &spend_proof_cbor, &issuer_key_hash, &refund_key, 0)
+                                .await;
                         return;
                     }
                 }
@@ -927,9 +961,14 @@ async fn handle_streaming_request(
                     );
 
                     let refund_credits = charge_credits.saturating_sub(cost);
-                    let refund_info =
-                        try_refund(&state, &spend_proof_cbor, &issuer_key_hash, refund_credits)
-                            .await;
+                    let refund_info = try_refund(
+                        &state,
+                        &spend_proof_cbor,
+                        &issuer_key_hash,
+                        &refund_key,
+                        refund_credits,
+                    )
+                    .await;
 
                     send_metadata_event(
                         &tx,
@@ -947,7 +986,8 @@ async fn handle_streaming_request(
                     error!("Stream error, issuing zero refund: {}", e);
                     timing.finish("upstream_error", None, Instant::now());
                     let refund_info =
-                        try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
+                        try_refund(&state, &spend_proof_cbor, &issuer_key_hash, &refund_key, 0)
+                            .await;
                     let privacy = build_privacy_metadata(&auth_context, true, provider);
                     let verification = build_verification_metadata(None);
                     send_metadata_event(&tx, refund_info, privacy, verification, String::new())
@@ -961,7 +1001,8 @@ async fn handle_streaming_request(
         // have been delivered and billed; we don't know the cost. Refund 0.
         warn!("Upstream channel closed without Done event, issuing zero refund");
         timing.finish("channel_closed", None, Instant::now());
-        let refund_info = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
+        let refund_info =
+            try_refund(&state, &spend_proof_cbor, &issuer_key_hash, &refund_key, 0).await;
         let privacy = build_privacy_metadata(&auth_context, true, provider);
         let verification = build_verification_metadata(None);
         send_metadata_event(&tx, refund_info, privacy, verification, String::new()).await;

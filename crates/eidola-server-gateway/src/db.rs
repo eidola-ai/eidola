@@ -10,6 +10,7 @@ use tokio_postgres::config::SslMode;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
+use crate::credentials::SealedRefundToken;
 use crate::error::ServerError;
 
 /// A row from the `account` table.
@@ -1019,13 +1020,15 @@ pub async fn record_nullifier(
     Ok(rows_affected > 0)
 }
 
-/// Store a CBOR-encoded refund token on an existing nullifier row.
+/// Store a sealed refund token on an existing nullifier row. Only a
+/// [`SealedRefundToken`] is accepted: the CBOR token carries the refund
+/// amount and is never written to Postgres in the clear.
 #[tracing::instrument(skip_all, name = "db.store_refund_token", err)]
 pub async fn store_refund_token(
     pool: &Pool,
     issuer_key_id: &str,
     nullifier_value: &[u8],
-    refund_token: &[u8],
+    refund_token: &SealedRefundToken,
 ) -> Result<(), ServerError> {
     let client = pool
         .get()
@@ -1036,7 +1039,7 @@ pub async fn store_refund_token(
         .execute(
             "UPDATE nullifier SET refund_token = $3 \
              WHERE issuer_key_id = $1 AND value = $2",
-            &[&issuer_key_id, &nullifier_value, &refund_token],
+            &[&issuer_key_id, &nullifier_value, &refund_token.as_bytes()],
         )
         .await
         .map_err(|e| {
@@ -1049,14 +1052,15 @@ pub async fn store_refund_token(
     Ok(())
 }
 
-/// Retrieve a stored refund token for a nullifier. Returns `None` if the
-/// nullifier does not exist or no refund token has been stored yet.
+/// Retrieve the sealed refund token stored for a nullifier. Returns `None` if
+/// the nullifier does not exist or no refund token has been stored yet; the
+/// caller opens what comes back ([`crate::credentials::open_refund_token`]).
 #[tracing::instrument(skip_all, name = "db.get_refund_token", err)]
 pub async fn get_refund_token(
     pool: &Pool,
     issuer_key_id: &str,
     nullifier_value: &[u8],
-) -> Result<Option<Vec<u8>>, ServerError> {
+) -> Result<Option<SealedRefundToken>, ServerError> {
     let client = pool
         .get()
         .await
@@ -1073,7 +1077,9 @@ pub async fn get_refund_token(
             ServerError::Internal(format!("get_refund_token failed: {}", db_error_summary(&e)))
         })?;
 
-    Ok(row.and_then(|r| r.get::<_, Option<Vec<u8>>>("refund_token")))
+    Ok(row
+        .and_then(|r| r.get::<_, Option<Vec<u8>>>("refund_token"))
+        .map(SealedRefundToken::from_stored))
 }
 
 /// A single ledger entry row.

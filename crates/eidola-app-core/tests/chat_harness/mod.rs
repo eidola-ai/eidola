@@ -711,6 +711,8 @@ pub struct MockServer {
     chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     /// Number of `POST /v1/credentials/refund` requests received.
     refund_hits: Arc<AtomicU64>,
+    /// The mock issuer, for what it remembers about spends.
+    issuer: Arc<Issuer>,
     /// Number of `GET /v1/models` requests received — the catalogue fetch a
     /// turn's *setup* makes, and so the earliest thing on the wire that says
     /// preparation got as far as building a client. Tests that assert a turn
@@ -726,6 +728,11 @@ impl MockServer {
     }
     pub fn refund_hits(&self) -> u64 {
         self.refund_hits.load(Ordering::SeqCst)
+    }
+    /// How many distinct spends arrived carrying a refund recovery key (a
+    /// spend without one is refused, as the real server refuses it).
+    pub fn keyed_spends(&self) -> usize {
+        self.issuer.keyed_spends()
     }
     /// Catalogue fetches (see `models_hits`).
     pub fn models_hits(&self) -> u64 {
@@ -1054,6 +1061,10 @@ struct Issuer {
     params: Params,
     key_id_hex: String,
     request_context_scalar: Scalar,
+    /// The refund recovery key each spend arrived with, by nullifier: the
+    /// key the real server seals that spend's stored refund under, and so
+    /// the only one its recovery endpoint opens it for.
+    spend_keys: std::sync::Mutex<std::collections::HashMap<Vec<u8>, [u8; 32]>>,
 }
 
 impl Issuer {
@@ -1076,7 +1087,22 @@ impl Issuer {
             params,
             key_id_hex,
             request_context_scalar,
+            spend_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Remember the refund recovery key a spend (or a recovery that found no
+    /// spend) arrived with, and say whether `key` is the one on record: what
+    /// decides whether the real server's stored copy opens.
+    fn spend_key_matches(&self, proof: &SpendProof<128>, key: [u8; 32]) -> bool {
+        let nullifier = proof.nullifier().as_bytes().to_vec();
+        let mut keys = self.spend_keys.lock().unwrap();
+        *keys.entry(nullifier).or_insert(key) == key
+    }
+
+    /// How many distinct spends arrived with a refund recovery key.
+    fn keyed_spends(&self) -> usize {
+        self.spend_keys.lock().unwrap().len()
     }
 
     fn public_key_b64(&self) -> String {
@@ -1213,6 +1239,7 @@ pub async fn start(config: MockConfig) -> MockServer {
         chat_auths,
         chat_auth_values,
         refund_hits,
+        issuer,
         models_hits,
         _task: task,
     }
@@ -1223,6 +1250,9 @@ struct Req {
     method: String,
     path: String,
     auth: Option<String>,
+    /// The refund recovery key header, decoded (`None` when absent or not
+    /// exactly the wire form — the real server refuses both alike).
+    refund_key: Option<[u8; 32]>,
     body: Vec<u8>,
 }
 
@@ -1253,6 +1283,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
 
     let mut content_length = 0usize;
     let mut auth = None;
+    let mut refund_key = None;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim().to_ascii_lowercase();
@@ -1261,6 +1292,8 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
                 content_length = value.parse().unwrap_or(0);
             } else if name == "authorization" {
                 auth = Some(value.to_string());
+            } else if name == eidola_common::refund_key::REFUND_KEY_HEADER {
+                refund_key = eidola_common::refund_key::decode_refund_key(value.as_bytes());
             }
         }
     }
@@ -1278,6 +1311,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
         method,
         path,
         auth,
+        refund_key,
         body,
     })
 }
@@ -1350,6 +1384,19 @@ async fn handle_conn(
         }
         ("POST", "/v1/credentials/refund") => {
             let attempt = refund_hits.fetch_add(1, Ordering::SeqCst) + 1;
+            // The real endpoint refuses a recovery without its key, and opens
+            // a stored refund only for the key the spend arrived with.
+            let proof = req.auth.as_deref().and_then(Issuer::spend_proof_from_auth);
+            match (proof, req.refund_key) {
+                (_, None) => {
+                    return write_json(&mut stream, 400, &error_body("refund key required")).await;
+                }
+                (Some(proof), Some(key)) if !issuer.spend_key_matches(&proof, key) => {
+                    return write_json(&mut stream, 404, &error_body("refund token not found"))
+                        .await;
+                }
+                _ => {}
+            }
             handle_refund(&mut stream, &issuer, &config, req.auth.as_deref(), attempt).await?;
         }
         ("POST", "/v1/chat/completions") => {
@@ -1368,6 +1415,19 @@ async fn handle_conn(
             chat_raw_bodies.lock().unwrap().push(req.body.clone());
             chat_auths.lock().unwrap().push(req.auth.is_some());
             chat_auth_values.lock().unwrap().push(req.auth.clone());
+            // A spend without its refund recovery key is refused before it is
+            // taken, as the real server's extractor refuses it.
+            if let Some(proof) = req.auth.as_deref().and_then(Issuer::spend_proof_from_auth) {
+                match req.refund_key {
+                    Some(key) => {
+                        issuer.spend_key_matches(&proof, key);
+                    }
+                    None => {
+                        return write_json(&mut stream, 400, &error_body("refund key required"))
+                            .await;
+                    }
+                }
+            }
             let parsed: serde_json::Value =
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
             // A branch-summary request is recognized by its system prompt (it

@@ -309,6 +309,12 @@ impl Inner {
         if let Some(auth) = &auth_value {
             request = request.header("Authorization", auth);
         }
+        if let Some(spend) = &spend {
+            request = request.header(
+                eidola_common::refund_key::REFUND_KEY_HEADER,
+                crate::refund_key_header_value(&spend.refund_key),
+            );
+        }
 
         let response = match request.send().await {
             Ok(resp) => resp,
@@ -403,9 +409,11 @@ impl Inner {
         let refund_obj = match inline {
             Some(obj) => Some(obj.clone()),
             None => match auth_value {
-                Some(auth) => recover_refund(&route.client, &route.base_url, auth)
-                    .await
-                    .ok(),
+                Some(auth) => {
+                    recover_refund(&route.client, &route.base_url, auth, &spend.refund_key)
+                        .await
+                        .ok()
+                }
                 None => None,
             },
         };

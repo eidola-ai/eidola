@@ -34,6 +34,7 @@ use anonymous_credit_tokens::{
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use eidola_common::engine_protocol::ContinueField;
+use eidola_common::refund_key::REFUND_KEY_HEADER;
 use rand_core::OsRng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -3721,7 +3722,9 @@ impl Inner {
             let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
             let auth_value = format!("PrivateToken token=\"{token_b64}\"");
 
-            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await
+            let refund_key = refund_recovery_key(&row.pre_refund_data);
+            if let Ok(refund_obj) =
+                recover_refund(&client, base_url, &auth_value, &refund_key).await
                 && process_refund(
                     &refund_obj,
                     &params,
@@ -7528,6 +7531,7 @@ impl Inner {
                 params,
                 spend_proof,
                 pre_refund,
+                refund_key: refund_recovery_key(&pre_refund_cbor),
                 pre_cred_id,
                 _live: live,
             },
@@ -7790,6 +7794,12 @@ impl Inner {
         );
         if let Some(auth_value) = &prep.auth_value {
             request = request.header("Authorization", auth_value);
+        }
+        if let Some(spend) = &prep.spend {
+            request = request.header(
+                REFUND_KEY_HEADER,
+                refund_key_header_value(&spend.refund_key),
+            );
         }
         let chat_result = prep.send(request).await;
         let response_at = now_ms();
@@ -8611,6 +8621,12 @@ impl Inner {
         );
         if let Some(auth_value) = &prep.auth_value {
             request = request.header("Authorization", auth_value);
+        }
+        if let Some(spend) = &prep.spend {
+            request = request.header(
+                REFUND_KEY_HEADER,
+                refund_key_header_value(&spend.refund_key),
+            );
         }
         let chat_result = prep.send(request).await;
 
@@ -13386,6 +13402,9 @@ struct SpendPrep {
     params: Params,
     spend_proof: SpendProof<128>,
     pre_refund: PreRefund,
+    /// [`refund_recovery_key`] of this spend's stored `PreRefund` bytes: sent
+    /// with the spend and with any recovery of it.
+    refund_key: zeroize::Zeroizing<[u8; 32]>,
     pre_cred_id: String,
     /// Marks this hold as one a request is in flight for, for as long as
     /// these materials exist. `SpendPrep` is the only in-memory handle to a
@@ -13551,11 +13570,12 @@ impl TurnPrep {
     /// decide its own control flow, never to decide whether to emit. Always
     /// `false` for local turns — there is no spend to recover.
     async fn try_refund_recovery(&mut self) -> bool {
-        let (Some(_), Some(auth_value)) = (&self.spend, &self.auth_value) else {
+        let (Some(spend), Some(auth_value)) = (&self.spend, &self.auth_value) else {
             return false;
         };
         let auth_value = auth_value.clone();
-        match recover_refund(&self.client, &self.base_url, &auth_value).await {
+        let refund_key = spend.refund_key.clone();
+        match recover_refund(&self.client, &self.base_url, &auth_value, &refund_key).await {
             Ok(refund_obj) => self.process_refund_obj(&refund_obj).await.is_ok(),
             Err(_) => false,
         }
@@ -14425,14 +14445,19 @@ async fn process_refund(
 
 /// Attempt to recover a refund token from the server via
 /// `POST /v1/credentials/refund`. Returns the refund JSON object on success.
+///
+/// `refund_key` is the spend's [`refund_recovery_key`]: the server stores the
+/// refund sealed under it and opens it only for the same key.
 async fn recover_refund(
     client: &reqwest::Client,
     base_url: &str,
     auth_value: &str,
+    refund_key: &[u8; 32],
 ) -> Result<serde_json::Value, AppError> {
     let resp = client
         .post(format!("{base_url}/v1/credentials/refund"))
         .header("Authorization", auth_value)
+        .header(REFUND_KEY_HEADER, refund_key_header_value(refund_key))
         .send()
         .await
         .map_err(AppError::from_request)?;
@@ -17463,6 +17488,42 @@ fn compute_challenge_digest() -> [u8; 32] {
     Sha256::digest(serialize_token_challenge()).into()
 }
 
+/// Domain separator for [`refund_recovery_key`].
+const REFUND_RECOVERY_KEY_DOMAIN: &[u8] = b"eidola-refund-recovery-key-v1\0";
+
+/// The refund recovery key for one spend
+/// (`eidola_common::refund_key`): SHA-256 over a domain separator and the
+/// spend's encoded `PreRefund`, the client-only state already kept for it.
+///
+/// The gateway seals the copy of the refund it stores under this key, and
+/// opens it on recovery only when the same key is presented, so it must be
+/// something only this client knows, and something every path that recovers
+/// a spend can rebuild. The `PreRefund` is both: its blinding factor `r` for
+/// the successor credential never leaves this client in the clear (spending
+/// the successor proves knowledge of it in zero knowledge), and the encoded
+/// bytes are stored beside the spend (`pre_credential_refund.pre_refund_data`)
+/// before the request is sent. Deriving the key from those bytes means no new
+/// secret to store and no state for a recovery to lose; hashing the exact
+/// stored bytes means the spend and every later recovery derive it from the
+/// same input. The domain separator keeps this use of the secret apart from
+/// its use inside the credential scheme.
+fn refund_recovery_key(pre_refund_cbor: &[u8]) -> zeroize::Zeroizing<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(REFUND_RECOVERY_KEY_DOMAIN);
+    hasher.update(pre_refund_cbor);
+    zeroize::Zeroizing::new(hasher.finalize().into())
+}
+
+/// The [`eidola_common::refund_key::REFUND_KEY_HEADER`] value for `key`,
+/// marked sensitive so it is never shown by an HTTP client's own debug output.
+fn refund_key_header_value(key: &[u8; 32]) -> reqwest::header::HeaderValue {
+    let text = zeroize::Zeroizing::new(eidola_common::refund_key::encode_refund_key(key));
+    let mut value = reqwest::header::HeaderValue::from_bytes(text.as_ref())
+        .expect("lowercase hex is a valid header value");
+    value.set_sensitive(true);
+    value
+}
+
 /// Current time as milliseconds since Unix epoch.
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -17695,6 +17756,59 @@ async fn insert_plain_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A spend's refund recovery key is a function of its stored
+    /// `PreRefund` bytes, and of nothing the server sees.** The spend and every
+    /// later recovery (in the turn, or the startup sweep from the stored row)
+    /// must rebuild the same key, and two spends must not share one.
+    #[test]
+    fn the_refund_recovery_key_is_rebuilt_from_the_stored_pre_refund() {
+        let params = Params::new("eidola", "inference", "production", "2026-03-05");
+        let issuer = anonymous_credit_tokens::PrivateKey::random(OsRng);
+        let pre = anonymous_credit_tokens::PreIssuance::random(OsRng);
+        let request = pre.request(&params, OsRng);
+        let response = issuer
+            .issue::<128>(
+                &params,
+                &request,
+                credit_to_scalar::<128>(1000).unwrap(),
+                anonymous_credit_tokens::Scalar::ZERO,
+                OsRng,
+            )
+            .unwrap();
+        let token = pre
+            .to_credit_token::<128>(&params, issuer.public(), &request, &response)
+            .unwrap();
+        let spend = |token: &CreditToken| {
+            let (proof, pre_refund) = token
+                .prove_spend::<128>(&params, credit_to_scalar::<128>(300).unwrap(), OsRng)
+                .unwrap();
+            (proof, pre_refund.to_cbor().unwrap())
+        };
+        let (proof, stored) = spend(&token);
+        let key = refund_recovery_key(&stored);
+
+        // Rebuilt from the stored bytes, and from a decode/re-encode of them.
+        assert_eq!(*refund_recovery_key(&stored.clone()), *key);
+        let reencoded = PreRefund::from_cbor(&stored).unwrap().to_cbor().unwrap();
+        assert_eq!(*refund_recovery_key(&reencoded), *key);
+
+        // Another spend's key is another key.
+        let (_, other) = spend(&token);
+        assert_ne!(*refund_recovery_key(&other), *key);
+
+        // Domain-separated: not a bare hash of the secret state, and not
+        // derivable from what the server is sent.
+        assert_ne!(<[u8; 32]>::from(Sha256::digest(&stored)), *key);
+        let proof_cbor = proof.to_cbor().unwrap();
+        assert_ne!(*refund_recovery_key(&proof_cbor), *key);
+        let text = eidola_common::refund_key::encode_refund_key(&key);
+        assert_eq!(
+            eidola_common::refund_key::decode_refund_key(&text),
+            Some(*key)
+        );
+        assert!(refund_key_header_value(&key).is_sensitive());
+    }
 
     /// **An event ends at any two line terminators the format allows.**
     ///
