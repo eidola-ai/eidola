@@ -212,10 +212,20 @@ enum AccountCommand {
     },
     /// Show credit balances
     Balances,
-    /// Allocate credits into an anonymous credential
+    /// Allocate credits into an anonymous credential.
+    ///
+    /// Credentials are issued in one size, the credential denomination
+    /// (1,000,000 credits), so every issuance looks like every other; the
+    /// last one an account makes may be its whole remaining balance when that
+    /// is less (`--all-remaining`). Any other amount is refused.
     Allocate {
-        /// Number of credits to allocate
-        credits: i64,
+        /// Credits to allocate: the credential denomination, which is the
+        /// default and the only amount accepted
+        credits: Option<i64>,
+        /// Allocate the account's whole remaining balance, when it is less
+        /// than one denomination
+        #[arg(long, conflicts_with = "credits")]
+        all_remaining: bool,
     },
 }
 
@@ -521,6 +531,13 @@ fn app_hint(e: &AppError) {
             eprintln!(
                 "hint: run `eidola account prices`, then \
                  `eidola account checkout <price_id>` to add credit"
+            );
+        }
+        AppError::IssuanceNotDenominated { denomination, .. } => {
+            eprintln!(
+                "hint: credentials are issued in one size so that no issuance stands out — run \
+                 `eidola account allocate` for {denomination} credits, or \
+                 `eidola account allocate --all-remaining` once less than that is left"
             );
         }
         AppError::HoldExceedsDenomination { .. } => {
@@ -934,7 +951,17 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                 }
                 Ok(())
             }
-            Some(AccountCommand::Allocate { credits }) => {
+            Some(AccountCommand::Allocate {
+                credits,
+                all_remaining,
+            }) => {
+                let credits = if all_remaining {
+                    // The whole balance; app-core refuses it when it is more
+                    // than one denomination, with the hint below.
+                    session.account_balances().await?.available
+                } else {
+                    credits.unwrap_or(eidola_app_core::CREDENTIAL_DENOMINATION)
+                };
                 let result = session
                     .local("`eidola account allocate`")?
                     .account_allocate(credits)
@@ -2228,6 +2255,39 @@ mod tests {
             assert!(Cli::try_parse_from(&refused).is_err(), "{refused:?}");
         }
         assert!(Cli::try_parse_from(["eidola", "chat", "hello"]).is_ok());
+    }
+
+    /// `allocate` names no amount by default (the denomination), takes
+    /// `--all-remaining` for the last issuance, and never both.
+    #[test]
+    fn allocate_defaults_to_the_denomination_and_takes_all_remaining_alone() {
+        use clap::Parser;
+        let parsed = |args: &[&str]| match Cli::try_parse_from(args).map(|c| c.command) {
+            Ok(Some(Command::Account {
+                command:
+                    Some(AccountCommand::Allocate {
+                        credits,
+                        all_remaining,
+                    }),
+            })) => Some((credits, all_remaining)),
+            _ => None,
+        };
+        assert_eq!(
+            parsed(&["eidola", "account", "allocate"]),
+            Some((None, false))
+        );
+        assert_eq!(
+            parsed(&["eidola", "account", "allocate", "--all-remaining"]),
+            Some((None, true))
+        );
+        assert_eq!(
+            parsed(&["eidola", "account", "allocate", "1000000"]),
+            Some((Some(1_000_000), false))
+        );
+        assert_eq!(
+            parsed(&["eidola", "account", "allocate", "--all-remaining", "5"]),
+            None
+        );
     }
 
     fn declined_turn(reason: &str) -> eidola_app_core::ChatResult {

@@ -1824,6 +1824,26 @@ const PROVISION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Poll cadence while the provisioning queue waits on an in-flight refund.
 const PROVISION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Why `credits` is not an amount this client issues, given the account's
+/// available balance (read only when `credits` is not the denomination).
+///
+/// The rule the server enforces at issuance, kept here so a refusal is
+/// local, typed and explained rather than a server 400: exactly
+/// [`CREDENTIAL_DENOMINATION`], or the whole available balance when that is
+/// less (the account's last issuance). Anything else would put a figure on
+/// the account's ledger row that only this account's issuances carry.
+fn issuance_amount_problem(credits: i64, available: Option<i64>) -> Option<AppError> {
+    if credits == CREDENTIAL_DENOMINATION
+        || (credits < CREDENTIAL_DENOMINATION && available == Some(credits))
+    {
+        return None;
+    }
+    Some(AppError::IssuanceNotDenominated {
+        credits,
+        denomination: CREDENTIAL_DENOMINATION,
+    })
+}
+
 /// Decide how many credits to auto-allocate, given the account's available
 /// balance and the hold of the request that triggered provisioning. Pure so
 /// the decision is unit-testable without HTTP.
@@ -3312,13 +3332,31 @@ impl Inner {
         })
     }
 
+    /// Issue one credential of `credits`: the denomination, or the account's
+    /// whole available balance when that is less ([`issuance_amount_problem`];
+    /// the server refuses anything else too). The balance is read only for an
+    /// amount below the denomination.
     async fn account_allocate(&self, credits: i64) -> Result<AllocateResult, AppError> {
         if credits <= 0 {
             return Err(AppError::Credential {
                 message: "credits must be greater than 0".into(),
             });
         }
+        let available = if credits == CREDENTIAL_DENOMINATION {
+            None
+        } else {
+            Some(self.account_balances().await?.available)
+        };
+        if let Some(refusal) = issuance_amount_problem(credits, available) {
+            return Err(refusal);
+        }
+        self.issue_credential(credits).await
+    }
 
+    /// Issue one credential of `credits`, with no denomination check: the
+    /// body [`Inner::account_allocate`] guards, and the test seam that mints
+    /// a credential of a size an older client could have issued.
+    async fn issue_credential(&self, credits: i64) -> Result<AllocateResult, AppError> {
         let cfg = self.load_config();
         let eidola = self.eidola_resolved().await?;
         let base_url = eidola.base_url.as_str();
@@ -6169,7 +6207,15 @@ impl Inner {
             if balances.available >= charge_credits {
                 // Enough to allocate at least the charge — grow the pool.
                 let amount = auto_allocation_amount(balances.available, charge_credits)?;
-                self.account_allocate(amount).await?;
+                match self.account_allocate(amount).await {
+                    Ok(_) => {}
+                    // The balance moved between the two reads, so the whole
+                    // balance this computed is not the whole balance any
+                    // more: read it again, inside the same bounded wait.
+                    Err(AppError::IssuanceNotDenominated { .. })
+                        if tokio::time::Instant::now() < deadline => {}
+                    Err(e) => return Err(e),
+                }
                 continue;
             }
 
@@ -10184,6 +10230,23 @@ impl AppCore {
         Self::build(config_dir, data_dir, Some(client))
     }
 
+    /// **Test-only seam.** Issue a credential of `credits` without the
+    /// denomination rule [`AppCore::account_allocate`] enforces — the wallet a
+    /// profile carries from a client that issued other sizes. Feature-gated:
+    /// a release build has no door past the rule.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub async fn issue_credential_of_any_size_for_test(
+        &self,
+        credits: i64,
+    ) -> Result<AllocateResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.issue_credential(credits).await })
+            .await
+            .map_err(join_err)?
+    }
+
     /// **Test-only seam.** Treat the eidola backend as though it were reached
     /// at this build's compiled-in pin, so its published capabilities count as
     /// a declaration rather than a hint.
@@ -10944,6 +11007,11 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Issue one anonymous credential of `credits`: the credential
+    /// denomination ([`CREDENTIAL_DENOMINATION`]), or the account's whole
+    /// available balance when that is less. Any other amount is refused with
+    /// [`AppError::IssuanceNotDenominated`] before anything is sent — the
+    /// server refuses it too.
     pub async fn account_allocate(&self, credits: i64) -> Result<AllocateResult, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -18244,6 +18312,37 @@ mod tests {
                     Err(other) => panic!("unexpected {other:?}"),
                 }
             }
+        }
+    }
+
+    /// **What provisioning allocates is always an amount the issuance rule
+    /// accepts**, and the rule accepts nothing else: the denomination, or the
+    /// whole balance below it.
+    #[test]
+    fn provisioning_only_ever_asks_for_a_denominated_amount() {
+        let d = CREDENTIAL_DENOMINATION;
+        for available in [1, 6_200, d / 2, d - 1, d, d + 1, 10 * d] {
+            let amount = auto_allocation_amount(available, 1).unwrap();
+            assert!(
+                issuance_amount_problem(amount, Some(available)).is_none(),
+                "{amount} from {available}"
+            );
+        }
+        assert!(issuance_amount_problem(d, None).is_none());
+        for (credits, available) in [
+            (d + 1, 10 * d),
+            (2 * d, 10 * d),
+            (62_500, 10 * d),
+            (1_500_000, 1_500_000),
+            (6_200, 6_201),
+        ] {
+            assert!(
+                matches!(
+                    issuance_amount_problem(credits, Some(available)),
+                    Some(AppError::IssuanceNotDenominated { .. })
+                ),
+                "{credits} from {available}"
+            );
         }
     }
 

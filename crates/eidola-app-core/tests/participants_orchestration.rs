@@ -647,7 +647,7 @@ fn concurrent_turns_each_get_their_own_credential() {
         // flip it to `spending` inside the lock, so the second must allocate a
         // fresh one — two distinct credentials.
         core.runtime()
-            .block_on(core.account_allocate(50_000))
+            .block_on(core.account_allocate(eidola_common::CREDENTIAL_DENOMINATION as i64))
             .expect("seed credential");
 
         // Two concurrent blocking chats (each posts + runs a turn), driven on

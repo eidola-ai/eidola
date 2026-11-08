@@ -636,6 +636,12 @@ pub struct MockConfig {
     /// answered, in arrival order — what each auto-provisioned issuance asked
     /// the account for. Shared, so a test reads it after the turn.
     pub issued: IssuedCredits,
+    /// Issue any amount `POST /v1/account/credentials` is asked for, as an
+    /// older server did — for a test that needs a wallet holding a credential
+    /// of a size this client no longer issues. Off by default: the mock
+    /// enforces the server's rule (the denomination, or the whole balance
+    /// below it).
+    pub allow_any_issuance: bool,
 }
 
 /// See [`MockConfig::issued`].
@@ -661,6 +667,7 @@ impl Default for MockConfig {
             completion_rate: 1,
             prompt_rate: 1,
             issued: IssuedCredits::default(),
+            allow_any_issuance: false,
         }
     }
 }
@@ -1352,6 +1359,19 @@ async fn handle_conn(
             let ir = parsed.get("issuance_request").and_then(|v| v.as_str());
             let credits = parsed.get("credits").and_then(|v| v.as_i64()).unwrap_or(0);
             config.issued.lock().unwrap().push(credits);
+            // The server's issuance rule: the denomination, or the whole
+            // balance below it — unless the test asked for an older server
+            // (`allow_any_issuance`).
+            let d = eidola_common::CREDENTIAL_DENOMINATION as i64;
+            let denominated = credits == d || (credits < d && credits == config.balance);
+            if !denominated && !config.allow_any_issuance {
+                let body = serde_json::json!({ "error": {
+                    "message": "credits must be the credential denomination",
+                    "type": "invalid_denomination",
+                }});
+                write_json(&mut stream, 400, &body.to_string()).await?;
+                return Ok(());
+            }
             match ir.and_then(|ir| issuer.issue(ir, credits)) {
                 Some(issuance_response) => {
                     let body = serde_json::json!({

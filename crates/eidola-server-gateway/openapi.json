@@ -260,7 +260,7 @@
             }
           },
           "400": {
-            "description": "Invalid request",
+            "description": "Invalid request, or an amount other than the credential denomination (or the whole available balance below it)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1638,7 +1638,7 @@
           "credits": {
             "type": "integer",
             "format": "int64",
-            "description": "Number of credits to issue."
+            "description": "Number of credits to issue: the credential denomination\n(1,000,000), or the account's whole available balance when that is\nless. Any other amount is refused."
           },
           "issuance_request": {
             "type": "string",

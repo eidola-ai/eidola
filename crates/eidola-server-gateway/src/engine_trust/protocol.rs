@@ -106,6 +106,19 @@ impl ValidatedRequest {
     pub(crate) fn raw(&self) -> &[u8] {
         &self.raw
     }
+
+    /// Ask for `ceiling` completion tokens when the request names no limit:
+    /// the model's declared `max_output_tokens`, so what is priced and what
+    /// the node is asked for are one number. A request that names a limit,
+    /// and a `None` ceiling, leave the request as it is. The body the node
+    /// receives carries the value ([`engine_request_body`]).
+    pub fn default_completion_ceiling(&mut self, ceiling: Option<u64>) {
+        if self.parsed.max_completion_tokens.is_none()
+            && let Some(ceiling) = ceiling
+        {
+            self.parsed.max_completion_tokens = Some(u32::try_from(ceiling).unwrap_or(u32::MAX));
+        }
+    }
 }
 
 /// The body of a chat request to a node.
@@ -130,6 +143,11 @@ impl ValidatedRequest {
 ///   is computed from); otherwise neither;
 /// - `cache_key`: re-encoded from the validated key, when there is one.
 ///
+/// And `max_completion_tokens` is written from the typed request — in its
+/// place when the client sent it, last when it did not — so a request the
+/// gateway gave the model's declared ceiling
+/// ([`ValidatedRequest::default_completion_ceiling`]) asks the node for it.
+///
 /// The returned buffer is scrubbed when dropped, and so are the copies of the
 /// key made here: the re-encoded text and the client's member as parsed out
 /// of `raw`. `raw` itself is an HTTP-stack buffer, out of reach like the
@@ -153,9 +171,17 @@ pub fn engine_request_body(request: &ValidatedRequest) -> Zeroizing<Vec<u8>> {
         write(body);
     };
     let parsed = &request.parsed;
+    let mut wrote_ceiling = false;
     for (key, mut value) in members {
         match key.as_str() {
             "stream" | "stream_options" => {}
+            "max_completion_tokens" => {
+                wrote_ceiling = true;
+                member(&mut body, &key, &|out| {
+                    serde_json::to_writer(&mut *out, &parsed.max_completion_tokens)
+                        .expect("a scalar serializes")
+                })
+            }
             "cache_key" => value.scrub(),
             // The fields the strict type narrows (`f32` sampling values) are
             // written from the typed request, exactly as `serde_json`
@@ -169,6 +195,11 @@ pub fn engine_request_body(request: &ValidatedRequest) -> Zeroizing<Vec<u8>> {
             }),
             _ => member(&mut body, &key, &|out| value.write(out)),
         }
+    }
+    if !wrote_ceiling && let Some(ceiling) = parsed.max_completion_tokens {
+        member(&mut body, "max_completion_tokens", &|out| {
+            serde_json::to_writer(&mut *out, &ceiling).expect("a scalar serializes")
+        });
     }
     if parsed.stream {
         member(&mut body, "stream", &|out| out.extend_from_slice(b"true"));
@@ -370,6 +401,54 @@ mod tests {
         assert!(EngineToken::new("line\nbreak".into()).is_err());
         assert!(EngineToken::new("short".into()).is_err());
         assert!(EngineToken::new("non-ascii-tøken-xxx".into()).is_err());
+    }
+
+    /// **The node is asked for what was priced.** A request naming no
+    /// completion limit is given the model's declared ceiling, and the body
+    /// carries it — appended, since the client sent no such member — while a
+    /// request that named one keeps its own, in its own place.
+    #[test]
+    fn a_request_naming_no_ceiling_reaches_the_node_with_the_declared_one() {
+        let mut absent = ValidatedRequest::from_bytes(bytes::Bytes::from_static(
+            br#"{"model":"fixture-model","messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .unwrap();
+        absent.default_completion_ceiling(Some(4_096));
+        assert_eq!(absent.request().max_completion_tokens, Some(4_096));
+        let body: serde_json::Value =
+            serde_json::from_slice(&engine_request_body(&absent)).unwrap();
+        assert_eq!(body["max_completion_tokens"], 4_096);
+
+        let mut null = ValidatedRequest::from_bytes(bytes::Bytes::from_static(
+            br#"{"model":"fixture-model","max_completion_tokens":null,"messages":[]}"#,
+        ))
+        .unwrap();
+        null.default_completion_ceiling(Some(4_096));
+        let text = String::from_utf8(engine_request_body(&null).to_vec()).unwrap();
+        assert!(
+            text.starts_with(r#"{"model":"fixture-model","max_completion_tokens":4096,"#),
+            "{text}"
+        );
+        assert_eq!(text.matches("max_completion_tokens").count(), 1, "{text}");
+
+        let mut named = ValidatedRequest::from_bytes(bytes::Bytes::from_static(
+            br#"{"model":"fixture-model","messages":[],"max_completion_tokens":16}"#,
+        ))
+        .unwrap();
+        named.default_completion_ceiling(Some(4_096));
+        assert_eq!(named.request().max_completion_tokens, Some(16));
+        let body: serde_json::Value = serde_json::from_slice(&engine_request_body(&named)).unwrap();
+        assert_eq!(body["max_completion_tokens"], 16);
+
+        // No declared ceiling: nothing is invented.
+        let mut undeclared = ValidatedRequest::from_bytes(bytes::Bytes::from_static(
+            br#"{"model":"fixture-model","messages":[]}"#,
+        ))
+        .unwrap();
+        undeclared.default_completion_ceiling(None);
+        let body: serde_json::Value =
+            serde_json::from_slice(&engine_request_body(&undeclared)).unwrap();
+        assert!(body.get("max_completion_tokens").is_none(), "{body}");
     }
 
     /// A request carrying a key reaches the node with it, in the shape the

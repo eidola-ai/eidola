@@ -514,7 +514,9 @@ pub struct ListKeysResponse {
 pub struct IssueCredentialsRequest {
     /// Base64-encoded CBOR `IssuanceRequest`.
     pub issuance_request: String,
-    /// Number of credits to issue.
+    /// Number of credits to issue: the credential denomination
+    /// (1,000,000), or the account's whole available balance when that is
+    /// less. Any other amount is refused.
     pub credits: i64,
 }
 
@@ -564,6 +566,40 @@ pub async fn list_keys(
     Ok(Json(ListKeysResponse { data }))
 }
 
+/// Why `credits` is not an amount this server issues, given the account's
+/// available balance — read only when it is needed.
+///
+/// **Credentials are issued in one public size**
+/// (`eidola_common::CREDENTIAL_DENOMINATION`, `D`): exactly `D`, or the
+/// account's whole available balance when that is less than `D` — the last
+/// issuance an account makes, whose size is a balance this server already
+/// holds. Any other amount is refused. The amount of an issuance is recorded
+/// against the account while every spend presents its hold anonymously, so
+/// an issuance sized to a request would link the two; holding every client
+/// to the rule here, rather than trusting each one to keep it, keeps every
+/// issuance in the common set. `D` itself needs no balance read: an account
+/// below it is refused by the debit as insufficient, as before.
+///
+/// The balance is read before the debit, not inside it, so a credit landing
+/// between the two can leave an issuance equal to the balance a moment
+/// earlier — a figure this server held either way.
+pub(crate) fn denomination_problem(
+    credits: i64,
+    available: impl FnOnce() -> i64,
+) -> Option<&'static str> {
+    let d = eidola_common::CREDENTIAL_DENOMINATION as i64;
+    if credits == d {
+        return None;
+    }
+    if credits < d && credits == available() {
+        return None;
+    }
+    Some(
+        "credits must be the credential denomination, or the account's whole \
+         available balance when that is less",
+    )
+}
+
 /// `POST /v1/account/credentials` — issue anonymous credentials (authenticated).
 #[utoipa::path(
     post,
@@ -573,7 +609,7 @@ pub async fn list_keys(
     security(("basic" = [])),
     responses(
         (status = 200, description = "Credential issued", body = IssueCredentialsResponse),
-        (status = 400, description = "Invalid request", body = crate::types::ErrorResponse),
+        (status = 400, description = "Invalid request, or an amount other than the credential denomination (or the whole available balance below it)", body = crate::types::ErrorResponse),
         (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
         (status = 402, description = "Insufficient credit balance", body = crate::types::ErrorResponse),
         (status = 428, description = "Terms acceptance required", body = crate::types::ErrorResponse),
@@ -596,6 +632,17 @@ pub async fn issue_credentials(
     // Conversion is a gated operation: the account must have accepted the
     // currently required terms/privacy versions (no-op when unconfigured).
     crate::account::ensure_terms_accepted(&state, account_id).await?;
+
+    // One public size (see `denomination_problem`). The balance is read only
+    // for an amount below the denomination.
+    let available = if request.credits == eidola_common::CREDENTIAL_DENOMINATION as i64 {
+        None
+    } else {
+        Some(db::get_available_balance(&state.db_pool, account_id).await?)
+    };
+    if let Some(message) = denomination_problem(request.credits, || available.unwrap_or(0)) {
+        return Err(ServerError::InvalidDenomination { message });
+    }
 
     // Both decode errors are discarded, not interpolated: their Display
     // quotes the offending byte, its offset, and the input length — all
@@ -838,6 +885,54 @@ pub async fn recover_refund(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const D: i64 = eidola_common::CREDENTIAL_DENOMINATION as i64;
+
+    /// **One public size, enforced here.** The denomination is accepted
+    /// without a balance read; an amount below it only when it is the whole
+    /// available balance; nothing else — not a larger credential, not a
+    /// smaller one carved out of a larger balance, not a request-sized one.
+    #[test]
+    fn only_the_denomination_or_the_whole_remaining_balance_is_issued() {
+        assert_eq!(
+            denomination_problem(D, || panic!("the denomination reads no balance")),
+            None
+        );
+        // The last issuance: the whole balance, below the denomination.
+        for balance in [1, 6_200, D / 2, D - 1] {
+            assert_eq!(denomination_problem(balance, || balance), None, "{balance}");
+        }
+        // Everything else is refused.
+        for (credits, balance) in [
+            (D + 1, 10 * D),
+            (2 * D, 10 * D),
+            (1_500_000, 1_500_000), // a whole balance past D is still not D
+            (62_500, 10 * D),       // a hold-sized issuance from a large balance
+            (D - 1, D),
+            (6_200, 6_201),
+            (6_200, 6_199),
+        ] {
+            assert!(
+                denomination_problem(credits, || balance).is_some(),
+                "{credits} against a balance of {balance}"
+            );
+        }
+    }
+
+    /// The refusal is typed, a 400, and its text names no amount.
+    #[test]
+    fn a_refused_amount_is_a_typed_400_with_no_figures() {
+        let message = denomination_problem(62_500, || 10 * D).unwrap();
+        let err = ServerError::InvalidDenomination { message };
+        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        let wire = serde_json::to_value(err.to_error_response()).unwrap();
+        assert_eq!(wire["error"]["type"], "invalid_denomination");
+        let text = format!("{wire} {err}");
+        assert!(
+            !text.contains("62500") && !text.contains("1000000"),
+            "{text}"
+        );
+    }
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {

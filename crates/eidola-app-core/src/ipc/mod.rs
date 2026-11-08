@@ -1108,6 +1108,13 @@ impl WireError {
                 "HoldExceedsDenomination",
                 json!({ "required": required, "denomination": denomination }),
             ),
+            AppError::IssuanceNotDenominated {
+                credits,
+                denomination,
+            } => (
+                "IssuanceNotDenominated",
+                json!({ "credits": credits, "denomination": denomination }),
+            ),
             AppError::ProvisioningTimeout { message } => {
                 ("ProvisioningTimeout", json!({ "message": message }))
             }
@@ -1203,6 +1210,10 @@ impl WireError {
             },
             "HoldExceedsDenomination" => AppError::HoldExceedsDenomination {
                 required: i("required")?,
+                denomination: i("denomination")?,
+            },
+            "IssuanceNotDenominated" => AppError::IssuanceNotDenominated {
+                credits: i("credits")?,
                 denomination: i("denomination")?,
             },
             "ProvisioningTimeout" => AppError::ProvisioningTimeout { message: msg() },
@@ -1934,6 +1945,10 @@ mod tests {
             },
             AppError::HoldExceedsDenomination {
                 required: 1_000_001,
+                denomination: 1_000_000,
+            },
+            AppError::IssuanceNotDenominated {
+                credits: 62_500,
                 denomination: 1_000_000,
             },
             AppError::DatabaseInUse {

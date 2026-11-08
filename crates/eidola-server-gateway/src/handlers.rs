@@ -95,12 +95,47 @@ pub(crate) fn chargeable_prompt_tokens_for(request: &ChatCompletionRequest) -> u
 }
 
 /// The effective completion-token ceiling for a request: its
-/// `max_completion_tokens`, falling back to the model's context length.
+/// `max_completion_tokens`, falling back to the model's declared
+/// `max_output_tokens`, and to its context length only for a row that
+/// declares none (which the catalog bound refuses for every token-priced row
+/// it sells).
+///
+/// A request that reaches pricing never has the field absent:
+/// `chat_completions` writes the declared ceiling into one that named none
+/// ([`ValidatedRequest::default_completion_ceiling`]), so the node is asked
+/// for exactly what was priced. The fallbacks keep this total for any caller.
 pub(crate) fn effective_max_completion(request: &ChatCompletionRequest, model: &Model) -> u64 {
     request
         .max_completion_tokens
         .map(|t| t as u64)
+        .or(model.max_output_tokens)
         .unwrap_or(model.context_length)
+}
+
+/// Refuse a request asking for more completion than the model's declared
+/// ceiling.
+///
+/// **Refused, not clamped.** The client sized its hold on what it sent, and
+/// the hold, the server's pre-flight minimum and the settlement cap are all
+/// the same function of that request; quietly lowering the field would
+/// answer a different request from the one priced and leave the caller
+/// unable to tell why its answer stopped short. A refusal after the
+/// nullifier is recorded refunds the whole charge, as every validation
+/// refusal does, and is padded like every other response. With this and the
+/// catalog bound, every accepted request's completion side is within the
+/// `eidola_common::MAX_DECLARED_HOLD` arithmetic, whoever the client is.
+fn check_completion_ceiling(
+    request: &ChatCompletionRequest,
+    model: &Model,
+) -> Result<(), ServerError> {
+    match (request.max_completion_tokens, model.max_output_tokens) {
+        (Some(asked), Some(declared)) if u64::from(asked) > declared => {
+            Err(ServerError::BadRequest {
+                message: "max_completion_tokens exceeds this model's max_output_tokens".to_string(),
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Compute the worst-case cost in credits for a request — the pre-flight
@@ -335,6 +370,9 @@ fn validate_request(
                 message: "unknown model".to_string(),
             })?;
 
+    // No completion past the declared ceiling, whatever the client.
+    check_completion_ceiling(request, &model)?;
+
     // Pre-flight go/no-go: the presented charge must cover the worst-case
     // cost (the shared contract's minimum hold).
     check_sufficient_charge(charge_credits, request, &model)?;
@@ -386,17 +424,21 @@ fn check_sufficient_charge(
 pub async fn chat_completions(
     TokenAuth(act): TokenAuth,
     State(state): State<AppState>,
-    ChatRequest(validated): ChatRequest,
+    ChatRequest(mut validated): ChatRequest,
 ) -> Result<axum::response::Response, ServerError> {
+    let model = state.catalog.lookup_model(&validated.request().model);
+    // A request that names no completion ceiling asks for the model's
+    // declared one — written into the request, so pricing, settlement and
+    // the body the node receives all read one number. Left absent, the node
+    // would fill the rest of its window, past what was priced.
+    if let Some(model) = &model {
+        validated.default_completion_ceiling(model.max_output_tokens);
+    }
     let request = validated.request();
     // The counter's `model` label must come from the catalog, never the
     // caller's string (the fixed-list rule bounding label cardinality):
     // resolve it up front, with anything unresolved collapsing to `other`.
-    let model_label = state
-        .catalog
-        .lookup_model(&request.model)
-        .map(|m| m.id)
-        .unwrap_or_else(|| "other".to_string());
+    let model_label = model.map(|m| m.id).unwrap_or_else(|| "other".to_string());
     let stream = request.stream;
 
     let result = chat_completions_phases(&state, &act, &validated).await;
@@ -1534,6 +1576,40 @@ pub(crate) mod tests {
             total_tokens: 2_000_000,
         };
         assert_eq!(actual_cost(&usage, &model, 1, 1), 5);
+    }
+
+    /// **No completion past the declared ceiling, and an absent field is the
+    /// declared ceiling.** A request asking for more than the model's
+    /// `max_output_tokens` is refused rather than clamped — its hold was sized
+    /// on what it sent — and one naming none is priced at the declared
+    /// ceiling, never at the context window, so the catalog's hold bound holds
+    /// for every client.
+    #[test]
+    fn the_completion_side_is_held_to_the_declared_ceiling() {
+        let model = test_model(); // declares 4096, context 8192
+        assert!(check_completion_ceiling(&request(&["hi"], 4_096), &model).is_ok());
+        assert!(check_completion_ceiling(&request(&["hi"], 1), &model).is_ok());
+        let refused = check_completion_ceiling(&request(&["hi"], 4_097), &model).unwrap_err();
+        assert_eq!(refused.status_code(), axum::http::StatusCode::BAD_REQUEST);
+
+        let absent: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap();
+        assert!(check_completion_ceiling(&absent, &model).is_ok());
+        assert_eq!(effective_max_completion(&absent, &model), 4_096);
+        assert_eq!(
+            worst_case_cost(&absent, &model),
+            worst_case_cost(&request(&["hi"], 4_096), &model),
+            "an absent field is priced as the declared ceiling"
+        );
+
+        // A row declaring nothing keeps the window as its last resort.
+        let mut undeclared = test_model();
+        undeclared.max_output_tokens = None;
+        assert!(check_completion_ceiling(&request(&["hi"], 8_000), &undeclared).is_ok());
+        assert_eq!(effective_max_completion(&absent, &undeclared), 8_192);
     }
 
     /// **A request's charge never depends on whether its prompt was served

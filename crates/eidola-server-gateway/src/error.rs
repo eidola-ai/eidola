@@ -11,6 +11,12 @@ pub enum ServerError {
     /// Client sent a bad request (400).
     BadRequest { message: String },
 
+    /// A credential issuance asked for an amount that is neither the one
+    /// public denomination nor the account's whole remaining balance below it
+    /// (400, type `invalid_denomination`). The message is a constant: the
+    /// amounts are linked-surface figures and never reach the log.
+    InvalidDenomination { message: &'static str },
+
     /// Authentication failed (401).
     Unauthorized { message: String },
 
@@ -53,7 +59,9 @@ impl ServerError {
     /// Map this error to an HTTP status code.
     pub fn status_code(&self) -> StatusCode {
         match self {
-            ServerError::BadRequest { .. } => StatusCode::BAD_REQUEST,
+            ServerError::BadRequest { .. } | ServerError::InvalidDenomination { .. } => {
+                StatusCode::BAD_REQUEST
+            }
             ServerError::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
             ServerError::Backend { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
@@ -73,6 +81,9 @@ impl ServerError {
         match self {
             ServerError::BadRequest { message } => {
                 ErrorResponse::new(message, "invalid_request_error")
+            }
+            ServerError::InvalidDenomination { message } => {
+                ErrorResponse::new(*message, "invalid_denomination")
             }
             ServerError::Unauthorized { message } => {
                 ErrorResponse::new(message, "authentication_error")
@@ -126,6 +137,9 @@ impl std::fmt::Display for ServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ServerError::BadRequest { message } => write!(f, "bad request: {}", message),
+            ServerError::InvalidDenomination { message } => {
+                write!(f, "invalid denomination: {}", message)
+            }
             ServerError::Unauthorized { message } => write!(f, "unauthorized: {}", message),
             ServerError::Backend {
                 status, error_type, ..

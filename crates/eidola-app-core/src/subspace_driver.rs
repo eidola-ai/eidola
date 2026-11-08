@@ -347,6 +347,9 @@ impl DelegationFailure {
             // The turn could not be paid for: its hold is past what one
             // credential carries.
             | AppError::HoldExceedsDenomination { .. }
+            // Reached only through an explicit allocation, never a turn;
+            // placed with the other wallet refusals.
+            | AppError::IssuanceNotDenominated { .. }
             | AppError::ProvisioningTimeout { .. }
             | AppError::TermsAcceptanceRequired { .. } => Self::Funding,
             AppError::NotConfigured { .. }

@@ -133,6 +133,16 @@ pub enum AppError {
     )]
     HoldExceedsDenomination { required: i64, denomination: i64 },
 
+    /// An explicit allocation asked for an amount this client does not issue:
+    /// credentials come in one size (`CREDENTIAL_DENOMINATION`), or the
+    /// account's whole available balance when that is less, and the server
+    /// refuses any other amount too. Refused before anything is sent.
+    #[error(
+        "{credits} credits is not an amount credentials are issued in: allocate \
+         {denomination} credits, or the whole remaining balance when it is less"
+    )]
+    IssuanceNotDenominated { credits: i64, denomination: i64 },
+
     /// The wallet-level ACT provisioning queue timed out waiting for an
     /// in-flight credential refund to free spendable balance for a concurrent
     /// turn. Distinct from [`AppError::InsufficientBalance`] (which is a true

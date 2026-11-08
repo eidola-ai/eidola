@@ -3562,22 +3562,24 @@ fn a_hold_past_one_credential_is_refused_before_anything_is_issued() {
 }
 
 /// **A credential larger than the denomination does not let a larger hold
-/// through.** An explicit `account_allocate` issues whatever it is asked for,
-/// so the wallet can hold a credential that would cover a four-credential
-/// hold — and spending it would tell the server the hold came from one of the
-/// few credentials not of the common size. The refusal therefore comes
-/// before the wallet is consulted, and the credential is left as it was.
+/// through.** A profile can carry one from a client that issued other sizes
+/// (minted here through the test seam, against a mock playing an older
+/// server), and it would cover a four-credential hold — but spending it would
+/// tell the server the hold came from one of the few credentials not of the
+/// common size. The refusal therefore comes before the wallet is consulted,
+/// and the credential is left as it was.
 #[test]
 fn a_larger_credential_in_the_wallet_does_not_let_a_larger_hold_through() {
     run(|| {
         let (mock, core, _dir) = setup(MockConfig {
             completion_rate: 1_000,
+            allow_any_issuance: true,
             ..MockConfig::default()
         });
         with_account(&core);
         core.runtime()
-            .block_on(core.account_allocate(5 * DENOMINATION))
-            .expect("an explicit allocation of five denominations");
+            .block_on(core.issue_credential_of_any_size_for_test(5 * DENOMINATION))
+            .expect("a credential of five denominations, as an older client issued");
 
         let err = core
             .runtime()
@@ -3599,6 +3601,64 @@ fn a_larger_credential_in_the_wallet_does_not_let_a_larger_hold_through() {
             "the credential is untouched"
         );
         assert_eq!(wallet[0].generation, 0, "and was never spent: {wallet:?}");
+    });
+}
+
+/// **An explicit allocation follows the same rule as provisioning.** Only the
+/// denomination, or the whole balance below it, is issued; any other amount
+/// is refused locally, typed, with nothing sent to the account. The mock
+/// enforces the server's half of the rule too, so a refusal here is the
+/// client's own.
+#[test]
+fn an_explicit_allocation_is_one_denomination_or_the_whole_remaining_balance() {
+    run(|| {
+        let config = MockConfig::default(); // balance 10 × D
+        let issued = config.issued.clone();
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+
+        for credits in [
+            62_500,
+            DENOMINATION + 1,
+            2 * DENOMINATION,
+            10 * DENOMINATION,
+        ] {
+            match core.runtime().block_on(core.account_allocate(credits)) {
+                Err(AppError::IssuanceNotDenominated {
+                    credits: c,
+                    denomination,
+                }) => {
+                    assert_eq!(c, credits);
+                    assert_eq!(denomination, DENOMINATION);
+                }
+                other => panic!("{credits}: expected IssuanceNotDenominated, got {other:?}"),
+            }
+        }
+        assert!(issued.lock().unwrap().is_empty(), "nothing was asked for");
+
+        core.runtime()
+            .block_on(core.account_allocate(DENOMINATION))
+            .expect("one denomination");
+        assert_eq!(*issued.lock().unwrap(), vec![DENOMINATION]);
+    });
+
+    // Below one denomination, the whole balance and nothing else.
+    run(|| {
+        let config = MockConfig {
+            balance: 300_000,
+            ..MockConfig::default()
+        };
+        let issued = config.issued.clone();
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        assert!(matches!(
+            core.runtime().block_on(core.account_allocate(200_000)),
+            Err(AppError::IssuanceNotDenominated { .. })
+        ));
+        core.runtime()
+            .block_on(core.account_allocate(300_000))
+            .expect("the whole remaining balance");
+        assert_eq!(*issued.lock().unwrap(), vec![300_000]);
     });
 }
 
