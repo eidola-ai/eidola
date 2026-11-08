@@ -6,9 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use anonymous_credit_tokens::{
-    IssuanceRequest, Params, PrivateKey, Scalar, credit_to_scalar, scalar_to_credit,
-};
+use anonymous_credit_tokens::{IssuanceRequest, Params, PrivateKey, Scalar, credit_to_scalar};
 use axum::Json;
 use axum::extract::State;
 use base64::Engine;
@@ -353,7 +351,7 @@ pub fn open_refund_token(
 
 /// Seal a spend's refund under its client's refund recovery key and store it
 /// on the spend's nullifier row: the one way a refund reaches Postgres, for
-/// every path that signs one ([`sign_refund`]).
+/// every path that signs one ([`sign_refund`], [`verify_and_sign_full_refund`]).
 pub async fn store_sealed_refund(
     state: &AppState,
     act: &crate::auth::ActSpend,
@@ -722,14 +720,36 @@ pub async fn load_key(
     Ok(())
 }
 
-/// Check a presented spend proof against the key it names: its request
-/// context must be this key's, and the proof must verify under this key.
+/// Verify `act`'s spend proof under `key` and, only if it verifies, sign a
+/// refund returning `t` credits.
 ///
-/// Nothing is recorded and nothing is signed. Every path that acts on a
-/// presented spend (the chat spend, and both branches of refund recovery)
-/// calls this before it reads or writes a nullifier row, so a proof that does
-/// not verify never reaches the database.
-pub fn verify_presented_spend(
+/// This is the gateway's one call into the ACT verifier. The crate
+/// (`anonymous-credit-tokens` 0.4) has no verify-only operation:
+/// `PrivateKey::refund` verifies the proof and then signs, and the refund it
+/// signs commits to `t` (both its signature and its proof of correctness are
+/// computed over it), so a refund signed for one `t` cannot be turned into
+/// one for another. A caller that does not yet know its final `t` therefore
+/// verifies here and discards the refund, and verifies again when it signs:
+/// the chat spend does, since its `t` is known only once the response is
+/// settled (`handlers::verify_spend_proof`, then [`sign_refund`]). Recovery
+/// knows its `t` (the whole charge) before it reads the database, so it
+/// verifies once ([`verify_and_sign_full_refund`]).
+///
+/// Every verification passes through here, which is what the
+/// `verification_count` seam counts in tests.
+fn verify_and_refund(
+    key: &DecryptedIssuerKey,
+    act: &crate::auth::ActSpend,
+    t: Scalar,
+) -> Result<anonymous_credit_tokens::Refund, anonymous_credit_tokens::ErrorCode> {
+    #[cfg(test)]
+    verification_count::record(&act.spend_proof);
+    key.secret_key
+        .refund::<128>(&key.params, &act.spend_proof, t, OsRng)
+}
+
+/// The refusal for a presented spend whose request context is not `key`'s.
+fn check_presented_context(
     key: &DecryptedIssuerKey,
     act: &crate::auth::ActSpend,
 ) -> Result<(), ServerError> {
@@ -738,14 +758,75 @@ pub fn verify_presented_spend(
             message: "invalid request_context in spend proof".to_string(),
         });
     }
-    // `refund` verifies the proof before it signs anything; the refund it
-    // returns for `t = 0` is discarded.
-    key.secret_key
-        .refund::<128>(&key.params, &act.spend_proof, Scalar::ZERO, OsRng)
-        .map_err(|_| ServerError::Unauthorized {
-            message: "invalid spend proof".to_string(),
-        })?;
     Ok(())
+}
+
+fn invalid_spend_proof() -> ServerError {
+    ServerError::Unauthorized {
+        message: "invalid spend proof".to_string(),
+    }
+}
+
+/// Check a presented spend proof against the key it names: its request
+/// context must be this key's, and the proof must verify under this key.
+///
+/// Nothing is recorded and nothing is kept: the refund the verifier signs for
+/// `t = 0` is discarded (see [`verify_and_refund`] on why). The chat spend
+/// calls this before it records the nullifier, so a proof that does not
+/// verify never reaches the database. Recovery, which knows its refund
+/// already, verifies with [`verify_and_sign_full_refund`] instead.
+pub fn verify_presented_spend(
+    key: &DecryptedIssuerKey,
+    act: &crate::auth::ActSpend,
+) -> Result<(), ServerError> {
+    check_presented_context(key, act)?;
+    verify_and_refund(key, act, Scalar::ZERO).map_err(|_| invalid_spend_proof())?;
+    Ok(())
+}
+
+/// A refund signed for a spend, CBOR-encoded, with the id of the key that
+/// signed it: the spent credential's own key.
+pub struct SignedRefund {
+    pub cbor: Vec<u8>,
+    pub issuer_key_id: String,
+}
+
+impl SignedRefund {
+    fn encode(
+        act: &crate::auth::ActSpend,
+        refund: anonymous_credit_tokens::Refund,
+    ) -> Result<Self, ServerError> {
+        let cbor = refund
+            .to_cbor()
+            .map_err(|e| ServerError::Internal(format!("refund CBOR encoding failed: {e:?}")))?;
+        Ok(Self {
+            cbor,
+            issuer_key_id: hex::encode(act.issuer_key_hash),
+        })
+    }
+}
+
+/// Check a presented spend proof as [`verify_presented_spend`] does, and
+/// keep the refund that one verification signs: a full refund, returning the
+/// whole charge. The proof is verified exactly once.
+///
+/// The key is the one `act` names, as for [`sign_refund`], and must still be
+/// usable for [`KeyUse::Refund`] at `now`. Nothing is recorded: a refund
+/// signed here leaves the gateway only if the caller goes on to record the
+/// spend's nullifier, so signing it before the database is read changes
+/// nothing anyone sees.
+pub fn verify_and_sign_full_refund(
+    cache: &HashMap<[u8; 32], DecryptedIssuerKey>,
+    act: &crate::auth::ActSpend,
+    now: SystemTime,
+) -> Result<SignedRefund, ServerError> {
+    let key = usable_key(cache, &act.issuer_key_hash, KeyUse::Refund, now)?;
+    check_presented_context(key, act)?;
+    // `t = s`. Any refusal is the proof's: a verified proof's charge fits the
+    // credential's 128 bits, and `t = s` is within `0 <= t <= s`.
+    let refund =
+        verify_and_refund(key, act, act.spend_proof.charge()).map_err(|_| invalid_spend_proof())?;
+    SignedRefund::encode(act, refund)
 }
 
 /// Sign the refund for a spent credential, returning its CBOR encoding and
@@ -755,6 +836,9 @@ pub fn verify_presented_spend(
 /// never the current issuing key: a refund is a credential under the same
 /// key as the one it replaces, so it lapses at that key's `accept_until`, and
 /// a spend near the end of an epoch cannot carry value into a later one.
+///
+/// Signing verifies the proof again ([`verify_and_refund`]): the chat spend's
+/// second verification, which the crate does not let it skip.
 pub fn sign_refund(
     cache: &HashMap<[u8; 32], DecryptedIssuerKey>,
     act: &crate::auth::ActSpend,
@@ -764,14 +848,44 @@ pub fn sign_refund(
     let t = credit_to_scalar::<128>(refund_credits)
         .map_err(|e| ServerError::Internal(format!("invalid refund amount: {e:?}")))?;
     let key = usable_key(cache, &act.issuer_key_hash, KeyUse::Refund, now)?;
-    let refund = key
-        .secret_key
-        .refund(&key.params, &act.spend_proof, t, OsRng)
+    let refund = verify_and_refund(key, act, t)
         .map_err(|e| ServerError::Internal(format!("refund issuance failed: {e:?}")))?;
-    let refund_cbor = refund
-        .to_cbor()
-        .map_err(|e| ServerError::Internal(format!("refund CBOR encoding failed: {e:?}")))?;
-    Ok((refund_cbor, hex::encode(act.issuer_key_hash)))
+    let signed = SignedRefund::encode(act, refund)?;
+    Ok((signed.cbor, signed.issuer_key_id))
+}
+
+/// How many times each spend proof has been through the verifier, keyed by
+/// its nullifier (unique to the proof), so tests running in parallel count
+/// their own proofs only. A clone of a spend counts as the same spend.
+#[cfg(test)]
+pub(crate) mod verification_count {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    use anonymous_credit_tokens::SpendProof;
+
+    fn counts() -> &'static Mutex<HashMap<[u8; 32], usize>> {
+        static COUNTS: OnceLock<Mutex<HashMap<[u8; 32], usize>>> = OnceLock::new();
+        COUNTS.get_or_init(Default::default)
+    }
+
+    pub(crate) fn record(proof: &SpendProof<128>) {
+        *counts()
+            .lock()
+            .unwrap()
+            .entry(proof.nullifier().to_bytes())
+            .or_default() += 1;
+    }
+
+    /// How many times `proof` has been verified so far.
+    pub(crate) fn of(proof: &SpendProof<128>) -> usize {
+        counts()
+            .lock()
+            .unwrap()
+            .get(&proof.nullifier().to_bytes())
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 /// Periodic key rotation check interval: 1 hour.
@@ -1103,16 +1217,15 @@ pub async fn recover_refund(
     // written. Recording an unverified nullifier would let anyone holding a
     // public key id write rows, and answering 200 or 404 for one would let
     // anyone who knows a nullifier ask what became of its spend.
-    {
+    //
+    // The one verification also signs the full refund the never-arrived
+    // branch returns (the verifier cannot verify without signing). It leaves
+    // the gateway only if that branch records the nullifier; otherwise it is
+    // dropped.
+    let full_refund = {
         let cache = state.credential_key_cache.read().await;
-        let key = usable_key(
-            &cache,
-            &act.issuer_key_hash,
-            KeyUse::Refund,
-            SystemTime::now(),
-        )?;
-        verify_presented_spend(key, &act)?;
-    }
+        verify_and_sign_full_refund(&cache, &act, SystemTime::now())?
+    };
 
     let key_id = hex::encode(act.issuer_key_hash);
     let nullifier_bytes = act.spend_proof.nullifier().as_bytes().to_vec();
@@ -1169,19 +1282,12 @@ pub async fn recover_refund(
     }
 
     // Nullifier was not previously recorded — the original request never
-    // arrived (its proof was verified above). Issue a full refund.
-
-    // Issue a full refund (charge_credits returned in full since no work was done).
-    let charge_credits = scalar_to_credit::<128>(&act.spend_proof.charge()).map_err(|_| {
-        ServerError::BadRequest {
-            message: "invalid charge amount in spend proof".to_string(),
-        }
-    })?;
-
-    let (refund_cbor, key_id) = {
-        let cache = state.credential_key_cache.read().await;
-        sign_refund(&cache, &act, charge_credits, SystemTime::now())?
-    };
+    // arrived. The full refund (the charge returned in full, since no work
+    // was done) was signed when the proof was verified above.
+    let SignedRefund {
+        cbor: refund_cbor,
+        issuer_key_id: key_id,
+    } = full_refund;
 
     // Store the refund token for idempotency, sealed (it carries the amount).
     store_sealed_refund(&state, &act, &key_id, &refund_cbor).await?;
@@ -1299,7 +1405,7 @@ mod tests {
 
     // --- Key deadlines ---
 
-    use anonymous_credit_tokens::{CreditToken, PreIssuance, PublicKey};
+    use anonymous_credit_tokens::{CreditToken, PreIssuance, PublicKey, scalar_to_credit};
 
     const HOUR: Duration = Duration::from_secs(3600);
     const DAY: Duration = Duration::from_secs(86400);
@@ -1814,7 +1920,7 @@ mod tests {
         token.extend_from_slice(&compute_challenge_digest());
         token.extend_from_slice(&[9u8; 32]);
         token.extend_from_slice(&proof.to_cbor().unwrap());
-        let authorization = format!("PrivateToken token=\"{}\"", URL_SAFE_NO_PAD.encode(&token));
+        let authorization = eidola_common::private_token::authorization_value(&token);
         let key = [0x5au8; 32];
         let good = encode_refund_key(&key);
         let good = std::str::from_utf8(&good).unwrap().to_string();
@@ -1848,6 +1954,54 @@ mod tests {
         let TokenAuth(act) = extract(Some(good)).await.unwrap();
         assert_eq!(act.refund_key.as_bytes(), &key);
         assert_eq!(format!("{:?}", act.refund_key), "RefundKey(<redacted>)");
+    }
+
+    /// A spend's token is read only in the spelling RFC 9577 requires and
+    /// the client writes: padded base64url. The same Token without its
+    /// padding is refused as unauthenticated by the extractor, before the
+    /// handler that records the nullifier runs.
+    #[tokio::test]
+    async fn a_spend_token_is_accepted_only_as_padded_base64url() {
+        use axum::extract::FromRequestParts;
+        use base64::engine::general_purpose::URL_SAFE;
+        use eidola_common::refund_key::{REFUND_KEY_HEADER, encode_refund_key};
+
+        let (_, _, proof, _, _) = refund_fixture(1000, 300, 0);
+        let mut token = Vec::new();
+        token.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+        token.extend_from_slice(&compute_challenge_digest());
+        token.extend_from_slice(&[9u8; 32]);
+        token.extend_from_slice(&proof.to_cbor().unwrap());
+        // The fixture's Token needs padding, so the two spellings differ.
+        assert_ne!(token.len() % 3, 0);
+        let refund_key = encode_refund_key(&[0x5au8; 32]);
+        let refund_key = std::str::from_utf8(&refund_key).unwrap().to_string();
+
+        let extract = |authorization: String| {
+            let refund_key = refund_key.clone();
+            async move {
+                let request = axum::http::Request::builder()
+                    .header("authorization", authorization)
+                    .header(REFUND_KEY_HEADER, refund_key);
+                let (mut parts, ()) = request.body(()).unwrap().into_parts();
+                TokenAuth::from_request_parts(&mut parts, &()).await
+            }
+        };
+
+        let padded = format!("PrivateToken token=\"{}\"", URL_SAFE.encode(&token));
+        assert_eq!(
+            padded,
+            eidola_common::private_token::authorization_value(&token)
+        );
+        let TokenAuth(act) = extract(padded).await.unwrap();
+        assert_eq!(act.spend_proof.nullifier(), proof.nullifier());
+
+        let unpadded = format!("PrivateToken token=\"{}\"", URL_SAFE_NO_PAD.encode(&token));
+        match extract(unpadded).await {
+            Err(ServerError::Unauthorized { .. }) => {}
+            Err(e) => panic!("expected 401, got {e:?}"),
+            Ok(_) => panic!("an unpadded token was accepted"),
+        }
     }
 
     /// What anyone holds without the client: the stored row (version, nonce,
@@ -2016,8 +2170,10 @@ mod tests {
         let nullifier = proof.nullifier().as_bytes().to_vec();
         let ck = client_key(7);
 
-        // The original request never arrived: a full refund is issued...
+        // The original request never arrived: a full refund is issued, its
+        // proof verified once...
         let first = recover(proof.clone(), ck.clone()).await.unwrap();
+        assert_eq!(verification_count::of(&proof), 1);
         let first_cbor = URL_SAFE_NO_PAD.decode(&first).unwrap();
         // ...and what Postgres holds is the sealed token, not the CBOR.
         let row = stored_row(&nullifier).await;
@@ -2034,11 +2190,13 @@ mod tests {
             Ok(_) => panic!("a stored token opened under another client's key"),
         }
         assert_eq!(stored_row(&nullifier).await, row);
+        assert_eq!(verification_count::of(&proof), 2, "one per ask");
 
         // Asked again with its own key, the stored token comes back and
         // completes the credential.
         let second = recover(proof.clone(), ck.clone()).await.unwrap();
         assert_eq!(second, first);
+        assert_eq!(verification_count::of(&proof), 3, "one per ask");
         let refund = Refund::from_cbor(&URL_SAFE_NO_PAD.decode(&second).unwrap()).unwrap();
         let next = {
             let cache = cache.read().await;
@@ -2146,13 +2304,18 @@ mod tests {
             async move { recover_refund(TokenAuth(act), State(state)).await }
         };
 
-        for (name, act) in [("forged", forged), ("wrong context", wrong_context)] {
+        // The forged proof reaches the verifier once; a proof under another
+        // context is refused before it.
+        for (name, act, verified) in [("forged", forged, 1), ("wrong context", wrong_context, 0)] {
+            let proof = act.spend_proof.clone();
             match recover(act).await {
                 Err(ServerError::Unauthorized { .. }) => {}
                 Err(e) => panic!("{name}: reached the database before verifying: {e}"),
                 Ok(_) => panic!("{name}: an unverified proof was answered"),
             }
+            assert_eq!(verification_count::of(&proof), verified, "{name}");
         }
+        let proof = valid.spend_proof.clone();
         match recover(valid).await {
             Err(ServerError::Unauthorized { .. }) => {
                 panic!("a valid proof was refused")
@@ -2160,6 +2323,141 @@ mod tests {
             Err(_) => {}
             Ok(_) => panic!("an unreachable database answered"),
         }
+        assert_eq!(verification_count::of(&proof), 1);
+    }
+
+    /// **The gateway calls the ACT verifier in one place.** The crate's only
+    /// verifier is `PrivateKey::refund`, so every call to it, outside tests,
+    /// must be `verify_and_refund`'s: that is what makes the
+    /// `verification_count` seam count every verification of a spend proof.
+    #[test]
+    fn the_verifier_is_called_only_through_its_counting_seam() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    out.push((path.display().to_string(), text));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        assert!(files.len() > 10, "the scan reads the crate's sources");
+        let mut calls = Vec::new();
+        for (path, text) in &files {
+            let shipped = text
+                .find("\n#[cfg(test)]\nmod tests")
+                .map_or(text.as_str(), |end| &text[..end]);
+            for pattern in [".refund(", ".refund::<", "::refund(", "::refund::<"] {
+                for (at, _) in shipped.match_indices(pattern) {
+                    calls.push((path.clone(), at));
+                }
+            }
+        }
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let (path, at) = &calls[0];
+        assert!(path.ends_with("credentials.rs"), "{path}");
+        let source = include_str!("credentials.rs");
+        let seam = source.find("fn verify_and_refund(").unwrap();
+        let seam_end = seam + source[seam..].find("\n}\n").unwrap();
+        assert!(
+            (seam..seam_end).contains(at),
+            "the call is verify_and_refund's"
+        );
+        assert!(source[seam..seam_end].contains("verification_count::record("));
+    }
+
+    /// **A chat spend's proof is verified at pre-flight and once more when
+    /// its refund is signed, and no more**, on the blocking path (the
+    /// handler's own `act`) and the streaming one (a clone moved into the
+    /// stream). Two is the floor the crate allows: it verifies only while
+    /// signing a refund for a fixed amount, and a chat spend's amount is not
+    /// known at pre-flight (`verify_and_refund`). Against an unreachable
+    /// database: the key is cached, and storing the refund is best-effort.
+    #[test]
+    fn a_chat_spend_is_verified_at_preflight_and_once_to_sign_its_refund() {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(a_chat_spend_is_verified_twice())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn a_chat_spend_is_verified_twice() {
+        let pool = db::create_pool(
+            "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
+            None,
+            None,
+        )
+        .unwrap();
+        let mut keys = Cache::new();
+        let hash = add_key(&mut keys, SystemTime::now() + DAY);
+        let (blocking, _) = spend(&keys[&hash], 100, 10);
+        let (streaming, _) = spend(&keys[&hash], 100, 10);
+        let state = AppState::new(
+            crate::backend::Catalog::new(None),
+            None,
+            pool,
+            None,
+            None,
+            [0u8; 32],
+            Arc::new(RwLock::new(keys)),
+            EpochConfig::default(),
+        );
+
+        crate::handlers::verify_spend_proof(&state, &blocking)
+            .await
+            .unwrap();
+        assert_eq!(verification_count::of(&blocking.spend_proof), 1);
+        crate::handlers::issue_refund_async(&state, &blocking, 4)
+            .await
+            .unwrap();
+        assert_eq!(verification_count::of(&blocking.spend_proof), 2);
+
+        crate::handlers::verify_spend_proof(&state, &streaming)
+            .await
+            .unwrap();
+        let spent = streaming.clone();
+        crate::handlers::issue_refund_async(&state, &spent, 4)
+            .await
+            .unwrap();
+        assert_eq!(verification_count::of(&streaming.spend_proof), 2);
+    }
+
+    /// Recovery's one verification signs the refund it returns: the refund
+    /// verifies for the client and returns the whole charge.
+    #[test]
+    fn the_full_refund_signed_by_verification_completes_the_credential() {
+        let mut keys = Cache::new();
+        let hash = add_key(&mut keys, SystemTime::now() + DAY);
+        let key = &keys[&hash];
+        let (act, pre_refund) = spend(key, 100, 30);
+        let signed = verify_and_sign_full_refund(&keys, &act, SystemTime::now()).unwrap();
+        assert_eq!(verification_count::of(&act.spend_proof), 1);
+        assert_eq!(signed.issuer_key_id, hex::encode(hash));
+        let refund = anonymous_credit_tokens::Refund::from_cbor(&signed.cbor).unwrap();
+        let next = pre_refund
+            .to_credit_token(
+                &key.params,
+                &act.spend_proof,
+                &refund,
+                key.secret_key.public(),
+            )
+            .unwrap();
+        assert_eq!(scalar_to_credit::<128>(&next.credits()).unwrap(), 100);
     }
 
     /// Two issuances of one account's whole balance cannot both pass the

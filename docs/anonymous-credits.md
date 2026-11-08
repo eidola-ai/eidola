@@ -193,7 +193,11 @@ For each one: the **decision**, **why**, **where it is enforced**, and **what wo
 
 **Why.** Recording before serving is what prevents a fork. The `(issuer_key_id, value)` primary key is enforced by the database every gateway instance shares, so a token spent concurrently against two instances is served once. Verifying before recording means an invalid proof never writes a row.
 
-**Enforced.** `handlers::chat_completions_phases`, `handlers::verify_spend_proof`, `credentials::verify_presented_spend`, `db::record_nullifier`.
+**The wire form.** A spend is presented as `Authorization: PrivateToken token="<base64url(Token)>"` (RFC 9577, Section 2.2.2), the value padded as that RFC requires. There is one spelling: the client writes it and the gateway reads it through the same rule (`eidola_common::private_token`), which refuses anything that does not re-encode to itself: missing padding, non-zero pad bits, whitespace, another alphabet, or the scheme spelled any other way. An unpadded value is refused as unauthenticated, before anything is recorded.
+
+**The cost of verifying.** Verifying a proof is the expensive step (about 6 ms at `L = 128` with `anonymous-credit-tokens` 0.4.2, on an Apple-silicon laptop; enclave hardware will differ), and a chat spend pays it twice: once before the nullifier is recorded and once when its refund is signed. The crate has no verify-only operation: it verifies a proof only as the first half of signing a refund for a fixed amount, and the refund commits to that amount, so a refund signed before the request runs cannot be adjusted to the amount the response settles at. The pre-flight verification signs a refund of nothing and discards it. Removing the second verification needs the crate to split verification from signing. Recovery knows its amount (the whole charge) before it reads the database, so it verifies once and keeps the refund that verification signed (see Refund recovery below).
+
+**Enforced.** `handlers::chat_completions_phases`, `handlers::verify_spend_proof`, `credentials::verify_presented_spend`, `db::record_nullifier`; every call into the verifier is `credentials::verify_and_refund`'s (`the_verifier_is_called_only_through_its_counting_seam`), and `a_chat_spend_is_verified_at_preflight_and_once_to_sign_its_refund` counts the two. The wire form: `eidola_common::private_token`, `a_spend_token_is_accepted_only_as_padded_base64url`, and the chat harness's mock gateway, which reads only the padded form.
 
 **What would break it.**
 
@@ -241,7 +245,7 @@ For each one: the **decision**, **why**, **where it is enforced**, and **what wo
 
 **Why.** A successor under the current key would let a token near the end of its life be renewed for a further epoch by spending one credit. Repeated, value bought once would live forever, past the expiry of the credits it was bought with, and the server would have to keep accepting it.
 
-**Enforced.** `credentials::sign_refund`, which takes the key from the spend and from nowhere else; `a_refund_is_signed_under_the_spent_credentials_key`. On the client, `process_refund` verifies the refund against the spent token's public key and stores the successor under that key's id.
+**Enforced.** `credentials::sign_refund` and recovery's `verify_and_sign_full_refund`, which take the key from the spend and from nowhere else; `a_refund_is_signed_under_the_spent_credentials_key`. On the client, `process_refund` verifies the refund against the spent token's public key and stores the successor under that key's id.
 
 **What would break it.** A refund path that signs with "the current key", or a client that accepts a successor under another key.
 
@@ -265,7 +269,7 @@ Value still in a token when its key lapses is lost. There is no rollover, becaus
 
 ## Refund recovery
 
-**Decision.** A client whose response was lost asks `POST /v1/credentials/refund` with the same spend. The endpoint verifies the spend proof first, under a key that is still retained. Then:
+**Decision.** A client whose response was lost asks `POST /v1/credentials/refund` with the same spend. The endpoint verifies the spend proof first, under a key that is still retained, and only once: that verification signs the full refund the never-arrived branch returns, which leaves the gateway only if that branch records the nullifier. Then:
 
 - if the nullifier was recorded and a refund was stored, it returns that refund;
 - if the nullifier was recorded and no refund was stored, it answers `404`, because the request may still be in flight;
@@ -275,7 +279,7 @@ The client never asks for recovery of a spend it is still waiting on (`LiveSpend
 
 **Why.** Recovery is what keeps a dropped connection from costing a token's whole balance. Verifying first means only the holder of a valid spend proof (the client that made it) learns anything, and an invalid proof writes nothing: without that, anyone could write nullifier rows under a public key id, or ask what became of a spend whose nullifier they knew.
 
-**Enforced.** `credentials::recover_refund`, `recovery_refuses_an_unverified_proof_before_the_database`; the client's `recover_spending_credentials`, `try_refund_recovery`, and the startup sweep.
+**Enforced.** `credentials::recover_refund`, `credentials::verify_and_sign_full_refund`, `recovery_refuses_an_unverified_proof_before_the_database` (which also counts one verification per ask); the client's `recover_spending_credentials`, `try_refund_recovery`, and the startup sweep.
 
 **What would break it.** Reading or writing a nullifier row before verifying; refunding in the never-arrived branch after `accept_until`; a recovery that answers differently by anything other than the spend's own state.
 
@@ -361,5 +365,5 @@ A change that touches credentials, issuance, spending, refunds, recovery, pricin
 ## Where to read the code
 
 - Gateway: `crates/eidola-server-gateway/src/credentials.rs` (keys, issuance, recovery), `handlers.rs` (spend, settlement, refunds), `auth.rs` (the token's wire form), `db.rs`, and `schema/schema.sql` (`issuer_key`, `credit_ledger`, `nullifier`, `debit_account`, `prune_expired_nullifiers`).
-- Shared: `crates/eidola-common` (`prompt_charge`, the pricing contract).
+- Shared: `crates/eidola-common` (`prompt_charge`, the pricing contract; `private_token`, the spelling of the `Authorization` value; `refund_key`).
 - Client: `crates/eidola-app-core/src/lib.rs` (`account_allocate`, `check_issued_credential`, `ensure_spendable_credential`, `auto_allocation_amount`, `process_refund`, `recover_spending_credentials`), `db.rs` and `schema/schema.sql` (the `credential_lifecycle` view), `proxy/` and `utility.rs` (the other spenders).
