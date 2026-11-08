@@ -9,8 +9,21 @@ CREATE TABLE issuer_key (
     params_hash     TEXT NOT NULL,
     public_key_data BLOB NOT NULL,
     params_data     BLOB NOT NULL,
-    expires_at      INTEGER NOT NULL,         -- ms since epoch
-    created_at      INTEGER NOT NULL
+    -- Two deadlines, both ms since epoch, both derived from the server's
+    -- `accept_until` (the instant it stops accepting this key's credentials;
+    -- one epoch after the key stops *issuing* at `issue_until`, which is why
+    -- neither deadline is read from `issue_until`).
+    --   spend_until:  the last instant a new spend may begin —
+    --                 `accept_until` minus `CREDENTIAL_SPEND_MARGIN`, so a
+    --                 spend started at the deadline still reaches the server
+    --                 inside its acceptance window.
+    --   accept_until: the server's deadline itself. A spend already in flight
+    --                 stays recoverable until here.
+    spend_until     INTEGER NOT NULL,
+    accept_until    INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL,
+
+    CHECK (spend_until <= accept_until)
 );
 
 CREATE TABLE pre_credential (
@@ -1118,9 +1131,16 @@ SELECT
     c.generation,
     c.created_at,
     c.issuer_key_id,
+    -- `expired` is reached two ways. A credential with no spend begun lapses
+    -- at its key's `spend_until`: no new spend may start under it. One with a
+    -- spend in flight (or settled) lapses only at `accept_until`, so recovery
+    -- of an interrupted spend is still attempted while the server would honour
+    -- it.
     CASE
-        WHEN ik.expires_at IS NOT NULL
-             AND ik.expires_at < (strftime('%s', 'now') * 1000)
+        WHEN ik.accept_until <= (strftime('%s', 'now') * 1000)
+                                                    THEN 'expired'
+        WHEN pc_spend.id IS NULL
+             AND ik.spend_until <= (strftime('%s', 'now') * 1000)
                                                     THEN 'expired'
         WHEN pc_spend.id IS NULL                    THEN 'active'
         WHEN c_next.nonce IS NULL                   THEN 'spending'

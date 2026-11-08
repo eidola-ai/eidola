@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use anonymous_credit_tokens::{
     IssuanceRequest, Params, PrivateKey, Scalar, credit_to_scalar, scalar_to_credit,
@@ -21,7 +21,7 @@ use tracing::{info, warn};
 use utoipa::ToSchema;
 
 use crate::AppState;
-use crate::auth::{BasicAuth, TokenAuth};
+use crate::auth::{BasicAuth, RefundKey, TokenAuth};
 use crate::db;
 use crate::error::ServerError;
 use crate::helpers::{EpochConfig, system_time_to_iso_lossy};
@@ -199,6 +199,170 @@ fn decrypt_private_key(
     cipher
         .decrypt(&nonce, ciphertext)
         .map_err(|e| ServerError::Internal(format!("AES decryption failed: {}", e)))
+}
+
+// ---------------------------------------------------------------------------
+// Refund-token sealing
+// ---------------------------------------------------------------------------
+
+/// HKDF info for the refund-token key, domain-separated from the issuer-key
+/// wrapping key's (`eidola-issuer-key-v1`).
+const REFUND_TOKEN_KEY_INFO: &[u8] = b"eidola-refund-token-v1";
+
+/// First byte of every sealed refund token. A CBOR `RefundMsg` (a five-entry
+/// map) begins with `0xa5`, so a bare token is told apart by this byte as
+/// well as by failing to open.
+const SEALED_REFUND_VERSION: u8 = 0x01;
+
+const SEALED_REFUND_NONCE_LEN: usize = 12;
+
+/// A refund token as it is stored in `nullifier.refund_token`: AES-256-GCM
+/// under a key derived from the client's refund recovery key alone, bound to
+/// its row.
+///
+/// The CBOR `RefundMsg` carries the refund amount `t` as a plain scalar, and
+/// `t` is the hold minus the actual charge: a function of the request's
+/// content lengths. Postgres is outside the enclave and assumed adversarial,
+/// so the token is never written there in the clear, and what it is sealed
+/// under is not something the gateway keeps: the client's key arrives with
+/// the spend and again with a recovery, and lives only in enclave memory in
+/// between. The database layer accepts and returns only this type, and
+/// [`seal_refund_token`] is the only way to make one from a token.
+///
+/// Layout: `version (1) || nonce (12) || ciphertext || tag (16)`. The
+/// ciphertext is exactly as long as the CBOR, which is fixed-size (four
+/// 32-byte scalars and a 32-byte point), so the length says nothing either.
+pub struct SealedRefundToken(Vec<u8>);
+
+impl SealedRefundToken {
+    /// Wrap bytes read back from the database. Nothing is checked here:
+    /// [`open_refund_token`] is what decides whether they are a sealed token.
+    pub(crate) fn from_stored(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// The key one spend's refund is sealed under: HKDF-SHA256 with the client's
+/// refund recovery key as the input key material, salted with the issuer key
+/// id.
+///
+/// The client's key alone: it is what keeps the stored amount from anyone
+/// without the client, and nothing the operator holds is mixed in, because
+/// an operator-provided secret (`CREDENTIAL_MASTER_KEY`) protects nothing
+/// against the operator. Each spend's client key is its own, so the
+/// random-nonce count under any one AES key is one or two.
+fn derive_refund_token_key(
+    refund_key: &RefundKey,
+    issuer_key_id: &str,
+) -> zeroize::Zeroizing<[u8; 32]> {
+    let hk = hkdf::Hkdf::<Sha256>::new(Some(issuer_key_id.as_bytes()), refund_key.as_bytes());
+    let mut okm = zeroize::Zeroizing::new([0u8; 32]);
+    hk.expand(REFUND_TOKEN_KEY_INFO, okm.as_mut())
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    okm
+}
+
+/// Associated data binding a sealed token to its row: the format version,
+/// then the issuer key id (length-prefixed), then the nullifier. A token
+/// copied onto another row (another nullifier, or another key's) fails to
+/// open there.
+fn refund_token_aad(issuer_key_id: &str, nullifier: &[u8]) -> Vec<u8> {
+    let id = issuer_key_id.as_bytes();
+    let mut aad = Vec::with_capacity(1 + 2 + id.len() + nullifier.len());
+    aad.push(SEALED_REFUND_VERSION);
+    aad.extend_from_slice(&(id.len() as u16).to_be_bytes());
+    aad.extend_from_slice(id);
+    aad.extend_from_slice(nullifier);
+    aad
+}
+
+/// Seal a CBOR refund token for storage on the nullifier row
+/// `(issuer_key_id, nullifier)`.
+///
+/// The nonce is random rather than derived from the nullifier: the row is
+/// written once per spend today, but a random nonce stays safe if a path ever
+/// writes a row twice, where a derived one would repeat a nonce under a key.
+pub fn seal_refund_token(
+    refund_key: &RefundKey,
+    issuer_key_id: &str,
+    nullifier: &[u8],
+    refund_cbor: &[u8],
+) -> Result<SealedRefundToken, ServerError> {
+    let key = derive_refund_token_key(refund_key, issuer_key_id);
+    let cipher = Aes256Gcm::new_from_slice(key.as_ref())
+        .map_err(|e| ServerError::Internal(format!("AES key init failed: {}", e)))?;
+
+    let mut nonce_bytes = [0u8; SEALED_REFUND_NONCE_LEN];
+    rand_core::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
+    let aad = refund_token_aad(issuer_key_id, nullifier);
+
+    let ciphertext = cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: refund_cbor,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| ServerError::Internal("refund token sealing failed".to_string()))?;
+
+    let mut out = Vec::with_capacity(1 + SEALED_REFUND_NONCE_LEN + ciphertext.len());
+    out.push(SEALED_REFUND_VERSION);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(SealedRefundToken(out))
+}
+
+/// Open a stored refund token for the row `(issuer_key_id, nullifier)`.
+///
+/// `None` for anything that is not a token sealed for this row under this
+/// client key: a recovery presenting another key, a
+/// token moved from another row, a bare token, or tampered bytes. The caller
+/// treats that exactly as a row with no token stored.
+pub fn open_refund_token(
+    refund_key: &RefundKey,
+    issuer_key_id: &str,
+    nullifier: &[u8],
+    sealed: &SealedRefundToken,
+) -> Option<Vec<u8>> {
+    let bytes = sealed.as_bytes();
+    let (&version, rest) = bytes.split_first()?;
+    if version != SEALED_REFUND_VERSION || rest.len() < SEALED_REFUND_NONCE_LEN {
+        return None;
+    }
+    let (nonce_bytes, ciphertext) = rest.split_at(SEALED_REFUND_NONCE_LEN);
+    let nonce = Nonce::try_from(nonce_bytes).ok()?;
+    let key = derive_refund_token_key(refund_key, issuer_key_id);
+    let cipher = Aes256Gcm::new_from_slice(key.as_ref()).ok()?;
+    let aad = refund_token_aad(issuer_key_id, nullifier);
+    cipher
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
+        .ok()
+}
+
+/// Seal a spend's refund under its client's refund recovery key and store it
+/// on the spend's nullifier row: the one way a refund reaches Postgres, for
+/// every path that signs one ([`sign_refund`]).
+pub async fn store_sealed_refund(
+    state: &AppState,
+    act: &crate::auth::ActSpend,
+    issuer_key_id: &str,
+    refund_cbor: &[u8],
+) -> Result<(), ServerError> {
+    let nullifier = act.spend_proof.nullifier().as_bytes().to_vec();
+    let sealed = seal_refund_token(&act.refund_key, issuer_key_id, &nullifier, refund_cbor)?;
+    db::store_refund_token(&state.db_pool, issuer_key_id, &nullifier, &sealed).await
 }
 
 // ---------------------------------------------------------------------------
@@ -891,14 +1055,22 @@ pub struct RefundRecoveryResponse {
 ///
 /// In both cases, the client gets a refund token it can combine with its
 /// local `PreRefund` state to reconstruct a credential.
+///
+/// The stored token is sealed under the refund recovery key the client sent
+/// with the spend, so recovery must present the same key: a different one
+/// opens nothing and is answered as no token stored (404).
 #[utoipa::path(
     post,
     path = "/v1/credentials/refund",
     tag = "Unlinked",
+    params(
+        ("x-eidola-refund-key" = String, Header, description = "The refund recovery key sent with the spend: 64 lowercase hex digits")
+    ),
     responses(
         (status = 200, description = "Refund token recovered or issued", body = RefundRecoveryResponse),
+        (status = 400, description = "Missing or malformed refund recovery key", body = crate::types::ErrorResponse),
         (status = 401, description = "Invalid spend proof", body = crate::types::ErrorResponse),
-        (status = 404, description = "Nullifier found but refund token not yet available", body = crate::types::ErrorResponse),
+        (status = 404, description = "Nullifier found but no refund token is available for this key yet", body = crate::types::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::types::ErrorResponse)
     )
 )]
@@ -946,10 +1118,21 @@ pub async fn recover_refund(
     let nullifier_bytes = act.spend_proof.nullifier().as_bytes().to_vec();
 
     // Check if the nullifier was already recorded (original request arrived).
-    if let Some(refund_cbor) =
-        db::get_refund_token(&state.db_pool, &key_id, &nullifier_bytes).await?
-    {
-        // Nullifier exists and has a stored refund token — return it.
+    if let Some(sealed) = db::get_refund_token(&state.db_pool, &key_id, &nullifier_bytes).await? {
+        // Nullifier exists and has a stored refund token — return it. A
+        // token that does not open for this row under the presented refund
+        // key (another key, moved from another row, or altered) is no token:
+        // the row exists, so this is the same permanent 404 a client gets
+        // when the best-effort store never happened, and the client settles
+        // the hold the way it does then.
+        let Some(refund_cbor) =
+            open_refund_token(&act.refund_key, &key_id, &nullifier_bytes, &sealed)
+        else {
+            warn!("stored refund token did not open; answering as if none were stored");
+            return Err(ServerError::NotFound {
+                message: "no refund token is stored for this credential".to_string(),
+            });
+        };
         return Ok(Json(RefundRecoveryResponse {
             refund: RefundInfo {
                 refund: URL_SAFE_NO_PAD.encode(&refund_cbor),
@@ -1000,8 +1183,8 @@ pub async fn recover_refund(
         sign_refund(&cache, &act, charge_credits, SystemTime::now())?
     };
 
-    // Store the refund token for idempotency.
-    db::store_refund_token(&state.db_pool, &key_id, &nullifier_bytes, &refund_cbor).await?;
+    // Store the refund token for idempotency, sealed (it carries the amount).
+    store_sealed_refund(&state, &act, &key_id, &refund_cbor).await?;
 
     Ok(Json(RefundRecoveryResponse {
         refund: RefundInfo {
@@ -1180,6 +1363,7 @@ mod tests {
             challenge_digest: compute_challenge_digest(),
             issuer_key_hash: key.key_hash,
             spend_proof,
+            refund_key: RefundKey::from_bytes([0x11; 32]),
         };
         (act, pre_refund)
     }
@@ -1449,6 +1633,446 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    // --- Refund-token sealing ---
+
+    use anonymous_credit_tokens::{PreRefund, Refund, SpendProof};
+
+    /// A real refund for a real spend: a credential of `credits`, spending
+    /// `charge` and refunding `t`. Returns what the client holds (the spend
+    /// proof, its `PreRefund`) and the issuer's CBOR refund message.
+    fn refund_fixture(
+        credits: u128,
+        charge: u128,
+        t: u128,
+    ) -> (PrivateKey, Params, SpendProof<128>, PreRefund, Vec<u8>) {
+        let params = Params::new(DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION);
+        let sk = PrivateKey::random(OsRng);
+        let pre = PreIssuance::random(OsRng);
+        let request = pre.request(&params, OsRng);
+        let response = sk
+            .issue::<128>(
+                &params,
+                &request,
+                credit_to_scalar::<128>(credits).unwrap(),
+                Scalar::ZERO,
+                OsRng,
+            )
+            .unwrap();
+        let token = pre
+            .to_credit_token::<128>(&params, sk.public(), &request, &response)
+            .unwrap();
+        let (proof, prerefund) = token
+            .prove_spend::<128>(&params, credit_to_scalar::<128>(charge).unwrap(), OsRng)
+            .unwrap();
+        let refund = sk
+            .refund(&params, &proof, credit_to_scalar::<128>(t).unwrap(), OsRng)
+            .unwrap();
+        let cbor = refund.to_cbor().unwrap();
+        (sk, params, proof, prerefund, cbor)
+    }
+
+    const KEY_ID: &str = "4f1c0d5e2a7b9c3d6e8f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d";
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    fn client_key(fill: u8) -> RefundKey {
+        RefundKey::from_bytes([fill; 32])
+    }
+
+    #[test]
+    fn a_sealed_refund_token_opens_to_the_token_the_client_completes() {
+        let ck = client_key(7);
+        let (sk, params, proof, prerefund, cbor) = refund_fixture(1000, 300, 117);
+        let nullifier = proof.nullifier().as_bytes().to_vec();
+
+        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, &cbor).unwrap();
+        let opened = open_refund_token(&ck, KEY_ID, &nullifier, &sealed).unwrap();
+        assert_eq!(opened, cbor);
+
+        // What recovery hands back still completes the client's credential.
+        let refund = Refund::from_cbor(&opened).unwrap();
+        let next = prerefund
+            .to_credit_token(&params, &proof, &refund, sk.public())
+            .unwrap();
+        assert_eq!(
+            scalar_to_credit::<128>(&next.credits()).unwrap(),
+            1000 - 300 + 117
+        );
+    }
+
+    #[test]
+    fn a_sealed_refund_token_opens_only_on_its_own_row() {
+        let ck = client_key(7);
+        let (_, _, proof, _, cbor) = refund_fixture(1000, 300, 117);
+        let nullifier = proof.nullifier().as_bytes().to_vec();
+        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, &cbor).unwrap();
+
+        // Moved to another nullifier under the same key.
+        let (_, _, other_proof, _, _) = refund_fixture(1000, 300, 117);
+        let other_nullifier = other_proof.nullifier().as_bytes().to_vec();
+        assert!(open_refund_token(&ck, KEY_ID, &other_nullifier, &sealed).is_none());
+
+        // Moved to the same nullifier value under another issuer key.
+        let other_key = "0".repeat(64);
+        assert!(open_refund_token(&ck, &other_key, &nullifier, &sealed).is_none());
+
+        // Any single altered byte.
+        for i in 0..sealed.as_bytes().len() {
+            let mut bytes = sealed.as_bytes().to_vec();
+            bytes[i] ^= 0x01;
+            let altered = SealedRefundToken::from_stored(bytes);
+            assert!(
+                open_refund_token(&ck, KEY_ID, &nullifier, &altered).is_none(),
+                "byte {i} altered and the token still opened"
+            );
+        }
+
+        // A row written before tokens were sealed holds the bare CBOR.
+        assert_eq!(cbor[0], 0xa5);
+        let legacy = SealedRefundToken::from_stored(cbor.clone());
+        assert!(open_refund_token(&ck, KEY_ID, &nullifier, &legacy).is_none());
+        let empty = SealedRefundToken::from_stored(Vec::new());
+        assert!(open_refund_token(&ck, KEY_ID, &nullifier, &empty).is_none());
+    }
+
+    #[test]
+    fn a_sealed_refund_token_carries_no_plaintext_amount() {
+        let ck = client_key(7);
+        let t: u128 = 0x0123_4567_89ab_cdef_0011_2233_4455_6677;
+        let (_, _, proof, _, cbor) = refund_fixture(u128::MAX >> 1, t, t);
+        let nullifier = proof.nullifier().as_bytes().to_vec();
+        let t_bytes = credit_to_scalar::<128>(t).unwrap().to_bytes();
+        // The bare token does carry the amount: that is what is being hidden.
+        assert!(contains(&cbor, &t_bytes));
+
+        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, &cbor).unwrap();
+        let bytes = sealed.as_bytes();
+        assert!(!contains(bytes, &t_bytes));
+        // Nor the amount's own bytes, nor any run of the CBOR.
+        assert!(!contains(bytes, &t.to_le_bytes()));
+        assert!(!cbor.windows(12).any(|w| contains(bytes, w)));
+
+        // And the length is the same whatever the amount.
+        let (_, _, p0, _, c0) = refund_fixture(1000, 300, 0);
+        let s0 = seal_refund_token(&ck, KEY_ID, p0.nullifier().as_bytes(), &c0).unwrap();
+        assert_eq!(s0.as_bytes().len(), bytes.len());
+        assert_eq!(bytes.len(), 1 + 12 + cbor.len() + 16);
+    }
+
+    #[test]
+    fn the_refund_token_key_is_its_own() {
+        let ck = client_key(7);
+        // Not the issuer-key wrapping key's derivation over the same bytes...
+        assert_ne!(
+            *derive_refund_token_key(&ck, KEY_ID),
+            derive_key_encryption_key(ck.as_bytes(), KEY_ID)
+        );
+        // ...and not another issuer key's refund-token key...
+        assert_ne!(
+            *derive_refund_token_key(&ck, KEY_ID),
+            *derive_refund_token_key(&ck, &"0".repeat(64))
+        );
+        // ...and not another client's.
+        assert_ne!(
+            *derive_refund_token_key(&ck, KEY_ID),
+            *derive_refund_token_key(&client_key(8), KEY_ID)
+        );
+    }
+
+    #[test]
+    fn a_sealed_refund_token_opens_only_with_its_clients_key() {
+        let ck = client_key(7);
+        let (_, _, proof, _, cbor) = refund_fixture(1000, 300, 117);
+        let nullifier = proof.nullifier().as_bytes().to_vec();
+        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, &cbor).unwrap();
+
+        // A recovery presenting any other key opens nothing.
+        for other in [client_key(8), client_key(0)] {
+            assert!(open_refund_token(&other, KEY_ID, &nullifier, &sealed).is_none());
+        }
+        let mut near = [7u8; 32];
+        near[31] ^= 0x01;
+        assert!(
+            open_refund_token(&RefundKey::from_bytes(near), KEY_ID, &nullifier, &sealed).is_none()
+        );
+    }
+
+    /// A spend arrives with its refund recovery key or is refused by the
+    /// extractor, before the handler that records the nullifier runs.
+    #[tokio::test]
+    async fn a_spend_without_its_refund_key_is_refused_before_it_is_taken() {
+        use axum::extract::FromRequestParts;
+        use eidola_common::refund_key::{REFUND_KEY_HEADER, encode_refund_key};
+
+        let (_, _, proof, _, _) = refund_fixture(1000, 300, 0);
+        let mut token = Vec::new();
+        token.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+        token.extend_from_slice(&compute_challenge_digest());
+        token.extend_from_slice(&[9u8; 32]);
+        token.extend_from_slice(&proof.to_cbor().unwrap());
+        let authorization = format!("PrivateToken token=\"{}\"", URL_SAFE_NO_PAD.encode(&token));
+        let key = [0x5au8; 32];
+        let good = encode_refund_key(&key);
+        let good = std::str::from_utf8(&good).unwrap().to_string();
+
+        let extract = |refund_key: Option<String>| {
+            let authorization = authorization.clone();
+            async move {
+                let mut request =
+                    axum::http::Request::builder().header("authorization", authorization);
+                if let Some(value) = refund_key {
+                    request = request.header(REFUND_KEY_HEADER, value);
+                }
+                let (mut parts, ()) = request.body(()).unwrap().into_parts();
+                TokenAuth::from_request_parts(&mut parts, &()).await
+            }
+        };
+
+        for refused in [
+            None,
+            Some(String::new()),
+            Some(good.to_ascii_uppercase()),
+            Some(good[..63].to_string()),
+            Some(format!("{good}0")),
+        ] {
+            match extract(refused).await {
+                Err(ServerError::BadRequest { .. }) => {}
+                Err(e) => panic!("expected 400, got {e:?}"),
+                Ok(_) => panic!("a spend without a well-formed refund key was accepted"),
+            }
+        }
+        let TokenAuth(act) = extract(Some(good)).await.unwrap();
+        assert_eq!(act.refund_key.as_bytes(), &key);
+        assert_eq!(format!("{:?}", act.refund_key), "RefundKey(<redacted>)");
+    }
+
+    /// What anyone holds without the client: the stored row (version, nonce,
+    /// ciphertext) and the public facts that address it (the issuer key id,
+    /// the nullifier). The key is derived from the client's key alone, so
+    /// nothing built from those opens the row; only the client's key does.
+    #[test]
+    fn the_stored_row_alone_without_the_client_key_opens_nothing() {
+        let random_key = || {
+            let mut bytes = [0u8; 32];
+            OsRng.fill_bytes(&mut bytes);
+            RefundKey::from_bytes(bytes)
+        };
+        let ck = random_key();
+        let (_, _, proof, _, cbor) = refund_fixture(1000, 300, 117);
+        let nullifier = proof.nullifier().as_bytes().to_vec();
+        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, &cbor).unwrap();
+        let row = sealed.as_bytes();
+
+        let as_key = |bytes: &[u8]| {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&Sha256::digest(bytes));
+            RefundKey::from_bytes(key)
+        };
+        let guesses = [
+            random_key(),
+            as_key(&nullifier),
+            as_key(KEY_ID.as_bytes()),
+            as_key(&row[1..1 + SEALED_REFUND_NONCE_LEN]),
+            as_key(row),
+        ];
+        for guess in &guesses {
+            assert!(open_refund_token(guess, KEY_ID, &nullifier, &sealed).is_none());
+        }
+        assert_eq!(
+            open_refund_token(&ck, KEY_ID, &nullifier, &sealed).as_deref(),
+            Some(cbor.as_slice())
+        );
+    }
+
+    /// The recovery endpoint end to end against Postgres: it stores only a
+    /// sealed token, returns the same token on the next ask with the same
+    /// client key, and answers another client key, a token moved from another
+    /// row, or a bare token, as no token at all.
+    ///
+    /// `DATABASE_URL` and `CREDENTIAL_MASTER_KEY` as `just test-integration`
+    /// sets them. Run on a thread with a larger stack: an unoptimized build
+    /// holds several 128-bit spend proofs in the handler's future at once,
+    /// which overflows a test thread's default 2 MiB.
+    #[test]
+    #[ignore]
+    fn recovery_stores_only_sealed_tokens_and_still_returns_the_refund() {
+        std::thread::Builder::new()
+            .stack_size(16 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(recovery_stores_only_sealed_tokens())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn recovery_stores_only_sealed_tokens() {
+        use crate::auth::{ActSpend, TokenAuth};
+        use crate::backend::Catalog;
+
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let pool = db::create_pool(
+            &std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
+            None,
+            None,
+        )
+        .unwrap();
+        let master_key: [u8; 32] =
+            hex::decode(std::env::var("CREDENTIAL_MASTER_KEY").unwrap_or_else(|_| "00".repeat(32)))
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let cache: KeyCache = Arc::new(RwLock::new(HashMap::new()));
+        let epoch = EpochConfig::default();
+        let key_hash = ensure_keys(&cache, &master_key, &pool, &epoch)
+            .await
+            .unwrap();
+        let state = AppState::new(
+            Catalog::new(None),
+            None,
+            pool.clone(),
+            None,
+            None,
+            master_key,
+            cache.clone(),
+            epoch,
+        );
+        let key_id = hex::encode(key_hash);
+
+        // A client's credential under the current key, and a spend of it.
+        let spend = |credits: u128, charge: u128| {
+            let cache = cache.clone();
+            async move {
+                let cache = cache.read().await;
+                let key = cache.get(&key_hash).unwrap();
+                let pre = PreIssuance::random(OsRng);
+                let request = pre.request(&key.params, OsRng);
+                let response = key
+                    .secret_key
+                    .issue::<128>(
+                        &key.params,
+                        &request,
+                        credit_to_scalar::<128>(credits).unwrap(),
+                        key.request_context_scalar,
+                        OsRng,
+                    )
+                    .unwrap();
+                let token = pre
+                    .to_credit_token::<128>(
+                        &key.params,
+                        key.secret_key.public(),
+                        &request,
+                        &response,
+                    )
+                    .unwrap();
+                token
+                    .prove_spend::<128>(
+                        &key.params,
+                        credit_to_scalar::<128>(charge).unwrap(),
+                        OsRng,
+                    )
+                    .unwrap()
+            }
+        };
+        let recover = |proof: SpendProof<128>, refund_key: RefundKey| {
+            let state = state.clone();
+            async move {
+                recover_refund(
+                    TokenAuth(ActSpend {
+                        challenge_digest: compute_challenge_digest(),
+                        issuer_key_hash: key_hash,
+                        spend_proof: proof,
+                        refund_key,
+                    }),
+                    State(state),
+                )
+                .await
+                .map(|Json(r)| r.refund.refund)
+            }
+        };
+        let client = pool.get().await.unwrap();
+        let stored_row = async |nullifier: &[u8]| -> Vec<u8> {
+            client
+                .query_one(
+                    "SELECT refund_token FROM nullifier \
+                     WHERE issuer_key_id = $1 AND value = $2",
+                    &[&key_id, &nullifier],
+                )
+                .await
+                .unwrap()
+                .get::<_, Option<Vec<u8>>>("refund_token")
+                .unwrap()
+        };
+
+        let (proof, prerefund) = spend(1000, 300).await;
+        let nullifier = proof.nullifier().as_bytes().to_vec();
+        let ck = client_key(7);
+
+        // The original request never arrived: a full refund is issued...
+        let first = recover(proof.clone(), ck.clone()).await.unwrap();
+        let first_cbor = URL_SAFE_NO_PAD.decode(&first).unwrap();
+        // ...and what Postgres holds is the sealed token, not the CBOR.
+        let row = stored_row(&nullifier).await;
+        assert_eq!(row[0], SEALED_REFUND_VERSION);
+        let t_bytes = credit_to_scalar::<128>(300).unwrap().to_bytes();
+        assert!(contains(&first_cbor, &t_bytes));
+        assert!(!contains(&row, &t_bytes));
+        assert!(!first_cbor.windows(12).any(|w| contains(&row, w)));
+
+        // Asked with another key, nothing comes back, and the row is untouched.
+        match recover(proof.clone(), client_key(8)).await {
+            Err(ServerError::NotFound { .. }) => {}
+            Err(e) => panic!("expected 404, got {e:?}"),
+            Ok(_) => panic!("a stored token opened under another client's key"),
+        }
+        assert_eq!(stored_row(&nullifier).await, row);
+
+        // Asked again with its own key, the stored token comes back and
+        // completes the credential.
+        let second = recover(proof.clone(), ck.clone()).await.unwrap();
+        assert_eq!(second, first);
+        let refund = Refund::from_cbor(&URL_SAFE_NO_PAD.decode(&second).unwrap()).unwrap();
+        let next = {
+            let cache = cache.read().await;
+            let key = cache.get(&key_hash).unwrap();
+            prerefund
+                .to_credit_token(&key.params, &proof, &refund, key.secret_key.public())
+                .unwrap()
+        };
+        assert_eq!(scalar_to_credit::<128>(&next.credits()).unwrap(), 1000);
+
+        // Another spend whose row exists: the first row's sealed token copied
+        // onto it, or a plaintext token, recovers nothing.
+        let (other, _) = spend(1000, 50).await;
+        let other_nullifier = other.nullifier().as_bytes().to_vec();
+        assert!(
+            db::record_nullifier(&pool, &key_id, &other_nullifier)
+                .await
+                .unwrap()
+        );
+        for planted in [row.clone(), first_cbor.clone()] {
+            client
+                .execute(
+                    "UPDATE nullifier SET refund_token = $3 \
+                     WHERE issuer_key_id = $1 AND value = $2",
+                    &[&key_id, &other_nullifier, &planted],
+                )
+                .await
+                .unwrap();
+            match recover(other.clone(), ck.clone()).await {
+                Err(ServerError::NotFound { .. }) => {}
+                Err(e) => panic!("expected 404, got {e:?}"),
+                Ok(_) => panic!("a token planted on another row was returned"),
+            }
+        }
     }
 
     /// Refund recovery verifies the presented proof before it reads or writes

@@ -24,10 +24,10 @@
 mod chat_harness;
 
 use chat_harness::{
-    ChatBehavior, DEFAULT_AGENT_LABEL, FLAT_MODEL, FLAT_PRICE, HUMAN_LABEL, MODEL, MockConfig,
-    MockServer, RefundMode, Stamps, THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE, TRAILING_BLOCK_NOTE,
-    flat_messages, map_entry, roster, system_message, system_message_with, thread_map, trailing,
-    with_account,
+    ChatBehavior, DEFAULT_AGENT_LABEL, FLAT_MODEL, FLAT_PRICE, HUMAN_LABEL, KeyWindow, MODEL,
+    MockConfig, MockServer, RefundMode, Stamps, THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE,
+    TRAILING_BLOCK_NOTE, flat_messages, map_entry, roster, system_message, system_message_with,
+    thread_map, trailing, with_account,
 };
 use eidola_app_core::changes::{Change, ChangeEvent};
 use eidola_app_core::error::AppError;
@@ -428,6 +428,42 @@ fn blocking_chat_recovers_refund_when_no_inline_refund() {
         assert!(
             !creds.is_empty(),
             "a recovered successor credential should be active"
+        );
+    });
+}
+
+/// **Recovery opens the stored refund only with the key the spend carried.**
+/// The server seals the refund it stores under the spend's refund recovery
+/// key and refuses a spend without one; the mock holds both rules, answering
+/// a recovery that presents any other key with the real endpoint's 404. So a
+/// successor here means the spend sent a key and the recovery rebuilt the
+/// same one.
+#[test]
+fn recovery_presents_the_refund_key_its_spend_carried() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat should succeed");
+
+        assert_eq!(mock.chat_hits(), 1);
+        assert_eq!(mock.keyed_spends(), 1, "the spend carried its refund key");
+        assert!(
+            mock.refund_hits() >= 1,
+            "no inline refund, so recovery was asked"
+        );
+        let creds = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert!(
+            !creds.is_empty(),
+            "recovery presented the spend's own key, so the stored refund opened"
         );
     });
 }
@@ -967,6 +1003,184 @@ fn an_issuance_that_could_mark_its_credential_is_refused() {
             assert!(wallet.is_empty(), "{what}: stored {wallet:?}");
         });
     }
+}
+
+// ===========================================================================
+// Credential lifetime: bounded by the key's acceptance deadline
+// ===========================================================================
+
+const WEEK_SECS: i64 = 7 * 86_400;
+
+fn now_unix_secs() -> i64 {
+    eidola_app_core::now_ms().div_euclid(1_000)
+}
+
+/// Sleep until the wall clock is safely past `secs` (unix seconds). The
+/// lifecycle view reads the database's own clock, so a deadline is crossed by
+/// waiting for it rather than by moving a test clock.
+fn sleep_past_unix_secs(secs: i64) {
+    let target_ms = secs * 1_000 + 300;
+    let wait = target_ms - eidola_app_core::now_ms();
+    if wait > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(wait as u64));
+    }
+}
+
+fn margin_secs() -> i64 {
+    eidola_app_core::CREDENTIAL_SPEND_MARGIN.as_secs() as i64
+}
+
+fn credential_states(core: &AppCore) -> Vec<(String, i64)> {
+    core.runtime()
+        .block_on(core.wallet_lifecycle())
+        .expect("lifecycle")
+        .into_iter()
+        .map(|c| (c.state, c.generation))
+        .collect()
+}
+
+/// Allocations the wallet has seen: every allocation mints a generation-0
+/// credential, and every spend's successor is a later generation.
+fn allocations(core: &AppCore) -> usize {
+    credential_states(core)
+        .iter()
+        .filter(|(_, generation)| *generation == 0)
+        .count()
+}
+
+/// A credential issued moments before its key stops *issuing* is still
+/// spendable after that moment: the server accepts it for a further epoch,
+/// and the client must not strand the balance it debited at issuance.
+#[test]
+fn a_credential_issued_just_before_its_key_stops_issuing_stays_spendable() {
+    run(|| {
+        let now = now_unix_secs();
+        let issue_until = now + 2;
+        let (mock, core, _dir) = setup(MockConfig {
+            key_window: Some(KeyWindow::from_unix_secs(
+                now - WEEK_SECS,
+                issue_until,
+                issue_until + WEEK_SECS,
+            )),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("first".into(), MODEL.into(), None))
+            .expect("the first turn provisions and spends");
+        assert_eq!(allocations(&core), 1);
+
+        sleep_past_unix_secs(issue_until);
+        assert!(
+            credential_states(&core)
+                .iter()
+                .any(|(state, _)| state == "active"),
+            "past issue_until but inside accept_until the change stays spendable: {:?}",
+            credential_states(&core)
+        );
+
+        core.runtime()
+            .block_on(core.chat("second".into(), MODEL.into(), None))
+            .expect("the second turn spends the change");
+        assert_eq!(mock.chat_hits(), 2);
+        assert_eq!(
+            allocations(&core),
+            1,
+            "the second turn must spend the existing credential, not allocate again"
+        );
+    });
+}
+
+/// The spendable life does end — `CREDENTIAL_SPEND_MARGIN` before the key's
+/// acceptance deadline. Past it the credential reads `expired`, and the
+/// provisioning queue no longer picks it: the next turn goes to allocate a
+/// fresh credential instead (and here finds no key still issuing, so fails
+/// before any completion request).
+#[test]
+fn a_credential_lapses_its_spend_margin_before_the_keys_acceptance_deadline() {
+    run(|| {
+        let now = now_unix_secs();
+        let spend_until = now + 3;
+        let (mock, core, _dir) = setup(MockConfig {
+            key_window: Some(KeyWindow::from_unix_secs(
+                now - WEEK_SECS,
+                now + 2,
+                spend_until + margin_secs(),
+            )),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("first".into(), MODEL.into(), None))
+            .expect("the first turn provisions and spends");
+        assert!(
+            credential_states(&core)
+                .iter()
+                .any(|(state, _)| state == "active"),
+            "before the spend deadline the change is spendable"
+        );
+
+        sleep_past_unix_secs(spend_until);
+        // The unspent change lapses; the settled spend keeps saying what it was
+        // until the key's acceptance deadline itself.
+        let mut states = credential_states(&core);
+        states.sort_by_key(|(_, generation)| *generation);
+        assert_eq!(
+            states,
+            vec![("spent".to_string(), 0), ("expired".to_string(), 1)],
+            "past accept_until less the margin, no credential under the key is spendable"
+        );
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("second".into(), MODEL.into(), None))
+            .expect_err("no spendable credential and no key still issuing");
+        assert!(matches!(err, AppError::Credential { .. }), "got {err:?}");
+        assert_eq!(
+            mock.chat_hits(),
+            1,
+            "the lapsed credential must never be spent"
+        );
+    });
+}
+
+/// The account is debited at issuance, so a credential that would be born
+/// already past its spend deadline is refused before the issuance request: a
+/// server advertising an acceptance window shorter than the margin gets no
+/// allocation, and the turn fails having written and announced nothing of
+/// the wallet.
+#[test]
+fn issuance_is_refused_when_the_key_could_not_be_spent_under() {
+    run(|| {
+        let now = now_unix_secs();
+        let (mock, core, _dir) = setup(MockConfig {
+            key_window: Some(KeyWindow::from_unix_secs(
+                now - WEEK_SECS,
+                now + 30,
+                now + margin_secs() - 60,
+            )),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect_err("issuance under a key about to lapse is refused");
+        assert!(matches!(err, AppError::Credential { .. }), "got {err:?}");
+        assert_eq!(mock.chat_hits(), 0);
+        assert!(credential_states(&core).is_empty(), "nothing was issued");
+
+        let changes = drain(&mut rx);
+        assert!(
+            !changes.contains(&Change::Wallet) && !changes.contains(&Change::Account),
+            "a refused issuance announces no wallet or account write; got {changes:?}"
+        );
+        assert!(changes.contains(&Change::SpaceIndex), "the post survives");
+    });
 }
 
 // ===========================================================================

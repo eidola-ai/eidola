@@ -43,6 +43,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use eidola_common::refund_key::REFUND_KEY_HEADER;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -269,6 +270,10 @@ fn mint_traceparent() -> String {
 ///   own key. **Never the downstream's.** A downstream `Authorization`
 ///   authenticates the tool *to the proxy* and is consumed there; the two
 ///   credentials share a header name and nothing else.
+/// - **`x-eidola-refund-key`** — with the ACT only: the spend's refund
+///   recovery key (`eidola_common::refund_key`), which the server seals the
+///   refund it stores under. A secret like the credential, and redacted from
+///   the Record the same way.
 /// - **`traceparent`** — only when [`TraceUpstream::On`], and then freshly
 ///   minted here. See [`TraceUpstream`].
 ///
@@ -286,8 +291,35 @@ fn mint_traceparent() -> String {
 pub struct UpstreamHeaders {
     /// `Some` iff the route carries a credential.
     pub authorization: Option<String>,
+    /// `Some` iff the credential is an ACT spend: its refund recovery key, as
+    /// the header's wire form.
+    pub refund_key: Option<RefundKeyText>,
     pub streaming: bool,
     pub trace: TraceUpstream,
+}
+
+/// A refund recovery key's header value, held apart from `String` so that
+/// `Debug` on the header description never prints it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RefundKeyText(String);
+
+impl RefundKeyText {
+    pub fn new(key: &[u8; 32]) -> Self {
+        let text = eidola_common::refund_key::encode_refund_key(key);
+        Self(String::from_utf8(text.to_vec()).expect("lowercase hex is UTF-8"))
+    }
+}
+
+impl std::fmt::Debug for RefundKeyText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RefundKeyText(<redacted>)")
+    }
+}
+
+impl Drop for RefundKeyText {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
 }
 
 /// The header set actually put on **one attempt's** wire.
@@ -300,8 +332,45 @@ pub struct UpstreamHeaders {
 /// attempt's headers are therefore materialised into this, and both the request
 /// and the row read that one value; `for_record` lives here rather than on the
 /// description because redacting *a set* is what the Record actually needs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// **Its secrets stay secret past materialization.** Two values here are
+/// secrets ([`is_secret_header`]): the credential, and an ACT spend's refund
+/// recovery key. One predicate decides both what the Record redacts, what
+/// `Debug` prints, and which header values the request marks sensitive (so
+/// the built request's own `Debug` hides them too), and the secret values are
+/// zeroed when the set is dropped.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SentHeaders(Vec<(&'static str, String)>);
+
+/// Whether a header this app sends upstream carries a secret: the credential
+/// (`Authorization`: a spend proof or an API key) or the refund recovery key.
+fn is_secret_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("Authorization") || name.eq_ignore_ascii_case(REFUND_KEY_HEADER)
+}
+
+impl std::fmt::Debug for SentHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut list = f.debug_list();
+        for (name, value) in &self.0 {
+            if is_secret_header(name) {
+                list.entry(&(name, "<redacted>"));
+            } else {
+                list.entry(&(name, value));
+            }
+        }
+        list.finish()
+    }
+}
+
+impl Drop for SentHeaders {
+    fn drop(&mut self) {
+        for (name, value) in &mut self.0 {
+            if is_secret_header(name) {
+                zeroize::Zeroize::zeroize(value);
+            }
+        }
+    }
+}
 
 impl SentHeaders {
     /// The pairs, in the order they are set.
@@ -310,12 +379,14 @@ impl SentHeaders {
     }
 
     /// What the Record shows about this request's headers: every name, and
-    /// every value **except** the credential, which is replaced by its scheme.
+    /// every value **except** the secrets: the credential, which is replaced
+    /// by its scheme, and the refund recovery key, replaced outright.
     ///
     /// The names are the evidence that the allowlist did its job — a reader
     /// can see for themselves that nothing of their tool's travelled. The
-    /// value of `Authorization` is a spend proof or an API key and is the one
-    /// thing that must not land in a durable local log.
+    /// value of `Authorization` is a spend proof or an API key, and the refund
+    /// key opens the stored copy of the spend's refund; neither may land in a
+    /// durable local log.
     pub fn for_record(&self) -> String {
         let redacted: Vec<Value> = self
             .0
@@ -326,6 +397,8 @@ impl SentHeaders {
                         .split_once(' ')
                         .map(|(scheme, _)| format!("{scheme} <redacted>"))
                         .unwrap_or_else(|| "<redacted>".to_string())
+                } else if is_secret_header(name) {
+                    "<redacted>".to_string()
                 } else {
                     value.clone()
                 };
@@ -364,6 +437,9 @@ impl UpstreamHeaders {
         ));
         if let Some(auth) = &self.authorization {
             pairs.push(("Authorization", auth.clone()));
+        }
+        if let Some(key) = &self.refund_key {
+            pairs.push((REFUND_KEY_HEADER, key.0.clone()));
         }
         if self.trace == TraceUpstream::On {
             pairs.push(("traceparent", mint_traceparent()));
@@ -1345,6 +1421,7 @@ impl Inner {
         // set being a value rather than a recipe.
         let headers = UpstreamHeaders {
             authorization: auth_value.clone(),
+            refund_key: spend.as_ref().map(|s| RefundKeyText::new(&s.refund_key)),
             streaming: false,
             trace: self.upstream_tracing(),
         }
@@ -1580,6 +1657,7 @@ impl Inner {
         // set being a value rather than a recipe.
         let headers = UpstreamHeaders {
             authorization: auth_value.clone(),
+            refund_key: spend.as_ref().map(|s| RefundKeyText::new(&s.refund_key)),
             streaming: true,
             trace: self.upstream_tracing(),
         }
@@ -1990,9 +2068,11 @@ impl Inner {
         let refund_obj = match inline {
             Some(object) => Some(object.clone()),
             None => match auth_value {
-                Some(auth) => recover_refund(&route.client, &route.base_url, auth)
-                    .await
-                    .ok(),
+                Some(auth) => {
+                    recover_refund(&route.client, &route.base_url, auth, &spend.refund_key)
+                        .await
+                        .ok()
+                }
                 None => None,
             },
         };
@@ -2094,10 +2174,11 @@ fn build_upstream_request(
                 message: format!("`{name}` is not a usable header name"),
             }
         })?;
-        let value =
+        let mut value =
             reqwest::header::HeaderValue::from_str(value).map_err(|_| AppError::Config {
                 message: format!("`{name}` carries a value that cannot travel in a header"),
             })?;
+        value.set_sensitive(is_secret_header(name.as_str()));
         out.insert(name, value);
     }
     Ok(request)
@@ -2338,6 +2419,7 @@ mod tests {
     fn headers(auth: Option<&str>, streaming: bool, trace: TraceUpstream) -> UpstreamHeaders {
         UpstreamHeaders {
             authorization: auth.map(str::to_string),
+            refund_key: None,
             streaming,
             trace,
         }
@@ -2428,6 +2510,59 @@ mod tests {
             "a spend proof must not land in a durable local log: {recorded}"
         );
         assert!(recorded.contains("text/event-stream"), "{recorded}");
+    }
+
+    #[test]
+    fn an_act_spend_carries_its_refund_key_and_the_record_never_shows_it() {
+        let key = [0x3cu8; 32];
+        let spend = UpstreamHeaders {
+            refund_key: Some(RefundKeyText::new(&key)),
+            ..headers(Some("PrivateToken token=\"x\""), false, TraceUpstream::Off)
+        };
+        let sent = spend.materialize();
+        let text =
+            String::from_utf8(eidola_common::refund_key::encode_refund_key(&key).to_vec()).unwrap();
+        assert_eq!(
+            sent.pairs()
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            vec!["Content-Type", "Accept", "Authorization", REFUND_KEY_HEADER],
+        );
+        assert!(sent.pairs().iter().any(|(_, value)| *value == text));
+        let recorded = sent.for_record();
+        assert!(recorded.contains(REFUND_KEY_HEADER), "{recorded}");
+        assert!(!recorded.contains(&text), "{recorded}");
+        assert!(!format!("{spend:?}").contains(&text));
+        // Materialized, the set still prints no secret...
+        let shown = format!("{sent:?}");
+        assert!(shown.contains(REFUND_KEY_HEADER), "{shown}");
+        assert!(!shown.contains(&text), "{shown}");
+        assert!(!shown.contains("token="), "{shown}");
+        // ...and neither does the request built from it, whose secret values
+        // are marked sensitive while still travelling as sent.
+        let route = route_with_pending_attestation("eidola", "http://127.0.0.1:9");
+        let request = build_upstream_request(&route, &serde_json::json!({}), &sent).unwrap();
+        let built = format!("{request:?}");
+        assert!(!built.contains(&text), "{built}");
+        assert!(!built.contains("token="), "{built}");
+        let key_value = request.headers().get(REFUND_KEY_HEADER).unwrap();
+        assert!(key_value.is_sensitive());
+        assert_eq!(key_value.as_bytes(), text.as_bytes());
+        assert!(
+            request
+                .headers()
+                .get("authorization")
+                .unwrap()
+                .is_sensitive()
+        );
+        assert!(
+            !request
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .is_sensitive()
+        );
     }
 
     #[test]

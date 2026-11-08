@@ -636,6 +636,32 @@ pub struct MockConfig {
     /// Credits added to what the client asked for at issuance. Zero issues
     /// exactly the requested amount.
     pub issuance_extra_credits: i64,
+    /// The current issuer key's `(issue_from, issue_until, accept_until)` as
+    /// `GET /v1/keys` advertises them. `None` — the default — is a window
+    /// spanning years, so no test written before key deadlines mattered can
+    /// meet one. A test about a key's deadlines sets them relative to now.
+    pub key_window: Option<KeyWindow>,
+}
+
+/// An issuer key's advertised window, as the ISO 8601 strings `/v1/keys`
+/// carries (see [`MockConfig::key_window`]).
+#[derive(Clone, Debug)]
+pub struct KeyWindow {
+    pub issue_from: String,
+    pub issue_until: String,
+    pub accept_until: String,
+}
+
+impl KeyWindow {
+    /// A window given as unix seconds.
+    pub fn from_unix_secs(issue_from: i64, issue_until: i64, accept_until: i64) -> Self {
+        use eidola_server_gateway::helpers::unix_to_iso;
+        Self {
+            issue_from: unix_to_iso(issue_from),
+            issue_until: unix_to_iso(issue_until),
+            accept_until: unix_to_iso(accept_until),
+        }
+    }
 }
 
 impl Default for MockConfig {
@@ -659,6 +685,7 @@ impl Default for MockConfig {
             refund_key_id: None,
             issuance_context: None,
             issuance_extra_credits: 0,
+            key_window: None,
         }
     }
 }
@@ -736,6 +763,8 @@ pub struct MockServer {
     chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     /// Number of `POST /v1/credentials/refund` requests received.
     refund_hits: Arc<AtomicU64>,
+    /// The mock issuer, for what it remembers about spends.
+    issuer: Arc<Issuer>,
     /// Number of `GET /v1/models` requests received — the catalogue fetch a
     /// turn's *setup* makes, and so the earliest thing on the wire that says
     /// preparation got as far as building a client. Tests that assert a turn
@@ -751,6 +780,11 @@ impl MockServer {
     }
     pub fn refund_hits(&self) -> u64 {
         self.refund_hits.load(Ordering::SeqCst)
+    }
+    /// How many distinct spends arrived carrying a refund recovery key (a
+    /// spend without one is refused, as the real server refuses it).
+    pub fn keyed_spends(&self) -> usize {
+        self.issuer.keyed_spends()
     }
     /// Catalogue fetches (see `models_hits`).
     pub fn models_hits(&self) -> u64 {
@@ -1079,6 +1113,10 @@ struct Issuer {
     params: Params,
     key_id_hex: String,
     request_context_scalar: Scalar,
+    /// The refund recovery key each spend arrived with, by nullifier: the
+    /// key the real server seals that spend's stored refund under, and so
+    /// the only one its recovery endpoint opens it for.
+    spend_keys: std::sync::Mutex<std::collections::HashMap<Vec<u8>, [u8; 32]>>,
 }
 
 impl Issuer {
@@ -1101,7 +1139,22 @@ impl Issuer {
             params,
             key_id_hex,
             request_context_scalar,
+            spend_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Remember the refund recovery key a spend (or a recovery that found no
+    /// spend) arrived with, and say whether `key` is the one on record: what
+    /// decides whether the real server's stored copy opens.
+    fn spend_key_matches(&self, proof: &SpendProof<128>, key: [u8; 32]) -> bool {
+        let nullifier = proof.nullifier().as_bytes().to_vec();
+        let mut keys = self.spend_keys.lock().unwrap();
+        *keys.entry(nullifier).or_insert(key) == key
+    }
+
+    /// How many distinct spends arrived with a refund recovery key.
+    fn keyed_spends(&self) -> usize {
+        self.spend_keys.lock().unwrap().len()
     }
 
     fn public_key_b64(&self) -> String {
@@ -1243,6 +1296,7 @@ pub async fn start(config: MockConfig) -> MockServer {
         chat_auths,
         chat_auth_values,
         refund_hits,
+        issuer,
         models_hits,
         _task: task,
     }
@@ -1253,6 +1307,9 @@ struct Req {
     method: String,
     path: String,
     auth: Option<String>,
+    /// The refund recovery key header, decoded (`None` when absent or not
+    /// exactly the wire form — the real server refuses both alike).
+    refund_key: Option<[u8; 32]>,
     body: Vec<u8>,
 }
 
@@ -1283,6 +1340,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
 
     let mut content_length = 0usize;
     let mut auth = None;
+    let mut refund_key = None;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim().to_ascii_lowercase();
@@ -1291,6 +1349,8 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
                 content_length = value.parse().unwrap_or(0);
             } else if name == "authorization" {
                 auth = Some(value.to_string());
+            } else if name == eidola_common::refund_key::REFUND_KEY_HEADER {
+                refund_key = eidola_common::refund_key::decode_refund_key(value.as_bytes());
             }
         }
     }
@@ -1308,6 +1368,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
         method,
         path,
         auth,
+        refund_key,
         body,
     })
 }
@@ -1349,7 +1410,7 @@ async fn handle_conn(
             }
         }
         ("GET", "/v1/keys") => {
-            write_json(&mut stream, 200, &keys_body(&issuer)).await?;
+            write_json(&mut stream, 200, &keys_body(&issuer, &config)).await?;
         }
         ("GET", "/v1/account/balances") => {
             let body = serde_json::json!({
@@ -1389,6 +1450,19 @@ async fn handle_conn(
         }
         ("POST", "/v1/credentials/refund") => {
             let attempt = refund_hits.fetch_add(1, Ordering::SeqCst) + 1;
+            // The real endpoint refuses a recovery without its key, and opens
+            // a stored refund only for the key the spend arrived with.
+            let proof = req.auth.as_deref().and_then(Issuer::spend_proof_from_auth);
+            match (proof, req.refund_key) {
+                (_, None) => {
+                    return write_json(&mut stream, 400, &error_body("refund key required")).await;
+                }
+                (Some(proof), Some(key)) if !issuer.spend_key_matches(&proof, key) => {
+                    return write_json(&mut stream, 404, &error_body("refund token not found"))
+                        .await;
+                }
+                _ => {}
+            }
             handle_refund(&mut stream, &issuer, &config, req.auth.as_deref(), attempt).await?;
         }
         ("POST", "/v1/chat/completions") => {
@@ -1407,6 +1481,19 @@ async fn handle_conn(
             chat_raw_bodies.lock().unwrap().push(req.body.clone());
             chat_auths.lock().unwrap().push(req.auth.is_some());
             chat_auth_values.lock().unwrap().push(req.auth.clone());
+            // A spend without its refund recovery key is refused before it is
+            // taken, as the real server's extractor refuses it.
+            if let Some(proof) = req.auth.as_deref().and_then(Issuer::spend_proof_from_auth) {
+                match req.refund_key {
+                    Some(key) => {
+                        issuer.spend_key_matches(&proof, key);
+                    }
+                    None => {
+                        return write_json(&mut stream, 400, &error_body("refund key required"))
+                            .await;
+                    }
+                }
+            }
             let parsed: serde_json::Value =
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
             // A branch-summary request is recognized by its system prompt (it
@@ -3053,7 +3140,7 @@ fn models_body(config: &MockConfig) -> String {
     serde_json::json!({ "data": listed }).to_string()
 }
 
-fn keys_body(issuer: &Issuer) -> String {
+fn keys_body(issuer: &Issuer, config: &MockConfig) -> String {
     let ds = format!("ACT-v1:{DS_ORG}:{DS_SERVICE}:{DS_DEPLOYMENT}:{DS_VERSION}");
     // Reproduce the production `/v1/keys` shape during a rotation grace
     // window: a just-retired key (out of its `issue_from..issue_until` issuing
@@ -3067,6 +3154,11 @@ fn keys_body(issuer: &Issuer) -> String {
         .to_cbor()
         .expect("encode decoy public key");
     let decoy_key_hash: [u8; 32] = Sha256::digest(&decoy_pk).into();
+    let window = config.key_window.clone().unwrap_or_else(|| KeyWindow {
+        issue_from: "2026-02-01T00:00:00Z".into(),
+        issue_until: "2030-01-01T00:00:00Z".into(),
+        accept_until: "2030-01-01T00:00:00Z".into(),
+    });
     serde_json::json!({
         "data": [
             {
@@ -3081,9 +3173,9 @@ fn keys_body(issuer: &Issuer) -> String {
                 "id": issuer.key_id_hex,
                 "public_key": issuer.public_key_b64(),
                 "domain_separator": ds,
-                "issue_from": "2026-02-01T00:00:00Z",
-                "issue_until": "2030-01-01T00:00:00Z",
-                "accept_until": "2030-01-01T00:00:00Z",
+                "issue_from": window.issue_from,
+                "issue_until": window.issue_until,
+                "accept_until": window.accept_until,
             }
         ]
     })

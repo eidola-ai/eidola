@@ -259,7 +259,7 @@ For each one: the **decision**, **why**, **where it is enforced**, and **what wo
 
 **Decision.** A token lives until its key's `accept_until` and no longer, and its change stays under the same key. Account credit carries its own expiry (a subscription's credits expire at the end of the billing period, a purchase's after a year). Credit converted just before it expires becomes a token that is good until its key stops accepting: between one and two epochs (7 to 14 days by default) after the conversion. That bounded grace is the most value can outlive its window; nothing extends it further.
 
-Value still in a token when its key lapses is lost. There is no rollover, because exchanging an old token for a new one without linking the two needs its own design. Small automatic allocations keep the amount at risk to one allocation's change per key; see [gaps.md](gaps.md).
+Value still in a token when its key lapses is lost. There is no rollover, because exchanging an old token for a new one without linking the two needs its own design. Small automatic allocations keep the amount at risk to one allocation's change per key; see [gaps.md § Credit left in a credential when its key lapses](gaps.md#credit-left-in-a-credential-when-its-key-lapses).
 
 **What would break it.** Any rollover, renewal or refund path that carries value into a later key without its own unlinkability analysis; any way to convert credit whose expiry has already passed.
 
@@ -307,7 +307,7 @@ Postgres runs outside the enclave. It is treated as adversarial: its operator or
 
 **Why.** The database is the one place both surfaces meet. A per-spend timestamp or amount beside per-account issuance timestamps and amounts would hand whoever reads it material to pair them.
 
-**What the rows do not hide.** Postgres records when each row was written: a live observer sees each write as it happens, its write-ahead log, replicas and backups carry commit times, and its transaction ids (`xmin`) order nullifier rows against ledger rows. So the database can see when each spend began and finished, and therefore how long each request took. That is disclosed in [gaps.md](gaps.md), and it is also why issuance timing (above) matters. If statement or parameter logging is enabled on the database, those logs also carry the values written, which is one more reason only ciphertexts and nullifiers may be written on the inference path.
+**What the rows do not hide.** Postgres records when each row was written: a live observer sees each write as it happens, its write-ahead log, replicas and backups carry commit times, and its transaction ids (`xmin`) order nullifier rows against ledger rows. So the database can see when each spend began and finished, and therefore how long each request took. That is disclosed in [gaps.md § Spend timing at the database](gaps.md#spend-timing-at-the-database), and it is also why issuance timing (above) matters. If statement or parameter logging is enabled on the database, those logs also carry the values written, which is one more reason only ciphertexts and nullifiers may be written on the inference path.
 
 **What would break it.** A timestamp, amount, account id, request id or content-derived value in any row the inference path writes; a new table written per spend; a join key between the two surfaces.
 

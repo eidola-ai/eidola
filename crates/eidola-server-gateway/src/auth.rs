@@ -9,6 +9,9 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use eidola_common::refund_key::{
+    REFUND_KEY_BYTES, REFUND_KEY_HEADER, REFUND_KEY_TEXT_LEN, decode_refund_key,
+};
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -66,6 +69,52 @@ pub struct ActSpend {
     pub issuer_key_hash: [u8; 32],
     /// The zero-knowledge spend proof.
     pub spend_proof: SpendProof<128>,
+    /// The client's refund recovery key for this spend, from the
+    /// [`REFUND_KEY_HEADER`] header: what the stored refund is sealed under.
+    pub refund_key: RefundKey,
+}
+
+/// A client's refund recovery key (`eidola_common::refund_key`), held only in
+/// enclave memory for the request that carried it.
+///
+/// The stored copy of a spend's refund is sealed under a key that needs this
+/// value, so neither the database nor anyone holding the gateway's own
+/// secrets can open it without the client. It is never stored, logged or
+/// traced: `Debug` is redacted, and the bytes are zeroed on drop. (The
+/// request's own header map, which axum owns, is not scrubbed.)
+#[derive(Clone)]
+pub struct RefundKey(zeroize::Zeroizing<[u8; REFUND_KEY_BYTES]>);
+
+impl RefundKey {
+    pub fn from_bytes(bytes: [u8; REFUND_KEY_BYTES]) -> Self {
+        Self(zeroize::Zeroizing::new(bytes))
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8; REFUND_KEY_BYTES] {
+        &self.0
+    }
+
+    /// The key from a request's headers. Refused when absent or not exactly
+    /// the wire form: a spend whose refund could not be sealed for its
+    /// client is not taken, so every stored refund is one only its client
+    /// can open, and every spend can be recovered.
+    fn from_headers(headers: &axum::http::HeaderMap) -> Result<Self, ServerError> {
+        headers
+            .get(REFUND_KEY_HEADER)
+            .and_then(|v| decode_refund_key(v.as_bytes()))
+            .map(Self::from_bytes)
+            .ok_or_else(|| ServerError::BadRequest {
+                message: format!(
+                    "a {REFUND_KEY_HEADER} header of {REFUND_KEY_TEXT_LEN} lowercase hex digits is required"
+                ),
+            })
+    }
+}
+
+impl std::fmt::Debug for RefundKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RefundKey(<redacted>)")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -74,7 +123,9 @@ pub struct ActSpend {
 
 /// Axum extractor that parses an ACT Token from the Authorization header.
 ///
-/// Expected format: `Authorization: PrivateToken token="<base64url(Token)>"`
+/// Expected format: `Authorization: PrivateToken token="<base64url(Token)>"`,
+/// plus the client's refund recovery key in [`REFUND_KEY_HEADER`] (required:
+/// see [`RefundKey::from_headers`]).
 ///
 /// Per RFC 9577 Section 2.2.2 and draft-schlesinger-privacypass-act-01 Section 9.1.
 pub struct TokenAuth(pub ActSpend);
@@ -140,10 +191,13 @@ impl<S: Send + Sync> FromRequestParts<S> for TokenAuth {
             }
         })?;
 
+        let refund_key = RefundKey::from_headers(&parts.headers)?;
+
         Ok(TokenAuth(ActSpend {
             challenge_digest,
             issuer_key_hash,
             spend_proof,
+            refund_key,
         }))
     }
 }

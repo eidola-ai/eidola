@@ -361,10 +361,32 @@ COMMENT ON COLUMN nullifier.value IS
     'the primary key — a duplicate insert fails, indicating a double-spend.';
 
 COMMENT ON COLUMN nullifier.refund_token IS
-    'The CBOR-encoded refund token issued for this spend. Stored so the client '
-    'can recover it via POST /v1/credentials/refund if the original response '
-    'was lost (network error, timeout, etc.). The token is already blinded — '
-    'it is only useful to the client holding the matching PreRefund state.';
+    'The refund token issued for this spend, sealed: a version byte (0x01), a '
+    '12-byte random nonce, then the CBOR RefundMsg under AES-256-GCM with its '
+    'tag. The key is HKDF-SHA256 (salt = issuer_key_id, info = '
+    'eidola-refund-token-v1) over the refund recovery key the client sent with '
+    'the spend, and nothing else, derived in enclave memory and kept nowhere: '
+    'the client key is never stored or logged, so no one without the client '
+    '(the operator included) can open the value; the client presents its key '
+    'again to recover the token. The associated '
+    'data is the version byte, the length-prefixed issuer_key_id and the '
+    'nullifier value, so a token opens only on its own row. Sealed because the '
+    'RefundMsg carries the refund amount t as a plain scalar (only its '
+    'signature parts are useful solely to the client holding the matching '
+    'PreRefund), and t is a function of the request''s content lengths. The '
+    'ciphertext is as long as the fixed-size CBOR, so its length says nothing. '
+    'Stored so the client can recover the token via POST '
+    '/v1/credentials/refund if the original response was lost; a value that '
+    'does not open for the presented key is answered as no token stored.';
+
+-- A database holding bare CBOR tokens from before this column was sealed
+-- (they begin 0xa5, a five-entry map) is cleared by hand, idempotently:
+--
+--   UPDATE nullifier SET refund_token = NULL
+--    WHERE substring(refund_token FROM 1 FOR 1) <> '\x01'::bytea;
+--
+-- That clears current values only: WAL, base backups and replicas keep the
+-- old ones until they age out.
 
 -- ---------------------------------------------------------------------------
 -- Engine Placement
