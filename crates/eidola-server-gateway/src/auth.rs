@@ -8,7 +8,7 @@ use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use eidola_common::private_token::{self, TokenAuthorizationError};
 use eidola_common::refund_key::{
     REFUND_KEY_BYTES, REFUND_KEY_HEADER, REFUND_KEY_TEXT_LEN, decode_refund_key,
 };
@@ -124,7 +124,8 @@ impl std::fmt::Debug for RefundKey {
 /// Axum extractor that parses an ACT Token from the Authorization header.
 ///
 /// Expected format: `Authorization: PrivateToken token="<base64url(Token)>"`,
-/// plus the client's refund recovery key in [`REFUND_KEY_HEADER`] (required:
+/// the value padded as RFC 9577 requires and spelled exactly as
+/// `eidola_common::private_token` writes it (anything else is refused), plus the client's refund recovery key in [`REFUND_KEY_HEADER`] (required:
 /// see [`RefundKey::from_headers`]).
 ///
 /// Per RFC 9577 Section 2.2.2 and draft-schlesinger-privacypass-act-01 Section 9.1.
@@ -143,20 +144,17 @@ impl<S: Send + Sync> FromRequestParts<S> for TokenAuth {
                 message: "missing Authorization header".to_string(),
             })?;
 
-        // Parse: PrivateToken token="<base64url>"
-        let payload = header
-            .strip_prefix("PrivateToken token=\"")
-            .and_then(|s| s.strip_suffix('"'))
-            .ok_or_else(|| ServerError::Unauthorized {
+        // PrivateToken token="<padded base64url>", the one spelling the
+        // client writes (RFC 9577); every other spelling is refused.
+        let token_bytes = private_token::token_bytes(header).map_err(|e| match e {
+            TokenAuthorizationError::Scheme => ServerError::Unauthorized {
                 message: "expected PrivateToken authorization scheme".to_string(),
-            })?;
-
-        let token_bytes =
-            URL_SAFE_NO_PAD
-                .decode(payload)
-                .map_err(|_| ServerError::Unauthorized {
-                    message: "invalid base64url in PrivateToken".to_string(),
-                })?;
+            },
+            TokenAuthorizationError::Encoding => ServerError::Unauthorized {
+                message: "invalid base64url in PrivateToken (padded base64url is required)"
+                    .to_string(),
+            },
+        })?;
 
         // Minimum size: 2 (token_type) + 32 (challenge_digest) + 32 (issuer_key_id) + 1 (spend proof)
         if token_bytes.len() < 67 {

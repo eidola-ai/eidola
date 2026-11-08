@@ -1201,12 +1201,18 @@ impl Issuer {
     }
 
     /// Parse a `PrivateToken token="..."` header into its embedded spend proof
-    /// (mirrors the server's `TokenAuth` extractor).
+    /// (mirrors the server's `TokenAuth` extractor). Like the server, it reads
+    /// only the spelling RFC 9577 requires, padded base64url, decoded here
+    /// with the `base64` crate's canonical padded engine rather than the
+    /// shared `eidola_common::private_token` rule the client writes with, so
+    /// the client's spelling is checked against an independent reading.
     fn spend_proof_from_auth(auth: &str) -> Option<SpendProof<128>> {
         let payload = auth
             .strip_prefix("PrivateToken token=\"")
             .and_then(|s| s.strip_suffix('"'))?;
-        let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+        let bytes = base64::engine::general_purpose::URL_SAFE
+            .decode(payload)
+            .ok()?;
         if bytes.len() < 67 {
             return None;
         }
