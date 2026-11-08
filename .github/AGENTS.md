@@ -52,6 +52,8 @@ Not every tool the release path uses is a Rust crate in `crates/devtools/`. **`s
 
 Runs on `v*` tags, two responsibilities: (1) generate `tinfoil-deployment.json` from `artifact-manifest.json`, attest it to Sigstore via `actions/attest`, and create the GitHub release — the artifact Tinfoil's verifier chain consumes; (2) sign `artifact-manifest.json` with `cosign sign-blob` (Fulcio keyless via the workflow's OIDC identity) and upload the manifest + Sigstore bundle as release assets for the client's self-update verifier. **The filename `tinfoil-build.yml` is mandated by Tinfoil's closed-source deployment system — do not rename.** The release is intentionally not marked `latest` here; the release officer's tooling does that once their human attestation is signed and uploaded.
 
+**A release tag names the workspace version.** Installed clients gate updates on their compile-time `CARGO_PKG_VERSION` (`[workspace.package] version`), never on the tag, so a tag that names another version ships clients that misplace themselves in the feed — `v0.0.2`–`v0.0.8` were cut at `0.1.0`, and each of those clients reports itself newer than all of them. Bump the workspace version in a commit and tag that commit; `release-tool`'s release-checkout preflight (`verify` and `attest`) refuses a mismatch.
+
 The macOS signing outputs — the signed container and the detached signature material — are the one class of release asset `scripts/release-assets.sh` does **not** publish, and cannot: it publishes what `artifact-manifest.json` measures, and neither of those may ever be measured there. They reach the release through `release-tool attest`, which is also the step that checks they reconstruct and records their hashes in the signed attestation.
 
 ## Image tagging
