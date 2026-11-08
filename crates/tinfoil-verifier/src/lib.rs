@@ -73,6 +73,8 @@ pub mod bundle;
 mod device;
 mod error;
 pub mod measurement;
+#[cfg(feature = "platform-endorsements")]
+pub mod platform_endorsements;
 pub mod sevsnp;
 mod sevsnp_crl;
 pub mod tdx;

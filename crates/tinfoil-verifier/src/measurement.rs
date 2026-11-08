@@ -139,10 +139,11 @@ pub struct TdxPolicy {
     pub minimum_tcb_evaluation_data_number: u32,
     /// Exact QE vendor id from the quote header (16 bytes).
     pub qe_vendor_id: String,
-    /// Allowed platform FMSPCs (6 bytes each), taken from the Intel-signed
-    /// PCK certificate. `None` accepts any FMSPC Intel's collateral covers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fmspc: Option<Vec<String>>,
+    /// The machines allowed, by PPID (16 bytes each): the Platform Provisioning
+    /// ID in the Intel-signed PCK certificate's SGX extension, which names one
+    /// registered platform. Must be non-empty, so every TDX pin names the
+    /// individual hosts it accepts.
+    pub ppids: Vec<String>,
     /// Expected `DynamicPlatform` flag of the Intel-signed PCK certificate:
     /// whether the platform may add or replace CPU packages after its keys
     /// were registered. Required: there is no default.
@@ -275,7 +276,7 @@ pub(crate) struct CompiledTdxPin {
     pub minimum_tee_tcb_svn: [u8; 16],
     pub minimum_tcb_evaluation_data_number: u32,
     pub qe_vendor_id: [u8; 16],
-    pub fmspc: Option<Vec<[u8; 6]>>,
+    pub ppids: Vec<[u8; 16]>,
     pub dynamic_platform: PckFlag,
     pub cached_keys: PckFlag,
     pub smt_enabled: PckFlag,
@@ -326,19 +327,16 @@ fn compile_tdx(pin: &TdxPin, index: usize) -> Result<CompiledTdxPin, Error> {
              SEPT_VE_DISABLE set"
         )));
     }
-    let fmspc = match &policy.fmspc {
-        None => None,
-        Some(list) if list.is_empty() => {
-            return Err(Error::InvalidPin(format!(
-                "allowed measurement {index}: tdx.policy.fmspc, when present, must not be empty"
-            )));
-        }
-        Some(list) => Some(
-            list.iter()
-                .map(|f| pin_hex(f, index, "tdx.policy.fmspc"))
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-    };
+    if policy.ppids.is_empty() {
+        return Err(Error::InvalidPin(format!(
+            "allowed measurement {index}: tdx.policy.ppids must list at least one machine"
+        )));
+    }
+    let ppids = policy
+        .ppids
+        .iter()
+        .map(|ppid| pin_hex(ppid, index, "tdx.policy.ppids"))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(CompiledTdxPin {
         mrtd: pin_hex(&pin.mrtd, index, "tdx.mrtd")?,
         mrconfigid: pin_hex(&pin.mrconfigid, index, "tdx.mrconfigid")?,
@@ -352,7 +350,7 @@ fn compile_tdx(pin: &TdxPin, index: usize) -> Result<CompiledTdxPin, Error> {
         )?,
         minimum_tcb_evaluation_data_number: policy.minimum_tcb_evaluation_data_number,
         qe_vendor_id: pin_hex(&policy.qe_vendor_id, index, "tdx.policy.qe_vendor_id")?,
-        fmspc,
+        ppids,
         dynamic_platform: policy.dynamic_platform,
         cached_keys: policy.cached_keys,
         smt_enabled: policy.smt_enabled,
@@ -387,7 +385,7 @@ pub(crate) mod tests {
                 minimum_tee_tcb_svn: "03010200000000000000000000000000".to_string(),
                 minimum_tcb_evaluation_data_number: 17,
                 qe_vendor_id: "939a7233f79c4ca9940a0db3957f0607".to_string(),
-                fmspc: None,
+                ppids: vec!["33".repeat(16)],
                 dynamic_platform: PckFlag::True,
                 cached_keys: PckFlag::True,
                 smt_enabled: PckFlag::True,
@@ -451,13 +449,10 @@ pub(crate) mod tests {
                 "tdx.policy.xfam",
                 Box::new(|p| p.policy.xfam = "e7".to_string()),
             ),
+            ("ppids must list", Box::new(|p| p.policy.ppids.clear())),
             (
-                "fmspc, when present",
-                Box::new(|p| p.policy.fmspc = Some(vec![])),
-            ),
-            (
-                "tdx.policy.fmspc",
-                Box::new(|p| p.policy.fmspc = Some(vec!["00".repeat(5)])),
+                "tdx.policy.ppids",
+                Box::new(|p| p.policy.ppids = vec!["00".repeat(15)]),
             ),
         ];
         for (needle, mutate) in cases {
@@ -484,8 +479,9 @@ pub(crate) mod tests {
         unknown["platform"]["tdx"]["rtmr1"] = serde_json::Value::String("00".repeat(48));
         assert!(serde_json::from_value::<AllowedMeasurement>(unknown).is_err());
 
-        // Each platform flag is required: omitting one is not a default.
-        for flag in ["dynamic_platform", "cached_keys", "smt_enabled"] {
+        // Each platform flag, and the machine allowlist, is required:
+        // omitting one is not a default.
+        for flag in ["dynamic_platform", "cached_keys", "smt_enabled", "ppids"] {
             let mut missing = json.clone();
             missing["platform"]["tdx"]["policy"]
                 .as_object_mut()

@@ -15,6 +15,12 @@ use eidola_common::engine_deployment;
 const MODEL: &str = "fixture-model";
 const CONFIG: &str = "deploy/engine/fixture-model/tdx-a/tinfoil-config.yml";
 const SIDECAR: &str = "deploy/engine/fixture-model/tdx-a/deployment.json";
+/// The platform endorsements the fixture sidecar names, as vendored.
+const ENDORSEMENTS: &str =
+    "releases/trust/platform-endorsements/platform-v0.1.11/platform-endorsements.json";
+const ENDORSEMENTS_BUNDLE: &str =
+    "releases/trust/platform-endorsements/platform-v0.1.11/attestation.sigstore.json";
+const TRUSTED_ROOT: &str = "releases/trust/sigstore-trusted-root.json";
 
 /// The weights pack's data size in the fixture's `mpk` (`_17419419648_`).
 const FIXTURE_PACK_BYTES: u64 = 17_419_419_648;
@@ -51,12 +57,22 @@ impl Tree {
     fn fixture() -> Self {
         let root = fixture_root();
         let read = |p: &str| std::fs::read(root.join(p)).unwrap();
+        let mut files: BTreeMap<String, Vec<u8>> = [CONFIG, SIDECAR]
+            .into_iter()
+            .map(|p| (p.to_string(), read(p)))
+            .collect();
+        // The vendored endorsements and the trusted root are the committed
+        // ones: the fixture deployment's machine policy is re-derived from
+        // the real signed release.
+        for path in [ENDORSEMENTS, ENDORSEMENTS_BUNDLE, TRUSTED_ROOT] {
+            files.insert(
+                path.to_string(),
+                std::fs::read(workspace_root().join(path)).unwrap(),
+            );
+        }
         Self {
             json: serde_json::from_slice(&read("engine-enclaves.json")).unwrap(),
-            files: [CONFIG, SIDECAR]
-                .into_iter()
-                .map(|p| (p.to_string(), read(p)))
-                .collect(),
+            files,
         }
     }
 
@@ -575,11 +591,15 @@ fn the_pin_carries_what_the_sidecar_states() {
     tree.deployment()["pin"]["expected_gpus"] = 1.into();
     refused(&tree, "pin.expected_gpus differs from");
 
+    // The PCK flags are the sidecar's.
     let mut tree = Tree::fixture();
     let mut sidecar = tree.sidecar();
-    sidecar["tdx_policy"]["smt_enabled"] = "true".into();
+    sidecar["tdx"]["smt_enabled"] = "true".into();
     tree.set_sidecar(sidecar);
-    refused(&tree, "pin.platform.tdx.policy differs from");
+    refused(
+        &tree,
+        "pin.platform.tdx.policy is not the policy derived from",
+    );
 
     let mut tree = Tree::fixture();
     let mut sidecar = tree.sidecar();
@@ -597,10 +617,10 @@ fn the_sidecar_is_read_strictly_at_every_level() {
     let tree = Tree::fixture();
     let text = String::from_utf8(tree.files[SIDECAR].clone()).unwrap();
     let sidecar = tree.sidecar();
-    let policy = serde_json::to_string(&sidecar["tdx_policy"]).unwrap();
-    let null_policy = {
+    let machines = serde_json::to_string(&sidecar["tdx"]).unwrap();
+    let null_machines = {
         let mut sidecar = sidecar.clone();
-        sidecar["tdx_policy"] = serde_json::Value::Null;
+        sidecar["tdx"] = serde_json::Value::Null;
         serde_json::to_string_pretty(&sidecar).unwrap()
     };
     let with = |edited: String| {
@@ -611,18 +631,18 @@ fn the_sidecar_is_read_strictly_at_every_level() {
     };
     for (name, edited, needle) in [
         (
-            "tdx_policy",
-            text.replacen(
-                "\"tdx_policy\":",
-                &format!("\"tdx_policy\": {policy}, \"tdx_policy\":"),
-                1,
-            ),
-            "duplicate field `tdx_policy`",
+            "tdx",
+            text.replacen("\"tdx\":", &format!("\"tdx\": {machines}, \"tdx\":"), 1),
+            "duplicate field `tdx`",
         ),
         (
-            "a policy member",
-            text.replacen("\"xfam\":", "\"xfam\": \"e702060000000000\", \"xfam\":", 1),
-            "duplicate field `xfam`",
+            "an endorsements member",
+            text.replacen(
+                "\"policy\":",
+                "\"policy\": \"tdx-h200-prod\", \"policy\":",
+                1,
+            ),
+            "duplicate field `policy`",
         ),
         (
             "weights.revision",
@@ -633,9 +653,19 @@ fn the_sidecar_is_read_strictly_at_every_level() {
             ),
             "duplicate field `revision`",
         ),
+        // A policy member written by hand: the policy is only ever derived.
         (
-            "an unknown policy member",
-            text.replacen("\"xfam\":", "\"debug\": \"ok\", \"xfam\":", 1),
+            "a hand-written policy member",
+            text.replacen(
+                "\"dynamic_platform\":",
+                "\"xfam\": \"e702060000000000\", \"dynamic_platform\":",
+                1,
+            ),
+            "unknown field `xfam`",
+        ),
+        (
+            "an unknown endorsements member",
+            text.replacen("\"policy\":", "\"debug\": \"ok\", \"policy\":", 1),
             "unknown field `debug`",
         ),
         (
@@ -648,7 +678,7 @@ fn the_sidecar_is_read_strictly_at_every_level() {
             text.replacen("\"expected_gpus\": 8", "\"expected_gpus\": null", 1),
             "invalid type: null",
         ),
-        ("a null policy", null_policy, "invalid type: null"),
+        ("null machines", null_machines, "invalid type: null"),
     ] {
         let err = with(edited).check().expect_err(name);
         assert!(
@@ -672,7 +702,7 @@ fn a_pin_names_exactly_one_platform() {
         serde_json::json!({"sev_snp": {"measurement": "a".repeat(96)}});
     refused(&tree, "a SEV-SNP pin, but");
     let mut sidecar = tree.sidecar();
-    sidecar.as_object_mut().unwrap().remove("tdx_policy");
+    sidecar.as_object_mut().unwrap().remove("tdx");
     tree.set_sidecar(sidecar);
     tree.check().expect("a SEV-SNP deployment is expressible");
 }
@@ -819,39 +849,122 @@ fn every_variable_the_node_requires_is_checked() {
     );
 }
 
-/// A TDX policy the attesting client would refuse when it compiles its pins
-/// fails the check, with the client's own reason: an empty object, wrong
-/// field widths, no MR_SEAM, and unsafe TD attributes.
+/// A TDX pin's machine policy is exactly the one derived from the signed
+/// platform endorsements its sidecar names: a pin edited in any member — a
+/// lowered floor, an added machine, another TDX module, unsafe attributes,
+/// a shape the client cannot read — is refused, as is a pin left behind
+/// when the sidecar names another policy.
 #[test]
-fn a_tdx_policy_the_attesting_client_refuses_is_refused() {
+fn a_tdx_policy_other_than_the_derived_one_is_refused() {
     type Edit = fn(&mut serde_json::Value);
-    let cases: [(&str, Edit); 5] = [
+    let cases: [(&str, Edit); 8] = [
         ("{}", |p| *p = serde_json::json!({})),
-        ("short xfam", |p| p["xfam"] = "e702".into()),
-        ("long mr_seam", |p| {
-            p["mr_seam"] = serde_json::json!(["55".repeat(49)])
+        ("a lowered evaluation-data floor", |p| {
+            p["minimum_tcb_evaluation_data_number"] = 17.into()
         }),
-        ("empty mr_seam", |p| p["mr_seam"] = serde_json::json!([])),
+        ("a lowered TEE_TCB_SVN floor", |p| {
+            p["minimum_tee_tcb_svn"] = "00".repeat(16).into()
+        }),
+        ("an added machine", |p| {
+            p["ppids"]
+                .as_array_mut()
+                .unwrap()
+                .push("00".repeat(16).into())
+        }),
+        ("no machine", |p| p["ppids"] = serde_json::json!([])),
+        ("another TDX module", |p| {
+            p["mr_seam"] = serde_json::json!(["55".repeat(48)])
+        }),
         // DEBUG set (bit 0) alongside SEPT_VE_DISABLE.
         ("debug attributes", |p| {
             p["td_attributes"] = "0100001000000000".into()
+        }),
+        ("an FMSPC allowlist", |p| {
+            p["fmspc"] = serde_json::json!(["b0c06f000000"])
         }),
     ];
     for (name, edit) in cases {
         let mut tree = Tree::fixture();
         let mut policy = tree.deployment()["pin"]["platform"]["tdx"]["policy"].clone();
         edit(&mut policy);
-        tree.deployment()["pin"]["platform"]["tdx"]["policy"] = policy.clone();
-        let mut sidecar = tree.sidecar();
-        sidecar["tdx_policy"] = policy;
-        tree.set_sidecar(sidecar);
+        tree.deployment()["pin"]["platform"]["tdx"]["policy"] = policy;
         let err = tree.check().expect_err(name);
         assert!(
             err.starts_with("engine-enclaves.json: ")
-                || err.contains("the attesting client refuses this pin"),
+                || err.contains("pin.platform.tdx.policy is not the policy derived from"),
             "{name}: {err}"
         );
     }
+
+    // The sidecar names another policy of the same release; the pin still
+    // carries the old one.
+    let mut tree = Tree::fixture();
+    let mut sidecar = tree.sidecar();
+    sidecar["tdx"]["platform_endorsements"]["policy"] = "tdx-h200-prod".into();
+    tree.set_sidecar(sidecar);
+    refused(
+        &tree,
+        "pin.platform.tdx.policy is not the policy derived from",
+    );
+}
+
+/// The endorsements are verified on every check: a vendored file edited
+/// (with the sidecar's hash moved to match), a hash the file does not have,
+/// a release that is not vendored, and a bundle that is not the release's
+/// are each refused, naming the sidecar.
+#[test]
+fn the_endorsements_a_pin_is_derived_from_are_verified() {
+    let at = "deployment.json: tdx.platform_endorsements: platform endorsements refused";
+
+    let mut tree = Tree::fixture();
+    let text = String::from_utf8(tree.files[ENDORSEMENTS].clone()).unwrap();
+    let edited = text.replacen(
+        "\"minimum_tcb_evaluation_data_number\": 19",
+        "\"minimum_tcb_evaluation_data_number\": 17",
+        1,
+    );
+    assert_ne!(edited, text);
+    let edited_sha: String = {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(edited.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    tree.files
+        .insert(ENDORSEMENTS.to_string(), edited.into_bytes());
+    let mut sidecar = tree.sidecar();
+    sidecar["tdx"]["platform_endorsements"]["sha256"] = edited_sha.into();
+    tree.set_sidecar(sidecar);
+    refused(&tree, "the attestation's subject is");
+    refused(&tree, at);
+
+    let mut tree = Tree::fixture();
+    let mut sidecar = tree.sidecar();
+    sidecar["tdx"]["platform_endorsements"]["sha256"] = "00".repeat(32).into();
+    tree.set_sidecar(sidecar);
+    refused(&tree, "but the recorded hash is");
+
+    let mut tree = Tree::fixture();
+    let mut sidecar = tree.sidecar();
+    sidecar["tdx"]["platform_endorsements"]["release"] = "platform-v0.1.9".into();
+    tree.set_sidecar(sidecar);
+    refused(
+        &tree,
+        "read releases/trust/platform-endorsements/platform-v0.1.9/platform-endorsements.json",
+    );
+
+    // The bundle replaced by another genuine Sigstore bundle (the trusted
+    // root's own bytes are not one; any other bundle fails its identity).
+    let mut tree = Tree::fixture();
+    let mut bundle: serde_json::Value =
+        serde_json::from_slice(&tree.files[ENDORSEMENTS_BUNDLE]).unwrap();
+    bundle["dsseEnvelope"]["signatures"][0]["sig"] = "MEUCIQ==".into();
+    tree.files.insert(
+        ENDORSEMENTS_BUNDLE.to_string(),
+        serde_json::to_vec(&bundle).unwrap(),
+    );
+    refused(&tree, "the DSSE signature does not verify");
 }
 
 /// Sets `expected_gpus` in the pin and the sidecar alike, so only the GPU rule

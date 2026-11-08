@@ -75,6 +75,15 @@ build system:
 engine-kernels *args:
     crates/eidola-engine-kernels/scripts/build-in-docker.sh {{args}}
 
+# Vendor a release of the platform provider's signed platform endorsements
+# (`platform-vX.Y.Z` of tinfoilsh/cvmimage) into
+# releases/trust/platform-endorsements/<tag>/: downloads the release file and
+# its attestation bundle, verifies them offline exactly as the gateway's build
+# does, and writes only what verified, for review. The one network fetch of
+# the endorsements; no build reads the network. See deploy/engine/README.md.
+engine-platform-endorsements tag:
+    ./scripts/engine-platform-endorsements.sh {{tag}}
+
 # Build the bundled on-device inference engine sidecar (static llama.cpp
 # `llama-server`) via Nix and materialize it at
 # crates/eidola-gui/build/llama-server. `just build gui` / `just run gui`

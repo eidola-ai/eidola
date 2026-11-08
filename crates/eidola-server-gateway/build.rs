@@ -4,7 +4,11 @@
 //! the engine deployments this gateway build accepts, per model. It is checked
 //! against the committed deployment configs under `deploy/engine/` before it
 //! is embedded (`src/engine_trust/manifest.rs`): a pin that disagrees with the
-//! config it names, or that names no committed config, fails the build.
+//! config it names, or that names no committed config, fails the build. A TDX
+//! pin's machine policy is re-derived from the vendored platform endorsements
+//! its deployment names (`releases/trust/platform-endorsements/<tag>/`),
+//! verified offline against `releases/trust/sigstore-trusted-root.json`; every
+//! file read is a `rerun-if-changed` input, and nothing reads the network.
 
 #[path = "src/engine_trust/manifest.rs"]
 mod engine_manifest;
