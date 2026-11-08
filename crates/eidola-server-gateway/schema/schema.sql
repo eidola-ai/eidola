@@ -429,7 +429,7 @@ COMMENT ON FUNCTION available_balance IS
 -- ledger entry IDs on success, NULL if p_require_balance is TRUE and the
 -- account has insufficient balance, or an empty array if the stripe_event_id
 -- has already been processed (idempotent duplicate).
-CREATE FUNCTION debit_account(
+CREATE OR REPLACE FUNCTION debit_account(
     p_account_id       UUID,
     p_amount           BIGINT,
     p_reason           TEXT,
@@ -448,6 +448,14 @@ DECLARE
     v_pool_idx  INT := 0;
     v_event_id  TEXT;
 BEGIN
+    -- One debit per account at a time. Without the lock, two concurrent
+    -- issuances each read the same balance, each pass the check below, and
+    -- both convert it into anonymous credentials: an overdraft no later step
+    -- can recover, because the credentials cannot be traced once issued.
+    -- Under READ COMMITTED each statement below takes a fresh snapshot, so a
+    -- debit that waited here sees the one it waited for.
+    PERFORM 1 FROM account WHERE id = p_account_id FOR UPDATE;
+
     -- Balance check (credential issuance).
     IF p_require_balance AND available_balance(p_account_id) < p_amount THEN
         RETURN NULL;
@@ -582,7 +590,9 @@ END;
 $$;
 
 COMMENT ON FUNCTION debit_account IS
-    'Pool-aware debit function.  Allocates a negative delta across credit '
+    'Pool-aware debit function.  Holds the account row lock for the rest of '
+    'the calling transaction, so concurrent debits of one account serialize '
+    'and a balance check cannot pass twice on the same balance.  Allocates a negative delta across credit '
     'pools in FIFO order (earliest expiry first, permanent last) so that '
     'each debit row carries the expires_at of the pool it draws from. '
     'Returns NULL when p_require_balance is TRUE and the balance is '

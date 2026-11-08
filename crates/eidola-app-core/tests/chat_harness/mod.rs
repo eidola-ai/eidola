@@ -624,6 +624,18 @@ pub struct MockConfig {
     /// answers instantly, which makes an in-flight turn unobservable, so a test
     /// about *concurrency* asks for a window it can act inside.
     pub chat_delay_ms: u64,
+    /// When set, the issuance response names this issuer key id instead of the
+    /// key that actually signed it. `None` — the default — names the real key.
+    pub issued_key_id: Option<String>,
+    /// When set, every refund (in band and recovered) names this issuer key id
+    /// instead of the key that actually signed it. `None` names the real key.
+    pub refund_key_id: Option<String>,
+    /// When set, issuance signs under this request context instead of the one
+    /// every credential under the key shares. `None` uses the shared one.
+    pub issuance_context: Option<Scalar>,
+    /// Credits added to what the client asked for at issuance. Zero issues
+    /// exactly the requested amount.
+    pub issuance_extra_credits: i64,
 }
 
 impl Default for MockConfig {
@@ -643,8 +655,21 @@ impl Default for MockConfig {
             close_switch: CloseSwitch::default(),
             list_flat_model: false,
             chat_delay_ms: 0,
+            issued_key_id: None,
+            refund_key_id: None,
+            issuance_context: None,
+            issuance_extra_credits: 0,
         }
     }
+}
+
+/// The issuer key id a refund names: the real one unless the test asked for
+/// another ([`MockConfig::refund_key_id`]).
+fn refund_key_id(issuer: &Issuer, config: &MockConfig) -> String {
+    config
+        .refund_key_id
+        .clone()
+        .unwrap_or_else(|| issuer.key_id_hex.clone())
 }
 
 /// See [`MockConfig::close_switch`].
@@ -1085,7 +1110,12 @@ impl Issuer {
 
     /// Issue a credential for a base64url CBOR `IssuanceRequest` and credit
     /// amount. Returns the base64url CBOR `IssuanceResponse`.
-    fn issue(&self, issuance_request_b64: &str, credits: i64) -> Option<String> {
+    fn issue(
+        &self,
+        issuance_request_b64: &str,
+        credits: i64,
+        context: Option<Scalar>,
+    ) -> Option<String> {
         let req_cbor = URL_SAFE_NO_PAD.decode(issuance_request_b64).ok()?;
         let req = IssuanceRequest::from_cbor(&req_cbor).ok()?;
         let credit_scalar = credit_to_scalar::<128>(credits as u128).ok()?;
@@ -1095,7 +1125,7 @@ impl Issuer {
                 &self.params,
                 &req,
                 credit_scalar,
-                self.request_context_scalar,
+                context.unwrap_or(self.request_context_scalar),
                 OsRng,
             )
             .ok()?;
@@ -1333,11 +1363,20 @@ async fn handle_conn(
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
             let ir = parsed.get("issuance_request").and_then(|v| v.as_str());
             let credits = parsed.get("credits").and_then(|v| v.as_i64()).unwrap_or(0);
-            match ir.and_then(|ir| issuer.issue(ir, credits)) {
+            match ir.and_then(|ir| {
+                issuer.issue(
+                    ir,
+                    credits + config.issuance_extra_credits,
+                    config.issuance_context,
+                )
+            }) {
                 Some(issuance_response) => {
                     let body = serde_json::json!({
                         "issuance_response": issuance_response,
-                        "issuer_key_id": issuer.key_id_hex,
+                        "issuer_key_id": config
+                            .issued_key_id
+                            .clone()
+                            .unwrap_or_else(|| issuer.key_id_hex.clone()),
                         "credits": credits,
                         "ledger_entry_id": uuid_like(),
                     });
@@ -1475,7 +1514,7 @@ async fn handle_refund(
     match refund {
         Some(refund_b64) => {
             let body = serde_json::json!({
-                "refund": { "refund": refund_b64, "issuer_key_id": issuer.key_id_hex },
+                "refund": { "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) },
             });
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1499,7 +1538,7 @@ async fn handle_chat(
         auth.and_then(Issuer::spend_proof_from_auth)
             .and_then(|sp| issuer.refund_for(&sp))
             .map(|refund_b64| {
-                serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex })
+                serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) })
             })
     } else {
         None
@@ -1555,8 +1594,7 @@ async fn handle_chat(
                 .and_then(Issuer::spend_proof_from_auth)
                 .and_then(|sp| issuer.refund_for(&sp))
             {
-                body["refund"] =
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex });
+                body["refund"] = serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) });
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1570,8 +1608,7 @@ async fn handle_chat(
                 .and_then(Issuer::spend_proof_from_auth)
                 .and_then(|sp| issuer.refund_for(&sp))
             {
-                body["refund"] =
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex });
+                body["refund"] = serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) });
             }
             write_json(stream, status, &body.to_string()).await
         }
@@ -1621,7 +1658,7 @@ async fn handle_chat(
                 .and_then(Issuer::spend_proof_from_auth)
                 .and_then(|sp| issuer.refund_for(&sp))
                 .map(|refund_b64| {
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex })
+                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) })
                 });
             write_sse_stream_with_metadata(stream, &[STREAM_CONTENT], refund).await
         }
@@ -1630,7 +1667,7 @@ async fn handle_chat(
                 .and_then(Issuer::spend_proof_from_auth)
                 .and_then(|sp| issuer.refund_for(&sp))
                 .map(|refund_b64| {
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex })
+                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) })
                 });
             let idle_frames = if matches!(config.chat, ChatBehavior::StreamingPaddedPastReadCeiling)
             {
@@ -1647,7 +1684,7 @@ async fn handle_chat(
                 .and_then(Issuer::spend_proof_from_auth)
                 .and_then(|sp| issuer.refund_for(&sp))
                 .map(|refund_b64| {
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex })
+                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) })
                 });
             write_sse_stream_split_data(stream, &[STREAM_CONTENT], refund).await
         }
@@ -3235,6 +3272,13 @@ pub fn reopen_core(dir: &tempfile::TempDir, base_url: &str) -> AppCore {
 /// Configure account credentials so auto-provisioning can reach the balance /
 /// allocate endpoints. The actual basic-auth password is never verified by the
 /// mock, so any non-empty values work.
+/// A request context no other credential shares, for
+/// [`MockConfig::issuance_context`].
+#[allow(dead_code)]
+pub fn distinct_context() -> Scalar {
+    Scalar::from(7u64)
+}
+
 pub fn with_account(core: &AppCore) {
     core.set_account_credentials(uuid_account_id(), "mock-secret".into())
         .expect("set account credentials");

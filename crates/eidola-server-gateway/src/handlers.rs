@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
-use anonymous_credit_tokens::{Scalar, scalar_to_credit};
+use anonymous_credit_tokens::scalar_to_credit;
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, Request, State};
@@ -10,7 +10,6 @@ use axum::response::IntoResponse;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use opentelemetry::KeyValue;
-use rand_core::OsRng;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tracing::{error, warn};
@@ -327,20 +326,7 @@ async fn verify_spend_proof(state: &AppState, act: &ActSpend) -> Result<(), Serv
         SystemTime::now(),
     )?;
 
-    if act.spend_proof.context() != key.request_context_scalar {
-        return Err(ServerError::Unauthorized {
-            message: "invalid request_context in spend proof".to_string(),
-        });
-    }
-
-    // Verify the spend proof by calling refund with t=0 (discards the result).
-    key.secret_key
-        .refund::<128>(&key.params, &act.spend_proof, Scalar::ZERO, OsRng)
-        .map_err(|_| ServerError::Unauthorized {
-            message: "invalid spend proof".to_string(),
-        })?;
-
-    Ok(())
+    credentials::verify_presented_spend(key, act)
 }
 
 /// Validate the model and charge amount against the request.

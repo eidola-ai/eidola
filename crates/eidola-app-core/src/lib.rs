@@ -3392,6 +3392,14 @@ impl Inner {
             PublicKey::from_cbor(&public_key_cbor).map_err(|e| AppError::Credential {
                 message: format!("invalid public key CBOR: {e}"),
             })?;
+        // A key's id is SHA-256 of its public key, and the id is what every
+        // spend names. Stored under any other id, a credential is unusable
+        // (its spends name a key the server cannot find) or mislabelled.
+        if key.id != issuer_key_id_of(&public_key_cbor) {
+            return Err(AppError::Credential {
+                message: "the server's issuer key id is not the hash of its public key".into(),
+            });
+        }
 
         let params = params_from_domain_separator(expected_ds)?;
 
@@ -3454,6 +3462,16 @@ impl Inner {
             serde_json::from_str(&body).map_err(|e| AppError::Network {
                 message: format!("failed to parse issuance response: {e}"),
             })?;
+        // The response is verified against `key` below; it must also say it
+        // is `key`, since the id it names is the one the credential is stored
+        // and later spent under.
+        if issued.issuer_key_id != key.id {
+            return Err(AppError::Credential {
+                message: "the server issued under a different key from the one it listed as \
+                          current"
+                    .into(),
+            });
+        }
 
         // 5. Construct CreditToken
         let response_cbor = URL_SAFE_NO_PAD
@@ -3471,21 +3489,22 @@ impl Inner {
                 message: format!("failed to construct credit token: {e}"),
             })?;
 
-        // 6. Store credential
-        let token_cbor = credit_token.to_cbor().map_err(|e| AppError::Credential {
-            message: format!("failed to encode credit token: {e}"),
-        })?;
-        let nonce_hex = hex_encode(&credit_token.nullifier().to_bytes());
+        // 6. Check what the issuer chose, then store the credential.
         let token_credits =
             scalar_to_credit::<128>(&credit_token.credits()).map_err(|e| AppError::Credential {
                 message: format!("invalid credit amount in token: {e}"),
             })?;
+        check_issued_credential(&credit_token, &params, &key.id, credits, token_credits)?;
+        let token_cbor = credit_token.to_cbor().map_err(|e| AppError::Credential {
+            message: format!("failed to encode credit token: {e}"),
+        })?;
+        let nonce_hex = hex_encode(&credit_token.nullifier().to_bytes());
 
         db::insert_credential(
             &db_conn,
             &nonce_hex,
             &pre_credential_id,
-            &issued.issuer_key_id,
+            &key.id,
             &token_cbor,
             token_credits as i64,
             0,
@@ -14383,6 +14402,19 @@ async fn process_refund(
         .ok_or_else(|| AppError::Credential {
             message: "missing issuer_key_id in refund".into(),
         })?;
+    // A refund is a credential under the spent credential's own key: it is
+    // verified against that key below, and it is stored under that key's id,
+    // never one the response names. A refund naming another key is refused
+    // rather than stored under a label that would misstate when it lapses.
+    let spent_key_id =
+        issuer_key_id_of(&public_key.to_cbor().map_err(|e| AppError::Credential {
+            message: format!("failed to encode issuer public key: {e}"),
+        })?);
+    if refund_key_id != spent_key_id {
+        return Err(AppError::Credential {
+            message: "the refund names a different issuer key from the spent credential's".into(),
+        });
+    }
 
     let refund_cbor = URL_SAFE_NO_PAD
         .decode(refund_b64)
@@ -14412,7 +14444,7 @@ async fn process_refund(
         db_conn,
         &new_nonce,
         pre_cred_id,
-        refund_key_id,
+        &spent_key_id,
         &new_token_cbor,
         new_credits as i64,
         generation,
@@ -17421,6 +17453,63 @@ fn truncate_on_word_boundary(s: &str, max_chars: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// The request context every credential under the key `key_id` must carry:
+/// `SHA-256(issuer_name ‖ origin_info ‖ issuer_key_id)` reduced to a scalar,
+/// with the credential context empty, exactly as the server derives it.
+fn expected_request_context(key_id: &str) -> Result<anonymous_credit_tokens::Scalar, AppError> {
+    let key_hash = hex_decode(key_id)?;
+    let mut ctx = Vec::with_capacity(ISSUER_NAME.len() + ORIGIN_INFO.len() + key_hash.len());
+    ctx.extend_from_slice(ISSUER_NAME.as_bytes());
+    ctx.extend_from_slice(ORIGIN_INFO.as_bytes());
+    ctx.extend_from_slice(&key_hash);
+    let digest: [u8; 32] = Sha256::digest(&ctx).into();
+    Ok(anonymous_credit_tokens::Scalar::from_bytes_mod_order(
+        digest,
+    ))
+}
+
+/// Refuse a freshly issued credential whose issuer-chosen values could mark
+/// it. The issuance response fixes two values the issuance proof does not
+/// constrain to what the client asked for: the request context, which every
+/// later spend under this credential and its successors reveals in the
+/// clear, and the amount. A context other than the one every client under
+/// the key shares would make each of those spends recognisable as this
+/// issuance's, so it is checked before anything is stored; so is the amount.
+/// The context is read from a spend proof of nothing, built here and never
+/// sent, because the crate exposes a credential's context only that way.
+fn check_issued_credential(
+    token: &CreditToken,
+    params: &Params,
+    key_id: &str,
+    requested: i64,
+    issued: u128,
+) -> Result<(), AppError> {
+    if u128::try_from(requested).ok() != Some(issued) {
+        return Err(AppError::Credential {
+            message: "the server issued a different amount from the one requested".into(),
+        });
+    }
+    let (probe, _) = token
+        .prove_spend::<128>(params, anonymous_credit_tokens::Scalar::ZERO, OsRng)
+        .map_err(|e| AppError::Credential {
+            message: format!("failed to check the issued credential: {e:?}"),
+        })?;
+    if probe.context() != expected_request_context(key_id)? {
+        return Err(AppError::Credential {
+            message: "the server issued a credential under a request context other clients \
+                      under this key do not share"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+/// The ACT issuer key id of a CBOR-encoded public key: hex SHA-256 of its
+/// bytes, as the server computes it and every spend names it.
+fn issuer_key_id_of(public_key_cbor: &[u8]) -> String {
+    hex_encode(&Sha256::digest(public_key_cbor))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

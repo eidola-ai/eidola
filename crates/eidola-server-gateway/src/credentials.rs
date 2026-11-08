@@ -558,6 +558,32 @@ pub async fn load_key(
     Ok(())
 }
 
+/// Check a presented spend proof against the key it names: its request
+/// context must be this key's, and the proof must verify under this key.
+///
+/// Nothing is recorded and nothing is signed. Every path that acts on a
+/// presented spend (the chat spend, and both branches of refund recovery)
+/// calls this before it reads or writes a nullifier row, so a proof that does
+/// not verify never reaches the database.
+pub fn verify_presented_spend(
+    key: &DecryptedIssuerKey,
+    act: &crate::auth::ActSpend,
+) -> Result<(), ServerError> {
+    if act.spend_proof.context() != key.request_context_scalar {
+        return Err(ServerError::Unauthorized {
+            message: "invalid request_context in spend proof".to_string(),
+        });
+    }
+    // `refund` verifies the proof before it signs anything; the refund it
+    // returns for `t = 0` is discarded.
+    key.secret_key
+        .refund::<128>(&key.params, &act.spend_proof, Scalar::ZERO, OsRng)
+        .map_err(|_| ServerError::Unauthorized {
+            message: "invalid spend proof".to_string(),
+        })?;
+    Ok(())
+}
+
 /// Sign the refund for a spent credential, returning its CBOR encoding and
 /// the id of the key that signed it.
 ///
@@ -901,6 +927,21 @@ pub async fn recover_refund(
     )
     .await?;
 
+    // The proof must verify before anything about its nullifier is read or
+    // written. Recording an unverified nullifier would let anyone holding a
+    // public key id write rows, and answering 200 or 404 for one would let
+    // anyone who knows a nullifier ask what became of its spend.
+    {
+        let cache = state.credential_key_cache.read().await;
+        let key = usable_key(
+            &cache,
+            &act.issuer_key_hash,
+            KeyUse::Refund,
+            SystemTime::now(),
+        )?;
+        verify_presented_spend(key, &act)?;
+    }
+
     let key_id = hex::encode(act.issuer_key_hash);
     let nullifier_bytes = act.spend_proof.nullifier().as_bytes().to_vec();
 
@@ -945,28 +986,7 @@ pub async fn recover_refund(
     }
 
     // Nullifier was not previously recorded — the original request never
-    // arrived. Verify the spend proof and issue a full refund.
-    {
-        let cache = state.credential_key_cache.read().await;
-        let key = usable_key(
-            &cache,
-            &act.issuer_key_hash,
-            KeyUse::Refund,
-            SystemTime::now(),
-        )?;
-
-        if act.spend_proof.context() != key.request_context_scalar {
-            return Err(ServerError::Unauthorized {
-                message: "invalid request_context in spend proof".to_string(),
-            });
-        }
-
-        key.secret_key
-            .refund::<128>(&key.params, &act.spend_proof, Scalar::ZERO, OsRng)
-            .map_err(|_| ServerError::Unauthorized {
-                message: "invalid spend proof".to_string(),
-            })?;
-    }
+    // arrived (its proof was verified above). Issue a full refund.
 
     // Issue a full refund (charge_credits returned in full since no work was done).
     let charge_credits = scalar_to_credit::<128>(&act.spend_proof.charge()).map_err(|_| {
@@ -1429,5 +1449,166 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// Refund recovery verifies the presented proof before it reads or writes
+    /// anything about its nullifier. The database here is unreachable, so a
+    /// request that got as far as the nullifier row would fail with a pool
+    /// error rather than the refusal asserted; a valid proof getting that pool
+    /// error is what shows the database is where the check sits in front of.
+    #[test]
+    fn recovery_refuses_an_unverified_proof_before_the_database() {
+        // `Params` is large, and this holds several: an unoptimized test's
+        // default stack is too small.
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(recovery_refuses_an_unverified_proof())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn recovery_refuses_an_unverified_proof() {
+        let pool = db::create_pool(
+            "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
+            None,
+            None,
+        )
+        .unwrap();
+        let mut keys = Cache::new();
+        let hash = add_key(&mut keys, SystemTime::now() + DAY);
+        let (valid, _) = spend(&keys[&hash], 100, 10);
+
+        // A credential from another secret key, issued with this key's own
+        // request context: its proof passes the context check and fails only
+        // the cryptographic verification.
+        let forged = {
+            let mut other = Cache::new();
+            let other_hash = add_key(&mut other, SystemTime::now() + DAY);
+            let other_key = other.get_mut(&other_hash).unwrap();
+            other_key.request_context_scalar = keys[&hash].request_context_scalar;
+            let (mut act, _) = spend(other_key, 100, 10);
+            act.issuer_key_hash = hash;
+            act
+        };
+        // A proof under another key's context, presented under this key.
+        let wrong_context = {
+            let mut other = Cache::new();
+            let other_hash = add_key(&mut other, SystemTime::now() + DAY);
+            let (mut act, _) = spend(&other[&other_hash], 100, 10);
+            act.issuer_key_hash = hash;
+            act
+        };
+
+        let cache: KeyCache = Arc::new(RwLock::new(keys));
+        let state = AppState::new(
+            crate::backend::Catalog::new(None),
+            None,
+            pool,
+            None,
+            None,
+            [0u8; 32],
+            cache,
+            EpochConfig::default(),
+        );
+        let recover = |act: crate::auth::ActSpend| {
+            let state = state.clone();
+            async move { recover_refund(TokenAuth(act), State(state)).await }
+        };
+
+        for (name, act) in [("forged", forged), ("wrong context", wrong_context)] {
+            match recover(act).await {
+                Err(ServerError::Unauthorized { .. }) => {}
+                Err(e) => panic!("{name}: reached the database before verifying: {e}"),
+                Ok(_) => panic!("{name}: an unverified proof was answered"),
+            }
+        }
+        match recover(valid).await {
+            Err(ServerError::Unauthorized { .. }) => {
+                panic!("a valid proof was refused")
+            }
+            Err(_) => {}
+            Ok(_) => panic!("an unreachable database answered"),
+        }
+    }
+
+    /// Two issuances of one account's whole balance cannot both pass the
+    /// balance check: the second waits for the first, then sees the balance it
+    /// spent. Without that, a client sending issuances in parallel converts its
+    /// balance into anonymous credentials once per request. Needs
+    /// `DATABASE_URL` with `schema.sql` applied.
+    #[tokio::test]
+    #[ignore]
+    async fn concurrent_issuances_cannot_spend_one_balance_twice() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let pool = db::create_pool(&url, None, None).unwrap();
+        let master_key = [0u8; 32];
+        let ec = EpochConfig::default();
+        let key = generate_key(&master_key, SystemTime::now(), &ec).unwrap();
+        let client = pool.get().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO issuer_key (id, private_key_enc, public_key, domain_separator, \
+                 issue_from, issue_until, accept_until) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                &[
+                    &key.id,
+                    &key.private_key_enc,
+                    &key.public_key,
+                    &key.domain_separator,
+                    &key.issue_from,
+                    &key.issue_until,
+                    &key.accept_until,
+                ],
+            )
+            .await
+            .unwrap();
+        let account = uuid::Uuid::new_v4();
+        db::insert_account(&pool, account, "unused").await.unwrap();
+        let event = format!("evt_test_{}", account.simple());
+        assert!(
+            db::insert_credit_ledger(&pool, account, 1000, "purchase", &event, None, None)
+                .await
+                .unwrap()
+        );
+
+        // The first issuance takes the whole balance and has not committed.
+        let mut first = pool.get().await.unwrap();
+        let tx = first.transaction().await.unwrap();
+        let ids: Option<Vec<uuid::Uuid>> = tx
+            .query_one(
+                "SELECT debit_account($1, 1000, 'credential_issuance', NULL, $2, TRUE)",
+                &[&account, &key.id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(ids.is_some_and(|ids| !ids.is_empty()));
+
+        // The second must wait for it rather than read the same balance.
+        let second = {
+            let pool = pool.clone();
+            let key_id = key.id.clone();
+            tokio::spawn(async move {
+                db::insert_credential_issuance(&pool, account, 1000, &key_id).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !second.is_finished(),
+            "a second debit of the same account ran while the first was open"
+        );
+        tx.commit().await.unwrap();
+        let second = second.await.unwrap().unwrap();
+        assert!(
+            second.is_none(),
+            "the second issuance was granted out of a balance already spent"
+        );
+        assert_eq!(db::get_available_balance(&pool, account).await.unwrap(), 0);
     }
 }
