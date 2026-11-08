@@ -408,6 +408,16 @@ DECLARE
     v_pool_idx  INT := 0;
     v_event_id  TEXT;
 BEGIN
+    -- Serialize every debit of one account. The balance check and the
+    -- inserts below are separate statements: under READ COMMITTED a
+    -- concurrent debit that has checked but not yet committed is invisible
+    -- here, so without the lock N overlapping issuances could each pass the
+    -- check and mint N times the balance as unlinkable credentials. The row
+    -- lock is held until this statement's transaction commits, and the
+    -- check that follows reads a snapshot taken after the previous holder
+    -- committed.
+    PERFORM 1 FROM account WHERE id = p_account_id FOR UPDATE;
+
     -- Balance check (credential issuance).
     IF p_require_balance AND available_balance(p_account_id) < p_amount THEN
         RETURN NULL;

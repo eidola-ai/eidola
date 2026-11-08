@@ -1116,4 +1116,98 @@ mod tests {
             .replace("sslmode=verify-full", "sslmode=require");
         assert!(normalized.contains("sslmode=require"));
     }
+
+    // -----------------------------------------------------------------------
+    // Integration tests (require running postgres: just db && just db-reset)
+    // -----------------------------------------------------------------------
+
+    use super::*;
+
+    /// A throwaway issuer key row: `credit_ledger.credential_key_id` is a
+    /// foreign key, and `issuer_key.id` must be the hash of its public key.
+    async fn insert_dummy_issuer_key(pool: &Pool) -> String {
+        let public_key = Uuid::new_v4().as_bytes().to_vec();
+        let client = pool.get().await.unwrap();
+        let row = client
+            .query_one(
+                "INSERT INTO issuer_key \
+                     (id, private_key_enc, public_key, domain_separator, \
+                      issue_from, issue_until, accept_until) \
+                 VALUES (encode(sha256($1), 'hex'), '\\x00', $1, 'test', \
+                         now() - interval '1 day', now() + interval '6 days', \
+                         now() + interval '13 days') \
+                 RETURNING id",
+                &[&public_key],
+            )
+            .await
+            .unwrap();
+        row.get("id")
+    }
+
+    /// Concurrent issuance must never debit more than the account holds.
+    ///
+    /// `debit_account` checks `available_balance` and then inserts, under the
+    /// default READ COMMITTED isolation and with no lock, so requests that
+    /// overlap can each see the balance before the others' debits commit.
+    /// Each round funds a fresh account and fires `CONCURRENCY` issuances
+    /// for the whole balance at once; at most one may succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore]
+    async fn concurrent_issuance_never_overdraws() {
+        const CONCURRENCY: usize = 8;
+        const ROUNDS: usize = 20;
+        const BALANCE: i64 = 1_000_000;
+
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let pool = create_pool(&url, None, None).expect("failed to create test pool");
+        let key_id = insert_dummy_issuer_key(&pool).await;
+
+        let mut overdrawn = Vec::new();
+        for round in 0..ROUNDS {
+            let account_id = Uuid::new_v4();
+            insert_account(&pool, account_id, "test_hash")
+                .await
+                .unwrap();
+            insert_credit_ledger(
+                &pool,
+                account_id,
+                BALANCE,
+                "purchase",
+                &format!("evt_test_{}", Uuid::new_v4()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
+            let tasks: Vec<_> = (0..CONCURRENCY)
+                .map(|_| {
+                    let (pool, key_id, barrier) = (pool.clone(), key_id.clone(), barrier.clone());
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        insert_credential_issuance(&pool, account_id, BALANCE, &key_id).await
+                    })
+                })
+                .collect();
+
+            let mut succeeded = 0;
+            for task in tasks {
+                if task.await.unwrap().unwrap().is_some() {
+                    succeeded += 1;
+                }
+            }
+            let balance = get_available_balance(&pool, account_id).await.unwrap();
+            if succeeded > 1 {
+                overdrawn.push((round, succeeded, balance));
+            }
+        }
+
+        assert!(
+            overdrawn.is_empty(),
+            "{} of {ROUNDS} rounds issued more than the balance \
+             (round, issuances that succeeded, final balance): {overdrawn:?}",
+            overdrawn.len()
+        );
+    }
 }
