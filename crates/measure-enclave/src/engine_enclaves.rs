@@ -291,6 +291,7 @@ containers:
       - EIDOLA_ENGINE_PREFIX_CACHE: "true"
       - EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS: "900"
       - EIDOLA_ENGINE_CACHE_MAX_AGE_SECS: "7200"
+      - EIDOLA_ENGINE_KV_HOST_BYTES: "34359738368"
 "#,
             digest = "2".repeat(64),
             weights = "3".repeat(64),
@@ -458,7 +459,10 @@ containers:
             err.contains(OTHER) && err.contains("prompt_cache differs"),
             "{err}"
         );
-        let no_cache = good.replace("PREFIX_CACHE: \"true\"", "PREFIX_CACHE: \"false\"");
+        // Without the cache the host tier must be 0 too.
+        let no_cache = good
+            .replace("PREFIX_CACHE: \"true\"", "PREFIX_CACHE: \"false\"")
+            .replace("KV_HOST_BYTES: \"34359738368\"", "KV_HOST_BYTES: \"0\"");
         let err = two(entry(OTHER, &no_cache, SIDECAR))
             .unwrap_err()
             .to_string();
@@ -621,7 +625,9 @@ containers:
                 .contains("may not set \"TOKIO_WORKER_THREADS\"")
         );
         let tiny = good.replace("memory: 65536", "memory: 1");
-        assert!(entry("fixture-model", &tiny, SIDECAR).contains("memory must be a power of two"));
+        assert!(
+            entry("fixture-model", &tiny, SIDECAR).contains("memory must be a whole number of GiB")
+        );
         let tagged = good.replace(&format!("@sha256:{}", "2".repeat(64)), ":v1");
         assert!(entry("fixture-model", &tagged, SIDECAR).contains("exactly one container"));
 

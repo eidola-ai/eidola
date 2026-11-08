@@ -128,6 +128,7 @@ const SLOTS: u32 = 9;
 fn gpu_config(depths: u32, blocks: u32, graphs: CudaGraphs) -> CudaExecutorConfig {
     CudaExecutorConfig {
         block_size: BS,
+        host_blocks: eidola_engine_cuda::KvBlocks::default(),
         num_blocks: KvBlocks {
             global: blocks,
             sliding: blocks,
@@ -393,6 +394,16 @@ impl Run<CudaExecutor> {
                 assert!(
                     self.ex().block_is_zero(g, b).unwrap(),
                     "free block {g}/{b} holds data with no zero pending"
+                );
+                checked += 1;
+            }
+        }
+        let host_zeros = kv.pending_host_zeros();
+        for (g, hb) in kv.free_host_set() {
+            if !host_zeros.contains(&(g, hb)) {
+                assert!(
+                    self.ex().host_block_is_zero(g, hb).unwrap(),
+                    "free host block {g}/{hb} holds data with no zero pending"
                 );
                 checked += 1;
             }
@@ -836,4 +847,70 @@ fn graphs_and_eager_agree_with_drafting() {
         outs.push(r.outputs);
     }
     assert_eq!(outs[0], outs[1], "graphs on and off give the same tokens");
+}
+
+/// With a host tier, a conversation pushed off the device by others drafts
+/// from blocks promoted back from host memory (its MTP KV and boundary taps
+/// included): the same tokens as its first run, every greedy token within
+/// the reference's margin, and every free host block zero.
+#[test]
+fn drafting_resumes_from_blocks_promoted_from_the_host_tier() {
+    let Some(env) = env() else { return };
+    let Some(su) = setup() else { return };
+    let prompts = pressure_prompts(&env.text);
+    let mut cfg = gpu_config(3, 16, CudaGraphs::Off);
+    cfg.host_blocks = KvBlocks {
+        global: 96,
+        sliding: 96,
+        drafter: 96,
+    };
+    let ex = CudaExecutor::new(su.gpu, &su.dir, env.store.clone(), Some(&KEEP), cfg).unwrap();
+    // Each prompt alone under its own key, then the first again.
+    let mut jobs: Vec<Job> = (0..6u64)
+        .map(|id| {
+            let key = u8::try_from(id).unwrap();
+            job(
+                id * 100,
+                id,
+                &prompts[&id].0,
+                SamplingParams::greedy(),
+                14,
+                Some(key),
+            )
+        })
+        .collect();
+    jobs.push(job(
+        600,
+        6,
+        &prompts[&0].0,
+        SamplingParams::greedy(),
+        14,
+        Some(0),
+    ));
+    let mut r = Run::new(ex, 32, true, jobs);
+    let mut zero_checks = 0;
+    while !r.done() {
+        r.step();
+        if r.eng.unfinished() == 0 {
+            r.eng.flush().unwrap();
+        }
+        zero_checks += r.check_kv();
+    }
+    let tier = r.eng.kv().tier_stats();
+    assert!(
+        tier.demoted_blocks > 0 && tier.promoted_blocks > 0,
+        "{tier:?}"
+    );
+    assert_eq!(
+        r.outputs[&6], r.outputs[&0],
+        "the same tokens from promoted blocks"
+    );
+    assert!(r.cached[&6] > 0);
+    let mut all = prompts.clone();
+    all.insert(6, prompts[&0].clone());
+    let (n, exact, worst) = check_outputs(&all, &r.outputs);
+    println!(
+        "host tier, D 3: {tier:?}; {n} greedy tokens, {exact} the reference argmax, worst trail \
+         {worst:.3}; {zero_checks} zero checks"
+    );
 }

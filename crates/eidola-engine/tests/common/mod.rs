@@ -94,7 +94,40 @@ impl Harness {
         // queued encryptions and decryptions have run.
         let idle = kv.idle_blocks();
         let crypts = kv.pending_crypts();
+        let transfers = kv.pending_transfers();
+        let landing: std::collections::BTreeSet<(u32, u32)> = transfers
+            .iter()
+            .filter(|t| !t.3)
+            .map(|t| (t.0, t.1))
+            .collect();
+        let demoting: std::collections::BTreeSet<(u32, u32)> = transfers
+            .iter()
+            .filter(|t| t.3)
+            .map(|t| (t.0, t.2))
+            .collect();
+        // The host tier: free host blocks are zero or have a zero queued, and every held
+        // one holds ciphertext (once a queued demotion into it has run).
+        let host_zeros = kv.pending_host_zeros();
+        for (g, hb) in kv.free_host_set() {
+            if !host_zeros.contains(&(g, hb)) {
+                assert!(
+                    self.eng.executor().host_block_is_zero(g, hb),
+                    "free host block {g}/{hb} holds data with no zero pending"
+                );
+            }
+        }
+        for (g, hb) in kv.host_cache_blocks() {
+            if !demoting.contains(&(g, hb)) {
+                assert!(
+                    self.eng.executor().host_encrypted_under(g, hb).is_some(),
+                    "held host block {g}/{hb} holds no ciphertext"
+                );
+            }
+        }
         for (g, b) in kv.cache_blocks().union(&kv.sequence_blocks()) {
+            if landing.contains(&(*g, *b)) {
+                continue;
+            }
             let want = idle.contains(&(*g, *b));
             let device = self.eng.executor().block_is_encrypted(*g, *b);
             match crypts.get(&(*g, *b)) {

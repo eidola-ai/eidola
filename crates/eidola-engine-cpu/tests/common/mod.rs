@@ -42,6 +42,34 @@ impl TestRng {
     }
 }
 
+/// Raises this process's soft memory-lock limit to its hard limit, so the host tier's
+/// `mlock`ed pools fit where the soft limit is small (CI runners often allow 8 MiB or
+/// less). Never lowers it. The host-tier tests also keep their pools small and run one
+/// at a time ([`memlock_guard`]); an executor that still cannot lock its tier refuses
+/// to start with a message naming the limit.
+pub fn allow_memlock() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let l = getrlimit(Resource::Memlock);
+    if l.current.is_some() && l.current != l.maximum {
+        let _ = setrlimit(
+            Resource::Memlock,
+            Rlimit {
+                current: l.maximum,
+                maximum: l.maximum,
+            },
+        );
+    }
+}
+
+/// Serializes the tests of one binary that build executors with a host tier, so their
+/// locked pools never add up past a small limit; also raises the limit
+/// ([`allow_memlock`]).
+pub fn memlock_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    allow_memlock();
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The lineage of client key `[n; 32]` under a fixed boot key.
 pub fn salt(n: u8) -> Lineage {
     SaltDeriver::with_boot_key(BootKey::from_bytes([0; 32])).lineage(&CacheKey::from_bytes([n; 32]))
@@ -70,6 +98,7 @@ pub fn exec_config(blocks: u32, mtp_depths: Vec<usize>) -> CpuExecutorConfig {
     CpuExecutorConfig {
         block_size: 4,
         num_blocks: blocks,
+        host_blocks: 0,
         num_state_slots: 32,
         max_model_len: 512,
         buckets: vec![
@@ -339,7 +368,39 @@ impl Harness {
         // queued encryptions and decryptions have run.
         let idle = kv.idle_blocks();
         let crypts = kv.pending_crypts();
+        let transfers = kv.pending_transfers();
+        let landing: std::collections::BTreeSet<(u32, u32)> = transfers
+            .iter()
+            .filter(|t| !t.3)
+            .map(|t| (t.0, t.1))
+            .collect();
+        let demoting: std::collections::BTreeSet<(u32, u32)> = transfers
+            .iter()
+            .filter(|t| t.3)
+            .map(|t| (t.0, t.2))
+            .collect();
+        // The host tier: free host blocks zero or with a zero queued, held ones ciphertext.
+        let host_zeros = kv.pending_host_zeros();
+        for (g, hb) in kv.free_host_set() {
+            if !host_zeros.contains(&(g, hb)) {
+                assert!(
+                    self.eng.executor().host_block_is_zero(g, hb),
+                    "free host block {g}/{hb} holds data with no zero pending"
+                );
+            }
+        }
+        for (g, hb) in kv.host_cache_blocks() {
+            if !demoting.contains(&(g, hb)) {
+                assert!(
+                    self.eng.executor().host_block_is_encrypted(g, hb),
+                    "held host block {g}/{hb} holds no ciphertext"
+                );
+            }
+        }
         for (g, b) in kv.cache_blocks().union(&kv.sequence_blocks()) {
+            if landing.contains(&(*g, *b)) {
+                continue;
+            }
             let want = idle.contains(&(*g, *b));
             let device = self.eng.executor().block_is_encrypted(*g, *b);
             match crypts.get(&(*g, *b)) {

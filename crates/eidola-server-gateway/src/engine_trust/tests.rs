@@ -431,6 +431,8 @@ fn the_prompt_cache_policy_is_the_configs() {
 
     let mut tree = Tree::fixture();
     tree.edit_config("PREFIX_CACHE: \"true\"", "PREFIX_CACHE: \"false\"");
+    refused(&tree, "EIDOLA_ENGINE_KV_HOST_BYTES must be 0");
+    tree.edit_config("KV_HOST_BYTES: \"34359738368\"", "KV_HOST_BYTES: \"0\"");
     refused(
         &tree,
         "but the config sets CheckedCachePolicy { enabled: false",
@@ -1064,13 +1066,45 @@ fn allocations_are_capped_and_fit_the_deployment() {
     // Host, near the limit: each request slot can hold 645,922,816 bytes at
     // worst (a 32 MiB body of up to 2^18 JSON values with both parses in the
     // read pool, and its tree, prompt and tokens in the admission pool); 99
-    // fit 64 GiB beside the headroom and tables, 100 do not.
+    // fit 64 GiB beside the headroom and tables, 100 do not (with no host
+    // tier).
+    let no_tier = |tree: &mut Tree| {
+        tree.edit_config("KV_HOST_BYTES: \"34359738368\"", "KV_HOST_BYTES: \"0\"");
+    };
     let mut tree = Tree::fixture();
+    no_tier(&mut tree);
     tree.edit_config("MAX_REQUESTS: \"8\"", "MAX_REQUESTS: \"99\"");
     tree.check().expect("99 request slots fit 64 GiB");
     let mut tree = Tree::fixture();
+    no_tier(&mut tree);
     tree.edit_config("MAX_REQUESTS: \"8\"", "MAX_REQUESTS: \"100\"");
     refused(&tree, "more than the VM's");
+    // The prefix cache's host tier is page-locked VM memory beside all that:
+    // with the fixture's 8 slots, a tier of exactly the rest of 64 GiB fits,
+    // a byte more does not; and it is capped at the largest VM.
+    let measured = fixture_measured(&Tree::fixture());
+    let rest = (65_536u64 << 20) - engine_deployment::host_memory_bytes(&measured.sizing);
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "KV_HOST_BYTES: \"34359738368\"",
+        &format!("KV_HOST_BYTES: \"{rest}\""),
+    );
+    tree.check().expect("the host tier fills the VM exactly");
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "KV_HOST_BYTES: \"34359738368\"",
+        &format!("KV_HOST_BYTES: \"{}\"", rest + 1),
+    );
+    refused(&tree, "host tier (EIDOLA_ENGINE_KV_HOST_BYTES)");
+    let mut tree = Tree::fixture();
+    tree.edit_config(
+        "KV_HOST_BYTES: \"34359738368\"",
+        &format!(
+            "KV_HOST_BYTES: \"{}\"",
+            engine_deployment::caps::KV_HOST_BYTES + 1
+        ),
+    );
+    refused(&tree, "EIDOLA_ENGINE_KV_HOST_BYTES must be at most");
     // Device: the KV budget holds one longest sequence, every seat's sliding
     // windows and, drafting three tokens, the drafter pool of as many blocks
     // with their boundary taps, each pool with its pad block, at their
@@ -1475,12 +1509,12 @@ fn the_vm_is_a_launchable_shape() {
         (
             "memory: 65536",
             "memory: 1",
-            "memory must be a power of two",
+            "memory must be a whole number of GiB",
         ),
         (
             "memory: 65536",
             "memory: 65000",
-            "memory must be a power of two",
+            "memory must be a whole number of GiB",
         ),
         ("cpus: 16", "cpus: 0", "cpus must be from"),
         ("cpus: 16", "cpus: 1000", "cpus must be from"),

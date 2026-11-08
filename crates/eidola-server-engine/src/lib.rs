@@ -7,6 +7,7 @@
 //! * [`auth`] — the gateway token (measured Argon2id hash, constant-time per request).
 //! * [`model`] — the weights hash, checked before loading, and the loaded model.
 //! * [`storage`] — the `verified-readonly` storage check (mount and superblock read-only).
+//! * [`swap`] — the boot refusal of a guest with active swap.
 //! * [`api`] — the strict request subset; [`error`] — refusals, with log-safe `Display`.
 //! * [`pipeline`] — template, tokens, sampling and cache scope in; detokenizer, stop
 //!   sequences, reasoning and tool calls out.
@@ -26,6 +27,7 @@ pub mod http;
 pub mod model;
 pub mod pipeline;
 pub mod storage;
+pub mod swap;
 pub mod worker;
 
 use std::sync::Arc;
@@ -159,11 +161,19 @@ pub async fn os_shutdown_signal() {
     tracing::info!("shutting down");
 }
 
-/// Verifies and loads the configured weights, then starts the node. In order: the
-/// weights storage, the weights hash, the model's files (and, for the CPU executor, the
-/// reference model), then the executor ([`start`]); a refusal at any step ends the boot
-/// with nothing served.
+/// Verifies and loads the configured weights, then starts the node. In order: no active
+/// swap ([`swap::check_guest`]), the weights storage, the weights hash, the model's files
+/// (and, for the CPU executor, the reference model), then the executor ([`start`]); a
+/// refusal at any step ends the boot with nothing served.
 pub fn boot(config: Config) -> Result<Node, BootError> {
+    boot_with_swap_list(config, std::path::Path::new(swap::PROC_SWAPS))
+}
+
+/// [`boot`] with the swap check reading the list at `swaps` instead of
+/// [`swap::PROC_SWAPS`]: for tests whose machine has swap (CI runners do) and that check
+/// what boot does after it. The node itself only ever calls [`boot`].
+pub fn boot_with_swap_list(config: Config, swaps: &std::path::Path) -> Result<Node, BootError> {
+    swap::check_guest_at(config.weights_storage, config.kv_host_bytes, swaps)?;
     let model = LoadedModel::load(
         &config.weights_dir,
         &config.expected_weights_sha256,
@@ -172,6 +182,28 @@ pub fn boot(config: Config) -> Result<Node, BootError> {
     )
     .map_err(|e| BootError(e.to_string()))?;
     start(config, Arc::new(model))
+}
+
+/// The CPU executor's host-tier block count from `kv_host_bytes`: as many blocks of every
+/// group together as the budget holds (one count for every group, as its pools have; the
+/// null block among them). 0 is none; a budget under two blocks is refused.
+fn cpu_host_blocks(
+    model: &Arc<eidola_engine_model::ReferenceModel>,
+    cfg: &CpuExecutorConfig,
+    kv_host_bytes: u64,
+) -> Result<u32, BootError> {
+    if kv_host_bytes == 0 {
+        return Ok(0);
+    }
+    let per_block = CpuExecutor::kv_block_bytes(model, cfg).max(1);
+    let blocks = (kv_host_bytes / per_block).min(i32::MAX as u64);
+    if blocks < 2 {
+        return Err(BootError(format!(
+            "{} ({kv_host_bytes}) holds fewer than two host blocks of {per_block} bytes",
+            config::env::KV_HOST_BYTES
+        )));
+    }
+    Ok(blocks as u32)
 }
 
 /// Starts the node over an already verified model. Refuses unless the model's verified
@@ -226,9 +258,10 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
                 )));
             }
             // One captured shape: the CPU executor runs any batch within it unpadded.
-            let exec_config = CpuExecutorConfig {
+            let mut exec_config = CpuExecutorConfig {
                 block_size: sizing.kv_block_size,
                 num_blocks: *kv_blocks,
+                host_blocks: 0,
                 num_state_slots: sizing.max_seqs,
                 max_model_len: sizing.max_model_len,
                 buckets: vec![Bucket {
@@ -241,6 +274,8 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
                 pad_batches: false,
                 record: false,
             };
+            exec_config.host_blocks =
+                cpu_host_blocks(&reference, &exec_config, config.kv_host_bytes)?;
             let engine = worker::spawn(
                 move || Ok(CpuExecutor::new(reference, exec_config)),
                 scheduler,
@@ -263,6 +298,7 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
                 &config.cache,
                 kernels_dir,
                 *kv_device_bytes,
+                config.kv_host_bytes,
                 *graphs,
                 *gpu_cc,
             )?;
@@ -275,6 +311,9 @@ pub fn start(config: Config, model: Arc<LoadedModel>) -> Result<Node, BootError>
                 global_kv_blocks = blocks.global,
                 sliding_kv_blocks = blocks.sliding,
                 drafter_kv_blocks = blocks.drafter,
+                global_host_kv_blocks = prepared.config().host_blocks.global,
+                sliding_host_kv_blocks = prepared.config().host_blocks.sliding,
+                drafter_host_kv_blocks = prepared.config().host_blocks.drafter,
                 draft_tokens = prepared.config().draft_tokens,
                 cuda_graphs = prepared.config().graphs.as_str(),
                 "loading the model onto the device"

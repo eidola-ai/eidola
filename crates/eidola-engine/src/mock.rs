@@ -18,6 +18,12 @@
 //! read of a block left encrypted fails like a read of a zeroed one. The mock also records
 //! which key encrypted each block (as a keystream fingerprint, not the key) and fails a
 //! step that decrypts under another key, decrypts a plaintext block or encrypts twice.
+//!
+//! With a host tier ([`KvGroupSpec::host_blocks`], see [`with_host_tier`]) the mock keeps
+//! a second memory per group. `Demote` copies a block and its key fingerprint there and
+//! fails on a block that is not encrypted; `Promote` copies back and fails unless the host
+//! block holds ciphertext and the device block is zero (its zero ran first); `ZeroHost`
+//! scrubs. So a plaintext block can never reach the host tier through a passing step.
 
 use std::collections::HashMap;
 
@@ -69,6 +75,7 @@ pub fn mimo_like_spec(
         head_dim_qk: 192,
         head_dim_v: 128,
         num_blocks,
+        host_blocks: 0,
     };
     ModelSpec {
         vocab_size: vocab,
@@ -109,6 +116,15 @@ pub fn mimo_like_spec(
             },
         ],
     }
+}
+
+/// `spec` with a host tier of `host_blocks` blocks (the null block included) in every
+/// group.
+pub fn with_host_tier(mut spec: ModelSpec, host_blocks: u32) -> ModelSpec {
+    for g in &mut spec.kv_groups {
+        g.host_blocks = host_blocks;
+    }
+    spec
 }
 
 /// KV value for `token` at `pos` in `group` (never zero).
@@ -202,6 +218,14 @@ pub struct MockExecutor {
     encrypted: Vec<Vec<Option<u64>>>,
     /// Every executed encrypt (`true`) or decrypt as `(step, group, block, encrypt)`.
     crypt_log: Vec<(u64, u32, u32, bool)>,
+    /// `[group][host * block_size + offset]`: the host tier, like `memory`.
+    host_memory: Vec<Vec<(u64, u32)>>,
+    /// `[group][host]`: the fingerprint of the key a host block's ciphertext is under.
+    host_encrypted: Vec<Vec<Option<u64>>>,
+    /// Every executed demote (`true`) or promote as `(step, group, block, host, demote)`.
+    transfer_log: Vec<(u64, u32, u32, u32, bool)>,
+    /// Every executed host zero as `(step, group, host)`.
+    host_zero_log: Vec<(u64, u32, u32)>,
     steps: u64,
     buckets_used: Vec<Bucket>,
     rows_used: Vec<Vec<SeqEntry>>,
@@ -228,6 +252,18 @@ impl MockExecutor {
                 .map(|g| vec![None; g.num_blocks as usize])
                 .collect(),
             crypt_log: Vec::new(),
+            host_memory: spec
+                .kv_groups
+                .iter()
+                .map(|g| vec![(0, 0); g.host_blocks as usize * bs])
+                .collect(),
+            host_encrypted: spec
+                .kv_groups
+                .iter()
+                .map(|g| vec![None; g.host_blocks as usize])
+                .collect(),
+            transfer_log: Vec::new(),
+            host_zero_log: Vec::new(),
             steps: 0,
             buckets_used: Vec::new(),
             rows_used: Vec::new(),
@@ -255,6 +291,43 @@ impl MockExecutor {
     /// Equal fingerprints mean the same key.
     pub fn encrypted_under(&self, group: u32, block: u32) -> Option<u64> {
         self.encrypted[group as usize][block as usize]
+    }
+
+    /// Every executed demote (`true`) or promote as `(step, group, block, host, demote)`.
+    pub fn transfer_log(&self) -> &[(u64, u32, u32, u32, bool)] {
+        &self.transfer_log
+    }
+
+    /// Every executed host zero as `(step, group, host)`.
+    pub fn host_zero_log(&self) -> &[(u64, u32, u32)] {
+        &self.host_zero_log
+    }
+
+    /// Whether every byte of a host block is zero.
+    pub fn host_block_is_zero(&self, group: u32, host: u32) -> bool {
+        self.host_block(group, host)
+            .iter()
+            .all(|&(v, p)| v == 0 && p == 0)
+    }
+
+    /// The keystream fingerprint a host block's ciphertext is under (`None`: it holds
+    /// none).
+    pub fn host_encrypted_under(&self, group: u32, host: u32) -> Option<u64> {
+        self.host_encrypted[group as usize][host as usize]
+    }
+
+    /// A host block's stored entries, `(value, position)` per offset, as they are.
+    pub fn host_block(&self, group: u32, host: u32) -> &[(u64, u32)] {
+        let bs = self.spec.block_size as usize;
+        let start = host as usize * bs;
+        &self.host_memory[group as usize][start..start + bs]
+    }
+
+    /// A device block's stored entries, `(value, position)` per offset, as they are.
+    pub fn device_block(&self, group: u32, block: u32) -> &[(u64, u32)] {
+        let bs = self.spec.block_size as usize;
+        let start = block as usize * bs;
+        &self.memory[group as usize][start..start + bs]
     }
 
     /// Steps executed.
@@ -503,6 +576,43 @@ impl Executor for MockExecutor {
                     );
                     let e = &mut self.encrypted[group as usize];
                     e[dst as usize] = e[src as usize];
+                }
+                Maintenance::Demote { group, block, host } => {
+                    let (g, b, h) = (group as usize, block as usize, host as usize);
+                    let Some(print) = self.encrypted[g][b] else {
+                        return Err(ExecutorError(format!(
+                            "group {group} block {block}: demote of a plaintext block"
+                        )));
+                    };
+                    let cells = self.memory[g][b * bs..(b + 1) * bs].to_vec();
+                    self.host_memory[g][h * bs..(h + 1) * bs].copy_from_slice(&cells);
+                    self.host_encrypted[g][h] = Some(print);
+                    self.transfer_log
+                        .push((self.steps, group, block, host, true));
+                }
+                Maintenance::Promote { group, host, block } => {
+                    let (g, b, h) = (group as usize, block as usize, host as usize);
+                    let Some(print) = self.host_encrypted[g][h] else {
+                        return Err(ExecutorError(format!(
+                            "group {group} host block {host}: promote of a block holding no ciphertext"
+                        )));
+                    };
+                    if !self.block_is_zero(group, block) || self.encrypted[g][b].is_some() {
+                        return Err(ExecutorError(format!(
+                            "group {group} block {block}: promote into a block that is not zero"
+                        )));
+                    }
+                    let cells = self.host_memory[g][h * bs..(h + 1) * bs].to_vec();
+                    self.memory[g][b * bs..(b + 1) * bs].copy_from_slice(&cells);
+                    self.encrypted[g][b] = Some(print);
+                    self.transfer_log
+                        .push((self.steps, group, block, host, false));
+                }
+                Maintenance::ZeroHost { group, host } => {
+                    let (g, h) = (group as usize, host as usize);
+                    self.host_memory[g][h * bs..(h + 1) * bs].fill((0, 0));
+                    self.host_encrypted[g][h] = None;
+                    self.host_zero_log.push((self.steps, group, host));
                 }
                 Maintenance::ResetSlot { slot } => {
                     for g in 0..self.spec.kv_groups.len() {

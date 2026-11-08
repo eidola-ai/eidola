@@ -89,6 +89,9 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     pub sizing: Sizing,
     pub cache: CacheConfig,
+    /// Host memory for the prefix cache's host tier, in bytes (0: none); each executor
+    /// derives its host block counts from it.
+    pub kv_host_bytes: u64,
 }
 
 /// A refused configuration. Names the variable and the problem, never its value (one of
@@ -161,6 +164,7 @@ impl Config {
             bind_addr: measured.bind_addr,
             sizing: measured.sizing,
             cache: measured.cache,
+            kv_host_bytes: measured.kv_host_bytes,
         })
     }
 }

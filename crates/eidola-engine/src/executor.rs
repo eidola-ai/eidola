@@ -16,10 +16,14 @@
 //!
 //! [`Executor::execute`] runs exactly this sequence, with no host interaction in between:
 //!
-//! 1. `maintenance`, in order ([`Maintenance::Copy`], [`Maintenance::Zero`],
-//!    [`Maintenance::ResetSlot`], [`Maintenance::Encrypt`], [`Maintenance::Decrypt`]).
-//!    Every zero completes before any later write to that block, and every decrypt before
-//!    any read of it, including this step's forward.
+//! 1. `maintenance`, in the order given ([`Maintenance::Copy`], [`Maintenance::Zero`],
+//!    [`Maintenance::ResetSlot`], [`Maintenance::Encrypt`], [`Maintenance::Decrypt`],
+//!    and the host tier's [`Maintenance::Demote`], [`Maintenance::Promote`] and
+//!    [`Maintenance::ZeroHost`]). Every operation on a block takes effect after the
+//!    operations listed before it that touch the same block (device or host) and before
+//!    those after it: every zero before any later write to that block, every demote's read
+//!    before the zero that follows it, every promote before the decrypt that follows it,
+//!    and every decrypt before any read of the block, including this step's forward.
 //! 2. `table_updates`, in order: `table[slot][group][index] = block`.
 //! 3. The forward: for each [`SeqEntry`], its host tokens occupy positions
 //!    `context_len .. context_len + num_tokens`. KV for every query position is written
@@ -65,11 +69,37 @@
 //! the same operation; they are distinct operations so that each can be checked.
 //!
 //! Between two steps the host names a block in at most one encrypt or decrypt, and never
-//! in both one of those and a zero or copy, so an executor may run all of a step's
-//! encryptions together (one launch); it must still finish them before the forward reads.
+//! lists a zero, copy or demote of a block after its encrypt or decrypt, so an executor
+//! may run a run of consecutive encryptions and decryptions together (one launch); it must
+//! still finish them before the forward reads. (A block may be zeroed, promoted into, and
+//! then decrypted in one step: a demoted block's id reused for a promoted one.)
 //! An executor keeps no key past the step: whatever device or host copy it makes of
 //! [`StepInput::kv_keys`] is zeroed before `execute` returns or by stream-ordered work
 //! queued before the forward.
+//!
+//! # Host tier
+//!
+//! An executor may keep a second, larger pool per group in host memory
+//! ([`crate::spec::KvGroupSpec::host_blocks`]: the confidential VM's own memory, never
+//! durable media), where the host parks idle prefix-cache blocks evicted from the device
+//! pools under pressure instead of dropping them. Host blocks have their own ids
+//! (`1..host_blocks`, 0 reserved), and the host owns their allocation exactly as it owns
+//! the device pools'. Only ciphertext ever moves there:
+//!
+//! * [`Maintenance::Demote`] copies a device block's whole image (every byte
+//!   [`Maintenance::Zero`] would zero) into a host block. The host demotes only a block
+//!   that is encrypted when the step begins, and queues the device block's zero after it.
+//! * [`Maintenance::Promote`] copies a host block's image back into a device block the
+//!   host just allocated (and whose zero, if any, is listed before it). The block is still
+//!   ciphertext; a [`Maintenance::Decrypt`] after it is what a hit then maps.
+//! * [`Maintenance::ZeroHost`] overwrites a host block with zeros. The host issues it for
+//!   every host block that stops holding an entry, after any promote that reads it, and
+//!   never names that block in a demote before the next step. Unlike device work it may
+//!   run after the forward, but it completes before `execute` returns.
+//!
+//! The executor never decrypts, encrypts or reads a host block for any other purpose, and
+//! holds no key for one. Host-tier memory must be locked into RAM (page-locked, never
+//! swapped); the node refuses to boot on a guest with active swap.
 //!
 //! # Graph capture
 //!
@@ -198,6 +228,36 @@ pub enum Maintenance {
         key: u32,
         /// The block's nonce.
         nonce: KvNonce,
+    },
+    /// Copy every byte of device `block` that [`Maintenance::Zero`] would zero into host
+    /// block `host` of `group`'s host tier. The block is ciphertext. Issued when an idle
+    /// entry is demoted under device pressure; its zero follows.
+    Demote {
+        /// KV group index.
+        group: u32,
+        /// Device block to copy from.
+        block: u32,
+        /// Host block to copy into.
+        host: u32,
+    },
+    /// Copy host block `host` of `group` back into device `block` (still ciphertext).
+    /// Issued when a prefix-cache hit needs a demoted block; a decrypt follows if a
+    /// sequence maps it.
+    Promote {
+        /// KV group index.
+        group: u32,
+        /// Host block to copy from.
+        host: u32,
+        /// Device block to copy into.
+        block: u32,
+    },
+    /// Overwrite every byte of host block `host` of `group` with zeros. Issued for every
+    /// host block that stops holding an entry (promoted, evicted or expired).
+    ZeroHost {
+        /// KV group index.
+        group: u32,
+        /// Host block to scrub.
+        host: u32,
     },
 }
 

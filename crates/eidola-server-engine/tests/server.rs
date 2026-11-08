@@ -57,6 +57,7 @@ fn direct_greedy(prompt: Vec<u32>, max_tokens: u32) -> (Vec<u32>, FinishReason) 
         CpuExecutorConfig {
             block_size: 16,
             num_blocks: 256,
+            host_blocks: 0,
             num_state_slots: 4,
             max_model_len: 1024,
             buckets: vec![Bucket {
@@ -1001,6 +1002,83 @@ async fn cache_key_reuses_the_prefix_only_for_the_same_key() {
     );
 }
 
+/// With a host tier, a conversation pushed off small KV pools by other keys' requests
+/// keeps its cached prefix (demoted to host memory, promoted back) and its output; without
+/// one, the same traffic drops it. The tier is sized from the executor's own block bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_tier_keeps_a_conversation_through_kv_pressure() {
+    use base64::Engine as _;
+    let b64 = |byte: u8| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32]);
+    let keyed = |key: u8| {
+        let mut b = request(LONG_TEXT, 4);
+        b["cache_key"] = b64(key).into();
+        b
+    };
+    let cached = |v: &Value| {
+        v["usage"]["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap()
+    };
+    let model = loaded();
+    let probe = CpuExecutorConfig {
+        block_size: 16,
+        num_blocks: 2,
+        host_blocks: 0,
+        num_state_slots: 4,
+        max_model_len: 1024,
+        buckets: vec![Bucket {
+            max_seqs: 4,
+            max_tokens: 256,
+        }],
+        mtp_depths: vec![0, 1],
+        mtp_hidden: MtpHidden::Normed,
+        sampleable_vocab_size: model.tokenizer().vocab_size() as u32,
+        pad_batches: false,
+        record: false,
+    };
+    let per_block = CpuExecutor::kv_block_bytes(model.reference().unwrap(), &probe);
+    // Room for the pushed-out conversations and small enough to lock under an 8 MiB
+    // memory-lock limit; the soft limit is raised to the hard one first.
+    let host_bytes = (24 * per_block).to_string();
+    assert!(
+        24 * per_block < 6 << 20,
+        "the host tier ({} bytes) stays under small memory-lock limits",
+        24 * per_block
+    );
+    {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        let l = getrlimit(Resource::Memlock);
+        if l.current.is_some() && l.current != l.maximum {
+            let _ = setrlimit(
+                Resource::Memlock,
+                Rlimit {
+                    current: l.maximum,
+                    maximum: l.maximum,
+                },
+            );
+        }
+    }
+    let mut runs = Vec::new();
+    for host in ["0", host_bytes.as_str()] {
+        let node = TestNode::start(&[(env::KV_BLOCKS, "16"), (env::KV_HOST_BYTES, host)]).await;
+        let (_, first) = node.chat_json(&keyed(1)).await;
+        let (_, hit) = node.chat_json(&keyed(1)).await;
+        assert!(cached(&hit) > 0);
+        for other in 2..9u8 {
+            let (status, _) = node.chat_json(&keyed(other)).await;
+            assert_eq!(status, 200);
+        }
+        let (_, after) = node.chat_json(&keyed(1)).await;
+        assert_eq!(after["choices"], first["choices"]);
+        runs.push((cached(&hit), cached(&after)));
+    }
+    assert_eq!(
+        runs[0].1, 0,
+        "without a host tier the pressure drops the conversation"
+    );
+    assert_eq!(runs[1].1, runs[1].0, "with one it keeps the whole prefix");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn tools_and_tool_history_render_and_parse() {
     let node = TestNode::start(&[]).await;
@@ -1447,7 +1525,7 @@ fn concurrent_dev_model_builders_never_unpublish_each_other() {
 fn verified_readonly_refuses_a_writable_weights_directory() {
     let mut map = env_map();
     map.insert(env::WEIGHTS_STORAGE, "verified-readonly".into());
-    let err = eidola_server_engine::boot(config_from(&map).unwrap()).unwrap_err();
+    let err = boot_without_swap(config_from(&map).unwrap()).unwrap_err();
     assert!(err.to_string().contains("read-only mount"), "{err}");
     let err = eidola_server_engine::start(config_from(&map).unwrap(), loaded()).unwrap_err();
     assert!(err.to_string().contains("storage"), "{err}");
@@ -1467,10 +1545,46 @@ fn verified_readonly_checks_storage_before_parsing() {
     let mut map = env_map();
     map.insert(env::WEIGHTS_STORAGE, "verified-readonly".into());
     map.insert(env::WEIGHTS_DIR, dir.path().display().to_string());
-    let err = eidola_server_engine::boot(config_from(&map).unwrap()).unwrap_err();
+    let err = boot_without_swap(config_from(&map).unwrap()).unwrap_err();
     assert!(err.to_string().contains("read-only mount"), "{err}");
     // The same directory in development mode does get parsed (and fails there).
     map.insert(env::WEIGHTS_STORAGE, "dev-writable".into());
-    let err = eidola_server_engine::boot(config_from(&map).unwrap()).unwrap_err();
+    let err = boot_without_swap(config_from(&map).unwrap()).unwrap_err();
     assert!(err.to_string().contains("cannot open the weights"), "{err}");
+}
+
+/// `boot` itself, which the binary calls, reads the machine's own `/proc/swaps`: a
+/// `verified-readonly` node on a writable directory is refused for swap exactly where the
+/// real list names an active area (Linux), and for its storage otherwise. With a list that
+/// names one (injected), the swap refusal comes first on Linux.
+#[test]
+fn boot_reads_the_machines_own_swap_list() {
+    let mut map = env_map();
+    map.insert(env::WEIGHTS_STORAGE, "verified-readonly".into());
+    let err = eidola_server_engine::boot(config_from(&map).unwrap())
+        .unwrap_err()
+        .to_string();
+    let real = eidola_server_engine::swap::check_no_swap(std::path::Path::new(
+        eidola_server_engine::swap::PROC_SWAPS,
+    ));
+    if cfg!(target_os = "linux") && real.is_err() {
+        assert!(err.contains("active swap"), "{err}");
+    } else {
+        assert!(err.contains("read-only mount"), "{err}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let swapping = dir.path().join("swaps");
+    std::fs::write(
+        &swapping,
+        "Filename Type Size Used Priority\n/swapfile file 4194300 0 -2\n",
+    )
+    .unwrap();
+    let err = eidola_server_engine::boot_with_swap_list(config_from(&map).unwrap(), &swapping)
+        .unwrap_err()
+        .to_string();
+    if cfg!(target_os = "linux") {
+        assert!(err.contains("1 active swap area"), "{err}");
+    } else {
+        assert!(err.contains("read-only mount"), "{err}");
+    }
 }
