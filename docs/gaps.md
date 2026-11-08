@@ -82,6 +82,42 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 
 **Future.** Distributing pinned attestants across hardware vendors, custody arrangements, and jurisdictions raises the cost of coordinated legal compulsion — the central concern of the no-coercion attestation claims in [privacy-guarantees.md §6.4](privacy-guarantees.md#6-release-integrity) and the bounded claim in [§8.7](privacy-guarantees.md#8-bounded-claims-what-this-document-does-not-promise). This is a matter of organizational rollout, not engineering, but it is named here because it is part of what the guarantee depends on.
 
+## Anonymous credits
+
+The decisions behind anonymous payment, and the reasons for them, are in [anonymous-credits.md](anonymous-credits.md). These are the residuals it names, beside two listed above: [Spend timing at the database](#spend-timing-at-the-database) and [Credit left in a credential when its key lapses](#credit-left-in-a-credential-when-its-key-lapses).
+
+### Issuance-to-first-spend timing
+
+**Current behavior.** When a request needs a credit token and the wallet holds none that covers it, the client converts credits from the account and spends the new token immediately. The database records each issuance with its account and time, and sees each spend's nullifier as it is written. Whoever can watch the database, or the server's traffic, can therefore pair an issuance with the spend that follows it a moment later, linking the first spend of each token to its account. A prompt-cache key on that request then links the rest of its conversation lineage ([privacy-guarantees.md §2.7](privacy-guarantees.md#2-unlinkability)). Later spends of the same token's successors are not linked this way.
+
+**What constrains it today.** Allocations are large enough (about $1.00) that a token pays for many requests, so issuances are infrequent; tokens can be converted ahead of time by hand (`eidola account allocate`) and are then spent whenever they are needed.
+
+**Future.** Provision ahead of need: keep a token in reserve and replace it at a time unrelated to any request, so issuance and spending are decoupled by default rather than only when the user arranges it.
+
+### A lost issuance response strands its allocation
+
+**Current behavior.** The server debits the account and then returns the signed token. Issuance cannot be repeated: if the response is lost (a dropped connection, a client crash), the account has paid for a token the client never obtained.
+
+**What constrains it today.** Each automatic allocation is about $1.00, and nothing else is lost.
+
+**Future.** Idempotent issuance: the client names each issuance request, and the server keeps the response on the account side so the same request can be answered again. The response is already known to the issuer, so keeping it does not help link the token's spends.
+
+### A crash mid-spend strands the token's remaining value
+
+**Current behavior.** A spend records its nullifier before the request is served and stores the refund when it completes. If the gateway stops between the two (a crash, a restart), the nullifier is recorded with no refund. Recovery then answers that the refund is not yet available, indefinitely, and the token's whole remaining balance is lost, not just the request's charge.
+
+**What constrains it today.** The window is the duration of one request on one instance. The client keeps the spend's state and keeps retrying recovery until the key stops accepting.
+
+**Future.** Let recovery return the remaining balance of a spend whose refund never arrived: a refund of nothing returns the token's balance less the charge, so the server keeps everything it was paid. Telling an abandoned spend from one still in flight without a per-spend timestamp in the database is the design question.
+
+### Issuer key records are not authenticated against the database
+
+**Current behavior.** Issuer private keys are stored encrypted, but each key's windows (`issue_from`, `issue_until`, `accept_until`) are plain columns, and a gateway decides whether to create a new key from what the database reports. A database that rewrote a key's windows could extend or shorten how long its tokens are accepted. One that hid keys from a gateway instance could make that instance create a key of its own, so that the clients it serves form a smaller anonymity set.
+
+**What constrains it today.** Each instance caches its keys and asks the database only when its cache holds no current or next key, so a hidden key can split the set at most at an instance's start or a rotation, and only by instance. The client checks that every key it uses is named by the hash of its public key, and that every token and refund it receives is under that key with the request context every client under the key shares. It cannot check that other clients were given the same key.
+
+**Future.** Bind each key's windows into the encryption of its private key, so a row whose windows were changed does not decrypt, and publish the sequence of keys somewhere a client can compare against.
+
 ## Hardware
 
 ### Trust in confidential-compute vendors

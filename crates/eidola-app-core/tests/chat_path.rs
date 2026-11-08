@@ -889,6 +889,122 @@ fn auto_provisioning_empty_wallet_funded_account_succeeds() {
     });
 }
 
+/// A credential is stored under the key that signed it and that the client
+/// verified it against, never under an id the issuance response names. An
+/// issuance naming another key is refused, and nothing enters the wallet.
+#[test]
+fn an_issuance_naming_another_key_is_refused() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            issued_key_id: Some("ab".repeat(32)),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let mut rx = core.subscribe_changes();
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(100_000))
+            .expect_err("an issuance naming another key must be refused");
+        assert!(
+            matches!(err, AppError::Credential { .. }),
+            "unexpected error: {err:?}"
+        );
+        let changes = drain(&mut rx);
+        assert!(
+            !changes.contains(&Change::Wallet) && !changes.contains(&Change::Account),
+            "a refused issuance announced a wallet or account change: {changes:?}"
+        );
+        let wallet = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert!(wallet.is_empty(), "nothing may be stored: {wallet:?}");
+    });
+}
+
+/// A refund is a credential under the spent credential's own key. One naming
+/// another key is not stored, so the spent credential stays `spending` rather
+/// than gaining a successor labelled with a key it does not belong to.
+#[test]
+fn a_refund_naming_another_key_is_not_stored() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            refund_key_id: Some("ab".repeat(32)),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // The blocking turn reports the refund it could not apply as its own
+        // failure; what matters here is what reached the wallet.
+        if let Err(err) = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+        {
+            assert!(
+                matches!(err, AppError::Credential { .. }),
+                "unexpected error: {err:?}"
+            );
+        }
+        let wallet = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert!(
+            wallet.is_empty(),
+            "a successor was stored from a refund naming another key: {wallet:?}"
+        );
+        let spending = core
+            .runtime()
+            .block_on(core.wallet_spending_credentials())
+            .expect("spending");
+        assert_eq!(spending.len(), 1, "the spent credential stays in flight");
+    });
+}
+
+/// The request context is revealed by every spend of a credential and of all
+/// its successors, so a credential issued under a context other clients do
+/// not share is recognisable at each of them. The client refuses one, and
+/// one carrying a different amount from the one it asked for, before
+/// anything enters the wallet.
+#[test]
+fn an_issuance_that_could_mark_its_credential_is_refused() {
+    for (what, config) in [
+        (
+            "a context of its own",
+            MockConfig {
+                issuance_context: Some(chat_harness::distinct_context()),
+                ..MockConfig::default()
+            },
+        ),
+        (
+            "an amount other than the one asked for",
+            MockConfig {
+                issuance_extra_credits: 1,
+                ..MockConfig::default()
+            },
+        ),
+    ] {
+        run(move || {
+            let (_mock, core, _dir) = setup(config);
+            with_account(&core);
+            let err = core
+                .runtime()
+                .block_on(core.account_allocate(100_000))
+                .expect_err(what);
+            assert!(
+                matches!(err, AppError::Credential { .. }),
+                "{what}: unexpected error: {err:?}"
+            );
+            let wallet = core
+                .runtime()
+                .block_on(core.wallet_credentials())
+                .expect("wallet");
+            assert!(wallet.is_empty(), "{what}: stored {wallet:?}");
+        });
+    }
+}
+
 // ===========================================================================
 // Credential lifetime: bounded by the key's acceptance deadline
 // ===========================================================================

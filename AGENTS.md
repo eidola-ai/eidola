@@ -20,6 +20,7 @@ Eidola is a privacy-preserving AI chat system: an OpenAI-compatible proxy server
 | Website generator | `crates/eidola-www/AGENTS.md` |
 | Identity assets (the mark, app icons, favicon) | `brand/AGENTS.md` |
 | Design/threat-model background (published docs) | `docs/` |
+| Anonymous-credit payment doctrine (keys, issuance, spends, refunds, what Postgres may hold) — **check every change to credential, billing, wallet or charging code against it** | `docs/anonymous-credits.md` |
 
 ## Architecture at a glance
 
