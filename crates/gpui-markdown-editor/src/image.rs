@@ -68,6 +68,38 @@ impl LoadedImage {
     }
 }
 
+/// Which image sources [`load`] may resolve: a host-set gpui global,
+/// [`ImageSources::Any`] when unset.
+///
+/// The destination of `![alt](url)` is chosen by whoever wrote the
+/// markdown, and a host that renders text it did not write (a model's
+/// reply, a pasted document) hands that author a fetch of their choosing:
+/// a remote URL is a request whose path can carry anything the author
+/// could see, and a local path is an unbounded `fs::read` — `/dev/zero`
+/// never ends, and a FIFO blocks the loading thread in `open` forever.
+/// Such a host sets [`ImageSources::EmbeddedOnly`]; a refused source
+/// takes the [`LoadedImage::Failed`] path, so its markdown stays visible
+/// rather than silently vanishing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImageSources {
+    /// `http(s)`, `file://` and absolute paths, and embedded assets.
+    #[default]
+    Any,
+    /// Only the host's own `AssetSource` (relative paths).
+    EmbeddedOnly,
+}
+
+impl gpui::Global for ImageSources {}
+
+impl ImageSources {
+    fn allows(self, resource: &Resource) -> bool {
+        match self {
+            ImageSources::Any => true,
+            ImageSources::EmbeddedOnly => matches!(resource, Resource::Embedded(_)),
+        }
+    }
+}
+
 /// Resolve `dest_url` through gpui's image cache. Kicks off an
 /// asynchronous load the first time the URL is seen; subsequent
 /// frames see the cached result. The cache invalidates the view
@@ -85,6 +117,10 @@ impl LoadedImage {
 ///   `gpui::AssetSource` to resolve these.
 pub fn load(dest_url: &str, window: &mut Window, cx: &mut App) -> LoadedImage {
     let resource = make_resource(dest_url);
+    let policy = cx.try_global::<ImageSources>().copied().unwrap_or_default();
+    if !policy.allows(&resource) {
+        return LoadedImage::Failed;
+    }
     match window.use_asset::<ImgResourceLoader>(&resource, cx) {
         Some(Ok(data)) => LoadedImage::Loaded(data),
         Some(Err(_)) => LoadedImage::Failed,
@@ -232,5 +268,41 @@ mod tests {
         let fit = fit_contain(natural, bounds);
         assert_eq!(fit.size.width, px(50.0));
         assert_eq!(fit.size.height, px(25.0));
+    }
+
+    #[test]
+    fn embedded_only_refuses_every_source_the_markdown_author_picks() {
+        for url in [
+            "https://example.com/x.png?q=secret",
+            "http://127.0.0.1:8765/x.png",
+            "file:///dev/zero",
+            "/dev/zero",
+            "/tmp/pipe.fifo",
+        ] {
+            let resource = make_resource(url);
+            assert!(
+                !ImageSources::EmbeddedOnly.allows(&resource),
+                "{url} must be refused under EmbeddedOnly"
+            );
+            assert!(ImageSources::Any.allows(&resource), "{url} under Any");
+        }
+    }
+
+    #[test]
+    fn embedded_only_keeps_the_hosts_own_assets() {
+        for url in [
+            "icons/logo.png",
+            "images/x.svg",
+            "HTTPS://upper-case-is-not-a-scheme",
+        ] {
+            let resource = make_resource(url);
+            assert!(matches!(resource, Resource::Embedded(_)), "{url}");
+            assert!(ImageSources::EmbeddedOnly.allows(&resource), "{url}");
+        }
+    }
+
+    #[test]
+    fn unset_policy_is_any() {
+        assert_eq!(ImageSources::default(), ImageSources::Any);
     }
 }
