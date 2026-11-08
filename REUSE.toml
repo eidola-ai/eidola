@@ -123,7 +123,11 @@ SPDX-License-Identifier = "MIT"
 # AGPL-3.0): its signed platform endorsements and their Sigstore attestation
 # bundles, vendored as trust inputs; and two of its attestation bundles kept
 # as test fixtures (one from tinfoilsh/confidential-model-router, declared
-# AGPL-3.0).
+# AGPL-3.0). Both repositories ship the AGPL-3.0 text with no version
+# statement, and the licence's section 14 lets the recipient then choose any
+# version, so "or later" is the accurate reading. These files are signed data
+# that our tooling verifies and reads, not code linked into any crate, so
+# they do not bind the licences of the crates that read them.
 [[annotations]]
 path = [
     "releases/trust/platform-endorsements/**",
@@ -131,4 +135,4 @@ path = [
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = "© Tinfoil contributors"
-SPDX-License-Identifier = "AGPL-3.0-only"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
