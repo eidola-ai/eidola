@@ -594,7 +594,7 @@
           "Unlinked"
         ],
         "summary": "Recover a refund token for a previously spent ACT.",
-        "description": "If the ACT's nullifier was already recorded (the server received and\nprocessed the original request), the stored refund token is returned.\n\nIf the nullifier was NOT recorded (the original request never arrived),\nthe server verifies the spend proof, records the nullifier, issues a\nfull refund (no credits consumed), stores it, and returns it.\n\nIn both cases, the client gets a refund token it can combine with its\nlocal `PreRefund` state to reconstruct a credential.",
+        "description": "If the ACT's nullifier was already recorded (the server received and\nprocessed the original request), the stored refund token is returned.\n\nIf the nullifier was NOT recorded (the original request never arrived),\nthe server verifies the spend proof, issues a full refund (no credits\nconsumed), records the nullifier together with it, and returns it.\n\nThe spend proof is verified before anything else, in both cases.\n\nIn both cases, the client gets a refund token it can combine with its\nlocal `PreRefund` state to reconstruct a credential.",
         "operationId": "recover_refund",
         "responses": {
           "200": {

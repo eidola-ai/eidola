@@ -972,6 +972,40 @@ pub async fn record_nullifier(
     Ok(rows_affected > 0)
 }
 
+/// Atomically record a nullifier **together with** the refund token it was
+/// spent for. Returns `true` if recorded, `false` if the nullifier was already
+/// present. For a spend whose refund is known before it is recorded (refund
+/// recovery): one statement means no interruption can leave the nullifier
+/// recorded without the token a retry has to find.
+#[tracing::instrument(skip_all, name = "db.record_nullifier_with_refund", err)]
+pub async fn record_nullifier_with_refund(
+    pool: &Pool,
+    issuer_key_id: &str,
+    value: &[u8],
+    refund_token: &[u8],
+) -> Result<bool, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+
+    let rows_affected = client
+        .execute(
+            "INSERT INTO nullifier (issuer_key_id, value, refund_token) \
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            &[&issuer_key_id, &value, &refund_token],
+        )
+        .await
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "record_nullifier_with_refund failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
+
+    Ok(rows_affected > 0)
+}
+
 /// Store a CBOR-encoded refund token on an existing nullifier row.
 #[tracing::instrument(skip_all, name = "db.store_refund_token", err)]
 pub async fn store_refund_token(

@@ -703,8 +703,10 @@ pub struct RefundRecoveryResponse {
 /// processed the original request), the stored refund token is returned.
 ///
 /// If the nullifier was NOT recorded (the original request never arrived),
-/// the server verifies the spend proof, records the nullifier, issues a
-/// full refund (no credits consumed), stores it, and returns it.
+/// the server verifies the spend proof, issues a full refund (no credits
+/// consumed), records the nullifier together with it, and returns it.
+///
+/// The spend proof is verified before anything else, in both cases.
 ///
 /// In both cases, the client gets a refund token it can combine with its
 /// local `PreRefund` state to reconstruct a credential.
@@ -723,78 +725,33 @@ pub async fn recover_refund(
     TokenAuth(act): TokenAuth,
     State(state): State<AppState>,
 ) -> Result<Json<RefundRecoveryResponse>, ServerError> {
-    let master_key = &state.credential_master_key;
-
-    // Verify the challenge_digest matches our expected TokenChallenge.
-    let expected_digest = compute_challenge_digest();
-    if act.challenge_digest != expected_digest {
-        return Err(ServerError::Unauthorized {
-            message: "invalid challenge_digest in token".to_string(),
-        });
-    }
-
-    // Load the issuer key.
-    load_key_for_spending(
-        &state.credential_key_cache,
-        master_key,
-        &state.db_pool,
-        &act.issuer_key_hash,
-    )
-    .await?;
+    // Verify first, exactly as the chat path does: until the proof checks
+    // out the caller is unauthenticated, and a rejected token must leave
+    // nothing behind — no nullifier recorded.
+    crate::handlers::verify_spend_proof(&state, &act).await?;
 
     let key_id = hex::encode(act.issuer_key_hash);
     let nullifier_bytes = act.spend_proof.nullifier().as_bytes().to_vec();
+    let answer = |refund_cbor: &[u8], key_id: String| {
+        Json(RefundRecoveryResponse {
+            refund: RefundInfo {
+                refund: URL_SAFE_NO_PAD.encode(refund_cbor),
+                issuer_key_id: key_id,
+            },
+        })
+    };
 
     // Check if the nullifier was already recorded (original request arrived).
     if let Some(refund_cbor) =
         db::get_refund_token(&state.db_pool, &key_id, &nullifier_bytes).await?
     {
-        // Nullifier exists and has a stored refund token — return it.
-        return Ok(Json(RefundRecoveryResponse {
-            refund: RefundInfo {
-                refund: URL_SAFE_NO_PAD.encode(&refund_cbor),
-                issuer_key_id: key_id,
-            },
-        }));
+        return Ok(answer(&refund_cbor, key_id));
     }
 
     // Either the nullifier doesn't exist (request never arrived) or it exists
-    // but the refund token hasn't been stored yet (race with in-flight request).
-    // Try to record the nullifier — if it succeeds, we own it.
-    let recorded = db::record_nullifier(&state.db_pool, &key_id, &nullifier_bytes).await?;
-
-    if !recorded {
-        // Nullifier exists but no refund token stored yet. The original
-        // request is likely still in flight. The client should retry shortly.
-        return Err(ServerError::NotFound {
-            message: "nullifier recorded but refund token not yet available — \
-                      the original request may still be in flight, retry shortly"
-                .to_string(),
-        });
-    }
-
-    // Nullifier was not previously recorded — the original request never
-    // arrived. Verify the spend proof and issue a full refund.
-    {
-        let cache = state.credential_key_cache.read().await;
-        let key = cache.get(&act.issuer_key_hash).ok_or_else(|| {
-            ServerError::Internal("issuer key evicted from cache unexpectedly".to_string())
-        })?;
-
-        if act.spend_proof.context() != key.request_context_scalar {
-            return Err(ServerError::Unauthorized {
-                message: "invalid request_context in spend proof".to_string(),
-            });
-        }
-
-        key.secret_key
-            .refund::<128>(&key.params, &act.spend_proof, Scalar::ZERO, OsRng)
-            .map_err(|_| ServerError::Unauthorized {
-                message: "invalid spend proof".to_string(),
-            })?;
-    }
-
-    // Issue a full refund (charge_credits returned in full since no work was done).
+    // but the refund token hasn't been stored yet (race with in-flight
+    // request). Prepare a full refund (charge_credits returned in full since
+    // no work was done) — computing it releases nothing.
     let charge_credits = scalar_to_credit::<128>(&act.spend_proof.charge()).map_err(|_| {
         ServerError::BadRequest {
             message: "invalid charge amount in spend proof".to_string(),
@@ -820,15 +777,27 @@ pub async fn recover_refund(
             .map_err(|e| ServerError::Internal(format!("refund CBOR encoding failed: {e:?}")))?
     };
 
-    // Store the refund token for idempotency.
-    db::store_refund_token(&state.db_pool, &key_id, &nullifier_bytes, &refund_cbor).await?;
+    // Record the nullifier and the refund in one statement: the nullifier is
+    // durable before the refund is released (the forking-attack rule), and
+    // no interruption — a dropped connection, a restart — can leave it
+    // recorded without the token every retry has to find.
+    if db::record_nullifier_with_refund(&state.db_pool, &key_id, &nullifier_bytes, &refund_cbor)
+        .await?
+    {
+        return Ok(answer(&refund_cbor, key_id));
+    }
 
-    Ok(Json(RefundRecoveryResponse {
-        refund: RefundInfo {
-            refund: URL_SAFE_NO_PAD.encode(&refund_cbor),
-            issuer_key_id: key_id,
-        },
-    }))
+    // Recorded by someone else meanwhile. A concurrent recovery records its
+    // token with its nullifier, so it is there now; the chat path stores its
+    // own afterwards, so an in-flight request may not have yet.
+    match db::get_refund_token(&state.db_pool, &key_id, &nullifier_bytes).await? {
+        Some(refund_cbor) => Ok(answer(&refund_cbor, key_id)),
+        None => Err(ServerError::NotFound {
+            message: "nullifier recorded but refund token not yet available — \
+                      the original request may still be in flight, retry shortly"
+                .to_string(),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -932,5 +901,211 @@ mod tests {
     fn test_params_does_not_panic() {
         // Verify Params::new accepts our domain separator components (no colons).
         let _params = Params::new(DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION);
+    }
+
+    // -----------------------------------------------------------------------
+    // Refund recovery (require running postgres: just db && just db-reset)
+    // -----------------------------------------------------------------------
+
+    async fn recovery_state() -> (AppState, [u8; 32]) {
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let pool = db::create_pool(&url, None, None).expect("failed to create test pool");
+        let backend = crate::backend::TinfoilBackend::new(
+            Arc::new(arc_swap::ArcSwap::from_pointee(reqwest::Client::new())),
+            String::new(),
+            None,
+            None,
+        );
+        let master_key = [7u8; 32];
+        let cache: KeyCache = Arc::new(RwLock::new(HashMap::new()));
+        let epoch = crate::helpers::EpochConfig::default();
+        // A key of this test's own: the shared test database holds other
+        // tests' keys, sealed under other master keys.
+        // Serializable, so a concurrent test's insert can make it retry.
+        let row = loop {
+            let row = generate_key(&master_key, SystemTime::now(), &epoch).unwrap();
+            if let Ok(Some(row)) =
+                db::insert_issuer_key_checked(&pool, move |_| Ok(Some(row))).await
+            {
+                break row;
+            }
+        };
+        let key_hash: [u8; 32] = hex::decode(&row.id).unwrap().try_into().unwrap();
+        load_key_for_spending(&cache, &master_key, &pool, &key_hash)
+            .await
+            .expect("load key");
+        let state = AppState::new(backend, pool, None, None, master_key, cache, epoch);
+        (state, key_hash)
+    }
+
+    /// A spend of `charge` from a fresh `credits` credential, presented under
+    /// `key_hash`. `signer` issues the credential — the cached key for an
+    /// honest spend, any other key for a proof the server must reject.
+    async fn spend_under(
+        state: &AppState,
+        key_hash: [u8; 32],
+        signer: Option<&PrivateKey>,
+        credits: u128,
+        charge: u128,
+    ) -> (crate::auth::ActSpend, anonymous_credit_tokens::PreRefund) {
+        use anonymous_credit_tokens::PreIssuance;
+        let cache = state.credential_key_cache.read().await;
+        let key = cache.get(&key_hash).expect("key cached");
+        let signer = signer.unwrap_or(&key.secret_key);
+        let pre = PreIssuance::random(OsRng);
+        let request = pre.request(&key.params, OsRng);
+        let response = signer
+            .issue::<128>(
+                &key.params,
+                &request,
+                Scalar::from(credits),
+                key.request_context_scalar,
+                OsRng,
+            )
+            .expect("issue");
+        let token = pre
+            .to_credit_token::<128>(&key.params, signer.public(), &request, &response)
+            .expect("credit token");
+        let (spend_proof, pre_refund) = token
+            .prove_spend::<128>(&key.params, Scalar::from(charge), OsRng)
+            .expect("prove spend");
+        let act = crate::auth::ActSpend {
+            challenge_digest: compute_challenge_digest(),
+            issuer_key_hash: key_hash,
+            spend_proof,
+        };
+        (act, pre_refund)
+    }
+
+    /// The same presented token again (`ActSpend` is not `Clone`).
+    fn copy_of(act: &crate::auth::ActSpend) -> crate::auth::ActSpend {
+        let cbor = act.spend_proof.to_cbor().unwrap();
+        crate::auth::ActSpend {
+            challenge_digest: act.challenge_digest,
+            issuer_key_hash: act.issuer_key_hash,
+            spend_proof: anonymous_credit_tokens::SpendProof::<128>::from_cbor(&cbor).unwrap(),
+        }
+    }
+
+    async fn nullifier_rows(state: &AppState, act: &crate::auth::ActSpend) -> i64 {
+        let client = state.db_pool.get().await.unwrap();
+        client
+            .query_one(
+                "SELECT count(*) FROM nullifier WHERE issuer_key_id = $1 AND value = $2",
+                &[
+                    &hex::encode(act.issuer_key_hash),
+                    &act.spend_proof.nullifier().as_bytes().to_vec(),
+                ],
+            )
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    /// The endpoint is unlinked and unauthenticated until the proof verifies,
+    /// so a rejected proof must leave nothing behind — the chat path's Phase 1
+    /// rule ("no nullifier recorded"). Recording first let anyone holding a
+    /// key's public hash write permanent rows into the billing database.
+    #[tokio::test]
+    #[ignore]
+    async fn refund_recovery_with_an_invalid_proof_records_nothing() {
+        let (state, key_hash) = recovery_state().await;
+        let forger = PrivateKey::random(OsRng);
+        let (act, _) = spend_under(&state, key_hash, Some(&forger), 1_000, 400).await;
+
+        let result = recover_refund(TokenAuth(copy_of(&act)), State(state.clone())).await;
+
+        assert!(
+            matches!(result, Err(ServerError::Unauthorized { .. })),
+            "a forged proof must be refused"
+        );
+        assert_eq!(
+            nullifier_rows(&state, &act).await,
+            0,
+            "a refused proof wrote a nullifier"
+        );
+    }
+
+    /// Recovery exists for the interrupted request, so an interrupted
+    /// *recovery* — a dropped connection, a restart — must be retryable too.
+    /// A test-only trigger holds this nullifier's insert open while the call
+    /// is abandoned; the statement still commits, and the retry must find a
+    /// refund rather than a nullifier with none ("retry shortly", forever).
+    #[tokio::test]
+    #[ignore]
+    async fn refund_recovery_interrupted_after_its_write_can_be_retried() {
+        let (state, key_hash) = recovery_state().await;
+        let (act, _) = spend_under(&state, key_hash, None, 1_000, 400).await;
+        let nullifier_hex = hex::encode(act.spend_proof.nullifier().as_bytes());
+        let trigger = format!("review_slow_{}", &nullifier_hex[..16]);
+        let client = state.db_pool.get().await.unwrap();
+        client
+            .batch_execute(&format!(
+                "CREATE FUNCTION {trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                 BEGIN IF NEW.value = '\\x{nullifier_hex}'::bytea THEN \
+                 PERFORM pg_sleep(1.5); END IF; RETURN NEW; END $$; \
+                 CREATE TRIGGER {trigger} BEFORE INSERT ON nullifier \
+                 FOR EACH ROW EXECUTE FUNCTION {trigger}();"
+            ))
+            .await
+            .unwrap();
+
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(500),
+            recover_refund(TokenAuth(copy_of(&act)), State(state.clone())),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        client
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger} ON nullifier; DROP FUNCTION {trigger}();"
+            ))
+            .await
+            .unwrap();
+        assert!(
+            abandoned.is_err(),
+            "the first call must be the interrupted one"
+        );
+
+        let retried = recover_refund(TokenAuth(copy_of(&act)), State(state.clone())).await;
+        assert!(
+            retried.is_ok(),
+            "the retry of an interrupted recovery was refused: {:?}",
+            retried.err()
+        );
+    }
+
+    /// The endpoint's purpose: a spend whose request never arrived comes back
+    /// whole — the refund restores every credit the spend withheld — and
+    /// asking again answers the same token rather than minting a second one.
+    #[tokio::test]
+    #[ignore]
+    async fn refund_recovery_restores_the_whole_credential_once() {
+        use anonymous_credit_tokens::Refund;
+        let (state, key_hash) = recovery_state().await;
+        let (act, pre_refund) = spend_under(&state, key_hash, None, 1_000, 400).await;
+
+        let first = recover_refund(TokenAuth(copy_of(&act)), State(state.clone()))
+            .await
+            .expect("recovery of an unspent request");
+        let again = recover_refund(TokenAuth(copy_of(&act)), State(state.clone()))
+            .await
+            .expect("repeated recovery");
+        assert_eq!(first.0.refund.refund, again.0.refund.refund);
+
+        let refund =
+            Refund::from_cbor(&URL_SAFE_NO_PAD.decode(&first.0.refund.refund).unwrap()).unwrap();
+        let cache = state.credential_key_cache.read().await;
+        let key = cache.get(&key_hash).unwrap();
+        let restored = pre_refund
+            .to_credit_token::<128>(
+                &key.params,
+                &act.spend_proof,
+                &refund,
+                key.secret_key.public(),
+            )
+            .expect("refund applies");
+        assert_eq!(restored.credits(), Scalar::from(1_000u128));
     }
 }

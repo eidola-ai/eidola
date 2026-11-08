@@ -240,7 +240,10 @@ fn error_response_with_refund(
 /// Checks challenge_digest, loads the issuer key, validates request_context,
 /// and verifies the proof itself. Does NOT record the nullifier — errors here
 /// mean the ACT is invalid or malformed, so no refund is needed.
-async fn verify_spend_proof(state: &AppState, act: &ActSpend) -> Result<(), ServerError> {
+pub(crate) async fn verify_spend_proof(
+    state: &AppState,
+    act: &ActSpend,
+) -> Result<(), ServerError> {
     let master_key = &state.credential_master_key;
 
     // Verify the challenge_digest matches our expected TokenChallenge.
