@@ -332,8 +332,45 @@ impl Drop for RefundKeyText {
 /// attempt's headers are therefore materialised into this, and both the request
 /// and the row read that one value; `for_record` lives here rather than on the
 /// description because redacting *a set* is what the Record actually needs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// **Its secrets stay secret past materialization.** Two values here are
+/// secrets ([`is_secret_header`]): the credential, and an ACT spend's refund
+/// recovery key. One predicate decides both what the Record redacts, what
+/// `Debug` prints, and which header values the request marks sensitive (so
+/// the built request's own `Debug` hides them too), and the secret values are
+/// zeroed when the set is dropped.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SentHeaders(Vec<(&'static str, String)>);
+
+/// Whether a header this app sends upstream carries a secret: the credential
+/// (`Authorization`: a spend proof or an API key) or the refund recovery key.
+fn is_secret_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("Authorization") || name.eq_ignore_ascii_case(REFUND_KEY_HEADER)
+}
+
+impl std::fmt::Debug for SentHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut list = f.debug_list();
+        for (name, value) in &self.0 {
+            if is_secret_header(name) {
+                list.entry(&(name, "<redacted>"));
+            } else {
+                list.entry(&(name, value));
+            }
+        }
+        list.finish()
+    }
+}
+
+impl Drop for SentHeaders {
+    fn drop(&mut self) {
+        for (name, value) in &mut self.0 {
+            if is_secret_header(name) {
+                zeroize::Zeroize::zeroize(value);
+            }
+        }
+    }
+}
 
 impl SentHeaders {
     /// The pairs, in the order they are set.
@@ -360,7 +397,7 @@ impl SentHeaders {
                         .split_once(' ')
                         .map(|(scheme, _)| format!("{scheme} <redacted>"))
                         .unwrap_or_else(|| "<redacted>".to_string())
-                } else if *name == REFUND_KEY_HEADER {
+                } else if is_secret_header(name) {
                     "<redacted>".to_string()
                 } else {
                     value.clone()
@@ -2137,10 +2174,11 @@ fn build_upstream_request(
                 message: format!("`{name}` is not a usable header name"),
             }
         })?;
-        let value =
+        let mut value =
             reqwest::header::HeaderValue::from_str(value).map_err(|_| AppError::Config {
                 message: format!("`{name}` carries a value that cannot travel in a header"),
             })?;
+        value.set_sensitive(is_secret_header(name.as_str()));
         out.insert(name, value);
     }
     Ok(request)
@@ -2496,6 +2534,35 @@ mod tests {
         assert!(recorded.contains(REFUND_KEY_HEADER), "{recorded}");
         assert!(!recorded.contains(&text), "{recorded}");
         assert!(!format!("{spend:?}").contains(&text));
+        // Materialized, the set still prints no secret...
+        let shown = format!("{sent:?}");
+        assert!(shown.contains(REFUND_KEY_HEADER), "{shown}");
+        assert!(!shown.contains(&text), "{shown}");
+        assert!(!shown.contains("token="), "{shown}");
+        // ...and neither does the request built from it, whose secret values
+        // are marked sensitive while still travelling as sent.
+        let route = route_with_pending_attestation("eidola", "http://127.0.0.1:9");
+        let request = build_upstream_request(&route, &serde_json::json!({}), &sent).unwrap();
+        let built = format!("{request:?}");
+        assert!(!built.contains(&text), "{built}");
+        assert!(!built.contains("token="), "{built}");
+        let key_value = request.headers().get(REFUND_KEY_HEADER).unwrap();
+        assert!(key_value.is_sensitive());
+        assert_eq!(key_value.as_bytes(), text.as_bytes());
+        assert!(
+            request
+                .headers()
+                .get("authorization")
+                .unwrap()
+                .is_sensitive()
+        );
+        assert!(
+            !request
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .is_sensitive()
+        );
     }
 
     #[test]
