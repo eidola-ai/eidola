@@ -206,7 +206,7 @@ fn decrypt_private_key(
 // ---------------------------------------------------------------------------
 
 /// HKDF info for the refund-token key, domain-separated from the issuer-key
-/// wrapping key (`eidola-issuer-key-v1`) derived from the same master key.
+/// wrapping key's (`eidola-issuer-key-v1`).
 const REFUND_TOKEN_KEY_INFO: &[u8] = b"eidola-refund-token-v1";
 
 /// First byte of every sealed refund token. A CBOR `RefundMsg` (a five-entry
@@ -217,8 +217,8 @@ const SEALED_REFUND_VERSION: u8 = 0x01;
 const SEALED_REFUND_NONCE_LEN: usize = 12;
 
 /// A refund token as it is stored in `nullifier.refund_token`: AES-256-GCM
-/// under a key that needs both the client's refund recovery key and the
-/// enclave's master key, bound to its row.
+/// under a key derived from the client's refund recovery key alone, bound to
+/// its row.
 ///
 /// The CBOR `RefundMsg` carries the refund amount `t` as a plain scalar, and
 /// `t` is the hold minus the actual charge: a function of the request's
@@ -246,25 +246,20 @@ impl SealedRefundToken {
     }
 }
 
-/// The key one spend's refund is sealed under: HKDF-SHA256 over the client's
-/// refund recovery key and the master key together, salted with the issuer
-/// key id.
+/// The key one spend's refund is sealed under: HKDF-SHA256 with the client's
+/// refund recovery key as the input key material, salted with the issuer key
+/// id.
 ///
-/// The client's key is what keeps the stored amount from anyone without the
-/// client, the gateway's own measured secrets included. The master key is
-/// mixed in as well so a client that sends a weak or shared key (a bug, or a
-/// third-party implementation) still leaves the stored copy sealed against a
-/// reader of the database alone. Each spend's client key is its own, so the
+/// The client's key alone: it is what keeps the stored amount from anyone
+/// without the client, and nothing the operator holds is mixed in, because
+/// an operator-provided secret (`CREDENTIAL_MASTER_KEY`) protects nothing
+/// against the operator. Each spend's client key is its own, so the
 /// random-nonce count under any one AES key is one or two.
 fn derive_refund_token_key(
-    master_key: &[u8; 32],
     refund_key: &RefundKey,
     issuer_key_id: &str,
 ) -> zeroize::Zeroizing<[u8; 32]> {
-    let mut ikm = zeroize::Zeroizing::new([0u8; 64]);
-    ikm[..32].copy_from_slice(refund_key.as_bytes());
-    ikm[32..].copy_from_slice(master_key);
-    let hk = hkdf::Hkdf::<Sha256>::new(Some(issuer_key_id.as_bytes()), ikm.as_ref());
+    let hk = hkdf::Hkdf::<Sha256>::new(Some(issuer_key_id.as_bytes()), refund_key.as_bytes());
     let mut okm = zeroize::Zeroizing::new([0u8; 32]);
     hk.expand(REFUND_TOKEN_KEY_INFO, okm.as_mut())
         .expect("32 bytes is a valid HKDF-SHA256 output length");
@@ -292,13 +287,12 @@ fn refund_token_aad(issuer_key_id: &str, nullifier: &[u8]) -> Vec<u8> {
 /// written once per spend today, but a random nonce stays safe if a path ever
 /// writes a row twice, where a derived one would repeat a nonce under a key.
 pub fn seal_refund_token(
-    master_key: &[u8; 32],
     refund_key: &RefundKey,
     issuer_key_id: &str,
     nullifier: &[u8],
     refund_cbor: &[u8],
 ) -> Result<SealedRefundToken, ServerError> {
-    let key = derive_refund_token_key(master_key, refund_key, issuer_key_id);
+    let key = derive_refund_token_key(refund_key, issuer_key_id);
     let cipher = Aes256Gcm::new_from_slice(key.as_ref())
         .map_err(|e| ServerError::Internal(format!("AES key init failed: {}", e)))?;
 
@@ -327,11 +321,10 @@ pub fn seal_refund_token(
 /// Open a stored refund token for the row `(issuer_key_id, nullifier)`.
 ///
 /// `None` for anything that is not a token sealed for this row under this
-/// client key and this master key: a recovery presenting another key, a
+/// client key: a recovery presenting another key, a
 /// token moved from another row, a bare token, or tampered bytes. The caller
 /// treats that exactly as a row with no token stored.
 pub fn open_refund_token(
-    master_key: &[u8; 32],
     refund_key: &RefundKey,
     issuer_key_id: &str,
     nullifier: &[u8],
@@ -344,7 +337,7 @@ pub fn open_refund_token(
     }
     let (nonce_bytes, ciphertext) = rest.split_at(SEALED_REFUND_NONCE_LEN);
     let nonce = Nonce::try_from(nonce_bytes).ok()?;
-    let key = derive_refund_token_key(master_key, refund_key, issuer_key_id);
+    let key = derive_refund_token_key(refund_key, issuer_key_id);
     let cipher = Aes256Gcm::new_from_slice(key.as_ref()).ok()?;
     let aad = refund_token_aad(issuer_key_id, nullifier);
     cipher
@@ -368,13 +361,7 @@ pub async fn store_sealed_refund(
     refund_cbor: &[u8],
 ) -> Result<(), ServerError> {
     let nullifier = act.spend_proof.nullifier().as_bytes().to_vec();
-    let sealed = seal_refund_token(
-        &state.credential_master_key,
-        &act.refund_key,
-        issuer_key_id,
-        &nullifier,
-        refund_cbor,
-    )?;
+    let sealed = seal_refund_token(&act.refund_key, issuer_key_id, &nullifier, refund_cbor)?;
     db::store_refund_token(&state.db_pool, issuer_key_id, &nullifier, &sealed).await
 }
 
@@ -1097,13 +1084,9 @@ pub async fn recover_refund(
         // the row exists, so this is the same permanent 404 a client gets
         // when the best-effort store never happened, and the client settles
         // the hold the way it does then.
-        let Some(refund_cbor) = open_refund_token(
-            master_key,
-            &act.refund_key,
-            &key_id,
-            &nullifier_bytes,
-            &sealed,
-        ) else {
+        let Some(refund_cbor) =
+            open_refund_token(&act.refund_key, &key_id, &nullifier_bytes, &sealed)
+        else {
             warn!("stored refund token did not open; answering as if none were stored");
             return Err(ServerError::NotFound {
                 message: "no refund token is stored for this credential".to_string(),
@@ -1682,13 +1665,12 @@ mod tests {
 
     #[test]
     fn a_sealed_refund_token_opens_to_the_token_the_client_completes() {
-        let master_key = [42u8; 32];
         let ck = client_key(7);
         let (sk, params, proof, prerefund, cbor) = refund_fixture(1000, 300, 117);
         let nullifier = proof.nullifier().as_bytes().to_vec();
 
-        let sealed = seal_refund_token(&master_key, &ck, KEY_ID, &nullifier, &cbor).unwrap();
-        let opened = open_refund_token(&master_key, &ck, KEY_ID, &nullifier, &sealed).unwrap();
+        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, &cbor).unwrap();
+        let opened = open_refund_token(&ck, KEY_ID, &nullifier, &sealed).unwrap();
         assert_eq!(opened, cbor);
 
         // What recovery hands back still completes the client's credential.
@@ -1704,23 +1686,19 @@ mod tests {
 
     #[test]
     fn a_sealed_refund_token_opens_only_on_its_own_row() {
-        let master_key = [42u8; 32];
         let ck = client_key(7);
         let (_, _, proof, _, cbor) = refund_fixture(1000, 300, 117);
         let nullifier = proof.nullifier().as_bytes().to_vec();
-        let sealed = seal_refund_token(&master_key, &ck, KEY_ID, &nullifier, &cbor).unwrap();
+        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, &cbor).unwrap();
 
         // Moved to another nullifier under the same key.
         let (_, _, other_proof, _, _) = refund_fixture(1000, 300, 117);
         let other_nullifier = other_proof.nullifier().as_bytes().to_vec();
-        assert!(open_refund_token(&master_key, &ck, KEY_ID, &other_nullifier, &sealed).is_none());
+        assert!(open_refund_token(&ck, KEY_ID, &other_nullifier, &sealed).is_none());
 
         // Moved to the same nullifier value under another issuer key.
         let other_key = "0".repeat(64);
-        assert!(open_refund_token(&master_key, &ck, &other_key, &nullifier, &sealed).is_none());
-
-        // Opened under another master key.
-        assert!(open_refund_token(&[43u8; 32], &ck, KEY_ID, &nullifier, &sealed).is_none());
+        assert!(open_refund_token(&ck, &other_key, &nullifier, &sealed).is_none());
 
         // Any single altered byte.
         for i in 0..sealed.as_bytes().len() {
@@ -1728,7 +1706,7 @@ mod tests {
             bytes[i] ^= 0x01;
             let altered = SealedRefundToken::from_stored(bytes);
             assert!(
-                open_refund_token(&master_key, &ck, KEY_ID, &nullifier, &altered).is_none(),
+                open_refund_token(&ck, KEY_ID, &nullifier, &altered).is_none(),
                 "byte {i} altered and the token still opened"
             );
         }
@@ -1736,14 +1714,13 @@ mod tests {
         // A row written before tokens were sealed holds the bare CBOR.
         assert_eq!(cbor[0], 0xa5);
         let legacy = SealedRefundToken::from_stored(cbor.clone());
-        assert!(open_refund_token(&master_key, &ck, KEY_ID, &nullifier, &legacy).is_none());
+        assert!(open_refund_token(&ck, KEY_ID, &nullifier, &legacy).is_none());
         let empty = SealedRefundToken::from_stored(Vec::new());
-        assert!(open_refund_token(&master_key, &ck, KEY_ID, &nullifier, &empty).is_none());
+        assert!(open_refund_token(&ck, KEY_ID, &nullifier, &empty).is_none());
     }
 
     #[test]
     fn a_sealed_refund_token_carries_no_plaintext_amount() {
-        let master_key = [42u8; 32];
         let ck = client_key(7);
         let t: u128 = 0x0123_4567_89ab_cdef_0011_2233_4455_6677;
         let (_, _, proof, _, cbor) = refund_fixture(u128::MAX >> 1, t, t);
@@ -1752,7 +1729,7 @@ mod tests {
         // The bare token does carry the amount: that is what is being hidden.
         assert!(contains(&cbor, &t_bytes));
 
-        let sealed = seal_refund_token(&master_key, &ck, KEY_ID, &nullifier, &cbor).unwrap();
+        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, &cbor).unwrap();
         let bytes = sealed.as_bytes();
         assert!(!contains(bytes, &t_bytes));
         // Nor the amount's own bytes, nor any run of the CBOR.
@@ -1761,64 +1738,46 @@ mod tests {
 
         // And the length is the same whatever the amount.
         let (_, _, p0, _, c0) = refund_fixture(1000, 300, 0);
-        let s0 =
-            seal_refund_token(&master_key, &ck, KEY_ID, p0.nullifier().as_bytes(), &c0).unwrap();
+        let s0 = seal_refund_token(&ck, KEY_ID, p0.nullifier().as_bytes(), &c0).unwrap();
         assert_eq!(s0.as_bytes().len(), bytes.len());
         assert_eq!(bytes.len(), 1 + 12 + cbor.len() + 16);
     }
 
     #[test]
     fn the_refund_token_key_is_its_own() {
-        let master_key = [42u8; 32];
         let ck = client_key(7);
-        // Not the issuer-key wrapping key derived from the same master key...
+        // Not the issuer-key wrapping key's derivation over the same bytes...
         assert_ne!(
-            *derive_refund_token_key(&master_key, &ck, KEY_ID),
-            derive_key_encryption_key(&master_key, KEY_ID)
+            *derive_refund_token_key(&ck, KEY_ID),
+            derive_key_encryption_key(ck.as_bytes(), KEY_ID)
         );
         // ...and not another issuer key's refund-token key...
         assert_ne!(
-            *derive_refund_token_key(&master_key, &ck, KEY_ID),
-            *derive_refund_token_key(&master_key, &ck, &"0".repeat(64))
+            *derive_refund_token_key(&ck, KEY_ID),
+            *derive_refund_token_key(&ck, &"0".repeat(64))
         );
-        // ...and not another client's, nor another master key's.
+        // ...and not another client's.
         assert_ne!(
-            *derive_refund_token_key(&master_key, &ck, KEY_ID),
-            *derive_refund_token_key(&master_key, &client_key(8), KEY_ID)
-        );
-        assert_ne!(
-            *derive_refund_token_key(&master_key, &ck, KEY_ID),
-            *derive_refund_token_key(&[43u8; 32], &ck, KEY_ID)
+            *derive_refund_token_key(&ck, KEY_ID),
+            *derive_refund_token_key(&client_key(8), KEY_ID)
         );
     }
 
     #[test]
     fn a_sealed_refund_token_opens_only_with_its_clients_key() {
-        let master_key = [42u8; 32];
         let ck = client_key(7);
         let (_, _, proof, _, cbor) = refund_fixture(1000, 300, 117);
         let nullifier = proof.nullifier().as_bytes().to_vec();
-        let sealed = seal_refund_token(&master_key, &ck, KEY_ID, &nullifier, &cbor).unwrap();
+        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, &cbor).unwrap();
 
         // A recovery presenting any other key opens nothing.
-        for other in [
-            client_key(8),
-            client_key(0),
-            RefundKey::from_bytes(master_key),
-        ] {
-            assert!(open_refund_token(&master_key, &other, KEY_ID, &nullifier, &sealed).is_none());
+        for other in [client_key(8), client_key(0)] {
+            assert!(open_refund_token(&other, KEY_ID, &nullifier, &sealed).is_none());
         }
         let mut near = [7u8; 32];
         near[31] ^= 0x01;
         assert!(
-            open_refund_token(
-                &master_key,
-                &RefundKey::from_bytes(near),
-                KEY_ID,
-                &nullifier,
-                &sealed
-            )
-            .is_none()
+            open_refund_token(&RefundKey::from_bytes(near), KEY_ID, &nullifier, &sealed).is_none()
         );
     }
 
@@ -1871,46 +1830,42 @@ mod tests {
         assert_eq!(format!("{:?}", act.refund_key), "RefundKey(<redacted>)");
     }
 
-    /// What an operator holds without the client: the stored row and every
-    /// secret the gateway has (the master key, and every key derivable from
-    /// it alone). None of it opens the row.
+    /// What anyone holds without the client: the stored row (version, nonce,
+    /// ciphertext) and the public facts that address it (the issuer key id,
+    /// the nullifier). The key is derived from the client's key alone, so
+    /// nothing built from those opens the row; only the client's key does.
     #[test]
-    fn the_stored_row_and_the_gateways_secrets_alone_open_nothing() {
-        let master_key = [42u8; 32];
-        let ck = client_key(7);
+    fn the_stored_row_alone_without_the_client_key_opens_nothing() {
+        let random_key = || {
+            let mut bytes = [0u8; 32];
+            OsRng.fill_bytes(&mut bytes);
+            RefundKey::from_bytes(bytes)
+        };
+        let ck = random_key();
         let (_, _, proof, _, cbor) = refund_fixture(1000, 300, 117);
         let nullifier = proof.nullifier().as_bytes().to_vec();
-        let sealed = seal_refund_token(&master_key, &ck, KEY_ID, &nullifier, &cbor).unwrap();
-        let bytes = sealed.as_bytes();
-        let (nonce, ciphertext) = bytes[1..].split_at(SEALED_REFUND_NONCE_LEN);
-        let nonce = Nonce::try_from(nonce).unwrap();
-        let aad = refund_token_aad(KEY_ID, &nullifier);
+        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, &cbor).unwrap();
+        let row = sealed.as_bytes();
 
-        // Keys an operator could derive from the master key by itself: the
-        // master key, the issuer-key wrapping key, the refund-token
-        // derivation with the client's half missing, and with it filled by
-        // anything the gateway itself has (zeros, its own master key).
-        let hk = hkdf::Hkdf::<Sha256>::new(Some(KEY_ID.as_bytes()), &master_key);
-        let mut master_only = [0u8; 32];
-        hk.expand(REFUND_TOKEN_KEY_INFO, &mut master_only).unwrap();
-        let candidates = [
-            master_key,
-            derive_key_encryption_key(&master_key, KEY_ID),
-            master_only,
-            *derive_refund_token_key(&master_key, &client_key(0), KEY_ID),
-            *derive_refund_token_key(&master_key, &RefundKey::from_bytes(master_key), KEY_ID),
+        let as_key = |bytes: &[u8]| {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&Sha256::digest(bytes));
+            RefundKey::from_bytes(key)
+        };
+        let guesses = [
+            random_key(),
+            as_key(&nullifier),
+            as_key(KEY_ID.as_bytes()),
+            as_key(&row[1..1 + SEALED_REFUND_NONCE_LEN]),
+            as_key(row),
         ];
-        for key in candidates {
-            let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-            let attempt = cipher.decrypt(
-                &nonce,
-                Payload {
-                    msg: ciphertext,
-                    aad: &aad,
-                },
-            );
-            assert!(attempt.is_err());
+        for guess in &guesses {
+            assert!(open_refund_token(guess, KEY_ID, &nullifier, &sealed).is_none());
         }
+        assert_eq!(
+            open_refund_token(&ck, KEY_ID, &nullifier, &sealed).as_deref(),
+            Some(cbor.as_slice())
+        );
     }
 
     /// The recovery endpoint end to end against Postgres: it stores only a
