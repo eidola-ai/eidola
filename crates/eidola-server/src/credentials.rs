@@ -39,6 +39,10 @@ pub struct DecryptedIssuerKey {
     pub request_context_scalar: Scalar,
     pub issue_from: SystemTime,
     pub issue_until: SystemTime,
+    /// End of the acceptance window. A cached key past it is retired: its
+    /// credentials are refused and the key is evicted, exactly as if the
+    /// database lookup (`accept_until > now()`) had been made.
+    pub accept_until: SystemTime,
 }
 
 /// Thread-safe cache of decrypted issuer keys, keyed by SHA-256(pkI).
@@ -262,6 +266,7 @@ fn cache_key(
             request_context_scalar,
             issue_from: row.issue_from,
             issue_until: row.issue_until,
+            accept_until: row.accept_until,
         },
     );
     Ok(key_hash)
@@ -402,6 +407,7 @@ pub async fn ensure_keys(
     let now = SystemTime::now();
     let rows = db::get_valid_issuer_keys(pool).await?;
     let mut cache = key_cache.write().await;
+    cache.retain(|_, k| k.accept_until > now);
     let mut current_hash = None;
     for row in &rows {
         let kh = cache_key(&mut cache, master_key, row)?;
@@ -423,9 +429,15 @@ pub async fn load_key_for_spending(
     pool: &deadpool_postgres::Pool,
     key_hash: &[u8; 32],
 ) -> Result<(), ServerError> {
-    // Fast path: already in cache
-    if key_cache.read().await.contains_key(key_hash) {
-        return Ok(());
+    // Fast path: already in cache, and not yet retired. A retired key is
+    // refused here, not reloaded: the database would refuse it too.
+    if let Some(key) = key_cache.read().await.get(key_hash) {
+        if key.accept_until > SystemTime::now() {
+            return Ok(());
+        }
+        return Err(ServerError::Unauthorized {
+            message: "unknown or expired issuer key".to_string(),
+        });
     }
 
     // Slow path: load from DB by key hash
@@ -908,6 +920,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     async fn recovery_state() -> (AppState, [u8; 32]) {
+        recovery_state_under(crate::helpers::EpochConfig::default()).await
+    }
+
+    async fn recovery_state_under(epoch: crate::helpers::EpochConfig) -> (AppState, [u8; 32]) {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
         let pool = db::create_pool(&url, None, None).expect("failed to create test pool");
@@ -919,7 +935,6 @@ mod tests {
         );
         let master_key = [7u8; 32];
         let cache: KeyCache = Arc::new(RwLock::new(HashMap::new()));
-        let epoch = crate::helpers::EpochConfig::default();
         // A key of this test's own: the shared test database holds other
         // tests' keys, sealed under other master keys.
         // Serializable, so a concurrent test's insert can make it retry.
@@ -1107,5 +1122,86 @@ mod tests {
             )
             .expect("refund applies");
         assert_eq!(restored.credits(), Scalar::from(1_000u128));
+    }
+
+    // -----------------------------------------------------------------------
+    // Key retirement (require running postgres: just db && just db-reset)
+    // -----------------------------------------------------------------------
+
+    /// A key that issues for one second and is accepted for one more, so a
+    /// test can watch it retire in real time.
+    async fn short_lived_key() -> (AppState, [u8; 32]) {
+        recovery_state_under(crate::helpers::EpochConfig {
+            epoch_duration: Duration::from_secs(1),
+            grace_period: Duration::from_secs(1),
+        })
+        .await
+    }
+
+    /// Waits past the key's `accept_until`.
+    async fn retire() {
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+    }
+
+    /// Retirement is the revocation mechanism (docs/server.md): after
+    /// `accept_until` a key's credentials are no longer spendable. The
+    /// database lookup enforces that, so the cache must too — a key cached
+    /// while valid would otherwise stay spendable for the process lifetime.
+    #[tokio::test]
+    #[ignore]
+    async fn a_retired_key_is_refused_by_a_process_that_cached_it() {
+        let (state, key_hash) = short_lived_key().await;
+        let (act, _) = spend_under(&state, key_hash, None, 1_000, 10).await;
+        crate::handlers::verify_spend_proof(&state, &act)
+            .await
+            .expect("a live key's spend verifies");
+
+        retire().await;
+
+        let (act, _) = spend_under(&state, key_hash, None, 1_000, 10).await;
+        let result = crate::handlers::verify_spend_proof(&state, &act).await;
+        assert!(
+            matches!(result, Err(ServerError::Unauthorized { .. })),
+            "a retired key's credential must be refused, got {result:?}"
+        );
+    }
+
+    /// `prune_expired_nullifiers` forgets a retired key's spends. That is only
+    /// safe if nothing still accepts the key: a cached key would accept every
+    /// pruned credential a second time.
+    #[tokio::test]
+    #[ignore]
+    async fn pruning_never_reopens_a_spent_credential() {
+        let (state, key_hash) = short_lived_key().await;
+        let (act, _) = spend_under(&state, key_hash, None, 1_000, 10).await;
+        let key_id = hex::encode(key_hash);
+        let nullifier = act.spend_proof.nullifier().as_bytes().to_vec();
+        crate::handlers::verify_spend_proof(&state, &act)
+            .await
+            .expect("first spend verifies");
+        assert!(
+            db::record_nullifier(&state.db_pool, &key_id, &nullifier)
+                .await
+                .unwrap()
+        );
+
+        retire().await;
+        let client = state.db_pool.get().await.unwrap();
+        client
+            .execute("SELECT prune_expired_nullifiers()", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            nullifier_rows(&state, &act).await,
+            0,
+            "the spend was pruned"
+        );
+
+        let again = copy_of(&act);
+        let result = crate::handlers::verify_spend_proof(&state, &again).await;
+        assert!(
+            matches!(result, Err(ServerError::Unauthorized { .. })),
+            "a pruned spend must not verify again, got {result:?}"
+        );
     }
 }
