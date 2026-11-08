@@ -3346,7 +3346,9 @@ impl Inner {
         let params_hash = blake3::hash(key.domain_separator.as_bytes())
             .to_hex()
             .to_string();
-        let expires_at = iso_to_ms(&key.issue_until)?;
+        // A credential lives as long as the server accepts its key — the
+        // grace window past `issue_until`, not just the issuing window.
+        let expires_at = iso_to_ms(&key.accept_until)?;
 
         db::upsert_issuer_key(
             &db_conn,
@@ -12508,7 +12510,6 @@ struct IssuerKeyResponse {
     domain_separator: String,
     issue_from: String,
     issue_until: String,
-    #[allow(dead_code)]
     accept_until: String,
 }
 

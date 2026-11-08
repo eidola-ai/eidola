@@ -7612,3 +7612,57 @@ fn a_turn_does_not_follow_a_redirect() {
         );
     });
 }
+
+/// A credential stays spendable for its key's whole **acceptance** window, not
+/// just its issuing window. After a rotation the old key stops issuing but
+/// `/v1/keys` still lists it with a future `accept_until`, and the server keeps
+/// accepting it until then (the grace period `docs/server.md` and the terms'
+/// "about two weeks" promise). A wallet that expired its credentials at
+/// `issue_until` would forfeit the unspent balance of every credential it holds
+/// across a rotation — up to a whole allocation — while the server would still
+/// have taken it.
+#[test]
+fn a_credential_held_across_a_rotation_stays_spendable() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            key_issuing_until: Some(
+                std::time::SystemTime::now() + std::time::Duration::from_secs(2),
+            ),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = turn(&core, "How do tides work?", None, None);
+        // The key stops issuing; it is still accepted.
+        std::thread::sleep(std::time::Duration::from_millis(3_000));
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let second = core.runtime().block_on(core.chat_stream_reply(
+            "And why two per day?".into(),
+            MODEL.into(),
+            Some(first.space_id.clone()),
+            None,
+            tx,
+        ));
+        let lifecycle = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("lifecycle");
+        assert!(
+            second.is_ok(),
+            "the held credential pays for the turn: {:?}; wallet {lifecycle:?}",
+            second.err()
+        );
+        assert!(
+            lifecycle.iter().all(|c| c.state != "expired"),
+            "nothing is forfeited inside the acceptance window; got {lifecycle:?}"
+        );
+        assert_eq!(
+            lifecycle.iter().filter(|c| c.generation == 0).count(),
+            1,
+            "the second turn spent the held credential, not a fresh allocation; \
+             got {lifecycle:?}"
+        );
+    });
+}
