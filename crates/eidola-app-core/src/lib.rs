@@ -7792,15 +7792,11 @@ impl Inner {
                 .post(format!("{}/v1/chat/completions", prep.base_url)),
             &request_body_json,
         );
-        if let Some(auth_value) = &prep.auth_value {
-            request = request.header("Authorization", auth_value);
-        }
-        if let Some(spend) = &prep.spend {
-            request = request.header(
-                REFUND_KEY_HEADER,
-                refund_key_header_value(&spend.refund_key),
-            );
-        }
+        request = with_credentials(
+            request,
+            prep.auth_value.as_deref(),
+            prep.spend.as_ref().map(|s| &*s.refund_key),
+        );
         let chat_result = prep.send(request).await;
         let response_at = now_ms();
 
@@ -8619,15 +8615,11 @@ impl Inner {
                 .header("Accept", "text/event-stream"),
             &request_body_json,
         );
-        if let Some(auth_value) = &prep.auth_value {
-            request = request.header("Authorization", auth_value);
-        }
-        if let Some(spend) = &prep.spend {
-            request = request.header(
-                REFUND_KEY_HEADER,
-                refund_key_header_value(&spend.refund_key),
-            );
-        }
+        request = with_credentials(
+            request,
+            prep.auth_value.as_deref(),
+            prep.spend.as_ref().map(|s| &*s.refund_key),
+        );
         let chat_result = prep.send(request).await;
 
         let resp = match chat_result {
@@ -14454,13 +14446,14 @@ async fn recover_refund(
     auth_value: &str,
     refund_key: &[u8; 32],
 ) -> Result<serde_json::Value, AppError> {
-    let resp = client
-        .post(format!("{base_url}/v1/credentials/refund"))
-        .header("Authorization", auth_value)
-        .header(REFUND_KEY_HEADER, refund_key_header_value(refund_key))
-        .send()
-        .await
-        .map_err(AppError::from_request)?;
+    let resp = with_credentials(
+        client.post(format!("{base_url}/v1/credentials/refund")),
+        Some(auth_value),
+        Some(refund_key),
+    )
+    .send()
+    .await
+    .map_err(AppError::from_request)?;
 
     let (status, body_text) =
         crate::peer_read::read_api_answer(resp, "the recovery response").await?;
@@ -17514,6 +17507,38 @@ fn refund_recovery_key(pre_refund_cbor: &[u8]) -> zeroize::Zeroizing<[u8; 32]> {
     zeroize::Zeroizing::new(hasher.finalize().into())
 }
 
+/// Put a request's secrets on it: the `Authorization` value (an ACT spend
+/// proof, or an external backend's key) and an ACT spend's refund recovery
+/// key, each as a header value marked sensitive so an HTTP client's own
+/// `Debug` never shows it.
+///
+/// **The one place these headers are built** for the app's own requests (the
+/// turn transports, the chores, refund recovery); the local proxy builds its
+/// enumerated set through `proxy::route::is_secret_header`, which marks the
+/// same two. A value that cannot be a header value is passed through as the
+/// string, so the builder refuses it exactly as it did before (the refusal
+/// carries no value).
+pub(crate) fn with_credentials(
+    request: reqwest::RequestBuilder,
+    authorization: Option<&str>,
+    refund_key: Option<&[u8; 32]>,
+) -> reqwest::RequestBuilder {
+    let mut request = request;
+    if let Some(auth) = authorization {
+        request = match reqwest::header::HeaderValue::from_str(auth) {
+            Ok(mut value) => {
+                value.set_sensitive(true);
+                request.header(reqwest::header::AUTHORIZATION, value)
+            }
+            Err(_) => request.header(reqwest::header::AUTHORIZATION, auth),
+        };
+    }
+    if let Some(key) = refund_key {
+        request = request.header(REFUND_KEY_HEADER, refund_key_header_value(key));
+    }
+    request
+}
+
 /// The [`eidola_common::refund_key::REFUND_KEY_HEADER`] value for `key`,
 /// marked sensitive so it is never shown by an HTTP client's own debug output.
 fn refund_key_header_value(key: &[u8; 32]) -> reqwest::header::HeaderValue {
@@ -17808,6 +17833,48 @@ mod tests {
             Some(*key)
         );
         assert!(refund_key_header_value(&key).is_sensitive());
+    }
+
+    /// **A request's secrets travel as sent and print as nothing.** Both the
+    /// spend proof (or an external key) and the refund recovery key go on
+    /// marked sensitive, so the built request's `Debug` shows neither.
+    #[test]
+    fn a_requests_credentials_are_sensitive_headers() {
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let client = reqwest::Client::builder().build().unwrap();
+        let proof = "PrivateToken token=\"c3BlbmQtcHJvb2Y\"";
+        let key = [0x6du8; 32];
+        let key_text =
+            String::from_utf8(eidola_common::refund_key::encode_refund_key(&key).to_vec()).unwrap();
+        let request = with_credentials(
+            client.post("http://127.0.0.1:9/v1/chat/completions"),
+            Some(proof),
+            Some(&key),
+        )
+        .build()
+        .unwrap();
+
+        let auth = request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .unwrap();
+        assert!(auth.is_sensitive());
+        assert_eq!(auth.as_bytes(), proof.as_bytes());
+        let sent_key = request.headers().get(REFUND_KEY_HEADER).unwrap();
+        assert!(sent_key.is_sensitive());
+        assert_eq!(sent_key.as_bytes(), key_text.as_bytes());
+
+        let shown = format!("{request:?}");
+        assert!(!shown.contains("c3BlbmQtcHJvb2Y"), "{shown}");
+        assert!(!shown.contains(&key_text), "{shown}");
+
+        // An external backend's bearer key, with no spend, is sensitive too.
+        let bearer = with_credentials(client.get("http://127.0.0.1:9/"), Some("Bearer sk-x"), None)
+            .build()
+            .unwrap();
+        assert!(bearer.headers()[reqwest::header::AUTHORIZATION].is_sensitive());
+        assert!(bearer.headers().get(REFUND_KEY_HEADER).is_none());
+        assert!(!format!("{bearer:?}").contains("sk-x"));
     }
 
     /// **An event ends at any two line terminators the format allows.**

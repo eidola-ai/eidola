@@ -306,15 +306,11 @@ impl Inner {
             .client
             .post(format!("{}/v1/chat/completions", route.base_url))
             .json(&body);
-        if let Some(auth) = &auth_value {
-            request = request.header("Authorization", auth);
-        }
-        if let Some(spend) = &spend {
-            request = request.header(
-                eidola_common::refund_key::REFUND_KEY_HEADER,
-                crate::refund_key_header_value(&spend.refund_key),
-            );
-        }
+        request = crate::with_credentials(
+            request,
+            auth_value.as_deref(),
+            spend.as_ref().map(|s| &*s.refund_key),
+        );
 
         let response = match request.send().await {
             Ok(resp) => resp,
