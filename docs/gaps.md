@@ -60,6 +60,14 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 
 **Future.** The set grows with the user base. If population per window stays small, the epoch length can be raised (a release-visible constant change) to trade key-rotation hygiene for coarser partitions.
 
+### Credit left in a credential when its key lapses
+
+**Current behavior.** Each anonymous credential is issued under one issuer key, and the change from every spend is issued under that same key, so a credential's whole remaining value lives and dies with the key. The server accepts a key's credentials until its `accept_until` — one full epoch after the key stops issuing ([server.md § Anonymity set](server.md#anonymity-set)) — and the client spends a credential until shortly before that deadline (`CREDENTIAL_SPEND_MARGIN`, a few minutes, so a spend begun at the edge still lands inside the window; a spend already in flight stays recoverable until the deadline itself). Whatever is still in the credential after that is lost: it was debited from the account when the credential was issued, and nothing exchanges it for a credential under a newer key.
+
+**What constrains it today.** Every credential gets at least one full epoch of spendable life, however late in its key's issuing window it was minted, and automatic provisioning allocates a modest amount at a time ([`DEFAULT_ALLOCATION_CREDITS`](../crates/eidola-app-core/src/lib.rs)), so the exposure is bounded by one allocation's unspent change per key. Issuance is refused outright under a key whose spend deadline has already passed, so the account is never debited into a credential that could not be spent.
+
+**Future.** A rollover: exchanging what remains in an expiring credential for a fresh one under the current key, without that exchange linking the two. That needs its own unlinkability analysis and is not designed yet.
+
 ### Multi-jurisdiction attestant distribution
 
 **Current behavior.** Attestants share a small operational surface and may share a jurisdiction.
