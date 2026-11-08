@@ -61,6 +61,7 @@ impl AuthMethod {
 ///     uint8_t encoded_spend_proof[...];
 /// } Token;
 /// ```
+#[derive(Clone)]
 pub struct ActSpend {
     /// SHA-256(TokenChallenge) — binds the token to the challenge context.
     pub challenge_digest: [u8; 32],

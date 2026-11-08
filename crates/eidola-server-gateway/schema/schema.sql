@@ -182,7 +182,8 @@ COMMENT ON COLUMN issuer_key.issue_until IS
 COMMENT ON COLUMN issuer_key.accept_until IS
     'Grace period end. Credentials signed by this key are accepted for spending '
     'until this timestamp. Defaults to one epoch duration after issue_until. '
-    'Nullifiers for this key can be pruned after this date.';
+    'Nullifiers for this key are pruned only once the gateway''s retention '
+    'margin past this timestamp has also passed (prune_expired_nullifiers).';
 
 -- ---------------------------------------------------------------------------
 -- Credit Ledger
@@ -614,26 +615,37 @@ COMMENT ON FUNCTION debit_account IS
     'only what exceeds those too is placed in the permanent (NULL expiry) '
     'pool.  Clawbacks skip the expired-pool pass and go permanent directly.';
 
-CREATE FUNCTION prune_expired_nullifiers()
+-- Self-contained and re-runnable, so an operator can apply it to an existing
+-- database by hand. The zero-argument form pruned at accept_until itself,
+-- with no margin for spends accepted just before it; it is dropped.
+DROP FUNCTION IF EXISTS prune_expired_nullifiers();
+
+CREATE OR REPLACE FUNCTION prune_expired_nullifiers(p_retain_past_accept INTERVAL)
 RETURNS BIGINT
 LANGUAGE plpgsql
 AS $$
 DECLARE
     pruned BIGINT;
 BEGIN
+    IF p_retain_past_accept IS NULL OR p_retain_past_accept <= interval '0' THEN
+        RAISE EXCEPTION 'prune_expired_nullifiers: retention past accept_until must be positive';
+    END IF;
     DELETE FROM nullifier
     WHERE issuer_key_id IN (
-        SELECT id FROM issuer_key WHERE accept_until < now()
+        SELECT id FROM issuer_key
+        WHERE accept_until + p_retain_past_accept < now()
     );
     GET DIAGNOSTICS pruned = ROW_COUNT;
     RETURN pruned;
 END;
 $$;
 
-COMMENT ON FUNCTION prune_expired_nullifiers IS
-    'Removes nullifiers for keys whose accept_until has passed. '
-    'Credentials from these keys can no longer be spent, so their nullifiers '
-    'are no longer needed. Returns the number of nullifiers pruned. '
-    'Safe to run periodically (e.g., daily) or manually after key rotation.';
+COMMENT ON FUNCTION prune_expired_nullifiers(INTERVAL) IS
+    'Removes nullifiers for keys retired at least p_retain_past_accept ago '
+    '(accept_until + p_retain_past_accept < now()). The gateway calls it '
+    'from its key-rotation task with RETENTION_PAST_ACCEPT, the same margin '
+    'during which it still signs refunds under a key, so no nullifier is '
+    'pruned while its key could accept a spend. Do not call it by hand with '
+    'a smaller interval. Returns the number of nullifiers pruned.';
 
 COMMIT;

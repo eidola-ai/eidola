@@ -963,13 +963,18 @@ pub async fn get_balance_pools(
     Ok((total, pools))
 }
 
-/// Retrieve an issuer key by its hex-encoded hash (if still valid for acceptance).
+/// Retrieve an issuer key by its hex-encoded hash, if it is still retained:
+/// `accept_until + retain_past_accept > now()`. The caller decides on its
+/// own clock whether the key is usable for what it wants
+/// (`credentials::key_usable`).
 #[tracing::instrument(skip_all, name = "db.get_issuer_key", err)]
 pub async fn get_issuer_key_by_hash(
     pool: &Pool,
     key_hash: &[u8],
+    retain_past_accept: std::time::Duration,
 ) -> Result<Option<IssuerKeyRow>, ServerError> {
     let id = hex::encode(key_hash);
+    let retain_secs = retain_past_accept.as_secs_f64();
     let client = pool
         .get()
         .await
@@ -979,8 +984,9 @@ pub async fn get_issuer_key_by_hash(
         .query_opt(
             "SELECT id, private_key_enc, public_key, domain_separator, \
                     issue_from, issue_until, accept_until \
-             FROM issuer_key WHERE id = $1 AND accept_until > now()",
-            &[&id],
+             FROM issuer_key \
+             WHERE id = $1 AND accept_until + make_interval(secs => $2) > now()",
+            &[&id, &retain_secs],
         )
         .await
         .map_err(|e| {
@@ -991,6 +997,38 @@ pub async fn get_issuer_key_by_hash(
         })?;
 
     Ok(row.as_ref().map(map_issuer_key_row))
+}
+
+/// Delete the nullifiers of every key retired at least `retain_past_accept`
+/// ago (`accept_until + retain_past_accept < now()`). Returns how many were
+/// deleted.
+///
+/// Called with `credentials::RETENTION_PAST_ACCEPT`, the same margin that
+/// bounds every use of a key, so a nullifier outlives anything that could
+/// accept a spend of it.
+#[tracing::instrument(skip_all, name = "db.prune_expired_nullifiers", err)]
+pub async fn prune_expired_nullifiers(
+    pool: &Pool,
+    retain_past_accept: std::time::Duration,
+) -> Result<i64, ServerError> {
+    let retain_secs = retain_past_accept.as_secs_f64();
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    let row = client
+        .query_one(
+            "SELECT prune_expired_nullifiers(make_interval(secs => $1)) AS pruned",
+            &[&retain_secs],
+        )
+        .await
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "prune_expired_nullifiers failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
+    Ok(row.get("pruned"))
 }
 
 /// Atomically record a nullifier. Returns `true` if successfully recorded,
