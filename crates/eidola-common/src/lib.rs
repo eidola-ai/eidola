@@ -6,7 +6,8 @@
 //! outer chat-request construction ([`chat_completion_request_body`]), the
 //! wire contract shared by clients, the gateway and the inference nodes
 //! ([`engine_protocol`]: the prefix-cache key's shape and the weights
-//! header), and the embed-marker recognition rule shared between the
+//! header), the refund recovery key's wire form ([`refund_key`]), and the
+//! embed-marker recognition rule shared between the
 //! markdown editor's embed plugin and app-core's upstream quote expansion
 //! ([`embed`]). It is intentionally lib-only, pure Rust, and float-free so
 //! `eidola-app-core`, `eidola-server-gateway`, `eidola-server-engine`, and
@@ -117,6 +118,7 @@
 pub mod embed;
 pub mod engine_deployment;
 pub mod engine_protocol;
+pub mod refund_key;
 
 use serde_json::Value;
 

@@ -245,8 +245,9 @@ fn engines(state: &AppState) -> Result<&crate::engine_router::EngineRouter, Serv
 /// `refund_credits` is the number of credits to return (i.e., the `t` parameter
 /// in the ACT spec — the resulting token will have `c - s + t` credits).
 ///
-/// The refund token is also stored in the nullifier row so the client can
-/// recover it via `POST /v1/credentials/refund` if the response is lost.
+/// The refund token is also stored in the nullifier row, sealed under the
+/// client's refund recovery key (`act.refund_key`), so the client can recover
+/// it via `POST /v1/credentials/refund` if the response is lost.
 ///
 /// The refund is signed under the spent credential's own key
 /// (`credentials::sign_refund` takes the key from `act`, and nothing else).
@@ -260,12 +261,11 @@ async fn issue_refund_async(
         credentials::sign_refund(&cache, act, refund_credits, SystemTime::now())?
     };
 
-    // Best-effort store in DB for client recovery. Failure here is not fatal
-    // — the refund is still returned in the response.
-    let nullifier_bytes = act.spend_proof.nullifier().as_bytes().to_vec();
-    if let Err(e) =
-        db::store_refund_token(&state.db_pool, &key_id, &nullifier_bytes, &refund_cbor).await
-    {
+    // Best-effort store in DB for client recovery, sealed under the client's
+    // key: the token carries the refund amount, and Postgres is outside the
+    // enclave. Failure here is not fatal — the refund is still returned in the
+    // response.
+    if let Err(e) = credentials::store_sealed_refund(state, act, &key_id, &refund_cbor).await {
         warn!("Failed to store refund token for recovery: {e}");
     }
 
@@ -408,9 +408,12 @@ fn check_sufficient_charge(
     path = "/v1/chat/completions",
     tag = "Unlinked",
     request_body = ChatCompletionRequest,
+    params(
+        ("x-eidola-refund-key" = String, Header, description = "The client's refund recovery key for this spend, 64 lowercase hex digits: the stored copy of the refund is sealed under it, and recovery must present it again")
+    ),
     responses(
         (status = 200, description = "Chat completion response with privacy and verification metadata", body = EidolaResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 400, description = "Invalid request, or a missing or malformed refund recovery key (refused before the credential is spent)", body = ErrorResponse),
         (status = 401, description = "Authentication failed", body = ErrorResponse),
         (status = 402, description = "Insufficient charge amount", body = ErrorResponse),
         (status = 409, description = "Credential already spent", body = ErrorResponse),
