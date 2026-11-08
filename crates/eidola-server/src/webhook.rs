@@ -557,59 +557,47 @@ async fn handle_charge_refunded(event: &StripeEvent, pool: &Pool) -> WebhookOutc
         }
     };
 
-    let amount = match cents_to_microdollars(amount_refunded) {
-        Some(a) => a,
-        None => {
-            error!("webhook: amount overflow in charge.refunded");
-            return WebhookOutcome::Done("amount_overflow");
-        }
-    };
+    if cents_to_microdollars(amount_refunded).is_none() {
+        error!("webhook: amount overflow in charge.refunded");
+        return WebhookOutcome::Done("amount_overflow");
+    }
 
-    // Prefer matching the refund to the original payment's balance pool via
-    // the charge's PaymentIntent, so the debit inherits that pool's
-    // expires_at even if it has already lapsed (goodwill refunds of expired
-    // credits net to zero instead of clawing back live credits). Fall back
-    // to pool-order debiting when no linked entry exists.
+    // `amount_refunded` is the charge's refunded total, and this event fires
+    // for every partial refund: `refund_charge` debits only what the
+    // charge's earlier refunds have not. The PaymentIntent both tags those
+    // debits and, when it links to the original credit entry, matches the
+    // refund to that pool (inheriting its expires_at even if it has lapsed,
+    // so goodwill refunds of expired credits net to zero) and voids the
+    // credits it granted pro rata to the charge `amount` refunded.
     let payment_intent = obj["payment_intent"].as_str();
+    let charge_amount = obj["amount"].as_i64();
 
-    let matched = match payment_intent {
-        Some(pi) => {
-            match db::refund_matched_to_payment_intent(pool, account.id, amount, &event.id, pi)
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    error!("webhook: failed to insert matched refund: {}", e);
-                    return WebhookOutcome::Retryable("db_error");
-                }
-            }
-        }
-        None => None,
-    };
-
-    match matched {
-        Some(true) => {
-            info!("webhook: ledger debited (refund matched to its payment intent)");
+    match db::refund_charge(
+        pool,
+        account.id,
+        &event.id,
+        payment_intent,
+        charge_amount,
+        amount_refunded,
+    )
+    .await
+    {
+        Ok(db::RefundOutcome::Debited) => {
+            info!("webhook: ledger debited (refund)");
             WebhookOutcome::Done("handled")
         }
-        Some(false) => {
+        Ok(db::RefundOutcome::Duplicate) => {
             info!("webhook: duplicate event, skipping");
             WebhookOutcome::Done("duplicate")
         }
-        None => match db::debit_stripe_event(pool, account.id, amount, "refund", &event.id).await {
-            Ok(true) => {
-                info!("webhook: ledger debited (refund)");
-                WebhookOutcome::Done("handled")
-            }
-            Ok(false) => {
-                info!("webhook: duplicate event, skipping");
-                WebhookOutcome::Done("duplicate")
-            }
-            Err(e) => {
-                error!("webhook: failed to insert ledger entry: {}", e);
-                WebhookOutcome::Retryable("db_error")
-            }
-        },
+        Ok(db::RefundOutcome::NothingNew) => {
+            info!("webhook: charge's refunds already debited, skipping");
+            WebhookOutcome::Done("already_refunded")
+        }
+        Err(e) => {
+            error!("webhook: failed to debit refund: {}", e);
+            WebhookOutcome::Retryable("db_error")
+        }
     }
 }
 
@@ -1008,6 +996,212 @@ mod tests {
         assert!(!outcome.is_retryable());
         assert_eq!(get_balance(&pool, account_id).await, 40_000_000);
         assert_eq!(count_ledger_entries(&pool, account_id).await, 2);
+    }
+
+    /// Stripe sends `charge.refunded` for every partial refund, each a new
+    /// event, and the Charge's `amount_refunded` is its refunded total so
+    /// far. Two $10 partial refunds of one charge must void $20, not
+    /// $10 + $20.
+    #[tokio::test]
+    #[ignore]
+    async fn second_partial_refund_debits_only_the_new_amount_matched() {
+        let pool = test_pool();
+        let cust = format!("cus_test_{}", uuid::Uuid::new_v4());
+        let account_id = create_test_account(&pool, &cust).await;
+        let pi = format!("pi_test_{}", uuid::Uuid::new_v4());
+        let expires = std::time::SystemTime::now() + std::time::Duration::from_secs(86_400);
+        db::insert_credit_ledger(
+            &pool,
+            account_id,
+            100_000_000,
+            "purchase",
+            &format!("evt_seed_{}", uuid::Uuid::new_v4()),
+            Some(&pi),
+            Some(expires),
+        )
+        .await
+        .unwrap();
+
+        for cumulative_cents in [1000, 2000] {
+            let event = make_event(
+                &format!("evt_{}", uuid::Uuid::new_v4()),
+                "charge.refunded",
+                serde_json::json!({
+                    "customer": cust,
+                    "payment_intent": pi,
+                    "amount": 10000,
+                    "amount_refunded": cumulative_cents
+                }),
+            );
+            assert!(!handle_charge_refunded(&event, &pool).await.is_retryable());
+        }
+
+        assert_eq!(get_balance(&pool, account_id).await, 80_000_000);
+    }
+
+    /// The same two partial refunds through the fallback path: a
+    /// subscription credit recorded without a PaymentIntent (the pinned API
+    /// version's invoices carry none), refunded by a charge that has one.
+    #[tokio::test]
+    #[ignore]
+    async fn second_partial_refund_debits_only_the_new_amount_unmatched() {
+        let pool = test_pool();
+        let cust = format!("cus_test_{}", uuid::Uuid::new_v4());
+        let account_id = create_test_account(&pool, &cust).await;
+        let pi = format!("pi_test_{}", uuid::Uuid::new_v4());
+        db::insert_credit_ledger(
+            &pool,
+            account_id,
+            100_000_000,
+            "subscription_renewal",
+            &format!("evt_seed_{}", uuid::Uuid::new_v4()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        for cumulative_cents in [1000, 2000] {
+            let event = make_event(
+                &format!("evt_{}", uuid::Uuid::new_v4()),
+                "charge.refunded",
+                serde_json::json!({
+                    "customer": cust,
+                    "payment_intent": pi,
+                    "amount": 10000,
+                    "amount_refunded": cumulative_cents
+                }),
+            );
+            assert!(!handle_charge_refunded(&event, &pool).await.is_retryable());
+        }
+
+        assert_eq!(get_balance(&pool, account_id).await, 80_000_000);
+    }
+
+    /// A $100 purchase linked to its PaymentIntent, for the refund tests
+    /// below. Returns the customer and PaymentIntent ids.
+    async fn seed_linked_purchase(pool: &Pool) -> (uuid::Uuid, String, String) {
+        let cust = format!("cus_test_{}", uuid::Uuid::new_v4());
+        let account_id = create_test_account(pool, &cust).await;
+        let pi = format!("pi_test_{}", uuid::Uuid::new_v4());
+        let expires = std::time::SystemTime::now() + std::time::Duration::from_secs(86_400);
+        db::insert_credit_ledger(
+            pool,
+            account_id,
+            100_000_000,
+            "purchase",
+            &format!("evt_seed_{}", uuid::Uuid::new_v4()),
+            Some(&pi),
+            Some(expires),
+        )
+        .await
+        .unwrap();
+        (account_id, cust, pi)
+    }
+
+    fn partial_refund_event(cust: &str, pi: &str, cumulative_cents: i64) -> StripeEvent {
+        make_event(
+            &format!("evt_{}", uuid::Uuid::new_v4()),
+            "charge.refunded",
+            serde_json::json!({
+                "customer": cust,
+                "payment_intent": pi,
+                "amount": 10000,
+                "amount_refunded": cumulative_cents
+            }),
+        )
+    }
+
+    /// Stripe does not guarantee delivery order: the second partial
+    /// refund's event arriving before the first must still void exactly
+    /// what was refunded.
+    #[tokio::test]
+    #[ignore]
+    async fn partial_refunds_delivered_out_of_order() {
+        let pool = test_pool();
+        let (account_id, cust, pi) = seed_linked_purchase(&pool).await;
+
+        for cumulative_cents in [2000, 1000] {
+            let event = partial_refund_event(&cust, &pi, cumulative_cents);
+            assert!(!handle_charge_refunded(&event, &pool).await.is_retryable());
+        }
+
+        assert_eq!(get_balance(&pool, account_id).await, 80_000_000);
+    }
+
+    /// Two partial refunds of one charge processed at once must not both
+    /// read the same "already debited" total.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn concurrent_partial_refunds_of_one_charge() {
+        const ROUNDS: usize = 20;
+        let pool = test_pool();
+
+        let mut wrong = Vec::new();
+        for round in 0..ROUNDS {
+            let (account_id, cust, pi) = seed_linked_purchase(&pool).await;
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let tasks: Vec<_> = [1000, 2000]
+                .into_iter()
+                .map(|cumulative_cents| {
+                    let event = partial_refund_event(&cust, &pi, cumulative_cents);
+                    let (pool, barrier) = (pool.clone(), barrier.clone());
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        handle_charge_refunded(&event, &pool).await
+                    })
+                })
+                .collect();
+            for task in tasks {
+                assert!(!task.await.unwrap().is_retryable());
+            }
+            let balance = get_balance(&pool, account_id).await;
+            if balance != 80_000_000 {
+                wrong.push((round, balance));
+            }
+        }
+
+        assert!(wrong.is_empty(), "rounds with a wrong balance: {wrong:?}");
+    }
+
+    /// Terms §5: a refund voids the credits the refunded money bought. A
+    /// product's `credits` metadata need not equal its price in
+    /// micro-dollars (terms §4: plans differ in price per unit), so a full
+    /// refund of a $20 purchase that granted 16,000,000 credits must void
+    /// 16,000,000, not 20,000,000.
+    #[tokio::test]
+    #[ignore]
+    async fn full_refund_voids_the_credits_the_purchase_granted() {
+        let pool = test_pool();
+        let cust = format!("cus_test_{}", uuid::Uuid::new_v4());
+        let account_id = create_test_account(&pool, &cust).await;
+        let pi = format!("pi_test_{}", uuid::Uuid::new_v4());
+        let expires = std::time::SystemTime::now() + std::time::Duration::from_secs(86_400);
+        db::insert_credit_ledger(
+            &pool,
+            account_id,
+            16_000_000,
+            "purchase",
+            &format!("evt_seed_{}", uuid::Uuid::new_v4()),
+            Some(&pi),
+            Some(expires),
+        )
+        .await
+        .unwrap();
+
+        let event = make_event(
+            &format!("evt_{}", uuid::Uuid::new_v4()),
+            "charge.refunded",
+            serde_json::json!({
+                "customer": cust,
+                "payment_intent": pi,
+                "amount": 2000,
+                "amount_refunded": 2000
+            }),
+        );
+        assert!(!handle_charge_refunded(&event, &pool).await.is_retryable());
+
+        assert_eq!(get_balance(&pool, account_id).await, 0);
     }
 
     /// A refund whose charge carries a PaymentIntent linked to an

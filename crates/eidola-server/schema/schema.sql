@@ -273,12 +273,14 @@ COMMENT ON COLUMN credit_ledger.stripe_event_id IS
 
 COMMENT ON COLUMN credit_ledger.stripe_payment_intent IS
     'Stripe PaymentIntent ID (pi_xxx) for entries originating from a payment '
-    '(purchase, subscription_renewal) and for refund debits matched to one. '
-    'Lets a later charge.refunded event locate the original credit entry and '
-    'issue the refund debit against the same balance pool — inheriting its '
-    'expires_at even when that pool has already expired, so the refund nets '
-    'against the credits it reverses. NULL for non-payment entries and for '
-    'events where Stripe did not include a payment intent.';
+    '(purchase, subscription_renewal) and for every refund debit of a charge '
+    'that carries one. Lets a later charge.refunded event locate the original '
+    'credit entry and issue the refund debit against the same balance pool — '
+    'inheriting its expires_at even when that pool has already expired, so the '
+    'refund nets against the credits it reverses — and lets it debit only what '
+    'the charge''s earlier refunds have not (charge.refunded carries the '
+    'refunded total, once per partial refund). NULL for non-payment entries '
+    'and for events where Stripe did not include a payment intent.';
 
 COMMENT ON COLUMN credit_ledger.memo IS
     'Optional free-text note. Primarily useful for manual_adjustment entries '
@@ -395,7 +397,8 @@ CREATE FUNCTION debit_account(
     p_reason           TEXT,
     p_stripe_event_id  TEXT    DEFAULT NULL,
     p_credential_key_id TEXT   DEFAULT NULL,
-    p_require_balance  BOOLEAN DEFAULT TRUE
+    p_require_balance  BOOLEAN DEFAULT TRUE,
+    p_payment_intent   TEXT    DEFAULT NULL
 ) RETURNS UUID[]
 LANGUAGE plpgsql
 AS $$
@@ -456,11 +459,12 @@ BEGIN
 
         INSERT INTO credit_ledger (
             id, account_id, delta, reason, stripe_event_id, expires_at,
-            credential_key_id, credential_credits, created_at
+            credential_key_id, credential_credits, stripe_payment_intent, created_at
         ) VALUES (
             gen_random_uuid(), p_account_id, -v_take, p_reason, v_event_id,
             v_pool.expires_at, p_credential_key_id,
             CASE WHEN p_credential_key_id IS NOT NULL THEN v_take ELSE NULL END,
+            p_payment_intent,
             now()
         )
         RETURNING id INTO v_entry_id;
@@ -505,11 +509,12 @@ BEGIN
 
             INSERT INTO credit_ledger (
                 id, account_id, delta, reason, stripe_event_id, expires_at,
-                credential_key_id, credential_credits, created_at
+                credential_key_id, credential_credits, stripe_payment_intent, created_at
             ) VALUES (
                 gen_random_uuid(), p_account_id, -v_take, p_reason, v_event_id,
                 v_pool.expires_at, p_credential_key_id,
                 CASE WHEN p_credential_key_id IS NOT NULL THEN v_take ELSE NULL END,
+                p_payment_intent,
                 now()
             )
             RETURNING id INTO v_entry_id;
@@ -535,11 +540,12 @@ BEGIN
 
         INSERT INTO credit_ledger (
             id, account_id, delta, reason, stripe_event_id, expires_at,
-            credential_key_id, credential_credits, created_at
+            credential_key_id, credential_credits, stripe_payment_intent, created_at
         ) VALUES (
             gen_random_uuid(), p_account_id, -v_remaining, p_reason, v_event_id,
             NULL, p_credential_key_id,
             CASE WHEN p_credential_key_id IS NOT NULL THEN v_remaining ELSE NULL END,
+            p_payment_intent,
             now()
         )
         RETURNING id INTO v_entry_id;

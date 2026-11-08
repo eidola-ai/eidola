@@ -769,72 +769,157 @@ pub async fn debit_stripe_event(
     }
 }
 
-/// Insert a refund debit matched to the original payment's balance pool.
+/// What [`refund_charge`] did with one `charge.refunded` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefundOutcome {
+    /// A debit for the newly refunded part was written.
+    Debited,
+    /// This event was already processed.
+    Duplicate,
+    /// The charge's refunds so far are already debited in full (a
+    /// redelivered or out-of-order earlier event).
+    NothingNew,
+}
+
+/// Debit the part of a charge's refunds not yet debited.
 ///
-/// Looks up the credit entry recorded for `payment_intent` and, if found,
-/// inserts the refund debit with that entry's `expires_at` — even when the
-/// pool has already expired — so the refund nets against exactly the credits
-/// it reverses instead of draining unrelated pools or creating a permanent
-/// negative entry. Returns `Ok(None)` when no credit entry carries this
-/// payment intent (caller should fall back to `debit_stripe_event`),
-/// `Ok(Some(false))` on a duplicate `stripe_event_id`, and `Ok(Some(true))`
-/// on success.
-pub async fn refund_matched_to_payment_intent(
+/// `charge.refunded` fires once per refund, partial ones included, and
+/// carries the Charge's `amount_refunded`: its refunded **total** so far,
+/// not this refund's amount. So the debit is target-based: what the charge's
+/// refund debits should total now, less what refund rows tagged with its
+/// PaymentIntent already debited. That makes a later event that arrives
+/// first, or a redelivery, debit nothing extra.
+///
+/// When the PaymentIntent locates the credit entry the charge paid for, the
+/// target is that entry's credits in proportion to the share of the charge
+/// refunded (terms §5: a refund voids the credits the money bought, and a
+/// product's credits need not equal its price), and the debit inherits the
+/// entry's `expires_at` — even when the pool has already expired — so it
+/// nets against exactly the credits it reverses. Otherwise the target is
+/// the refunded amount at one credit per micro-dollar, debited through
+/// `debit_account`'s pool order and tagged with the PaymentIntent so the
+/// next partial refund can see it. Without a PaymentIntent there is nothing
+/// to tag, and each event debits its `amount_refunded` as before.
+///
+/// The account row is locked for the whole transaction so two refund
+/// events of one charge cannot both read the same "already debited" sum.
+pub async fn refund_charge(
     pool: &Pool,
     account_id: Uuid,
-    amount: i64,
     stripe_event_id: &str,
-    payment_intent: &str,
-) -> Result<Option<bool>, ServerError> {
-    let client = pool
+    payment_intent: Option<&str>,
+    charge_amount_cents: Option<i64>,
+    amount_refunded_cents: i64,
+) -> Result<RefundOutcome, ServerError> {
+    let db_err = |what: &'static str| {
+        move |e: tokio_postgres::Error| {
+            ServerError::Internal(format!("{what} failed: {}", db_error_summary(&e)))
+        }
+    };
+    let mut client = pool
         .get()
         .await
         .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    let tx = client
+        .transaction()
+        .await
+        .map_err(db_err("begin refund transaction"))?;
 
-    let original = client
-        .query_opt(
-            "SELECT expires_at FROM credit_ledger \
-             WHERE account_id = $1 AND stripe_payment_intent = $2 AND delta > 0 \
-             ORDER BY created_at ASC LIMIT 1",
-            &[&account_id, &payment_intent],
+    tx.execute(
+        "SELECT 1 FROM account WHERE id = $1 FOR UPDATE",
+        &[&account_id],
+    )
+    .await
+    .map_err(db_err("refund account lock"))?;
+
+    let duplicate: bool = tx
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM credit_ledger WHERE stripe_event_id = $1)",
+            &[&stripe_event_id],
         )
         .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "refund pool lookup failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
+        .map_err(db_err("refund duplicate check"))?
+        .get(0);
+    if duplicate {
+        tx.rollback().await.map_err(db_err("refund rollback"))?;
+        return Ok(RefundOutcome::Duplicate);
+    }
 
-    let Some(row) = original else {
-        return Ok(None);
+    let original = match payment_intent {
+        Some(pi) => tx
+            .query_opt(
+                "SELECT delta, expires_at FROM credit_ledger \
+                 WHERE account_id = $1 AND stripe_payment_intent = $2 AND delta > 0 \
+                 ORDER BY created_at ASC LIMIT 1",
+                &[&account_id, &pi],
+            )
+            .await
+            .map_err(db_err("refund pool lookup"))?,
+        None => None,
     };
-    let expires_at: Option<SystemTime> = row.get("expires_at");
-    let delta = -amount;
 
-    let result = client
-        .execute(
-            "INSERT INTO credit_ledger \
-                 (account_id, delta, reason, stripe_event_id, stripe_payment_intent, expires_at) \
-             VALUES ($1, $2, 'refund', $3, $4, $5) \
-             ON CONFLICT (stripe_event_id) DO NOTHING",
-            &[
-                &account_id,
-                &delta,
-                &stripe_event_id,
-                &payment_intent,
-                &expires_at,
-            ],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "matched refund insert failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
+    let at_par = amount_refunded_cents.checked_mul(10_000).ok_or_else(|| {
+        ServerError::Internal("refund amount overflows micro-dollars".to_string())
+    })?;
+    let target = match (&original, charge_amount_cents) {
+        (Some(row), Some(charge)) if charge > 0 => {
+            let granted: i64 = row.get("delta");
+            let share = i128::from(granted) * i128::from(amount_refunded_cents.min(charge))
+                / i128::from(charge);
+            i64::try_from(share)
+                .map_err(|_| ServerError::Internal("refund share overflows credits".to_string()))?
+        }
+        _ => at_par,
+    };
 
-    Ok(Some(result == 1))
+    let already: i64 = match payment_intent {
+        Some(pi) => tx
+            .query_one(
+                "SELECT COALESCE(SUM(-delta), 0)::bigint FROM credit_ledger \
+                 WHERE account_id = $1 AND reason = 'refund' AND stripe_payment_intent = $2",
+                &[&account_id, &pi],
+            )
+            .await
+            .map_err(db_err("refund total lookup"))?
+            .get(0),
+        None => 0,
+    };
+    let increment = target - already;
+    if increment <= 0 {
+        tx.rollback().await.map_err(db_err("refund rollback"))?;
+        return Ok(RefundOutcome::NothingNew);
+    }
+
+    match original {
+        Some(row) => {
+            let expires_at: Option<SystemTime> = row.get("expires_at");
+            tx.execute(
+                "INSERT INTO credit_ledger \
+                     (account_id, delta, reason, stripe_event_id, stripe_payment_intent, expires_at) \
+                 VALUES ($1, $2, 'refund', $3, $4, $5)",
+                &[
+                    &account_id,
+                    &-increment,
+                    &stripe_event_id,
+                    &payment_intent,
+                    &expires_at,
+                ],
+            )
+            .await
+            .map_err(db_err("matched refund insert"))?;
+        }
+        None => {
+            tx.query_one(
+                "SELECT debit_account($1, $2, 'refund', $3, NULL, FALSE, $4)",
+                &[&account_id, &increment, &stripe_event_id, &payment_intent],
+            )
+            .await
+            .map_err(db_err("refund debit"))?;
+        }
+    }
+
+    tx.commit().await.map_err(db_err("refund commit"))?;
+    Ok(RefundOutcome::Debited)
 }
 
 /// Get the current available balance for an account.
