@@ -20,6 +20,8 @@ Parsing and challenge checking alone authenticate nothing. Only the signed hardw
 
 ALPN is pinned to HTTP/1.1 so the inline attestation and application request share one connection lifecycle. Pooled keepalive requests inherit the binding established for that connection. TLS roots are caller-supplied and authenticate only the inference endpoint; hardware roots are separate and never enter WebPKI. Keep the implementation pure Rust.
 
+The attestation response is read by hand (`read_http1_response`) from a peer nothing has authenticated yet, so its bounds are checked without arithmetic the peer controls: the release profile builds with `overflow-checks = false`, where `body.len() + size` for a peer-declared chunk size wraps past the bound into a panic. Compare the peer's number against the remaining room instead (`size > MAX_BODY - body.len()`). Test: `a_chunk_size_past_the_body_bound_is_refused_not_wrapped`.
+
 ## Threat-model note
 
 The nonce defeats stale-document replay and the quote authenticates the peer certificate's long-lived SPKI. It does **not** bind the live TLS session. An attacker holding an exfiltrated TLS private key can terminate TLS outside the enclave while relaying a fresh nonce-bound document from a genuine enclave. Closing that gap requires channel binding, such as committing TLS exporter material to `REPORT_DATA`; Tinfoil's current v3 implementation does not do this.
