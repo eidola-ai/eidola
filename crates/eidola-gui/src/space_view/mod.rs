@@ -46,7 +46,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use eidola_app_core::error::AppError;
+use eidola_app_core::error::{AppError, IssuerKeyRefusal};
 use gpui::{
     AnyElement, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
     FontWeight, InteractiveElement, IntoElement, IsZero, Overflow, ParentElement, Pixels, Render,
@@ -2926,6 +2926,18 @@ fn error_copy(e: &AppError, cx: &gpui::App) -> String {
         AppError::ModelUnavailable { model } => {
             crate::i18n::msg::space_error_model_unavailable(cx, model.clone()).to_string()
         }
+        // The server's issuer key failed a check this client makes for
+        // itself. Worded as what the reader needs: they were protected,
+        // nothing was charged, held credits still work, and (for a second
+        // key) waiting for the next epoch is what clears it.
+        AppError::IssuerKeyRefused { refusal } => match refusal {
+            IssuerKeyRefusal::NotOnCalendar => {
+                crate::i18n::msg::space_error_issuer_key_off_calendar(cx).to_string()
+            }
+            IssuerKeyRefusal::SecondKeyForEpoch { .. } => {
+                crate::i18n::msg::space_error_issuer_key_second_for_epoch(cx).to_string()
+            }
+        },
         other => other.to_string(),
     }
 }

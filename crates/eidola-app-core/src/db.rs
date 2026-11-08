@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 15;
+const LATEST_VERSION: i64 = 16;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -545,6 +545,78 @@ pub async fn upsert_issuer_key(
         message: format!("failed to upsert issuer key: {e}"),
     })?;
     Ok(())
+}
+
+/// Record `issuer_key_id` as the key for `epoch` at `scope` unless one is
+/// already recorded, and return the key recorded for the epoch either way:
+/// the first key seen for an epoch is the one that stands (see the
+/// `issuer_key_epoch` table). Epochs before `oldest_listable` (whose keys can
+/// no longer be listed) are pruned in the same transaction.
+pub async fn pin_issuer_key_epoch(
+    conn: &Connection,
+    scope: &str,
+    epoch: u64,
+    issuer_key_id: &str,
+    oldest_listable: u64,
+    now: i64,
+) -> Result<String, AppError> {
+    let epoch = i64::try_from(epoch).map_err(|_| AppError::Credential {
+        message: "issuer epoch out of range".into(),
+    })?;
+    let oldest = i64::try_from(oldest_listable).unwrap_or(i64::MAX);
+    begin_write(conn).await?;
+    match pin_issuer_key_epoch_body(conn, scope, epoch, issuer_key_id, oldest, now).await {
+        Ok(pinned) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(pinned)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn pin_issuer_key_epoch_body(
+    conn: &Connection,
+    scope: &str,
+    epoch: i64,
+    issuer_key_id: &str,
+    oldest: i64,
+    now: i64,
+) -> Result<String, AppError> {
+    conn.execute(
+        "DELETE FROM issuer_key_epoch WHERE scope = ?1 AND epoch < ?2",
+        (Value::Text(scope.to_string()), Value::Integer(oldest)),
+    )
+    .await
+    .map_err(AppError::db)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO issuer_key_epoch (scope, epoch, issuer_key_id, first_seen) \
+         VALUES (?1, ?2, ?3, ?4)",
+        (
+            Value::Text(scope.to_string()),
+            Value::Integer(epoch),
+            Value::Text(issuer_key_id.to_string()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+    let mut rows = conn
+        .query(
+            "SELECT issuer_key_id FROM issuer_key_epoch WHERE scope = ?1 AND epoch = ?2",
+            (Value::Text(scope.to_string()), Value::Integer(epoch)),
+        )
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<String>(0).map_err(AppError::db),
+        None => Err(AppError::Database {
+            message: "issuer key epoch record vanished".into(),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -11610,6 +11682,72 @@ mod tests {
         let lc = list_credential_lifecycle(&conn).await.unwrap();
         let exp = lc.iter().find(|r| r.nonce == "nonce-exp").unwrap();
         assert_eq!(exp.state, "expired");
+    }
+
+    /// The first key recorded for an epoch stands: a second one for the same
+    /// epoch reads back the first, another epoch's key is recorded on its
+    /// own, another server's record is separate, and epochs that can no
+    /// longer be listed are pruned.
+    #[tokio::test]
+    async fn the_first_key_seen_for_an_epoch_stands() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+        let a = "https://a.example";
+        let b = "https://b.example";
+
+        assert_eq!(
+            pin_issuer_key_epoch(&conn, a, 10, "k10", 9, 1)
+                .await
+                .unwrap(),
+            "k10"
+        );
+        assert_eq!(
+            pin_issuer_key_epoch(&conn, a, 10, "other", 9, 2)
+                .await
+                .unwrap(),
+            "k10",
+            "a second key for a seen epoch does not replace the first"
+        );
+        assert_eq!(
+            pin_issuer_key_epoch(&conn, a, 11, "k11", 9, 3)
+                .await
+                .unwrap(),
+            "k11"
+        );
+        assert_eq!(
+            pin_issuer_key_epoch(&conn, b, 10, "b10", 9, 4)
+                .await
+                .unwrap(),
+            "b10",
+            "each server's epochs are its own"
+        );
+
+        // Moving on two epochs prunes epoch 10 for that server only.
+        assert_eq!(
+            pin_issuer_key_epoch(&conn, a, 12, "k12", 11, 5)
+                .await
+                .unwrap(),
+            "k12"
+        );
+        let mut rows = conn
+            .query(
+                "SELECT scope, epoch FROM issuer_key_epoch ORDER BY scope, epoch",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            seen.push((row.get::<String>(0).unwrap(), row.get::<i64>(1).unwrap()));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (a.to_string(), 11),
+                (a.to_string(), 12),
+                (b.to_string(), 10)
+            ]
+        );
     }
 
     /// A key's two deadlines split the lifecycle: past `spend_until` an unspent

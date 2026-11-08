@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -24,8 +24,9 @@ use crate::AppState;
 use crate::auth::{BasicAuth, RefundKey, TokenAuth};
 use crate::db;
 use crate::error::ServerError;
-use crate::helpers::{EpochConfig, system_time_to_iso_lossy};
+use crate::helpers::system_time_to_iso_lossy;
 use crate::response::RefundInfo;
+use eidola_common::issuer_calendar::{EpochWindows, ISSUER_CALENDAR};
 
 // ---------------------------------------------------------------------------
 // Key cache types
@@ -36,7 +37,12 @@ pub struct DecryptedIssuerKey {
     pub secret_key: PrivateKey,
     pub params: Params,
     pub key_hash: [u8; 32],
+    /// The key's public half (CBOR), as `GET /v1/keys` serves it.
+    pub public_key: Vec<u8>,
     pub request_context_scalar: Scalar,
+    /// The calendar epoch this key issues in. Every cached key's windows are
+    /// exactly this epoch's (see [`canonical_epoch`]).
+    pub epoch: u64,
     pub issue_from: SystemTime,
     pub issue_until: SystemTime,
     /// End of acceptance (exclusive): no spend under this key is accepted
@@ -143,23 +149,131 @@ pub fn evict_retired_keys(
 }
 
 // ---------------------------------------------------------------------------
+// Key windows: the public calendar
+// ---------------------------------------------------------------------------
+
+/// Unix seconds of `t`, if it is a whole second at or after the Unix epoch.
+/// Every instant on the calendar is; anything else is not a key window.
+fn whole_unix_secs(t: SystemTime) -> Option<u64> {
+    let d = t.duration_since(UNIX_EPOCH).ok()?;
+    (d.subsec_nanos() == 0).then_some(d.as_secs())
+}
+
+/// The calendar's windows as stored and served.
+fn calendar_windows(
+    issue_from: SystemTime,
+    issue_until: SystemTime,
+    accept_until: SystemTime,
+) -> Option<EpochWindows> {
+    Some(EpochWindows {
+        issue_from: whole_unix_secs(issue_from)?,
+        issue_until: whole_unix_secs(issue_until)?,
+        accept_until: whole_unix_secs(accept_until)?,
+    })
+}
+
+/// The epoch a key with these windows belongs to, or `None` if they are not
+/// exactly one epoch's windows on the public calendar
+/// ([`ISSUER_CALENDAR`]). A key that answers `None` is never used.
+pub fn canonical_epoch(
+    issue_from: SystemTime,
+    issue_until: SystemTime,
+    accept_until: SystemTime,
+) -> Option<u64> {
+    ISSUER_CALENDAR.epoch_of(calendar_windows(issue_from, issue_until, accept_until)?)
+}
+
+/// The epoch `now` falls in.
+fn epoch_at(now: SystemTime) -> Result<u64, ServerError> {
+    now.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| ISSUER_CALENDAR.epoch_at(d.as_secs()))
+        .ok_or_else(|| ServerError::Internal("clock is before the issuer calendar".to_string()))
+}
+
+/// Epoch `epoch`'s three instants.
+fn epoch_instants(epoch: u64) -> Result<(SystemTime, SystemTime, SystemTime), ServerError> {
+    let w = ISSUER_CALENDAR
+        .windows(epoch)
+        .ok_or_else(|| ServerError::Internal("issuer epoch out of range".to_string()))?;
+    let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+    Ok((at(w.issue_from), at(w.issue_until), at(w.accept_until)))
+}
+
+/// The one refusal for a key record this gateway will not use: windows off
+/// the calendar, a foreign domain separator, an id that is not its key's
+/// hash, or a private key that does not decrypt under the record as it
+/// stands. Logged without anything from the record.
+fn refused_key_record() -> ServerError {
+    warn!("refusing an issuer key record that does not authenticate");
+    ServerError::Internal("issuer key record refused".to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Key encryption / decryption
 // ---------------------------------------------------------------------------
+
+/// HKDF info for the issuer-key wrapping key. `v2` is the format whose
+/// associated data binds the record (see [`issuer_key_aad`]).
+const ISSUER_KEY_WRAP_INFO: &[u8] = b"eidola-issuer-key-v2";
+
+/// Domain separator at the head of an issuer key's associated data.
+const ISSUER_KEY_AAD_LABEL: &[u8] = b"eidola/issuer-key/v2";
+
+/// The associated data an issuer private key is encrypted under: everything
+/// the gateway reads from the key's row besides the ciphertext.
+///
+/// `label ‖ len(id) ‖ id ‖ len(public_key) ‖ public_key ‖ len(ds) ‖ ds ‖
+/// issue_from ‖ issue_until ‖ accept_until`, each length and instant a
+/// big-endian `u64` (instants in Unix seconds). So a row whose id, public
+/// key, domain separator or any of its three windows was edited no longer
+/// decrypts, and the key is refused. Postgres holds these columns in the
+/// clear; this is what makes them the enclave's statement rather than the
+/// database's.
+fn issuer_key_aad(
+    id: &str,
+    public_key: &[u8],
+    domain_separator: &str,
+    windows: EpochWindows,
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(
+        ISSUER_KEY_AAD_LABEL.len()
+            + 3 * 8
+            + id.len()
+            + public_key.len()
+            + domain_separator.len()
+            + 3 * 8,
+    );
+    aad.extend_from_slice(ISSUER_KEY_AAD_LABEL);
+    for field in [id.as_bytes(), public_key, domain_separator.as_bytes()] {
+        aad.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        aad.extend_from_slice(field);
+    }
+    for instant in [
+        windows.issue_from,
+        windows.issue_until,
+        windows.accept_until,
+    ] {
+        aad.extend_from_slice(&instant.to_be_bytes());
+    }
+    aad
+}
 
 /// Derive a per-key AES-256-GCM key from the master key using HKDF-SHA256.
 fn derive_key_encryption_key(master_key: &[u8; 32], key_id: &str) -> [u8; 32] {
     let hk = hkdf::Hkdf::<Sha256>::new(Some(key_id.as_bytes()), master_key);
     let mut okm = [0u8; 32];
-    hk.expand(b"eidola-issuer-key-v1", &mut okm)
+    hk.expand(ISSUER_KEY_WRAP_INFO, &mut okm)
         .expect("32 bytes is a valid HKDF-SHA256 output length");
     okm
 }
 
-/// Encrypt a private key with AES-256-GCM.
+/// Encrypt a private key with AES-256-GCM under associated data `aad`.
 /// Output format: `nonce (12 bytes) || ciphertext+tag`.
 fn encrypt_private_key(
     master_key: &[u8; 32],
     key_id: &str,
+    aad: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, ServerError> {
     let aes_key = derive_key_encryption_key(master_key, key_id);
@@ -171,7 +285,13 @@ fn encrypt_private_key(
     let nonce = Nonce::from(nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(&nonce, plaintext)
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|e| ServerError::Internal(format!("AES encryption failed: {}", e)))?;
 
     let mut out = Vec::with_capacity(12 + ciphertext.len());
@@ -180,10 +300,12 @@ fn encrypt_private_key(
     Ok(out)
 }
 
-/// Decrypt a private key from the `nonce || ciphertext+tag` format.
+/// Decrypt a private key from the `nonce || ciphertext+tag` format, under the
+/// same associated data it was encrypted with.
 fn decrypt_private_key(
     master_key: &[u8; 32],
     key_id: &str,
+    aad: &[u8],
     encrypted: &[u8],
 ) -> Result<Vec<u8>, ServerError> {
     if encrypted.len() < 12 {
@@ -197,7 +319,13 @@ fn decrypt_private_key(
         .map_err(|e| ServerError::Internal(format!("invalid nonce length: {}", e)))?;
 
     cipher
-        .decrypt(&nonce, ciphertext)
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|e| ServerError::Internal(format!("AES decryption failed: {}", e)))
 }
 
@@ -206,7 +334,7 @@ fn decrypt_private_key(
 // ---------------------------------------------------------------------------
 
 /// HKDF info for the refund-token key, domain-separated from the issuer-key
-/// wrapping key's (`eidola-issuer-key-v1`).
+/// wrapping key's (`eidola-issuer-key-v2`).
 const REFUND_TOKEN_KEY_INFO: &[u8] = b"eidola-refund-token-v1";
 
 /// First byte of every sealed refund token. A CBOR `RefundMsg` (a five-entry
@@ -498,7 +626,15 @@ pub fn compute_challenge_digest() -> [u8; 32] {
 // Key lifecycle
 // ---------------------------------------------------------------------------
 
-/// Decrypt an issuer key row and insert it into the cache. Returns the key hash.
+/// Authenticate an issuer key row and insert it into the cache. Returns the
+/// key hash.
+///
+/// The row is used only if its windows are exactly one epoch's on the public
+/// calendar, its domain separator is this deployment's, its id is the hash
+/// of its public key, and its private key decrypts under associated data
+/// binding all of them ([`issuer_key_aad`]). Anything else is refused
+/// ([`refused_key_record`]): Postgres can edit a plain column, but not one
+/// that is bound into the ciphertext.
 fn cache_key(
     cache: &mut HashMap<[u8; 32], DecryptedIssuerKey>,
     master_key: &[u8; 32],
@@ -508,10 +644,19 @@ fn cache_key(
     if cache.contains_key(&key_hash) {
         return Ok(key_hash);
     }
-    let plaintext = decrypt_private_key(master_key, &row.id, &row.private_key_enc)?;
-    let secret_key = PrivateKey::from_cbor(&plaintext).map_err(|e| {
-        ServerError::Internal(format!("failed to decode issuer private key: {}", e))
-    })?;
+    if row.id != hex::encode(key_hash) || row.domain_separator != domain_separator() {
+        return Err(refused_key_record());
+    }
+    let (Some(windows), Some(epoch)) = (
+        calendar_windows(row.issue_from, row.issue_until, row.accept_until),
+        canonical_epoch(row.issue_from, row.issue_until, row.accept_until),
+    ) else {
+        return Err(refused_key_record());
+    };
+    let aad = issuer_key_aad(&row.id, &row.public_key, &row.domain_separator, windows);
+    let plaintext = decrypt_private_key(master_key, &row.id, &aad, &row.private_key_enc)
+        .map_err(|_| refused_key_record())?;
+    let secret_key = PrivateKey::from_cbor(&plaintext).map_err(|_| refused_key_record())?;
     let params = Params::new(DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION);
     let request_context = compute_request_context(&key_hash);
     let request_context_scalar = request_context_to_scalar(&request_context);
@@ -521,7 +666,9 @@ fn cache_key(
             secret_key,
             params,
             key_hash,
+            public_key: row.public_key.clone(),
             request_context_scalar,
+            epoch,
             issue_from: row.issue_from,
             issue_until: row.issue_until,
             accept_until: row.accept_until,
@@ -530,12 +677,10 @@ fn cache_key(
     Ok(key_hash)
 }
 
-/// Generate a new issuer key pair and build a row ready for insertion.
-fn generate_key(
-    master_key: &[u8; 32],
-    issue_from: SystemTime,
-    epoch_config: &EpochConfig,
-) -> Result<db::IssuerKeyRow, ServerError> {
+/// Generate a new issuer key pair for calendar epoch `epoch` and build a row
+/// ready for insertion. Its windows are the epoch's and nothing else, and
+/// they are bound into the encryption of its private key.
+fn generate_key(master_key: &[u8; 32], epoch: u64) -> Result<db::IssuerKeyRow, ServerError> {
     let secret_key = PrivateKey::random(OsRng);
     let public_key_cbor = secret_key
         .public()
@@ -545,84 +690,135 @@ fn generate_key(
     let private_key_cbor = secret_key
         .to_cbor()
         .map_err(|e| ServerError::Internal(format!("failed to encode private key: {}", e)))?;
-    let encrypted = encrypt_private_key(master_key, &id, &private_key_cbor)?;
 
-    let (issue_until, accept_until) = epoch_config.boundaries_from(issue_from);
+    let (issue_from, issue_until, accept_until) = epoch_instants(epoch)?;
+    let windows = calendar_windows(issue_from, issue_until, accept_until)
+        .ok_or_else(|| ServerError::Internal("issuer epoch out of range".to_string()))?;
+    let ds = domain_separator();
+    let aad = issuer_key_aad(&id, &public_key_cbor, &ds, windows);
+    let encrypted = encrypt_private_key(master_key, &id, &aad, &private_key_cbor)?;
 
     Ok(db::IssuerKeyRow {
         id,
         private_key_enc: encrypted,
         public_key: public_key_cbor,
-        domain_separator: domain_separator(),
+        domain_separator: ds,
         issue_from,
         issue_until,
         accept_until,
     })
 }
 
-/// Ensure that both a current key and the next key exist in the database
-/// and are cached in memory. Returns the current key's hash (for issuance).
+/// The one cached key for `epoch`: `Ok(None)` if there is none, and a refusal
+/// if there is more than one. An honest gateway holds exactly one key per
+/// epoch, so two can only mean a database that hid one key from some
+/// instance until it minted another; issuing under either would put the
+/// clients who got it in a smaller set than the epoch's, so neither is used
+/// for issuance. (Both still accept spends: each is genuinely this
+/// deployment's key, and tokens already issued under it were paid for.)
+fn sole_key_for_epoch(
+    cache: &HashMap<[u8; 32], DecryptedIssuerKey>,
+    epoch: u64,
+) -> Result<Option<[u8; 32]>, ServerError> {
+    let mut keys = cache.values().filter(|k| k.epoch == epoch);
+    match (keys.next(), keys.next()) {
+        (None, _) => Ok(None),
+        (Some(k), None) => Ok(Some(k.key_hash)),
+        (Some(_), Some(_)) => {
+            warn!("more than one issuer key for the current epoch; refusing to issue under either");
+            Err(ServerError::Internal(
+                "more than one issuer key for one epoch".to_string(),
+            ))
+        }
+    }
+}
+
+/// Which epoch's key to mint, given the epochs among the current and the
+/// next that the database shows a key for (`present`), the current epoch,
+/// and the epochs this gateway already holds keys for. `Ok(None)` when both
+/// keys exist.
 ///
-/// Key chaining: each new key's `issue_from` = predecessor's `issue_until`.
-/// The very first key's `issue_from` = now.
+/// The current key first, then the next one, so a client can see the next
+/// epoch's key a whole epoch before it issues. Never a key for an epoch this
+/// gateway already holds one for: a database that stopped showing a key this
+/// instance has cached is refused rather than answered with a second key for
+/// that epoch, which is how a hidden row would otherwise split the epoch's
+/// anonymity set.
+fn epoch_to_mint(
+    present: &std::collections::HashSet<u64>,
+    current: u64,
+    held: &std::collections::HashSet<u64>,
+) -> Result<Option<u64>, ServerError> {
+    let Some(wanted) = [current, current + 1]
+        .into_iter()
+        .find(|e| !present.contains(e))
+    else {
+        return Ok(None);
+    };
+    if held.contains(&wanted) {
+        warn!(
+            "the database shows no issuer key for an epoch this gateway holds one for; \
+             refusing to mint a second"
+        );
+        return Err(ServerError::Internal(
+            "issuer key missing from the database".to_string(),
+        ));
+    }
+    Ok(Some(wanted))
+}
+
+/// Ensure that the current epoch's key and the next epoch's key exist in the
+/// database and are cached in memory. Returns the current key's hash (for
+/// issuance).
 ///
-/// Race safety: uses a serializable transaction so concurrent server instances
-/// cannot create duplicate keys.
+/// Keys sit on the public calendar ([`ISSUER_CALENDAR`]): epoch `n`'s key is
+/// the one whose windows are epoch `n`'s, whenever and by whichever instance
+/// it was minted, so a restart or a late rotation cannot shift a boundary.
+/// One key per epoch: a gateway never mints a key for an epoch it already
+/// holds one for, even when the database no longer shows it.
+///
+/// Race safety: uses a serializable transaction (and the table's unique
+/// `issue_from`) so concurrent server instances cannot create duplicate keys.
 pub async fn ensure_keys(
     key_cache: &KeyCache,
     master_key: &[u8; 32],
     pool: &deadpool_postgres::Pool,
-    epoch_config: &EpochConfig,
 ) -> Result<[u8; 32], ServerError> {
-    let now = SystemTime::now();
+    let current = epoch_at(SystemTime::now())?;
 
-    // Fast path: check if a valid current key is already cached.
+    // Fast path: the current key and the next are already cached.
     {
         let cache = key_cache.read().await;
-        let current = cache
-            .values()
-            .find(|k| k.issue_from <= now && k.issue_until > now);
-        if let Some(k) = current {
-            // Also check that a next key exists in cache.
-            let has_next = cache.values().any(|k2| k2.issue_from >= k.issue_until);
-            if has_next {
-                return Ok(k.key_hash);
-            }
+        if let Some(hash) = sole_key_for_epoch(&cache, current)?
+            && cache.values().any(|k| k.epoch == current + 1)
+        {
+            return Ok(hash);
         }
     }
 
     // Slow path: check the database and provision any missing keys.
     // We may need to create up to 2 keys (current + next), or just the next one.
     loop {
-        let ec = epoch_config.clone();
         let mk = *master_key;
+        let held: std::collections::HashSet<u64> =
+            key_cache.read().await.values().map(|k| k.epoch).collect();
+        let current = epoch_at(SystemTime::now())?;
+        let wanted = [epoch_instants(current)?.0, epoch_instants(current + 1)?.0];
 
-        let result = db::insert_issuer_key_checked(pool, move |latest| {
-            let now = SystemTime::now();
-            match latest {
-                Some(latest_key) => {
-                    if latest_key.issue_until <= now {
-                        // Latest key's issuance window has passed — need a new current key.
-                        // Chain from the latest key's issue_until, but if that's in the past,
-                        // start from now to avoid creating already-expired keys.
-                        let issue_from = if latest_key.issue_until < now {
-                            now
-                        } else {
-                            latest_key.issue_until
-                        };
-                        Ok(Some(generate_key(&mk, issue_from, &ec)?))
-                    } else if latest_key.issue_from <= now {
-                        // Latest key is the current key — need the next key.
-                        Ok(Some(generate_key(&mk, latest_key.issue_until, &ec)?))
-                    } else {
-                        // Latest key is already a future key — nothing to do.
-                        Ok(None)
-                    }
-                }
-                None => {
-                    // No keys at all — bootstrap with issue_from = now.
-                    Ok(Some(generate_key(&mk, now, &ec)?))
-                }
+        let result = db::insert_issuer_key_checked(pool, &wanted, move |rows| {
+            // A row occupies its epoch's slot (the table's unique
+            // `issue_from`) whether or not it authenticates; one that does
+            // not is refused when it is loaded, below.
+            let present = rows
+                .iter()
+                .filter_map(|r| {
+                    let secs = whole_unix_secs(r.issue_from)?;
+                    ISSUER_CALENDAR.epoch_at(secs)
+                })
+                .collect();
+            match epoch_to_mint(&present, current, &held)? {
+                Some(epoch) => Ok(Some(generate_key(&mk, epoch)?)),
+                None => Ok(None),
             }
         })
         .await;
@@ -655,25 +851,17 @@ pub async fn ensure_keys(
         }
     }
 
-    // Load all valid keys from DB into cache and find the current one.
-    // Re-capture `now` here: the outer `now` was taken before the
-    // provisioning round-trips, and on a high-latency database link the
-    // freshly-inserted key's `issue_from` (captured inside the insert
-    // closure) can be strictly after the outer `now`, which would make
-    // the key look like a future key and trip the "no current issuer
-    // key found" error below.
-    let now = SystemTime::now();
+    // Load all valid keys from DB into cache, authenticating each; a row that
+    // does not authenticate is refused (and logged) and the rest still load.
+    // Re-read the epoch: the provisioning round-trips may have crossed a
+    // boundary.
     let rows = db::get_valid_issuer_keys(pool).await?;
     let mut cache = key_cache.write().await;
-    let mut current_hash = None;
     for row in &rows {
-        let kh = cache_key(&mut cache, master_key, row)?;
-        if row.issue_from <= now && row.issue_until > now {
-            current_hash = Some(kh);
-        }
+        let _ = cache_key(&mut cache, master_key, row);
     }
-
-    current_hash.ok_or_else(|| {
+    let current = epoch_at(SystemTime::now())?;
+    sole_key_for_epoch(&cache, current)?.ok_or_else(|| {
         ServerError::Internal("no current issuer key found after provisioning".to_string())
     })
 }
@@ -682,7 +870,9 @@ pub async fn ensure_keys(
 /// `key_use`, checking the cache first and then the database.
 ///
 /// The deadline is checked on both paths: a cached key past it is refused
-/// (and dropped once past retention), never answered from memory.
+/// (and dropped once past retention), never answered from memory. A key
+/// read from the database is authenticated ([`cache_key`]) before its
+/// deadline is read, so the deadline checked is the one bound to the key.
 pub async fn load_key(
     key_cache: &KeyCache,
     master_key: &[u8; 32],
@@ -709,16 +899,21 @@ pub async fn load_key(
     }
 
     // Slow path: load from DB by key hash. The query returns any key still
-    // retained; the deadline for this use is checked here, on our clock.
+    // retained; the deadline for this use is checked here, on our clock,
+    // against the authenticated record.
     let row = db::get_issuer_key_by_hash(pool, key_hash, RETENTION_PAST_ACCEPT)
         .await?
         .ok_or_else(expired_key)?;
-    if !key_usable(row.accept_until, key_use, now) {
+    if !key_usable(row.accept_until, KeyUse::Refund, now) {
         return Err(expired_key());
     }
 
     let mut cache = key_cache.write().await;
-    cache_key(&mut cache, master_key, &row)?;
+    let hash = cache_key(&mut cache, master_key, &row).map_err(|_| expired_key())?;
+    let accept_until = cache[&hash].accept_until;
+    if !key_usable(accept_until, key_use, now) {
+        return Err(expired_key());
+    }
     Ok(())
 }
 
@@ -785,7 +980,6 @@ pub fn spawn_key_rotation_task(
     key_cache: KeyCache,
     master_key: [u8; 32],
     pool: deadpool_postgres::Pool,
-    epoch_config: EpochConfig,
 ) {
     tokio::spawn(async move {
         loop {
@@ -809,7 +1003,7 @@ pub fn spawn_key_rotation_task(
                 info!("evicted {evicted} retired issuer key(s) from the cache");
             }
 
-            match ensure_keys(&key_cache, &master_key, &pool, &epoch_config).await {
+            match ensure_keys(&key_cache, &master_key, &pool).await {
                 Ok(key_hash) => {
                     info!("periodic key check: current key {}", hex::encode(key_hash));
                 }
@@ -894,17 +1088,37 @@ pub struct IssueCredentialsResponse {
 pub async fn list_keys(
     State(state): State<AppState>,
 ) -> Result<Json<ListKeysResponse>, ServerError> {
-    let rows = db::get_valid_issuer_keys(&state.db_pool).await?;
+    // Served from the cache, never straight from Postgres: every cached key
+    // was authenticated against its own record when it was loaded, so what a
+    // client is told about a key's windows is what the enclave bound to it.
+    // A failure here (say, two keys for the current epoch) still lists what
+    // is held, so a client can see it and refuse.
+    if let Err(e) = ensure_keys(
+        &state.credential_key_cache,
+        &state.credential_master_key,
+        &state.db_pool,
+    )
+    .await
+    {
+        warn!("issuer key check before listing failed: {}", e);
+    }
+    let now = SystemTime::now();
+    let cache = state.credential_key_cache.read().await;
+    let mut keys: Vec<&DecryptedIssuerKey> = cache
+        .values()
+        .filter(|k| key_usable(k.accept_until, KeyUse::Spend, now))
+        .collect();
+    keys.sort_by_key(|k| (k.issue_from, k.key_hash));
 
-    let data: Vec<IssuerKeyResponse> = rows
+    let data: Vec<IssuerKeyResponse> = keys
         .into_iter()
-        .map(|r| IssuerKeyResponse {
-            id: r.id.clone(),
-            public_key: URL_SAFE_NO_PAD.encode(&r.public_key),
-            domain_separator: r.domain_separator,
-            issue_from: system_time_to_iso_lossy(r.issue_from),
-            issue_until: system_time_to_iso_lossy(r.issue_until),
-            accept_until: system_time_to_iso_lossy(r.accept_until),
+        .map(|k| IssuerKeyResponse {
+            id: hex::encode(k.key_hash),
+            public_key: URL_SAFE_NO_PAD.encode(&k.public_key),
+            domain_separator: domain_separator(),
+            issue_from: system_time_to_iso_lossy(k.issue_from),
+            issue_until: system_time_to_iso_lossy(k.issue_until),
+            accept_until: system_time_to_iso_lossy(k.accept_until),
         })
         .collect();
 
@@ -964,13 +1178,7 @@ pub async fn issue_credentials(
             message: format!("invalid credit amount: {}", e),
         })?;
 
-    let key_hash = ensure_keys(
-        &state.credential_key_cache,
-        master_key,
-        &state.db_pool,
-        &state.epoch_config,
-    )
-    .await?;
+    let key_hash = ensure_keys(&state.credential_key_cache, master_key, &state.db_pool).await?;
 
     let key_id = hex::encode(key_hash);
 
@@ -1207,8 +1415,8 @@ mod tests {
         let master_key = [42u8; 32];
         let key_id = "550e8400-e29b-41d4-a716-446655440000";
         let plaintext = b"test private key material";
-        let encrypted = encrypt_private_key(&master_key, key_id, plaintext).unwrap();
-        let decrypted = decrypt_private_key(&master_key, key_id, &encrypted).unwrap();
+        let encrypted = encrypt_private_key(&master_key, key_id, b"aad", plaintext).unwrap();
+        let decrypted = decrypt_private_key(&master_key, key_id, b"aad", &encrypted).unwrap();
         assert_eq!(plaintext.as_slice(), &decrypted);
     }
 
@@ -1218,15 +1426,289 @@ mod tests {
         let encrypted = encrypt_private_key(
             &master_key,
             "550e8400-e29b-41d4-a716-446655440000",
+            b"aad",
             b"secret",
         )
         .unwrap();
         let result = decrypt_private_key(
             &master_key,
             "660e8400-e29b-41d4-a716-446655440000",
+            b"aad",
             &encrypted,
         );
         assert!(result.is_err());
+    }
+
+    // --- Key records bound to their windows ---
+
+    const WEEK_SECS: u64 = 7 * 86_400;
+
+    fn current_epoch() -> u64 {
+        epoch_at(SystemTime::now()).unwrap()
+    }
+
+    /// Every field the associated data covers is load-bearing: a private key
+    /// encrypted under one record's fields decrypts under no other's.
+    #[test]
+    fn an_issuer_key_decrypts_only_under_its_own_record() {
+        let master_key = [7u8; 32];
+        let row = generate_key(&master_key, current_epoch()).unwrap();
+        let windows = calendar_windows(row.issue_from, row.issue_until, row.accept_until).unwrap();
+        let aad = |id: &str, pk: &[u8], ds: &str, w: EpochWindows| issuer_key_aad(id, pk, ds, w);
+        let open =
+            |aad: Vec<u8>| decrypt_private_key(&master_key, &row.id, &aad, &row.private_key_enc);
+
+        assert!(
+            open(aad(
+                &row.id,
+                &row.public_key,
+                &row.domain_separator,
+                windows
+            ))
+            .is_ok()
+        );
+
+        let mut other_pk = row.public_key.clone();
+        other_pk[0] ^= 1;
+        let other_id = hex::encode([0xAB; 32]);
+        let edits = [
+            (
+                "id",
+                aad(&other_id, &row.public_key, &row.domain_separator, windows),
+            ),
+            (
+                "public key",
+                aad(&row.id, &other_pk, &row.domain_separator, windows),
+            ),
+            (
+                "domain separator",
+                aad(
+                    &row.id,
+                    &row.public_key,
+                    "ACT-v1:eidola:inference:production:2099-01-01",
+                    windows,
+                ),
+            ),
+            (
+                "issue_from",
+                aad(
+                    &row.id,
+                    &row.public_key,
+                    &row.domain_separator,
+                    EpochWindows {
+                        issue_from: windows.issue_from + 1,
+                        ..windows
+                    },
+                ),
+            ),
+            (
+                "issue_until",
+                aad(
+                    &row.id,
+                    &row.public_key,
+                    &row.domain_separator,
+                    EpochWindows {
+                        issue_until: windows.issue_until + WEEK_SECS,
+                        ..windows
+                    },
+                ),
+            ),
+            (
+                "accept_until",
+                aad(
+                    &row.id,
+                    &row.public_key,
+                    &row.domain_separator,
+                    EpochWindows {
+                        accept_until: windows.accept_until + WEEK_SECS,
+                        ..windows
+                    },
+                ),
+            ),
+        ];
+        for (field, edited) in edits {
+            assert!(open(edited).is_err(), "an edited {field} still decrypts");
+        }
+        // Without associated data (the old format's shape) it does not open.
+        assert!(open(Vec::new()).is_err());
+    }
+
+    /// The same, through the path every key takes into use: a row whose
+    /// plain columns were edited is refused, including the edit that keeps
+    /// the windows on the calendar — relabelling an old key as the current
+    /// epoch's.
+    #[test]
+    fn an_edited_key_row_is_refused() {
+        let master_key = [7u8; 32];
+        let n = current_epoch();
+        let row = generate_key(&master_key, n).unwrap();
+        let mut cache = Cache::new();
+        let hash = cache_key(&mut cache, &master_key, &row).unwrap();
+        assert_eq!(cache[&hash].epoch, n);
+
+        let week = Duration::from_secs(WEEK_SECS);
+        let other = generate_key(&master_key, n).unwrap();
+        type Edit = fn(&mut db::IssuerKeyRow, &db::IssuerKeyRow, Duration);
+        let edits: [(&str, Edit); 8] = [
+            ("issue_from", |r, _, _| {
+                r.issue_from += Duration::from_secs(1)
+            }),
+            ("issue_until", |r, _, w| r.issue_until += w),
+            ("accept_until", |r, _, w| r.accept_until += w),
+            ("a whole epoch later", |r, _, w| {
+                r.issue_from += w;
+                r.issue_until += w;
+                r.accept_until += w;
+            }),
+            ("a whole epoch earlier", |r, _, w| {
+                r.issue_from -= w;
+                r.issue_until -= w;
+                r.accept_until -= w;
+            }),
+            ("domain separator", |r, _, _| {
+                r.domain_separator = "ACT-v1:eidola:inference:production:2099-01-01".into()
+            }),
+            ("id and public key", |r, o, _| {
+                r.id = o.id.clone();
+                r.public_key = o.public_key.clone();
+            }),
+            ("ciphertext", |r, _, _| {
+                let last = r.private_key_enc.len() - 1;
+                r.private_key_enc[last] ^= 1;
+            }),
+        ];
+        for (field, edit) in edits {
+            let mut edited = db::IssuerKeyRow {
+                id: row.id.clone(),
+                private_key_enc: row.private_key_enc.clone(),
+                public_key: row.public_key.clone(),
+                domain_separator: row.domain_separator.clone(),
+                issue_from: row.issue_from,
+                issue_until: row.issue_until,
+                accept_until: row.accept_until,
+            };
+            edit(&mut edited, &other, week);
+            let mut fresh = Cache::new();
+            assert!(
+                cache_key(&mut fresh, &master_key, &edited).is_err(),
+                "a row with an edited {field} was used"
+            );
+            assert!(fresh.is_empty());
+        }
+    }
+
+    /// A key whose windows are off the calendar is refused even when its
+    /// record authenticates: the gateway uses no key a client could not check.
+    #[test]
+    fn a_key_off_the_calendar_is_refused_even_when_it_authenticates() {
+        let master_key = [7u8; 32];
+        let secret_key = PrivateKey::random(OsRng);
+        let public_key = secret_key.public().to_cbor().unwrap();
+        let id = hex::encode(compute_key_hash(&public_key));
+        let (issue_from, _, _) = epoch_instants(current_epoch()).unwrap();
+        // The pre-calendar shape: a window starting at an arbitrary instant.
+        let issue_from = issue_from + Duration::from_secs(3_600);
+        let issue_until = issue_from + Duration::from_secs(WEEK_SECS);
+        let accept_until = issue_until + Duration::from_secs(WEEK_SECS);
+        let windows = calendar_windows(issue_from, issue_until, accept_until).unwrap();
+        let ds = domain_separator();
+        let aad = issuer_key_aad(&id, &public_key, &ds, windows);
+        let row = db::IssuerKeyRow {
+            private_key_enc: encrypt_private_key(
+                &master_key,
+                &id,
+                &aad,
+                &secret_key.to_cbor().unwrap(),
+            )
+            .unwrap(),
+            id,
+            public_key,
+            domain_separator: ds,
+            issue_from,
+            issue_until,
+            accept_until,
+        };
+        let mut cache = Cache::new();
+        assert!(cache_key(&mut cache, &master_key, &row).is_err());
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn generated_keys_sit_exactly_on_the_calendar() {
+        let master_key = [7u8; 32];
+        let n = current_epoch();
+        for epoch in [n, n + 1] {
+            let row = generate_key(&master_key, epoch).unwrap();
+            let secs = |t: SystemTime| t.duration_since(UNIX_EPOCH).unwrap().as_secs();
+            assert_eq!(
+                secs(row.issue_from) % WEEK_SECS,
+                0,
+                "a boundary is a multiple of a week"
+            );
+            assert_eq!(secs(row.issue_until), secs(row.issue_from) + WEEK_SECS);
+            assert_eq!(secs(row.accept_until), secs(row.issue_until) + WEEK_SECS);
+            assert_eq!(
+                canonical_epoch(row.issue_from, row.issue_until, row.accept_until),
+                Some(epoch)
+            );
+        }
+        let now = SystemTime::now();
+        let (from, until, _) = epoch_instants(n).unwrap();
+        assert!(from <= now && now < until, "the current epoch covers now");
+        // Sub-second instants are never on the calendar.
+        let (f, u, a) = epoch_instants(n).unwrap();
+        let nudge = Duration::from_millis(1);
+        assert_eq!(canonical_epoch(f + nudge, u + nudge, a + nudge), None);
+    }
+
+    #[test]
+    fn a_gateway_mints_the_current_key_then_the_next_and_never_a_second() {
+        use std::collections::HashSet;
+        let n = 100;
+        let none = HashSet::new();
+        let shows = |epochs: &[u64]| epochs.iter().copied().collect::<HashSet<u64>>();
+        assert_eq!(epoch_to_mint(&shows(&[]), n, &none).unwrap(), Some(n));
+        assert_eq!(epoch_to_mint(&shows(&[n + 1]), n, &none).unwrap(), Some(n));
+        assert_eq!(epoch_to_mint(&shows(&[n]), n, &none).unwrap(), Some(n + 1));
+        assert_eq!(epoch_to_mint(&shows(&[n, n + 1]), n, &none).unwrap(), None);
+
+        // A database that hides the current key (or every key) from an
+        // instance that holds it does not get a second key for the epoch.
+        let held: HashSet<u64> = [n].into();
+        assert!(epoch_to_mint(&shows(&[]), n, &held).is_err());
+        assert!(epoch_to_mint(&shows(&[n + 1]), n, &held).is_err());
+        let held: HashSet<u64> = [n, n + 1].into();
+        assert!(epoch_to_mint(&shows(&[n]), n, &held).is_err());
+        assert_eq!(epoch_to_mint(&shows(&[n, n + 1]), n, &held).unwrap(), None);
+    }
+
+    #[test]
+    fn two_keys_for_one_epoch_issue_under_neither() {
+        let master_key = [7u8; 32];
+        let n = current_epoch();
+        let mut cache = Cache::new();
+        assert_eq!(sole_key_for_epoch(&cache, n).unwrap(), None);
+        let first = cache_key(
+            &mut cache,
+            &master_key,
+            &generate_key(&master_key, n).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sole_key_for_epoch(&cache, n).unwrap(), Some(first));
+        cache_key(
+            &mut cache,
+            &master_key,
+            &generate_key(&master_key, n + 1).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sole_key_for_epoch(&cache, n).unwrap(), Some(first));
+        cache_key(
+            &mut cache,
+            &master_key,
+            &generate_key(&master_key, n).unwrap(),
+        )
+        .unwrap();
+        assert!(sole_key_for_epoch(&cache, n).is_err());
     }
 
     #[test]
@@ -1312,16 +1794,21 @@ mod tests {
     /// overflows it.)
     fn add_key(cache: &mut Cache, accept_until: SystemTime) -> [u8; 32] {
         let secret_key = PrivateKey::random(OsRng);
-        let key_hash = compute_key_hash(&secret_key.public().to_cbor().unwrap());
+        let public_key = secret_key.public().to_cbor().unwrap();
+        let key_hash = compute_key_hash(&public_key);
         cache.insert(
             key_hash,
             DecryptedIssuerKey {
                 secret_key,
                 params: Params::new(DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION),
                 key_hash,
+                public_key,
                 request_context_scalar: request_context_to_scalar(&compute_request_context(
                     &key_hash,
                 )),
+                // These tests are about deadlines, not the calendar; no two
+                // of them ask which key is an epoch's.
+                epoch: 0,
                 issue_from: accept_until - 14 * DAY,
                 issue_until: accept_until - 7 * DAY,
                 accept_until,
@@ -1553,23 +2040,22 @@ mod tests {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
         let pool = db::create_pool(&url, None, None).unwrap();
         let master_key = [0u8; 32];
-        let ec = EpochConfig::default();
         let now = SystemTime::now();
+        // This exercises the database's own filters, which read the plain
+        // columns; the rows are placed off the calendar so their deadlines can
+        // sit minutes from now (the gateway would never use them).
+        let row_ending_at = |accept_until: SystemTime| {
+            let mut row = generate_key(&master_key, 0).unwrap();
+            row.issue_from = accept_until - 14 * DAY;
+            row.issue_until = accept_until - 7 * DAY;
+            row.accept_until = accept_until;
+            row
+        };
 
         // accept_until passed 10 minutes ago: retained.
-        let lapsing = generate_key(
-            &master_key,
-            now - ec.epoch_duration - ec.grace_period - Duration::from_secs(600),
-            &ec,
-        )
-        .unwrap();
+        let lapsing = row_ending_at(now - Duration::from_secs(600));
         // accept_until passed past the retention margin: retired.
-        let retired = generate_key(
-            &master_key,
-            now - ec.epoch_duration - ec.grace_period - RETENTION_PAST_ACCEPT - HOUR,
-            &ec,
-        )
-        .unwrap();
+        let retired = row_ending_at(now - RETENTION_PAST_ACCEPT - HOUR);
 
         let client = pool.get().await.unwrap();
         for key in [&lapsing, &retired] {
@@ -1931,10 +2417,7 @@ mod tests {
                 .try_into()
                 .unwrap();
         let cache: KeyCache = Arc::new(RwLock::new(HashMap::new()));
-        let epoch = EpochConfig::default();
-        let key_hash = ensure_keys(&cache, &master_key, &pool, &epoch)
-            .await
-            .unwrap();
+        let key_hash = ensure_keys(&cache, &master_key, &pool).await.unwrap();
         let state = AppState::new(
             Catalog::new(None),
             None,
@@ -1943,7 +2426,6 @@ mod tests {
             None,
             master_key,
             cache.clone(),
-            epoch,
         );
         let key_id = hex::encode(key_hash);
 
@@ -2139,7 +2621,6 @@ mod tests {
             None,
             [0u8; 32],
             cache,
-            EpochConfig::default(),
         );
         let recover = |act: crate::auth::ActSpend| {
             let state = state.clone();
@@ -2173,8 +2654,10 @@ mod tests {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
         let pool = db::create_pool(&url, None, None).unwrap();
         let master_key = [0u8; 32];
-        let ec = EpochConfig::default();
-        let key = generate_key(&master_key, SystemTime::now(), &ec).unwrap();
+        // Any key the ledger can name; a far-future epoch of its own, so it
+        // cannot collide with the epoch's real key in a shared database.
+        let epoch = 10_000 + u64::from(OsRng.next_u32() % 1_000_000);
+        let key = generate_key(&master_key, epoch).unwrap();
         let client = pool.get().await.unwrap();
         client
             .execute(
@@ -2234,5 +2717,93 @@ mod tests {
             "the second issuance was granted out of a balance already spent"
         );
         assert_eq!(db::get_available_balance(&pool, account).await.unwrap(), 0);
+    }
+
+    /// Keys land on the calendar however often the gateway restarts, one per
+    /// epoch, and a row whose windows the database edits stops being a key
+    /// until it is put back. Needs `DATABASE_URL` with `schema.sql` applied;
+    /// run with `--test-threads=1` beside the other database tests, since it
+    /// edits the current key's row for a moment.
+    #[tokio::test]
+    #[ignore]
+    async fn keys_stay_on_the_calendar_across_restarts_and_an_edited_row_is_refused() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let pool = db::create_pool(&url, None, None).unwrap();
+        let master_key: [u8; 32] =
+            hex::decode(std::env::var("CREDENTIAL_MASTER_KEY").unwrap_or_else(|_| "00".repeat(32)))
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let n = current_epoch();
+
+        // Every restart (a fresh cache) finds the same current key and mints
+        // nothing new.
+        let first = ensure_keys(&KeyCache::default(), &master_key, &pool)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let restarted = ensure_keys(&KeyCache::default(), &master_key, &pool)
+                .await
+                .unwrap();
+            assert_eq!(restarted, first, "a restart moved the current key");
+        }
+        let client = pool.get().await.unwrap();
+        for epoch in [n, n + 1] {
+            let (from, until, accept) = epoch_instants(epoch).unwrap();
+            let rows = client
+                .query(
+                    "SELECT issue_until, accept_until FROM issuer_key WHERE issue_from = $1",
+                    &[&from],
+                )
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1, "epoch {epoch} has exactly one key");
+            assert_eq!(rows[0].get::<_, SystemTime>(0), until);
+            assert_eq!(rows[0].get::<_, SystemTime>(1), accept);
+        }
+
+        // Stretch the current key's acceptance in the database: a gateway
+        // loading it refuses it, for issuance and for spends.
+        let id = hex::encode(first);
+        let stretch = |sign: &'static str| {
+            let pool = pool.clone();
+            let id = id.clone();
+            async move {
+                pool.get()
+                    .await
+                    .unwrap()
+                    .execute(
+                        &format!(
+                            "UPDATE issuer_key SET accept_until = accept_until {sign} \
+                             interval '7 days' WHERE id = $1"
+                        ),
+                        &[&id],
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(stretch("+").await, 1);
+        let cache = KeyCache::default();
+        let issuing = ensure_keys(&cache, &master_key, &pool).await;
+        let spending = load_key(&cache, &master_key, &pool, &first, KeyUse::Spend).await;
+        assert_eq!(stretch("-").await, 1);
+        assert!(
+            issuing.is_err(),
+            "issued under a key whose window was edited"
+        );
+        assert!(
+            spending.is_err(),
+            "accepted a spend under a key whose window was edited"
+        );
+        assert!(!cache.read().await.contains_key(&first));
+
+        // Put back, it authenticates again.
+        assert_eq!(
+            ensure_keys(&KeyCache::default(), &master_key, &pool)
+                .await
+                .unwrap(),
+            first
+        );
     }
 }

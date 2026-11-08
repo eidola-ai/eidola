@@ -34,6 +34,7 @@ use anonymous_credit_tokens::{
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use eidola_common::engine_protocol::ContinueField;
+use eidola_common::issuer_calendar::{EpochWindows, ISSUER_CALENDAR, IssuerCalendar};
 use eidola_common::refund_key::REFUND_KEY_HEADER;
 use rand_core::OsRng;
 use serde::Deserialize;
@@ -48,7 +49,7 @@ use changes::{BroadcastSource, Change, ChangeSource};
 use config::Config;
 pub use config::DEFAULT_TEMPLATE_ID;
 pub use db::HUMAN_PARTICIPANT_ID;
-use error::AppError;
+use error::{AppError, IssuerKeyRefusal};
 pub use local_models::{
     ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
     LocalModelStatus, LocalModelsState, ModelDownloadTarget, RunningEngine, resolve_model_download,
@@ -1858,6 +1859,29 @@ pub fn issuer_key_deadlines(accept_until_ms: i64) -> db::IssuerKeyDeadlines {
     }
 }
 
+/// The epoch of the public issuer calendar a listed key's windows are
+/// exactly, or `None` if they are not one epoch's windows (including any
+/// instant that is not a whole second).
+fn listed_key_epoch(calendar: &IssuerCalendar, key: &IssuerKeyResponse) -> Option<u64> {
+    let secs = |iso: &str| -> Option<u64> {
+        let ms = iso_to_ms(iso).ok()?;
+        (ms % 1000 == 0).then_some(u64::try_from(ms / 1000).ok()?)
+    };
+    calendar.epoch_of(EpochWindows {
+        issue_from: secs(&key.issue_from)?,
+        issue_until: secs(&key.issue_until)?,
+        accept_until: secs(&key.accept_until)?,
+    })
+}
+
+/// Whether a listed key's id is the hash of its public key. A key that is
+/// not is never recorded as an epoch's key.
+fn listed_key_is_its_hash(key: &IssuerKeyResponse) -> bool {
+    URL_SAFE_NO_PAD
+        .decode(&key.public_key)
+        .is_ok_and(|pk| issuer_key_id_of(&pk) == key.id)
+}
+
 /// How long the ACT provisioning queue waits for an in-flight credential
 /// refund (a concurrent turn's recovery) to free spendable balance before
 /// giving up with [`AppError::ProvisioningTimeout`]. Bounds the worst case
@@ -2236,6 +2260,12 @@ struct Inner {
     /// test can hold the write and its cleanup to one transaction.
     #[cfg(feature = "test-support")]
     fail_cache_key_cleanup: std::sync::atomic::AtomicBool,
+    /// The calendar issuer key windows are checked against. A release build
+    /// has no field here and reads [`ISSUER_CALENDAR`], the one the gateway
+    /// uses; under `test-support` a test may stand a boundary seconds from
+    /// now ([`AppCore::test_set_issuer_calendar`]).
+    #[cfg(feature = "test-support")]
+    issuer_calendar: Mutex<IssuerCalendar>,
     /// The process-lifetime exclusive advisory lock on the local database
     /// (`<data_dir>/eidola.db.lock`). Taken in [`AppCore::build`] — a second
     /// opener is refused *there* with [`AppError::DatabaseInUse`] rather than
@@ -3343,6 +3373,22 @@ impl Inner {
         })
     }
 
+    /// The calendar issuer key windows are checked against: the production
+    /// [`ISSUER_CALENDAR`], the gateway's own, in every release build.
+    fn issuer_calendar(&self) -> IssuerCalendar {
+        #[cfg(feature = "test-support")]
+        {
+            *self
+                .issuer_calendar
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            ISSUER_CALENDAR
+        }
+    }
+
     async fn account_allocate(&self, credits: i64) -> Result<AllocateResult, AppError> {
         if credits <= 0 {
             return Err(AppError::Credential {
@@ -3372,43 +3418,59 @@ impl Inner {
 
         let expected_ds = cfg.domain_separator();
         let now = now_ms();
+        let calendar = self.issuer_calendar();
         // Every issuer key shares the same domain separator — rotation mints
         // new keys, never new separators — so the separator alone does not
-        // identify a single key. `/v1/keys` lists all still-accepted keys
-        // oldest-first, which during a rotation grace window includes the
-        // just-rotated-out key whose accept window has not yet closed.
-        // Issuance always signs with the *current* key (the server's
-        // `get_current_issuer_key`, newest by `issue_from`), so we must verify
-        // against that same key: select the key whose issuing window covers
-        // now (`issue_from <= now < issue_until`), preferring the newest such
-        // key. Selecting the first separator match (the old behavior) grabbed
-        // the oldest accepted key and failed proof verification whenever an
-        // out-of-issuance-but-still-accepted key preceded the current one.
-        let key = keys
+        // identify a single key. `/v1/keys` lists every still-accepted key
+        // (the previous epoch's, the current one's) and the next epoch's.
+        // Issuance signs with the *current* key, so we verify against that
+        // same key: the one whose issuing window covers now.
+        let covering: Vec<&IssuerKeyResponse> = keys
             .data
             .iter()
             .filter(|k| k.domain_separator == expected_ds)
-            .filter_map(|k| {
-                let issue_from = iso_to_ms(&k.issue_from).ok()?;
-                let issue_until = iso_to_ms(&k.issue_until).ok()?;
-                (issue_from <= now && now < issue_until).then_some((issue_from, k))
-            })
-            .max_by_key(|(issue_from, _)| *issue_from)
-            .map(|(_, k)| k)
-            .ok_or_else(|| {
-                let server_ds: Vec<&str> = keys
-                    .data
-                    .iter()
-                    .map(|k| k.domain_separator.as_str())
-                    .collect();
-                AppError::Credential {
-                    message: format!(
-                        "no issuer key currently valid for issuance matches expected \
-                         domain separator \"{expected_ds}\"\n\
-                         server advertised: {server_ds:?}"
-                    ),
-                }
-            })?;
+            .filter(
+                |k| match (iso_to_ms(&k.issue_from), iso_to_ms(&k.issue_until)) {
+                    (Ok(from), Ok(until)) => from <= now && now < until,
+                    _ => false,
+                },
+            )
+            .collect();
+        let Some(&key) = covering.first() else {
+            let server_ds: Vec<&str> = keys
+                .data
+                .iter()
+                .map(|k| k.domain_separator.as_str())
+                .collect();
+            return Err(AppError::Credential {
+                message: format!(
+                    "no issuer key currently valid for issuance matches expected \
+                     domain separator \"{expected_ds}\"\n\
+                     server advertised: {server_ds:?}"
+                ),
+            });
+        };
+        // The key's windows must be exactly one epoch's on the public
+        // calendar, which the gateway's windows are a pure function of: a
+        // key whose windows nobody could have computed in advance is one a
+        // server could have timed around this client.
+        let Some(epoch) = covering
+            .iter()
+            .map(|k| listed_key_epoch(&calendar, k))
+            .collect::<Option<Vec<u64>>>()
+            .and_then(|epochs| epochs.first().copied())
+        else {
+            return Err(AppError::IssuerKeyRefused {
+                refusal: IssuerKeyRefusal::NotOnCalendar,
+            });
+        };
+        // An honest server lists one key per epoch, so two different keys
+        // issuing now are one too many to choose between.
+        if covering.iter().any(|k| k.id != key.id) {
+            return Err(AppError::IssuerKeyRefused {
+                refusal: IssuerKeyRefusal::SecondKeyForEpoch { epoch },
+            });
+        }
 
         let public_key_cbor =
             URL_SAFE_NO_PAD
@@ -3430,10 +3492,42 @@ impl Inner {
             });
         }
 
+        // One key per epoch, checked against what this client has already
+        // seen. Every listed key on the calendar is recorded first-seen-wins
+        // (the next epoch's key a whole epoch before it issues), and the
+        // current key must be the one recorded for its epoch. A different one
+        // is refused before anything is debited: the client cannot tell an
+        // emergency rotation from a server singling it out, and the honest
+        // design has no rotation within an epoch.
+        let db_conn = self.db_conn().await?;
+        let oldest_listable = epoch.saturating_sub(1);
+        for listed in keys.data.iter().filter(|k| {
+            k.domain_separator == expected_ds && k.id != key.id && listed_key_is_its_hash(k)
+        }) {
+            if let Some(listed_epoch) = listed_key_epoch(&calendar, listed) {
+                db::pin_issuer_key_epoch(
+                    &db_conn,
+                    base_url,
+                    listed_epoch,
+                    &listed.id,
+                    oldest_listable,
+                    now,
+                )
+                .await?;
+            }
+        }
+        let pinned =
+            db::pin_issuer_key_epoch(&db_conn, base_url, epoch, &key.id, oldest_listable, now)
+                .await?;
+        if pinned != key.id {
+            return Err(AppError::IssuerKeyRefused {
+                refusal: IssuerKeyRefusal::SecondKeyForEpoch { epoch },
+            });
+        }
+
         let params = params_from_domain_separator(expected_ds)?;
 
-        // 2. Open DB and store issuer key
-        let db_conn = self.db_conn().await?;
+        // 2. Store the issuer key
         let params_hash = blake3::hash(key.domain_separator.as_bytes())
             .to_hex()
             .to_string();
@@ -10294,6 +10388,19 @@ impl AppCore {
             .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// **Test-only seam.** Check issuer key windows against `calendar` instead
+    /// of the production one, so a test can put a key's deadlines seconds
+    /// from now and still be on a calendar.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_set_issuer_calendar(&self, calendar: IssuerCalendar) {
+        *self
+            .inner
+            .issuer_calendar
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = calendar;
+    }
+
     /// **Test-only seam.** Advance the prefix-cache clock by `delta_ms` each
     /// time a turn hands a request to the transport — after the request is
     /// built, before the connection is set up — modelling a slow connection,
@@ -10390,6 +10497,8 @@ impl AppCore {
                 cache_clock: CacheClock::default(),
                 #[cfg(feature = "test-support")]
                 fail_cache_key_cleanup: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(feature = "test-support")]
+                issuer_calendar: Mutex::new(ISSUER_CALENDAR),
                 _db_lock: db_lock,
             }),
         })

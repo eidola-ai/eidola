@@ -23,3 +23,5 @@ space-answer-cut-off = 這則回覆在長度上限處停下。
 space-continue-answer = 繼續
 space-continue-answer-label = 從停下的地方繼續這則回覆
 space-continuing = 正在繼續…
+space-error-issuer-key-off-calendar = Eidola 伺服器提供的付款金鑰不符合公開的金鑰時程，因此本應用程式沒有使用它。沒有傳送任何請求，也沒有產生任何費用；你已持有的額度仍可正常使用。
+space-error-issuer-key-second-for-epoch = Eidola 伺服器本週提供的付款金鑰與本應用程式已有的不同。誠實的伺服器每週只使用一把金鑰，因此在下週的金鑰生效之前，本應用程式不會用它領取新的額度。沒有傳送任何請求，也沒有產生任何費用；你已持有的額度仍可正常使用。
