@@ -30,7 +30,8 @@ use crate::response::{
     build_verification_metadata,
 };
 use crate::types::{
-    ChatCompletionChunk, ChatCompletionRequest, ErrorResponse, Model, ModelsResponse, Usage,
+    ChatCompletionChunk, ChatCompletionRequest, ContentPart, ErrorResponse, MessageContent, Model,
+    ModelsResponse, Usage,
 };
 
 /// Health check endpoint.
@@ -321,6 +322,21 @@ fn check_sufficient_charge(
     request: &ChatCompletionRequest,
     model: &Model,
 ) -> Result<(), ServerError> {
+    // The contract prices content bytes, and the settlement clamp is safe
+    // only because text tokens never exceed text bytes. An image's tokens
+    // come from its pixels instead, so it prices at nothing and whatever
+    // upstream counts for it is clamped away. Until the contract prices
+    // images, no hold covers one: refuse rather than forward it.
+    let has_image = request.messages.iter().any(|m| {
+        matches!(&m.content, Some(MessageContent::Parts(parts))
+            if parts.iter().any(|p| matches!(p, ContentPart::ImageUrl { .. })))
+    });
+    if has_image {
+        return Err(ServerError::BadRequest {
+            message: "image input is not priced yet; send text content only".to_string(),
+        });
+    }
+
     let wc = worst_case_cost(request, model);
     if charge_credits < wc {
         return Err(ServerError::PaymentRequired {
@@ -1190,6 +1206,56 @@ mod tests {
             check_sufficient_charge(old_style_hold, &req, &model).is_err(),
             "bytes-as-tokens hold must be below the contract minimum"
         );
+    }
+
+    /// A request carrying an image part, in the exact JSON shape a client
+    /// sends (an inline data URI — remote URLs price the same: nothing).
+    fn image_request(max_completion_tokens: u32) -> ChatCompletionRequest {
+        let data_uri = format!("data:image/png;base64,{}", "A".repeat(1_000_000));
+        serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ]}],
+            "max_completion_tokens": max_completion_tokens,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn unpriced_image_input_is_refused_whatever_the_hold() {
+        // The contract prices content *bytes*, and its clamp
+        // (`min(actual, chargeable)`) is safe because text tokens never
+        // exceed text bytes. An image's tokens come from its pixels, not
+        // from any byte the contract counts: here a 1 MB image prices like
+        // the word beside it, and whatever upstream reports for it is
+        // clamped away. No hold is "sufficient" for input that is not priced.
+        let req = image_request(1);
+        assert_eq!(
+            chargeable_prompt_tokens_for(&req),
+            chargeable_prompt_tokens_for(&request(&["describe"], 1)),
+            "the image contributes nothing to the contract"
+        );
+        let err = check_sufficient_charge(u64::MAX as u128, &req, &test_model())
+            .expect_err("an unpriced image must not be forwarded");
+        assert!(matches!(err, ServerError::BadRequest { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn text_only_content_parts_are_still_accepted() {
+        let parts: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello world!"}]}],
+            "max_completion_tokens": 100,
+        }))
+        .unwrap();
+        let model = test_model();
+        check_sufficient_charge(worst_case_cost(&parts, &model), &parts, &model)
+            .expect("text parts are priced");
+        let plain = request(&["hello world!"], 100);
+        check_sufficient_charge(worst_case_cost(&plain, &model), &plain, &model)
+            .expect("plain text is priced");
     }
 
     #[test]
