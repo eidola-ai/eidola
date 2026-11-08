@@ -72,7 +72,7 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 
 **Current behavior.** Each anonymous credential is issued under one issuer key, and the change from every spend is issued under that same key, so a credential's whole remaining value lives and dies with the key. The server accepts a key's credentials until its `accept_until` — one full epoch after the key stops issuing ([server.md § Anonymity set](server.md#anonymity-set)) — and the client spends a credential until shortly before that deadline (`CREDENTIAL_SPEND_MARGIN`, a few minutes, so a spend begun at the edge still lands inside the window; a spend already in flight stays recoverable until the deadline itself). Whatever is still in the credential after that is lost: it was debited from the account when the credential was issued, and nothing exchanges it for a credential under a newer key.
 
-**What constrains it today.** Every credential gets at least one full epoch of spendable life, however late in its key's issuing window it was minted, and automatic provisioning allocates a modest amount at a time ([`DEFAULT_ALLOCATION_CREDITS`](../crates/eidola-app-core/src/lib.rs)), so the exposure is bounded by one allocation's unspent change per key. Issuance is refused outright under a key whose spend deadline has already passed, so the account is never debited into a credential that could not be spent.
+**What constrains it today.** Every credential gets at least one full epoch of spendable life, however late in its key's issuing window it was minted, and automatic provisioning allocates a modest amount at a time ([`DEFAULT_ALLOCATION_CREDITS`](../crates/eidola-app-core/src/lib.rs)), so the exposure is bounded by one allocation's unspent change per key. Issuance ahead of need adds at most one allocation to what is held at a time, keeps no buffer for a wallet that has not spent within a week, and prefers a key's early life, when its credentials have the longest to be spent ([anonymous-credits.md § Issuance timing](anonymous-credits.md#issuance-timing)). Issuance is refused outright under a key whose spend deadline has already passed, so the account is never debited into a credential that could not be spent.
 
 **Future.** A rollover: exchanging what remains in an expiring credential for a fresh one under the current key, without that exchange linking the two. That needs its own unlinkability analysis and is not designed yet.
 
@@ -88,19 +88,13 @@ The decisions behind anonymous payment, and the reasons for them, are in [anonym
 
 ### Issuance-to-first-spend timing
 
-**Current behavior.** When a request needs a credit token and the wallet holds none that covers it, the client converts credits from the account and spends the new token immediately. The database records each issuance with its account and time, and sees each spend's nullifier as it is written. Whoever can watch the database, or the server's traffic, can therefore pair an issuance with the spend that follows it a moment later, linking the first spend of each token to its account. A prompt-cache key on that request then links the rest of its conversation lineage ([privacy-guarantees.md §2.7](privacy-guarantees.md#2-unlinkability)). Later spends of the same token's successors are not linked this way.
+**Current behavior.** The app keeps a small buffer of credit tokens issued ahead of need, at random intervals unrelated to any request, so a token's first spend normally comes long after its issuance ([anonymous-credits.md § Issuance timing](anonymous-credits.md#issuance-timing)). When nothing held covers a request, the client still converts credits and spends the new token immediately: on a fresh install, on the first request after a week without spending (no buffer is kept for an idle wallet), from a CLI used while the app is not running, when the balance is below one standard allocation, or for a request larger than what is held. The database records each issuance with its account and time and sees each spend's nullifier as it is written, so whoever can watch it, or the server's traffic, can pair such an issuance with the spend that follows it a moment later, linking that token's first spend to its account. A prompt-cache key on that request then links the rest of its conversation lineage ([privacy-guarantees.md §2.7](privacy-guarantees.md#2-unlinkability)).
 
-**What constrains it today.** Allocations are large enough (about $1.00) that a token pays for many requests, so issuances are infrequent; tokens can be converted ahead of time by hand (`eidola account allocate`) and are then spent whenever they are needed.
+A background issuance is timed too: it follows, by one random interval of 10 to 50 minutes, the spend that took the buffer below its threshold. That says some spend in the preceding hour drained a token, which every spend in that window shares; it does not pair the issuance with a spend.
 
-**Future.** Provision ahead of need: keep a token in reserve and replace it at a time unrelated to any request, so issuance and spending are decoupled by default rather than only when the user arranges it.
+**What constrains it today.** Allocations are large enough (about $1.00) that a token pays for many requests, so even the fallback is rare for an active user; tokens can be converted ahead of time by hand (`eidola account allocate`).
 
-### A lost issuance response strands its allocation
-
-**Current behavior.** The server debits the account and then returns the signed token. Issuance cannot be repeated: if the response is lost (a dropped connection, a client crash), the account has paid for a token the client never obtained.
-
-**What constrains it today.** Each automatic allocation is about $1.00, and nothing else is lost.
-
-**Future.** Idempotent issuance: the client names each issuance request, and the server keeps the response on the account side so the same request can be answered again. The response is already known to the issuer, so keeping it does not help link the token's spends.
+**Future.** A buffer for the CLI-only case, which needs a long-lived process the CLI does not have.
 
 ### A crash mid-spend strands the token's remaining value
 

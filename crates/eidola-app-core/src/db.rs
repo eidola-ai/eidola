@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 15;
+const LATEST_VERSION: i64 = 16;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -551,23 +551,38 @@ pub async fn upsert_issuer_key(
 // Layer 0 — Wallet: Pre-credential operations
 // ---------------------------------------------------------------------------
 
+/// What an issuance's pre-credential row records, written before the request
+/// is first sent (see the `pre_credential` table).
+pub struct PreIssuanceRecord<'a> {
+    pub id: &'a str,
+    pub issuer_key_id: &'a str,
+    /// The CBOR `PreIssuance` (the client's secret issuance state).
+    pub data: &'a [u8],
+    pub credits: i64,
+    pub idempotency_key: &'a [u8; 32],
+    /// The CBOR `IssuanceRequest` exactly as it is sent.
+    pub issuance_request: &'a [u8],
+    pub account_id: &'a str,
+    pub created_at: i64,
+}
+
 pub async fn insert_pre_credential_issuance(
     conn: &Connection,
-    id: &str,
-    issuer_key_id: &str,
-    data: &[u8],
-    credits: i64,
-    created_at: i64,
+    record: &PreIssuanceRecord<'_>,
 ) -> Result<(), AppError> {
     conn.execute(
-        "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, spend_amount, created_at) \
-         VALUES (?1, 'issuance', NULL, ?2, ?3, ?4, NULL, ?5)",
+        "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, \
+         spend_amount, idempotency_key, issuance_request, account_id, created_at) \
+         VALUES (?1, 'issuance', NULL, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8)",
         (
-            Value::Text(id.to_string()),
-            Value::Text(issuer_key_id.to_string()),
-            Value::Blob(data.to_vec()),
-            Value::Integer(credits),
-            Value::Integer(created_at),
+            Value::Text(record.id.to_string()),
+            Value::Text(record.issuer_key_id.to_string()),
+            Value::Blob(record.data.to_vec()),
+            Value::Integer(record.credits),
+            Value::Blob(record.idempotency_key.to_vec()),
+            Value::Blob(record.issuance_request.to_vec()),
+            Value::Text(record.account_id.to_string()),
+            Value::Integer(record.created_at),
         ),
     )
     .await
@@ -575,6 +590,125 @@ pub async fn insert_pre_credential_issuance(
         message: format!("failed to insert pre_credential: {e}"),
     })?;
     Ok(())
+}
+
+/// An issuance whose response never landed: its pre-credential row has no
+/// credential, was not abandoned, and its key still lets a new spend begin.
+pub struct PendingIssuance {
+    pub id: String,
+    pub issuer_key_id: String,
+    pub data: Vec<u8>,
+    pub credits: i64,
+    pub idempotency_key: Vec<u8>,
+    pub issuance_request: Vec<u8>,
+    pub account_id: String,
+    pub created_at: i64,
+    pub public_key_data: Vec<u8>,
+}
+
+/// Every [`PendingIssuance`] at `now`, oldest first.
+pub async fn list_pending_issuances(
+    conn: &Connection,
+    now: i64,
+) -> Result<Vec<PendingIssuance>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT pc.id, pc.issuer_key_id, pc.data, pc.credits, pc.idempotency_key, \
+             pc.issuance_request, pc.account_id, pc.created_at, ik.public_key_data \
+             FROM pre_credential pc \
+             JOIN issuer_key ik ON ik.id = pc.issuer_key_id \
+             WHERE pc.type = 'issuance' \
+               AND pc.abandoned_at IS NULL \
+               AND ik.spend_until > ?1 \
+               AND NOT EXISTS (SELECT 1 FROM credential c WHERE c.pre_credential_id = pc.id) \
+             ORDER BY pc.created_at",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query([now]).await.map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(PendingIssuance {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            issuer_key_id: row.get::<String>(1).map_err(AppError::db)?,
+            data: row.get::<Vec<u8>>(2).map_err(AppError::db)?,
+            credits: row.get::<i64>(3).map_err(AppError::db)?,
+            idempotency_key: row.get::<Vec<u8>>(4).map_err(AppError::db)?,
+            issuance_request: row.get::<Vec<u8>>(5).map_err(AppError::db)?,
+            account_id: row.get::<String>(6).map_err(AppError::db)?,
+            created_at: row.get::<i64>(7).map_err(AppError::db)?,
+            public_key_data: row.get::<Vec<u8>>(8).map_err(AppError::db)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Mark an issuance the server answered as debiting nothing, so recovery
+/// stops asking for it. Idempotent.
+pub async fn abandon_pre_credential_issuance(
+    conn: &Connection,
+    id: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE pre_credential SET abandoned_at = ?2 \
+         WHERE id = ?1 AND type = 'issuance' AND abandoned_at IS NULL",
+        (Value::Text(id.to_string()), Value::Integer(now)),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to abandon pre_credential: {e}"),
+    })?;
+    Ok(())
+}
+
+/// The credits the wallet can still spend at `now` from credentials whose key
+/// lets a spend begin until at least `horizon_until`: every active
+/// credential's balance, plus what an in-flight spend's successor is worth at
+/// least (its balance less the charge held). A credential about to lapse is
+/// left out, since it cannot carry the next few days' spending.
+pub async fn spendable_credits_until(
+    conn: &Connection,
+    now: i64,
+    horizon_until: i64,
+) -> Result<i64, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT COALESCE(SUM(CASE \
+                 WHEN pc.id IS NULL THEN c.credits \
+                 WHEN c_next.nonce IS NULL THEN MAX(c.credits - pc.spend_amount, 0) \
+                 ELSE 0 END), 0) \
+             FROM credential c \
+             JOIN issuer_key ik ON ik.id = c.issuer_key_id \
+             LEFT JOIN pre_credential pc \
+                 ON pc.credential_nonce = c.nonce AND pc.type = 'refund' \
+             LEFT JOIN credential c_next ON c_next.pre_credential_id = pc.id \
+             WHERE ik.spend_until > ?2 AND ik.accept_until > ?1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Integer(now), Value::Integer(horizon_until)))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<i64>(0).map_err(AppError::db),
+        None => Ok(0),
+    }
+}
+
+/// When this wallet last began a spend (the newest spend pre-credential), if
+/// it ever has.
+pub async fn last_spend_at(conn: &Connection) -> Result<Option<i64>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT MAX(created_at) FROM pre_credential WHERE type = 'refund'")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<Option<i64>>(0).map_err(AppError::db),
+        None => Ok(None),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11348,9 +11482,21 @@ mod tests {
         )
         .await
         .unwrap();
-        insert_pre_credential_issuance(conn, "pc-1", "ik-1", b"pre", 10_000, 1_000)
-            .await
-            .unwrap();
+        insert_pre_credential_issuance(
+            conn,
+            &PreIssuanceRecord {
+                id: "pc-1",
+                issuer_key_id: "ik-1",
+                data: b"pre",
+                credits: 10_000,
+                idempotency_key: &[0u8; 32],
+                issuance_request: b"request",
+                account_id: "account",
+                created_at: 1_000,
+            },
+        )
+        .await
+        .unwrap();
         insert_credential(conn, "nonce-1", "pc-1", "ik-1", b"cred", 10_000, 0, 1_100)
             .await
             .unwrap();
@@ -11601,9 +11747,21 @@ mod tests {
         )
         .await
         .unwrap();
-        insert_pre_credential_issuance(&conn, "pc-exp", "ik-exp", b"pre", 5, 4_000)
-            .await
-            .unwrap();
+        insert_pre_credential_issuance(
+            &conn,
+            &PreIssuanceRecord {
+                id: "pc-exp",
+                issuer_key_id: "ik-exp",
+                data: b"pre",
+                credits: 5,
+                idempotency_key: &[0u8; 32],
+                issuance_request: b"request",
+                account_id: "account",
+                created_at: 4_000,
+            },
+        )
+        .await
+        .unwrap();
         insert_credential(&conn, "nonce-exp", "pc-exp", "ik-exp", b"c", 5, 0, 4_000)
             .await
             .unwrap();
@@ -11626,9 +11784,21 @@ mod tests {
 
         async fn credential_under(conn: &Connection, key: &str, nonce: &str, credits: i64) {
             let pc = format!("pc-{nonce}");
-            insert_pre_credential_issuance(conn, &pc, key, b"pre", credits, 1_000)
-                .await
-                .unwrap();
+            insert_pre_credential_issuance(
+                conn,
+                &PreIssuanceRecord {
+                    id: &pc,
+                    issuer_key_id: key,
+                    data: b"pre",
+                    credits,
+                    idempotency_key: &[0u8; 32],
+                    issuance_request: b"request",
+                    account_id: "account",
+                    created_at: 1_000,
+                },
+            )
+            .await
+            .unwrap();
             insert_credential(conn, nonce, &pc, key, b"cred", credits, 0, 1_000)
                 .await
                 .unwrap();

@@ -31,7 +31,7 @@ use chat_harness::{
 };
 use eidola_app_core::changes::{Change, ChangeEvent};
 use eidola_app_core::error::AppError;
-use eidola_app_core::{AppCore, ChatStreamEvent};
+use eidola_app_core::{AppCore, ChatStreamEvent, DEFAULT_ALLOCATION_CREDITS, ProvisionOutcome};
 
 /// The generic system prompt the seeded default template agent carries (mirrors
 /// `db::DEFAULT_AGENT_SYSTEM_PROMPT`). Participant-aware turns prepend it as the
@@ -9991,5 +9991,360 @@ fn a_configuration_write_and_its_key_cleanup_are_one_transaction() {
             .block_on(core.set_base_url(elsewhere.base_url.clone()))
             .expect("without the fault, the write lands");
         assert!(lineages(&core).is_empty());
+    });
+}
+
+// ===========================================================================
+// Issuance ahead of need, and issuance that survives a lost response
+// ===========================================================================
+
+/// A wallet that has spent lately and holds less than the provisioner's
+/// threshold: an explicit small allocation, then one turn spent from it.
+fn spend_from_a_small_credential(core: &AppCore, credits: i64) {
+    with_account(core);
+    core.runtime()
+        .block_on(core.account_allocate(credits))
+        .expect("a small explicit allocation");
+    core.runtime()
+        .block_on(core.chat("hello".into(), MODEL.into(), None))
+        .expect("the turn spends the small credential");
+}
+
+fn active_credentials(core: &AppCore) -> Vec<(i64, i64)> {
+    core.runtime()
+        .block_on(core.wallet_credentials())
+        .expect("active credentials")
+        .into_iter()
+        .map(|c| (c.credits, c.generation))
+        .collect()
+}
+
+fn provision(core: &AppCore) -> ProvisionOutcome {
+    core.runtime()
+        .block_on(core.test_provision_once())
+        .expect("a provisioner pass")
+}
+
+/// Below the threshold, with recent spending and a funded account, one pass
+/// issues one credential of the standard size; the next pass finds the buffer
+/// covered and issues nothing.
+#[test]
+fn the_provisioner_tops_up_a_wallet_running_low() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        spend_from_a_small_credential(&core, 100_000);
+        assert_eq!(mock.issuance_debits(), 1);
+
+        let outcome = provision(&core);
+        assert!(
+            matches!(outcome, ProvisionOutcome::Issued { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(mock.issuance_debits(), 2);
+        assert!(
+            active_credentials(&core).contains(&(DEFAULT_ALLOCATION_CREDITS, 0)),
+            "the background credential is the standard size: {:?}",
+            active_credentials(&core)
+        );
+
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+        assert_eq!(mock.issuance_debits(), 2, "a covered wallet issues nothing");
+    });
+}
+
+/// The credential the provisioner issues is not the one the next request
+/// spends: what was already held still covers it, so the new credential's
+/// first spend waits for the reader's own use to exhaust the old one rather
+/// than following its issuance.
+#[test]
+fn a_background_credential_is_not_spent_by_the_next_request() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        spend_from_a_small_credential(&core, 100_000);
+        assert!(matches!(provision(&core), ProvisionOutcome::Issued { .. }));
+
+        core.runtime()
+            .block_on(core.chat("again".into(), MODEL.into(), None))
+            .expect("the next turn");
+        assert_eq!(mock.chat_hits(), 2);
+        assert_eq!(mock.issuance_debits(), 2, "the next turn converted nothing");
+        assert!(
+            active_credentials(&core).contains(&(DEFAULT_ALLOCATION_CREDITS, 0)),
+            "the background credential is still unspent after the next turn: {:?}",
+            active_credentials(&core)
+        );
+    });
+}
+
+/// No buffer is kept for a wallet that has not spent: a credential issued for
+/// it would most likely lapse unspent. Nothing is sent to the server at all.
+#[test]
+fn the_provisioner_keeps_no_buffer_for_a_wallet_that_has_not_spent() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        assert_eq!(provision(&core), ProvisionOutcome::Idle);
+        assert_eq!(mock.issuance_requests(), 0);
+        assert!(credential_states(&core).is_empty());
+    });
+}
+
+/// Without an account the provisioner does nothing.
+#[test]
+fn the_provisioner_does_nothing_without_an_account() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        assert_eq!(provision(&core), ProvisionOutcome::NoAccount);
+        assert_eq!(mock.issuance_requests(), 0);
+    });
+}
+
+/// Below one standard allocation of balance nothing is issued in the
+/// background; the remainder is left for the just-in-time path, which still
+/// converts it when a request needs it.
+#[test]
+fn the_provisioner_never_issues_from_a_balance_below_a_standard_allocation() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            balance: DEFAULT_ALLOCATION_CREDITS - 1,
+            ..MockConfig::default()
+        });
+        spend_from_a_small_credential(&core, 100_000);
+        assert_eq!(provision(&core), ProvisionOutcome::LowBalance);
+        assert_eq!(mock.issuance_debits(), 1);
+    });
+}
+
+/// A key whose credentials lapse within the provisioner's horizon is never
+/// issued under in the background: the credential would not count toward the
+/// buffer, and would lapse before it could carry the days ahead.
+#[test]
+fn the_provisioner_never_issues_under_a_key_about_to_lapse() {
+    run(|| {
+        let now = now_unix_secs();
+        let (mock, core, _dir) = setup(MockConfig {
+            key_window: Some(KeyWindow::from_unix_secs(
+                now - WEEK_SECS,
+                now + 3_600,
+                now + 12 * 3_600,
+            )),
+            ..MockConfig::default()
+        });
+        spend_from_a_small_credential(&core, 100_000);
+        assert_eq!(provision(&core), ProvisionOutcome::NoUsableKey);
+        assert_eq!(mock.issuance_debits(), 1);
+    });
+}
+
+/// Late in a key's issuing window, with enough still held, the provisioner
+/// waits for the next key; with too little held it issues anyway.
+#[test]
+fn the_provisioner_prefers_a_keys_early_life() {
+    let window = || {
+        let now = now_unix_secs();
+        Some(KeyWindow::from_unix_secs(
+            now - WEEK_SECS,
+            now + 3_600,
+            now + 3_600 + WEEK_SECS,
+        ))
+    };
+    run(move || {
+        let (mock, core, _dir) = setup(MockConfig {
+            key_window: window(),
+            ..MockConfig::default()
+        });
+        spend_from_a_small_credential(&core, 200_000);
+        assert_eq!(provision(&core), ProvisionOutcome::Deferred);
+        assert_eq!(mock.issuance_debits(), 1);
+    });
+    run(move || {
+        let (mock, core, _dir) = setup(MockConfig {
+            key_window: window(),
+            ..MockConfig::default()
+        });
+        spend_from_a_small_credential(&core, 50_000);
+        assert!(matches!(provision(&core), ProvisionOutcome::Issued { .. }));
+        assert_eq!(mock.issuance_debits(), 2);
+    });
+}
+
+/// The running provisioner looks only after an interval drawn from its
+/// window — never at start, never in reaction to a request — and then issues.
+#[test]
+fn the_provisioner_issues_only_after_its_interval() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        spend_from_a_small_credential(&core, 100_000);
+        let min = std::time::Duration::from_millis(600);
+        core.test_set_provision_interval(min, std::time::Duration::from_millis(900));
+        let started = std::time::Instant::now();
+        core.start_credential_provisioner();
+
+        // A request made right after start provokes nothing.
+        core.runtime()
+            .block_on(core.chat("right away".into(), MODEL.into(), None))
+            .expect("a turn");
+        assert_eq!(mock.issuance_debits(), 1, "nothing was issued at start");
+
+        let deadline = started + std::time::Duration::from_secs(10);
+        while mock.issuance_debits() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(mock.issuance_debits(), 2, "the provisioner issued once");
+        assert!(
+            elapsed >= min,
+            "the first look came {elapsed:?} after start, inside its {min:?} floor"
+        );
+    });
+}
+
+/// The just-in-time path still provisions a turn the wallet cannot cover,
+/// whatever the provisioner is doing.
+#[test]
+fn the_just_in_time_path_remains_the_fallback() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.start_credential_provisioner();
+        core.runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect("an empty wallet still gets its turn");
+        assert_eq!(mock.issuance_debits(), 1);
+        assert_eq!(mock.chat_hits(), 1);
+    });
+}
+
+/// A response lost after the server debited (the connection closed before
+/// anything came back) is not lost value: the pending issuance survives a
+/// restart, and asking again under the same idempotency key gets the stored
+/// response — one debit, one credential.
+#[test]
+fn a_lost_issuance_response_is_recovered_without_a_second_debit() {
+    run(|| {
+        // The upstream runs on a runtime of its own so it outlives the core.
+        let mock_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("mock runtime");
+        let mock = mock_rt.block_on(chat_harness::start(MockConfig::default()));
+        let (_unused, core, dir) = setup(MockConfig::default());
+        core.runtime()
+            .block_on(core.set_base_url(mock.base_url.clone()))
+            .expect("point at the lasting upstream");
+        with_account(&core);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("the response never arrived");
+        assert_eq!(mock.issuance_debits(), 1);
+        assert!(credential_states(&core).is_empty());
+
+        // Too young to be asked for again: an original attempt could still be
+        // in flight on the server.
+        assert!(
+            core.runtime()
+                .block_on(core.recover_spending_credentials())
+                .expect("recovery")
+                .is_empty()
+        );
+        assert_eq!(mock.issuance_requests(), 1, "nothing was resent");
+
+        // The process dies; the next one recovers it.
+        let base_url = mock.base_url.clone();
+        drop(core);
+        let core = chat_harness::reopen_core(&dir, &base_url);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_spending_credentials())
+            .expect("recovery");
+        assert_eq!(recovered.len(), 1, "the lost issuance came back");
+        assert_eq!(mock.issuance_requests(), 2);
+        assert_eq!(mock.issuance_debits(), 1, "the retry was not debited again");
+        assert_eq!(
+            active_credentials(&core),
+            vec![(DEFAULT_ALLOCATION_CREDITS, 0)]
+        );
+
+        // Recovered once, it is never asked for again.
+        assert!(
+            core.runtime()
+                .block_on(core.recover_spending_credentials())
+                .expect("recovery")
+                .is_empty()
+        );
+        assert_eq!(mock.issuance_requests(), 2);
+    });
+}
+
+/// The provisioner's own pass recovers a lost issuance before deciding, so a
+/// background issuance whose response was lost is answered, not repeated.
+#[test]
+fn the_provisioner_recovers_a_lost_issuance_instead_of_issuing_again() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        spend_from_a_small_credential(&core, 100_000);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.test_provision_once())
+            .expect_err("the background issuance's response was lost");
+        assert_eq!(mock.issuance_debits(), 2);
+
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+        assert_eq!(mock.issuance_debits(), 2, "recovered, not issued again");
+        assert!(active_credentials(&core).contains(&(DEFAULT_ALLOCATION_CREDITS, 0)));
+    });
+}
+
+/// An issuance the server refused debited nothing, so it is abandoned rather
+/// than asked for again.
+#[test]
+fn a_refused_issuance_is_not_asked_for_again() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        let knobs = mock.issuance_knobs();
+        with_account(&core);
+        knobs.refuse_with(Some(402));
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("refused");
+        knobs.refuse_with(None);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        assert!(
+            core.runtime()
+                .block_on(core.recover_spending_credentials())
+                .expect("recovery")
+                .is_empty()
+        );
+        assert_eq!(mock.issuance_requests(), 1, "a refusal is final");
+    });
+}
+
+/// A retry is only ever sent for the account the issuance was made for.
+#[test]
+fn a_pending_issuance_is_never_retried_for_another_account() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("lost");
+        core.reset_account().expect("sign out");
+        core.set_account_credentials(
+            "00000000-0000-0000-0000-000000000002".into(),
+            "other-secret".into(),
+        )
+        .expect("switch account");
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        assert!(
+            core.runtime()
+                .block_on(core.recover_spending_credentials())
+                .expect("recovery")
+                .is_empty()
+        );
+        assert_eq!(mock.issuance_requests(), 1);
     });
 }
