@@ -12,16 +12,19 @@
 //!   image, which the `cuda` executor needs).
 //! - `deployment.json` — what a pin needs that the config does not determine:
 //!   the weights' provenance (`repo`, `revision`), the GPU count the
-//!   deployment presents evidence for, and the Intel TDX machine policy
-//!   (`tinfoil_verifier::TdxPolicy`) its hosts are held to.
+//!   deployment presents evidence for, and the machines its hosts are: one
+//!   policy of a vendored platform endorsements release (tag and file hash),
+//!   plus the PCK platform flags the endorsements do not carry.
 //!
 //! [`deployment_entry`] turns one such directory, plus the release manifest
 //! and TDX IGVM image its `cvm-version` names, into the file's entry: the
 //! TDX launch identity (MRTD recomputed from the image, MRCONFIGID from the
-//! config, via [`crate::tdx_igvm::release_pin`]) with the sidecar's policy,
-//! and the weights and cache policy the config sets. The gateway's build
-//! re-derives everything here except MRTD from the same committed files, so a
-//! hand edit that disagrees with them fails that build.
+//! config, via [`crate::tdx_igvm::release_pin`]) with the machine policy
+//! derived from the verified endorsements
+//! ([`crate::platform_endorsements::tdx_policy`]), and the weights and cache
+//! policy the config sets. The gateway's build re-derives everything here
+//! except MRTD from the same committed files, so a hand edit that disagrees
+//! with them fails that build.
 //!
 //! Only TDX deployments are measured here: the platform provider deploys
 //! engines on its IGVM launch model, which has no SEV-SNP image. The file's
@@ -38,8 +41,9 @@ use eidola_common::engine_deployment::deployment::{
     ModelIdentity, check_deployment, check_model_agreement,
 };
 
-use tinfoil_verifier::{AllowedMeasurement, PlatformMeasurement, TdxPin, TdxPolicy};
+use tinfoil_verifier::{AllowedMeasurement, PlatformMeasurement, TdxPin};
 
+use crate::platform_endorsements::{self, ReadFile};
 use crate::tdx_igvm;
 
 /// The schema version emitted.
@@ -56,6 +60,9 @@ pub struct DeploymentInputs<'a> {
     pub release_manifest: &'a [u8],
     /// The release's `tinfoil-tdx-<version>.igvm`.
     pub igvm: &'a [u8],
+    /// Reads other committed files (the vendored platform endorsements and
+    /// the Sigstore trusted root) by path relative to the workspace root.
+    pub read: &'a ReadFile<'a>,
 }
 
 /// The release artifacts a config needs: `(version, manifest SHA-256)` from
@@ -92,9 +99,10 @@ pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result
     )
     .map_err(anyhow::Error::msg)?;
     let identity = checked.model_identity();
-    let tdx_policy = checked
-        .tdx_policy
-        .context("deployment.json states no tdx_policy; only TDX deployments are measured")?;
+    let machines = checked
+        .tdx
+        .as_ref()
+        .context("deployment.json states no tdx machines; only TDX deployments are measured")?;
 
     let (_, manifest_sha256) = required_release(inputs.config)?;
     let launch = tdx_igvm::release_pin(
@@ -104,12 +112,14 @@ pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result
         inputs.config,
     )?;
 
-    // The pin in the attesting client's own type, compiled by its own pin
-    // compiler (the one the gateway's build runs over the file): a policy the
-    // client would refuse — an empty MR_SEAM list, DEBUG attributes, a wrong
-    // width — fails here, before the file is rendered.
-    let policy: TdxPolicy =
-        serde_json::from_value(tdx_policy).context("deployment.json: tdx_policy")?;
+    // The machine policy, from the signed endorsements the sidecar names,
+    // verified offline. The pin is then built in the attesting client's own
+    // type and compiled by its own pin compiler (the one the gateway's build
+    // runs over the file): a policy the client would refuse — DEBUG
+    // attributes, a wrong width, no machine — fails here, before the file is
+    // rendered.
+    let policy = platform_endorsements::tdx_policy(machines, inputs.read)
+        .map_err(|e| anyhow::anyhow!("{sidecar_path}: tdx.platform_endorsements: {e:#}"))?;
     let pin = AllowedMeasurement {
         platform: PlatformMeasurement::Tdx(TdxPin {
             mrtd: launch.mrtd,
@@ -292,18 +302,43 @@ containers:
     const SIDECAR: &str = r#"{
         "weights": {"repo": "example/fixture-model", "revision": "4444444444444444444444444444444444444444"},
         "expected_gpus": 8,
-        "tdx_policy": {
-            "mr_seam": ["555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555"],
-            "td_attributes": "0000001000000000",
-            "xfam": "e702060000000000",
-            "minimum_tee_tcb_svn": "06010300000000000000000000000000",
-            "minimum_tcb_evaluation_data_number": 17,
-            "qe_vendor_id": "939a7233f79c4ca9940a0db3957f0607",
+        "tdx": {
+            "platform_endorsements": {
+                "release": "platform-v0.1.11",
+                "sha256": "ba0ccfbe8fb8a92d77a072ffeab362dc4b67faa0c88e7114eee7939ad9dd9548",
+                "policy": "tdx-b300-prod"
+            },
             "dynamic_platform": "true",
             "cached_keys": "true",
             "smt_enabled": "false"
         }
     }"#;
+
+    /// Reads the committed tree (the vendored endorsements and the Sigstore
+    /// trusted root), as the tool's binary does.
+    fn workspace_file(relative: &str) -> Result<Vec<u8>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative);
+        std::fs::read(&path).with_context(|| format!("reading {relative}"))
+    }
+
+    /// The machine policy `SIDECAR` names: `tdx-b300-prod` of the vendored
+    /// `platform-v0.1.11`, with the sidecar's PCK flags.
+    fn b300_policy() -> Value {
+        json!({
+            "mr_seam": ["aef4ed3e686fe6cf44c9a8d1cc63105443b558ac4f40c282abf78271e9a4586c50408c8584c7b43fd21edb736700ba5f"],
+            "td_attributes": "0000001000000000",
+            "xfam": "e702060000000000",
+            "minimum_tee_tcb_svn": "03010200000000000000000000000000",
+            "minimum_tcb_evaluation_data_number": 19,
+            "qe_vendor_id": "939a7233f79c4ca9940a0db3957f0607",
+            "ppids": ["9e2d1e4f1e26f3347d5d7ddd3841f9f4"],
+            "dynamic_platform": "true",
+            "cached_keys": "true",
+            "smt_enabled": "false"
+        })
+    }
 
     #[test]
     fn an_entry_carries_the_launch_identity_and_what_the_config_sets() {
@@ -325,6 +360,7 @@ containers:
                 sidecar: SIDECAR.as_bytes(),
                 release_manifest: &release,
                 igvm: &igvm,
+                read: &workspace_file,
             },
         )
         .unwrap();
@@ -340,7 +376,7 @@ containers:
                     "platform": {"tdx": {
                         "mrtd": mrtd,
                         "mrconfigid": format!("{config_sha}{}", "00".repeat(16)),
-                        "policy": serde_json::from_str::<serde_json::Value>(SIDECAR).unwrap()["tdx_policy"],
+                        "policy": b300_policy(),
                     }},
                     "expected_gpus": 8,
                 },
@@ -379,6 +415,7 @@ containers:
                     sidecar: sidecar.as_bytes(),
                     release_manifest: &release,
                     igvm: &igvm,
+                    read: &workspace_file,
                 },
             )
             .unwrap()
@@ -462,6 +499,7 @@ containers:
                     sidecar: sidecar.as_bytes(),
                     release_manifest: &release,
                     igvm: &igvm,
+                    read: &workspace_file,
                 },
             )
             .unwrap_err()
@@ -470,36 +508,57 @@ containers:
         let good = config(&release_sha);
 
         assert!(entry("other-model", &good, SIDECAR).contains("but the deployment is for"));
-        let no_policy = r#"{
+        let no_machines = r#"{
             "weights": {"repo": "example/fixture-model", "revision": "4444444444444444444444444444444444444444"},
             "expected_gpus": 8
         }"#;
-        assert!(entry("fixture-model", &good, no_policy).contains("only TDX deployments"));
+        assert!(entry("fixture-model", &good, no_machines).contains("only TDX deployments"));
         let unpinned = good.replace(&format!("@sha256:{release_sha}"), "");
         assert!(entry("fixture-model", &unpinned, SIDECAR).contains("pin its release manifest"));
         let other_release = good.replace(&release_sha, &"ab".repeat(32));
         assert!(entry("fixture-model", &other_release, SIDECAR).contains("not the pinned"));
 
-        // A machine policy the attesting client would refuse is refused here,
-        // by its own pin compiler, before anything is rendered: an empty
-        // MR_SEAM list, DEBUG set in TD_ATTRIBUTES, a short field.
-        let seam = format!("[\"{}\"]", "5".repeat(96));
-        for (name, from, to) in [
-            ("empty mr_seam", seam.as_str(), "[]"),
+        // The machine policy comes only from verified endorsements: a policy
+        // the release does not define, a recorded hash that is not the
+        // vendored file's, a release that is not vendored, a malformed tag,
+        // and a policy written out by hand are each refused before anything
+        // is rendered.
+        for (name, from, to, needle) in [
             (
-                "debug attributes",
-                "\"0000001000000000\"",
-                "\"0100001000000000\"",
+                "unknown policy",
+                "\"tdx-b300-prod\"",
+                "\"tdx-b300-dev\"",
+                "define no such policy",
             ),
-            ("short xfam", "\"e702060000000000\"", "\"e702\""),
+            (
+                "wrong hash",
+                "\"ba0ccfbe8fb8a92d77a072ffeab362dc4b67faa0c88e7114eee7939ad9dd9548\"",
+                "\"ba0ccfbe8fb8a92d77a072ffeab362dc4b67faa0c88e7114eee7939ad9dd9549\"",
+                "but the recorded hash is",
+            ),
+            (
+                "release not vendored",
+                "\"platform-v0.1.11\"",
+                "\"platform-v0.1.9\"",
+                "reading releases/trust/platform-endorsements/platform-v0.1.9/",
+            ),
+            (
+                "malformed tag",
+                "\"platform-v0.1.11\"",
+                "\"../platform-v0.1.11\"",
+                "must be a platform-vX.Y.Z release tag",
+            ),
+            (
+                "hand-written policy",
+                "\"dynamic_platform\": \"true\",",
+                "\"dynamic_platform\": \"true\", \"mr_seam\": [],",
+                "unknown field `mr_seam`",
+            ),
         ] {
-            let policy = SIDECAR.replace(from, to);
-            assert_ne!(policy, SIDECAR, "{name}: the edit applied");
-            let err = entry("fixture-model", &good, &policy);
-            assert!(
-                err.contains("the attesting client refuses this pin"),
-                "{name}: {err}"
-            );
+            let sidecar = SIDECAR.replace(from, to);
+            assert_ne!(sidecar, SIDECAR, "{name}: the edit applied");
+            let err = entry("fixture-model", &good, &sidecar);
+            assert!(err.contains(needle), "{name}: {err}");
         }
 
         // A CUDA deployment that asks for no GPU evidence, or a different

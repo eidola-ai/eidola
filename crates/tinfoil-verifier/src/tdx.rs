@@ -17,10 +17,10 @@
 //!    [`CompiledTdxPin`]: MRTD and MRCONFIGID (the launch identity), RTMR0–3
 //!    all zero, MROWNER/MROWNERCONFIG zero, and the machine policy (MR_SEAM
 //!    allowlist, exact TD_ATTRIBUTES and XFAM, TEE_TCB_SVN floor, QE vendor,
-//!    collateral evaluation-data floor, optional FMSPC allowlist, and the
-//!    PCK certificate's DynamicPlatform / CachedKeys / SMTEnabled flags, each
-//!    stated explicitly by the pin), with every Intel TCB status required to
-//!    be `UpToDate`.
+//!    collateral evaluation-data floor, the machine's PPID in the pinned
+//!    allowlist, and the PCK certificate's DynamicPlatform / CachedKeys /
+//!    SMTEnabled flags, each stated explicitly by the pin), with every Intel
+//!    TCB status required to be `UpToDate`.
 //!
 //! `REPORT_DATA` binding is not here: the handshake verifier compares the
 //! quote's signed `REPORT_DATA` with the envelope's recomputation through the
@@ -117,8 +117,11 @@ pub(crate) struct AuthenticatedQuote {
     pub report: TDReport10,
     /// MR_SERVICETD: the service TD this TD is bound to, zero when unbound.
     pub mr_service_td: [u8; 48],
-    /// FMSPC from the Intel-signed PCK certificate.
+    /// FMSPC from the Intel-signed PCK certificate. Logged, not pinned: the
+    /// PPID allowlist names the machines, and a machine's FMSPC is fixed.
     pub fmspc: [u8; 6],
+    /// PPID from the Intel-signed PCK certificate (see [`PPID_OID`]).
+    pub ppid: [u8; 16],
     /// Platform flags from the Intel-signed PCK certificate.
     pub dynamic_platform: PckFlag,
     pub cached_keys: PckFlag,
@@ -132,6 +135,16 @@ pub(crate) struct AuthenticatedQuote {
     /// `tcbEvaluationDataNumber` of the verified QE Identity.
     pub qe_identity_evaluation_data_number: u32,
 }
+
+/// The PPID's object identifier inside the PCK certificate's SGX extension
+/// (`1.2.840.113741.1.13.1`), per Intel's "SGX PCK Certificate and
+/// Certificate Revocation List Profile Specification" (the PCK certificate's
+/// SGX extensions table): `PPID` is `1.2.840.113741.1.13.1.1`, an OCTET
+/// STRING of 16 bytes, the Platform Provisioning ID naming one registered
+/// platform. `dcap-qvl` reads it (`intel::parse_pck_extension_with`,
+/// `oids::PPID`) from the leaf of the chain it has just verified to Intel's
+/// root, so the value is Intel-signed.
+pub const PPID_OID: &str = "1.2.840.113741.1.13.1.1";
 
 /// Authenticate a raw TDX quote against Intel's root, using only the
 /// captured PCS responses, at `now` (Unix seconds).
@@ -184,11 +197,24 @@ pub(crate) fn authenticate(
             "collateral evaluation data numbers are inconsistent".to_string(),
         ));
     }
+    let ppid: [u8; 16] = claims
+        .platform
+        .pck
+        .ppid
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            Error::Quote(format!(
+                "PCK certificate PPID is {} bytes, not 16",
+                claims.platform.pck.ppid.len()
+            ))
+        })?;
     Ok(AuthenticatedQuote {
         qe_vendor_id: claims.header.qe_vendor_id,
         report,
         mr_service_td,
         fmspc: claims.platform.pck.fmspc,
+        ppid,
         dynamic_platform: pck_flag(claims.platform.pck.dynamic_platform),
         cached_keys: pck_flag(claims.platform.pck.cached_keys),
         smt_enabled: pck_flag(claims.platform.pck.smt_enabled),
@@ -499,12 +525,10 @@ pub(crate) fn appraise(quote: &AuthenticatedQuote, pin: &CompiledTdxPin) -> Resu
             ));
         }
     }
-    if let Some(allowed) = &pin.fmspc
-        && !allowed.contains(&quote.fmspc)
-    {
+    if !pin.ppids.contains(&quote.ppid) {
         return violation(format!(
-            "FMSPC {} is not an allowed platform",
-            hex::encode(quote.fmspc)
+            "PPID {} is not an allowed machine",
+            hex::encode(quote.ppid)
         ));
     }
     for (label, observed, expected) in [
@@ -619,6 +643,7 @@ pub(crate) mod tests {
             },
             mr_service_td: [0; 48],
             fmspc: [0xb0, 0xc0, 0x6f, 0, 0, 0],
+            ppid: [0x33; 16],
             dynamic_platform: PckFlag::True,
             cached_keys: PckFlag::True,
             smt_enabled: PckFlag::True,
@@ -709,10 +734,9 @@ pub(crate) mod tests {
                 "QE Identity tcbEvaluationDataNumber 18",
                 Box::new(|q, _| q.qe_identity_evaluation_data_number = 18),
             ),
-            (
-                "FMSPC",
-                Box::new(|_, p| p.fmspc = Some(vec![[0x90, 0xc0, 0x6f, 0, 0, 0]])),
-            ),
+            // A machine the pin does not list, from either side.
+            ("PPID", Box::new(|q, _| q.ppid[15] = 0x34)),
+            ("PPID", Box::new(|_, p| p.ppids = vec![[0x44; 16]])),
             // Each platform flag, both directions and the absent case: the
             // pin states the value, so a host that differs either way is
             // refused.
@@ -758,6 +782,8 @@ pub(crate) mod tests {
     /// Inside every validity window of the fixture's collateral.
     pub(crate) const FIXTURE_NOW: u64 = 1_751_500_000;
     pub(crate) const FIXTURE_MRTD: &str = "91eb2b44d141d4ece09f0c75c2c53d247a3c68edd7fafe8a3520c942a604a407de03ae6dc5f87f27428b2538873118b7";
+    /// The fixture PCK certificate's PPID (its SGX extension's `PPID`).
+    pub(crate) const FIXTURE_PPID: &str = "811dca2a26b952e85bb6448b097ba4fd";
 
     fn pct(value: &str) -> String {
         value
@@ -825,6 +851,7 @@ pub(crate) mod tests {
         assert_eq!(quote.report.mr_config_id, [0; 48]);
         assert_eq!(quote.mr_service_td, [0; 48]);
         assert_eq!(hex::encode(quote.fmspc), "b0c06f000000");
+        assert_eq!(hex::encode(quote.ppid), FIXTURE_PPID);
         assert_eq!(quote.tcb_status, TcbStatus::UpToDate);
         assert_eq!(quote.tcb_info_evaluation_data_number, 17);
         assert_eq!(quote.qe_identity_evaluation_data_number, 17);
@@ -861,7 +888,7 @@ pub(crate) mod tests {
             minimum_tee_tcb_svn: quote.report.tee_tcb_svn,
             minimum_tcb_evaluation_data_number: 17,
             qe_vendor_id: quote.qe_vendor_id,
-            fmspc: Some(vec![quote.fmspc]),
+            ppids: vec![quote.ppid],
             dynamic_platform: quote.dynamic_platform,
             cached_keys: quote.cached_keys,
             smt_enabled: quote.smt_enabled,
@@ -1044,14 +1071,153 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn appraisal_accepts_higher_svns_and_a_listed_fmspc() {
+    fn appraisal_accepts_higher_svns_and_a_listed_machine() {
         let mut quote = authenticated();
         quote.report.tee_tcb_svn = [4, 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         quote.tcb_info_evaluation_data_number = 20;
         quote.qe_identity_evaluation_data_number = 21;
         let mut pin = pin();
-        pin.fmspc = Some(vec![[0x90, 0xc0, 0x6f, 0, 0, 0], quote.fmspc]);
+        pin.ppids = vec![[0x44; 16], quote.ppid];
         pin.mr_seam.push([0x44; 48]);
         appraise(&quote, &pin).expect("within policy");
+    }
+
+    /// The fixture PCK certificate's PPID, read independently of `dcap-qvl`:
+    /// the quote's embedded PEM chain, its leaf's SGX extension
+    /// (`1.2.840.113741.1.13.1`), and inside it the `PPID` member
+    /// ([`PPID_OID`]), walked here with `x509-cert` and a minimal DER reader.
+    #[test]
+    fn the_ppid_is_the_pck_certificates_sgx_extension_member() {
+        use der::Encode as _;
+        use der::asn1::ObjectIdentifier;
+
+        let text = FIXTURE_QUOTE;
+        let begin = b"-----BEGIN CERTIFICATE-----";
+        let end = b"-----END CERTIFICATE-----";
+        let start = text
+            .windows(begin.len())
+            .position(|w| w == begin)
+            .expect("the quote embeds its PCK chain");
+        let stop = start
+            + text[start..]
+                .windows(end.len())
+                .position(|w| w == end)
+                .unwrap()
+            + end.len();
+        let leaf = pem::parse(&text[start..stop]).unwrap();
+        let cert = x509_cert::Certificate::from_der(leaf.contents()).unwrap();
+        assert!(
+            cert.tbs_certificate
+                .subject
+                .to_string()
+                .contains("Intel SGX PCK Certificate"),
+            "the first certificate is the PCK leaf"
+        );
+        let sgx = ObjectIdentifier::new_unwrap("1.2.840.113741.1.13.1");
+        let ppid_oid = ObjectIdentifier::new_unwrap(PPID_OID);
+        let extension = cert
+            .tbs_certificate
+            .extensions
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|e| e.extn_id == sgx)
+            .expect("the PCK certificate carries the SGX extension");
+
+        // DER: a SEQUENCE of SEQUENCE { OBJECT IDENTIFIER, value }.
+        fn tlv(bytes: &[u8]) -> (u8, &[u8], &[u8]) {
+            let tag = bytes[0];
+            let (len, header) = match bytes[1] {
+                n if n < 0x80 => (n as usize, 2),
+                0x81 => (bytes[2] as usize, 3),
+                0x82 => (((bytes[2] as usize) << 8) | bytes[3] as usize, 4),
+                other => panic!("unexpected DER length byte {other:#x}"),
+            };
+            (tag, &bytes[header..header + len], &bytes[header + len..])
+        }
+        let (tag, mut members, rest) = tlv(extension.extn_value.as_bytes());
+        assert_eq!((tag, rest.len()), (0x30, 0));
+        let mut found = None;
+        while !members.is_empty() {
+            let (tag, member, next) = tlv(members);
+            assert_eq!(tag, 0x30);
+            let (oid_tag, oid, value) = tlv(member);
+            assert_eq!(oid_tag, 0x06);
+            let mut encoded = Vec::new();
+            ppid_oid.encode_to_vec(&mut encoded).unwrap();
+            if encoded[2..] == *oid {
+                let (value_tag, ppid, _) = tlv(value);
+                assert_eq!(value_tag, 0x04, "the PPID is an OCTET STRING");
+                found = Some(hex::encode(ppid));
+            }
+            members = next;
+        }
+        assert_eq!(found.as_deref(), Some(FIXTURE_PPID));
+
+        let quote = authenticate(
+            FIXTURE_QUOTE,
+            &fixture_responses(),
+            INTEL_SGX_ROOT_CA_DER,
+            FIXTURE_NOW,
+        )
+        .unwrap();
+        assert_eq!(hex::encode(quote.ppid), FIXTURE_PPID);
+    }
+
+    /// The real quote, authenticated, against a pin that otherwise accepts it
+    /// (RTMRs cleared on the copy, as above): a machine the pin does not
+    /// list, and TCB floors above what the machine and its collateral
+    /// report, are each refused.
+    #[test]
+    fn a_real_quote_from_an_unlisted_machine_or_below_a_floor_is_refused() {
+        let mut quote = authenticate(
+            FIXTURE_QUOTE,
+            &fixture_responses(),
+            INTEL_SGX_ROOT_CA_DER,
+            FIXTURE_NOW,
+        )
+        .unwrap();
+        quote.report.rt_mr0 = [0; 48];
+        quote.report.rt_mr1 = [0; 48];
+        quote.report.rt_mr2 = [0; 48];
+        quote.report.rt_mr3 = [0; 48];
+        let accepting = CompiledTdxPin {
+            mrtd: quote.report.mr_td,
+            mrconfigid: quote.report.mr_config_id,
+            mr_seam: vec![quote.report.mr_seam],
+            td_attributes: quote.report.td_attributes,
+            xfam: quote.report.xfam,
+            minimum_tee_tcb_svn: quote.report.tee_tcb_svn,
+            minimum_tcb_evaluation_data_number: 17,
+            qe_vendor_id: quote.qe_vendor_id,
+            ppids: vec![quote.ppid],
+            dynamic_platform: quote.dynamic_platform,
+            cached_keys: quote.cached_keys,
+            smt_enabled: quote.smt_enabled,
+        };
+        appraise(&quote, &accepting).expect("the accepting pin accepts");
+
+        let mut unlisted = accepting.clone();
+        unlisted.ppids = vec![[0x9e; 16]];
+        let err = appraise(&quote, &unlisted).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("PPID {FIXTURE_PPID} is not an allowed machine")),
+            "{err}"
+        );
+
+        let mut svn_floor = accepting.clone();
+        svn_floor.minimum_tee_tcb_svn[0] = quote.report.tee_tcb_svn[0] + 1;
+        let err = appraise(&quote, &svn_floor).unwrap_err().to_string();
+        assert!(err.contains("TEE_TCB_SVN"), "{err}");
+
+        // The fixture's collateral is number 17; a floor of 19 (what the
+        // platform endorsements state today) refuses it.
+        let mut eval_floor = accepting;
+        eval_floor.minimum_tcb_evaluation_data_number = 19;
+        let err = appraise(&quote, &eval_floor).unwrap_err().to_string();
+        assert!(
+            err.contains("tcbEvaluationDataNumber 17 is below the minimum 19"),
+            "{err}"
+        );
     }
 }

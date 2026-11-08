@@ -110,13 +110,18 @@ sha2 = "0.11"
 # also runs (`engine_deployment::deployment`).
 eidola-common = { path = "../eidola-common", features = ["deployment"] }
 # The attesting client's own pin compiler (`validate_pins`), so a committed pin
-# the client would refuse fails the build rather than the first connection.
-# Costs a host build of the verifier's dependency tree for the build script.
-tinfoil-verifier = { path = "../tinfoil-verifier" }
+# the client would refuse fails the build rather than the first connection,
+# and (`platform-endorsements`) the offline verification of the signed
+# platform endorsements a TDX pin's machine policy is re-derived from. Costs a
+# host build of the verifier's dependency tree for the build script; the
+# feature never reaches the runtime binary, whose features build-dependencies
+# do not share.
+tinfoil-verifier = { path = "../tinfoil-verifier", features = ["platform-endorsements"] }
 
 [dev-dependencies]
 # The same module, compiled into the crate's tests.
 eidola-common = { path = "../eidola-common", features = ["deployment"] }
+tinfoil-verifier = { path = "../tinfoil-verifier", features = ["platform-endorsements"] }
 # `InMemoryLogExporter` for the telemetry regression test pinning that
 # exported log records carry no trace context.
 opentelemetry_sdk = { version = "0.33", features = ["testing"] }

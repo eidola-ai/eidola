@@ -11,6 +11,9 @@
 //! platform provider's `tinfoil-inference-v<version>-manifest.json` and
 //! `tinfoil-tdx-v<version>.igvm`. The manifest must hash to the pin in the
 //! config's `cvm-version`, and the image to the manifest's record of it.
+//! Each deployment's TDX machine policy is derived from the platform
+//! endorsements release its `deployment.json` names, vendored under
+//! `releases/trust/platform-endorsements/` and verified offline.
 //! Release-time work, like `just update-manifest`: nothing here downloads.
 //! With no deployments committed it writes the empty pin set.
 
@@ -40,6 +43,7 @@ fn main() -> Result<()> {
     let read =
         |path: &Path| std::fs::read(path).with_context(|| format!("reading {}", path.display()));
     let root = cli.workspace.join("deploy/engine");
+    let workspace_file = |relative: &str| read(&cli.workspace.join(relative));
 
     let mut entries: BTreeMap<String, Vec<engine_enclaves::Entry>> = BTreeMap::new();
     for model in sorted_dirs(&root)? {
@@ -64,6 +68,7 @@ fn main() -> Result<()> {
                     sidecar: &sidecar,
                     release_manifest: &release_manifest,
                     igvm: &igvm,
+                    read: &workspace_file,
                 },
             )
             .with_context(|| config_path.clone())?;
