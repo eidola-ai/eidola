@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 14;
+const LATEST_VERSION: i64 = 15;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -507,24 +507,36 @@ async fn set_user_version(conn: &Connection, version: i64) -> Result<(), AppErro
 // Layer 0 — Wallet: Issuer key operations
 // ---------------------------------------------------------------------------
 
+/// The local lifecycle deadlines of one issuer key, both ms since epoch (see
+/// the `issuer_key` table in `schema.sql`): `spend_until` is the last instant a
+/// new spend may begin under the key, `accept_until` the server's own
+/// acceptance deadline, until which an in-flight spend stays recoverable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IssuerKeyDeadlines {
+    pub spend_until: i64,
+    pub accept_until: i64,
+}
+
 pub async fn upsert_issuer_key(
     conn: &Connection,
     id: &str,
     params_hash: &str,
     public_key_data: &[u8],
     params_data: &[u8],
-    expires_at: i64,
+    deadlines: IssuerKeyDeadlines,
     created_at: i64,
 ) -> Result<(), AppError> {
     conn.execute(
-        "INSERT OR IGNORE INTO issuer_key (id, params_hash, public_key_data, params_data, expires_at, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR IGNORE INTO issuer_key \
+             (id, params_hash, public_key_data, params_data, spend_until, accept_until, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         (
             Value::Text(id.to_string()),
             Value::Text(params_hash.to_string()),
             Value::Blob(public_key_data.to_vec()),
             Value::Blob(params_data.to_vec()),
-            Value::Integer(expires_at),
+            Value::Integer(deadlines.spend_until),
+            Value::Integer(deadlines.accept_until),
             Value::Integer(created_at),
         ),
     )
@@ -11328,7 +11340,10 @@ mod tests {
             "ph",
             b"pub",
             b"params",
-            99_999_999_999_999,
+            IssuerKeyDeadlines {
+                spend_until: 99_999_999_999_999,
+                accept_until: 99_999_999_999_999,
+            },
             1_000,
         )
         .await
@@ -11572,9 +11587,20 @@ mod tests {
         assert_eq!(states, vec![("nonce-2", "active"), ("nonce-1", "spent")]);
 
         // An expired issuer key flips its credentials to expired.
-        upsert_issuer_key(&conn, "ik-exp", "ph", b"pub", b"params", 1, 1_000)
-            .await
-            .unwrap();
+        upsert_issuer_key(
+            &conn,
+            "ik-exp",
+            "ph",
+            b"pub",
+            b"params",
+            IssuerKeyDeadlines {
+                spend_until: 1,
+                accept_until: 1,
+            },
+            1_000,
+        )
+        .await
+        .unwrap();
         insert_pre_credential_issuance(&conn, "pc-exp", "ik-exp", b"pre", 5, 4_000)
             .await
             .unwrap();
@@ -11584,6 +11610,107 @@ mod tests {
         let lc = list_credential_lifecycle(&conn).await.unwrap();
         let exp = lc.iter().find(|r| r.nonce == "nonce-exp").unwrap();
         assert_eq!(exp.state, "expired");
+    }
+
+    /// A key's two deadlines split the lifecycle: past `spend_until` an unspent
+    /// credential is `expired` (no new spend may start, so the provisioning
+    /// queue cannot pick it), but one whose spend is already in flight stays
+    /// `spending` — recoverable — until `accept_until`, when everything under
+    /// the key is `expired`.
+    #[tokio::test]
+    async fn spend_and_accept_deadlines_split_the_lifecycle() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+        let now = crate::now_ms();
+        let hour = 3_600_000;
+
+        async fn credential_under(conn: &Connection, key: &str, nonce: &str, credits: i64) {
+            let pc = format!("pc-{nonce}");
+            insert_pre_credential_issuance(conn, &pc, key, b"pre", credits, 1_000)
+                .await
+                .unwrap();
+            insert_credential(conn, nonce, &pc, key, b"cred", credits, 0, 1_000)
+                .await
+                .unwrap();
+        }
+        async fn key(
+            conn: &Connection,
+            id: &str,
+            spend_until: i64,
+            accept_until: i64,
+        ) -> Result<(), AppError> {
+            let deadlines = IssuerKeyDeadlines {
+                spend_until,
+                accept_until,
+            };
+            upsert_issuer_key(conn, id, "ph", b"pub", b"params", deadlines, 1_000).await
+        }
+
+        // Spend deadline still ahead: spendable.
+        key(&conn, "ik-live", now + hour, now + 2 * hour)
+            .await
+            .unwrap();
+        credential_under(&conn, "ik-live", "live", 50).await;
+        // Spend deadline passed, acceptance deadline ahead.
+        key(&conn, "ik-margin", now - 1_000, now + hour)
+            .await
+            .unwrap();
+        credential_under(&conn, "ik-margin", "margin-idle", 10).await;
+        credential_under(&conn, "ik-margin", "margin-flying", 10).await;
+        insert_pre_credential_refund(
+            &conn,
+            "pc-margin-refund",
+            "margin-flying",
+            "ik-margin",
+            b"pre-refund",
+            4,
+            b"proof",
+            2_000,
+        )
+        .await
+        .unwrap();
+        // Acceptance deadline passed: everything lapses, in flight or not.
+        key(&conn, "ik-gone", now - 2_000, now - 1_000)
+            .await
+            .unwrap();
+        credential_under(&conn, "ik-gone", "gone-flying", 10).await;
+        insert_pre_credential_refund(
+            &conn,
+            "pc-gone-refund",
+            "gone-flying",
+            "ik-gone",
+            b"pre-refund",
+            4,
+            b"proof",
+            2_000,
+        )
+        .await
+        .unwrap();
+
+        let lc = list_credential_lifecycle(&conn).await.unwrap();
+        let state = |nonce: &str| {
+            lc.iter()
+                .find(|r| r.nonce == nonce)
+                .map(|r| r.state.clone())
+                .unwrap()
+        };
+        assert_eq!(state("live"), "active");
+        assert_eq!(state("margin-idle"), "expired");
+        assert_eq!(state("margin-flying"), "spending");
+        assert_eq!(state("gone-flying"), "expired");
+
+        // The provisioning queue reads the same view: the smaller credential
+        // past its spend deadline is never the best fit, the live one is.
+        let picked = find_spendable_credential(&conn, 1).await.unwrap().unwrap();
+        assert_eq!(picked.nonce, "live");
+        // Recovery still sees the in-flight spend inside the acceptance window.
+        let flying: Vec<String> = list_spending_credentials(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.nonce)
+            .collect();
+        assert_eq!(flying, vec!["margin-flying".to_string()]);
     }
 
     #[tokio::test]

@@ -624,6 +624,32 @@ pub struct MockConfig {
     /// answers instantly, which makes an in-flight turn unobservable, so a test
     /// about *concurrency* asks for a window it can act inside.
     pub chat_delay_ms: u64,
+    /// The current issuer key's `(issue_from, issue_until, accept_until)` as
+    /// `GET /v1/keys` advertises them. `None` — the default — is a window
+    /// spanning years, so no test written before key deadlines mattered can
+    /// meet one. A test about a key's deadlines sets them relative to now.
+    pub key_window: Option<KeyWindow>,
+}
+
+/// An issuer key's advertised window, as the ISO 8601 strings `/v1/keys`
+/// carries (see [`MockConfig::key_window`]).
+#[derive(Clone, Debug)]
+pub struct KeyWindow {
+    pub issue_from: String,
+    pub issue_until: String,
+    pub accept_until: String,
+}
+
+impl KeyWindow {
+    /// A window given as unix seconds.
+    pub fn from_unix_secs(issue_from: i64, issue_until: i64, accept_until: i64) -> Self {
+        use eidola_server_gateway::helpers::unix_to_iso;
+        Self {
+            issue_from: unix_to_iso(issue_from),
+            issue_until: unix_to_iso(issue_until),
+            accept_until: unix_to_iso(accept_until),
+        }
+    }
 }
 
 impl Default for MockConfig {
@@ -643,6 +669,7 @@ impl Default for MockConfig {
             close_switch: CloseSwitch::default(),
             list_flat_model: false,
             chat_delay_ms: 0,
+            key_window: None,
         }
     }
 }
@@ -1353,7 +1380,7 @@ async fn handle_conn(
             }
         }
         ("GET", "/v1/keys") => {
-            write_json(&mut stream, 200, &keys_body(&issuer)).await?;
+            write_json(&mut stream, 200, &keys_body(&issuer, &config)).await?;
         }
         ("GET", "/v1/account/balances") => {
             let body = serde_json::json!({
@@ -3076,7 +3103,7 @@ fn models_body(config: &MockConfig) -> String {
     serde_json::json!({ "data": listed }).to_string()
 }
 
-fn keys_body(issuer: &Issuer) -> String {
+fn keys_body(issuer: &Issuer, config: &MockConfig) -> String {
     let ds = format!("ACT-v1:{DS_ORG}:{DS_SERVICE}:{DS_DEPLOYMENT}:{DS_VERSION}");
     // Reproduce the production `/v1/keys` shape during a rotation grace
     // window: a just-retired key (out of its `issue_from..issue_until` issuing
@@ -3090,6 +3117,11 @@ fn keys_body(issuer: &Issuer) -> String {
         .to_cbor()
         .expect("encode decoy public key");
     let decoy_key_hash: [u8; 32] = Sha256::digest(&decoy_pk).into();
+    let window = config.key_window.clone().unwrap_or_else(|| KeyWindow {
+        issue_from: "2026-02-01T00:00:00Z".into(),
+        issue_until: "2030-01-01T00:00:00Z".into(),
+        accept_until: "2030-01-01T00:00:00Z".into(),
+    });
     serde_json::json!({
         "data": [
             {
@@ -3104,9 +3136,9 @@ fn keys_body(issuer: &Issuer) -> String {
                 "id": issuer.key_id_hex,
                 "public_key": issuer.public_key_b64(),
                 "domain_separator": ds,
-                "issue_from": "2026-02-01T00:00:00Z",
-                "issue_until": "2030-01-01T00:00:00Z",
-                "accept_until": "2030-01-01T00:00:00Z",
+                "issue_from": window.issue_from,
+                "issue_until": window.issue_until,
+                "accept_until": window.accept_until,
             }
         ]
     })

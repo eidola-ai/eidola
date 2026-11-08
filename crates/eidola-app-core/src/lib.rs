@@ -1698,7 +1698,9 @@ impl OutputBudgetClass {
 /// One credential row with its lifecycle state, as computed by the local
 /// `credential_lifecycle` view: `active` (spendable), `spending` (a spend
 /// proof is in flight / unsettled), `spent` (settled into a successor), or
-/// `expired` (issuer key past its expiry).
+/// `expired` (an unspent credential past its key's spend deadline, or any
+/// credential past the key's acceptance deadline — see
+/// [`CREDENTIAL_SPEND_MARGIN`]).
 /// **Serialized by the local control protocol** ([`crate::ipc`]): a field
 /// rename here is a wire change.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -1829,6 +1831,32 @@ pub struct SpendTrailEntry {
 /// at a time, large enough that re-allocation (an account-linked,
 /// timing-correlatable operation) stays infrequent.
 pub const DEFAULT_ALLOCATION_CREDITS: i64 = 1_000_000;
+
+/// How long before an issuer key's acceptance deadline (`accept_until`) the
+/// client stops *beginning* spends under it.
+///
+/// The server honours a key's credentials until `accept_until` — one epoch
+/// after the key stops issuing — so that, not `issue_until`, is what bounds a
+/// credential's spendable life. A spend chosen at the very edge of that window
+/// still has to reach the server inside it: a connection and attested TLS
+/// handshake, a transport retry or two, and whatever disagreement there is
+/// between this machine's clock and the server's. Ten minutes covers all of
+/// that with room for a clock that has drifted by minutes, and costs about a
+/// thousandth of the default seven-day acceptance window. A spend already in
+/// flight when the margin begins is unaffected: it stays recoverable until
+/// `accept_until` itself (see the `credential_lifecycle` view).
+pub const CREDENTIAL_SPEND_MARGIN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The local lifecycle deadlines for an issuer key the server stops accepting
+/// at `accept_until_ms`: new spends may begin until [`CREDENTIAL_SPEND_MARGIN`]
+/// before it, and an in-flight spend stays recoverable until it.
+pub fn issuer_key_deadlines(accept_until_ms: i64) -> db::IssuerKeyDeadlines {
+    let margin_ms = i64::try_from(CREDENTIAL_SPEND_MARGIN.as_millis()).unwrap_or(i64::MAX);
+    db::IssuerKeyDeadlines {
+        spend_until: accept_until_ms.saturating_sub(margin_ms),
+        accept_until: accept_until_ms,
+    }
+}
 
 /// How long the ACT provisioning queue waits for an in-flight credential
 /// refund (a concurrent turn's recovery) to free spendable balance before
@@ -3401,7 +3429,24 @@ impl Inner {
         let params_hash = blake3::hash(key.domain_separator.as_bytes())
             .to_hex()
             .to_string();
-        let expires_at = iso_to_ms(&key.issue_until)?;
+        // A credential's spendable life is bounded by when the server stops
+        // *accepting* the key, not when it stops issuing under it: a credential
+        // issued in the last moments of `issue_until` is spendable for a whole
+        // further epoch.
+        let deadlines = issuer_key_deadlines(iso_to_ms(&key.accept_until)?);
+        // The account is debited at issuance, so a credential that would be
+        // born past its own spend deadline is value thrown away. The server's
+        // grace window is a full epoch, so this is only reachable against a
+        // misconfigured (or hostile) server; refuse before any debit.
+        if deadlines.spend_until <= now {
+            return Err(AppError::Credential {
+                message: format!(
+                    "the current issuer key stops being accepted at {}, too soon for a new \
+                     credential to be spent under it",
+                    key.accept_until
+                ),
+            });
+        }
 
         db::upsert_issuer_key(
             &db_conn,
@@ -3409,7 +3454,7 @@ impl Inner {
             &params_hash,
             &public_key_cbor,
             key.domain_separator.as_bytes(),
-            expires_at,
+            deadlines,
             now,
         )
         .await?;
@@ -12917,7 +12962,6 @@ struct IssuerKeyResponse {
     domain_separator: String,
     issue_from: String,
     issue_until: String,
-    #[allow(dead_code)]
     accept_until: String,
 }
 
