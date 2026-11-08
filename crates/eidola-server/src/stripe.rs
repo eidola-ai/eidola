@@ -165,6 +165,13 @@ struct StripeErrorBody {
     pub error_type: Option<String>,
 }
 
+/// The one field of a Stripe Charge the dispute handlers need.
+#[derive(Debug, Deserialize)]
+struct StripeChargeCustomer {
+    #[serde(default)]
+    customer: Option<String>,
+}
+
 /// Stripe product (expanded from a price).
 #[derive(Debug, Deserialize)]
 pub struct StripeProduct {
@@ -502,6 +509,47 @@ impl StripeClient {
                 crate::error::parse_error_summary(&e)
             ))
         })
+    }
+
+    /// The customer a charge was made for, if any. A Dispute carries only
+    /// the disputed charge's id — no customer — so this is how a
+    /// `charge.dispute.*` event reaches the account it concerns.
+    pub async fn get_charge_customer(
+        &self,
+        charge_id: &str,
+    ) -> Result<Option<String>, ServerError> {
+        let response = self
+            .client
+            .get(format!("{}/charges/{}", self.base_url, charge_id))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
+
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ServerError::Network(format!("stripe: {}", e.without_url())))?;
+
+        if !status.is_success() {
+            return Err(stripe_error(&body));
+        }
+
+        let charge: StripeChargeCustomer = serde_json::from_slice(&body).map_err(|e| {
+            ServerError::Parse(format!(
+                "stripe charge: {}",
+                crate::error::parse_error_summary(&e)
+            ))
+        })?;
+        Ok(charge.customer)
+    }
+
+    /// Point the client at a stub server.
+    #[cfg(test)]
+    pub(crate) fn with_base_url(mut self, base_url: String) -> Self {
+        self.base_url = base_url;
+        self
     }
 
     /// Create a Stripe Checkout Session and return the checkout URL.

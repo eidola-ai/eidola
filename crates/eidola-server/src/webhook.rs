@@ -253,8 +253,12 @@ pub async fn stripe_webhook(
             WebhookOutcome::Done("ignored")
         }
         "charge.refunded" => handle_charge_refunded(&event, &state.db_pool).await,
-        "charge.dispute.created" => handle_dispute_created(&event, &state.db_pool).await,
-        "charge.dispute.closed" => handle_dispute_closed(&event, &state.db_pool).await,
+        "charge.dispute.created" => {
+            handle_dispute_created(&event, &state.db_pool, &state.stripe).await
+        }
+        "charge.dispute.closed" => {
+            handle_dispute_closed(&event, &state.db_pool, &state.stripe).await
+        }
         _ => {
             // The verbatim type is unrecognized by definition here, so
             // there is nothing loggable beyond the fact of the fallthrough
@@ -601,34 +605,61 @@ async fn handle_charge_refunded(event: &StripeEvent, pool: &Pool) -> WebhookOutc
     }
 }
 
-async fn handle_dispute_created(event: &StripeEvent, pool: &Pool) -> WebhookOutcome {
-    let obj = &event.data.object;
-
-    let customer_id = match obj["charge"].as_str() {
-        Some(_) => obj["customer"]
-            .as_str()
-            .or_else(|| obj["charge_object"]["customer"].as_str()),
-        None => obj["customer"].as_str(),
+/// The account a `charge.dispute.*` event concerns.
+///
+/// Stripe's Dispute object has no `customer` field (nor anything like a
+/// `charge_object`): it names only the disputed `charge`, as an unexpanded
+/// id in webhook payloads. The customer lives on that Charge, so it is
+/// fetched — the same shape as the product lookup `invoice.paid` makes,
+/// and a failure to reach Stripe is likewise retryable.
+async fn dispute_account(
+    obj: &serde_json::Value,
+    pool: &Pool,
+    stripe: &Option<StripeClient>,
+    event_label: &'static str,
+) -> Result<db::AccountRow, WebhookOutcome> {
+    let Some(charge_id) = obj["charge"].as_str() else {
+        error!("webhook: {event_label} missing charge");
+        return Err(WebhookOutcome::Done("malformed_event"));
     };
-
-    let customer_id = match customer_id {
-        Some(c) => c,
-        None => {
-            error!("webhook: charge.dispute.created missing customer");
-            return WebhookOutcome::Done("malformed_event");
+    let Some(stripe) = stripe.as_ref() else {
+        error!("webhook: stripe client not configured, cannot fetch disputed charge");
+        return Err(WebhookOutcome::Retryable("stripe_unconfigured"));
+    };
+    let customer_id = match stripe.get_charge_customer(charge_id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            warn!("webhook: disputed charge in {event_label} has no customer");
+            return Err(WebhookOutcome::Done("orphan_customer"));
+        }
+        Err(e) => {
+            error!("webhook: failed to fetch disputed charge: {}", e);
+            return Err(WebhookOutcome::Retryable("stripe_api_error"));
         }
     };
-
-    let account = match db::get_account_by_stripe_customer(pool, customer_id).await {
-        Ok(Some(a)) => a,
+    match db::get_account_by_stripe_customer(pool, &customer_id).await {
+        Ok(Some(a)) => Ok(a),
         Ok(None) => {
-            warn!("webhook: orphan customer in charge.dispute.created");
-            return WebhookOutcome::Done("orphan_customer");
+            warn!("webhook: orphan customer in {event_label}");
+            Err(WebhookOutcome::Done("orphan_customer"))
         }
         Err(e) => {
             error!("webhook: db error looking up customer: {}", e);
-            return WebhookOutcome::Retryable("db_error");
+            Err(WebhookOutcome::Retryable("db_error"))
         }
+    }
+}
+
+async fn handle_dispute_created(
+    event: &StripeEvent,
+    pool: &Pool,
+    stripe: &Option<StripeClient>,
+) -> WebhookOutcome {
+    let obj = &event.data.object;
+
+    let account = match dispute_account(obj, pool, stripe, "charge.dispute.created").await {
+        Ok(a) => a,
+        Err(outcome) => return outcome,
     };
 
     let amount = match obj["amount"].as_i64() {
@@ -671,7 +702,11 @@ async fn handle_dispute_created(event: &StripeEvent, pool: &Pool) -> WebhookOutc
     }
 }
 
-async fn handle_dispute_closed(event: &StripeEvent, pool: &Pool) -> WebhookOutcome {
+async fn handle_dispute_closed(
+    event: &StripeEvent,
+    pool: &Pool,
+    stripe: &Option<StripeClient>,
+) -> WebhookOutcome {
     let obj = &event.data.object;
 
     let status = obj["status"].as_str().unwrap_or("");
@@ -680,24 +715,9 @@ async fn handle_dispute_closed(event: &StripeEvent, pool: &Pool) -> WebhookOutco
         return WebhookOutcome::Done("ignored");
     }
 
-    let customer_id = match obj["customer"].as_str() {
-        Some(c) => c,
-        None => {
-            error!("webhook: charge.dispute.closed missing customer");
-            return WebhookOutcome::Done("malformed_event");
-        }
-    };
-
-    let account = match db::get_account_by_stripe_customer(pool, customer_id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => {
-            warn!("webhook: orphan customer in charge.dispute.closed");
-            return WebhookOutcome::Done("orphan_customer");
-        }
-        Err(e) => {
-            error!("webhook: db error looking up customer: {}", e);
-            return WebhookOutcome::Retryable("db_error");
-        }
+    let account = match dispute_account(obj, pool, stripe, "charge.dispute.closed").await {
+        Ok(a) => a,
+        Err(outcome) => return outcome,
     };
 
     let amount = match obj["amount"].as_i64() {
@@ -1344,11 +1364,126 @@ mod tests {
             }),
         );
 
-        let outcome = handle_dispute_created(&event, &pool).await;
+        let stripe = stub_charge_customer(Some(cust.clone())).await;
+        let outcome = handle_dispute_created(&event, &pool, &stripe).await;
 
         assert!(!outcome.is_retryable());
         assert_eq!(get_balance(&pool, account_id).await, 45_000_000);
         assert_eq!(count_ledger_entries(&pool, account_id).await, 2);
+    }
+
+    /// A stub Stripe answering `GET /charges/{id}` with `customer`, through
+    /// the production client (the pattern of `stripe::tests::stub_stripe`).
+    async fn stub_charge_customer(customer: Option<String>) -> Option<StripeClient> {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/charges/{id}",
+            get(
+                move |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                    Json(serde_json::json!({ "id": id, "object": "charge", "customer": customer }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        Some(StripeClient::new("sk_test".to_string()).with_base_url(format!("http://{addr}")))
+    }
+
+    /// A dispute that cannot be resolved to its account because Stripe is
+    /// unreachable or unconfigured must be redelivered, not dropped as a
+    /// 200 — the old `malformed_event` ending was silent and final.
+    #[tokio::test]
+    async fn dispute_whose_charge_cannot_be_fetched_is_retryable() {
+        // Never connected: the lookup fails before the pool is used.
+        let pool = db::create_pool("postgres://x@127.0.0.1:1/x?sslmode=disable", None, None)
+            .expect("lazy pool");
+        let event = make_event(
+            "evt_dispute_unreachable",
+            "charge.dispute.created",
+            stripe_shaped_dispute("needs_response"),
+        );
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let unreachable = Some(
+            StripeClient::new("sk_test".to_string()).with_base_url("http://127.0.0.1:1".into()),
+        );
+
+        assert!(
+            handle_dispute_created(&event, &pool, &unreachable)
+                .await
+                .is_retryable()
+        );
+        assert!(
+            handle_dispute_created(&event, &pool, &None)
+                .await
+                .is_retryable()
+        );
+    }
+
+    /// The Dispute object Stripe actually sends (API `2025-03-31.basil`
+    /// and today): no `customer`, `charge` as an unexpanded id, and a
+    /// `payment_intent`. There is no `charge_object` field.
+    fn stripe_shaped_dispute(status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "dp_test_123",
+            "object": "dispute",
+            "amount": 500,
+            "currency": "usd",
+            "charge": "ch_test_123",
+            "payment_intent": "pi_test_123",
+            "reason": "fraudulent",
+            "status": status
+        })
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn dispute_created_claws_back_a_stripe_shaped_dispute() {
+        let pool = test_pool();
+        let cust = format!("cus_test_{}", uuid::Uuid::new_v4());
+        let account_id = create_test_account(&pool, &cust).await;
+        db::insert_credit_ledger(
+            &pool,
+            account_id,
+            50_000_000,
+            "subscription_renewal",
+            &format!("evt_seed_{}", uuid::Uuid::new_v4()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let event = make_event(
+            &format!("evt_{}", uuid::Uuid::new_v4()),
+            "charge.dispute.created",
+            stripe_shaped_dispute("needs_response"),
+        );
+        let stripe = stub_charge_customer(Some(cust.clone())).await;
+        let outcome = handle_dispute_created(&event, &pool, &stripe).await;
+
+        assert!(!outcome.is_retryable());
+        assert_eq!(get_balance(&pool, account_id).await, 45_000_000);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn dispute_closed_won_reverses_a_stripe_shaped_dispute() {
+        let pool = test_pool();
+        let cust = format!("cus_test_{}", uuid::Uuid::new_v4());
+        let account_id = create_test_account(&pool, &cust).await;
+
+        let event = make_event(
+            &format!("evt_{}", uuid::Uuid::new_v4()),
+            "charge.dispute.closed",
+            stripe_shaped_dispute("won"),
+        );
+        let stripe = stub_charge_customer(Some(cust.clone())).await;
+        let outcome = handle_dispute_closed(&event, &pool, &stripe).await;
+
+        assert!(!outcome.is_retryable());
+        assert_eq!(get_balance(&pool, account_id).await, 5_000_000);
     }
 
     #[tokio::test]
@@ -1363,12 +1498,14 @@ mod tests {
             "charge.dispute.closed",
             serde_json::json!({
                 "customer": cust,
+                "charge": "ch_test_123",
                 "status": "won",
                 "amount": 500
             }),
         );
 
-        let outcome = handle_dispute_closed(&event, &pool).await;
+        let stripe = stub_charge_customer(Some(cust.clone())).await;
+        let outcome = handle_dispute_closed(&event, &pool, &stripe).await;
 
         assert!(!outcome.is_retryable());
         assert_eq!(get_balance(&pool, account_id).await, 5_000_000);
@@ -1392,7 +1529,7 @@ mod tests {
             }),
         );
 
-        let outcome = handle_dispute_closed(&event, &pool).await;
+        let outcome = handle_dispute_closed(&event, &pool, &None).await;
 
         assert!(!outcome.is_retryable());
         assert_eq!(get_balance(&pool, account_id).await, 0);
