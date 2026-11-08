@@ -354,9 +354,37 @@ impl Config {
         toml::from_str(&contents).unwrap_or_default()
     }
 
+    /// Load config from `path` **to write it back**: a missing file is the
+    /// defaults, but one that cannot be read or parsed is an error. Every
+    /// setter rewrites the whole file, account secret included, so reading an
+    /// unparseable file as defaults (what [`Config::load_from`] does, which is
+    /// right for display) would save those defaults over the only copy of
+    /// the credentials on the next preference change.
+    pub fn load_for_update(path: &Path) -> Result<Config, AppError> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(e) => {
+                return Err(AppError::Config {
+                    message: format!("failed to read {}: {e}", path.display()),
+                });
+            }
+        };
+        toml::from_str(&contents).map_err(|e| AppError::Config {
+            message: format!(
+                "{} is not valid; fix or move it aside (nothing was written): {e}",
+                path.display()
+            ),
+        })
+    }
+
     /// Serialize and write the config to `path`, creating parent directories
-    /// as needed.
+    /// as needed. The file is replaced whole — written beside it, synced, then
+    /// renamed over — so a reader or a crash never sees it truncated, and on
+    /// Unix it is created owner-only, since it holds the account secret.
     pub fn save_to(&self, path: &Path) -> Result<(), AppError> {
+        use std::io::Write;
+
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| AppError::Config {
                 message: format!("failed to create config directory: {e}"),
@@ -365,9 +393,23 @@ impl Config {
         let contents = toml::to_string_pretty(self).map_err(|e| AppError::Config {
             message: format!("failed to serialize config: {e}"),
         })?;
-        fs::write(path, contents).map_err(|e| AppError::Config {
+        let write_err = |e: std::io::Error| AppError::Config {
             message: format!("failed to write config: {e}"),
-        })
+        };
+        let tmp = path.with_extension("toml.tmp");
+        // A leftover from an interrupted save may carry other permissions;
+        // `create_new` below must make the file this call writes.
+        let _ = fs::remove_file(&tmp);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&tmp).map_err(write_err)?;
+        file.write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(write_err)?;
+        drop(file);
+        fs::rename(&tmp, path).map_err(write_err)
     }
 }
 

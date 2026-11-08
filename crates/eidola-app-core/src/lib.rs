@@ -2242,6 +2242,13 @@ impl Inner {
         Config::load_from(&self.config_path)
     }
 
+    /// The config a setter is about to rewrite whole: see
+    /// [`Config::load_for_update`] (an unreadable file refuses the write
+    /// rather than reading as defaults the save would then persist).
+    fn load_config_for_update(&self) -> Result<Config, AppError> {
+        Config::load_for_update(&self.config_path)
+    }
+
     fn require_credentials<'a>(&self, cfg: &'a Config) -> Result<(&'a str, &'a str), AppError> {
         match (&cfg.account_id, &cfg.account_secret) {
             (Some(id), Some(secret)) => Ok((id, secret)),
@@ -2846,7 +2853,7 @@ impl Inner {
         &self,
         accepted_terms: Vec<TermsDocument>,
     ) -> Result<AccountCreateResult, AppError> {
-        let cfg = self.load_config();
+        let cfg = self.load_config_for_update()?;
 
         if cfg.account_id.is_some() || cfg.account_secret.is_some() {
             return Err(AppError::Config {
@@ -2871,7 +2878,7 @@ impl Inner {
                 message: format!("failed to parse response: {e}"),
             })?;
 
-        let mut cfg = self.load_config();
+        let mut cfg = self.load_config_for_update()?;
         cfg.account_id = Some(created.account_id.to_string());
         cfg.account_secret = Some(created.secret.clone());
         cfg.save_to(&self.config_path)?;
@@ -10130,7 +10137,7 @@ impl AppCore {
                 message: "default template id must not be empty".into(),
             });
         }
-        let mut cfg = self.inner.load_config();
+        let mut cfg = self.inner.load_config_for_update()?;
         cfg.default_template_override = Some(template_id);
         cfg.save_to(&self.inner.config_path)?;
         self.bus.emit(Change::Config);
@@ -10142,7 +10149,7 @@ impl AppCore {
     /// override): `system` tracks the OS appearance, `day`/`night` pin one
     /// palette family, `auto` switches on the system clock.
     pub fn set_appearance(&self, appearance: config::AppearanceSetting) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
+        let mut cfg = self.inner.load_config_for_update()?;
         cfg.appearance_override = Some(appearance);
         cfg.save_to(&self.inner.config_path)?;
         self.bus.emit(Change::Config);
@@ -10153,7 +10160,7 @@ impl AppCore {
     /// config override): whether the palette takes on the character of the
     /// light at the current hour, or stays on the neutral palettes.
     pub fn set_time_of_day_tint(&self, tint: config::TimeOfDayTint) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
+        let mut cfg = self.inner.load_config_for_update()?;
         cfg.time_of_day_tint_override = Some(tint);
         cfg.save_to(&self.inner.config_path)?;
         self.bus.emit(Change::Config);
@@ -10164,7 +10171,7 @@ impl AppCore {
     /// override) the palettes render under while the time-of-day axis is
     /// `off`.
     pub fn set_light_character(&self, character: config::LightCharacter) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
+        let mut cfg = self.inner.load_config_for_update()?;
         cfg.light_character_override = Some(character);
         cfg.save_to(&self.inner.config_path)?;
         self.bus.emit(Change::Config);
@@ -10178,7 +10185,7 @@ impl AppCore {
     /// pre-validating. Emits [`Change::Config`] so every window's theme
     /// re-applies.
     pub fn set_font_scale(&self, scale: f32) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
+        let mut cfg = self.inner.load_config_for_update()?;
         cfg.font_scale_override = Some(config::clamp_font_scale(scale));
         cfg.save_to(&self.inner.config_path)?;
         self.bus.emit(Change::Config);
@@ -10192,7 +10199,7 @@ impl AppCore {
     /// what a tag resolves to and what an unrecognized one falls back to.
     /// Emits [`Change::Config`] so every window re-reads it.
     pub fn set_language(&self, language: Option<String>) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
+        let mut cfg = self.inner.load_config_for_update()?;
         cfg.language_override = language
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty());
@@ -10205,7 +10212,7 @@ impl AppCore {
     /// used for local inference. When unset, the binary is discovered on
     /// `PATH` and in the usual install locations.
     pub fn set_llama_server_path(&self, path: Option<String>) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
+        let mut cfg = self.inner.load_config_for_update()?;
         cfg.llama_server_path_override = path.filter(|p| !p.trim().is_empty());
         cfg.save_to(&self.inner.config_path)?;
         self.bus.emit(Change::Config);
@@ -10335,7 +10342,7 @@ impl AppCore {
     }
 
     pub fn set_account_credentials(&self, id: String, secret: String) -> Result<(), AppError> {
-        let cfg = self.inner.load_config();
+        let cfg = self.inner.load_config_for_update()?;
         if cfg.account_id.is_some() || cfg.account_secret.is_some() {
             return Err(AppError::Config {
                 message: "account credentials already configured — reset first".into(),
@@ -10350,7 +10357,7 @@ impl AppCore {
     }
 
     pub fn reset_account(&self) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
+        let mut cfg = self.inner.load_config_for_update()?;
         cfg.account_id = None;
         cfg.account_secret = None;
         cfg.save_to(&self.inner.config_path)?;
