@@ -39,10 +39,108 @@ pub struct DecryptedIssuerKey {
     pub request_context_scalar: Scalar,
     pub issue_from: SystemTime,
     pub issue_until: SystemTime,
+    /// End of acceptance (exclusive): no spend under this key is accepted
+    /// at or after this instant.
+    pub accept_until: SystemTime,
 }
 
 /// Thread-safe cache of decrypted issuer keys, keyed by SHA-256(pkI).
 pub type KeyCache = Arc<RwLock<HashMap<[u8; 32], DecryptedIssuerKey>>>;
+
+// ---------------------------------------------------------------------------
+// Key deadlines
+// ---------------------------------------------------------------------------
+
+/// How long past a key's `accept_until` the gateway keeps the key, and every
+/// nullifier recorded under it.
+///
+/// A spend accepted just before `accept_until` still has to finish: its
+/// refund is signed when the response completes, and the stored refund token
+/// answers `POST /v1/credentials/refund`. The key stays usable for that work
+/// until `accept_until + RETENTION_PAST_ACCEPT`, and the gateway prunes a
+/// key's nullifiers (`db::prune_expired_nullifiers`, called only with this
+/// constant) only after that same instant. So no nullifier is pruned while
+/// its key could still accept a spend, with this whole margin to spare
+/// against clock skew between gateway instances and the database.
+///
+/// The client stops starting spends `CREDENTIAL_SPEND_MARGIN` (10 min) before
+/// `accept_until` and stops recovering at `accept_until`, so its useful
+/// window ends inside this one. A refund signed after `accept_until` carries
+/// no spendable value (it is a credential under the same, now-refusing key);
+/// signing it only keeps a response that began in time well-formed.
+pub const RETENTION_PAST_ACCEPT: Duration = Duration::from_secs(3600);
+
+const _: () = assert!(
+    RETENTION_PAST_ACCEPT.as_secs() > 2 * db::MAX_CLOCK_SKEW.as_secs(),
+    "the retention margin must exceed the clock skew two instances can disagree by"
+);
+
+/// What a key is being used for, each with its own deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyUse {
+    /// Accepting a spend: verifying a proof and recording a fresh nullifier.
+    /// Allowed while `now < accept_until`.
+    Spend,
+    /// Finishing a spend already accepted: signing its refund or returning
+    /// its stored refund token. Allowed while `now < retain_until`.
+    Refund,
+}
+
+/// The instant from which a key does nothing at all, and its nullifiers may
+/// be pruned.
+pub fn retain_until(accept_until: SystemTime) -> SystemTime {
+    accept_until + RETENTION_PAST_ACCEPT
+}
+
+/// Whether a key whose acceptance deadline is `accept_until` may be used for
+/// `key_use` at `now`.
+pub fn key_usable(accept_until: SystemTime, key_use: KeyUse, now: SystemTime) -> bool {
+    match key_use {
+        KeyUse::Spend => now < accept_until,
+        KeyUse::Refund => now < retain_until(accept_until),
+    }
+}
+
+/// Whether a key's nullifiers may be pruned at `now`: only once nothing can
+/// use the key any more. Mirrors the condition in the SQL
+/// `prune_expired_nullifiers`, which the gateway calls with
+/// `RETENTION_PAST_ACCEPT`.
+pub fn nullifiers_prunable(accept_until: SystemTime, now: SystemTime) -> bool {
+    now >= retain_until(accept_until)
+}
+
+/// The cached key for `key_hash`, if it may be used for `key_use` at `now`.
+///
+/// Every read of the cache that acts on a presented credential goes through
+/// here, so a key past its deadline is refused whether or not it is cached.
+pub fn usable_key<'a>(
+    cache: &'a HashMap<[u8; 32], DecryptedIssuerKey>,
+    key_hash: &[u8; 32],
+    key_use: KeyUse,
+    now: SystemTime,
+) -> Result<&'a DecryptedIssuerKey, ServerError> {
+    match cache.get(key_hash) {
+        Some(key) if key_usable(key.accept_until, key_use, now) => Ok(key),
+        _ => Err(expired_key()),
+    }
+}
+
+fn expired_key() -> ServerError {
+    ServerError::Unauthorized {
+        message: "unknown or expired issuer key".to_string(),
+    }
+}
+
+/// Drop every cached key past its retention deadline. Returns how many were
+/// dropped.
+pub fn evict_retired_keys(
+    cache: &mut HashMap<[u8; 32], DecryptedIssuerKey>,
+    now: SystemTime,
+) -> usize {
+    let before = cache.len();
+    cache.retain(|_, key| key_usable(key.accept_until, KeyUse::Refund, now));
+    before - cache.len()
+}
 
 // ---------------------------------------------------------------------------
 // Key encryption / decryption
@@ -262,6 +360,7 @@ fn cache_key(
             request_context_scalar,
             issue_from: row.issue_from,
             issue_until: row.issue_until,
+            accept_until: row.accept_until,
         },
     );
     Ok(key_hash)
@@ -415,29 +514,74 @@ pub async fn ensure_keys(
     })
 }
 
-/// Load an issuer key for spending verification, checking the cache first
-/// then falling back to the database.
-pub async fn load_key_for_spending(
+/// Make sure the issuer key for `key_hash` is cached and usable for
+/// `key_use`, checking the cache first and then the database.
+///
+/// The deadline is checked on both paths: a cached key past it is refused
+/// (and dropped once past retention), never answered from memory.
+pub async fn load_key(
     key_cache: &KeyCache,
     master_key: &[u8; 32],
     pool: &deadpool_postgres::Pool,
     key_hash: &[u8; 32],
+    key_use: KeyUse,
 ) -> Result<(), ServerError> {
-    // Fast path: already in cache
-    if key_cache.read().await.contains_key(key_hash) {
-        return Ok(());
+    let now = SystemTime::now();
+
+    // Fast path: already in cache.
+    {
+        let cache = key_cache.read().await;
+        if let Some(key) = cache.get(key_hash) {
+            if key_usable(key.accept_until, key_use, now) {
+                return Ok(());
+            }
+            let retired = !key_usable(key.accept_until, KeyUse::Refund, now);
+            drop(cache);
+            if retired {
+                key_cache.write().await.remove(key_hash);
+            }
+            return Err(expired_key());
+        }
     }
 
-    // Slow path: load from DB by key hash
-    let row = db::get_issuer_key_by_hash(pool, key_hash)
+    // Slow path: load from DB by key hash. The query returns any key still
+    // retained; the deadline for this use is checked here, on our clock.
+    let row = db::get_issuer_key_by_hash(pool, key_hash, RETENTION_PAST_ACCEPT)
         .await?
-        .ok_or_else(|| ServerError::Unauthorized {
-            message: "unknown or expired issuer key".to_string(),
-        })?;
+        .ok_or_else(expired_key)?;
+    if !key_usable(row.accept_until, key_use, now) {
+        return Err(expired_key());
+    }
 
     let mut cache = key_cache.write().await;
     cache_key(&mut cache, master_key, &row)?;
     Ok(())
+}
+
+/// Sign the refund for a spent credential, returning its CBOR encoding and
+/// the id of the key that signed it.
+///
+/// The key is the one the spent credential names (`act.issuer_key_hash`),
+/// never the current issuing key: a refund is a credential under the same
+/// key as the one it replaces, so it lapses at that key's `accept_until`, and
+/// a spend near the end of an epoch cannot carry value into a later one.
+pub fn sign_refund(
+    cache: &HashMap<[u8; 32], DecryptedIssuerKey>,
+    act: &crate::auth::ActSpend,
+    refund_credits: u128,
+    now: SystemTime,
+) -> Result<(Vec<u8>, String), ServerError> {
+    let t = credit_to_scalar::<128>(refund_credits)
+        .map_err(|e| ServerError::Internal(format!("invalid refund amount: {e:?}")))?;
+    let key = usable_key(cache, &act.issuer_key_hash, KeyUse::Refund, now)?;
+    let refund = key
+        .secret_key
+        .refund(&key.params, &act.spend_proof, t, OsRng)
+        .map_err(|e| ServerError::Internal(format!("refund issuance failed: {e:?}")))?;
+    let refund_cbor = refund
+        .to_cbor()
+        .map_err(|e| ServerError::Internal(format!("refund CBOR encoding failed: {e:?}")))?;
+    Ok((refund_cbor, hex::encode(act.issuer_key_hash)))
 }
 
 /// Periodic key rotation check interval: 1 hour.
@@ -470,6 +614,11 @@ pub fn spawn_key_rotation_task(
                 continue;
             }
 
+            let evicted = evict_retired_keys(&mut *key_cache.write().await, SystemTime::now());
+            if evicted > 0 {
+                info!("evicted {evicted} retired issuer key(s) from the cache");
+            }
+
             match ensure_keys(&key_cache, &master_key, &pool, &epoch_config).await {
                 Ok(key_hash) => {
                     info!("periodic key check: current key {}", hex::encode(key_hash));
@@ -477,6 +626,14 @@ pub fn spawn_key_rotation_task(
                 Err(e) => {
                     warn!("periodic key check failed: {}", e);
                 }
+            }
+
+            // Same deadline as the eviction above: a key's nullifiers go
+            // only once nothing can use the key.
+            match db::prune_expired_nullifiers(&pool, RETENTION_PAST_ACCEPT).await {
+                Ok(0) => {}
+                Ok(n) => info!("pruned {n} nullifier(s) of retired issuer keys"),
+                Err(e) => warn!("nullifier pruning failed: {}", e),
             }
         }
     });
@@ -733,12 +890,14 @@ pub async fn recover_refund(
         });
     }
 
-    // Load the issuer key.
-    load_key_for_spending(
+    // Load the issuer key. Returning a stored refund token finishes a spend
+    // already accepted, so it is allowed until the key's retention deadline.
+    load_key(
         &state.credential_key_cache,
         master_key,
         &state.db_pool,
         &act.issuer_key_hash,
+        KeyUse::Refund,
     )
     .await?;
 
@@ -756,6 +915,18 @@ pub async fn recover_refund(
                 issuer_key_id: key_id,
             },
         }));
+    }
+
+    // Anything past here may record a fresh nullifier, which is accepting a
+    // spend: only before the key's acceptance deadline, like any spend.
+    {
+        let cache = state.credential_key_cache.read().await;
+        usable_key(
+            &cache,
+            &act.issuer_key_hash,
+            KeyUse::Spend,
+            SystemTime::now(),
+        )?;
     }
 
     // Either the nullifier doesn't exist (request never arrived) or it exists
@@ -777,9 +948,12 @@ pub async fn recover_refund(
     // arrived. Verify the spend proof and issue a full refund.
     {
         let cache = state.credential_key_cache.read().await;
-        let key = cache.get(&act.issuer_key_hash).ok_or_else(|| {
-            ServerError::Internal("issuer key evicted from cache unexpectedly".to_string())
-        })?;
+        let key = usable_key(
+            &cache,
+            &act.issuer_key_hash,
+            KeyUse::Refund,
+            SystemTime::now(),
+        )?;
 
         if act.spend_proof.context() != key.request_context_scalar {
             return Err(ServerError::Unauthorized {
@@ -801,23 +975,9 @@ pub async fn recover_refund(
         }
     })?;
 
-    let t = credit_to_scalar::<128>(charge_credits)
-        .map_err(|e| ServerError::Internal(format!("invalid refund amount: {e:?}")))?;
-
-    let refund_cbor = {
+    let (refund_cbor, key_id) = {
         let cache = state.credential_key_cache.read().await;
-        let key = cache.get(&act.issuer_key_hash).ok_or_else(|| {
-            ServerError::Internal("issuer key not in cache for refund".to_string())
-        })?;
-
-        let refund = key
-            .secret_key
-            .refund(&key.params, &act.spend_proof, t, OsRng)
-            .map_err(|e| ServerError::Internal(format!("refund issuance failed: {e:?}")))?;
-
-        refund
-            .to_cbor()
-            .map_err(|e| ServerError::Internal(format!("refund CBOR encoding failed: {e:?}")))?
+        sign_refund(&cache, &act, charge_credits, SystemTime::now())?
     };
 
     // Store the refund token for idempotency.
@@ -932,5 +1092,342 @@ mod tests {
     fn test_params_does_not_panic() {
         // Verify Params::new accepts our domain separator components (no colons).
         let _params = Params::new(DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION);
+    }
+
+    // --- Key deadlines ---
+
+    use anonymous_credit_tokens::{CreditToken, PreIssuance, PublicKey};
+
+    const HOUR: Duration = Duration::from_secs(3600);
+    const DAY: Duration = Duration::from_secs(86400);
+
+    type Cache = HashMap<[u8; 32], DecryptedIssuerKey>;
+
+    /// Cache a fresh key whose acceptance window ends at `accept_until`,
+    /// returning its hash. (Keys are built straight into the map: `Params`
+    /// is large enough that holding several on an unoptimized test stack
+    /// overflows it.)
+    fn add_key(cache: &mut Cache, accept_until: SystemTime) -> [u8; 32] {
+        let secret_key = PrivateKey::random(OsRng);
+        let key_hash = compute_key_hash(&secret_key.public().to_cbor().unwrap());
+        cache.insert(
+            key_hash,
+            DecryptedIssuerKey {
+                secret_key,
+                params: Params::new(DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION),
+                key_hash,
+                request_context_scalar: request_context_to_scalar(&compute_request_context(
+                    &key_hash,
+                )),
+                issue_from: accept_until - 14 * DAY,
+                issue_until: accept_until - 7 * DAY,
+                accept_until,
+            },
+        );
+        key_hash
+    }
+
+    /// A credential of `credits` issued under `key`, as the client holds it.
+    fn credential(key: &DecryptedIssuerKey, credits: u128) -> CreditToken {
+        let pre = PreIssuance::random(OsRng);
+        let request = pre.request(&key.params, OsRng);
+        let response = key
+            .secret_key
+            .issue::<128>(
+                &key.params,
+                &request,
+                credit_to_scalar::<128>(credits).unwrap(),
+                key.request_context_scalar,
+                OsRng,
+            )
+            .unwrap();
+        pre.to_credit_token::<128>(&key.params, key.secret_key.public(), &request, &response)
+            .unwrap()
+    }
+
+    /// Spend `charge` of a fresh credential under `key`, returning the token
+    /// the server sees and the client's pre-refund state.
+    fn spend(
+        key: &DecryptedIssuerKey,
+        credits: u128,
+        charge: u128,
+    ) -> (crate::auth::ActSpend, anonymous_credit_tokens::PreRefund) {
+        let token = credential(key, credits);
+        let (spend_proof, pre_refund) = token
+            .prove_spend::<128>(&key.params, credit_to_scalar::<128>(charge).unwrap(), OsRng)
+            .unwrap();
+        let act = crate::auth::ActSpend {
+            challenge_digest: compute_challenge_digest(),
+            issuer_key_hash: key.key_hash,
+            spend_proof,
+        };
+        (act, pre_refund)
+    }
+
+    #[test]
+    fn a_cached_key_past_accept_until_refuses_a_spend() {
+        let accept_until = SystemTime::now() + DAY;
+        let mut cache = Cache::new();
+        let hash = add_key(&mut cache, accept_until);
+        let second = Duration::from_secs(1);
+
+        assert!(usable_key(&cache, &hash, KeyUse::Spend, accept_until - second).is_ok());
+        for now in [accept_until, accept_until + second, accept_until + HOUR] {
+            assert!(matches!(
+                usable_key(&cache, &hash, KeyUse::Spend, now),
+                Err(ServerError::Unauthorized { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_spend_accepted_in_time_still_gets_its_refund_after_the_deadline() {
+        let accept_until = SystemTime::now() + DAY;
+        let mut cache = Cache::new();
+        let hash = add_key(&mut cache, accept_until);
+        let just_after = accept_until + Duration::from_secs(30);
+        let retired = retain_until(accept_until);
+
+        assert!(usable_key(&cache, &hash, KeyUse::Spend, just_after).is_err());
+        assert!(usable_key(&cache, &hash, KeyUse::Refund, just_after).is_ok());
+        assert!(
+            usable_key(
+                &cache,
+                &hash,
+                KeyUse::Refund,
+                retired - Duration::from_secs(1)
+            )
+            .is_ok()
+        );
+        assert!(usable_key(&cache, &hash, KeyUse::Refund, retired).is_err());
+    }
+
+    #[tokio::test]
+    async fn load_key_refuses_a_cached_key_past_its_deadline_without_the_database() {
+        // An unreachable database: reaching the slow path would answer with a
+        // pool error, never the refusal asserted here.
+        let pool = db::create_pool(
+            "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
+            None,
+            None,
+        )
+        .unwrap();
+        let master_key = [0u8; 32];
+        let now = SystemTime::now();
+
+        // Past acceptance, still retained: refused for a spend, kept cached
+        // for the refund of a spend already accepted.
+        let mut keys = Cache::new();
+        let lapsing_hash = add_key(&mut keys, now - Duration::from_secs(60));
+        // Past retention: refused for everything, and dropped from the cache.
+        let retired_hash = add_key(&mut keys, now - RETENTION_PAST_ACCEPT - HOUR);
+        // Live: accepted from the cache.
+        let live_hash = add_key(&mut keys, now + DAY);
+        let cache: KeyCache = Arc::new(RwLock::new(keys));
+
+        let load = |hash: [u8; 32], key_use| {
+            let cache = cache.clone();
+            let pool = pool.clone();
+            async move { load_key(&cache, &master_key, &pool, &hash, key_use).await }
+        };
+
+        assert!(load(live_hash, KeyUse::Spend).await.is_ok());
+        assert!(matches!(
+            load(lapsing_hash, KeyUse::Spend).await,
+            Err(ServerError::Unauthorized { .. })
+        ));
+        assert!(load(lapsing_hash, KeyUse::Refund).await.is_ok());
+        assert!(cache.read().await.contains_key(&lapsing_hash));
+        assert!(matches!(
+            load(retired_hash, KeyUse::Refund).await,
+            Err(ServerError::Unauthorized { .. })
+        ));
+        assert!(!cache.read().await.contains_key(&retired_hash));
+    }
+
+    #[test]
+    fn eviction_drops_only_keys_past_retention() {
+        let now = SystemTime::now();
+        let mut cache = Cache::new();
+        let live_hash = add_key(&mut cache, now + DAY);
+        let lapsing_hash = add_key(&mut cache, now - Duration::from_secs(60));
+        let retired_hash = add_key(&mut cache, now - RETENTION_PAST_ACCEPT);
+
+        assert_eq!(evict_retired_keys(&mut cache, now), 1);
+        assert!(cache.contains_key(&live_hash));
+        assert!(cache.contains_key(&lapsing_hash));
+        assert!(!cache.contains_key(&retired_hash));
+    }
+
+    /// The invariant: no nullifier is pruned while its key could still accept
+    /// a spend — not on this instance's clock, and not on any instance's
+    /// clock within the skew the gateway tolerates against the database's.
+    #[test]
+    fn no_nullifier_is_pruned_while_its_key_could_accept_a_spend() {
+        let accept_until = SystemTime::now() + DAY;
+        let skew = db::MAX_CLOCK_SKEW;
+        let step = Duration::from_secs(5);
+        let mut t = accept_until - HOUR;
+        while t < retain_until(accept_until) + HOUR {
+            let prunable = nullifiers_prunable(accept_until, t);
+            for instance_clock in [t - skew, t, t + skew] {
+                if prunable {
+                    assert!(
+                        !key_usable(accept_until, KeyUse::Spend, instance_clock),
+                        "nullifiers prunable while a spend could be accepted"
+                    );
+                }
+            }
+            // Pruning starts exactly where every use of the key ends.
+            assert_eq!(prunable, !key_usable(accept_until, KeyUse::Refund, t));
+            t += step;
+        }
+        assert!(RETENTION_PAST_ACCEPT > 2 * skew);
+    }
+
+    /// The SQL pruning condition is the one `nullifiers_prunable` states,
+    /// parameterized by the margin the gateway passes in.
+    #[test]
+    fn the_schema_prunes_on_the_shared_deadline() {
+        let schema = include_str!("../schema/schema.sql");
+        assert!(schema.contains(
+            "CREATE OR REPLACE FUNCTION prune_expired_nullifiers(p_retain_past_accept INTERVAL)"
+        ));
+        assert!(schema.contains("WHERE accept_until + p_retain_past_accept < now()"));
+        assert!(schema.contains("DROP FUNCTION IF EXISTS prune_expired_nullifiers();"));
+    }
+
+    /// A refund is signed under the spent credential's own key, never the
+    /// current issuing key, so a spend near the end of an epoch cannot carry
+    /// value into a later one.
+    #[test]
+    fn a_refund_is_signed_under_the_spent_credentials_key() {
+        let now = SystemTime::now();
+        // The spent credential's key has stopped issuing and lapses in an hour;
+        // a newer key is the one currently issuing.
+        let mut cache = Cache::new();
+        let old_hash = add_key(&mut cache, now + HOUR);
+        let current_hash = add_key(&mut cache, now + 8 * DAY);
+        let old_public: PublicKey = cache[&old_hash].secret_key.public().clone();
+        let current_public: PublicKey = cache[&current_hash].secret_key.public().clone();
+        let (act, pre_refund) = spend(&cache[&old_hash], 100, 10);
+
+        for at in [now, now + HOUR + Duration::from_secs(60)] {
+            let (refund_cbor, key_id) = sign_refund(&cache, &act, 7, at).unwrap();
+            assert_eq!(key_id, hex::encode(old_hash));
+            let refund = anonymous_credit_tokens::Refund::from_cbor(&refund_cbor).unwrap();
+            let params = Params::new(DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION);
+            let token = pre_refund
+                .to_credit_token::<128>(&params, &act.spend_proof, &refund, &old_public)
+                .expect("refund completes under the spent credential's key");
+            assert_eq!(
+                scalar_to_credit::<128>(&token.credits()).unwrap(),
+                100 - 10 + 7
+            );
+            assert!(
+                pre_refund
+                    .to_credit_token::<128>(&params, &act.spend_proof, &refund, &current_public)
+                    .is_err(),
+                "a refund must not complete under any other key"
+            );
+        }
+
+        // Past retention the spent credential's key signs nothing, and no
+        // other key stands in for it.
+        assert!(matches!(
+            sign_refund(&cache, &act, 7, retain_until(now + HOUR)),
+            Err(ServerError::Unauthorized { .. })
+        ));
+    }
+
+    /// The database's own filters against the shared deadline: a key retained
+    /// past `accept_until` is still found, and pruning spares its nullifiers
+    /// until retention ends. Needs `DATABASE_URL` with `schema.sql` applied.
+    #[tokio::test]
+    #[ignore]
+    async fn pruning_and_lookup_honour_the_retention_margin() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let pool = db::create_pool(&url, None, None).unwrap();
+        let master_key = [0u8; 32];
+        let ec = EpochConfig::default();
+        let now = SystemTime::now();
+
+        // accept_until passed 10 minutes ago: retained.
+        let lapsing = generate_key(
+            &master_key,
+            now - ec.epoch_duration - ec.grace_period - Duration::from_secs(600),
+            &ec,
+        )
+        .unwrap();
+        // accept_until passed past the retention margin: retired.
+        let retired = generate_key(
+            &master_key,
+            now - ec.epoch_duration - ec.grace_period - RETENTION_PAST_ACCEPT - HOUR,
+            &ec,
+        )
+        .unwrap();
+
+        let client = pool.get().await.unwrap();
+        for key in [&lapsing, &retired] {
+            client
+                .execute(
+                    "INSERT INTO issuer_key (id, private_key_enc, public_key, domain_separator, \
+                     issue_from, issue_until, accept_until) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                    &[
+                        &key.id,
+                        &key.private_key_enc,
+                        &key.public_key,
+                        &key.domain_separator,
+                        &key.issue_from,
+                        &key.issue_until,
+                        &key.accept_until,
+                    ],
+                )
+                .await
+                .unwrap();
+            assert!(
+                db::record_nullifier(&pool, &key.id, &[7u8; 32])
+                    .await
+                    .unwrap()
+            );
+        }
+
+        let lapsing_hash = compute_key_hash(&lapsing.public_key);
+        let retired_hash = compute_key_hash(&retired.public_key);
+        assert!(
+            db::get_issuer_key_by_hash(&pool, &lapsing_hash, RETENTION_PAST_ACCEPT)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db::get_issuer_key_by_hash(&pool, &retired_hash, RETENTION_PAST_ACCEPT)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        db::prune_expired_nullifiers(&pool, RETENTION_PAST_ACCEPT)
+            .await
+            .unwrap();
+        // The lapsing key's nullifier survives: recording it again is refused
+        // as a duplicate. The retired key's is gone.
+        assert!(
+            !db::record_nullifier(&pool, &lapsing.id, &[7u8; 32])
+                .await
+                .unwrap()
+        );
+        assert!(
+            db::record_nullifier(&pool, &retired.id, &[7u8; 32])
+                .await
+                .unwrap()
+        );
+
+        // A non-positive margin is refused outright.
+        assert!(
+            db::prune_expired_nullifiers(&pool, Duration::ZERO)
+                .await
+                .is_err()
+        );
     }
 }
