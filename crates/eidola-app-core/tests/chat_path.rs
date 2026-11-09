@@ -845,6 +845,47 @@ fn one_inputs_recovery_waits_while_the_others_is_final() {
     });
 }
 
+/// **Each input's settlement is announced at its own write.** The answer
+/// carries no refunds; the first input's recovery succeeds and the second's
+/// never answers. The first input's successor is durable, and `Wallet` says
+/// so while the turn is still waiting on the second, rather than only once
+/// the whole settlement returns, which here it never does.
+#[test]
+fn a_settled_input_is_announced_while_the_other_still_waits() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            refund: RefundMode::StallAfter(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        for amount in [1_000_000, 1_000] {
+            core.runtime()
+                .block_on(core.account_allocate(amount))
+                .expect("an allocation");
+        }
+        let mut rx = core.subscribe_changes();
+        let outcome = core.runtime().block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                core.chat("hello".into(), MODEL.into(), None),
+            )
+            .await
+        });
+        assert!(outcome.is_err(), "the second recovery never answers");
+        assert_eq!(mock.refund_hits(), 2);
+        assert_eq!(spending_credentials(&core).len(), 1, "one input settled");
+        let wallet = drain(&mut rx)
+            .into_iter()
+            .filter(|c| *c == Change::Wallet)
+            .count();
+        assert_eq!(
+            wallet, 2,
+            "one at the spend's start, one at the settled input's write"
+        );
+    });
+}
+
 /// **Two turns at once never take one credential.** Both inputs of a request
 /// are marked `spending` together, under the wallet's spend gate: the first
 /// turn takes the drain and the fill, and the second, finding neither, is
@@ -10805,6 +10846,49 @@ fn the_provisioner_issues_two_credentials_under_a_key_it_has_not_issued_under() 
             "both the one public denomination"
         );
         assert_eq!(provision(&core), ProvisionOutcome::Covered);
+    });
+}
+
+/// **A pair interrupted by a lost response is finished on a later pass.**
+/// The first of the two issuances under a fresh key loses its response, so
+/// the pass ends there. The next pass recovers it, which covers the buffer,
+/// and still issues the second: the account ends up with two issuances under
+/// the key, as every provisioning account does. Then the buffer is covered.
+#[test]
+fn a_pair_interrupted_by_a_lost_response_is_finished_later() {
+    run(|| {
+        let now = now_unix_secs();
+        let boundary = now + 6;
+        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
+        let config = MockConfig {
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        };
+        let key_swap = config.key_swap.clone();
+        let (mock, core, _dir) = setup(config);
+        spend_from_a_small_credential(&core, 100_000);
+
+        key_swap.swap();
+        sleep_past_unix_secs(boundary);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.test_provision_once())
+            .expect_err("the first issuance's response was lost");
+        assert_eq!(mock.issuance_debits(), 2);
+
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        let outcome = provision(&core);
+        let ProvisionOutcome::Issued { nonces } = outcome else {
+            panic!("got {outcome:?}");
+        };
+        assert_eq!(
+            nonces.len(),
+            1,
+            "the pair's second, after the first was recovered"
+        );
+        assert_eq!(mock.issuance_debits(), 3);
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+        assert_eq!(mock.issuance_debits(), 3);
     });
 }
 

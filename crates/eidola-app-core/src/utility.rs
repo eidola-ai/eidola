@@ -25,8 +25,8 @@
 
 use crate::error::AppError;
 use crate::{
-    Change, ChargePricing, EidolaResolved, Inner, backends, db, estimate_charge_credits,
-    fetch_models, local_models, now_ms,
+    ChargePricing, EidolaResolved, Inner, backends, db, estimate_charge_credits, fetch_models,
+    local_models, now_ms,
 };
 
 /// Where a chore call would go, and what it would cost — resolved without
@@ -395,12 +395,16 @@ impl Inner {
         now: i64,
     ) {
         let Some(spend) = spend else { return };
-        let (written, error) = spend
-            .settle(&route.client, &route.base_url, db_conn, inline, now)
+        let (_, error) = spend
+            .settle(
+                &route.client,
+                &route.base_url,
+                db_conn,
+                &self.bus,
+                inline,
+                now,
+            )
             .await;
-        if written > 0 {
-            self.bus.emit(Change::Wallet);
-        }
         if let Some(e) = error {
             eprintln!("warning: a utility call's credential refund was not applied: {e}");
         }

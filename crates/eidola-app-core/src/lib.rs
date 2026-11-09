@@ -3929,7 +3929,30 @@ impl Inner {
         let held = db::spendable_credits_until(&db_conn, now, horizon_until)
             .await?
             .saturating_add(pending.iter().map(|r| r.credits).sum::<i64>());
-        if held >= PROVISION_THRESHOLD_CREDITS {
+        // A pair left unfinished under the current key (its second issuance
+        // never made, say because the first one's response was lost and only
+        // recovered on a later pass) is finished even when the buffer is
+        // covered, so the account still ends up with two issuances under the
+        // key. Only while one more allocation keeps what is held within the
+        // threshold plus two.
+        let eidola = self.eidola_resolved().await?;
+        let unfinished_pair = match u64::try_from(now.div_euclid(1000))
+            .ok()
+            .and_then(|secs| self.issuer_calendar().epoch_at(secs))
+        {
+            Some(epoch) => match db::issuer_key_for_epoch(&db_conn, &eidola.base_url, epoch).await?
+            {
+                Some(key_id) => {
+                    let issued = db::issuances_under_key(&db_conn, account_id, &key_id).await?;
+                    (1..PROVISION_CREDENTIALS_PER_KEY).contains(&issued)
+                }
+                None => false,
+            },
+            None => false,
+        };
+        if held >= PROVISION_THRESHOLD_CREDITS
+            && !(unfinished_pair && held < PROVISION_THRESHOLD_CREDITS + DEFAULT_ALLOCATION_CREDITS)
+        {
             return Ok(ProvisionOutcome::Covered);
         }
         if !pending.is_empty() {
@@ -3945,7 +3968,6 @@ impl Inner {
             return Ok(ProvisionOutcome::Idle);
         }
 
-        let eidola = self.eidola_resolved().await?;
         let client = self.build_client(&eidola, None).await?;
         let key = current_issuer_key(
             &client,
@@ -6707,17 +6729,24 @@ impl Inner {
 
             // Balance can't cover a fresh allocation. Waiting only helps if a
             // concurrent turn holds coverage this turn could actually use once
-            // its refund lands. A refund recovers a *wallet successor* worth at
+            // its refunds land. A refund recovers a *wallet successor* worth at
             // most the original credential's face value (a full refund on a
-            // failed turn) — it never tops up the account balance. So an
-            // in-flight credential can only cover what is missing if its own
-            // `credits` already do; a smaller one — even fully refunded — never
-            // will, and no allocation is possible either. Wait only when such a
-            // credential exists; otherwise this is a true shortfall.
-            let recoverable = db::list_spending_credentials(db_conn)
+            // failed turn) — it never tops up the account balance. So waiting
+            // helps only when some in-flight credential, at its face value,
+            // could pay alone or as one of two inputs ([`settlement_could_cover`]);
+            // otherwise no allocation is possible either, and this is a true
+            // shortfall.
+            let in_flight: Vec<i64> = db::list_spending_credentials(db_conn)
                 .await?
                 .into_iter()
-                .any(|c| c.credits >= need);
+                .map(|c| c.credits)
+                .collect();
+            let held: Vec<i64> = db::spendable_credentials(db_conn)
+                .await?
+                .into_iter()
+                .map(|c| c.credits)
+                .collect();
+            let recoverable = settlement_could_cover(&in_flight, &held, charge_credits);
             if recoverable && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
                 continue;
@@ -14116,6 +14145,11 @@ impl SpendPrep {
     /// back the same token — and its input stays unsettled for a later
     /// attempt and the startup sweep.
     ///
+    /// **Each successor written is announced at its write** (`Change::Wallet`
+    /// on `bus`), before the next input's recovery is awaited: a recovery
+    /// that stalls, or a caller that drops this future, never leaves a
+    /// settled input unannounced.
+    ///
     /// Returns the number of successors written, and the first error any
     /// input met. Once every input is settled at once, the partial returns
     /// are checked against the in-order allocation the server must follow
@@ -14126,6 +14160,7 @@ impl SpendPrep {
         client: &reqwest::Client,
         base_url: &str,
         db_conn: &turso::Connection,
+        bus: &BroadcastSource,
         inline: Option<&serde_json::Value>,
         now: i64,
     ) -> (usize, Option<AppError>) {
@@ -14166,6 +14201,7 @@ impl SpendPrep {
                 Ok(credits) => {
                     input.settled = Some(credits);
                     written += 1;
+                    bus.emit(Change::Wallet);
                 }
                 Err(e) => {
                     first_error.get_or_insert(e);
@@ -14220,6 +14256,24 @@ fn check_partial_returns(inputs: &[(i64, u128, i64)]) -> bool {
     };
     eidola_common::spend_credentials::partial_returns(&shares, charge).as_deref()
         == Some(returns.as_slice())
+}
+
+/// Whether settling the credentials now in flight could let a request whose
+/// worst case is `worst` be paid from the wallet: some in-flight credential,
+/// at its face value (the most its successor can hold), covers `worst` alone,
+/// or does so together with one other credential, in flight or `held`. Only
+/// then is waiting for in-flight refunds worth anything.
+fn settlement_could_cover(in_flight: &[i64], held: &[i64], worst: i64) -> bool {
+    in_flight.iter().enumerate().any(|(i, &face)| {
+        face >= worst
+            || in_flight
+                .iter()
+                .enumerate()
+                .any(|(j, &other)| j != i && face.saturating_add(other) >= worst)
+            || held
+                .iter()
+                .any(|&other| face.saturating_add(other) >= worst)
+    })
 }
 
 /// The inputs a request whose worst case is `worst` spends from the wallet
@@ -14420,10 +14474,10 @@ impl TurnPrep {
     /// answer each input, or any input's refund fails to apply; the inputs
     /// that did settle stay settled.
     ///
-    /// **This is where a settled hold emits `Change::Wallet`.** Writing a
-    /// successor is the durable commit — its credential leaves `spending` at
-    /// that instant — and every refund the turn applies, inline or recovered,
-    /// arrives through here. Emitting at the write rather than at each caller
+    /// **A settled input emits `Change::Wallet` at its own write**, inside
+    /// [`SpendPrep::settle`]. Writing a successor is the durable commit — its
+    /// credential leaves `spending` at that instant — and every refund the
+    /// turn applies, inline or recovered, arrives through there. Emitting at the write rather than at each caller
     /// is what keeps the crate's emit-after-every-durable-commit rule true by
     /// construction: a caller that forgets (or an exit that returns before its
     /// own emit could run) cannot leave subscribers showing a credential as
@@ -14434,7 +14488,7 @@ impl TurnPrep {
 
     /// Best-effort refund recovery via `/v1/credentials/refund`, input by
     /// input. Returns whether every input is now settled — the `Wallet`
-    /// emission for a written successor is [`Self::settle_spend`]'s, so a
+    /// emission for a written successor is [`SpendPrep::settle`]'s, so a
     /// caller reads this only to decide its own control flow, never to decide
     /// whether to emit. Always `false` for local turns — there is no spend to
     /// recover.
@@ -14445,24 +14499,23 @@ impl TurnPrep {
         self.settle_spend(None).await.is_ok()
     }
 
-    /// [`SpendPrep::settle`] for this turn's spend, emitting `Change::Wallet`
-    /// when any successor was written. `Ok` once every input is settled.
+    /// [`SpendPrep::settle`] for this turn's spend, which emits
+    /// `Change::Wallet` at each successor it writes. `Ok` once every input is
+    /// settled.
     async fn settle_spend(&mut self, inline: Option<&serde_json::Value>) -> Result<(), AppError> {
         let Some(spend) = self.spend.as_mut() else {
             return Ok(());
         };
-        let (written, error) = spend
+        let (_, error) = spend
             .settle(
                 &self.client,
                 &self.base_url,
                 &self.db_conn,
+                &self.bus,
                 inline,
                 self.now,
             )
             .await;
-        if written > 0 {
-            self.bus.emit(Change::Wallet);
-        }
         match error {
             Some(e) => Err(e),
             None if spend.all_settled() => Ok(()),
@@ -14501,7 +14554,7 @@ impl TurnPrep {
     /// [`Inner::begin_next_round`]'s last-chance attempt and the startup sweep.
     ///
     /// Returns whether every input is settled; the `Wallet` emission is
-    /// [`Self::settle_spend`]'s. A no-op for a turn with no spend.
+    /// [`SpendPrep::settle`]'s. A no-op for a turn with no spend.
     async fn settle(&mut self, inline: Option<&serde_json::Value>) -> bool {
         if self.spend.is_none() {
             return false;
@@ -19372,6 +19425,21 @@ mod tests {
         // No later credential covers the rest: a new one, for the rest only.
         assert_eq!(choose_inputs(&[3_000, 3_199], w), Allocate { need: 3_200 });
         assert_eq!(choose_inputs(&[3_000], w), Allocate { need: 3_200 });
+    }
+
+    /// **Waiting for in-flight refunds is worth it when their successors could
+    /// pay**, alone or as one of two inputs: two in-flight credentials of
+    /// 3,000 and 4,000 could fund a 6,200 hold between them, and one of 3,000
+    /// beside a held 4,000 could too. Nothing in flight, or nothing that
+    /// reaches the hold even paired, is a true shortfall.
+    #[test]
+    fn waiting_counts_two_input_coverage_from_settling_credentials() {
+        assert!(settlement_could_cover(&[6_200], &[], 6_200));
+        assert!(settlement_could_cover(&[3_000, 4_000], &[], 6_200));
+        assert!(settlement_could_cover(&[3_000], &[4_000], 6_200));
+        assert!(!settlement_could_cover(&[], &[3_000, 4_000], 6_200));
+        assert!(!settlement_could_cover(&[3_000], &[], 6_200));
+        assert!(!settlement_could_cover(&[3_000, 3_000], &[100], 6_200));
     }
 
     /// **The partial returns a response carries are checked against the

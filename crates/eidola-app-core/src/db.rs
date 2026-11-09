@@ -769,6 +769,31 @@ pub async fn abandon_pre_credential_issuance(
     Ok(())
 }
 
+/// The issuer key this client recorded for `epoch` under `scope` (the
+/// server's base URL), if it has seen one: what the server listed first for
+/// that epoch.
+pub async fn issuer_key_for_epoch(
+    conn: &Connection,
+    scope: &str,
+    epoch: u64,
+) -> Result<Option<String>, AppError> {
+    let Ok(epoch) = i64::try_from(epoch) else {
+        return Ok(None);
+    };
+    let mut stmt = conn
+        .prepare("SELECT issuer_key_id FROM issuer_key_epoch WHERE scope = ?1 AND epoch = ?2")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(scope.to_string()), Value::Integer(epoch)))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+        None => Ok(None),
+    }
+}
+
 /// How many issuances `account_id` has made under `issuer_key_id` and not
 /// abandoned: those that landed and those whose response is still pending.
 pub async fn issuances_under_key(

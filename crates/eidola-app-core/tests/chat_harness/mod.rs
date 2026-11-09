@@ -569,6 +569,10 @@ pub enum RefundMode {
     /// passed since it recorded the spend and the provisional refund is the
     /// spend's last word. Inline refunds are omitted, as for `Fail`.
     ProvisionalFirst(u64),
+    /// The first `n` calls to `/v1/credentials/refund` succeed and every
+    /// later one never answers: a recovery that stalls part-way through a
+    /// request's inputs. Inline refunds are omitted.
+    StallAfter(u64),
 }
 
 /// Mock upstream configuration.
@@ -2117,6 +2121,11 @@ async fn handle_refund(
         RefundMode::Fail => true,
         RefundMode::FailFirst(n) => attempt <= n,
         RefundMode::Succeed | RefundMode::ProvisionalFirst(_) => false,
+        RefundMode::StallAfter(n) if attempt > n => {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+        RefundMode::StallAfter(_) => false,
         RefundMode::NotStored => {
             return write_json(stream, 404, &error_body("refund token not found")).await;
         }

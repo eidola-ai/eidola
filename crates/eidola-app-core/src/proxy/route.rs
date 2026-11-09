@@ -2018,12 +2018,16 @@ impl Inner {
         inline: Option<&Value>,
     ) {
         let Some(spend) = spend else { return };
-        let (written, error) = spend
-            .settle(&route.client, &route.base_url, db_conn, inline, now_ms())
+        let (_, error) = spend
+            .settle(
+                &route.client,
+                &route.base_url,
+                db_conn,
+                &self.bus,
+                inline,
+                now_ms(),
+            )
             .await;
-        if written > 0 {
-            self.bus.emit(Change::Wallet);
-        }
         if let Some(e) = error {
             eprintln!("warning: a proxied call's credential refund was not applied: {e}");
         }
