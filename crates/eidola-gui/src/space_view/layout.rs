@@ -217,7 +217,7 @@ pub(crate) const COMPACT_GUTTER_GAP_REMS: f32 = 0.5;
 /// The bottom action bar's clearance under its verb line — what keeps Post
 /// off the very edge of the screen.
 pub(crate) const COMPACT_ACTION_BAR_CLEARANCE_REMS: f32 = 1.0;
-pub(crate) const COMPACT_PAGE_INSET: Pixels = POST_PAD_Y;
+pub const COMPACT_PAGE_INSET: Pixels = POST_PAD_Y;
 
 pub(crate) fn compact_gutter_occupancy(rem_size: Pixels) -> f32 {
     rem_size.as_f32() * (COMPACT_GUTTER_LINE_REMS + COMPACT_GUTTER_GAP_REMS)
@@ -289,7 +289,7 @@ pub(crate) fn body_width(page_width: Pixels) -> f32 {
 /// The narrowest page that fits the full reading measure between side gutters.
 /// Below it the gutters stack; `lib.rs::writing_surface_size` derives the
 /// default space-window width from this so a fresh window opens in side mode.
-pub(crate) fn full_measure_page_width() -> Pixels {
+pub fn full_measure_page_width() -> Pixels {
     BODY_MAX_WIDTH + (GUTTER_WIDTH + GUTTER_GAP) * 2.
 }
 

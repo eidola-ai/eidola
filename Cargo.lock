@@ -2913,6 +2913,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "eidola-notepad"
+version = "0.1.0"
+dependencies = [
+ "dirs 6.0.0",
+ "eidola-app-core",
+ "eidola-gui",
+ "futures",
+ "gpui-component",
+ "gpui-kit-assets",
+ "gpui-markdown-editor",
+ "gpui-pre",
+ "gpui-pre-platform",
+ "image",
+ "tempfile",
+]
+
+[[package]]
 name = "eidola-server"
 version = "0.1.0"
 dependencies = [

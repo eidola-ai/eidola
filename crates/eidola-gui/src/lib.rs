@@ -884,7 +884,7 @@ fn try_focus_existing_onboarding(cx: &mut App) -> bool {
 /// tree's otherwise-anonymous root node. It paints nothing: gpui_macos pairs
 /// `titlebarAppearsTransparent` with `NSWindowTitleHidden`, so the string
 /// never reaches the title bar.
-fn transparent_titlebar() -> TitlebarOptions {
+pub fn transparent_titlebar() -> TitlebarOptions {
     TitlebarOptions {
         title: None,
         appears_transparent: true,
@@ -1046,7 +1046,7 @@ pub fn open_new_space_window(cx: &mut App, stores: Stores) {
 /// the page isn't lost in the middle of a 4K display. Both fall back to fixed
 /// values with no primary display (rare; offscreen render contexts), and the
 /// width yields to a display too narrow to show it.
-fn writing_surface_size(cx: &mut App) -> (f32, f32) {
+pub fn writing_surface_size(cx: &mut App) -> (f32, f32) {
     let width = (space_view::layout::full_measure_page_width()
         + chrome::opening_content_inset() * 2.)
         .as_f32();

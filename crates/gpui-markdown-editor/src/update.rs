@@ -3070,6 +3070,28 @@ mod tests {
     }
 
     #[test]
+    fn frontmatter_edits_verbatim_and_keeps_its_lines() {
+        let source = "---\na: 1\nb: 2\n---\n\nBody";
+
+        let s = update(
+            st(source, source.len()),
+            EditorEvent::InsertText("!".into()),
+        );
+        assert_eq!(s.markdown, "---\na: 1\nb: 2\n---\n\nBody!");
+
+        // Enter on a key's line is a literal newline, with nothing promoted.
+        let s = update(st(source, 8), EditorEvent::InsertNewline);
+        assert_eq!(s.markdown, "---\na: 1\n\nb: 2\n---\n\nBody");
+        assert_eq!(s.selection, Selection::Cursor(9));
+        let s = update(s, EditorEvent::InsertText("c: 3".into()));
+        assert_eq!(s.markdown, "---\na: 1\nc: 3\nb: 2\n---\n\nBody");
+
+        // Markdown syntax typed inside stays text.
+        let s = update(st(source, 8), EditorEvent::InsertText(" # **x**".into()));
+        assert_eq!(s.markdown, "---\na: 1 # **x**\nb: 2\n---\n\nBody");
+    }
+
+    #[test]
     fn insert_newline_promotes_to_paragraph_break() {
         // Enter in the middle of a paragraph creates a paragraph break, not a
         // soft break — the post-pass enforces the invariant.
