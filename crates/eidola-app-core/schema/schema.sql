@@ -53,6 +53,21 @@ CREATE TABLE pre_credential (
     credits          INTEGER,
     spend_amount     INTEGER,
     spend_proof_data BLOB,
+    -- Issuance only, all written before the request is first sent, so a
+    -- retry after a lost response or a crash sends the same request under the
+    -- same idempotency key and the server answers it from what it stored:
+    --   idempotency_key:  32 random bytes naming this issuance to the server.
+    --   issuance_request: the CBOR IssuanceRequest exactly as sent (its proof
+    --                     is randomized, so it cannot be rebuilt).
+    --   account_id:       the account it was sent for; a retry is only ever
+    --                     sent for that account.
+    --   abandoned_at:     set when the server answered in a way that means
+    --                     nothing was or will be debited for it, so nothing
+    --                     is left to recover.
+    idempotency_key  BLOB,
+    issuance_request BLOB,
+    account_id       TEXT,
+    abandoned_at     INTEGER,
     created_at       INTEGER NOT NULL,
 
     CHECK (
@@ -60,13 +75,20 @@ CREATE TABLE pre_credential (
             AND credential_nonce IS NULL
             AND spend_amount IS NULL
             AND spend_proof_data IS NULL
-            AND credits IS NOT NULL)
+            AND credits IS NOT NULL
+            AND length(idempotency_key) = 32
+            AND issuance_request IS NOT NULL
+            AND account_id IS NOT NULL)
         OR
         (type = 'refund'
             AND credential_nonce IS NOT NULL
             AND spend_amount IS NOT NULL
             AND spend_proof_data IS NOT NULL
-            AND credits IS NULL)
+            AND credits IS NULL
+            AND idempotency_key IS NULL
+            AND issuance_request IS NULL
+            AND account_id IS NULL
+            AND abandoned_at IS NULL)
     )
 );
 

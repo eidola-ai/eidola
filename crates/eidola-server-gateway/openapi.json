@@ -237,6 +237,7 @@
           "Linked"
         ],
         "summary": "`POST /v1/account/credentials` — issue anonymous credentials (authenticated).",
+        "description": "Idempotent per `(account, idempotency_key)`: the first request debits and\nstores the signed response in one transaction, and a retry with the same\nkey and request is answered from what was stored, so a response lost on the\nway back costs nothing. A stored issuance is answered before the terms gate\nand the current-key check, because it was already paid for.",
         "operationId": "issue_credentials",
         "requestBody": {
           "content": {
@@ -250,7 +251,7 @@
         },
         "responses": {
           "200": {
-            "description": "Credential issued",
+            "description": "Credential issued, or the stored response to an earlier attempt under the same idempotency key",
             "content": {
               "application/json": {
                 "schema": {
@@ -281,6 +282,16 @@
           },
           "402": {
             "description": "Insufficient credit balance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The idempotency key was used for a different request, or the named issuer key is not the current one; nothing was debited",
             "content": {
               "application/json": {
                 "schema": {
@@ -1664,7 +1675,9 @@
         "description": "Request body for `POST /v1/account/credentials`.",
         "required": [
           "issuance_request",
-          "credits"
+          "credits",
+          "idempotency_key",
+          "issuer_key_id"
         ],
         "properties": {
           "credits": {
@@ -1672,9 +1685,17 @@
             "format": "int64",
             "description": "Number of credits to issue."
           },
+          "idempotency_key": {
+            "type": "string",
+            "description": "64 lowercase hex digits (32 random bytes) the client chose for this\nissuance and kept before sending it. A retry under the same key and the\nsame request receives the response the first attempt was given, with no\nsecond debit; the same key with any other request is refused (`409`)."
+          },
           "issuance_request": {
             "type": "string",
             "description": "Base64-encoded CBOR `IssuanceRequest`."
+          },
+          "issuer_key_id": {
+            "type": "string",
+            "description": "The issuer key the client expects to be signed under: the current\nissuing key it read from `GET /v1/keys`. Refused (`409`) before any\ndebit when it is not the current key, so a credential is never paid for\nunder a key the client would not accept."
           }
         }
       },

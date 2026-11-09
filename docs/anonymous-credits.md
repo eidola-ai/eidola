@@ -180,11 +180,11 @@ Each of them ends at the same place: a client being offered a key other clients 
 
 ## Issuance sizing
 
-**Decision.** When a request needs a token and none in the wallet covers it, the client converts `min(available, max(DEFAULT_ALLOCATION_CREDITS, charge))` from the account: 1,000,000 credits ($1.00) in the usual case, the remaining balance when less is left, and the charge itself when one request needs more than $1.00. `eidola account allocate` converts any amount the user asks for.
+**Decision.** When a request needs a token and none in the wallet covers it, the client converts `min(available, max(DEFAULT_ALLOCATION_CREDITS, charge))` from the account: 1,000,000 credits ($1.00) in the usual case, the remaining balance when less is left, and the charge itself when one request needs more than $1.00. Issuance ahead of need (below) always converts exactly `DEFAULT_ALLOCATION_CREDITS`, and never from a balance smaller than that. `eidola account allocate` converts any amount the user asks for.
 
 **Why.** The amount converted is visible at issuance, and the charge `s` is visible at each spend. A fixed amount makes issuances look alike, and an allocation large enough for many requests means issuances are rare. A small one keeps the value parked in any one anonymous token, and so the value at risk if it lapses (below), small.
 
-**Enforced.** `auto_allocation_amount` and `DEFAULT_ALLOCATION_CREDITS` in app-core.
+**Enforced.** `auto_allocation_amount`, `DEFAULT_ALLOCATION_CREDITS` and `Inner::provision_once` in app-core.
 
 **What would break it.**
 
@@ -205,29 +205,67 @@ Each of them ends at the same place: a client being offered a key other clients 
 
 ## Issuance timing
 
-**Decision.** Automatic provisioning converts credits at the moment a request needs them, immediately before that request is spent.
+**Decision.** The long-lived app keeps a small buffer of credit tokens, issued ahead of need at times unrelated to any request. At intervals drawn uniformly between 10 and 50 minutes (the first one interval after the app starts, never at launch), it looks at the wallet. It issues one token of the standard size (`DEFAULT_ALLOCATION_CREDITS`, $1.00) when what the wallet can spend for at least the next 24 hours is below a quarter of that. It does not watch for requests, so an issuance happens at the first look after the buffer runs low: a random draw, not a reaction to a spend. Just-in-time conversion, immediately before the request it pays for, remains as the fallback when nothing held covers a request.
 
-**Why.** It keeps the client simple, and the account never has more converted than it uses.
+The buffer is kept only within limits that do not depend on the request that will follow:
 
-**The cost.** Anyone who can see when issuances and spends happen (the database, which records the account and time of each issuance and sees each nullifier as it is written, or an observer of the server's traffic) can pair an issuance with the spend that follows it milliseconds later. That links the first spend of each token to the account, and a prompt-cache key on that request links the rest of its conversation lineage ([privacy-guarantees.md §2.7](privacy-guarantees.md#2-unlinkability)). The acceptance window allows tokens to be issued well before they are spent (§2.4); automatic provisioning does not use it. This is a disclosed residual: [gaps.md](gaps.md#issuance-to-first-spend-timing).
+- **Only for a wallet that has spent lately.** No buffer is kept unless a spend began within the last seven days. A token's value dies with its key at most two epochs after issuance, so a token issued for a profile nobody is using would most likely lapse unspent. This reads local history, but only to decide *whether* a buffer is kept; when and how much is issued are public constants either way, and an observer of the account surface learns from it only what the account's issuances already show, that the account is in use.
+- **Never beside an unresolved issuance.** An issuance whose response was lost may already have been paid for, so it counts toward the buffer, and while one for the account is unresolved (its retry hold-off included) nothing new is issued. Otherwise each pass whose recovery failed would convert another allocation.
+- **Never for a backend the reader turned off.** With the Eidola backend disabled or removed, the provisioner sends nothing, not even the retry of a pending issuance.
+- **Only the standard size, from a balance that covers it.** A balance below one standard allocation is left for the just-in-time path, which converts the remainder when a request needs it. Sizing is unchanged (see Issuance sizing).
+- **Only under a key the client accepts.** Background issuance reads the current key through the same check every issuance does: the listing must be on the public issuer calendar, one key per epoch, agreeing with the per-epoch record, or the key is refused before anything is sent.
+- **Only under a key that will carry it.** Nothing is issued under a key whose spend deadline falls within the 24-hour horizon, since the token would not count toward the buffer and could not carry the days ahead; issuance is refused outright under a key past its spend deadline.
+- **Early in a key's life where it can wait.** Within 12 hours of a key's `issue_until`, while what is held still covers several worst-case requests, the provisioner waits for the next key: a token issued at the start of a window is spendable for up to two epochs, one issued at its end for one.
+- **Not spent first.** Selection stays best-fit, and the buffer is replenished while the old token still holds a quarter of an allocation, so the next requests are paid by the old token and the new one's first spend comes when the reader's own use exhausts it.
 
-**What would break it further.** Issuing smaller tokens more often, or issuing per request.
+What is held at once, unresolved issuances included, is at most the threshold plus one allocation, so a buffer costs little more than just-in-time conversion would put at risk of lapsing anyway (`what_is_held_stays_within_the_threshold_plus_one_allocation` holds that while every retry fails).
+
+**Bounded waits.** Every request an issuance makes (the key listing, the balance read, the issuance) has a 30-second deadline, connection to last byte, and a whole background pass is cut off at five minutes; a request given up on leaves its issuance pending, to be asked for again. Anything waiting for the issuance gate waits at most the provisioning queue's 30 seconds and then fails with a typed timeout. That matters because a turn waits for the gate while holding the spend gate: a server that accepted a request and stalled would otherwise stall every paid turn behind it.
+
+**Where it runs.** In the process that holds the profile and answers for it over the control socket: the app (`AppCore::start_credential_provisioner`, started in `stores::open_app_core`, which the windowless service also goes through). A one-shot CLI invocation does not start it. Every issuance in a process, background, just-in-time, explicit and recovered, is serialized by one gate, so two never convert for the same need. There is no setting: turning it off would only restore the linkable default, and `eidola account allocate` still converts any amount by hand.
+
+**Enforced.** `Inner::provision_once` and the `PROVISION_*` constants in app-core; `db::spendable_credits_until`, `db::last_spend_at`. Tests in `chat_path.rs`: `the_provisioner_tops_up_a_wallet_running_low`, `a_background_credential_is_not_spent_by_the_next_request`, `the_provisioner_keeps_no_buffer_for_a_wallet_that_has_not_spent`, `the_provisioner_never_issues_from_a_balance_below_a_standard_allocation`, `the_provisioner_never_issues_under_a_key_about_to_lapse`, `the_provisioner_prefers_a_keys_early_life`, `the_provisioner_issues_only_after_its_interval`, `the_just_in_time_path_remains_the_fallback`, `an_unresolved_issuance_holds_off_a_fresh_one`, `what_is_held_stays_within_the_threshold_plus_one_allocation`, `the_provisioner_leaves_a_disabled_backend_alone`, `a_stalled_issuance_gives_up_at_its_deadline`, `a_turn_waiting_on_a_stalled_issuance_times_out`.
+
+**The cost that remains.** The fallback is the old behaviour: when nothing held covers a request (a fresh install, the first request after a quiet week, a CLI used without the app running, a request larger than what is held), the token is converted and spent at once, and that first spend can still be paired with its issuance ([gaps.md](gaps.md#issuance-to-first-spend-timing)). A background issuance is still timed: it follows, by one random interval, the spend that took the buffer below the threshold. Its timing therefore says that some spend in the preceding hour or so drained a token, which is weaker than a pairing and is shared by every spend in that window.
+
+**What would break it.**
+
+- Issuing in reaction to a request: on a spend, on a turn starting, on the app coming to the foreground.
+- Sizing, timing or the threshold from anything about the requests themselves, or from usage history beyond whether a buffer is kept at all.
+- Issuing smaller tokens more often, or issuing per request.
+- Spending the newest token first.
 
 ## Issuance concurrency
 
-**Decision.** Debiting an account takes a lock on the account's row for the rest of the transaction, so two issuances against the same account run one after the other.
+**Decision.** Debiting an account takes a lock on the account's row for the rest of the transaction, so two issuances against the same account run one after the other. An issuance takes the lock before it looks for a response already stored under its idempotency key, so a retry racing its own original waits for it and then finds what it stored.
 
 **Why.** An issuance checks the balance and then debits it. Without the lock, two concurrent issuances each read the same balance, each pass the check, and both convert it: a client sending issuance requests in parallel could convert its balance once per request. The tokens cannot be traced or recalled once issued, so an overdraft here is pure loss.
 
-**Enforced.** `debit_account` in the gateway's `schema/schema.sql`; `concurrent_issuances_cannot_spend_one_balance_twice` (`credentials.rs`, against Postgres).
+**Enforced.** `debit_account` and `record_credential_issuance` in the gateway's `schema/schema.sql`; `concurrent_issuances_cannot_spend_one_balance_twice` and `an_issuance_racing_its_own_retry_is_debited_once` (`credentials.rs`, against Postgres).
 
 **What would break it.** Any balance check and debit that are not serialized per account, including a second debit path that bypasses `debit_account`.
 
 ## Lost issuance responses
 
-**Decision.** The server signs, then debits, then answers. Issuance is not idempotent: a client whose response was lost cannot ask for it again.
+**Decision.** Issuance is idempotent per account. Before it first sends an issuance request, the client writes down everything a retry needs: its secret issuance state, the request exactly as sent (its proof is randomized, so it could not be rebuilt), 32 random bytes naming the request to the server (the idempotency key), and the account it is for. The server signs, then, in one transaction under the account's row lock, looks for an issuance already stored under that account and key: if there is one it answers with the stored response and debits nothing; otherwise it debits and stores the response beside the debit. A retry with the same key but a different request (another commitment, amount or key) is refused with `409`. The request also names the issuer key the client expects, and the server refuses it (`409`, before any debit) when that is not the current issuing key, so a token is never paid for under a key the client would refuse.
 
-**The cost.** If the response is lost after the debit (a dropped connection, a client crash), the converted amount is gone: the account was charged and the client never obtained the token. It is at most one allocation per occurrence. Disclosed in [gaps.md](gaps.md#a-lost-issuance-response-strands-its-allocation).
+A retry is sent under the key the issuance was made under, read from the local record, never the key that is current when it is sent: the stored response answers it even after the epoch has moved. The client stops asking at that key's spend deadline, inside the hour the gateway keeps the stored response past `accept_until`.
+
+The client asks again for any issuance whose response never arrived (no answer, or a server error) on each provisioner pass and on `wallet credentials recover`, only for the account it was made for, and only once it is ten minutes old, so a retry never races an original attempt the server may still be processing. Any `4xx` to a first attempt means nothing was debited, since it is the only request under its key. A retry is abandoned only on a refusal that proves the issuance dead: a malformed request (`400`, `422`), decided by bytes the first attempt shared, or a refusal the gateway gives after looking for the stored response (`402`, `409`, `428`). An authentication failure (`401`, `403`) is decided before that lookup (a relinked account with a mistyped secret would otherwise abandon an issuance it had paid for), so it stays pending, like `429`, any other `4xx`, a `5xx` or no answer. Stored responses are pruned with their key's nullifiers, an hour past `accept_until`; by then the key has long stopped issuing, so a retry arriving after the prune is refused rather than debited again.
+
+**Why it costs no privacy.** Everything stored is on the account surface the issuance was already on, beside the ledger row that records the account, amount, key and time: the account, the idempotency key, a digest of the request, the key, the amount, the ledger entry, and the signed response. The response is what the issuer computed and could always have kept; issuance is blind, so it does not recognise the token when it is spent. The row carries no timestamp of its own. The idempotency key is random, is never sent with a spend, and is never derived from anything a spend reveals.
+
+**Enforced.** `record_credential_issuance` and `prune_expired_issuances` in the gateway's `schema/schema.sql`; `credentials::issue_credentials`, `issuance_request_digest`; tests `a_retried_issuance_is_answered_once_and_debited_once`, `an_issuance_racing_its_own_retry_is_debited_once`, `stored_issuances_are_pruned_on_their_keys_deadline` (against Postgres). In app-core, `Inner::allocate_with_key`, `settle_issuance`, `recover_pending_issuances_locked` and the `pre_credential` columns; tests `a_lost_issuance_response_is_recovered_without_a_second_debit` (across a restart), `the_provisioner_recovers_a_lost_issuance_instead_of_issuing_again`, `a_refused_issuance_is_not_asked_for_again`, `a_pending_issuance_is_never_retried_for_another_account`.
+
+**What would break it.**
+
+- Debiting outside the transaction that stores the response, or looking for a stored response without the account lock.
+- Answering a stored response for a request whose digest differs.
+- Checking the terms gate or the current key before the stored lookup: a paid-for issuance would then be refused on retry, and abandoned.
+- Generating the idempotency key after the request was sent, or reusing one across issuances.
+- Pruning a stored response while its key could still issue.
+
+**What it does not cover.** An original attempt that the server is still processing more than ten minutes after the client gave up on it could be refused on a retry, abandoned, and then debited. The gateway answers an issuance in well under a second, so this needs a server stalled for minutes mid-request.
 
 ## Spending and the nullifier
 
@@ -349,7 +387,7 @@ The client never asks for recovery of a spend it is still waiting on (`LiveSpend
 
 Postgres runs outside the enclave. It is treated as adversarial: its operator or hosting provider could be compelled, under a gag order, to hand over or watch everything in it.
 
-**Decision.** For the account surface it holds what billing needs: accounts (a UUID and a secret hash), the credit ledger, Stripe references, terms acceptances, and one ledger row per issuance (account, amount, key, time). For the inference surface it holds, per spend, only the issuer key id, the nullifier, and the sealed refund. **Nullifier rows carry no timestamp and no amount, and nothing written on the inference path names an account.** Issuer private keys are stored encrypted.
+**Decision.** For the account surface it holds what billing needs: accounts (a UUID and a secret hash), the credit ledger, Stripe references, terms acceptances, one ledger row per issuance (account, amount, key, time), and beside it the stored response of that issuance (account, idempotency key, request digest, key, amount, ledger entry, and the signed response, with no timestamp of its own), kept until its key can be used for nothing. For the inference surface it holds, per spend, only the issuer key id, the nullifier, and the sealed refund. **Nullifier rows carry no timestamp and no amount, and nothing written on the inference path names an account.** Issuer private keys are stored encrypted.
 
 **Why.** The database is the one place both surfaces meet. A per-spend timestamp or amount beside per-account issuance timestamps and amounts would hand whoever reads it material to pair them.
 
@@ -385,7 +423,7 @@ Postgres runs outside the enclave. It is treated as adversarial: its operator or
 
 ## The local wallet
 
-**Decision.** The client's database holds its tokens, the pre-refund state of each spend in flight, and the link between each spend and the request it paid for (the spend trail). It is the user's own record. One spend at a time runs per wallet (`spend_gate`), so two concurrent requests never pick the same token. Automatic provisioning, chat turns, utility chores and the local inference proxy all spend through the same path and settle through the same refund handling.
+**Decision.** The client's database holds its tokens, the pre-issuance state of each issuance (with the request as sent, its idempotency key and the account it was for, so a lost response can be asked for again), the pre-refund state of each spend in flight, and the link between each spend and the request it paid for (the spend trail). It is the user's own record. One spend at a time runs per wallet (`spend_gate`), so two concurrent requests never pick the same token. Chat turns, utility chores and the local inference proxy all spend through the same path and settle through the same refund handling. Every issuance (ahead of need, just in time, explicit, recovered) goes through one gate, so two never convert for the same need.
 
 **Why.** The device is the one place where the connection between account and requests is meant to exist. Its protection is the device's ([privacy-guarantees.md §8.1](privacy-guarantees.md#8-bounded-claims-what-this-document-does-not-promise)).
 
@@ -404,9 +442,12 @@ A change that touches credentials, issuance, spending, refunds, recovery, pricin
 - Is every issuer key still on the public calendar, one per epoch, with its windows bound into its encryption, and does the client still refuse a key that is off the calendar or is not the one it recorded for the epoch?
 - Does the client still check what the issuer chose (context, amount, key) before storing a token?
 - Is no new value made to outlive the key it was issued under?
+- Is every issuance still either ahead of need at a time no request decides, or the just-in-time fallback, and is its amount still the standard size rule?
+- Does every debit for an issuance still happen in the transaction that stores its response, after the stored lookup, under the account lock?
+- Does no idempotency key, request digest or stored response ever reach the inference surface or a log?
 
 ## Where to read the code
 
-- Gateway: `crates/eidola-server-gateway/src/credentials.rs` (keys, issuance, recovery), `handlers.rs` (spend, settlement, refunds), `auth.rs` (the token's wire form), `db.rs`, and `schema/schema.sql` (`issuer_key`, `credit_ledger`, `nullifier`, `debit_account`, `prune_expired_nullifiers`).
+- Gateway: `crates/eidola-server-gateway/src/credentials.rs` (keys, issuance, recovery), `handlers.rs` (spend, settlement, refunds), `auth.rs` (the token's wire form), `db.rs`, and `schema/schema.sql` (`issuer_key`, `credit_ledger`, `credential_issuance`, `nullifier`, `debit_account`, `record_credential_issuance`, `prune_expired_nullifiers`, `prune_expired_issuances`).
 - Shared: `crates/eidola-common` (`prompt_charge`, the pricing contract; `issuer_calendar`, the public calendar key windows are checked against; `private_token`, the spelling of the `Authorization` value; `refund_key`).
-- Client: `crates/eidola-app-core/src/lib.rs` (`account_allocate`, `check_issued_credential`, `ensure_spendable_credential`, `auto_allocation_amount`, `process_refund`, `recover_spending_credentials`), `db.rs` and `schema/schema.sql` (the `credential_lifecycle` view), `proxy/` and `utility.rs` (the other spenders).
+- Client: `crates/eidola-app-core/src/lib.rs` (`account_allocate`, `allocate_with_key`, `settle_issuance`, `recover_pending_issuances_locked`, `provision_once`, `start_credential_provisioner`, `check_issued_credential`, `ensure_spendable_credential`, `auto_allocation_amount`, `process_refund`, `recover_spending_credentials`), `db.rs` and `schema/schema.sql` (the `credential_lifecycle` view), `proxy/` and `utility.rs` (the other spenders).

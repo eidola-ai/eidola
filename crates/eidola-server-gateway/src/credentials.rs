@@ -1138,6 +1138,13 @@ pub fn spawn_key_rotation_task(
                 Ok(n) => info!("pruned {n} nullifier(s) of retired issuer keys"),
                 Err(e) => warn!("nullifier pruning failed: {}", e),
             }
+            // A stored issuance response is useful only while a credential
+            // built from it could be spent, so it goes on the same deadline.
+            match db::prune_expired_issuances(&pool, RETENTION_PAST_ACCEPT).await {
+                Ok(0) => {}
+                Ok(n) => info!("pruned {n} stored issuance(s) of retired issuer keys"),
+                Err(e) => warn!("issuance pruning failed: {}", e),
+            }
         }
     });
 }
@@ -1176,6 +1183,16 @@ pub struct IssueCredentialsRequest {
     pub issuance_request: String,
     /// Number of credits to issue.
     pub credits: i64,
+    /// 64 lowercase hex digits (32 random bytes) the client chose for this
+    /// issuance and kept before sending it. A retry under the same key and the
+    /// same request receives the response the first attempt was given, with no
+    /// second debit; the same key with any other request is refused (`409`).
+    pub idempotency_key: String,
+    /// The issuer key the client expects to be signed under: the current
+    /// issuing key it read from `GET /v1/keys`. Refused (`409`) before any
+    /// debit when it is not the current key, so a credential is never paid for
+    /// under a key the client would not accept.
+    pub issuer_key_id: String,
 }
 
 /// Response for `POST /v1/account/credentials`.
@@ -1189,6 +1206,60 @@ pub struct IssueCredentialsResponse {
     pub credits: i64,
     /// The ledger entry ID for this issuance.
     pub ledger_entry_id: String,
+}
+
+/// Length in bytes of an issuance idempotency key.
+pub const IDEMPOTENCY_KEY_BYTES: usize = 32;
+
+/// An idempotency key from its wire form: exactly 64 lowercase hex digits.
+fn decode_idempotency_key(text: &str) -> Option<[u8; IDEMPOTENCY_KEY_BYTES]> {
+    if text.len() != IDEMPOTENCY_KEY_BYTES * 2
+        || !text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    let mut out = [0u8; IDEMPOTENCY_KEY_BYTES];
+    hex::decode_to_slice(text, &mut out).ok()?;
+    Some(out)
+}
+
+/// The digest an idempotent issuance is matched on: SHA-256 over a version
+/// tag, the CBOR issuance request (length-prefixed), the credit amount and the
+/// issuer key the client named. A retry under one idempotency key must agree
+/// on all of them to be answered from the stored response.
+pub fn issuance_request_digest(
+    issuance_cbor: &[u8],
+    credits: i64,
+    issuer_key_id: &str,
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"eidola-issuance-request-v1");
+    h.update((issuance_cbor.len() as u64).to_be_bytes());
+    h.update(issuance_cbor);
+    h.update(credits.to_be_bytes());
+    h.update(issuer_key_id.as_bytes());
+    h.finalize().into()
+}
+
+/// The response to return for an issuance already stored under the request's
+/// idempotency key, or the refusal when the stored one answered a different
+/// request.
+fn answer_stored(
+    stored: db::StoredIssuance,
+    digest: &[u8; 32],
+) -> Result<Json<IssueCredentialsResponse>, ServerError> {
+    if stored.request_digest.as_slice() != digest.as_slice() {
+        return Err(ServerError::Conflict {
+            message: "this idempotency key was already used for a different issuance request"
+                .to_string(),
+        });
+    }
+    Ok(Json(IssueCredentialsResponse {
+        issuance_response: URL_SAFE_NO_PAD.encode(&stored.issuance_response),
+        issuer_key_id: stored.issuer_key_id,
+        credits: stored.credits,
+        ledger_entry_id: stored.ledger_entry_id.to_string(),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1247,6 +1318,12 @@ pub async fn list_keys(
 }
 
 /// `POST /v1/account/credentials` — issue anonymous credentials (authenticated).
+///
+/// Idempotent per `(account, idempotency_key)`: the first request debits and
+/// stores the signed response in one transaction, and a retry with the same
+/// key and request is answered from what was stored, so a response lost on the
+/// way back costs nothing. A stored issuance is answered before the terms gate
+/// and the current-key check, because it was already paid for.
 #[utoipa::path(
     post,
     path = "/v1/account/credentials",
@@ -1254,10 +1331,11 @@ pub async fn list_keys(
     request_body = IssueCredentialsRequest,
     security(("basic" = [])),
     responses(
-        (status = 200, description = "Credential issued", body = IssueCredentialsResponse),
+        (status = 200, description = "Credential issued, or the stored response to an earlier attempt under the same idempotency key", body = IssueCredentialsResponse),
         (status = 400, description = "Invalid request", body = crate::types::ErrorResponse),
         (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
         (status = 402, description = "Insufficient credit balance", body = crate::types::ErrorResponse),
+        (status = 409, description = "The idempotency key was used for a different request, or the named issuer key is not the current one; nothing was debited", body = crate::types::ErrorResponse),
         (status = 428, description = "Terms acceptance required", body = crate::types::ErrorResponse),
         (status = 503, description = "Credential issuance not configured", body = crate::types::ErrorResponse),
     )
@@ -1275,9 +1353,16 @@ pub async fn issue_credentials(
         });
     }
 
-    // Conversion is a gated operation: the account must have accepted the
-    // currently required terms/privacy versions (no-op when unconfigured).
-    crate::account::ensure_terms_accepted(&state, account_id).await?;
+    // Like the refund key, the idempotency key's decode error says only what
+    // the wire form is, never anything about the value presented.
+    let idempotency_key = decode_idempotency_key(&request.idempotency_key).ok_or_else(|| {
+        ServerError::BadRequest {
+            message: format!(
+                "idempotency_key must be {} lowercase hex digits",
+                IDEMPOTENCY_KEY_BYTES * 2
+            ),
+        }
+    })?;
 
     // Both decode errors are discarded, not interpolated: their Display
     // quotes the offending byte, its offset, and the input length — all
@@ -1299,9 +1384,34 @@ pub async fn issue_credentials(
             message: format!("invalid credit amount: {}", e),
         })?;
 
+    let digest = issuance_request_digest(&issuance_cbor, request.credits, &request.issuer_key_id);
+
+    // A retry of an issuance already paid for is answered from what was
+    // stored, whatever has changed since: the terms in force, the current key.
+    if let Some(stored) =
+        db::find_credential_issuance(&state.db_pool, account_id, &idempotency_key).await?
+    {
+        return answer_stored(stored, &digest);
+    }
+
+    // Conversion is a gated operation: the account must have accepted the
+    // currently required terms/privacy versions (no-op when unconfigured).
+    crate::account::ensure_terms_accepted(&state, account_id).await?;
+
     let key_hash = ensure_keys(&state.credential_key_cache, master_key, &state.db_pool).await?;
 
     let key_id = hex::encode(key_hash);
+
+    // The client verifies the response against the key it named and refuses
+    // any other, so signing under another key would debit for a credential it
+    // will never store. Refused before any debit; a key that has stopped
+    // issuing can never again be debited for, which is also what makes a
+    // retry arriving after its stored response was pruned safe.
+    if request.issuer_key_id != key_id {
+        return Err(ServerError::Conflict {
+            message: "the named issuer key is not the current issuing key".to_string(),
+        });
+    }
 
     let issuance_response = {
         let cache = state.credential_key_cache.read().await;
@@ -1328,25 +1438,36 @@ pub async fn issue_credentials(
         .to_cbor()
         .map_err(|e| ServerError::Internal(format!("failed to encode issuance response: {}", e)))?;
 
-    let ledger_entry_id =
-        match db::insert_credential_issuance(&state.db_pool, account_id, request.credits, &key_id)
-            .await?
-        {
-            Some(id) => id,
-            None => {
-                let available = match db::get_available_balance(&state.db_pool, account_id).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("failed to fetch balance for 402 response: {e}");
-                        0
-                    }
-                };
-                return Err(ServerError::PaymentRequired {
-                    message: "insufficient balance".to_string(),
-                    available,
-                });
-            }
-        };
+    // The decision that debits, under the account lock: an attempt under the
+    // same key that committed while this one was signing is found here, and
+    // its response returned instead of a second debit.
+    let ledger_entry_id = match db::record_credential_issuance(
+        &state.db_pool,
+        account_id,
+        &idempotency_key,
+        &digest,
+        &key_id,
+        request.credits,
+        &response_cbor,
+    )
+    .await?
+    {
+        db::IssuanceRecord::Issued { ledger_entry_id } => ledger_entry_id,
+        db::IssuanceRecord::Stored(stored) => return answer_stored(stored, &digest),
+        db::IssuanceRecord::Insufficient => {
+            let available = match db::get_available_balance(&state.db_pool, account_id).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("failed to fetch balance for 402 response: {e}");
+                    0
+                }
+            };
+            return Err(ServerError::PaymentRequired {
+                message: "insufficient balance".to_string(),
+                available,
+            });
+        }
+    };
 
     // No ledger id and no amount: the ledger row already records both
     // durably, and an exported log line naming them would hand the
@@ -3006,7 +3127,16 @@ mod tests {
             let pool = pool.clone();
             let key_id = key.id.clone();
             tokio::spawn(async move {
-                db::insert_credential_issuance(&pool, account, 1000, &key_id).await
+                db::record_credential_issuance(
+                    &pool,
+                    account,
+                    &[3u8; 32],
+                    &[0u8; 32],
+                    &key_id,
+                    1000,
+                    b"response",
+                )
+                .await
             })
         };
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -3017,7 +3147,7 @@ mod tests {
         tx.commit().await.unwrap();
         let second = second.await.unwrap().unwrap();
         assert!(
-            second.is_none(),
+            second == db::IssuanceRecord::Insufficient,
             "the second issuance was granted out of a balance already spent"
         );
         assert_eq!(db::get_available_balance(&pool, account).await.unwrap(), 0);
@@ -3109,5 +3239,354 @@ mod tests {
                 .unwrap(),
             first
         );
+    }
+
+    #[test]
+    fn an_idempotency_key_has_exactly_one_wire_form() {
+        let good = "ab".repeat(32);
+        assert_eq!(decode_idempotency_key(&good), Some([0xab; 32]));
+        for bad in [
+            "AB".repeat(32),
+            "ab".repeat(31),
+            "ab".repeat(33),
+            format!("{}zz", "ab".repeat(31)),
+            String::new(),
+        ] {
+            assert_eq!(decode_idempotency_key(&bad), None, "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn the_issuance_digest_covers_every_part_of_the_request() {
+        let base = issuance_request_digest(b"request", 1000, "key");
+        assert_eq!(base, issuance_request_digest(b"request", 1000, "key"));
+        assert_ne!(base, issuance_request_digest(b"requesT", 1000, "key"));
+        assert_ne!(base, issuance_request_digest(b"request", 1001, "key"));
+        assert_ne!(base, issuance_request_digest(b"request", 1000, "kez"));
+        // The request is length-prefixed, so bytes cannot move between it and
+        // the key id without changing the digest.
+        assert_ne!(
+            issuance_request_digest(b"ab", 1, "c"),
+            issuance_request_digest(b"a", 1, "bc")
+        );
+    }
+
+    /// Issuance end to end against Postgres: a retry under the same
+    /// idempotency key gets the first attempt's response and is not debited
+    /// again, a retry naming the key with a different request is refused, a
+    /// request naming a key that is not current is refused before any debit,
+    /// and the stored response still completes the client's credential.
+    /// `DATABASE_URL` and `CREDENTIAL_MASTER_KEY` as `just test-integration`
+    /// sets them; on a large stack for the same reason as the recovery test.
+    #[test]
+    #[ignore]
+    fn a_retried_issuance_is_answered_once_and_debited_once() {
+        std::thread::Builder::new()
+            .stack_size(16 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(retried_issuance())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn retried_issuance() {
+        use crate::backend::Catalog;
+
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let pool = db::create_pool(
+            &std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
+            None,
+            None,
+        )
+        .unwrap();
+        let master_key: [u8; 32] =
+            hex::decode(std::env::var("CREDENTIAL_MASTER_KEY").unwrap_or_else(|_| "00".repeat(32)))
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let cache: KeyCache = Arc::new(RwLock::new(HashMap::new()));
+        let key_hash = ensure_keys(&cache, &master_key, &pool).await.unwrap();
+        let key_id = hex::encode(key_hash);
+        let state = AppState::new(
+            Catalog::new(None),
+            None,
+            pool.clone(),
+            None,
+            None,
+            master_key,
+            cache.clone(),
+        );
+
+        let account = uuid::Uuid::new_v4();
+        db::insert_account(&pool, account, "unused").await.unwrap();
+        let event = format!("evt_test_{}", account.simple());
+        assert!(
+            db::insert_credit_ledger(&pool, account, 5_000, "purchase", &event, None, None)
+                .await
+                .unwrap()
+        );
+
+        let (params, public_key) = {
+            let cache = cache.read().await;
+            let key = cache.get(&key_hash).unwrap();
+            (key.params.clone(), key.secret_key.public().clone())
+        };
+        let pre = PreIssuance::random(OsRng);
+        let request = pre.request(&params, OsRng);
+        let request_b64 = URL_SAFE_NO_PAD.encode(request.to_cbor().unwrap());
+        let idem = "5a".repeat(32);
+        let body =
+            |credits: i64, issuance_request: &str, idem: &str, key: &str| IssueCredentialsRequest {
+                issuance_request: issuance_request.to_string(),
+                credits,
+                idempotency_key: idem.to_string(),
+                issuer_key_id: key.to_string(),
+            };
+        let issue = |req: IssueCredentialsRequest| {
+            let state = state.clone();
+            async move { issue_credentials(BasicAuth(account), State(state), Json(req)).await }
+        };
+
+        let first = issue(body(1_000, &request_b64, &idem, &key_id))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            db::get_available_balance(&pool, account).await.unwrap(),
+            4_000
+        );
+
+        // The same request again: the same response, and no second debit.
+        let again = issue(body(1_000, &request_b64, &idem, &key_id))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(again.issuance_response, first.issuance_response);
+        assert_eq!(again.ledger_entry_id, first.ledger_entry_id);
+        assert_eq!(again.issuer_key_id, key_id);
+        assert_eq!(again.credits, 1_000);
+        assert_eq!(
+            db::get_available_balance(&pool, account).await.unwrap(),
+            4_000
+        );
+
+        // The stored response completes the client's credential.
+        let response = anonymous_credit_tokens::IssuanceResponse::from_cbor(
+            &URL_SAFE_NO_PAD.decode(&again.issuance_response).unwrap(),
+        )
+        .unwrap();
+        pre.to_credit_token::<128>(&params, &public_key, &request, &response)
+            .expect("the stored response completes the credential");
+
+        // The same key with a different request is refused, debiting nothing.
+        let other = URL_SAFE_NO_PAD.encode(
+            PreIssuance::random(OsRng)
+                .request(&params, OsRng)
+                .to_cbor()
+                .unwrap(),
+        );
+        for mismatched in [
+            body(2_000, &request_b64, &idem, &key_id),
+            body(1_000, &other, &idem, &key_id),
+        ] {
+            match issue(mismatched).await {
+                Err(ServerError::Conflict { .. }) => {}
+                Err(e) => panic!("a mismatched retry was refused with {e:?}"),
+                Ok(_) => panic!("a mismatched retry was answered"),
+            }
+        }
+        assert_eq!(
+            db::get_available_balance(&pool, account).await.unwrap(),
+            4_000
+        );
+
+        // A fresh key naming an issuer key that is not current is refused
+        // before the debit.
+        match issue(body(1_000, &other, &"6b".repeat(32), &"00".repeat(32))).await {
+            Err(ServerError::Conflict { .. }) => {}
+            Err(e) => panic!("a stale key was refused with {e:?}"),
+            Ok(_) => panic!("an issuance under a key that is not current was answered"),
+        }
+        assert_eq!(
+            db::get_available_balance(&pool, account).await.unwrap(),
+            4_000
+        );
+
+        // A fresh idempotency key is a fresh issuance.
+        let fresh = issue(body(1_000, &other, &"7c".repeat(32), &key_id))
+            .await
+            .unwrap()
+            .0;
+        assert_ne!(fresh.ledger_entry_id, first.ledger_entry_id);
+        assert_eq!(
+            db::get_available_balance(&pool, account).await.unwrap(),
+            3_000
+        );
+    }
+
+    /// A retry racing its own original: two attempts under one idempotency
+    /// key, released together, debit once and both answer with the one stored
+    /// response. Needs `DATABASE_URL` with `schema.sql` applied.
+    #[tokio::test]
+    #[ignore]
+    async fn an_issuance_racing_its_own_retry_is_debited_once() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let pool = db::create_pool(&url, None, None).unwrap();
+        let master_key = [0u8; 32];
+        // A far-future epoch of its own, clear of the real current key.
+        let key = generate_key(
+            &master_key,
+            10_000 + u64::from(OsRng.next_u32() % 1_000_000),
+        )
+        .unwrap();
+        insert_key_row(&pool, &key).await;
+        let account = uuid::Uuid::new_v4();
+        db::insert_account(&pool, account, "unused").await.unwrap();
+        let event = format!("evt_test_{}", account.simple());
+        assert!(
+            db::insert_credit_ledger(&pool, account, 5_000, "purchase", &event, None, None)
+                .await
+                .unwrap()
+        );
+
+        // Hold the account lock so both attempts queue behind it.
+        let mut holder = pool.get().await.unwrap();
+        let tx = holder.transaction().await.unwrap();
+        tx.execute(
+            "SELECT 1 FROM account WHERE id = $1 FOR UPDATE",
+            &[&account],
+        )
+        .await
+        .unwrap();
+        let attempt = |response: &'static [u8]| {
+            let pool = pool.clone();
+            let key_id = key.id.clone();
+            tokio::spawn(async move {
+                db::record_credential_issuance(
+                    &pool, account, &[9u8; 32], &[1u8; 32], &key_id, 1_000, response,
+                )
+                .await
+            })
+        };
+        let a = attempt(b"first");
+        let b = attempt(b"second");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tx.commit().await.unwrap();
+        let outcomes = [a.await.unwrap().unwrap(), b.await.unwrap().unwrap()];
+
+        let issued: Vec<_> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                db::IssuanceRecord::Issued { ledger_entry_id } => Some(*ledger_entry_id),
+                _ => None,
+            })
+            .collect();
+        let stored: Vec<_> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                db::IssuanceRecord::Stored(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(issued.len(), 1, "exactly one attempt debits: {outcomes:?}");
+        assert_eq!(
+            stored.len(),
+            1,
+            "the other finds what it stored: {outcomes:?}"
+        );
+        assert_eq!(stored[0].ledger_entry_id, issued[0]);
+        assert_eq!(
+            db::get_available_balance(&pool, account).await.unwrap(),
+            4_000
+        );
+    }
+
+    /// Stored responses go with their key's nullifiers, and not before. Needs
+    /// `DATABASE_URL` with `schema.sql` applied.
+    #[tokio::test]
+    #[ignore]
+    async fn stored_issuances_are_pruned_on_their_keys_deadline() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let pool = db::create_pool(&url, None, None).unwrap();
+        let master_key = [0u8; 32];
+        // One key of an epoch in the 1970s, long retired, and one of an epoch far
+        // in the future, still accepting; each its own, clear of the real keys.
+        let retired = generate_key(&master_key, 1 + u64::from(OsRng.next_u32() % 1_000)).unwrap();
+        let live = generate_key(
+            &master_key,
+            10_000 + u64::from(OsRng.next_u32() % 1_000_000),
+        )
+        .unwrap();
+        insert_key_row(&pool, &retired).await;
+        insert_key_row(&pool, &live).await;
+        let account = uuid::Uuid::new_v4();
+        db::insert_account(&pool, account, "unused").await.unwrap();
+        let event = format!("evt_test_{}", account.simple());
+        assert!(
+            db::insert_credit_ledger(&pool, account, 5_000, "purchase", &event, None, None)
+                .await
+                .unwrap()
+        );
+        for (idem, key) in [([1u8; 32], &retired), ([2u8; 32], &live)] {
+            let outcome = db::record_credential_issuance(
+                &pool,
+                account,
+                &idem,
+                &[0u8; 32],
+                &key.id,
+                100,
+                b"response",
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, db::IssuanceRecord::Issued { .. }));
+        }
+        assert!(
+            db::prune_expired_issuances(&pool, RETENTION_PAST_ACCEPT)
+                .await
+                .unwrap()
+                >= 1
+        );
+        assert!(
+            db::find_credential_issuance(&pool, account, &[1u8; 32])
+                .await
+                .unwrap()
+                .is_none(),
+            "a retired key's stored issuance survived pruning"
+        );
+        assert!(
+            db::find_credential_issuance(&pool, account, &[2u8; 32])
+                .await
+                .unwrap()
+                .is_some(),
+            "a live key's stored issuance was pruned"
+        );
+    }
+
+    async fn insert_key_row(pool: &deadpool_postgres::Pool, key: &db::IssuerKeyRow) {
+        pool.get()
+            .await
+            .unwrap()
+            .execute(
+                "INSERT INTO issuer_key (id, private_key_enc, public_key, domain_separator, \
+                 issue_from, issue_until, accept_until) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                &[
+                    &key.id,
+                    &key.private_key_enc,
+                    &key.public_key,
+                    &key.domain_separator,
+                    &key.issue_from,
+                    &key.issue_until,
+                    &key.accept_until,
+                ],
+            )
+            .await
+            .unwrap();
     }
 }

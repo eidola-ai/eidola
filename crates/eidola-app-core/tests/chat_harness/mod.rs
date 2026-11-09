@@ -655,6 +655,9 @@ pub struct MockConfig {
     /// Stop listing the previous epoch's key: a listing that leaves out the
     /// one entry a key reused from it would otherwise collide with.
     pub omit_previous_key: Arc<std::sync::atomic::AtomicBool>,
+    /// How `POST /v1/account/credentials` misbehaves, switchable mid-test
+    /// (see [`IssuanceKnobs`]). The default answers every request.
+    pub issuance: IssuanceKnobs,
 }
 
 /// See [`MockConfig::key_swap`].
@@ -688,6 +691,68 @@ impl KeySwap {
             self.second()
         } else {
             first
+        }
+    }
+}
+
+/// Switches on the mock's issuance endpoint, shared with the running server so
+/// a test can flip one between two requests.
+#[derive(Clone, Default)]
+pub struct IssuanceKnobs(Arc<IssuanceKnobState>);
+
+#[derive(Default)]
+struct IssuanceKnobState {
+    /// How many upcoming issuances are recorded (debited and stored, as the
+    /// real server does) and then answered with nothing: the connection is
+    /// closed before a response is written — a lost response.
+    lose: std::sync::atomic::AtomicU32,
+    /// When non-zero, every issuance not already stored is refused with this
+    /// status before anything is debited.
+    refuse_with: std::sync::atomic::AtomicU32,
+    /// Answer every retry — a request whose idempotency key is already
+    /// stored — with `503`, while fresh issuances still go through: a lost
+    /// response whose recovery keeps failing.
+    fail_retries: std::sync::atomic::AtomicBool,
+    /// Accept every issuance request and never answer it.
+    stall: std::sync::atomic::AtomicBool,
+    /// Refuse every issuance request with `401` before anything else, as the
+    /// gateway's `BasicAuth` does for a wrong secret.
+    unauthorized: std::sync::atomic::AtomicBool,
+}
+
+impl IssuanceKnobs {
+    /// Lose the responses of the next `n` issuances (see [`IssuanceKnobState`]).
+    pub fn lose_next(&self, n: u32) {
+        self.0.lose.store(n, Ordering::SeqCst);
+    }
+    /// Refuse every fresh issuance with `status`; `None` answers again.
+    pub fn refuse_with(&self, status: Option<u16>) {
+        self.0
+            .refuse_with
+            .store(status.map(u32::from).unwrap_or(0), Ordering::SeqCst);
+    }
+    /// Fail every retry (see [`IssuanceKnobState`]); `false` answers again.
+    pub fn fail_retries(&self, on: bool) {
+        self.0.fail_retries.store(on, Ordering::SeqCst);
+    }
+    /// Refuse every issuance as unauthenticated (see [`IssuanceKnobState`]).
+    pub fn unauthorized(&self, on: bool) {
+        self.0.unauthorized.store(on, Ordering::SeqCst);
+    }
+    /// Stall every issuance request (see [`IssuanceKnobState`]).
+    pub fn stall(&self, on: bool) {
+        self.0.stall.store(on, Ordering::SeqCst);
+    }
+    fn take_loss(&self) -> bool {
+        self.0
+            .lose
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    }
+    fn refusal(&self) -> Option<u16> {
+        match self.0.refuse_with.load(Ordering::SeqCst) {
+            0 => None,
+            status => Some(status as u16),
         }
     }
 }
@@ -760,6 +825,7 @@ impl Default for MockConfig {
             issuance_context: None,
             issuance_extra_credits: 0,
             key_window: None,
+            issuance: IssuanceKnobs::default(),
             issuer_calendar: None,
             key_swap: KeySwap::default(),
             omit_previous_key: Arc::default(),
@@ -848,6 +914,8 @@ pub struct MockServer {
     /// was refused before it did any work read this rather than `chat_hits`,
     /// which only notices once the turn is fully prepared.
     models_hits: Arc<AtomicU64>,
+    /// The issuance switches the server was started with.
+    issuance: IssuanceKnobs,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -862,6 +930,23 @@ impl MockServer {
     /// spend without one is refused, as the real server refuses it).
     pub fn keyed_spends(&self) -> usize {
         self.issuer.keyed_spends()
+    }
+    /// The issuance endpoint's switches (see [`MockConfig::issuance`]).
+    pub fn issuance_knobs(&self) -> IssuanceKnobs {
+        self.issuance.clone()
+    }
+    /// Issuance requests received, retries included.
+    pub fn issuance_requests(&self) -> u64 {
+        self.issuer.issuance_requests.load(Ordering::SeqCst)
+    }
+    /// Issuances that debited the account: a retry answered from what was
+    /// stored is not one.
+    pub fn issuance_debits(&self) -> u64 {
+        self.issuer.issuance_debits.load(Ordering::SeqCst)
+    }
+    /// The credits converted by every debiting issuance.
+    pub fn issuance_debited_credits(&self) -> i64 {
+        self.issuer.issuance_debited_credits.load(Ordering::SeqCst) as i64
     }
     /// Catalogue fetches (see `models_hits`).
     pub fn models_hits(&self) -> u64 {
@@ -1194,6 +1279,15 @@ struct Issuer {
     /// key the real server seals that spend's stored refund under, and so
     /// the only one its recovery endpoint opens it for.
     spend_keys: std::sync::Mutex<std::collections::HashMap<Vec<u8>, [u8; 32]>>,
+    /// Idempotent issuance, as the real server keeps it: idempotency key →
+    /// (the request it answered, the response body it was given).
+    issuances: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+    /// Every `POST /v1/account/credentials` received.
+    issuance_requests: AtomicU64,
+    /// Every issuance that debited (a fresh one, not a stored answer).
+    issuance_debits: AtomicU64,
+    /// The credits all those debits converted.
+    issuance_debited_credits: AtomicU64,
     /// A public key listed as the previous epoch's, for an epoch the mock
     /// never listed a current key for: stable for the mock's life.
     decoy_public_key: Vec<u8>,
@@ -1223,6 +1317,10 @@ impl Issuer {
             key_id_hex,
             request_context_scalar,
             spend_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
+            issuances: std::sync::Mutex::new(std::collections::HashMap::new()),
+            issuance_requests: AtomicU64::new(0),
+            issuance_debits: AtomicU64::new(0),
+            issuance_debited_credits: AtomicU64::new(0),
             decoy_public_key: PrivateKey::random(OsRng)
                 .public()
                 .to_cbor()
@@ -1315,6 +1413,7 @@ pub async fn start(config: MockConfig) -> MockServer {
         tokio::sync::mpsc::unbounded_channel::<tokio::sync::oneshot::Sender<()>>();
     config.close_switch.install(close_tx);
     let issuer = Arc::new(Issuer::new());
+    let issuance = config.issuance.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
     let base_url = format!("http://{addr}");
@@ -1392,6 +1491,7 @@ pub async fn start(config: MockConfig) -> MockServer {
         refund_hits,
         issuer,
         models_hits,
+        issuance,
         _task: task,
     }
 }
@@ -1514,34 +1614,9 @@ async fn handle_conn(
             write_json(&mut stream, 200, &body.to_string()).await?;
         }
         ("POST", "/v1/account/credentials") => {
-            let parsed: serde_json::Value =
-                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
-            let ir = parsed.get("issuance_request").and_then(|v| v.as_str());
-            let credits = parsed.get("credits").and_then(|v| v.as_i64()).unwrap_or(0);
-            let issuing = config.key_swap.active(&issuer);
-            match ir.and_then(|ir| {
-                issuing.issue(
-                    ir,
-                    credits + config.issuance_extra_credits,
-                    config.issuance_context,
-                )
-            }) {
-                Some(issuance_response) => {
-                    let body = serde_json::json!({
-                        "issuance_response": issuance_response,
-                        "issuer_key_id": config
-                            .issued_key_id
-                            .clone()
-                            .unwrap_or_else(|| issuing.key_id_hex.clone()),
-                        "credits": credits,
-                        "ledger_entry_id": uuid_like(),
-                    });
-                    write_json(&mut stream, 200, &body.to_string()).await?;
-                }
-                None => {
-                    write_json(&mut stream, 400, &error_body("issuance failed")).await?;
-                }
-            }
+            // Its own boxed future: every route's locals share this one, which
+            // runs on the core's worker threads beside the turn it answers.
+            Box::pin(handle_issuance(&mut stream, &issuer, &config, &req.body)).await?;
         }
         ("POST", "/v1/credentials/refund") => {
             let attempt = refund_hits.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1666,6 +1741,94 @@ async fn handle_conn(
         }
         _ => {
             write_json(&mut stream, 404, &error_body("not found")).await?;
+        }
+    }
+    Ok(())
+}
+
+/// `POST /v1/account/credentials`: idempotent issuance, as the real server
+/// answers it (see [`IssuanceKnobs`] for the misbehaviours a test can ask for).
+async fn handle_issuance(
+    stream: &mut TcpStream,
+    issuer: &Issuer,
+    config: &MockConfig,
+    body: &[u8],
+) -> std::io::Result<()> {
+    issuer.issuance_requests.fetch_add(1, Ordering::SeqCst);
+    if config.issuance.0.unauthorized.load(Ordering::SeqCst) {
+        return write_json(stream, 401, &error_body("invalid credentials")).await;
+    }
+    if config.issuance.0.stall.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        return Ok(());
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+    let ir = parsed.get("issuance_request").and_then(|v| v.as_str());
+    let credits = parsed.get("credits").and_then(|v| v.as_i64()).unwrap_or(0);
+    let named_key = parsed.get("issuer_key_id").and_then(|v| v.as_str());
+    let Some(idem) = parsed
+        .get("idempotency_key")
+        .and_then(|v| v.as_str())
+        .filter(|k| k.len() == 64)
+        .map(str::to_string)
+    else {
+        return write_json(stream, 400, &error_body("idempotency_key required")).await;
+    };
+    // What a retry must agree on to be answered from the store.
+    let request_digest = format!("{}|{credits}|{}", ir.unwrap_or(""), named_key.unwrap_or(""));
+    let stored = issuer.issuances.lock().unwrap().get(&idem).cloned();
+    if stored.is_some() && config.issuance.0.fail_retries.load(Ordering::SeqCst) {
+        return write_json(stream, 503, &error_body("issuance unavailable")).await;
+    }
+    if let Some((digest, body)) = stored {
+        if digest != request_digest {
+            return write_json(stream, 409, &error_body("idempotency key reused")).await;
+        }
+        return write_json(stream, 200, &body).await;
+    }
+    if let Some(status) = config.issuance.refusal() {
+        return write_json(stream, status, &error_body("issuance refused")).await;
+    }
+    // The key listed as current — the second one once a test swapped it.
+    let issuing = config.key_swap.active(issuer);
+    if named_key != Some(issuing.key_id_hex.as_str()) {
+        return write_json(stream, 409, &error_body("issuer key is not current")).await;
+    }
+    match ir.and_then(|ir| {
+        issuing.issue(
+            ir,
+            credits + config.issuance_extra_credits,
+            config.issuance_context,
+        )
+    }) {
+        Some(issuance_response) => {
+            let body = serde_json::json!({
+                "issuance_response": issuance_response,
+                "issuer_key_id": config
+                    .issued_key_id
+                    .clone()
+                    .unwrap_or_else(|| issuing.key_id_hex.clone()),
+                "credits": credits,
+                "ledger_entry_id": uuid_like(),
+            })
+            .to_string();
+            issuer.issuance_debits.fetch_add(1, Ordering::SeqCst);
+            issuer
+                .issuance_debited_credits
+                .fetch_add(credits.max(0) as u64, Ordering::SeqCst);
+            issuer
+                .issuances
+                .lock()
+                .unwrap()
+                .insert(idem, (request_digest, body.clone()));
+            if config.issuance.take_loss() {
+                // Debited and stored; the client hears nothing.
+                return Ok(());
+            }
+            write_json(stream, 200, &body).await?;
+        }
+        None => {
+            write_json(stream, 400, &error_body("issuance failed")).await?;
         }
     }
     Ok(())
@@ -3317,7 +3480,10 @@ async fn write_json(stream: &mut TcpStream, status: u16, body: &str) -> std::io:
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        402 => "Payment Required",
         404 => "Not Found",
+        409 => "Conflict",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Status",
