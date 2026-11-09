@@ -17435,6 +17435,11 @@ async fn a_refused_issuer_key_says_so_in_the_readers_language(cx: &mut gpui::Tes
             "Eidola’s server offered a different payment key this week",
             "Le serveur d’Eidola a proposé cette semaine une clé de paiement différente",
         ),
+        (
+            IssuerKeyRefusal::OneKeyForSeveralEpochs { epoch: 2967 },
+            "Eidola’s server offered the same payment key for two different weeks",
+            "Le serveur d’Eidola a proposé la même clé de paiement pour deux semaines",
+        ),
     ] {
         cx.update(|cx| eidola_gui::i18n::apply("en", cx));
         let stores = stub_stores_with_agents(cx, "s");

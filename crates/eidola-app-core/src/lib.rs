@@ -18468,7 +18468,8 @@ mod tests {
     /// parse that rounds would let an off-calendar instant through.
     #[test]
     fn a_window_that_only_rounds_onto_the_calendar_is_refused() {
-        let spellings: [(&str, fn(&mut IssuerKeyResponse)); 7] = [
+        type Respell = fn(&mut IssuerKeyResponse);
+        let spellings: [(&str, Respell); 7] = [
             ("a fraction of a second", |k| {
                 k.issue_from = k.issue_from.replace('Z', ".500Z")
             }),
