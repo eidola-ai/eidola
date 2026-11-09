@@ -514,10 +514,18 @@ async fn chat_completions_phases(
     // stored beside it in the same statement. After this succeeds, the
     // credential is consumed and we MUST issue a refund on every subsequent
     // code path; the final one overwrites the provisional one.
+    //
+    // The request's deadline and the instant sealed into the provisional
+    // refund are read together, before the database is: recovery declares
+    // the provisional refund final `T_SETTLE` after that instant, so the
+    // request's `MAX_REQUEST_DURATION` must count from it too, with however
+    // long recording takes spent out of the request's own budget.
+    let recorded_at = SystemTime::now();
+    let deadline = tokio::time::Instant::now() + eidola_common::MAX_REQUEST_DURATION;
     let recorded = credentials::record_spend(
         state,
         act,
-        RefundStage::provisional_at(SystemTime::now()),
+        RefundStage::provisional_at(recorded_at),
         &provisional,
     )
     .await?;
@@ -530,7 +538,6 @@ async fn chat_completions_phases(
     // --- POINT OF NO RETURN: nullifier is recorded ---
     // From here on, we MUST issue a refund on any error, and the request ends
     // by `deadline` whatever the engine does.
-    let deadline = tokio::time::Instant::now() + eidola_common::MAX_REQUEST_DURATION;
     let act = &crate::auth::ActSpend {
         provisional: Some(std::sync::Arc::new(recorded)),
         ..act.clone()
