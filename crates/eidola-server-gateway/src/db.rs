@@ -619,15 +619,17 @@ pub struct IssuerKeyRow {
 
 /// Insert a new issuer key within a serializable transaction to prevent races.
 ///
-/// The `check` callback receives the latest key (if any) inside the transaction
-/// and returns `Ok(Some(key))` to insert or `Ok(None)` to skip. This ensures
-/// the "is a new key needed?" check and the insert are atomic.
+/// The `check` callback receives, inside the transaction, every key whose
+/// `issue_from` is one of `issue_froms` (the epochs the caller needs), and
+/// returns `Ok(Some(key))` to insert or `Ok(None)` to skip. This ensures the
+/// "is a new key needed?" check and the insert are atomic.
 pub async fn insert_issuer_key_checked<F>(
     pool: &Pool,
+    issue_froms: &[SystemTime],
     check: F,
 ) -> Result<Option<IssuerKeyRow>, ServerError>
 where
-    F: FnOnce(Option<&IssuerKeyRow>) -> Result<Option<IssuerKeyRow>, ServerError>,
+    F: FnOnce(&[IssuerKeyRow]) -> Result<Option<IssuerKeyRow>, ServerError>,
 {
     let mut client = pool
         .get()
@@ -646,25 +648,25 @@ where
             ))
         })?;
 
-    // Read the latest key inside the transaction.
-    let latest_row = tx
-        .query_opt(
+    // Read the keys for the wanted epochs inside the transaction.
+    let rows = tx
+        .query(
             "SELECT id, private_key_enc, public_key, domain_separator, \
                     issue_from, issue_until, accept_until \
-             FROM issuer_key ORDER BY issue_from DESC LIMIT 1",
-            &[],
+             FROM issuer_key WHERE issue_from = ANY($1)",
+            &[&issue_froms],
         )
         .await
         .map_err(|e| {
             ServerError::Internal(format!(
-                "query latest issuer_key failed: {}",
+                "query issuer_keys by epoch failed: {}",
                 db_error_summary(&e)
             ))
         })?;
 
-    let latest = latest_row.as_ref().map(map_issuer_key_row);
+    let present: Vec<IssuerKeyRow> = rows.iter().map(map_issuer_key_row).collect();
 
-    let key = match check(latest.as_ref())? {
+    let key = match check(&present)? {
         Some(k) => k,
         None => {
             tx.rollback().await.map_err(|e| {

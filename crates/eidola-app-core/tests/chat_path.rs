@@ -30,7 +30,7 @@ use chat_harness::{
     thread_map, trailing, with_account,
 };
 use eidola_app_core::changes::{Change, ChangeEvent};
-use eidola_app_core::error::AppError;
+use eidola_app_core::error::{AppError, IssuerKeyRefusal};
 use eidola_app_core::{AppCore, ChatStreamEvent, DEFAULT_ALLOCATION_CREDITS, ProvisionOutcome};
 
 /// The generic system prompt the seeded default template agent carries (mirrors
@@ -1056,12 +1056,10 @@ fn a_credential_issued_just_before_its_key_stops_issuing_stays_spendable() {
     run(|| {
         let now = now_unix_secs();
         let issue_until = now + 2;
+        let (window, calendar) = KeyWindow::epoch_ending_at(issue_until, WEEK_SECS as u64);
         let (mock, core, _dir) = setup(MockConfig {
-            key_window: Some(KeyWindow::from_unix_secs(
-                now - WEEK_SECS,
-                issue_until,
-                issue_until + WEEK_SECS,
-            )),
+            key_window: Some(window),
+            issuer_calendar: Some(calendar),
             ..MockConfig::default()
         });
         with_account(&core);
@@ -1102,12 +1100,13 @@ fn a_credential_lapses_its_spend_margin_before_the_keys_acceptance_deadline() {
     run(|| {
         let now = now_unix_secs();
         let spend_until = now + 3;
+        // Issuing ends at now + 2 and acceptance one epoch later, at the spend
+        // deadline plus the margin: an epoch of margin + 1 seconds.
+        let (window, calendar) =
+            KeyWindow::epoch_ending_at(now + 2, (spend_until + margin_secs() - (now + 2)) as u64);
         let (mock, core, _dir) = setup(MockConfig {
-            key_window: Some(KeyWindow::from_unix_secs(
-                now - WEEK_SECS,
-                now + 2,
-                spend_until + margin_secs(),
-            )),
+            key_window: Some(window),
+            issuer_calendar: Some(calendar),
             ..MockConfig::default()
         });
         with_account(&core);
@@ -1155,12 +1154,13 @@ fn a_credential_lapses_its_spend_margin_before_the_keys_acceptance_deadline() {
 fn issuance_is_refused_when_the_key_could_not_be_spent_under() {
     run(|| {
         let now = now_unix_secs();
+        // Issuing until now + 30, accepted until a minute short of the margin
+        // from now: an epoch shorter than the margin.
+        let (window, calendar) =
+            KeyWindow::epoch_ending_at(now + 30, (margin_secs() - 60 - 30) as u64);
         let (mock, core, _dir) = setup(MockConfig {
-            key_window: Some(KeyWindow::from_unix_secs(
-                now - WEEK_SECS,
-                now + 30,
-                now + margin_secs() - 60,
-            )),
+            key_window: Some(window),
+            issuer_calendar: Some(calendar),
             ..MockConfig::default()
         });
         with_account(&core);
@@ -1180,6 +1180,256 @@ fn issuance_is_refused_when_the_key_could_not_be_spent_under() {
             "a refused issuance announces no wallet or account write; got {changes:?}"
         );
         assert!(changes.contains(&Change::SpaceIndex), "the post survives");
+    });
+}
+
+// ===========================================================================
+// Issuer keys against the public calendar, one per epoch
+// ===========================================================================
+
+/// A key whose windows are not one epoch's on the public calendar is refused
+/// before anything is requested: a window nobody could have computed in
+/// advance is one a server could have timed around this client.
+#[test]
+fn a_key_off_the_calendar_is_refused_before_issuance() {
+    run(|| {
+        let now = now_unix_secs();
+        // An issuing window covering now that starts at an arbitrary instant,
+        // the shape keys had before they were put on a calendar.
+        let (mock, core, _dir) = setup(MockConfig {
+            key_window: Some(KeyWindow::from_unix_secs(
+                now - 3_600,
+                now - 3_600 + WEEK_SECS,
+                now - 3_600 + 2 * WEEK_SECS,
+            )),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect_err("a key off the calendar is refused");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::NotOnCalendar
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(mock.chat_hits(), 0);
+        assert!(credential_states(&core).is_empty(), "nothing was issued");
+        let changes = drain(&mut rx);
+        assert!(
+            !changes.contains(&Change::Wallet) && !changes.contains(&Change::Account),
+            "a refused key announces no wallet or account write; got {changes:?}"
+        );
+    });
+}
+
+/// The same key the client checks is the one the calendar's production
+/// constants describe: with no test calendar, the mock's windows are the
+/// production epoch's, and they are accepted.
+#[test]
+fn the_production_calendars_current_epoch_is_accepted() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the current epoch's key on the production calendar issues");
+    });
+}
+
+/// An honest server has one key per epoch. Once this client has seen the
+/// epoch's key, a different one for the same epoch is refused — before any
+/// issuance request, though the second key is real and would have signed —
+/// and the refusal lasts until the next epoch, whose key is accepted.
+#[test]
+fn a_second_key_for_a_seen_epoch_is_refused_until_the_next_epoch() {
+    run(|| {
+        let now = now_unix_secs();
+        // An epoch boundary a few seconds from now, on week-long epochs (a
+        // key's acceptance has to outlast the spend margin).
+        let boundary = now + 6;
+        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
+        let config = MockConfig {
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        };
+        let key_swap = config.key_swap.clone();
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.account_allocate(1_000_000))
+            .expect("the epoch's first key issues");
+        let before = credential_states(&core).len();
+        assert_eq!(before, 1);
+
+        key_swap.swap();
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect_err("a second key for the epoch is refused");
+        let epoch = calendar
+            .epoch_at(u64::try_from(now).unwrap())
+            .expect("on the calendar");
+        assert!(
+            matches!(
+                &err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::SecondKeyForEpoch { epoch: e }
+                } if *e == epoch
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            credential_states(&core).len(),
+            before,
+            "nothing was issued under the second key"
+        );
+        // The credential already held is untouched and still spends.
+        core.runtime()
+            .block_on(core.chat("still works".into(), MODEL.into(), None))
+            .expect("a held credential keeps working");
+        assert_eq!(mock.chat_hits(), 1);
+
+        // Asking again is refused the same way: nothing about the refusal
+        // wears off within the epoch.
+        let refused_again = core.runtime().block_on(core.account_allocate(1_000));
+        assert!(
+            matches!(refused_again, Err(AppError::IssuerKeyRefused { .. })),
+            "got {refused_again:?}"
+        );
+
+        sleep_past_unix_secs(boundary);
+        let next = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the next epoch's key issues");
+        assert_eq!(next.issuer_key_id, key_swap.second_key_id());
+        assert_ne!(next.issuer_key_id, first.issuer_key_id);
+    });
+}
+
+/// An honest server has a distinct key for every epoch. One that keeps its
+/// key across a boundary lists it for the epoch just ended and for the new
+/// one, and the client refuses it: a key the record could hold for one epoch
+/// only would leave the other to be filled by whatever the server shows next.
+#[test]
+fn a_key_kept_across_an_epoch_boundary_is_refused() {
+    run(|| {
+        let now = now_unix_secs();
+        let boundary = now + 6;
+        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
+        let (_mock, core, _dir) = setup(MockConfig {
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the epoch's key issues");
+
+        sleep_past_unix_secs(boundary);
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect_err("the same key for the next epoch is refused");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::OneKeyForSeveralEpochs { .. }
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(credential_states(&core).len(), 1, "nothing more was issued");
+    });
+}
+
+/// The record remembers which epoch each key was seen for, so a key reused
+/// for a later epoch is refused even when the listing leaves out the entry
+/// it would have collided with.
+#[test]
+fn a_key_seen_for_one_epoch_is_refused_for_the_next() {
+    run(|| {
+        let now = now_unix_secs();
+        let boundary = now + 6;
+        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
+        let config = MockConfig {
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        };
+        let omit = config.omit_previous_key.clone();
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the epoch's key issues");
+
+        omit.store(true, std::sync::atomic::Ordering::SeqCst);
+        sleep_past_unix_secs(boundary);
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect_err("a key already seen for the previous epoch is refused");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::OneKeyForSeveralEpochs { .. }
+                }
+            ),
+            "got {err:?}"
+        );
+    });
+}
+
+/// The record is kept on disk: a client that restarts still refuses a
+/// second key for an epoch it saw before the restart.
+#[test]
+fn the_key_seen_for_an_epoch_survives_a_restart() {
+    run(|| {
+        // The upstream runs on a runtime of its own so it outlives the core.
+        let config = MockConfig::default();
+        let key_swap = config.key_swap.clone();
+        let mock_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("mock runtime");
+        let mock = mock_rt.block_on(chat_harness::start(config.clone()));
+        let (_unused, core, dir) = setup(config);
+        core.runtime()
+            .block_on(core.set_base_url(mock.base_url.clone()))
+            .expect("point at the lasting upstream");
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the epoch's first key issues");
+        drop(core);
+
+        key_swap.swap();
+        let core = chat_harness::reopen_core(&dir, &mock.base_url);
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect_err("a second key for the epoch is refused after a restart");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::SecondKeyForEpoch { .. }
+                }
+            ),
+            "got {err:?}"
+        );
     });
 }
 
@@ -10121,13 +10371,12 @@ fn the_provisioner_never_issues_from_a_balance_below_a_standard_allocation() {
 #[test]
 fn the_provisioner_never_issues_under_a_key_about_to_lapse() {
     run(|| {
-        let now = now_unix_secs();
+        // Six-hour epochs: the current key stops issuing in an hour and is
+        // accepted for six more, well inside the 24-hour horizon.
+        let (window, calendar) = KeyWindow::epoch_ending_at(now_unix_secs() + 3_600, 6 * 3_600);
         let (mock, core, _dir) = setup(MockConfig {
-            key_window: Some(KeyWindow::from_unix_secs(
-                now - WEEK_SECS,
-                now + 3_600,
-                now + 12 * 3_600,
-            )),
+            key_window: Some(window),
+            issuer_calendar: Some(calendar),
             ..MockConfig::default()
         });
         spend_from_a_small_credential(&core, 100_000);
@@ -10140,28 +10389,25 @@ fn the_provisioner_never_issues_under_a_key_about_to_lapse() {
 /// waits for the next key; with too little held it issues anyway.
 #[test]
 fn the_provisioner_prefers_a_keys_early_life() {
-    let window = || {
-        let now = now_unix_secs();
-        Some(KeyWindow::from_unix_secs(
-            now - WEEK_SECS,
-            now + 3_600,
-            now + 3_600 + WEEK_SECS,
-        ))
+    // The current key stops issuing in an hour, inside the late window, and
+    // its credentials are accepted for a further week.
+    let config = || {
+        let (window, calendar) =
+            KeyWindow::epoch_ending_at(now_unix_secs() + 3_600, WEEK_SECS as u64);
+        MockConfig {
+            key_window: Some(window),
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        }
     };
     run(move || {
-        let (mock, core, _dir) = setup(MockConfig {
-            key_window: window(),
-            ..MockConfig::default()
-        });
+        let (mock, core, _dir) = setup(config());
         spend_from_a_small_credential(&core, 200_000);
         assert_eq!(provision(&core), ProvisionOutcome::Deferred);
         assert_eq!(mock.issuance_debits(), 1);
     });
     run(move || {
-        let (mock, core, _dir) = setup(MockConfig {
-            key_window: window(),
-            ..MockConfig::default()
-        });
+        let (mock, core, _dir) = setup(config());
         spend_from_a_small_credential(&core, 50_000);
         assert!(matches!(provision(&core), ProvisionOutcome::Issued { .. }));
         assert_eq!(mock.issuance_debits(), 2);
@@ -10621,5 +10867,74 @@ fn a_recovery_that_fails_after_settling_a_hold_still_announces_it() {
             drain(&mut rx).contains(&Change::Wallet),
             "the settled hold was announced although recovery failed"
         );
+    });
+}
+
+/// The provisioner issues only under a key the client's calendar and epoch
+/// record accept: a server that lists a second key for an epoch the client
+/// already holds a key for is refused before anything is debited, in the
+/// background as at every other door.
+#[test]
+fn the_provisioner_never_issues_under_a_refused_key() {
+    run(|| {
+        let config = MockConfig::default();
+        let swap = config.key_swap.clone();
+        let (mock, core, _dir) = setup(config);
+        spend_from_a_small_credential(&core, 100_000);
+        swap.swap();
+        let err = core
+            .runtime()
+            .block_on(core.test_provision_once())
+            .expect_err("a second key for the epoch is refused");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::SecondKeyForEpoch { .. }
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(mock.issuance_debits(), 1, "nothing was issued under it");
+    });
+}
+
+/// A pending issuance is asked for again under the key it was made under,
+/// even once the epoch has moved and the server lists another key as current:
+/// the stored response answers it, whatever is current now. (Recovery stops
+/// at the key's spend deadline, inside the server's retention of the stored
+/// response.)
+#[test]
+fn a_pending_issuance_is_retried_under_its_own_key_after_the_epoch_moves() {
+    run(|| {
+        // Twenty-minute epochs, the current one ending in three seconds.
+        let boundary = now_unix_secs() + 3;
+        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, 20 * 60);
+        let config = MockConfig {
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        };
+        let swap = config.key_swap.clone();
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("lost");
+
+        sleep_past_unix_secs(boundary);
+        // The next epoch, honestly under a key of its own.
+        swap.swap();
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_spending_credentials())
+            .expect("recovery");
+        assert_eq!(
+            recovered.len(),
+            1,
+            "a retry naming the new key would not match what was stored"
+        );
+        assert_eq!(mock.issuance_debits(), 1);
     });
 }

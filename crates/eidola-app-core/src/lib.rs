@@ -34,6 +34,7 @@ use anonymous_credit_tokens::{
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use eidola_common::engine_protocol::ContinueField;
+use eidola_common::issuer_calendar::{ISSUER_CALENDAR, IssuerCalendar, rfc3339_utc};
 use eidola_common::refund_key::REFUND_KEY_HEADER;
 use rand_core::OsRng;
 use serde::Deserialize;
@@ -48,7 +49,7 @@ use changes::{BroadcastSource, Change, ChangeSource};
 use config::Config;
 pub use config::DEFAULT_TEMPLATE_ID;
 pub use db::HUMAN_PARTICIPANT_ID;
-use error::AppError;
+use error::{AppError, IssuerKeyRefusal};
 pub use local_models::{
     ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
     LocalModelStatus, LocalModelsState, ModelDownloadTarget, RunningEngine, resolve_model_download,
@@ -1961,6 +1962,83 @@ pub fn issuer_key_deadlines(accept_until_ms: i64) -> db::IssuerKeyDeadlines {
     }
 }
 
+/// The epoch of the public issuer calendar a listed key's windows are
+/// exactly, or `None` if they are not one epoch's windows.
+///
+/// "Exactly" is byte for byte: each instant must be the calendar's one
+/// spelling of its epoch's instant (`issuer_calendar::rfc3339_utc`, which
+/// the gateway serves). A parse is used only to find which epoch to compare
+/// against, never to decide; so a fraction of a second, an offset, a missing
+/// `Z` or a normalized date (a February 30th) cannot round a key onto the
+/// calendar.
+fn listed_key_epoch(calendar: &IssuerCalendar, key: &IssuerKeyResponse) -> Option<u64> {
+    let from_ms = iso_to_ms(&key.issue_from).ok()?;
+    let epoch = calendar.epoch_at(u64::try_from(from_ms.div_euclid(1000)).ok()?)?;
+    let w = calendar.windows(epoch)?;
+    let spelled = |secs: u64, listed: &str| rfc3339_utc(secs) == listed;
+    (spelled(w.issue_from, &key.issue_from)
+        && spelled(w.issue_until, &key.issue_until)
+        && spelled(w.accept_until, &key.accept_until))
+    .then_some(epoch)
+}
+
+/// Whether a listed key's id is the hash of its public key.
+fn listed_key_is_its_hash(key: &IssuerKeyResponse) -> bool {
+    URL_SAFE_NO_PAD
+        .decode(&key.public_key)
+        .is_ok_and(|pk| issuer_key_id_of(&pk) == key.id)
+}
+
+/// How many epochs of the per-epoch key record are kept: a year's. Rows are
+/// one per epoch per server, and a longer memory is what lets the client
+/// notice a key it already saw for one epoch being offered for another.
+const ISSUER_KEY_RECORD_EPOCHS: u64 = 52;
+
+/// The keys a `/v1/keys` listing offers under `ds`, each with its epoch, in
+/// epoch order — **once the whole listing is one an honest gateway could
+/// have served**. An honest gateway lists only keys on the calendar, each
+/// named by the hash of its public key, one key per epoch and a distinct key
+/// for every epoch. A listing that breaks any of that is refused whole,
+/// whichever entry breaks it: an entry that escaped the check (a next
+/// epoch's key off the calendar, or with a mislabelled id, or listed twice)
+/// would escape being recorded, and the record is what holds the server to
+/// its keys later. Keys under another domain separator are not this
+/// deployment's and are ignored.
+fn checked_listing<'a>(
+    calendar: &IssuerCalendar,
+    keys: &'a [IssuerKeyResponse],
+    ds: &str,
+) -> Result<Vec<(u64, &'a IssuerKeyResponse)>, AppError> {
+    let refused = |refusal| AppError::IssuerKeyRefused { refusal };
+    let mut by_epoch: std::collections::BTreeMap<u64, &IssuerKeyResponse> =
+        std::collections::BTreeMap::new();
+    let mut epoch_of_id: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for key in keys.iter().filter(|k| k.domain_separator == ds) {
+        let epoch =
+            listed_key_epoch(calendar, key).ok_or(refused(IssuerKeyRefusal::NotOnCalendar))?;
+        if !listed_key_is_its_hash(key) {
+            return Err(AppError::Credential {
+                message: "the server listed an issuer key whose id is not the hash of its \
+                          public key"
+                    .into(),
+            });
+        }
+        if by_epoch.get(&epoch).is_some_and(|k| k.id != key.id) {
+            return Err(refused(IssuerKeyRefusal::SecondKeyForEpoch { epoch }));
+        }
+        if let Some(&other) = epoch_of_id.get(key.id.as_str())
+            && other != epoch
+        {
+            return Err(refused(IssuerKeyRefusal::OneKeyForSeveralEpochs {
+                epoch: other.max(epoch),
+            }));
+        }
+        by_epoch.insert(epoch, key);
+        epoch_of_id.insert(&key.id, epoch);
+    }
+    Ok(by_epoch.into_iter().collect())
+}
+
 /// How long the ACT provisioning queue waits for an in-flight credential
 /// refund (a concurrent turn's recovery) to free spendable balance before
 /// giving up with [`AppError::ProvisioningTimeout`]. Bounds the worst case
@@ -2359,6 +2437,12 @@ struct Inner {
     /// test can hold the write and its cleanup to one transaction.
     #[cfg(feature = "test-support")]
     fail_cache_key_cleanup: std::sync::atomic::AtomicBool,
+    /// The calendar issuer key windows are checked against. A release build
+    /// has no field here and reads [`ISSUER_CALENDAR`], the one the gateway
+    /// uses; under `test-support` a test may stand a boundary seconds from
+    /// now ([`AppCore::test_set_issuer_calendar`]).
+    #[cfg(feature = "test-support")]
+    issuer_calendar: Mutex<IssuerCalendar>,
     /// The process-lifetime exclusive advisory lock on the local database
     /// (`<data_dir>/eidola.db.lock`). Taken in [`AppCore::build`] — a second
     /// opener is refused *there* with [`AppError::DatabaseInUse`] rather than
@@ -3466,9 +3550,6 @@ impl Inner {
         })
     }
 
-    /// Convert `credits` from the account into a new credential: the explicit
-    /// `account allocate` door. Serialized with every other issuance in this
-    /// process by [`Inner::issuance_gate`].
     fn issuance_request_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_millis(
             self.issuance_request_timeout_ms
@@ -3515,6 +3596,25 @@ impl Inner {
             .is_some_and(|row| row.enabled && row.removed_at.is_none()))
     }
 
+    /// The calendar issuer key windows are checked against: the production
+    /// [`ISSUER_CALENDAR`], the gateway's own, in every release build.
+    fn issuer_calendar(&self) -> IssuerCalendar {
+        #[cfg(feature = "test-support")]
+        {
+            *self
+                .issuer_calendar
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            ISSUER_CALENDAR
+        }
+    }
+
+    /// Convert `credits` from the account into a new credential: the explicit
+    /// `account allocate` door. Serialized with every other issuance in this
+    /// process by [`Inner::issuance_gate`].
     async fn account_allocate(&self, credits: i64) -> Result<AllocateResult, AppError> {
         let _issuing = self
             .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
@@ -3538,6 +3638,8 @@ impl Inner {
             &eidola.base_url,
             cfg.domain_separator(),
             self.issuance_request_timeout(),
+            &self.issuer_calendar(),
+            &self.db_conn().await?,
         )
         .await?;
         Box::pin(self.allocate_with_key(&cfg, &client, &eidola.base_url, &key, credits)).await
@@ -3829,6 +3931,8 @@ impl Inner {
             &eidola.base_url,
             cfg.domain_separator(),
             self.issuance_request_timeout(),
+            &self.issuer_calendar(),
+            &self.db_conn().await?,
         )
         .await?;
         // A credential that would not count toward the buffer once issued is
@@ -10603,6 +10707,19 @@ impl AppCore {
             .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// **Test-only seam.** Check issuer key windows against `calendar` instead
+    /// of the production one, so a test can put a key's deadlines seconds
+    /// from now and still be on a calendar.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_set_issuer_calendar(&self, calendar: IssuerCalendar) {
+        *self
+            .inner
+            .issuer_calendar
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = calendar;
+    }
+
     /// **Test-only seam.** Advance the prefix-cache clock by `delta_ms` each
     /// time a turn hands a request to the transport — after the request is
     /// built, before the connection is set up — modelling a slow connection,
@@ -10715,6 +10832,8 @@ impl AppCore {
                 cache_clock: CacheClock::default(),
                 #[cfg(feature = "test-support")]
                 fail_cache_key_cleanup: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(feature = "test-support")]
+                issuer_calendar: Mutex::new(ISSUER_CALENDAR),
                 _db_lock: db_lock,
             }),
         })
@@ -13413,7 +13532,7 @@ struct ListKeysResponse {
     data: Vec<IssuerKeyResponse>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct IssuerKeyResponse {
     id: String,
     public_key: String,
@@ -17966,20 +18085,33 @@ struct CurrentIssuerKey {
     deadlines: db::IssuerKeyDeadlines,
 }
 
-/// Read the current issuing key from `GET /v1/keys`.
+/// Read the current issuing key from `GET /v1/keys`, and hold the server to
+/// the keys it has listed before.
 ///
 /// Every issuer key shares the same domain separator — rotation mints new
 /// keys, never new separators — so the separator alone does not identify a
-/// single key. `/v1/keys` lists all still-accepted keys oldest-first, which
-/// during a rotation grace window includes the just-rotated-out key whose
-/// accept window has not yet closed. Issuance always signs with the *current*
-/// key (newest by `issue_from`), so the client verifies against that same key:
-/// the one whose issuing window covers now, preferring the newest such key.
+/// single key. `/v1/keys` lists every still-accepted key (the previous
+/// epoch's, the current one's) and the next epoch's. The whole listing is
+/// checked first: every key on the calendar, one per epoch, a distinct key per
+/// epoch (`checked_listing`). A key whose windows nobody could have computed in
+/// advance is one a server could have timed around this client. Issuance signs
+/// with the *current* key: the current epoch's.
+///
+/// One key per epoch, and one epoch per key, is then checked against what
+/// this client has already seen. **Every** listed key is recorded,
+/// first-seen-wins (the next epoch's key a whole epoch before it issues), and
+/// every one must agree with the record. Any disagreement refuses the key
+/// ([`AppError::IssuerKeyRefused`]) before any issuance request is built, for
+/// every door that issues — explicit, just in time and in the background
+/// alike: the client cannot tell an emergency rotation from a server singling
+/// it out, and the honest design has no rotation within an epoch.
 async fn current_issuer_key(
     client: &reqwest::Client,
     base_url: &str,
     expected_ds: &str,
     timeout: std::time::Duration,
+    calendar: &IssuerCalendar,
+    db_conn: &turso::Connection,
 ) -> Result<CurrentIssuerKey, AppError> {
     let resp = client
         .get(format!("{base_url}/v1/keys"))
@@ -17993,33 +18125,28 @@ async fn current_issuer_key(
         message: format!("failed to parse keys response: {e}"),
     })?;
     let now = now_ms();
-    let server_ds: Vec<String> = keys
-        .data
-        .iter()
-        .map(|k| k.domain_separator.clone())
-        .collect();
-    let listed = keys
-        .data
-        .into_iter()
-        .filter(|k| k.domain_separator == expected_ds)
-        .filter_map(|k| {
-            let issue_from = iso_to_ms(&k.issue_from).ok()?;
-            let issue_until = iso_to_ms(&k.issue_until).ok()?;
-            (issue_from <= now && now < issue_until).then_some((issue_from, k))
-        })
-        .max_by_key(|(issue_from, _)| *issue_from)
-        .map(|(_, k)| k)
-        .ok_or_else(|| AppError::Credential {
+    let listing = checked_listing(calendar, &keys.data, expected_ds)?;
+    let now_epoch = u64::try_from(now.div_euclid(1000))
+        .ok()
+        .and_then(|secs| calendar.epoch_at(secs));
+    let Some(&(epoch, key)) = listing.iter().find(|(e, _)| Some(*e) == now_epoch) else {
+        let server_ds: Vec<&str> = keys
+            .data
+            .iter()
+            .map(|k| k.domain_separator.as_str())
+            .collect();
+        return Err(AppError::Credential {
             message: format!(
                 "no issuer key currently valid for issuance matches expected \
                  domain separator \"{expected_ds}\"\n\
                  server advertised: {server_ds:?}"
             ),
-        })?;
+        });
+    };
 
     let public_key_cbor =
         URL_SAFE_NO_PAD
-            .decode(&listed.public_key)
+            .decode(&key.public_key)
             .map_err(|e| AppError::Credential {
                 message: format!("invalid base64 public key: {e}"),
             })?;
@@ -18029,19 +18156,51 @@ async fn current_issuer_key(
     // A key's id is SHA-256 of its public key, and the id is what every
     // spend names. Stored under any other id, a credential is unusable
     // (its spends name a key the server cannot find) or mislabelled.
-    if listed.id != issuer_key_id_of(&public_key_cbor) {
+    // (`checked_listing` already refused a listing with any such key;
+    // this is the check the credential is stored under.)
+    if key.id != issuer_key_id_of(&public_key_cbor) {
         return Err(AppError::Credential {
             message: "the server's issuer key id is not the hash of its public key".into(),
         });
     }
+
+    let oldest_kept = epoch.saturating_sub(ISSUER_KEY_RECORD_EPOCHS);
+    let mut refusal = None;
+    for &(listed_epoch, listed) in &listing {
+        let pinned = db::pin_issuer_key_epoch(
+            db_conn,
+            base_url,
+            listed_epoch,
+            &listed.id,
+            oldest_kept,
+            now,
+        )
+        .await?;
+        let disagreement = if pinned.key_id != listed.id {
+            Some(IssuerKeyRefusal::SecondKeyForEpoch {
+                epoch: listed_epoch,
+            })
+        } else if pinned.also_recorded_for.is_some() {
+            Some(IssuerKeyRefusal::OneKeyForSeveralEpochs {
+                epoch: listed_epoch,
+            })
+        } else {
+            None
+        };
+        refusal = refusal.or(disagreement);
+    }
+    if let Some(refusal) = refusal {
+        return Err(AppError::IssuerKeyRefused { refusal });
+    }
+
     let params = params_from_domain_separator(expected_ds)?;
     // A credential's spendable life is bounded by when the server stops
     // *accepting* the key, not when it stops issuing under it: a credential
     // issued in the last moments of `issue_until` is spendable for a whole
     // further epoch.
-    let deadlines = issuer_key_deadlines(iso_to_ms(&listed.accept_until)?);
+    let deadlines = issuer_key_deadlines(iso_to_ms(&key.accept_until)?);
     Ok(CurrentIssuerKey {
-        listed,
+        listed: key.clone(),
         public_key_cbor,
         public_key,
         params,
@@ -19027,6 +19186,149 @@ mod tests {
         // 2026-01-01T00:00:00Z → 1767225600000
         let ms = iso_to_ms("2026-01-01T00:00:00Z").unwrap();
         assert_eq!(ms, 1767225600000);
+    }
+
+    // --- Issuer key listings against the public calendar ---
+
+    const LISTED_DS: &str = "ACT-v1:eidola:inference:production:2026-03-05";
+
+    /// A listed key for `epoch` on the production calendar, whose public key
+    /// is `fill` repeated (the listing check hashes it, never decodes it).
+    fn listed(epoch: u64, fill: u8) -> IssuerKeyResponse {
+        let pk = vec![fill; 32];
+        let w = ISSUER_CALENDAR.windows(epoch).unwrap();
+        IssuerKeyResponse {
+            id: issuer_key_id_of(&pk),
+            public_key: URL_SAFE_NO_PAD.encode(&pk),
+            domain_separator: LISTED_DS.into(),
+            issue_from: rfc3339_utc(w.issue_from),
+            issue_until: rfc3339_utc(w.issue_until),
+            accept_until: rfc3339_utc(w.accept_until),
+        }
+    }
+
+    fn refusal_of(keys: &[IssuerKeyResponse]) -> Option<IssuerKeyRefusal> {
+        match checked_listing(&ISSUER_CALENDAR, keys, LISTED_DS) {
+            Err(AppError::IssuerKeyRefused { refusal }) => Some(refusal),
+            Err(e) => panic!("refused, but not by the calendar checks: {e}"),
+            Ok(_) => None,
+        }
+    }
+
+    #[test]
+    fn an_honest_listing_is_accepted_in_epoch_order() {
+        let mut other_ds = listed(2967, 9);
+        other_ds.domain_separator = "ACT-v1:someone:else:x:y".into();
+        let keys = [listed(2967, 3), listed(2965, 1), other_ds, listed(2966, 2)];
+        let checked = checked_listing(&ISSUER_CALENDAR, &keys, LISTED_DS).unwrap();
+        let epochs: Vec<u64> = checked.iter().map(|(e, _)| *e).collect();
+        assert_eq!(
+            epochs,
+            [2965, 2966, 2967],
+            "another separator's key is ignored"
+        );
+        // A key listed twice, identically, is one key.
+        assert_eq!(refusal_of(&[listed(2966, 2), listed(2966, 2)]), None);
+    }
+
+    /// The windows must be the calendar's own spelling, byte for byte: a
+    /// parse that rounds would let an off-calendar instant through.
+    #[test]
+    fn a_window_that_only_rounds_onto_the_calendar_is_refused() {
+        type Respell = fn(&mut IssuerKeyResponse);
+        let spellings: [(&str, Respell); 7] = [
+            ("a fraction of a second", |k| {
+                k.issue_from = k.issue_from.replace('Z', ".500Z")
+            }),
+            ("a fraction on the acceptance deadline", |k| {
+                k.accept_until = k.accept_until.replace('Z', ".999Z")
+            }),
+            ("no Z", |k| {
+                k.issue_until = k.issue_until.trim_end_matches('Z').into()
+            }),
+            ("an offset", |k| {
+                k.issue_from = k.issue_from.replace('Z', "+00:00")
+            }),
+            ("lower case", |k| k.issue_from = k.issue_from.to_lowercase()),
+            ("surrounding space", |k| {
+                k.issue_from = format!(" {}", k.issue_from)
+            }),
+            ("a signed year", |k| {
+                k.issue_from = format!("+{}", k.issue_from)
+            }),
+        ];
+        for (what, spell) in spellings {
+            let mut key = listed(2966, 2);
+            spell(&mut key);
+            assert_eq!(
+                refusal_of(&[key]),
+                Some(IssuerKeyRefusal::NotOnCalendar),
+                "{what} was accepted"
+            );
+        }
+        // A normalized instant: 24:00 on the 4th is the 5th to a lenient parser.
+        let mut key = listed(2966, 2);
+        let w = ISSUER_CALENDAR.windows(2966).unwrap();
+        assert_eq!(rfc3339_utc(w.issue_from), "2026-11-05T00:00:00Z");
+        key.issue_from = "2026-11-04T24:00:00Z".into();
+        assert_eq!(refusal_of(&[key]), Some(IssuerKeyRefusal::NotOnCalendar));
+    }
+
+    /// One key for two epochs is refused, whichever epochs and whatever the
+    /// order: listed as next epoch's too, it would leave next epoch
+    /// unrecorded for a different key to fill when it arrives.
+    #[test]
+    fn one_key_listed_for_two_epochs_is_refused() {
+        let mut next = listed(2966, 2);
+        let w = ISSUER_CALENDAR.windows(2967).unwrap();
+        next.issue_from = rfc3339_utc(w.issue_from);
+        next.issue_until = rfc3339_utc(w.issue_until);
+        next.accept_until = rfc3339_utc(w.accept_until);
+        for keys in [
+            vec![listed(2966, 2), next.clone()],
+            vec![next.clone(), listed(2966, 2)],
+            vec![listed(2965, 1), next, listed(2966, 2)],
+        ] {
+            assert_eq!(
+                refusal_of(&keys),
+                Some(IssuerKeyRefusal::OneKeyForSeveralEpochs { epoch: 2967 })
+            );
+        }
+    }
+
+    /// Two keys for one epoch are refused wherever they sit in the listing —
+    /// the next epoch's included, which no check at issuance would otherwise
+    /// look at, and in either order, so the server's ordering decides nothing.
+    #[test]
+    fn two_keys_for_any_one_epoch_are_refused() {
+        for keys in [
+            vec![listed(2966, 2), listed(2967, 3), listed(2967, 4)],
+            vec![listed(2967, 4), listed(2966, 2), listed(2967, 3)],
+            vec![listed(2966, 5), listed(2966, 2)],
+        ] {
+            assert!(matches!(
+                refusal_of(&keys),
+                Some(IssuerKeyRefusal::SecondKeyForEpoch { .. })
+            ));
+        }
+    }
+
+    /// Every entry is held to the checks, not only the current key: an entry
+    /// that escaped them would escape being recorded.
+    #[test]
+    fn every_listed_key_is_held_to_the_checks() {
+        let mut off = listed(2967, 3);
+        off.issue_from = off.issue_from.replace("T00", "T01");
+        assert_eq!(
+            refusal_of(&[listed(2966, 2), off]),
+            Some(IssuerKeyRefusal::NotOnCalendar)
+        );
+        let mut mislabelled = listed(2967, 3);
+        mislabelled.id = listed(2967, 4).id;
+        assert!(matches!(
+            checked_listing(&ISSUER_CALENDAR, &[listed(2966, 2), mislabelled], LISTED_DS),
+            Err(AppError::Credential { .. })
+        ));
     }
 
     #[test]

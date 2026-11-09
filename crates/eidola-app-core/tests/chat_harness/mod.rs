@@ -50,6 +50,7 @@ use anonymous_credit_tokens::{
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use eidola_app_core::AppCore;
+use eidola_common::issuer_calendar::{ISSUER_CALENDAR, IssuerCalendar};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -637,13 +638,61 @@ pub struct MockConfig {
     /// exactly the requested amount.
     pub issuance_extra_credits: i64,
     /// The current issuer key's `(issue_from, issue_until, accept_until)` as
-    /// `GET /v1/keys` advertises them. `None` — the default — is a window
-    /// spanning years, so no test written before key deadlines mattered can
-    /// meet one. A test about a key's deadlines sets them relative to now.
+    /// `GET /v1/keys` advertises them. `None` — the default — is the current
+    /// epoch's windows on [`MockConfig::issuer_calendar`], so no test written
+    /// before key deadlines mattered can meet one. A test about a key's
+    /// deadlines sets them relative to now ([`KeyWindow::epoch_ending_at`]),
+    /// with the calendar that puts them on one.
     pub key_window: Option<KeyWindow>,
+    /// The issuer calendar the mock lists windows on and the client checks
+    /// them against (`AppCore::test_set_issuer_calendar`, applied by
+    /// [`core_for`]). `None` is the production calendar.
+    pub issuer_calendar: Option<IssuerCalendar>,
+    /// Switch the mock to a second, real issuer key: listed as current and
+    /// signing issuances, in the same epoch as the first. What a server
+    /// rotating within an epoch (or singling a client out) looks like.
+    pub key_swap: KeySwap,
+    /// Stop listing the previous epoch's key: a listing that leaves out the
+    /// one entry a key reused from it would otherwise collide with.
+    pub omit_previous_key: Arc<std::sync::atomic::AtomicBool>,
     /// How `POST /v1/account/credentials` misbehaves, switchable mid-test
     /// (see [`IssuanceKnobs`]). The default answers every request.
     pub issuance: IssuanceKnobs,
+}
+
+/// See [`MockConfig::key_swap`].
+#[derive(Clone, Default)]
+pub struct KeySwap(Arc<KeySwapState>);
+
+#[derive(Default)]
+struct KeySwapState {
+    on: std::sync::atomic::AtomicBool,
+    second: std::sync::OnceLock<Issuer>,
+}
+
+impl KeySwap {
+    /// From now on, list and issue under the second key.
+    pub fn swap(&self) {
+        self.0.on.store(true, Ordering::SeqCst);
+    }
+
+    /// The second key's id.
+    pub fn second_key_id(&self) -> String {
+        self.second().key_id_hex.clone()
+    }
+
+    fn second(&self) -> &Issuer {
+        self.0.second.get_or_init(Issuer::new)
+    }
+
+    /// The issuer that lists and issues: the second one once swapped.
+    fn active<'a>(&'a self, first: &'a Issuer) -> &'a Issuer {
+        if self.0.on.load(Ordering::SeqCst) {
+            self.second()
+        } else {
+            first
+        }
+    }
 }
 
 /// Switches on the mock's issuance endpoint, shared with the running server so
@@ -718,6 +767,31 @@ pub struct KeyWindow {
 }
 
 impl KeyWindow {
+    /// The windows of the epoch that ends issuing at `issue_until`, on a
+    /// calendar of `epoch_secs`-long epochs aligned to it: the pair a test
+    /// about a key's deadlines needs, since the client refuses any key whose
+    /// windows are not on its calendar.
+    pub fn epoch_ending_at(issue_until: i64, epoch_secs: u64) -> (Self, IssuerCalendar) {
+        let until = u64::try_from(issue_until).expect("a deadline after 1970");
+        let calendar = IssuerCalendar {
+            anchor_unix_secs: until % epoch_secs,
+            epoch_secs,
+        };
+        let epoch = calendar.epoch_at(until).expect("on the calendar") - 1;
+        (Self::of_epoch(&calendar, epoch), calendar)
+    }
+
+    /// Epoch `epoch`'s windows on `calendar`.
+    pub fn of_epoch(calendar: &IssuerCalendar, epoch: u64) -> Self {
+        let w = calendar.windows(epoch).expect("epoch in range");
+        let secs = |s: u64| i64::try_from(s).expect("in range");
+        Self::from_unix_secs(
+            secs(w.issue_from),
+            secs(w.issue_until),
+            secs(w.accept_until),
+        )
+    }
+
     /// A window given as unix seconds.
     pub fn from_unix_secs(issue_from: i64, issue_until: i64, accept_until: i64) -> Self {
         use eidola_server_gateway::helpers::unix_to_iso;
@@ -752,6 +826,9 @@ impl Default for MockConfig {
             issuance_extra_credits: 0,
             key_window: None,
             issuance: IssuanceKnobs::default(),
+            issuer_calendar: None,
+            key_swap: KeySwap::default(),
+            omit_previous_key: Arc::default(),
         }
     }
 }
@@ -1211,6 +1288,12 @@ struct Issuer {
     issuance_debits: AtomicU64,
     /// The credits all those debits converted.
     issuance_debited_credits: AtomicU64,
+    /// A public key listed as the previous epoch's, for an epoch the mock
+    /// never listed a current key for: stable for the mock's life.
+    decoy_public_key: Vec<u8>,
+    /// The key (id, base64 public key) the mock listed as current for each
+    /// epoch, first listing wins — what it lists as that epoch's key later.
+    listed: std::sync::Mutex<std::collections::HashMap<u64, (String, String)>>,
 }
 
 impl Issuer {
@@ -1238,6 +1321,11 @@ impl Issuer {
             issuance_requests: AtomicU64::new(0),
             issuance_debits: AtomicU64::new(0),
             issuance_debited_credits: AtomicU64::new(0),
+            decoy_public_key: PrivateKey::random(OsRng)
+                .public()
+                .to_cbor()
+                .expect("encode decoy public key"),
+            listed: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1701,11 +1789,13 @@ async fn handle_issuance(
     if let Some(status) = config.issuance.refusal() {
         return write_json(stream, status, &error_body("issuance refused")).await;
     }
-    if named_key != Some(issuer.key_id_hex.as_str()) {
+    // The key listed as current — the second one once a test swapped it.
+    let issuing = config.key_swap.active(issuer);
+    if named_key != Some(issuing.key_id_hex.as_str()) {
         return write_json(stream, 409, &error_body("issuer key is not current")).await;
     }
     match ir.and_then(|ir| {
-        issuer.issue(
+        issuing.issue(
             ir,
             credits + config.issuance_extra_credits,
             config.issuance_context,
@@ -1717,7 +1807,7 @@ async fn handle_issuance(
                 "issuer_key_id": config
                     .issued_key_id
                     .clone()
-                    .unwrap_or_else(|| issuer.key_id_hex.clone()),
+                    .unwrap_or_else(|| issuing.key_id_hex.clone()),
                 "credits": credits,
                 "ledger_entry_id": uuid_like(),
             })
@@ -3310,44 +3400,71 @@ fn models_body(config: &MockConfig) -> String {
 
 fn keys_body(issuer: &Issuer, config: &MockConfig) -> String {
     let ds = format!("ACT-v1:{DS_ORG}:{DS_SERVICE}:{DS_DEPLOYMENT}:{DS_VERSION}");
-    // Reproduce the production `/v1/keys` shape during a rotation grace
-    // window: a just-retired key (out of its `issue_from..issue_until` issuing
-    // window but still within `accept_until`) sorts *ahead* of the current
-    // key. It carries a different public key, so a client that selected by
-    // domain separator alone — every key shares one — would pick the decoy and
-    // fail proof verification against the current issuer (the original bug).
-    // The client must skip the out-of-window decoy and choose the current key.
-    let decoy_pk = PrivateKey::random(OsRng)
-        .public()
-        .to_cbor()
-        .expect("encode decoy public key");
-    let decoy_key_hash: [u8; 32] = Sha256::digest(&decoy_pk).into();
-    let window = config.key_window.clone().unwrap_or_else(|| KeyWindow {
-        issue_from: "2026-02-01T00:00:00Z".into(),
-        issue_until: "2030-01-01T00:00:00Z".into(),
-        accept_until: "2030-01-01T00:00:00Z".into(),
+    // Reproduce the production `/v1/keys` shape: the previous epoch's key
+    // (out of its issuing window but still within `accept_until`) sorts
+    // *ahead* of the current key. It carries a different public key, so a
+    // client that selected by domain separator alone — every key shares one
+    // — would pick the decoy and fail proof verification against the current
+    // issuer (the original bug). The client must skip the out-of-window
+    // decoy and choose the current key.
+    //
+    // Like an honest server, the mock remembers which key it listed for each
+    // epoch: the previous epoch's entry is the key it listed as current then
+    // (the decoy only for an epoch it never listed). So a mock that keeps one
+    // key across a boundary lists that key for two epochs, as a dishonest
+    // server would; a test wanting the next epoch accepted gives it a new key
+    // ([`KeySwap`]).
+    let calendar = config.issuer_calendar.unwrap_or(ISSUER_CALENDAR);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs();
+    let window = config.key_window.clone().unwrap_or_else(|| {
+        KeyWindow::of_epoch(&calendar, calendar.epoch_at(now).expect("on the calendar"))
     });
-    serde_json::json!({
-        "data": [
-            {
-                "id": hex::encode(decoy_key_hash),
-                "public_key": URL_SAFE_NO_PAD.encode(&decoy_pk),
-                "domain_separator": ds,
-                "issue_from": "2026-01-01T00:00:00Z",
-                "issue_until": "2026-02-01T00:00:00Z",
-                "accept_until": "2030-01-01T00:00:00Z",
-            },
-            {
-                "id": issuer.key_id_hex,
-                "public_key": issuer.public_key_b64(),
-                "domain_separator": ds,
-                "issue_from": window.issue_from,
-                "issue_until": window.issue_until,
-                "accept_until": window.accept_until,
-            }
-        ]
-    })
-    .to_string()
+    let current_epoch = eidola_app_core::iso_to_ms(&window.issue_from)
+        .ok()
+        .and_then(|ms| u64::try_from(ms.div_euclid(1000)).ok())
+        .and_then(|secs| calendar.epoch_at(secs))
+        .unwrap_or(0);
+    let current = config.key_swap.active(issuer);
+    let previous = {
+        let mut listed = issuer.listed.lock().unwrap();
+        listed
+            .entry(current_epoch)
+            .or_insert_with(|| (current.key_id_hex.clone(), current.public_key_b64()));
+        listed.get(&current_epoch.wrapping_sub(1)).cloned()
+    };
+    let (previous_id, previous_pk) = previous.unwrap_or_else(|| {
+        let hash: [u8; 32] = Sha256::digest(&issuer.decoy_public_key).into();
+        (
+            hex::encode(hash),
+            URL_SAFE_NO_PAD.encode(&issuer.decoy_public_key),
+        )
+    });
+    let decoy = KeyWindow::of_epoch(&calendar, current_epoch.saturating_sub(1));
+    let previous_entry = serde_json::json!({
+        "id": previous_id,
+        "public_key": previous_pk,
+        "domain_separator": ds,
+        "issue_from": decoy.issue_from,
+        "issue_until": decoy.issue_until,
+        "accept_until": decoy.accept_until,
+    });
+    let current_entry = serde_json::json!({
+        "id": current.key_id_hex,
+        "public_key": current.public_key_b64(),
+        "domain_separator": ds,
+        "issue_from": window.issue_from,
+        "issue_until": window.issue_until,
+        "accept_until": window.accept_until,
+    });
+    let data = if config.omit_previous_key.load(Ordering::SeqCst) {
+        vec![current_entry]
+    } else {
+        vec![previous_entry, current_entry]
+    };
+    serde_json::json!({ "data": data }).to_string()
 }
 
 fn error_body(message: &str) -> String {
@@ -3504,6 +3621,9 @@ pub fn core_for(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) 
         .build()
         .expect("plain http client");
     let core = AppCore::with_test_http_client(config_dir, data_dir, client).expect("open core");
+    if let Some(calendar) = config.issuer_calendar {
+        core.test_set_issuer_calendar(calendar);
+    }
     let mock = core.runtime().block_on(async { start(config).await });
     core.runtime()
         .block_on(core.set_base_url(mock.base_url.clone()))
