@@ -652,6 +652,9 @@ pub struct MockConfig {
     /// signing issuances, in the same epoch as the first. What a server
     /// rotating within an epoch (or singling a client out) looks like.
     pub key_swap: KeySwap,
+    /// Stop listing the previous epoch's key: a listing that leaves out the
+    /// one entry a key reused from it would otherwise collide with.
+    pub omit_previous_key: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// See [`MockConfig::key_swap`].
@@ -759,6 +762,7 @@ impl Default for MockConfig {
             key_window: None,
             issuer_calendar: None,
             key_swap: KeySwap::default(),
+            omit_previous_key: Arc::default(),
         }
     }
 }
@@ -3270,27 +3274,28 @@ fn keys_body(issuer: &Issuer, config: &MockConfig) -> String {
         )
     });
     let decoy = KeyWindow::of_epoch(&calendar, current_epoch.saturating_sub(1));
-    serde_json::json!({
-        "data": [
-            {
-                "id": previous_id,
-                "public_key": previous_pk,
-                "domain_separator": ds,
-                "issue_from": decoy.issue_from,
-                "issue_until": decoy.issue_until,
-                "accept_until": decoy.accept_until,
-            },
-            {
-                "id": current.key_id_hex,
-                "public_key": current.public_key_b64(),
-                "domain_separator": ds,
-                "issue_from": window.issue_from,
-                "issue_until": window.issue_until,
-                "accept_until": window.accept_until,
-            }
-        ]
-    })
-    .to_string()
+    let previous_entry = serde_json::json!({
+        "id": previous_id,
+        "public_key": previous_pk,
+        "domain_separator": ds,
+        "issue_from": decoy.issue_from,
+        "issue_until": decoy.issue_until,
+        "accept_until": decoy.accept_until,
+    });
+    let current_entry = serde_json::json!({
+        "id": current.key_id_hex,
+        "public_key": current.public_key_b64(),
+        "domain_separator": ds,
+        "issue_from": window.issue_from,
+        "issue_until": window.issue_until,
+        "accept_until": window.accept_until,
+    });
+    let data = if config.omit_previous_key.load(Ordering::SeqCst) {
+        vec![current_entry]
+    } else {
+        vec![previous_entry, current_entry]
+    };
+    serde_json::json!({ "data": data }).to_string()
 }
 
 fn error_body(message: &str) -> String {

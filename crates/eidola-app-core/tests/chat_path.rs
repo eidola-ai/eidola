@@ -1354,6 +1354,44 @@ fn a_key_kept_across_an_epoch_boundary_is_refused() {
     });
 }
 
+/// The record remembers which epoch each key was seen for, so a key reused
+/// for a later epoch is refused even when the listing leaves out the entry
+/// it would have collided with.
+#[test]
+fn a_key_seen_for_one_epoch_is_refused_for_the_next() {
+    run(|| {
+        let now = now_unix_secs();
+        let boundary = now + 6;
+        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
+        let config = MockConfig {
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        };
+        let omit = config.omit_previous_key.clone();
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the epoch's key issues");
+
+        omit.store(true, std::sync::atomic::Ordering::SeqCst);
+        sleep_past_unix_secs(boundary);
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect_err("a key already seen for the previous epoch is refused");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::OneKeyForSeveralEpochs { .. }
+                }
+            ),
+            "got {err:?}"
+        );
+    });
+}
+
 /// The record is kept on disk: a client that restarts still refuses a
 /// second key for an epoch it saw before the restart.
 #[test]
