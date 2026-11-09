@@ -1,6 +1,8 @@
 # Engine deployments
 
-One directory per Eidola-hosted engine deployment: `deploy/engine/<model-id>/<variant>/`, holding the deployment's `tinfoil-config.yml` and its `deployment.json` (weights provenance, GPU count, and the machines it runs on).
+One directory per Eidola-hosted engine deployment: `deploy/engine/<name>/<variant>/`, holding the deployment's `tinfoil-config.yml` and its `deployment.json` (the weights' architecture and provenance, the GPU count, and the machines it runs on). `<name>` is for people (the model's family, say); a deployment is identified by the weights it serves: its node's `EIDOLA_ENGINE_MODEL_ID` must be its `EIDOLA_ENGINE_WEIGHTS_SHA256`, it is pinned under that hash in `releases/trust/engine-enclaves.json`, and the hash must have a served row in the model catalog (`models/`, see its README).
+
+`deployment.json` names the weights' architecture, an implemented `eidola_common::architecture::Architecture` (`"architecture": "MimoV26Flash"`): the resource checks (KV bytes per position, the drafter, the executor's scratch) read that architecture's shape, and the draft width is held to its MTP layers. A stub architecture (`MimoV26Pro` today) is refused.
 
 A deployment runs the `cuda` executor on the platform release's GPU image (`cvm-version: X+gpu@sha256:<that image's release manifest>`; the CPU image refuses GPUs) with `EIDOLA_ENGINE_GPU_CC: "required"`, so the node checks its GPUs' confidential-computing mode before opening one; `not-required` is for unpinned development boots on a GPU without confidential computing, and the gateway's build refuses to pin it.
 

@@ -494,3 +494,24 @@ fn a_listed_id_never_holds_an_at_sign() {
         format!("sha256:{}", ROWS[0].sha256)
     );
 }
+
+/// The runtime's tag grammar is the one the build checks rows with.
+#[test]
+fn the_runtime_and_the_build_read_tags_alike() {
+    assert_eq!(super::MAX_TAG_LEN, file::MAX_TAG_LEN);
+    let long = "x".repeat(129);
+    for tag in [
+        "a",
+        "A.b_c-9",
+        "mimo-v2.6-flash",
+        "",
+        "a@b",
+        "a:b",
+        "a b",
+        "a/b",
+        "é",
+        &long,
+    ] {
+        assert_eq!(super::is_tag(tag), file::is_tag(tag), "{tag:?}");
+    }
+}

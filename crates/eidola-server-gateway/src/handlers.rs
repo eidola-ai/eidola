@@ -44,6 +44,9 @@ pub async fn health() -> impl IntoResponse {
 }
 
 /// List available models.
+///
+/// One entry per weights hash, with its tags, source, per-file manifest,
+/// lifecycle and the engine deployments that serve it (`docs/model-identity.md`).
 #[utoipa::path(
     get,
     path = "/v1/models",
@@ -393,6 +396,11 @@ fn check_sufficient_charge(
 /// Requires an ACT (Anonymous Credit Token) for authorization. The spend proof
 /// is verified, the nullifier is recorded, and a refund token is issued with
 /// any unspent credits.
+///
+/// `model` is `tag`, `tag@sha256:<hex>` or `sha256:<hex>` (a full SHA-256 in
+/// lowercase hex), resolved to the model's weights hash before anything else;
+/// the response's `model` is `tag@sha256:<hex>` (or `sha256:<hex>` for a
+/// hash named alone).
 #[utoipa::path(
     post,
     path = "/v1/chat/completions",
@@ -403,10 +411,12 @@ fn check_sufficient_charge(
     ),
     responses(
         (status = 200, description = "Chat completion response with privacy and verification metadata", body = EidolaResponse),
-        (status = 400, description = "Invalid request, or a missing or malformed refund recovery key (refused before the credential is spent)", body = ErrorResponse),
+        (status = 400, description = "Invalid request, a malformed model reference (`invalid_model_reference`: not `tag`, `tag@sha256:<hex>` or `sha256:<hex>`), or a missing or malformed refund recovery key (refused before the credential is spent)", body = ErrorResponse),
         (status = 401, description = "Authentication failed", body = ErrorResponse),
         (status = 402, description = "Insufficient charge amount", body = ErrorResponse),
-        (status = 409, description = "Credential already spent", body = ErrorResponse),
+        (status = 404, description = "The model reference names no model (`model_not_found`); refunded in full", body = ErrorResponse),
+        (status = 409, description = "Credential already spent, or a `tag@sha256:<hex>` reference whose tag does not resolve to that hash (`model_reference_mismatch`, refunded in full)", body = ErrorResponse),
+        (status = 410, description = "The model reference names a retired model (`model_retired`); refunded in full", body = ErrorResponse),
         (status = 502, description = "Upstream provider error", body = ErrorResponse),
         (status = 503, description = "No upstream is available for the model", body = ErrorResponse)
     )
