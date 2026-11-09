@@ -43,7 +43,7 @@ Client                                                    Server (in enclave)
   |   body: "credentials": [{token, refund_key}, ...]          | parse all, static checks (§6.1)
   |                                                            | verify every proof
   |                                                            | record all nullifiers atomically
-  |                                                            | H = Σ s_i; check H ≥ W
+  |                                                            | H = Σ s_i; check H = W
   |                                                            | run inference, settle C ≤ H
   |                                                            | allocate C in order (§6.3)
   |                                                            | refund_i = VerifyAndRefund(sk_i, proof_i, t_i)
@@ -133,7 +133,7 @@ A server MUST process a request in this order, and MUST NOT record any nullifier
 3. **Duplicates.** The inputs' nullifiers MUST be pairwise distinct, compared per issuer key. A repeated nullifier refuses the whole request. Two inputs with the same nullifier are two spends of one credential instance; ACT permits a client to produce them (with different shares), and they are exactly the forking attempt nullifiers exist to stop.
 4. **Verify every proof.** `VerifySpendProof(skᵢ, proofᵢ)` under each input's own key, with the key's spend deadline re-checked under the same lock or snapshot the verification uses. All proofs must verify. A server SHOULD run the checks of steps 1 to 3 for every input before verifying any proof, since they are cheap and the proofs are not (§8.7).
 5. **Record atomically** (§6.2). If any nullifier is already recorded, record none and refuse the request.
-6. **Validate the request** against the pricing contract: the model exists, the completion ceiling is within the model's declared ceiling, and `H ≥ W`. A failure here is after recording, so it MUST be answered with full refunds (§6.6, class 3).
+6. **Validate the request** against the pricing contract: the model exists, the completion ceiling is within the model's declared ceiling, and `H = W` exactly. A failure here is after recording, so it MUST be answered with full refunds (§6.6, class 3).
 7. **Serve.** Dispatch the request; on a dispatch failure, answer with full refunds (class 4).
 8. **Settle.** Compute the charge `C` by the deployment's settlement rule with `H` in place of the single-spend charge, clamped so that `C ≤ H`. Allocate it (§6.3), issue one refund per input (§6.4), store each (§6.5), and respond (§5.3).
 
@@ -208,7 +208,7 @@ A server MUST verify the proof before recording a nullifier on the recovery path
 |---|---|---|---|---|
 | 1 | Parsing, counting, static checks, duplicates, any proof's verification, any key unknown or past `accept_until` | none | none | Recover every input through `POST /v1/credentials/refund` (each gets a full refund into a fresh successor). Do not present the same proofs again (§7.7). |
 | 2 | Recording: some input's nullifier already recorded | none (rolled back) | none (`409`) | Recover every input. The one already recorded returns its stored refund if it has one; the others are recorded now and fully refunded. |
-| 3 | Request validation after recording (unknown model, ceiling, `H < W`) | all | all, `tᵢ = sᵢ` | Construct every successor. |
+| 3 | Request validation after recording (unknown model, ceiling, `H ≠ W`) | all | all, `tᵢ = sᵢ` | Construct every successor. |
 | 4 | Dispatch or upstream failure | all | all, `tᵢ = sᵢ` | Construct every successor. |
 | 5 | Settled (including a stream that ended early) | all | all, by §6.3 | Construct every successor; discard empty ones. |
 | 6 | Response lost after any of 3 to 5 | all | stored, sealed per input | Recover each input by its own nullifier and key. |
@@ -271,7 +271,7 @@ The order of §7.2 produces this. Every element of that order is already visible
 
 A share is either `W` (a single input), a drain's balance (§7.5), or a fill derived from `W` and the drains. In the last case, `W` is computed by the server from the request itself and the drain shares are already in the proofs, so the fill share discloses nothing new. A client MUST NOT size any other share from a balance. A partial share sized from a credential's balance would reveal the balance without draining it, and a sequence of such shares would let an issuer that remembers amounts reconstruct a credential's history.
 
-The shares sum to exactly `W`, the same hold a single-input spend of the same request would show. A client MAY over-hold (present `H > W`), but SHOULD NOT, since `H` is otherwise a constant of the request.
+The shares sum to exactly `W`, the same hold a single-input spend of the same request would show. A client MUST NOT over-hold, and the server refuses any `H ≠ W` (§6.1 step 6): an over-hold would be a degree of freedom a client could fingerprint itself with, and with `H = W` the charge for a request without reported usage, the whole hold, is never more than the worst case.
 
 ### 7.5 When to drain
 
@@ -435,7 +435,7 @@ The database sees what the issuer's store holds: one `nullifier` row per input, 
 
 - **Sealed refund tokens.** Each input carries its own recovery key derived from its own `PreRefund`, and its refund is sealed on its own row (§5.1, §6.5). Nothing new is persisted in the clear, and recovering one input never requires another's key.
 - **Public denomination.** Provisioning issues credentials of one public $1 denomination. A hold up to $1 is always covered by a fresh credential, so multi-input requests serve mainly to drain residuals, recovering what would otherwise be stranded. With `N_max = 2`, two credentials can also cover a hold above what either holds alone. A hold no pair covers falls to step 4 of §7.2 and the client's ordinary allocation rule.
-- **Holds and ceilings.** `W` is computed exactly as today, from the request and the model's declared completion ceiling. The server's check is `H ≥ W`, with `H` the sum of the shares. A server that charges the whole hold when the upstream reports no usage would charge `H`; with canonical shares `H = W`, as for a single spend (§13.1 proposes requiring `H = W`).
+- **Holds and ceilings.** `W` is computed exactly as today, from the request and the model's declared completion ceiling. The server's check is `H = W`, with `H` the sum of the shares, for one input as for two. A request without reported usage is charged the whole hold, which is therefore exactly `W`.
 - **Tool rounds and continuations.** Every round of a tool loop takes its own inputs, exactly as it takes its own credential today. A round may drain (§7.2), and a hold may not be abandoned unsettled to take another, for every input.
 - **Prefix caching.** A `cache_key` links the requests of one lineage whatever their inputs, and multi-input requests change nothing about it. If charges ever depend on whether a prompt prefix was cached (a declared-prefix discount), `C` falls, so drains are less often fully consumed, making issuer-known successors more frequent in model A, and the hold `W` must still assume no discount, since the client cannot know the cache state.
 
@@ -496,11 +496,11 @@ Decided:
 - **Body transport, exclusively** (§5.1), with `credentials` and `refunds` always arrays.
 - **`L = 32`** (§5.5).
 - **Input choice without thresholds** (§7.2): oldest key first, then smallest; drain the first credential when it cannot cover the hold. Exact drains; rounding deferred until the population makes it meaningful; no deferral rule (§9.3).
+- **Hold equality:** `H = W` exactly, for every request (§7.4).
 
 Open:
 
-1. **Hold equality.** Require `H = W` exactly, refusing an over-hold, which also settles what a request without reported usage is charged.
-2. **Privacy-guarantee wording.** §2.2 says redemptions are cryptographically unlinkable. With exact drains, that remains true against everyone outside the enclave but rests on the measured code for drained credentials (§9.2). A proposed addition: *"A request may present up to two anonymous credentials. Credentials presented together are known to come from one client, which places the request among the accounts issued at least two credentials under each presented key; the client provisions two credentials per epoch so that this is every account that provisioned. A credential drained to zero discloses its balance to the server's measured code, which retains no per-request amount."*
+1. **Privacy-guarantee wording.** §2.2 says redemptions are cryptographically unlinkable. With exact drains, that remains true against everyone outside the enclave but rests on the measured code for drained credentials (§9.2). A proposed addition: *"A request may present up to two anonymous credentials. Credentials presented together are known to come from one client, which places the request among the accounts issued at least two credentials under each presented key; the client provisions two credentials per epoch so that this is every account that provisioned. A credential drained to zero discloses its balance to the server's measured code, which retains no per-request amount."*
 
 ### 13.2 For a working-group discussion
 
