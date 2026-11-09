@@ -274,9 +274,10 @@ pub(crate) async fn issue_refund_async(
     })
 }
 
-/// How long a stream ended at its deadline offers its terminal metadata to a
-/// client that is not reading: the refund is already stored, so this bounds
-/// only how long the task waits to hand it over in band.
+/// How long past its deadline (or, for a stream cut off there, past the cut)
+/// a stream offers its terminal metadata to a client that is not reading: the
+/// refund is already stored, so this bounds only how long the task waits to
+/// hand it over in band, on every ending.
 const DEADLINE_DELIVERY_GRACE: Duration = Duration::from_secs(5);
 
 /// The answer to a request ended at its deadline
@@ -914,18 +915,27 @@ async fn handle_streaming_request(
         }
 
         /// Send a metadata SSE event containing a refund, then [DONE].
+        ///
+        /// Abandoned at `until`, whatever ending it closes: a client that
+        /// holds its connection open without reading does not hold the task
+        /// past the request's deadline (and its grace), and the refund is
+        /// stored before this runs.
         async fn send_metadata_event(
             tx: &padding::EventSender,
             refund_info: Option<RefundInfo>,
             privacy: crate::response::PrivacyMetadata,
             verification: crate::response::VerificationMetadata,
             chat_id: String,
+            until: tokio::time::Instant,
         ) {
             let stream_meta =
                 EidolaStreamMetadata::new(chat_id, privacy, verification, refund_info);
             let json_str = serde_json::to_string(&stream_meta).unwrap();
-            let _ = tx.send(StreamEvent::Json(json_str)).await;
-            let _ = tx.send(StreamEvent::Done).await;
+            let _ = tokio::time::timeout_at(until, async {
+                let _ = tx.send(StreamEvent::Json(json_str)).await;
+                let _ = tx.send(StreamEvent::Done).await;
+            })
+            .await;
         }
 
         /// The request reached its deadline mid-stream: settled as a stream
@@ -948,13 +958,19 @@ async fn handle_streaming_request(
             let refund_info = try_refund(state, spent, 0).await;
             let privacy = build_privacy_metadata(auth_context, true, provider);
             let verification = build_verification_metadata(None);
-            let _ = tokio::time::timeout(
-                DEADLINE_DELIVERY_GRACE,
-                send_metadata_event(tx, refund_info, privacy, verification, String::new()),
+            send_metadata_event(
+                tx,
+                refund_info,
+                privacy,
+                verification,
+                String::new(),
+                tokio::time::Instant::now() + DEADLINE_DELIVERY_GRACE,
             )
             .await;
         }
 
+        // Every terminal metadata write is abandoned by then.
+        let delivery_until = deadline + DEADLINE_DELIVERY_GRACE;
         let mut final_usage: Option<Usage> = None;
         let mut timing = StreamTiming::new(model_id.clone(), dispatched_at);
 
@@ -1053,6 +1069,7 @@ async fn handle_streaming_request(
                         privacy,
                         verification,
                         meta.chat_id.unwrap_or_default(),
+                        delivery_until,
                     )
                     .await;
                     return;
@@ -1065,8 +1082,15 @@ async fn handle_streaming_request(
                     let refund_info = try_refund(&state, &spent, 0).await;
                     let privacy = build_privacy_metadata(&auth_context, true, provider);
                     let verification = build_verification_metadata(None);
-                    send_metadata_event(&tx, refund_info, privacy, verification, String::new())
-                        .await;
+                    send_metadata_event(
+                        &tx,
+                        refund_info,
+                        privacy,
+                        verification,
+                        String::new(),
+                        delivery_until,
+                    )
+                    .await;
                     return;
                 }
             }
@@ -1079,7 +1103,15 @@ async fn handle_streaming_request(
         let refund_info = try_refund(&state, &spent, 0).await;
         let privacy = build_privacy_metadata(&auth_context, true, provider);
         let verification = build_verification_metadata(None);
-        send_metadata_event(&tx, refund_info, privacy, verification, String::new()).await;
+        send_metadata_event(
+            &tx,
+            refund_info,
+            privacy,
+            verification,
+            String::new(),
+            delivery_until,
+        )
+        .await;
     });
 
     Ok(padding::padded_sse_response(padded))
