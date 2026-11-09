@@ -27,7 +27,7 @@ This document uses the terms of the ACT specification (`draft-schlesinger-cfrg-a
 - **Worst-case cost** (`W`): the pre-flight minimum hold the server computes from the request under the pricing contract the client and server share (`eidola_common`): the prompt charge plus the completion ceiling at the completion rate, or the flat per-request price.
 - **Charge** (`C`): the amount the server finally charges the request, `0 ≤ C ≤ H`.
 - **Consumption** (`aᵢ`): the part of `C` allocated to input `i`. Its partial return is `tᵢ = sᵢ − aᵢ`.
-- **Drain**: an input whose share equals the credential's entire remaining balance (`sᵢ = cᵢ`), or that balance rounded down to a public step (§7.5).
+- **Drain**: an input whose share equals the credential's entire remaining balance (`sᵢ = cᵢ`).
 - **Fill**: the input whose share is derived from the hold rather than from a balance (`s_fill = W − Σ drains`).
 - **Accepting key**: an issuer key `K` with `now < accept_until(K)`. Keys rotate weekly and accept for one further epoch, so at most two keys accept at once (three for an instant at a boundary).
 
@@ -228,7 +228,7 @@ This specification closes it for single and multi-input requests alike with a **
 
 - The marker travels inside the sealed refund (so the database learns nothing from it beyond the overwrite it already sees), and recovery returns it: `POST /v1/credentials/refund` answers a provisional refund with `"provisional": true`, and a final one with `"provisional": false`.
 - The server MUST overwrite every provisional refund of a request with a final one when the request ends for any reason (classes 3 to 5 of §6.6), before or as it responds.
-- The server publishes `T_settle`, the longest a request can remain unsettled after its nullifiers are recorded (the request's maximum duration plus settlement). A provisional refund still stored `T_settle` after recording can only be a crash's.
+- The server ends every request no later than 30 minutes after its nullifiers are recorded, stopping a stream that is still running and settling it as a stream that ended early (class 5). So `T_settle`, the longest a refund can stay provisional without a crash, is 30 minutes, fixed in the pricing contract client and server share. A provisional refund still stored after that can only be a crash's. Clock skew and settlement are covered by the client waiting `T_settle` from when it sent the request, which is before the server recorded anything.
 
 On a provisional answer, the client MUST keep the input pending. It MAY construct and store the provisional successor, but MUST NOT spend it, and retries recovery later. It settles the input when recovery returns a final refund, or, once `T_settle` has passed since it sent the request, accepts the provisional successor as final. Pending state is durable (§7.1), so a restart preserves it. The deadline that bounds every input applies here too: the input's key retains refunds until `accept_until + retention`, and a successor is only worth anything if it can be spent before `accept_until`. A client that reaches its spend margin while an input is still provisional accepts the provisional successor at that point.
 
@@ -242,23 +242,30 @@ The client MUST take every input of a request in one atomic local step: under th
 
 ### 7.2 Choosing inputs
 
-Inputs and shares are chosen so that the amounts reveal nothing that a single spend would not, except the balances of drained inputs (§9.2). For a request with worst-case cost `W`:
+Inputs and shares are chosen so that the amounts reveal nothing that a single spend would not, except the balances of drained inputs (§9.2). The rule has no thresholds or tunable parameters. For a request with worst-case cost `W`:
 
-1. **No drain due:** if some credential covers `W`, spend the best-fitting one (the smallest that covers `W`) alone, with share `W`. That is today's rule, and the common case.
-2. **A drain due** (§7.5): present the drains first, then a fill. The fill is the best-fitting credential covering `W − Σ drains`, preferring one under the same key as the drains (§7.6), with share `W − Σ drains`. If the drains alone cover `W`, the last drain becomes the fill instead: its share is `W` minus the shares before it.
-3. **No credential covers `W`, and no combination of due drains and a fill does:** allocate a new credential (one public denomination, never an amount derived from `W`), and spend it alone. That request MUST NOT also drain (§9.3).
-4. **A hold no single credential could ever cover** (only possible where holds may exceed the denomination): present drains of as many credentials as needed, soonest-expiring first, plus a fill, within `N_max`. With Eidola's `N_max = 2` that is one drain and one fill. This is the case the fixed denomination is designed to make unnecessary; §9.7 discusses it.
+1. **Order the wallet.** Take the credentials available for a spend now (not in flight, and before their spend deadline), sorted by key `accept_until` ascending, then balance ascending, then nullifier bytes. All credentials under one key share an `accept_until`, so this is: oldest key first, smallest first within a key.
+2. **One input.** If the first credential covers `W`, spend it alone with share `W`.
+3. **Two inputs.** Otherwise the first credential, with balance `a < W`, is drained: present it first with share `a`, then the first later credential in the order that covers `W − a`, with share `W − a`.
+4. **A new credential.** If no later credential covers `W − a` (or the wallet is empty), allocate a new credential by the client's ordinary allocation rule and use it as that later credential (or alone, for an empty wallet).
 
 The client MUST NOT present an input whose spend deadline (`accept_until` minus the client's margin) has passed. The request's own deadline is the earliest of its inputs'.
+
+Consequences of the rule, all accepted:
+
+- **Draining is eager.** A credential is drained as soon as it is the first in order and cannot cover the request at hand. Holds vary by request, so a credential that could have paid a cheaper request alone may be drained by a dearer one. No value is lost by that: the drain is consumed only by `a₁ ≤ C`, and its change comes back under its own key.
+- **Runs of two-input requests.** A drained credential that is not fully consumed returns as a smaller successor (§6.3), which is again first in order and below `W`, so it is drained again on the next request, until a charge exhausts it. Because charges are usually far below `W`, one credential's tail can take several consecutive two-input requests. Each is placed in `A₂(K)`, which two-credential provisioning makes every provisioning account (§9.1), and in Eidola's deployment the drained balances are visible only to the measured code (§9.2).
+- **Less concurrency.** During such a run each request holds two credentials, so a client with two credentials can have only one request in flight; a concurrent request finds nothing free and allocates a new credential (step 4). That costs no value, only more credits held ahead of need, which lapse with their key if unspent. The client's provisioning keeps enough credentials on hand for its usual concurrency.
+- **Oldest value first.** Ordering by `accept_until` spends an older key's credentials before a newer key's, so value is consumed in the order it would lapse, and a residual under the older key is drained into a request whose fill is under the newer key when the older key has no fill (§7.6).
 
 ### 7.3 Canonical order
 
 A client SHOULD order inputs as a deterministic function of public information only:
 
-1. drains before the fill;
-2. among drains, by key `accept_until` ascending (soonest-expiring value is consumed first), then by share ascending, then by nullifier bytes ascending.
+1. the drain before the fill;
+2. with more than one drain (only where `N_max > 2`), by key `accept_until` ascending (soonest-expiring value is consumed first), then by share ascending, then by nullifier bytes ascending.
 
-Every element of that order is already visible in the request, so the order adds nothing (the nullifier tie-break is uniformly random). An order that depends on anything else (a balance, a local id, a history) would leak it. Whether the server should enforce the canonical order rather than honour any order is an open question (§13.2).
+The order of §7.2 produces this. Every element of that order is already visible in the request, so the order adds nothing (the nullifier tie-break is uniformly random). An order that depends on anything else (a balance, a local id, a history) would leak it. Whether the server should enforce the canonical order rather than honour any order is an open question (§13.2).
 
 ### 7.4 Shares never come from balances, except drains
 
@@ -268,11 +275,10 @@ The shares sum to exactly `W`, the same hold a single-input spend of the same re
 
 ### 7.5 When to drain
 
-A credential is a **drain candidate** when it is too small to be the best fit for the holds the client expects: its balance is below a client constant `θ` (RECOMMENDED: the smallest worst-case hold on any model the client offers), or its spend deadline is within a horizon (RECOMMENDED: one day) and it cannot cover the request at hand. A candidate is drained by presenting it with its whole balance as its share.
+A credential is drained exactly when §7.2 puts it first and it cannot cover the request (step 3). It is drained by presenting its whole balance as its share.
 
-- **Rounding.** A client MAY round a drain's share down to a multiple of a public step `Δ`, stranding less than `Δ` and revealing the balance only to precision `Δ`. Eidola's client uses `Δ = 1` (exact drains), for the reason given in §9.2. A deployment in which the issuer is an adversary for amounts SHOULD use a larger step, or SHOULD strand issuer-known successors (§9.2).
-- **Deferral.** A client MUST NOT drain in the first request it sends after an issuance it performed, and SHOULD drain at a request chosen at random among the following ones, before the candidate's deadline (§9.3).
-- **Usually one drain per key** is due at a time under this policy: a drained input that is not fully consumed comes back as a smaller successor, which is drained again later, so a wallet rarely holds more than one small credential under a key.
+- **Exact drains.** Eidola's client drains exact balances, for the reason given in §9.2. A client MAY instead round a drain's share down to a multiple of a public step `Δ`, stranding less than `Δ` and revealing the balance only to precision `Δ`. A deployment in which the issuer is an adversary for amounts SHOULD do so, or SHOULD strand issuer-known successors (§9.2). How coarse `Δ` must be to matter depends on the population, so Eidola defers it.
+- **No deferral.** A client may drain in any request, including the first after an issuance. §9.3 explains why a deferral rule was considered and not adopted.
 
 ### 7.6 Mixing issuer keys
 
@@ -407,13 +413,13 @@ The allocation rule is what keeps this from being worse. Because `tᵢ` is deter
 
 ### 9.3 Issuance-adjacent timing
 
-The issuer sees issuance times on the account-linked surface and request times on the anonymous one. A client provisioning credentials on demand already sends its first spend from a new credential shortly after the issuance; that spend is one of many single spends under the key. A drain-and-fill request sent right after an issuance would be much rarer (about one per credential lifetime, which with typical charges far below the worst case spans tens to hundreds of requests), and would sit next to an account's second issuance under the key. That would correlate the account with the request far more sharply. Hence §7.5: no drain in the first request after an issuance, and drains at randomly chosen later requests. Provisioning ahead of need, so that issuance is not tied to a particular request, helps further and is RECOMMENDED where the account balance allows.
+The issuer sees issuance times on the account-linked surface and request times on the anonymous one. A client provisioning credentials on demand already sends its first spend from a new credential shortly after the issuance; that spend is one of many single spends under the key. A drain-and-fill request sent right after an issuance would be much rarer (about one per credential lifetime, which with typical charges far below the worst case spans tens to hundreds of requests), and would sit next to an account's second issuance under the key. That would correlate the account with the request far more sharply. A deferral rule would avoid that: no drain in the first request after an issuance, and drains at randomly chosen later requests. Eidola does not adopt one, for three reasons. Provisioning ahead of need, at randomized times, already separates issuances from the requests that follow them. Provisioning two credentials per epoch makes the second issuance under a key ordinary rather than a sign of a drain (§9.1). And a deferral rule needs wallet state ("issued since the last spend") written by the background provisioner and read by concurrent requests, which is the kind of race-prone coupling the rule of §7.2 is designed to avoid. A deferral would never make a request impossible (a fresh credential always covers a hold up to the denomination), so it remains available if the analysis changes.
 
 ### 9.4 Input count and order
 
 **Order.** The canonical order (§7.3) is a function of the keys and shares already visible, plus a random tie-break, so it discloses nothing further. A client using another order would expose its implementation, and whatever its order depends on.
 
-**Count.** `N` discloses how many drains are due, which is a function of the client's wallet state. Under §7, `N` is 1 for most requests and 2 when draining, and Eidola's `N_max` allows no more. Every client that uses its credentials down drains at some point, so `N = 2` is common to all such clients, and because drains are deferred randomly, when one happens is not tied to the client's issuances.
+**Count.** `N` discloses how many drains are due, which is a function of the client's wallet state. Under §7, `N` is 1 for most requests and 2 when draining, and Eidola's `N_max` allows no more. Every client that uses its credentials down drains, in runs (§7.2), so `N = 2` is common to all such clients.
 
 **Padding to a fixed count was considered and rejected.** Padding with zero-share inputs (ACT permits spending zero, which only refreshes a credential) would make every request present `N_max` proofs. That needs `N_max` live credentials per request (most clients hold one or two), multiplies proof size and verification by `N_max` on every request, and every padding input would still disclose its key and that its holder owns at least that many credentials, which is the §9.1 linkage again, so padding trades one fingerprint for another, larger one. For the same reason, servers refuse zero-share inputs: they pay for nothing and are a degree of freedom for fingerprinting. Whether the working group wants fixed or bucketed counts is an open question.
 
@@ -428,9 +434,9 @@ The database sees what the issuer's store holds: one `nullifier` row per input, 
 ### 9.7 Interactions
 
 - **Sealed refund tokens.** Each input carries its own recovery key derived from its own `PreRefund`, and its refund is sealed on its own row (§5.1, §6.5). Nothing new is persisted in the clear, and recovering one input never requires another's key.
-- **Fixed public denomination.** With every issuance of `D` and every hold bounded by `D/k`, a fresh credential always covers a hold, so problem 2 of §1 does not arise and multi-input requests serve mainly to drain residuals, recovering what would otherwise be stranded (up to `D/k` per credential). Multi-input requests would also let `D` be lowered, or holds be allowed above `D` (covered by several credentials, rule 4 of §7.2), at the costs of §9.1 and §9.2. Lowering `D` splits the issuance anonymity set by client version and is out of scope.
+- **Public denomination.** Provisioning issues credentials of one public $1 denomination. A hold up to $1 is always covered by a fresh credential, so multi-input requests serve mainly to drain residuals, recovering what would otherwise be stranded. With `N_max = 2`, two credentials can also cover a hold above what either holds alone. A hold no pair covers falls to step 4 of §7.2 and the client's ordinary allocation rule.
 - **Holds and ceilings.** `W` is computed exactly as today, from the request and the model's declared completion ceiling. The server's check is `H ≥ W`, with `H` the sum of the shares. A server that charges the whole hold when the upstream reports no usage would charge `H`; with canonical shares `H = W`, as for a single spend (§13.1 proposes requiring `H = W`).
-- **Tool rounds and continuations.** Every round of a tool loop takes its own inputs, exactly as it takes its own credential today. A round may drain, subject to §7.5, and a hold may not be abandoned unsettled to take another, for every input.
+- **Tool rounds and continuations.** Every round of a tool loop takes its own inputs, exactly as it takes its own credential today. A round may drain (§7.2), and a hold may not be abandoned unsettled to take another, for every input.
 - **Prefix caching.** A `cache_key` links the requests of one lineage whatever their inputs, and multi-input requests change nothing about it. If charges ever depend on whether a prompt prefix was cached (a declared-prefix discount), `C` falls, so drains are less often fully consumed, making issuer-known successors more frequent in model A, and the hold `W` must still assume no discount, since the client cannot know the cache state.
 
 ## 10. Alternatives considered
@@ -485,17 +491,16 @@ Decided:
 
 - **`N_max = 2`** (§5.5), paired with provisioning two $1 credentials per epoch (§9.1), revisited when the population grows.
 - **Mixed keys** are allowed, to drain an older key's residual before it stops accepting (§7.6). Each input's refund stays under its own key.
-- **Provisional refunds** (§6.7) are adopted for single and multi-input requests alike, marked provisional and published with `T_settle`.
+- **Provisional refunds** (§6.7) are adopted for single and multi-input requests alike, marked provisional, with `T_settle` = 30 minutes enforced by the server as a hard limit on a request's duration.
 - **No presentation binding.** A per-request binding of spend proofs is a change to ACT, not something this extension can build, and it is not needed for soundness (§8.4).
 - **Body transport, exclusively** (§5.1), with `credentials` and `refunds` always arrays.
 - **`L = 32`** (§5.5).
+- **Input choice without thresholds** (§7.2): oldest key first, then smallest; drain the first credential when it cannot cover the hold. Exact drains; rounding deferred until the population makes it meaningful; no deferral rule (§9.3).
 
 Open:
 
-1. **Drain parameters.** `θ`, the deadline horizon, `Δ = 1`, and the deferral rule (§7.5).
-2. **Hold equality.** Require `H = W` exactly, refusing an over-hold, which also settles what a request without reported usage is charged.
-3. **`T_settle`** (§6.7): its value, and whether the gateway enforces it as a hard limit on request duration.
-4. **Privacy-guarantee wording.** §2.2 says redemptions are cryptographically unlinkable. With exact drains, that remains true against everyone outside the enclave but rests on the measured code for drained credentials (§9.2). A proposed addition: *"A request may present up to two anonymous credentials. Credentials presented together are known to come from one client, which places the request among the accounts issued at least two credentials under each presented key; the client provisions two credentials per epoch so that this is every account that provisioned. A credential drained to zero discloses its balance to the server's measured code, which retains no per-request amount."*
+1. **Hold equality.** Require `H = W` exactly, refusing an over-hold, which also settles what a request without reported usage is charged.
+2. **Privacy-guarantee wording.** §2.2 says redemptions are cryptographically unlinkable. With exact drains, that remains true against everyone outside the enclave but rests on the measured code for drained credentials (§9.2). A proposed addition: *"A request may present up to two anonymous credentials. Credentials presented together are known to come from one client, which places the request among the accounts issued at least two credentials under each presented key; the client provisions two credentials per epoch so that this is every account that provisioned. A credential drained to zero discloses its balance to the server's measured code, which retains no per-request amount."*
 
 ### 13.2 For a working-group discussion
 
