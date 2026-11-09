@@ -1,6 +1,6 @@
 # Spending several anonymous credits in one request
 
-**Status: design specification, not implemented.** Nothing in this document describes the current behaviour of the Eidola server or client. It specifies an extension to how Eidola presents Privacy Pass Anonymous Credit Tokens (ACT), written so that its normative parts can be adapted into a section of an Internet-Draft. Where it depends on mechanisms that are proposed but not yet merged (sealed refund tokens and the `x-eidola-refund-key` header; the client's spend deadline of `accept_until` minus a margin; a fixed public issuance denomination), it says so and assumes the proposed behaviour.
+**Status: design specification, not implemented.** Nothing in this document describes the current behaviour of the Eidola server or client. It specifies an extension to how Eidola presents Privacy Pass Anonymous Credit Tokens (ACT), written so that its normative parts can be adapted into a section of an Internet-Draft. It builds on mechanisms Eidola already has: sealed refund tokens with a client-held refund-recovery key, the client's spend deadline of `accept_until` minus a margin, and provisioning credentials of one public $1 denomination ahead of need.
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 (RFC 2119, RFC 8174) when, and only when, they appear in all capitals.
 
@@ -40,8 +40,8 @@ Client                                                    Server (in enclave)
   | choose inputs 1..N and shares s1..sN (§7)                  |
   | ProveSpend(cred_i, s_i) for each i, mark all spending      |
   |-- POST /v1/chat/completions -----------------------------> |
-  |   Authorization: PrivateToken tokens="<TokenList>"         | parse all, static checks (§6.1)
-  |   x-eidola-refund-key: <key1>,<key2>,...                   | verify every proof
+  |   body: "credentials": [{token, refund_key}, ...]          | parse all, static checks (§6.1)
+  |                                                            | verify every proof
   |                                                            | record all nullifiers atomically
   |                                                            | H = Σ s_i; check H ≥ W
   |                                                            | run inference, settle C ≤ H
@@ -52,7 +52,7 @@ Client                                                    Server (in enclave)
   |               refund_i, state_i)                           |
 ```
 
-A request with one input is today's single spend: the same header parameter, the same proof, the same processing and the same refund. Only two spellings change, for every request alike (§11): the token value gains base64url padding, and the response's refund moves into a one-element `refunds` array.
+A request with one input is the same spend as today's, with the same proof, the same processing and the same refund. Only the transport changes, for every request alike (§11): the Token and its refund-recovery key move from request headers into the request body, as a one-element `credentials` array, and the response's refund moves into a one-element `refunds` array.
 
 ## 4. Relationship to the ACT cryptography
 
@@ -60,54 +60,38 @@ The extension changes nothing in ACT. Every input is produced by an unmodified `
 
 ## 5. Wire format
 
-### 5.1 Request: the Authorization header
+### 5.1 Request: the `credentials` member
 
-A request with **one** input is unchanged. It carries one Token (`draft-schlesinger-privacypass-act`, Token Creation) in the `token` parameter of the `PrivateToken` authentication scheme (RFC 9577, Section 2.2.2):
+Every request that spends carries its inputs in the request body, never in a header. The body of every endpoint that takes a spend is a JSON object (for inference, the OpenAI-compatible request), and the inputs are a top-level `credentials` member, an array with one element per input, in input order:
 
-```text
-Authorization: PrivateToken token="<base64url(Token)>"
+```json
+"credentials": [
+  { "token": "<base64url(Token)>", "refund_key": "<64 lowercase hex digits>" },
+  { "token": "<base64url(Token)>", "refund_key": "<64 lowercase hex digits>" }
+]
 ```
 
-A request with **two or more** inputs carries them in a new `tokens` parameter of the same scheme, whose value is the base64url encoding of a `TokenList`:
+- **`token`** is one Token exactly as `draft-schlesinger-privacypass-act` defines it (Token Creation): `token_type`, `challenge_digest`, `issuer_key_id` and the encoded spend proof. Its bytes are unchanged; only where they travel differs.
+- **`refund_key`** is that input's refund-recovery key: with sealed refund tokens, 32 bytes derived by the client from that input's own `PreRefund` state, as exactly 64 lowercase hexadecimal digits. Each input has its own `PreRefund`, and therefore its own key, so the key travels beside the Token it belongs to rather than in a parallel list.
 
-```text
-Authorization: PrivateToken tokens="<base64url(TokenList)>"
-```
+The order of the array is the order of the inputs: element 1 is input 1. Rules:
 
-```text
-struct {
-    opaque token<1..2^16-1>;   /* one Token, exactly as the base specification defines it */
-} TokenEntry;
+- **Always an array.** `credentials` is an array whatever the input count, `1 ≤ N ≤ N_max`, so every count has one encoding and a single input is not a special case. A server MUST refuse a request with more than `N_max` elements before decoding any spend proof.
+- **Body only.** A server MUST refuse a request that carries a credential anywhere else (an `Authorization: PrivateToken` header, or the legacy refund-key header), so there is one transport and nothing to reconcile between two.
+- **Strict members.** Each element has exactly the members `token` and `refund_key`. A server MUST refuse an unknown member, a missing one, a duplicated member name (in an element or at the top level), and a `credentials` value that is not an array.
+- **Encoding.** `token` is base64url (RFC 4648, Section 5) with padding, and a server MUST refuse a value that does not re-encode to itself (non-zero pad bits, missing padding, or whitespace). `refund_key` MUST be lowercase hex; uppercase digits, whitespace or a wrong length are refused. Each Token MUST decode with no trailing bytes.
+- **Uniform type.** Every Token MUST carry the same `token_type` (`0xE5AD`) and the same `challenge_digest`. Tokens MAY name different `issuer_key_id` values (§7.6 says when a client should).
+- **Not forwarded.** The server removes `credentials` before the request leaves it for the inference backend, as it removes every other field the backend does not need.
 
-struct {
-    TokenEntry entries<1..2^24-1>;
-} TokenList;
-```
+**Why the body.** One Token at Eidola's former `L = 128` was about 24 KB as base64url, which already exceeded common header limits of 8 to 16 KB: nginx (`large_client_header_buffers`, 8 KB per line), Apache (`LimitRequestFieldSize`, 8,190 bytes), Node.js (16 KB in total), and hyper's HTTP/2 server on Eidola's own path, which advertises a 16 KB `SETTINGS_MAX_HEADER_LIST_SIZE`. It worked only because TLS terminates inside the attested enclave, so every hop that parses the request is one Eidola configures. A list would have been larger still. Request bodies have no such limits along the path, the request is read whole before it is authorized in any case, and the ACT issuance protocol already carries its messages as request content. This departs from RFC 9577, whose `PrivateToken` scheme puts a Token in the `Authorization` header; §13.2 raises that with the working group.
 
-The order of `entries` is the order of the inputs: entry 1 is input 1. Rules:
+### 5.2 (Removed)
 
-- **Exactly one form.** A request MUST carry exactly one of `token` and `tokens`, never both. `tokens` MUST carry at least two entries: a single input MUST use `token`. So every input count has one encoding, and a single input is byte-identical to the base specification.
-- **Count.** `2 ≤ N ≤ N_max`. A server MUST refuse a request with more than `N_max` entries before decoding any spend proof.
-- **Self-delimiting entries.** Each entry is length-prefixed, so the list parses whether the Token's spend-proof field is fixed-length (the `-01` CBOR encoding Eidola uses, where the proof runs to the end of the Token) or itself length-prefixed (the current editor's draft). Each entry MUST parse as exactly one Token with no trailing bytes, and the list MUST have no trailing bytes.
-- **Uniform type.** Every entry MUST carry the same `token_type` (`0xE5AD`) and the same `challenge_digest`. Entries MAY name different `issuer_key_id` values (§7.6 says when a client should).
-- **Encoding.** RFC 9577 requires the base64url value to include padding. Both parameters MUST use base64url (RFC 4648, Section 5) with padding, and a server MUST refuse a value that does not re-encode to itself (non-zero pad bits, missing padding, or whitespace). The value is sent as a quoted-string, because padding introduces `=`. The current Eidola implementation omits padding on the single-token path; §11 changes that, so there is one canonical spelling.
-- **Unknown parameters.** RFC 9577 requires unknown `PrivateToken` parameters to be ignored, so a server that does not implement this extension sees a request with `tokens` and no `token`. It refuses that request as unauthenticated before recording anything (§6.6, class 1), so a client talking to an older server loses nothing.
-
-The `Authorization` field carries one set of credentials and is not a list-based field (RFC 9110, Section 11.6.2), so the inputs cannot be spread across several `Authorization` lines. RFC 9110 (Section 11.2) lets a parameter name occur only once per challenge, and repeating `token` in credentials would invite the same ambiguity: an RFC 9577 origin reading the first or the last `token` would process one input of several. A new parameter of the existing scheme carrying one list is the least disruptive encoding that avoids both.
-
-### 5.2 Request: refund-recovery keys
-
-With sealed refund tokens (proposed alongside this specification), every spend carries `x-eidola-refund-key`, 32 bytes as exactly 64 lowercase hexadecimal digits, derived by the client from that spend's `PreRefund` state. Each input has its own `PreRefund`, and therefore its own key. A request with `N` inputs carries exactly `N` keys, in input order, joined by single commas with no whitespace:
-
-```text
-x-eidola-refund-key: 3f2a...c901,8be0...11d4
-```
-
-The field MUST appear on exactly one field line, with exactly `N` entries. A server MUST refuse any other spelling (uppercase digits, whitespace, an empty entry, a count that does not match the inputs) with `400` before recording any nullifier. With one input the field is byte-identical to the single-spend form.
+The separate refund-recovery header is gone: each input's key travels in its `credentials` element (§5.1).
 
 ### 5.3 Response: refunds
 
-Every response that follows the recording of the inputs' nullifiers (§6.6, classes 3 to 5) carries one refund per input, in input order, in a `refunds` array that replaces today's single `refund` object, in the JSON body of a blocking response or error and in the final metadata event of a streamed response:
+Every response that follows the recording of the inputs' nullifiers (§6.6, classes 3 to 5) carries one refund per input, in input order, in a `refunds` array that replaces today's single `refund` object (an array even for one input, mirroring `credentials`), in the JSON body of a blocking response or error and in the final metadata event of a streamed response:
 
 ```json
 "refunds": [
@@ -122,15 +106,21 @@ Refunds travel in the body rather than in a response header, because a streamed 
 
 ### 5.4 Refund recovery is per input
 
-`POST /v1/credentials/refund` is unchanged and takes exactly one input in the `token` parameter, with that input's one refund-recovery key. A recovery request carrying `tokens` MUST be refused. Each input of a multi-input request is recovered by its own nullifier and its own key, independently of the others (§6.5).
+`POST /v1/credentials/refund` takes exactly one input, in the same body form as §5.1: `{"credentials": [{"token": …, "refund_key": …}]}`, an array of exactly one element. A recovery request with any other count MUST be refused. Its answer carries `refunds` as an array of one, with the `provisional` marker of §6.7. Each input of a multi-input request is recovered by its own nullifier and its own key, independently of the others (§6.5).
 
 ### 5.5 Sizes and limits
 
-Eidola's ACT parameters use `L = 128`. One spend proof is 18,071 bytes of CBOR (the ACT draft's formula, `32 × (14 + 4L)` bytes, gives 16,832 bytes of raw proof), so one Token is 18,137 bytes and one `token` value is 24,184 base64url characters. One refund is 176 bytes of CBOR. With `N_max = 2` the `tokens` value is about 48,400 characters.
+Eidola's ACT parameters use `L = 32`: a balance lies in `[0, 2^32)` credits, and since one credit is a millionth of a US dollar, one credential can hold up to about $4,294, over four thousand times the $1 issuance denomination. The ACT specification leaves `L` to the deployment (it must be at most 252) and does not signal it in keys, Tokens or challenges, so client and server fix it at build time. Measured with `anonymous-credit-tokens` 0.4.2 (release build, one thread, an Apple-silicon laptop; enclave hardware will differ):
+
+| `L` | Spend proof (CBOR) | Token as base64url | Prove | Verify and refund |
+|---|---|---|---|---|
+| 32 | 4,919 B | about 6.6 KB | 1.4 ms | 1.8 ms |
+| 64 | 9,303 B | about 12.5 KB | 2.5 ms | 3.1 ms |
+| 128 | 18,071 B | about 24.2 KB | 4.9 ms | 6.1 ms |
+
+Size and cost are linear in `L` (the ACT draft gives `32 × (14 + 4L)` bytes of raw proof). `L` bounds only the largest representable balance; it does not change what a proof hides or what the issuer learns. One refund is 176 bytes of CBOR whatever `L` is.
 
 **`N_max` for Eidola is 2.** That is one drain and one fill (§7.2), under one key or, to drain an expiring residual, under two (§7.6). The protocol is written for a general `N_max`, and §9.1 is why Eidola's is the smallest useful one: every input beyond the first narrows the request's anonymity set, and at a small population that cost dominates. A deployment with a larger population could raise it.
-
-**Header size is a real constraint, already for one input.** Common defaults cap a single header field, or the whole header block, at 8 to 16 KB: nginx (`large_client_header_buffers`, 8 KB per line), Apache (`LimitRequestFieldSize`, 8,190 bytes), Node.js (16 KB in total), and, on Eidola's own path, hyper's HTTP/2 server, which advertises a 16 KB `SETTINGS_MAX_HEADER_LIST_SIZE`. hyper's HTTP/1.1 server buffers about 400 KB, and Go's `net/http` 1 MB. A single 24 KB `token` value therefore already exceeds many defaults, and works for Eidola only because TLS terminates inside the attested enclave, so every hop that parses the request is one Eidola deploys and configures. A list of two doubles that. Header limits along the request path MUST admit `N_max` Tokens, and the gateway MUST set its HTTP/2 header-list limit explicitly rather than inherit the default. Whether the inputs should instead travel in the request body is an open question (§13.1); a body transport would also be the natural generic answer for a working group, since the ACT issuance protocol already carries its messages as request content. Proof size scales linearly with `L`, so a smaller `L` is the other lever (§13.1).
 
 ## 6. Server processing
 
@@ -138,7 +128,7 @@ Eidola's ACT parameters use `L = 128`. One spend proof is 18,071 bytes of CBOR (
 
 A server MUST process a request in this order, and MUST NOT record any nullifier before step 5.
 
-1. **Parse.** Decode the `Authorization` value per §5.1 and the refund keys per §5.2. Refuse on any error, on `N > N_max`, or on a key count different from `N`.
+1. **Parse.** Decode the `credentials` member per §5.1. Refuse on any error, on `N > N_max`, or on a credential carried outside the body.
 2. **Static checks, every input.** `token_type` is `0xE5AD`. `challenge_digest` equals the expected digest. `issuer_key_id` names a key the server holds that is usable for a spend now (`now < accept_until`). The proof's `ctx` equals that key's request context. The share decodes to an integer (`ScalarToCredit`) and is at least 1 (zero shares are refused; see §9.4). The hold `H = Σ sᵢ` is computed with checked arithmetic.
 3. **Duplicates.** The inputs' nullifiers MUST be pairwise distinct, compared per issuer key. A repeated nullifier refuses the whole request. Two inputs with the same nullifier are two spends of one credential instance; ACT permits a client to produce them (with different shares), and they are exactly the forking attempt nullifiers exist to stop.
 4. **Verify every proof.** `VerifySpendProof(skᵢ, proofᵢ)` under each input's own key, with the key's spend deadline re-checked under the same lock or snapshot the verification uses. All proofs must verify. A server SHOULD run the checks of steps 1 to 3 for every input before verifying any proof, since they are cheap and the proofs are not (§8.7).
@@ -363,6 +353,7 @@ An ACT spend proof is not bound to anything outside itself. Its Fiat–Shamir tr
 - **Against recovery:** recovery of an unrecorded input records it, so a later request containing it is refused whole, and the request's other inputs remain recoverable (§6.5).
 - **After a crash mid-request:** the nullifiers are either all recorded or none are, so no input is half-spent, and the provisional refunds (§6.7) mean no remainder is lost.
 - **Several refunds of one proof** (provisional, then final; or a recovery that raced the response): the successors share one nullifier, so at most one is ever spendable, and no value is created. The provisional marker keeps the client from spending the smaller one while the larger may still come (§6.7).
+- **No forks.** A fork would be two successors of one spend that are both spendable. Every refund the server issues for a spend signs the commitment `K′` carried inside that spend's proof, and `K′` fixes the successor's nullifier `k*`, so every successor of one spend, however many refunds it receives and whatever their `t`, has the same `k*`. Spending any of them records `k*` and refuses the rest, and every later successor in the chain descends from the one spend that was accepted. Three server rules keep this airtight, and each is already required: a refund is only ever issued for a proof whose nullifier is recorded (§6.1, §6.5), recovery of a recorded nullifier returns the stored refund and never signs a fresh full refund, and a nullifier row outlives every successor that shares its key (§8.6). A refund cannot be issued against a different `K′`, because `K′` is inside the verified proof and not chosen by the server.
 - **After a key's deadline:** an input under a key past `accept_until` refuses the request before recording (class 1). A nullifier is never pruned while its key could accept a spend, so a spend cannot be replayed after its nullifier was pruned.
 
 ### 8.6 Key rotation and epochs
@@ -371,7 +362,7 @@ The epoch rule is that no value extends into a later epoch beyond the existing g
 
 ### 8.7 Cost and denial of service
 
-Verification is the expensive step, and it runs before anything is recorded, so an unauthenticated sender can make the server verify up to `N_max` invalid proofs per request instead of one. Measured with `anonymous-credit-tokens` 0.4.2 at `L = 128` (release build, one thread, an Apple-silicon laptop; enclave hardware will differ): decoding a proof takes about 0.36 ms, proving about 5.4 ms, and verifying plus signing a refund about 6.0 ms. So `N_max = 2` bounds a bogus request to roughly 12 ms of verification. The bounds:
+Verification is the expensive step, and it runs before anything is recorded, so an unauthenticated sender can make the server verify up to `N_max` invalid proofs per request instead of one. Verifying plus signing a refund takes about 1.8 ms per input at `L = 32` (§5.5; enclave hardware will differ). So `N_max = 2` bounds a bogus request to roughly 4 ms of verification. The bounds:
 
 - the count is checked before any proof is decoded, and the cheap static checks for every input (key, context, digest, share, duplicates) run before any proof is verified (§6.1);
 - verification stops at the first invalid proof; which index failed is visible only to the sender;
@@ -395,7 +386,7 @@ What is new is that the issuer learns that `N` credential instances, under the p
 
 For a client that drains, the second issuance under `K` happens anyway: the drain exists because a credential ran low and another was issued. What multi-input adds is that one request is placed in `A₂(K)`. If, say, 30% of an epoch's accounts are issued twice, a drain request's anonymity set is 30% of a single spend's. In a small deployment, where `A₁(K)` is already small (see [Known gaps → Anonymity-set size](../gaps.md#anonymity-set-size)), this can be decisive.
 
-**Making `A₂(K)` the common case.** The reduction is a function of how many accounts have two issuances under a key, and that is a client policy, not a property of usage. Eidola's client provisions credentials ahead of need. If it provisions **two** credentials at the start of each epoch it uses, each of one public denomination, then every provisioning account is in `A₂(K)` from the start, and `A₂(K) = A₁(K)` for those accounts: a drain-and-fill request is placed among every account that provisioned under `K`, not among the heavy users. A further issuance under `K` moves an account into `A₃(K)`, which matters only if `N_max ≥ 3`; with `N_max = 2` nothing a request presents can distinguish two issuances from more. This is why Eidola caps `N_max` at 2 and pairs it with two-credential provisioning. The cost is that a client holds two denominations' worth of credits per epoch rather than one, and more value is exposed to lapse at a key's `accept_until`; issuing two credentials of half the denomination would avoid that, at the price of a second public denomination.
+**Making `A₂(K)` the common case.** The reduction is a function of how many accounts have two issuances under a key, and that is a client policy, not a property of usage. Eidola's client provisions credentials ahead of need. If it provisions **two** credentials at the start of each epoch it uses, each of one public denomination, then every provisioning account is in `A₂(K)` from the start, and `A₂(K) = A₁(K)` for those accounts: a drain-and-fill request is placed among every account that provisioned under `K`, not among the heavy users. A further issuance under `K` moves an account into `A₃(K)`, which matters only if `N_max ≥ 3`; with `N_max = 2` nothing a request presents can distinguish two issuances from more. This is why Eidola caps `N_max` at 2 and pairs it with two-credential provisioning. Both are credentials of the one public $1 denomination, so provisioning adds no new amount to the issuance surface. The cost is that a client holds $2 of credits per epoch rather than $1, and more value is exposed to lapse at a key's `accept_until`; the client's existing rules (spend the soonest-expiring credential that fits, and drain an expiring residual, §7.6) keep that small.
 
 **Compared with the alternatives (§10).** A same-key merge endpoint links the same instances and places the merge in the same `A_n(K)`, and adds an extra request whose timing is separate from any inference request. Single spends link nothing, but strand residuals and, if holds can approach the denomination, push towards issuances sized to holds, which link an account to a request outright.
 
@@ -428,7 +419,7 @@ The issuer sees issuance times on the account-linked surface and request times o
 
 ### 9.5 Network observer
 
-Requests are not padded: their size already reveals the prompt's size. Each input adds about 24 KB, so a network observer learns `N` from a request's size, and also from the server's longer pre-flight (about 6 ms per input). That is wallet state, not content, and it is the same `N` the issuer sees. The response's `refunds` add about 330 bytes per input, which can move a padded response into the next size bucket or a streamed response's metadata into one more frame; that reveals the same `N`.
+Requests are not padded: their size already reveals the prompt's size. Each input adds about 6.7 KB, so a network observer learns `N` from a request's size, and also from the server's longer pre-flight (about 2 ms per input). That is wallet state, not content, and it is the same `N` the issuer sees. The response's `refunds` add about 330 bytes per input, which can move a padded response into the next size bucket or a streamed response's metadata into one more frame; that reveals the same `N`.
 
 ### 9.6 Database observer (model B)
 
@@ -436,9 +427,9 @@ The database sees what the issuer's store holds: one `nullifier` row per input, 
 
 ### 9.7 Interactions
 
-- **Sealed refund tokens.** Each input carries its own recovery key derived from its own `PreRefund`, and its refund is sealed on its own row (§5.2, §6.5). Nothing new is persisted in the clear, and recovering one input never requires another's key.
+- **Sealed refund tokens.** Each input carries its own recovery key derived from its own `PreRefund`, and its refund is sealed on its own row (§5.1, §6.5). Nothing new is persisted in the clear, and recovering one input never requires another's key.
 - **Fixed public denomination.** With every issuance of `D` and every hold bounded by `D/k`, a fresh credential always covers a hold, so problem 2 of §1 does not arise and multi-input requests serve mainly to drain residuals, recovering what would otherwise be stranded (up to `D/k` per credential). Multi-input requests would also let `D` be lowered, or holds be allowed above `D` (covered by several credentials, rule 4 of §7.2), at the costs of §9.1 and §9.2. Lowering `D` splits the issuance anonymity set by client version and is out of scope.
-- **Holds and ceilings.** `W` is computed exactly as today, from the request and the model's declared completion ceiling. The server's check is `H ≥ W`, with `H` the sum of the shares. A server that charges the whole hold when the upstream reports no usage would charge `H`; with canonical shares `H = W`, as for a single spend (§13.1 asks whether to cap it at `W`).
+- **Holds and ceilings.** `W` is computed exactly as today, from the request and the model's declared completion ceiling. The server's check is `H ≥ W`, with `H` the sum of the shares. A server that charges the whole hold when the upstream reports no usage would charge `H`; with canonical shares `H = W`, as for a single spend (§13.1 proposes requiring `H = W`).
 - **Tool rounds and continuations.** Every round of a tool loop takes its own inputs, exactly as it takes its own credential today. A round may drain, subject to §7.5, and a hold may not be abandoned unsettled to take another, for every input.
 - **Prefix caching.** A `cache_key` links the requests of one lineage whatever their inputs, and multi-input requests change nothing about it. If charges ever depend on whether a prompt prefix was cached (a declared-prefix discount), `C` falls, so drains are less often fully consumed, making issuer-known successors more frequent in model A, and the hold `W` must still assume no discount, since the client cannot know the cache state.
 
@@ -463,25 +454,26 @@ Rejected outright: rolling a credential's remainder into the current key at expi
 
 Eidola is pre-production and starts fresh: no installed client or server needs to interoperate across this change.
 
-- **Single spends become the one-input case.** The `token` parameter, the single refund-recovery key and the recovery endpoint keep their form (apart from the padding change below). The server's processing of a one-input request is today's.
-- **Response shape.** `refund` (an object) becomes `refunds` (an array of one per input) in blocking responses, error bodies and the streamed metadata event; `openapi.json` is regenerated.
-- **Encoding.** The `token` value becomes padded base64url (RFC 9577), and the server refuses the unpadded spelling. The current implementation is unpadded.
+- **Single spends become the one-input case.** The Token's bytes, the refund-recovery key and the recovery endpoint keep their meaning; only their transport changes.
+- **Transport.** The `Authorization: PrivateToken` header and the `x-eidola-refund-key` header are replaced by the body's `credentials` array (§5.1), on inference and recovery alike, and a credential in a header is refused.
+- **Response shape.** `refund` (an object) becomes `refunds` (an array of one per input) in blocking responses, error bodies, recovery answers and the streamed metadata event; `openapi.json` is regenerated.
+- **`L` from 128 to 32.** A wire change for proofs and issuance alike: every `::<128>` in client and server becomes the one shared constant, and existing credentials are not carried over.
 - **Server store.** No schema change: one `nullifier` row per input, as today. Recording becomes a multi-row transaction. Provisional refunds (§6.7), if adopted, write `refund_token` at insertion.
 - **Client store.** In-flight inputs are grouped per request (a group identifier on the pending-refund rows), which is a schema change under the fresh-start rule (bump the local schema version; old development databases are refused).
 - **Privacy guarantees.** The new disclosures (§9.1, §9.2) are reflected in `docs/privacy-guarantees.md` §2 and `docs/gaps.md` when this is implemented; proposed wording is an open question below.
-- **Privacy Pass interoperability.** A server that does not implement `tokens` refuses a multi-input request without recording anything (§5.1), and the client recovers its inputs. A client can therefore send multi-input requests only to servers it knows implement them; Eidola's client knows its server.
+- **Privacy Pass interoperability.** The body transport is specific to this extension: a generic RFC 9577 origin expects a Token in the `Authorization` header and would treat a request carrying only `credentials` as unauthenticated, recording nothing. A client can therefore use it only with servers it knows implement it; Eidola's client knows its server.
 
 ## 12. Test-vector and test plan
 
 **Allocation vectors (normative).** Tables of `(shares in order, C) → (aᵢ, tᵢ)`, including: `N = 1` (today's single spend); `C = 0`; `C = H`; `C` at every prefix boundary (exactly `s₁`, `s₁ + s₂`, …); `C` one either side of each boundary; shares near `2^63` and checked overflow of `H`; and the example of §6.3. Property tests: `Σ aᵢ = C`, `0 ≤ tᵢ ≤ sᵢ`, the prefix structure, and determinism.
 
-**Wire vectors.** Deterministic proofs from a seeded RNG (the crate accepts any `CryptoRngCore`; the ACT specification's appendix parameters and key), producing: the `TokenList` bytes and the `tokens` header value for `N = 2, 3, 4`; the refund-key header; and the expected refunds for given `tᵢ` (refund randomness seeded too). Negative vectors, each refused before anything is recorded: `N = 1` in `tokens`; both `token` and `tokens`; `N > N_max`; an unpadded value; non-zero pad bits; an entry with trailing bytes; a list with trailing bytes; mixed `token_type`; mixed `challenge_digest`; a duplicated nullifier (same credential, two shares); a zero share; a key count that does not match; uppercase hex; whitespace in the key list.
+**Wire vectors.** Deterministic proofs from a seeded RNG (the crate accepts any `CryptoRngCore`; the ACT specification's appendix parameters and key), producing: the `credentials` member for `N = 1` and `N = 2`, and the expected refunds for given `tᵢ` (refund randomness seeded too). Negative vectors, each refused before anything is recorded: an empty array; `N > N_max`; `credentials` not an array; a Token or refund key in a header; an unknown, missing or duplicated member; an unpadded value; non-zero pad bits; a Token with trailing bytes; mixed `token_type`; mixed `challenge_digest`; a duplicated nullifier (same credential, two shares); a zero share; uppercase hex; whitespace or a wrong length in a refund key.
 
 **Server processing, against a real Postgres.** One invalid proof among valid ones records nothing; one already-recorded nullifier rolls back the rest, and recovery then fully refunds each of the others; mixed keys settle each refund under its own key and each successor completes only under its own key; an input under a key past `accept_until` refuses the request; a request accepted just before one input's deadline settles every input after it; recovery of an unrecorded input followed by its request's late arrival records nothing for the request; concurrent requests sharing nullifiers in opposite orders do not deadlock; a crash injected after recording (with and without provisional refunds) leaves each input's remainder recoverable as specified; class 3 and class 4 failures return full refunds for every input.
 
 **Client, in the chat harness.** Every exit point of a multi-input round settles every input; inputs are taken atomically (a crash between proofs leaves none marked spending); canonical order; no drain right after an issuance; drains defer and still happen before a credential's deadline; mixed keys only to drain an expiring residual; a refund that does not verify triggers recovery of that input alone; a response whose partial returns break the prefix structure is surfaced; and the bus exit-point table gains the new rows.
 
-**Limits.** A request with `N_max` Tokens passes the attestation shim and the gateway's HTTP stack, over HTTP/1.1 and HTTP/2.
+**Limits.** A request with `N_max` Tokens and a large prompt passes the attestation shim and the gateway's body limit, over HTTP/1.1 and HTTP/2.
 
 **Teeth.** As the repository's practice: each property above, mutated (allocation from the end instead of the start, a non-atomic insert, a missing duplicate check, a partial return moved between inputs, a refund signed under the wrong key), makes its tests fail.
 
@@ -491,27 +483,24 @@ Eidola is pre-production and starts fresh: no installed client or server needs t
 
 Decided:
 
-- **`N_max = 2`** (§5.5), paired with two-credential provisioning per epoch (§9.1), revisited when the population grows.
+- **`N_max = 2`** (§5.5), paired with provisioning two $1 credentials per epoch (§9.1), revisited when the population grows.
 - **Mixed keys** are allowed, to drain an older key's residual before it stops accepting (§7.6). Each input's refund stays under its own key.
 - **Provisional refunds** (§6.7) are adopted for single and multi-input requests alike, marked provisional and published with `T_settle`.
 - **No presentation binding.** A per-request binding of spend proofs is a change to ACT, not something this extension can build, and it is not needed for soundness (§8.4).
-- **Encoding.** Padded base64url per RFC 9577, already the single-spend spelling.
+- **Body transport, exclusively** (§5.1), with `credentials` and `refunds` always arrays.
+- **`L = 32`** (§5.5).
 
 Open:
 
-1. **Transport.** Keep the inputs in the `Authorization` header (`token` / `tokens`, about 24 KB per input, so every hop's header limit must be raised and pinned), or carry them in the request body for every request, one input or two (§5.5)?
-2. **Two-credential provisioning.** Two credentials of the full denomination (more value held and exposed to lapse), or two of half the denomination (a second public denomination)?
-3. **Drain parameters.** `θ`, the deadline horizon, `Δ = 1`, and the deferral distribution.
-4. **Settlement without usage.** Charge the hold `H` (today's rule) or `min(H, W)`?
-5. **Response shape.** A `refunds` array always (proposed), or keep `refund` for one input?
-6. **Smaller `L`.** Every proof is about 18 KB at `L = 128`; `L = 64` would roughly halve it and the verification cost, at a much smaller representable balance.
-7. **`T_settle`** (§6.7): its value, and whether it is published in the model catalog or fixed in the client.
-8. **Privacy-guarantee wording.** §2.2 says redemptions are cryptographically unlinkable. With exact drains, that remains true against everyone outside the enclave but rests on the measured code for drained credentials (§9.2). A proposed addition: *"A request may present up to two anonymous credentials. Credentials presented together are known to come from one client, which places the request among the accounts issued at least two credentials under each presented key; the client provisions two credentials per epoch so that this is every account that provisioned. A credential drained to zero discloses its balance to the server's measured code, which retains no per-request amount."*
+1. **Drain parameters.** `θ`, the deadline horizon, `Δ = 1`, and the deferral rule (§7.5).
+2. **Hold equality.** Require `H = W` exactly, refusing an over-hold, which also settles what a request without reported usage is charged.
+3. **`T_settle`** (§6.7): its value, and whether the gateway enforces it as a hard limit on request duration.
+4. **Privacy-guarantee wording.** §2.2 says redemptions are cryptographically unlinkable. With exact drains, that remains true against everyone outside the enclave but rests on the measured code for drained credentials (§9.2). A proposed addition: *"A request may present up to two anonymous credentials. Credentials presented together are known to come from one client, which places the request among the accounts issued at least two credentials under each presented key; the client provisions two credentials per epoch so that this is every account that provisioned. A credential drained to zero discloses its balance to the server's measured code, which retains no per-request amount."*
 
 ### 13.2 For a working-group discussion
 
 1. **Scope.** Is presenting several ACT Tokens in one HTTP request in scope for the Privacy Pass ACT binding, or a deployment matter?
-2. **Encoding and transport.** A new `tokens` parameter on `PrivateToken` (proposed), a list-valued dedicated field, or the request body? One ACT Token is already larger than many deployed header limits (§5.5), so a body transport may be needed even for single spends. How should a multi-input presentation signal itself to an origin that ignores unknown parameters?
+2. **Transport.** One ACT Token is larger than many deployed header limits at practical `L` (§5.1), so Eidola carries Tokens in the request body. Should the Privacy Pass ACT binding define a body transport, for one Token or several, alongside RFC 9577's `Authorization` header, and how should an origin signal which it accepts?
 3. **Allocation as origin policy or as specification.** The base specification lets the origin choose `t`. A multi-input binding needs a public, deterministic rule so clients can order inputs for privacy and detect deviations; is in-order consumption the right one to standardize?
 4. **Advertising `N_max`.** A challenge attribute, alongside `cost`?
 5. **Challenge `cost` with several Tokens.** Should `Σ sᵢ` equal `cost` exactly, or be at least `cost`?
