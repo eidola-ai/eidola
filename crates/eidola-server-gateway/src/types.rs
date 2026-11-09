@@ -575,8 +575,31 @@ pub struct ModelsResponse {
 /// A model descriptor.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Model {
-    /// The model identifier (e.g. "openai/gpt-4o").
+    /// The id to request the model by: its first tag, which follows the tag
+    /// (`tag`), or `sha256:<hex>` when it has none. A request may also name
+    /// `tag@sha256:<hex>` (the tag, asserted to resolve to this hash) or
+    /// `sha256:<hex>` (these weights, under any tag).
     pub id: String,
+
+    /// The model's identity: its weights hash, lowercase hex
+    /// (`docs/model-identity.md`).
+    pub sha256: String,
+
+    /// Every tag that resolves to this hash. Each tag names exactly one hash.
+    pub tags: Vec<String>,
+
+    /// The model architecture (`MimoV26Flash`, …).
+    pub architecture: String,
+
+    /// Where the weights come from, and every file the hash covers.
+    pub weights: WeightsProvenance,
+
+    /// Whether the model is current or deprecated, and when it retires.
+    pub lifecycle: ModelLifecycle,
+
+    /// The engine deployments that serve these weights: each config's hash
+    /// and the attestation measurement this gateway holds it to.
+    pub deployments: Vec<EngineDeploymentPin>,
 
     /// Human-readable display name.
     pub name: String,
@@ -604,6 +627,59 @@ pub struct Model {
 
     /// Pricing in integer credits per 1k tokens.
     pub pricing: ModelPricing,
+}
+
+/// Where a model's weights come from, and every file its hash covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct WeightsProvenance {
+    /// The source repository, `<owner>/<name>` (on Hugging Face).
+    pub repo: String,
+    /// The source repository's revision (a 40-hex-digit commit).
+    pub revision: String,
+    /// Every file the weights hash covers, sorted by path. The hash is the
+    /// SHA-256 of `<sha256>␠␠<path>\n` over these, in this order.
+    pub files: Vec<WeightsFileEntry>,
+}
+
+/// One file the weights hash covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct WeightsFileEntry {
+    /// The file's name, in the weights directory and in the repository.
+    pub path: String,
+    /// Its size in bytes.
+    pub size: u64,
+    /// Its SHA-256, lowercase hex.
+    pub sha256: String,
+}
+
+/// A model's place in its lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ModelLifecycle {
+    /// `current` or `deprecated` (a retired model is not listed).
+    pub status: LifecycleStatus,
+    /// For a deprecated model, the announced retirement date, `YYYY-MM-DD`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retire_after: Option<String>,
+}
+
+/// A listed model's lifecycle status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleStatus {
+    Current,
+    Deprecated,
+}
+
+/// One engine deployment that serves a model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct EngineDeploymentPin {
+    /// SHA-256 of the deployment's committed `tinfoil-config.yml`, lowercase
+    /// hex (on Intel TDX, its MRCONFIGID).
+    pub config_sha256: String,
+    /// The attestation measurement every connection to the deployment is
+    /// held to, in `tinfoil-verifier`'s pin shape.
+    #[schema(value_type = Object)]
+    pub measurement: serde_json::Value,
 }
 
 /// One capability leaf.

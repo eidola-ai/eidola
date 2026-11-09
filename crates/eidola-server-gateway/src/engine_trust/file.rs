@@ -5,8 +5,8 @@
 //! with this before checking anything else, and the running gateway reads its
 //! pins with it (`allowed_measurements`), so a file the build accepts is a
 //! file the runtime can read. Every level is strict: unknown members and
-//! repeated members are refused, the latter including a model id repeated in
-//! `models` (which a plain map would silently collapse to its last value).
+//! repeated members are refused, the latter including a weights hash repeated
+//! in `models` (which a plain map would silently collapse to its last value).
 //!
 //! Compiled into `build.rs` too (`#[path]`), so it uses nothing from the
 //! crate and only `serde` and `tinfoil-verifier`, both build-dependencies.

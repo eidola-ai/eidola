@@ -2,7 +2,8 @@
 //! build accepts, computed from the committed deployments.
 //!
 //! Each Eidola-hosted engine deployment is a directory
-//! `deploy/engine/<model-id>/<variant>/` holding:
+//! `deploy/engine/<name>/<variant>/` holding (`<name>` a label for people;
+//! a deployment is identified by the weights hash it serves):
 //!
 //! - `tinfoil-config.yml` — the deployment's Tinfoil Container config, deployed
 //!   and measured exactly as the gateway's own: the `eidola-server-engine`
@@ -11,7 +12,7 @@
 //!   platform release manifest inline (`X+gpu@sha256:<hex>`: the release's GPU
 //!   image, which the `cuda` executor needs).
 //! - `deployment.json` — what a pin needs that the config does not determine:
-//!   the weights' provenance (`repo`, `revision`), the GPU count the
+//!   the weights' architecture and provenance (`repo`, `revision`), the GPU count the
 //!   deployment presents evidence for, and the machines its hosts are: one
 //!   policy of a vendored platform endorsements release (tag and file hash),
 //!   plus the PCK platform flags the endorsements do not carry.
@@ -76,7 +77,8 @@ pub fn required_release(config: &[u8]) -> Result<(String, String)> {
     Ok((release.version, sha))
 }
 
-/// The `engine-enclaves.json` entry for one deployment of `model_id`.
+/// The `engine-enclaves.json` entry for one deployment, filed under the
+/// weights hash it serves.
 ///
 /// The deployment is checked by `eidola_common::engine_deployment::deployment::
 /// check_deployment`, the one check the gateway's build also runs on every
@@ -84,14 +86,13 @@ pub fn required_release(config: &[u8]) -> Result<(String, String)> {
 /// What only this tool adds is the launch identity from the platform release;
 /// the pin is then compiled by the attesting client's own pin compiler
 /// (`tinfoil_verifier::validate_pins`), as the gateway's build compiles it.
-pub fn deployment_entry(model_id: &str, inputs: &DeploymentInputs<'_>) -> Result<Entry> {
+pub fn deployment_entry(inputs: &DeploymentInputs<'_>) -> Result<Entry> {
     let sidecar_path = inputs
         .config_path
         .strip_suffix("tinfoil-config.yml")
         .map(|dir| format!("{dir}deployment.json"))
         .context("the config path must end in tinfoil-config.yml")?;
     let checked = check_deployment(
-        model_id,
         inputs.config_path,
         inputs.config,
         &sidecar_path,
@@ -168,14 +169,22 @@ pub struct Entry {
     pub identity: ModelIdentity,
 }
 
-/// The whole file, from every model's checked entries. Each model's
-/// deployments are first held to agree by
+/// The whole file, from every deployment's checked entry, grouped under the
+/// weights hash each serves. Each model's deployments are first held to
+/// agree by
 /// `eidola_common::engine_deployment::deployment::check_model_agreement`, the
 /// per-model rule the gateway's build also runs, so the file rendered is one
 /// that build accepts.
-pub fn render(entries: BTreeMap<String, Vec<Entry>>) -> Result<String> {
+pub fn render(entries: Vec<Entry>) -> Result<String> {
+    let mut grouped: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
+    for entry in entries {
+        grouped
+            .entry(entry.identity.weights_sha256.clone())
+            .or_default()
+            .push(entry);
+    }
     let mut models = BTreeMap::new();
-    for (model, deployments) in entries {
+    for (model, deployments) in grouped {
         check_model_agreement(
             &model,
             deployments
@@ -188,7 +197,7 @@ pub fn render(entries: BTreeMap<String, Vec<Entry>>) -> Result<String> {
     render_values(models)
 }
 
-/// The file's canonical text: entries grouped by model id, each model's
+/// The file's canonical text: entries grouped by weights hash, each model's
 /// deployments in config-path order.
 fn render_values(entries: BTreeMap<String, Vec<Value>>) -> Result<String> {
     let mut models = serde_json::Map::new();
@@ -270,7 +279,7 @@ containers:
     secrets:
       - GATEWAY_TOKEN
     env:
-      - EIDOLA_ENGINE_MODEL_ID: "fixture-model"
+      - EIDOLA_ENGINE_MODEL_ID: "{weights}"
       - EIDOLA_ENGINE_WEIGHTS_DIR: "/tinfoil/models/weights"
       - EIDOLA_ENGINE_WEIGHTS_SHA256: "{weights}"
       - EIDOLA_ENGINE_WEIGHTS_STORAGE: "verified-readonly"
@@ -300,6 +309,7 @@ containers:
     }
 
     const SIDECAR: &str = r#"{
+        "architecture": "MimoV26Flash",
         "weights": {"repo": "example/fixture-model", "revision": "4444444444444444444444444444444444444444"},
         "expected_gpus": 8,
         "tdx": {
@@ -352,17 +362,14 @@ containers:
             required_release(config.as_bytes()).unwrap(),
             ("0.0.0-test+gpu".to_string(), release_sha.clone())
         );
-        let entry = deployment_entry(
-            "fixture-model",
-            &DeploymentInputs {
-                config_path: PATH,
-                config: config.as_bytes(),
-                sidecar: SIDECAR.as_bytes(),
-                release_manifest: &release,
-                igvm: &igvm,
-                read: &workspace_file,
-            },
-        )
+        let entry = deployment_entry(&DeploymentInputs {
+            config_path: PATH,
+            config: config.as_bytes(),
+            sidecar: SIDECAR.as_bytes(),
+            release_manifest: &release,
+            igvm: &igvm,
+            read: &workspace_file,
+        })
         .unwrap();
 
         let config_sha = hex::encode(Sha256::digest(config.as_bytes()));
@@ -389,14 +396,14 @@ containers:
             })
         );
 
-        let rendered =
-            render(BTreeMap::from([("fixture-model".to_string(), vec![entry])])).unwrap();
+        let rendered = render(vec![entry]).unwrap();
         let parsed: Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(parsed["schema_version"], 1);
-        assert_eq!(parsed["models"]["fixture-model"][0]["config"], PATH);
+        assert_eq!(parsed["models"][&"3".repeat(64)][0]["config"], PATH);
     }
 
-    /// Every variant of a model shares its weights and prompt-cache policy:
+    /// Every deployment of one weights hash shares its provenance and
+    /// prompt-cache policy:
     /// the generator refuses to render a file whose variants disagree, by the
     /// same rule the gateway's build holds the file to.
     #[test]
@@ -407,46 +414,36 @@ containers:
         let release_sha = hex::encode(Sha256::digest(&release));
         let good = config(&release_sha);
         let entry = |path: &str, config: &str, sidecar: &str| {
-            deployment_entry(
-                "fixture-model",
-                &DeploymentInputs {
-                    config_path: path,
-                    config: config.as_bytes(),
-                    sidecar: sidecar.as_bytes(),
-                    release_manifest: &release,
-                    igvm: &igvm,
-                    read: &workspace_file,
-                },
-            )
+            deployment_entry(&DeploymentInputs {
+                config_path: path,
+                config: config.as_bytes(),
+                sidecar: sidecar.as_bytes(),
+                release_manifest: &release,
+                igvm: &igvm,
+                read: &workspace_file,
+            })
             .unwrap()
         };
         const OTHER: &str = "deploy/engine/fixture-model/tdx-b/tinfoil-config.yml";
-        let two = |b: Entry| {
-            render(BTreeMap::from([(
-                "fixture-model".to_string(),
-                vec![entry(PATH, &good, SIDECAR), b],
-            )]))
-        };
+        let two = |b: Entry| render(vec![entry(PATH, &good, SIDECAR), b]);
 
         let rendered = two(entry(OTHER, &good, SIDECAR)).unwrap();
         let parsed: Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(parsed["models"]["fixture-model"][1]["config"], OTHER);
+        assert_eq!(parsed["models"][&"3".repeat(64)][1]["config"], OTHER);
 
+        // Other weights are another model: filed under their own hash.
         let other_weights = good.replace(&"3".repeat(64), &"6".repeat(64));
-        let err = two(entry(OTHER, &other_weights, SIDECAR))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains(OTHER) && err.contains("weights differ"),
-            "{err}"
-        );
+        let rendered = two(entry(OTHER, &other_weights, SIDECAR)).unwrap();
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["models"][&"3".repeat(64)][0]["config"], PATH);
+        assert_eq!(parsed["models"][&"6".repeat(64)][0]["config"], OTHER);
 
         let other_revision = SIDECAR.replace(&"4".repeat(40), &"7".repeat(40));
         let other_pack = good.replace(&"4".repeat(40), &"7".repeat(40));
         let err = two(entry(OTHER, &other_pack, &other_revision))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("weights differ"), "{err}");
+        assert!(err.contains("weights provenance differs"), "{err}");
 
         let other_cache = good.replace(
             "CACHE_MAX_AGE_SECS: \"7200\"",
@@ -490,33 +487,41 @@ containers:
         let mrtd = hex::encode(tdx_igvm::mrtd_from_igvm(&igvm).unwrap());
         let release = manifest(&igvm, &mrtd, &"00".repeat(48));
         let release_sha = hex::encode(Sha256::digest(&release));
-        let entry = |model: &str, config: &str, sidecar: &str| {
-            deployment_entry(
-                model,
-                &DeploymentInputs {
-                    config_path: PATH,
-                    config: config.as_bytes(),
-                    sidecar: sidecar.as_bytes(),
-                    release_manifest: &release,
-                    igvm: &igvm,
-                    read: &workspace_file,
-                },
-            )
+        let entry = |config: &str, sidecar: &str| {
+            deployment_entry(&DeploymentInputs {
+                config_path: PATH,
+                config: config.as_bytes(),
+                sidecar: sidecar.as_bytes(),
+                release_manifest: &release,
+                igvm: &igvm,
+                read: &workspace_file,
+            })
             .unwrap_err()
             .to_string()
         };
         let good = config(&release_sha);
 
-        assert!(entry("other-model", &good, SIDECAR).contains("but the deployment is for"));
+        // A pinned node is named by its weights hash.
+        let named = good.replace(
+            &format!("EIDOLA_ENGINE_MODEL_ID: \"{}\"", "3".repeat(64)),
+            "EIDOLA_ENGINE_MODEL_ID: \"fixture-model\"",
+        );
+        assert!(entry(&named, SIDECAR).contains("named by its weights hash"));
+        // The sidecar names an architecture the engine implements.
+        let pro = SIDECAR.replace("MimoV26Flash", "MimoV26Pro");
+        assert!(entry(&good, &pro).contains("not implemented"));
+        let unknown = SIDECAR.replace("MimoV26Flash", "Llama");
+        assert!(entry(&good, &unknown).contains("not one the engine knows"));
         let no_machines = r#"{
+            "architecture": "MimoV26Flash",
             "weights": {"repo": "example/fixture-model", "revision": "4444444444444444444444444444444444444444"},
             "expected_gpus": 8
         }"#;
-        assert!(entry("fixture-model", &good, no_machines).contains("only TDX deployments"));
+        assert!(entry(&good, no_machines).contains("only TDX deployments"));
         let unpinned = good.replace(&format!("@sha256:{release_sha}"), "");
-        assert!(entry("fixture-model", &unpinned, SIDECAR).contains("pin its release manifest"));
+        assert!(entry(&unpinned, SIDECAR).contains("pin its release manifest"));
         let other_release = good.replace(&release_sha, &"ab".repeat(32));
-        assert!(entry("fixture-model", &other_release, SIDECAR).contains("not the pinned"));
+        assert!(entry(&other_release, SIDECAR).contains("not the pinned"));
 
         // The machine policy comes only from verified endorsements: a policy
         // the release does not define, a recorded hash that is not the
@@ -557,90 +562,75 @@ containers:
         ] {
             let sidecar = SIDECAR.replace(from, to);
             assert_ne!(sidecar, SIDECAR, "{name}: the edit applied");
-            let err = entry("fixture-model", &good, &sidecar);
+            let err = entry(&good, &sidecar);
             assert!(err.contains(needle), "{name}: {err}");
         }
 
         // A CUDA deployment that asks for no GPU evidence, or a different
         // count than it attaches.
         let no_gpus = SIDECAR.replace("\"expected_gpus\": 8,", "");
-        assert!(entry("fixture-model", &good, &no_gpus).contains("expected_gpus must be 8"));
+        assert!(entry(&good, &no_gpus).contains("expected_gpus must be 8"));
         let zero_gpus = SIDECAR.replace("\"expected_gpus\": 8", "\"expected_gpus\": 0");
-        assert!(entry("fixture-model", &good, &zero_gpus).contains("expected_gpus must be 8"));
+        assert!(entry(&good, &zero_gpus).contains("expected_gpus must be 8"));
         let unstated = good.replace("gpus: 8\n", "");
-        assert!(
-            entry("fixture-model", &unstated, SIDECAR).contains("needs the config to attach GPUs")
-        );
+        assert!(entry(&unstated, SIDECAR).contains("needs the config to attach GPUs"));
         let nine = good.replace("gpus: 8\n", "gpus: 9\n");
-        assert!(entry("fixture-model", &nine, SIDECAR).contains("gpus must be between 0 and 8"));
+        assert!(entry(&nine, SIDECAR).contains("gpus must be between 0 and 8"));
 
         // The CPU image under the cuda executor, and the node's GPU
         // confidential-computing check switched off.
         let cpu_image = good.replace("0.0.0-test+gpu@", "0.0.0-test@");
         assert_ne!(cpu_image, good);
-        assert!(entry("fixture-model", &cpu_image, SIDECAR).contains("is not a GPU image"));
+        assert!(entry(&cpu_image, SIDECAR).contains("is not a GPU image"));
         let no_cc = good.replace("GPU_CC: \"required\"", "GPU_CC: \"not-required\"");
         assert_ne!(no_cc, good);
-        assert!(
-            entry("fixture-model", &no_cc, SIDECAR)
-                .contains("EIDOLA_ENGINE_GPU_CC is \"not-required\"")
-        );
+        assert!(entry(&no_cc, SIDECAR).contains("EIDOLA_ENGINE_GPU_CC is \"not-required\""));
 
         // A companion container, or an engine named by a tag.
         let companion = format!(
             "{good}  - name: \"sidecar\"\n    image: \"ghcr.io/example/sidecar:latest\"\n    env: []\n"
         );
-        assert!(entry("fixture-model", &companion, SIDECAR).contains("exactly one container"));
+        assert!(entry(&companion, SIDECAR).contains("exactly one container"));
         // A key an engine deployment does not need.
         let entrypoint = good.replace(
             "    runtime: nvidia\n",
             "    runtime: nvidia\n    entrypoint: [\"/bin/sh\"]\n",
         );
-        assert!(
-            entry("fixture-model", &entrypoint, SIDECAR).contains("unknown field `entrypoint`")
-        );
+        assert!(entry(&entrypoint, SIDECAR).contains("unknown field `entrypoint`"));
         let no_runtime = good.replace("    runtime: nvidia\n", "");
-        assert!(entry("fixture-model", &no_runtime, SIDECAR).contains("runtime: nvidia"));
+        assert!(entry(&no_runtime, SIDECAR).contains("runtime: nvidia"));
         // Another secret, a partial shim, an ungranted pack.
         let extra_secret = good.replace(
             "      - GATEWAY_TOKEN\n",
             "      - GATEWAY_TOKEN\n      - RUST_LOG\n",
         );
-        assert!(entry("fixture-model", &extra_secret, SIDECAR).contains("secrets must be exactly"));
+        assert!(entry(&extra_secret, SIDECAR).contains("secrets must be exactly"));
         let partial = good.replace("    - /*\n", "    - /v1/chat/completions\n");
-        assert!(entry("fixture-model", &partial, SIDECAR).contains("shim.paths must expose"));
+        assert!(entry(&partial, SIDECAR).contains("shim.paths must expose"));
         let ungranted = good.replace("    models: [\"weights\"]\n", "");
-        assert!(
-            entry("fixture-model", &ungranted, SIDECAR)
-                .contains("granted exactly the weights pack")
-        );
+        assert!(entry(&ungranted, SIDECAR).contains("granted exactly the weights pack"));
         // A variable the node does not read, and a VM shape the platform does
         // not launch.
         let ambient = good.replace(
             "      - EIDOLA_ENGINE_MODEL_ID",
             "      - TOKIO_WORKER_THREADS: \"0\"\n      - EIDOLA_ENGINE_MODEL_ID",
         );
-        assert!(
-            entry("fixture-model", &ambient, SIDECAR)
-                .contains("may not set \"TOKIO_WORKER_THREADS\"")
-        );
+        assert!(entry(&ambient, SIDECAR).contains("may not set \"TOKIO_WORKER_THREADS\""));
         let tiny = good.replace("memory: 65536", "memory: 1");
-        assert!(
-            entry("fixture-model", &tiny, SIDECAR).contains("memory must be a whole number of GiB")
-        );
+        assert!(entry(&tiny, SIDECAR).contains("memory must be a whole number of GiB"));
         let tagged = good.replace(&format!("@sha256:{}", "2".repeat(64)), ":v1");
-        assert!(entry("fixture-model", &tagged, SIDECAR).contains("exactly one container"));
+        assert!(entry(&tagged, SIDECAR).contains("exactly one container"));
 
         // The generator runs the gateway's whole deployment check: a variable
         // the node requires, missing, is refused here as it is there.
         for name in ["EIDOLA_ENGINE_BIND_ADDR", "EIDOLA_ENGINE_MAX_REQUESTS"] {
             let line = good.lines().find(|l| l.contains(name)).unwrap();
             let missing = good.replace(&format!("{line}\n"), "");
-            let err = entry("fixture-model", &missing, SIDECAR);
+            let err = entry(&missing, SIDECAR);
             assert!(err.contains(&format!("{name} is not set")), "{name}: {err}");
         }
         // And a weights pack whose layout it does not state.
         let no_schema = good.replace("    schema: 2\n", "");
-        assert!(entry("fixture-model", &no_schema, SIDECAR).contains("schema must be one of"));
+        assert!(entry(&no_schema, SIDECAR).contains("schema must be one of"));
     }
 }

@@ -14,8 +14,9 @@
 //!
 //! - The file's shape, strictly (the runtime's typed parse first, then every
 //!   member's width and form).
-//! - Each deployment's `config` names `deploy/engine/<model>/<variant>/
-//!   tinfoil-config.yml` for the model it is listed under, and that file
+//! - Each model is listed under its weights hash, and each deployment's
+//!   `config` names `deploy/engine/<name>/<variant>/tinfoil-config.yml` (the
+//!   `<name>` a label for people, the identity the hash), and that file
 //!   exists and hashes to `config_sha256`.
 //! - **The deployment itself** — its config and its sidecar — by
 //!   `eidola_common::engine_deployment::deployment::check_deployment`, the one
@@ -35,8 +36,9 @@
 //!   derived, the sidecar's PCK flags added, and the pin's policy must be
 //!   exactly that. `measure-enclave` makes the same two calls over the same
 //!   bytes when it emits the pin.
-//! - Every deployment of one model agrees on its weights and prompt-cache
-//!   policy, since the gateway publishes one of each per model:
+//! - Every deployment listed under a hash serves those weights, and they
+//!   agree on provenance, architecture and prompt-cache policy, since the
+//!   gateway publishes one of each per hash:
 //!   `deployment::check_model_agreement`, which `measure-enclave` also runs
 //!   before it renders the file.
 //! - Every deployment directory committed under `deploy/engine/` is pinned
@@ -49,7 +51,7 @@
 
 use std::collections::BTreeMap;
 
-use eidola_common::engine_deployment::{CacheConfig, deployment, is_safe_component};
+use eidola_common::engine_deployment::{Architecture, CacheConfig, deployment, is_safe_component};
 use sha2::{Digest, Sha256};
 
 /// The schema version this gateway reads.
@@ -61,7 +63,11 @@ pub const DEPLOY_ROOT: &str = "deploy/engine";
 /// A model the file pins, as checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckedModel {
+    /// The weights hash the model is listed under, which is also its
+    /// weights' `sha256`.
     pub id: String,
+    /// The architecture its deployments' sidecars name.
+    pub architecture: Architecture,
     pub weights: CheckedWeights,
     pub prompt_cache: CheckedCachePolicy,
     /// The config path of every accepted deployment, in file order.
@@ -91,7 +97,7 @@ type Object = serde_json::Map<String, serde_json::Value>;
 /// deployments it names, reading each committed file through `read` (a path
 /// relative to the workspace root).
 ///
-/// Returns the pinned models in id order. Any disagreement is an error naming
+/// Returns the pinned models in weights-hash order. Any disagreement is an error naming
 /// the model, the file and the member; nothing is skipped or defaulted.
 pub fn check(
     json: &[u8],
@@ -122,8 +128,10 @@ pub fn check(
     let mut checked = Vec::new();
     for (id, deployments) in models {
         let at = format!("engine-enclaves.json: model {id:?}");
-        if !is_safe_component(id) {
-            return Err(format!("{at}: a model id must match [a-z0-9][a-z0-9._-]*"));
+        if !is_lower_hex(id, 32) {
+            return Err(format!(
+                "{at}: a model is listed under its weights hash, 64 lowercase hex digits"
+            ));
         }
         let deployments = deployments
             .as_array()
@@ -133,7 +141,8 @@ pub fn check(
         let mut identities = Vec::new();
         for (index, deployment) in deployments.iter().enumerate() {
             let at = format!("{at}, deployment {index}");
-            let (config, weights, prompt_cache) = check_deployment(id, deployment, &at, read)?;
+            let (config, weights, prompt_cache, architecture) =
+                check_deployment(deployment, &at, read)?;
             if let Some(previous) = seen_configs.insert(config.clone(), id.clone()) {
                 return Err(format!(
                     "{at}: {config} is already pinned under model {previous:?}"
@@ -144,6 +153,7 @@ pub fn check(
                 at,
                 deployment::ModelIdentity {
                     weights_sha256: weights.sha256,
+                    architecture,
                     weights_repo: weights.repo,
                     weights_revision: weights.revision,
                     prompt_cache: CacheConfig {
@@ -161,6 +171,7 @@ pub fn check(
         )?;
         checked.push(CheckedModel {
             id: id.clone(),
+            architecture: identity.architecture,
             weights: CheckedWeights {
                 sha256: identity.weights_sha256,
                 repo: identity.weights_repo,
@@ -178,7 +189,7 @@ pub fn check(
 }
 
 /// Every committed deployment directory must be pinned: `committed` is the
-/// config path of every `deploy/engine/<model>/<variant>/` directory in the
+/// config path of every `deploy/engine/<name>/<variant>/` directory in the
 /// tree. A deployment committed without its pin is one no gateway built from
 /// this tree would accept, which is a release that cannot route to it.
 pub fn require_every_deployment_pinned(
@@ -197,11 +208,10 @@ pub fn require_every_deployment_pinned(
 }
 
 fn check_deployment(
-    model_id: &str,
     deployment: &serde_json::Value,
     at: &str,
     read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
-) -> Result<(String, CheckedWeights, CheckedCachePolicy), String> {
+) -> Result<(String, CheckedWeights, CheckedCachePolicy, Architecture), String> {
     let deployment = object(deployment, at)?;
     exact_keys(
         deployment,
@@ -219,14 +229,16 @@ fn check_deployment(
 
     // The config's path, and the config itself.
     let config_path = string(&deployment["config"], &format!("{at}: config"))?;
-    let variant = config_path
-        .strip_prefix(&format!("{DEPLOY_ROOT}/{model_id}/"))
+    let directory = config_path
+        .strip_prefix(&format!("{DEPLOY_ROOT}/"))
         .and_then(|rest| rest.strip_suffix("/tinfoil-config.yml"))
-        .filter(|variant| is_safe_component(variant))
+        .and_then(|rest| rest.split_once('/'))
+        .filter(|(name, variant)| is_safe_component(name) && is_safe_component(variant))
+        .map(|(name, variant)| format!("{DEPLOY_ROOT}/{name}/{variant}"))
         .ok_or_else(|| {
             format!(
-                "{at}: config must be {DEPLOY_ROOT}/{model_id}/<variant>/tinfoil-config.yml \
-                 with <variant> matching [a-z0-9][a-z0-9._-]*"
+                "{at}: config must be {DEPLOY_ROOT}/<name>/<variant>/tinfoil-config.yml with \
+                 <name> and <variant> matching [a-z0-9][a-z0-9._-]*"
             )
         })?;
     let config_bytes = read(config_path)?;
@@ -244,16 +256,11 @@ fn check_deployment(
 
     // The deployment itself, by the one check the measurer also runs: every
     // rule about the config and the sidecar lives there.
-    let sidecar_path = format!("{DEPLOY_ROOT}/{model_id}/{variant}/deployment.json");
+    let sidecar_path = format!("{directory}/deployment.json");
     let sidecar_bytes = read(&sidecar_path)?;
-    let checked = deployment::check_deployment(
-        model_id,
-        config_path,
-        &config_bytes,
-        &sidecar_path,
-        &sidecar_bytes,
-    )
-    .map_err(|e| format!("{at}: {e}"))?;
+    let checked =
+        deployment::check_deployment(config_path, &config_bytes, &sidecar_path, &sidecar_bytes)
+            .map_err(|e| format!("{at}: {e}"))?;
 
     // What follows compares the pin with that deployment.
     let cvm_version = string(&deployment["cvm_version"], &format!("{at}: cvm_version"))?;
@@ -426,7 +433,12 @@ fn check_deployment(
     tinfoil_verifier::validate_pins(std::slice::from_ref(&typed))
         .map_err(|e| format!("{at}: the attesting client refuses this pin: {e}"))?;
 
-    Ok((config_path.to_owned(), weights, prompt_cache))
+    Ok((
+        config_path.to_owned(),
+        weights,
+        prompt_cache,
+        checked.architecture,
+    ))
 }
 
 /// The machine policy `machines` names, from the committed platform

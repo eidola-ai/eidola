@@ -16,7 +16,7 @@ use tracing::{error, warn};
 
 use crate::AppState;
 use crate::auth::{ActSpend, AuthContext, AuthMethod, TokenAuth};
-use crate::backend::{BackendStreamEvent, PRICING_SCALE_FACTOR};
+use crate::backend::{BackendStreamEvent, PRICING_SCALE_FACTOR, ResolvedModel};
 use crate::credentials::{self, KeyUse};
 use crate::db;
 use crate::engine_trust::protocol::ValidatedRequest;
@@ -340,11 +340,13 @@ pub(crate) async fn verify_spend_proof(
 /// Validate the model and charge amount against the request.
 ///
 /// Called after the nullifier is recorded. Errors here require a full refund.
+/// `resolution` is the request's `model`, resolved at the edge
+/// (`Catalog::resolve`).
 fn validate_request(
-    state: &AppState,
     act: &ActSpend,
     request: &ChatCompletionRequest,
-) -> Result<(Model, u128), ServerError> {
+    resolution: Result<&ResolvedModel, crate::models::ModelRefError>,
+) -> Result<(ResolvedModel, u128), ServerError> {
     // Decode the charge amount from the spend proof.
     let charge_credits = scalar_to_credit::<128>(&act.spend_proof.charge()).map_err(|_| {
         ServerError::BadRequest {
@@ -352,23 +354,17 @@ fn validate_request(
         }
     })?;
 
-    // Look up the model and validate pricing.
-    let model =
-        state
-            .catalog
-            .lookup_model(&request.model)
-            .ok_or_else(|| ServerError::BadRequest {
-                message: "unknown model".to_string(),
-            })?;
+    // The model, resolved to its weights hash, and its pricing.
+    let resolved = resolution.map_err(ServerError::ModelReference)?.clone();
 
     // No completion past the declared ceiling, whatever the client.
-    check_completion_ceiling(request, &model)?;
+    check_completion_ceiling(request, &resolved.model)?;
 
     // Pre-flight go/no-go: the presented charge must cover the worst-case
     // cost (the shared contract's minimum hold).
-    check_sufficient_charge(charge_credits, request, &model)?;
+    check_sufficient_charge(charge_credits, request, &resolved.model)?;
 
-    Ok((model, charge_credits))
+    Ok((resolved, charge_credits))
 }
 
 /// Pre-flight go/no-go: reject a spend that presents less than the
@@ -420,22 +416,38 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     ChatRequest(mut validated): ChatRequest,
 ) -> Result<axum::response::Response, ServerError> {
-    let model = state.catalog.lookup_model(&validated.request().model);
-    // A request that names no completion ceiling asks for the model's
-    // declared one — written into the request, so pricing, settlement and
-    // the body the node receives all read one number. Left absent, the node
-    // would fill the rest of its window, past what was priced.
-    if let Some(model) = &model {
-        validated.default_completion_ceiling(model.max_output_tokens);
+    // The model reference is resolved to a weights hash here, at the edge:
+    // the request is rewritten to name the hash, so routing, the node,
+    // billing, logs and telemetry see only the hash, never the tag the
+    // client sent. A reference that does not resolve is refused after the
+    // credential is spent, with a full refund, like every validation
+    // refusal.
+    let resolution = state.catalog.resolve(&validated.request().model);
+    if let Ok(resolved) = &resolution {
+        validated.resolve_model(&resolved.model.sha256);
+        // A request that names no completion ceiling asks for the model's
+        // declared one — written into the request, so pricing, settlement
+        // and the body the node receives all read one number. Left absent,
+        // the node would fill the rest of its window, past what was priced.
+        validated.default_completion_ceiling(resolved.model.max_output_tokens);
     }
     let request = validated.request();
     // The counter's `model` label must come from the catalog, never the
-    // caller's string (the fixed-list rule bounding label cardinality):
-    // resolve it up front, with anything unresolved collapsing to `other`.
-    let model_label = model.map(|m| m.id).unwrap_or_else(|| "other".to_string());
+    // caller's string (the fixed-list rule bounding label cardinality): the
+    // resolved hash, with anything unresolved collapsing to `other`.
+    let model_label = resolution
+        .as_ref()
+        .map(|r| r.model.sha256.clone())
+        .unwrap_or_else(|_| "other".to_string());
     let stream = request.stream;
 
-    let result = chat_completions_phases(&state, &act, &validated).await;
+    let result = chat_completions_phases(
+        &state,
+        &act,
+        &validated,
+        resolution.as_ref().map_err(|e| *e),
+    )
+    .await;
 
     // An `Ok` from the phases can still be an error *response* — a
     // refund-bearing 4xx/5xx built after the credential was spent — so
@@ -465,6 +477,7 @@ async fn chat_completions_phases(
     state: &AppState,
     act: &ActSpend,
     validated: &ValidatedRequest,
+    resolution: Result<&ResolvedModel, crate::models::ModelRefError>,
 ) -> Result<axum::response::Response, ServerError> {
     let request = validated.request();
     // Phase 1: Verify the ACT cryptographically. Errors here mean the token
@@ -488,7 +501,7 @@ async fn chat_completions_phases(
 
     // Phase 3: Validate the request (model, charge amount). On failure, issue
     // a full refund of the charge amount back to the client.
-    let (model, charge_credits) = match validate_request(state, act, request) {
+    let (resolved, charge_credits) = match validate_request(act, request, resolution) {
         Ok(v) => v,
         Err(e) => {
             // Decode charge for the refund. If this also fails, fall back to
@@ -502,9 +515,9 @@ async fn chat_completions_phases(
 
     // Phase 4: Handle the request.
     if request.stream {
-        handle_streaming_request(state.clone(), validated, act, &model, charge_credits).await
+        handle_streaming_request(state.clone(), validated, act, &resolved, charge_credits).await
     } else {
-        handle_non_streaming_request(state, validated, act, &model, charge_credits).await
+        handle_non_streaming_request(state, validated, act, &resolved, charge_credits).await
     }
 }
 
@@ -513,9 +526,10 @@ async fn handle_non_streaming_request(
     state: &AppState,
     validated: &ValidatedRequest,
     act: &ActSpend,
-    model: &Model,
+    resolved: &ResolvedModel,
     charge_credits: u128,
 ) -> Result<axum::response::Response, ServerError> {
+    let model = &resolved.model;
     let request = validated.request();
     let auth_context = AuthContext {
         method: AuthMethod::AnonymousCredential,
@@ -534,12 +548,12 @@ async fn handle_non_streaming_request(
     };
     crate::telemetry::metrics::CHAT_DURATION.record(
         dispatched_at.elapsed().as_secs_f64(),
-        &[KeyValue::new("model", model.id.clone())],
+        &[KeyValue::new("model", model.sha256.clone())],
     );
 
     // Record token usage metrics (safe for unlinked layer: only model + counts).
     if let Some(usage) = &backend_response.meta.usage {
-        let model_attr = KeyValue::new("model", model.id.clone());
+        let model_attr = KeyValue::new("model", model.sha256.clone());
         crate::telemetry::metrics::CHAT_TOKENS.add(
             usage.prompt_tokens as u64,
             &[model_attr.clone(), KeyValue::new("type", "prompt")],
@@ -584,12 +598,12 @@ async fn handle_non_streaming_request(
     let privacy = build_privacy_metadata(&auth_context, is_tee, &meta.provider);
     let verification = build_verification_metadata(None);
 
-    let eidola_response = EidolaResponse::from_completion(
-        backend_response.response,
-        privacy,
-        verification,
-        refund_info,
-    );
+    // The response names the model as the client's reference resolved:
+    // `tag@sha256:<hex>`, or `sha256:<hex>` for a hash named alone.
+    let mut completion = backend_response.response;
+    completion.model.clone_from(&resolved.echo);
+    let eidola_response =
+        EidolaResponse::from_completion(completion, privacy, verification, refund_info);
 
     Ok(Json(eidola_response).into_response())
 }
@@ -762,9 +776,10 @@ async fn handle_streaming_request(
     state: AppState,
     validated: &ValidatedRequest,
     act: &ActSpend,
-    model: &Model,
+    resolved: &ResolvedModel,
     charge_credits: u128,
 ) -> Result<axum::response::Response, ServerError> {
+    let model = &resolved.model;
     let request = validated.request();
     let auth_context = AuthContext {
         method: AuthMethod::AnonymousCredential,
@@ -791,7 +806,8 @@ async fn handle_streaming_request(
     // Clone/copy values for the spawned task. The task refunds the spent
     // credential itself, under the key that credential names.
     let spent = act.clone();
-    let model_id = model.id.clone();
+    let model_id = model.sha256.clone();
+    let echo = resolved.echo.clone();
     let task_model = model.clone();
     // Contract clamp inputs, computed from the request before the task takes
     // over (the spawned task never sees the request itself).
@@ -851,7 +867,8 @@ async fn handle_streaming_request(
 
         while let Some(event_result) = upstream_rx.recv().await {
             match event_result {
-                Ok(BackendStreamEvent::Chunk(chunk, at)) => {
+                Ok(BackendStreamEvent::Chunk(mut chunk, at)) => {
+                    chunk.model.clone_from(&echo);
                     if carries_output(&chunk) {
                         timing.on_chunk(at);
                     }
@@ -1257,6 +1274,19 @@ pub(crate) mod tests {
     pub(crate) fn test_model() -> Model {
         Model {
             id: "test-model".to_string(),
+            sha256: "3".repeat(64),
+            tags: vec![],
+            architecture: "MimoV26Flash".to_string(),
+            weights: crate::types::WeightsProvenance {
+                repo: "example/fixture".to_string(),
+                revision: "4".repeat(40),
+                files: vec![],
+            },
+            lifecycle: crate::types::ModelLifecycle {
+                status: crate::types::LifecycleStatus::Current,
+                retire_after: None,
+            },
+            deployments: vec![],
             name: "Test Model".to_string(),
             description: String::new(),
             context_length: 8192,
