@@ -389,14 +389,14 @@ impl RefundStage {
         }
     }
 
-    /// When this stage's refund is the spend's last word: now for a final
-    /// refund, and for a provisional one `T_SETTLE` after its spend was
-    /// recorded. By then the request has ended at its deadline
+    /// When this stage's refund may be declared the spend's last word: now for
+    /// a final refund, and for a provisional one `T_SETTLE` after its spend
+    /// was recorded. By then the request has ended at its deadline
     /// (`eidola_common::MAX_REQUEST_DURATION`, shorter by a margin that covers
-    /// clock disagreement between instances and settlement's own write), and
-    /// a final refund the gateway has not stored by then it never stores
-    /// ([`final_refund_still_storable`]): only a crash leaves one provisional
-    /// that long.
+    /// clock disagreement between instances and settlement's own write), so
+    /// only a crash leaves one provisional that long. Recovery declares it by
+    /// rewriting the row as final, a compare-and-swap that a final refund
+    /// still in flight cannot then overwrite ([`recover_presented_refund`]).
     pub fn settled_at(self) -> SystemTime {
         match self {
             RefundStage::Final => UNIX_EPOCH,
@@ -425,15 +425,6 @@ impl RefundStage {
             _ => None,
         }
     }
-}
-
-/// Whether a spend recorded at `recorded_at` may still have its final refund
-/// stored at `now`. Not once its provisional refund has become the spend's
-/// last word ([`RefundStage::settled_at`]): recovery may already have told the
-/// client so, and the client may have spent that successor. A request reaches
-/// this only if its own instance stalled past the deadline's margin.
-pub fn final_refund_still_storable(recorded_at: SystemTime, now: SystemTime) -> bool {
-    now < RefundStage::provisional_at(recorded_at).settled_at()
 }
 
 const SEALED_REFUND_NONCE_LEN: usize = 12;
@@ -590,22 +581,18 @@ pub fn open_refund_token(
 /// store it over the provisional one on the spend's nullifier row: what every
 /// ending of a request writes ([`sign_refund`]).
 ///
-/// Not once the spend's provisional refund has become its last word
-/// ([`final_refund_still_storable`]): then nothing is written, and the
-/// refund reaches the client only in the response.
+/// **Only over the provisional refund this gateway recorded**
+/// (`act.provisional`): the write is a compare-and-swap, so once recovery has
+/// declared the provisional refund final (by rewriting the row) a final
+/// refund still in flight changes nothing, and an answer recovery gave is
+/// never contradicted. Then nothing is written, and the refund reaches the
+/// client only in the response.
 pub async fn store_sealed_refund(
     state: &AppState,
     act: &crate::auth::ActSpend,
     issuer_key_id: &str,
     refund_cbor: &[u8],
 ) -> Result<(), ServerError> {
-    if let Some(recorded_at) = act.recorded_at
-        && !final_refund_still_storable(recorded_at, SystemTime::now())
-    {
-        return Err(ServerError::Internal(
-            "the spend's provisional refund is already its last word".to_string(),
-        ));
-    }
     let nullifier = act.spend_proof.nullifier().as_bytes().to_vec();
     let sealed = seal_refund_token(
         &act.refund_key,
@@ -614,12 +601,29 @@ pub async fn store_sealed_refund(
         RefundStage::Final,
         refund_cbor,
     )?;
-    db::store_refund_token(&state.db_pool, issuer_key_id, &nullifier, &sealed).await
+    let Some(provisional) = &act.provisional else {
+        return db::store_refund_token(&state.db_pool, issuer_key_id, &nullifier, &sealed).await;
+    };
+    if db::replace_refund_token(
+        &state.db_pool,
+        issuer_key_id,
+        &nullifier,
+        provisional,
+        &sealed,
+    )
+    .await?
+    {
+        Ok(())
+    } else {
+        Err(ServerError::Internal(
+            "the spend's stored refund is no longer its provisional one".to_string(),
+        ))
+    }
 }
 
 /// Record a spend's nullifier with `refund` stored on its row, sealed at
-/// `stage`, in one statement: `true` if this call recorded it, `false` if it
-/// was already recorded (and nothing was written).
+/// `stage`, in one statement: the sealed token stored if this call recorded
+/// it, `None` if it was already recorded (and nothing was written).
 ///
 /// The chat spend records with its provisional refund (`t = 0`, the one its
 /// pre-flight verification signed); recovery of a spend that never arrived
@@ -630,7 +634,7 @@ pub async fn record_spend(
     act: &crate::auth::ActSpend,
     stage: RefundStage,
     refund: &SignedRefund,
-) -> Result<bool, ServerError> {
+) -> Result<Option<SealedRefundToken>, ServerError> {
     let nullifier = act.spend_proof.nullifier().as_bytes().to_vec();
     let sealed = seal_refund_token(
         &act.refund_key,
@@ -639,7 +643,9 @@ pub async fn record_spend(
         stage,
         &refund.cbor,
     )?;
-    db::record_nullifier(&state.db_pool, &refund.issuer_key_id, &nullifier, &sealed).await
+    let recorded =
+        db::record_nullifier(&state.db_pool, &refund.issuer_key_id, &nullifier, &sealed).await?;
+    Ok(recorded.then_some(sealed))
 }
 
 // ---------------------------------------------------------------------------
@@ -1657,9 +1663,10 @@ pub struct RefundRecoveryResponse {
     /// client keeps the spend pending and asks again, since the final
     /// refund's successor shares its nullifier and spending either destroys
     /// the other. `false` once the stored refund is the spend's last word: a
-    /// final refund, or a provisional one `T_settle`
+    /// final refund, or a provisional one asked for `T_settle`
     /// (`eidola_common::T_SETTLE`) after its spend was recorded, which only a
-    /// gateway crash leaves standing that long.
+    /// gateway crash leaves standing that long, and which recovery then
+    /// rewrites as final, so no later write can change it.
     pub provisional: bool,
 }
 
@@ -1670,7 +1677,7 @@ impl RefundRecoveryResponse {
                 refund: URL_SAFE_NO_PAD.encode(refund_cbor),
                 issuer_key_id,
             }],
-            provisional: SystemTime::now() < stage.settled_at(),
+            provisional: stage != RefundStage::Final,
         })
     }
 }
@@ -1774,7 +1781,51 @@ pub(crate) async fn recover_presented_refund(
                 message: "no refund token is stored for this credential".to_string(),
             });
         };
-        return Ok(RefundRecoveryResponse::new(&refund_cbor, key_id, stage));
+        if stage == RefundStage::Final || SystemTime::now() < stage.settled_at() {
+            return Ok(RefundRecoveryResponse::new(&refund_cbor, key_id, stage));
+        }
+        // A provisional refund that may now be declared the spend's last
+        // word. Declared by rewriting the row as final, a compare-and-swap on
+        // exactly what was read: a final refund that a stalled request
+        // writes after this can then change nothing, and one written before
+        // it fails this swap, and is what the client gets.
+        let declared = seal_refund_token(
+            &act.refund_key,
+            &key_id,
+            &nullifier_bytes,
+            RefundStage::Final,
+            &refund_cbor,
+        )?;
+        if db::replace_refund_token(
+            &state.db_pool,
+            &key_id,
+            &nullifier_bytes,
+            &sealed,
+            &declared,
+        )
+        .await?
+        {
+            return Ok(RefundRecoveryResponse::new(
+                &refund_cbor,
+                key_id,
+                RefundStage::Final,
+            ));
+        }
+        let reread = db::get_refund_token(&state.db_pool, &key_id, &nullifier_bytes)
+            .await?
+            .and_then(|sealed| {
+                open_refund_token(&act.refund_key, &key_id, &nullifier_bytes, &sealed)
+            });
+        return match reread {
+            Some((RefundStage::Final, refund_cbor)) => Ok(RefundRecoveryResponse::new(
+                &refund_cbor,
+                key_id,
+                RefundStage::Final,
+            )),
+            _ => Err(ServerError::NotFound {
+                message: "the stored refund changed while it was read; retry shortly".to_string(),
+            }),
+        };
     }
 
     // Anything past here may record a fresh nullifier, which is accepting a
@@ -1795,7 +1846,7 @@ pub(crate) async fn recover_presented_refund(
     // stored beside it, in one statement; if that wins, the spend is ours.
     let recorded = record_spend(state, act, RefundStage::Final, &full_refund).await?;
 
-    if !recorded {
+    if recorded.is_none() {
         // Recorded by someone else between the read and the insert: the
         // original request, arriving now. The client should retry shortly.
         return Err(ServerError::NotFound {
@@ -2269,7 +2320,7 @@ mod tests {
             issuer_key_hash: key.key_hash,
             spend_proof,
             refund_key: RefundKey::from_bytes([0x11; 32]),
-            recorded_at: None,
+            provisional: None,
         };
         (act, pre_refund)
     }
@@ -2758,10 +2809,9 @@ mod tests {
         );
     }
 
-    /// **The gateway says when a provisional refund is the last word**, from
-    /// the recording instant in its seal: `T_SETTLE` after recording, by when
-    /// the request has ended at its shorter deadline and no final refund is
-    /// stored any more. A final refund is the last word at once.
+    /// **A provisional refund may be declared the last word** `T_SETTLE`
+    /// after its spend was recorded, by when the request has ended at its
+    /// shorter deadline. A final refund is the last word at once.
     #[test]
     fn a_provisional_refund_settles_t_settle_after_its_spend_was_recorded() {
         let recorded = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
@@ -2769,10 +2819,6 @@ mod tests {
         assert_eq!(settled, recorded + eidola_common::T_SETTLE);
         assert!(recorded + eidola_common::MAX_REQUEST_DURATION < settled);
         assert_eq!(RefundStage::Final.settled_at(), UNIX_EPOCH);
-        // The final refund is stored up to that instant, and never after it.
-        let second = Duration::from_secs(1);
-        assert!(final_refund_still_storable(recorded, settled - second));
-        assert!(!final_refund_still_storable(recorded, settled));
     }
 
     /// **No forks.** A spend can be answered by two refunds: the provisional
@@ -3100,7 +3146,7 @@ mod tests {
             issuer_key_hash: key_hash,
             spend_proof: proof,
             refund_key,
-            recorded_at: None,
+            provisional: None,
         };
         let answer = |proof: SpendProof<ACT_L>, refund_key: RefundKey| {
             let state = state.clone();
@@ -3117,6 +3163,7 @@ mod tests {
             let answer = &answer;
             async move { answer(proof, refund_key).await.map(|(refund, _)| refund) }
         };
+        let nullifier_of = |proof: &SpendProof<ACT_L>| proof.nullifier().as_bytes().to_vec();
         let client = pool.get().await.unwrap();
         let stored_row = async |nullifier: &[u8]| -> Vec<u8> {
             client
@@ -3181,6 +3228,15 @@ mod tests {
             let cache = cache.read().await;
             verify_presented_spend(cache.get(&key_hash).unwrap(), &in_flight_act).unwrap()
         };
+        let recorded = record_spend(
+            &state,
+            &in_flight_act,
+            RefundStage::provisional_at(SystemTime::now()),
+            &provisional,
+        )
+        .await
+        .unwrap()
+        .expect("recorded");
         assert!(
             record_spend(
                 &state,
@@ -3190,18 +3246,13 @@ mod tests {
             )
             .await
             .unwrap()
-        );
-        assert!(
-            !record_spend(
-                &state,
-                &in_flight_act,
-                RefundStage::provisional_at(SystemTime::now()),
-                &provisional
-            )
-            .await
-            .unwrap(),
+            .is_none(),
             "a nullifier is recorded once"
         );
+        let in_flight_act = ActSpend {
+            provisional: Some(Arc::new(recorded)),
+            ..in_flight_act
+        };
         let (refund, is_provisional) = answer(in_flight.clone(), ck.clone()).await.unwrap();
         assert!(is_provisional);
         assert_eq!(URL_SAFE_NO_PAD.decode(&refund).unwrap(), provisional.cbor);
@@ -3237,16 +3288,15 @@ mod tests {
             verify_presented_spend(cache.get(&key_hash).unwrap(), &crashed_act).unwrap()
         };
         let long_ago = SystemTime::now() - eidola_common::T_SETTLE - Duration::from_secs(1);
-        assert!(
-            record_spend(
-                &state,
-                &crashed_act,
-                RefundStage::provisional_at(long_ago),
-                &crashed_refund,
-            )
-            .await
-            .unwrap()
-        );
+        let crashed_recorded = record_spend(
+            &state,
+            &crashed_act,
+            RefundStage::provisional_at(long_ago),
+            &crashed_refund,
+        )
+        .await
+        .unwrap()
+        .expect("recorded");
         let (refund, is_provisional) = answer(crashed.clone(), ck.clone()).await.unwrap();
         assert!(
             !is_provisional,
@@ -3256,9 +3306,15 @@ mod tests {
             URL_SAFE_NO_PAD.decode(&refund).unwrap(),
             crashed_refund.cbor
         );
-        // And a final refund for it is no longer stored.
+        // Recovery rewrote the row as final, so a final refund that a
+        // stalled request writes now (a compare-and-swap on the provisional
+        // refund it recorded) changes nothing.
+        assert_ne!(
+            stored_row(&nullifier_of(&crashed)).await,
+            crashed_recorded.as_bytes()
+        );
         let late = ActSpend {
-            recorded_at: Some(long_ago),
+            provisional: Some(Arc::new(crashed_recorded)),
             ..crashed_act.clone()
         };
         let signed = {

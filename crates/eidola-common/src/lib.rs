@@ -224,9 +224,10 @@ pub const PER_REQUEST_TOKENS: u64 = 32;
 /// the provisional one says so, and the client keeps the spend pending rather
 /// than settle on a successor whose final sibling (the same nullifier, a
 /// larger balance) may still come. Once `T_SETTLE` has passed since the
-/// recording, by the gateway's clock, the gateway calls the provisional refund
-/// final (only a crash leaves one standing that long) and stores no final
-/// refund any more, so its answer cannot change after it says so. The client
+/// recording, by the gateway's clock, recovery declares the provisional refund
+/// final (only a crash leaves one standing that long) by rewriting the row as
+/// final in a compare-and-swap, which a final refund still in flight cannot
+/// then overwrite, so its answer cannot change after it says so. The client
 /// never estimates this instant: it cannot see when the gateway recorded.
 pub const T_SETTLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 

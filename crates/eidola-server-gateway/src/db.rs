@@ -1208,6 +1208,46 @@ pub async fn store_refund_token(
     Ok(())
 }
 
+/// Replace the sealed refund token on a nullifier row with `new`, **only if**
+/// it is still exactly `expected`: `true` if it was replaced. A
+/// compare-and-swap, so of two writers racing over one row (settlement
+/// storing the final refund over the provisional one, and recovery declaring
+/// the provisional one final) exactly one wins, and the other sees it lost:
+/// under Postgres's row lock the loser re-checks its condition against the
+/// winner's row and matches nothing.
+#[tracing::instrument(skip_all, name = "db.replace_refund_token", err)]
+pub async fn replace_refund_token(
+    pool: &Pool,
+    issuer_key_id: &str,
+    nullifier_value: &[u8],
+    expected: &SealedRefundToken,
+    new: &SealedRefundToken,
+) -> Result<bool, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    let replaced = client
+        .execute(
+            "UPDATE nullifier SET refund_token = $4 \
+             WHERE issuer_key_id = $1 AND value = $2 AND refund_token = $3",
+            &[
+                &issuer_key_id,
+                &nullifier_value,
+                &expected.as_bytes(),
+                &new.as_bytes(),
+            ],
+        )
+        .await
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "replace_refund_token failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
+    Ok(replaced > 0)
+}
+
 /// Retrieve the sealed refund token stored for a nullifier. Returns `None` if
 /// the nullifier does not exist or no refund token has been stored yet; the
 /// caller opens what comes back ([`crate::credentials::open_refund_token`]).

@@ -409,6 +409,7 @@ pub mod metrics {
         "db.get_valid_issuer_keys",
         "db.insert_credit_ledger",
         "db.record_nullifier",
+        "db.replace_refund_token",
         "db.store_refund_token",
         "upstream.chat",
         "upstream.chat_stream",

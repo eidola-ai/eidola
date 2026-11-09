@@ -513,26 +513,25 @@ async fn chat_completions_phases(
     // stored beside it in the same statement. After this succeeds, the
     // credential is consumed and we MUST issue a refund on every subsequent
     // code path; the final one overwrites the provisional one.
-    let recorded_at = SystemTime::now();
     let recorded = credentials::record_spend(
         state,
         act,
-        RefundStage::provisional_at(recorded_at),
+        RefundStage::provisional_at(SystemTime::now()),
         &provisional,
     )
     .await?;
-    if !recorded {
+    let Some(recorded) = recorded else {
         return Err(ServerError::Conflict {
             message: "credential already spent (duplicate nullifier)".to_string(),
         });
-    }
+    };
 
     // --- POINT OF NO RETURN: nullifier is recorded ---
     // From here on, we MUST issue a refund on any error, and the request ends
     // by `deadline` whatever the engine does.
     let deadline = tokio::time::Instant::now() + eidola_common::MAX_REQUEST_DURATION;
     let act = &crate::auth::ActSpend {
-        recorded_at: Some(recorded_at),
+        provisional: Some(std::sync::Arc::new(recorded)),
         ..act.clone()
     };
 
