@@ -3948,14 +3948,7 @@ impl Inner {
             };
 
             // Reconstruct the PrivateToken auth header
-            let challenge_digest = compute_challenge_digest();
-            let mut token_bytes = Vec::new();
-            token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
-            token_bytes.extend_from_slice(&challenge_digest);
-            token_bytes.extend_from_slice(&issuer_key_hash);
-            token_bytes.extend_from_slice(&spend_proof_cbor);
-            let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
-            let auth_value = format!("PrivateToken token=\"{token_b64}\"");
+            let auth_value = spend_authorization(&issuer_key_hash, &spend_proof_cbor);
 
             let refund_key = refund_recovery_key(&row.pre_refund_data);
             if let Ok(refund_obj) =
@@ -7768,16 +7761,7 @@ impl Inner {
         self.bus.emit(Change::Wallet);
 
         let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
-        let challenge_digest = compute_challenge_digest();
-
-        let mut token_bytes = Vec::new();
-        token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
-        token_bytes.extend_from_slice(&challenge_digest);
-        token_bytes.extend_from_slice(&issuer_key_hash);
-        token_bytes.extend_from_slice(&spend_proof_cbor);
-
-        let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
-        let auth_value = format!("PrivateToken token=\"{token_b64}\"");
+        let auth_value = spend_authorization(&issuer_key_hash, &spend_proof_cbor);
 
         Ok((
             SpendPrep {
@@ -18156,6 +18140,21 @@ fn compute_challenge_digest() -> [u8; 32] {
     Sha256::digest(serialize_token_challenge()).into()
 }
 
+/// The `Authorization` value presenting one spend: the ACT Token
+/// (`token_type`, `challenge_digest`, `issuer_key_id`, the encoded spend
+/// proof) in the `PrivateToken` scheme, spelled by
+/// `eidola_common::private_token` (padded base64url, RFC 9577), the one
+/// spelling the gateway accepts. The spend and every recovery of it build
+/// the value here.
+fn spend_authorization(issuer_key_hash: &[u8], spend_proof_cbor: &[u8]) -> String {
+    let mut token = Vec::with_capacity(2 + 32 + issuer_key_hash.len() + spend_proof_cbor.len());
+    token.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+    token.extend_from_slice(&compute_challenge_digest());
+    token.extend_from_slice(issuer_key_hash);
+    token.extend_from_slice(spend_proof_cbor);
+    eidola_common::private_token::authorization_value(&token)
+}
+
 /// Domain separator for [`refund_recovery_key`].
 const REFUND_RECOVERY_KEY_DOMAIN: &[u8] = b"eidola-refund-recovery-key-v1\0";
 
@@ -18517,7 +18516,7 @@ mod tests {
     fn a_requests_credentials_are_sensitive_headers() {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let client = reqwest::Client::builder().build().unwrap();
-        let proof = "PrivateToken token=\"c3BlbmQtcHJvb2Y\"";
+        let proof = "PrivateToken token=\"c3BlbmQtcHJvb2Y=\"";
         let key = [0x6du8; 32];
         let key_text =
             String::from_utf8(eidola_common::refund_key::encode_refund_key(&key).to_vec()).unwrap();

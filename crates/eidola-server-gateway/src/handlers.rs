@@ -250,7 +250,7 @@ fn engines(state: &AppState) -> Result<&crate::engine_router::EngineRouter, Serv
 ///
 /// The refund is signed under the spent credential's own key
 /// (`credentials::sign_refund` takes the key from `act`, and nothing else).
-async fn issue_refund_async(
+pub(crate) async fn issue_refund_async(
     state: &AppState,
     act: &ActSpend,
     refund_credits: u128,
@@ -294,7 +294,15 @@ fn error_response_with_refund(
 /// Checks challenge_digest, loads the issuer key, validates request_context,
 /// and verifies the proof itself. Does NOT record the nullifier — errors here
 /// mean the ACT is invalid or malformed, so no refund is needed.
-async fn verify_spend_proof(state: &AppState, act: &ActSpend) -> Result<(), ServerError> {
+///
+/// The refund signed at settlement verifies the proof once more: the ACT
+/// crate verifies only as part of signing a refund for a fixed amount, and
+/// this request's amount is not known until its response is settled
+/// (`credentials::verify_and_refund`).
+pub(crate) async fn verify_spend_proof(
+    state: &AppState,
+    act: &ActSpend,
+) -> Result<(), ServerError> {
     let master_key = &state.credential_master_key;
 
     // Verify the challenge_digest matches our expected TokenChallenge.
