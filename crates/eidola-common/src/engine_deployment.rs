@@ -1002,8 +1002,8 @@ pub fn parse_measured(
     })
 }
 
-/// A deployment path component (a model id, a variant):
-/// `[a-z0-9][a-z0-9._-]*`. `deploy/engine/<model>/<variant>/` directories
+/// A deployment path component (a deployment's name, a variant):
+/// `[a-z0-9][a-z0-9._-]*`. `deploy/engine/<name>/<variant>/` directories
 /// are named this way; the gateway's build refuses a pin naming any other,
 /// and `measure-enclave` refuses to measure one.
 pub fn is_safe_component(s: &str) -> bool {

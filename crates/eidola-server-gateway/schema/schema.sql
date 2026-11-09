@@ -470,6 +470,11 @@ COMMENT ON TABLE engine_placement IS
     'those compiled-in pins. Health is each gateway''s own and is never '
     'written here.';
 
+COMMENT ON COLUMN engine_placement.model_id IS
+    'The model''s weights hash, lowercase hex: the key it is listed under in '
+    'releases/trust/engine-enclaves.json and the models/ catalog. Never a '
+    'tag: a gateway resolves a client''s tag to this hash before routing.';
+
 COMMENT ON COLUMN engine_placement.deployment IS
     'The engine deployment''s config hash: config_sha256 in '
     'releases/trust/engine-enclaves.json (on Intel TDX, the launch''s '
