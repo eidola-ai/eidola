@@ -625,26 +625,63 @@ pub async fn store_sealed_refund(
 /// `stage`, in one statement: the sealed token stored if this call recorded
 /// it, `None` if it was already recorded (and nothing was written).
 ///
-/// The chat spend records with its provisional refund (`t = 0`, the one its
-/// pre-flight verification signed); recovery of a spend that never arrived
-/// records with the final, full one. Either way no row is ever without a
-/// refund, so a crash after recording loses at most the spend's hold.
+/// Recovery of a spend that never arrived records with the final, full
+/// refund; a request records its inputs together through [`record_spends`].
+/// Either way no row is ever without a refund, so a crash after recording
+/// loses at most the spend's hold.
 pub async fn record_spend(
     state: &AppState,
     act: &crate::auth::ActSpend,
     stage: RefundStage,
     refund: &SignedRefund,
 ) -> Result<Option<SealedRefundToken>, ServerError> {
-    let nullifier = act.spend_proof.nullifier().as_bytes().to_vec();
-    let sealed = seal_refund_token(
-        &act.refund_key,
-        &refund.issuer_key_id,
-        &nullifier,
-        stage,
-        &refund.cbor,
-    )?;
-    let recorded =
-        db::record_nullifier(&state.db_pool, &refund.issuer_key_id, &nullifier, &sealed).await?;
+    Ok(record_spends(state, &[(act, refund)], stage)
+        .await?
+        .map(|mut sealed| sealed.remove(0)))
+}
+
+/// Record every input of one request, each nullifier with its `refund`
+/// sealed at `stage` under that input's own refund recovery key, **all or
+/// none** ([`db::record_nullifiers`]): the sealed tokens stored, in input
+/// order, if every nullifier was recorded by this call; `None` if any was
+/// already recorded, in which case nothing was written and every other input
+/// is still unrecorded, so its holder recovers it with a full refund.
+///
+/// The chat spend records each input with its provisional refund (`t = 0`,
+/// the one its pre-flight verification signed).
+pub async fn record_spends(
+    state: &AppState,
+    inputs: &[(&crate::auth::ActSpend, &SignedRefund)],
+    stage: RefundStage,
+) -> Result<Option<Vec<SealedRefundToken>>, ServerError> {
+    let nullifiers: Vec<Vec<u8>> = inputs
+        .iter()
+        .map(|(act, _)| act.spend_proof.nullifier().as_bytes().to_vec())
+        .collect();
+    let sealed = inputs
+        .iter()
+        .zip(&nullifiers)
+        .map(|((act, refund), nullifier)| {
+            seal_refund_token(
+                &act.refund_key,
+                &refund.issuer_key_id,
+                nullifier,
+                stage,
+                &refund.cbor,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let rows: Vec<db::NullifierRecord<'_>> = inputs
+        .iter()
+        .zip(&nullifiers)
+        .zip(&sealed)
+        .map(|(((_, refund), nullifier), sealed)| db::NullifierRecord {
+            issuer_key_id: &refund.issuer_key_id,
+            value: nullifier,
+            refund_token: sealed,
+        })
+        .collect();
+    let recorded = db::record_nullifiers(&state.db_pool, &rows).await?;
     Ok(recorded.then_some(sealed))
 }
 
@@ -1083,7 +1120,7 @@ pub async fn load_key(
 /// one for another. A caller that does not yet know its final `t` therefore
 /// verifies here and discards the refund, and verifies again when it signs:
 /// the chat spend does, since its `t` is known only once the response is
-/// settled (`handlers::verify_spend_proof`, then [`sign_refund`]). Recovery
+/// settled (`handlers::check_presented_spends`, then [`sign_refund`]). Recovery
 /// knows its `t` (the whole charge) before it reads the database, so it
 /// verifies once ([`verify_and_sign_full_refund`]).
 ///
@@ -1101,7 +1138,7 @@ fn verify_and_refund(
 }
 
 /// The refusal for a presented spend whose request context is not `key`'s.
-fn check_presented_context(
+pub(crate) fn check_presented_context(
     key: &DecryptedIssuerKey,
     act: &crate::auth::ActSpend,
 ) -> Result<(), ServerError> {
@@ -2877,6 +2914,454 @@ mod tests {
         assert!(!recorded.insert(next(&from_provisional).as_bytes().to_vec()));
     }
 
+    /// **No forks, for every input.** Each input of a two-input request is
+    /// its own spend under its own key, and every refund of it, the
+    /// provisional one and the final one alike, signs the commitment inside
+    /// that input's proof. So each input's provisional and final successors
+    /// share one nullifier, and the two inputs' successors share none: one
+    /// spendable successor per input, under that input's key. Here the inputs
+    /// are under two keys (an older key's residual drained, a newer key's
+    /// credential filling), charged 4,000 across a drain of 3,000 and a fill
+    /// of 3,200, in input order.
+    #[test]
+    fn each_input_of_a_two_input_request_has_exactly_one_successor_nullifier() {
+        let mut keys = Cache::new();
+        let old = add_key(&mut keys, SystemTime::now() + DAY);
+        let new = add_key(&mut keys, SystemTime::now() + 8 * DAY);
+        let (drain, drain_pre) = spend(&keys[&old], 3_000, 3_000);
+        let (fill, fill_pre) = spend(&keys[&new], 10_000, 3_200);
+        let returns =
+            eidola_common::spend_credentials::partial_returns(&[3_000, 3_200], 4_000).unwrap();
+        assert_eq!(returns, [0, 2_200]);
+
+        let mut seen = std::collections::HashSet::new();
+        for ((act, pre, key_hash), (t, settled)) in
+            [(&drain, &drain_pre, old), (&fill, &fill_pre, new)]
+                .into_iter()
+                .zip([(returns[0], 0), (returns[1], 9_000)])
+        {
+            let key = &keys[&key_hash];
+            let provisional = verify_presented_spend(key, act).unwrap();
+            let (final_cbor, final_key) = sign_refund(&keys, act, t, SystemTime::now()).unwrap();
+            assert_eq!(
+                final_key,
+                hex::encode(key_hash),
+                "each refund under its own key"
+            );
+            let complete = |cbor: &[u8], under: &DecryptedIssuerKey| {
+                pre.to_credit_token(
+                    &under.params,
+                    &act.spend_proof,
+                    &Refund::from_cbor(cbor).unwrap(),
+                    under.secret_key.public(),
+                )
+            };
+            let from_provisional = complete(&provisional.cbor, key).unwrap();
+            let from_final = complete(&final_cbor, key).unwrap();
+            assert_eq!(
+                scalar_to_credit::<ACT_L>(&from_final.credits()).unwrap(),
+                settled
+            );
+            // The refund completes only under its input's own key.
+            let other = &keys[if key_hash == old { &new } else { &old }];
+            assert!(complete(&final_cbor, other).is_err());
+            // The two successors of this input share one nullifier, which no
+            // other input's successor has.
+            let next = |token: &anonymous_credit_tokens::CreditToken| {
+                token
+                    .prove_spend::<ACT_L>(&key.params, Scalar::ZERO, OsRng)
+                    .unwrap()
+                    .0
+                    .nullifier()
+                    .as_bytes()
+                    .to_vec()
+            };
+            assert_eq!(next(&from_provisional), next(&from_final));
+            assert!(seen.insert(next(&from_final)), "distinct across inputs");
+        }
+    }
+
+    /// The pre-flight of a request with several inputs, against an
+    /// unreachable database (nothing is recorded here): a repeated credential
+    /// and a share of zero are refused before any proof is verified, and two
+    /// inputs under two keys verify, each under its own.
+    #[test]
+    fn several_inputs_are_checked_before_any_is_verified() {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(several_inputs_are_checked())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn several_inputs_are_checked() {
+        let mut keys = Cache::new();
+        let old = add_key(&mut keys, SystemTime::now() + DAY);
+        let new = add_key(&mut keys, SystemTime::now() + 8 * DAY);
+        // One credential spent twice in one request, with two shares: the
+        // fork nullifiers exist to stop.
+        let token = credential(&keys[&old], 1_000);
+        let twice: Vec<crate::auth::ActSpend> = [300u128, 400]
+            .into_iter()
+            .map(|charge| crate::auth::ActSpend {
+                challenge_digest: compute_challenge_digest(),
+                issuer_key_hash: old,
+                spend_proof: token
+                    .prove_spend::<ACT_L>(
+                        &keys[&old].params,
+                        credit_to_scalar::<ACT_L>(charge).unwrap(),
+                        OsRng,
+                    )
+                    .unwrap()
+                    .0,
+                refund_key: RefundKey::from_bytes([0x22; 32]),
+                provisional: None,
+            })
+            .collect();
+        let (zero, _) = spend(&keys[&old], 1_000, 0);
+        let (drain, _) = spend(&keys[&old], 1_000, 1_000);
+        let (fill, _) = spend(&keys[&new], 1_000, 500);
+        let state = unreachable_state(keys);
+
+        let err = crate::handlers::check_presented_spends(&state, &twice)
+            .await
+            .err()
+            .expect("one credential twice is refused");
+        assert!(matches!(err, ServerError::BadRequest { .. }), "{err:?}");
+        assert!(
+            twice
+                .iter()
+                .all(|a| verification_count::of(&a.spend_proof) == 0)
+        );
+
+        let with_zero = [drain.clone(), zero.clone()];
+        let err = crate::handlers::check_presented_spends(&state, &with_zero)
+            .await
+            .err()
+            .expect("a zero share is refused");
+        assert!(matches!(err, ServerError::BadRequest { .. }), "{err:?}");
+        assert_eq!(verification_count::of(&drain.spend_proof), 0);
+
+        let (shares, provisionals) =
+            crate::handlers::check_presented_spends(&state, &[drain.clone(), fill.clone()])
+                .await
+                .unwrap();
+        assert_eq!(shares, [1_000, 500]);
+        assert_eq!(provisionals[0].issuer_key_id, hex::encode(old));
+        assert_eq!(provisionals[1].issuer_key_id, hex::encode(new));
+        assert_eq!(verification_count::of(&drain.spend_proof), 1);
+        assert_eq!(verification_count::of(&fill.spend_proof), 1);
+    }
+
+    /// Settlement across two inputs under two keys, against an unreachable
+    /// database (storing is best-effort): the refunds come back in input
+    /// order, each under its own input's key, and complete to the in-order
+    /// allocation of the charge. A charge of the whole hold returns each
+    /// input's untouched balance; a charge of nothing returns every share.
+    #[test]
+    fn a_two_input_request_settles_each_input_under_its_own_key() {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(two_inputs_settle())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn two_inputs_settle() {
+        let mut keys = Cache::new();
+        let old = add_key(&mut keys, SystemTime::now() + DAY);
+        let new = add_key(&mut keys, SystemTime::now() + 8 * DAY);
+        let (drain, drain_pre) = spend(&keys[&old], 3_000, 3_000);
+        let (fill, fill_pre) = spend(&keys[&new], 10_000, 3_200);
+        let params = keys[&old].params.clone();
+        let publics = [
+            keys[&old].secret_key.public().clone(),
+            keys[&new].secret_key.public().clone(),
+        ];
+        let state = unreachable_state(keys);
+        let inputs = crate::handlers::tests::paid_inputs(
+            vec![drain.clone(), fill.clone()],
+            vec![3_000, 3_200],
+        );
+
+        for (charge, expected) in [
+            (500u128, [2_500u128, 10_000]),
+            (4_000, [0, 9_000]),
+            (6_200, [0, 6_800]),
+            (0, [3_000, 10_000]),
+        ] {
+            let refunds = crate::handlers::settle_inputs(&state, &inputs, charge).await;
+            assert_eq!(refunds.len(), 2, "one refund per input, in input order");
+            assert_eq!(refunds[0].issuer_key_id, hex::encode(old));
+            assert_eq!(refunds[1].issuer_key_id, hex::encode(new));
+            for (i, (act, pre)) in [(&drain, &drain_pre), (&fill, &fill_pre)]
+                .into_iter()
+                .enumerate()
+            {
+                let refund =
+                    Refund::from_cbor(&URL_SAFE_NO_PAD.decode(&refunds[i].refund).unwrap())
+                        .unwrap();
+                let next = pre
+                    .to_credit_token(&params, &act.spend_proof, &refund, &publics[i])
+                    .unwrap();
+                assert_eq!(
+                    scalar_to_credit::<ACT_L>(&next.credits()).unwrap(),
+                    expected[i],
+                    "input {i} charged {charge}"
+                );
+            }
+        }
+    }
+
+    /// A request's inputs are recorded all or none, against Postgres: an
+    /// input already recorded (a replay, or a recovery that raced the
+    /// request) leaves the other unrecorded, and its recovery is then a full
+    /// refund; the same credential twice records nothing; two requests sharing
+    /// inputs in opposite orders record one of them and never deadlock; and a
+    /// two-input request under two keys, settled across its inputs, stores
+    /// each input's final refund over its own provisional one, under its own
+    /// key. Needs `DATABASE_URL` with `schema.sql` applied; run with
+    /// `--test-threads=1` beside the other database tests.
+    #[test]
+    #[ignore]
+    fn a_requests_inputs_are_recorded_all_or_none() {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(inputs_recorded_all_or_none())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn inputs_recorded_all_or_none() {
+        use crate::auth::ActSpend;
+        use crate::backend::Catalog;
+
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let pool = db::create_pool(
+            &std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
+            None,
+            None,
+        )
+        .unwrap();
+        let master_key: [u8; 32] =
+            hex::decode(std::env::var("CREDENTIAL_MASTER_KEY").unwrap_or_else(|_| "00".repeat(32)))
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let cache: KeyCache = Arc::new(RwLock::new(HashMap::new()));
+        let current = ensure_keys(&cache, &master_key, &pool).await.unwrap();
+        // The next epoch's key accepts spends too: two keys to mix.
+        let next = {
+            let keys = cache.read().await;
+            let epoch = keys[&current].epoch;
+            *keys
+                .iter()
+                .find(|(_, k)| k.epoch == epoch + 1)
+                .expect("the next epoch's key is minted with the current one")
+                .0
+        };
+        let state = AppState::new(
+            Catalog::new(None),
+            None,
+            pool.clone(),
+            None,
+            None,
+            master_key,
+            cache.clone(),
+        );
+        let input = |key_hash: [u8; 32], credits: u128, charge: u128, fill: u8| {
+            let cache = cache.clone();
+            async move {
+                let keys = cache.read().await;
+                let (act, pre) = spend(&keys[&key_hash], credits, charge);
+                (
+                    ActSpend {
+                        refund_key: client_key(fill),
+                        ..act
+                    },
+                    pre,
+                )
+            }
+        };
+        let client = pool.get().await.unwrap();
+        let recorded = async |act: &ActSpend| -> bool {
+            client
+                .query_opt(
+                    "SELECT 1 FROM nullifier WHERE issuer_key_id = $1 AND value = $2",
+                    &[
+                        &hex::encode(act.issuer_key_hash),
+                        &act.spend_proof.nullifier().as_bytes().to_vec(),
+                    ],
+                )
+                .await
+                .unwrap()
+                .is_some()
+        };
+        let provisional_of = |act: &ActSpend| {
+            let cache = cache.clone();
+            let act = act.clone();
+            async move {
+                let keys = cache.read().await;
+                verify_presented_spend(&keys[&act.issuer_key_hash], &act).unwrap()
+            }
+        };
+        let stage = RefundStage::provisional_at(SystemTime::now());
+
+        // An input already recorded refuses the request, and records nothing
+        // of the other input.
+        let (drain, drain_pre) = input(current, 1_000, 1_000, 1).await;
+        let (fill, _) = input(next, 5_000, 2_000, 2).await;
+        let (p_drain, p_fill) = (provisional_of(&drain).await, provisional_of(&fill).await);
+        assert!(
+            record_spend(&state, &fill, stage, &p_fill)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let refused = record_spends(&state, &[(&drain, &p_drain), (&fill, &p_fill)], stage)
+            .await
+            .unwrap();
+        assert!(refused.is_none(), "a recorded input refuses the request");
+        assert!(
+            !recorded(&drain).await,
+            "and the other input is not recorded"
+        );
+        // The unrecorded input is still its holder's: recovered whole.
+        let Json(answer) = recover_presented_refund(&state, &drain).await.unwrap();
+        assert!(!answer.provisional);
+        let whole = {
+            let keys = cache.read().await;
+            let key = &keys[&current];
+            drain_pre
+                .to_credit_token(
+                    &key.params,
+                    &drain.spend_proof,
+                    &Refund::from_cbor(&URL_SAFE_NO_PAD.decode(&answer.refunds[0].refund).unwrap())
+                        .unwrap(),
+                    key.secret_key.public(),
+                )
+                .unwrap()
+        };
+        assert_eq!(scalar_to_credit::<ACT_L>(&whole.credits()).unwrap(), 1_000);
+
+        // The same credential twice in one request records nothing.
+        let (twice, _) = input(current, 1_000, 300, 3).await;
+        let p_twice = provisional_of(&twice).await;
+        assert!(
+            record_spends(&state, &[(&twice, &p_twice), (&twice, &p_twice)], stage)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!recorded(&twice).await);
+
+        // Two requests sharing both inputs, in opposite orders, at once:
+        // exactly one records them, and neither deadlocks.
+        for round in 0..20u8 {
+            let (a, _) = input(current, 1_000, 100, 10 + round).await;
+            let (b, _) = input(next, 1_000, 100, 40 + round).await;
+            let (pa, pb) = (provisional_of(&a).await, provisional_of(&b).await);
+            let forward = [(&a, &pa), (&b, &pb)];
+            let backward = [(&b, &pb), (&a, &pa)];
+            let (one, two) = tokio::join!(
+                record_spends(&state, &forward, stage),
+                record_spends(&state, &backward, stage),
+            );
+            let wins = [one.unwrap(), two.unwrap()]
+                .iter()
+                .filter(|r| r.is_some())
+                .count();
+            assert_eq!(wins, 1, "round {round}: exactly one request records");
+            assert!(recorded(&a).await && recorded(&b).await);
+        }
+
+        // A two-input request under two keys, recorded, then settled at a
+        // charge of 1,500 across a drain of 1,000 and a fill of 2,000: each
+        // final refund replaces its own provisional one, under its own key.
+        let (drain, drain_pre) = input(current, 1_000, 1_000, 90).await;
+        let (fill, fill_pre) = input(next, 5_000, 2_000, 91).await;
+        let (p_drain, p_fill) = (provisional_of(&drain).await, provisional_of(&fill).await);
+        let sealed = record_spends(&state, &[(&drain, &p_drain), (&fill, &p_fill)], stage)
+            .await
+            .unwrap()
+            .expect("both inputs record");
+        let acts: Vec<ActSpend> = [drain.clone(), fill.clone()]
+            .into_iter()
+            .zip(sealed)
+            .map(|(act, sealed)| ActSpend {
+                provisional: Some(Arc::new(sealed)),
+                ..act
+            })
+            .collect();
+        let inputs = crate::handlers::tests::paid_inputs(acts.clone(), vec![1_000, 2_000]);
+        let refunds = crate::handlers::settle_inputs(&state, &inputs, 1_500).await;
+        assert_eq!(refunds.len(), 2);
+        for ((act, pre, key_hash), expected) in
+            [(&acts[0], &drain_pre, current), (&acts[1], &fill_pre, next)]
+                .into_iter()
+                .zip([0u128, 4_500])
+        {
+            let Json(answer) = recover_presented_refund(&state, act).await.unwrap();
+            assert!(!answer.provisional, "settled: the final refund is stored");
+            assert_eq!(answer.refunds[0].issuer_key_id, hex::encode(key_hash));
+            let keys = cache.read().await;
+            let key = &keys[&key_hash];
+            let next_token = pre
+                .to_credit_token(
+                    &key.params,
+                    &act.spend_proof,
+                    &Refund::from_cbor(&URL_SAFE_NO_PAD.decode(&answer.refunds[0].refund).unwrap())
+                        .unwrap(),
+                    key.secret_key.public(),
+                )
+                .unwrap();
+            assert_eq!(
+                scalar_to_credit::<ACT_L>(&next_token.credits()).unwrap(),
+                expected
+            );
+        }
+    }
+
+    /// An `AppState` holding `keys`, whose database is unreachable.
+    fn unreachable_state(keys: Cache) -> AppState {
+        let pool = db::create_pool(
+            "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
+            None,
+            None,
+        )
+        .unwrap();
+        AppState::new(
+            crate::backend::Catalog::new(None),
+            None,
+            pool,
+            None,
+            None,
+            [0u8; 32],
+            Arc::new(RwLock::new(keys)),
+        )
+    }
+
     /// The body form of one spend, from `act`'s Token bytes, with `refund_key`
     /// as given.
     fn credential_wire(
@@ -3549,7 +4034,7 @@ mod tests {
             Arc::new(RwLock::new(keys)),
         );
 
-        crate::handlers::verify_spend_proof(&state, &blocking)
+        crate::handlers::check_presented_spends(&state, std::slice::from_ref(&blocking))
             .await
             .unwrap();
         assert_eq!(verification_count::of(&blocking.spend_proof), 1);
@@ -3558,7 +4043,7 @@ mod tests {
             .unwrap();
         assert_eq!(verification_count::of(&blocking.spend_proof), 2);
 
-        crate::handlers::verify_spend_proof(&state, &streaming)
+        crate::handlers::check_presented_spends(&state, std::slice::from_ref(&streaming))
             .await
             .unwrap();
         let spent = streaming.clone();

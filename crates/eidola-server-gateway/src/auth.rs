@@ -149,14 +149,15 @@ pub fn presented_spends(wires: &[CredentialWire]) -> Result<Vec<ActSpend>, Serve
     decoded.iter().map(parse_token).collect()
 }
 
-/// Exactly one spend: the shape every endpoint takes today
-/// (`MAX_CREDENTIALS_PER_REQUEST`).
+/// Exactly one spend: the shape refund recovery takes. Each input of a
+/// request is recovered by its own nullifier and key, independently of the
+/// others, so a recovery presenting several is refused.
 pub fn presented_spend(wires: &[CredentialWire]) -> Result<ActSpend, ServerError> {
     let mut spends = presented_spends(wires)?;
     match (spends.pop(), spends.is_empty()) {
         (Some(spend), true) => Ok(spend),
         _ => Err(ServerError::BadRequest {
-            message: CredentialsError::TooMany.to_string(),
+            message: "refund recovery takes exactly one credential".to_string(),
         }),
     }
 }

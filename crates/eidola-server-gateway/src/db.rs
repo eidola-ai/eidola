@@ -1146,34 +1146,97 @@ pub async fn prune_expired_nullifiers(
     Ok(row.get("pruned"))
 }
 
+/// One nullifier row to record: the issuer key id, the nullifier value, and
+/// the sealed refund stored beside it.
+pub struct NullifierRecord<'a> {
+    pub issuer_key_id: &'a str,
+    pub value: &'a [u8],
+    pub refund_token: &'a SealedRefundToken,
+}
+
 /// Atomically record a nullifier with its sealed refund token, in one
 /// statement, so no recorded nullifier is ever without a refund. Returns
 /// `true` if successfully recorded, `false` if the nullifier was already
 /// present (double-spend attempt), in which case nothing is written.
-#[tracing::instrument(skip_all, name = "db.record_nullifier", err)]
 pub async fn record_nullifier(
     pool: &Pool,
     issuer_key_id: &str,
     value: &[u8],
     refund_token: &SealedRefundToken,
 ) -> Result<bool, ServerError> {
-    let client = pool
+    record_nullifiers(
+        pool,
+        &[NullifierRecord {
+            issuer_key_id,
+            value,
+            refund_token,
+        }],
+    )
+    .await
+}
+
+/// Record every one of a request's nullifiers, each with its sealed refund
+/// token, **all or none**: `true` if every row was inserted, `false` if any
+/// was already present (a replay, a recovery that raced the request, or the
+/// same nullifier twice in `rows`), in which case nothing is written.
+///
+/// One transaction, one multi-row `INSERT … ON CONFLICT DO NOTHING` whose
+/// count is compared with the number of rows: anything short of all of them
+/// rolls the transaction back. A concurrent transaction inserting a shared
+/// nullifier waits on the first's uncommitted row and then sees it (or, if
+/// the first rolled back, inserts it), so two requests sharing an input can
+/// never both record it. Rows are inserted sorted by (issuer key id, value),
+/// so two requests sharing nullifiers in opposite orders lock them in the
+/// same order and cannot deadlock.
+///
+/// What the database sees is what one request is: its rows commit together.
+/// That discloses the request's input count and key set to whoever watches
+/// the database, never an amount (`docs/specs/act-multi-spend.md` §9.6).
+#[tracing::instrument(skip_all, name = "db.record_nullifiers", err)]
+pub async fn record_nullifiers(
+    pool: &Pool,
+    rows: &[NullifierRecord<'_>],
+) -> Result<bool, ServerError> {
+    let mut sorted: Vec<&NullifierRecord<'_>> = rows.iter().collect();
+    sorted.sort_by(|a, b| (a.issuer_key_id, a.value).cmp(&(b.issuer_key_id, b.value)));
+    let key_ids: Vec<&str> = sorted.iter().map(|r| r.issuer_key_id).collect();
+    let values: Vec<&[u8]> = sorted.iter().map(|r| r.value).collect();
+    let tokens: Vec<&[u8]> = sorted.iter().map(|r| r.refund_token.as_bytes()).collect();
+
+    let mut client = pool
         .get()
         .await
         .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
-
-    let rows_affected = client
+    let tx = client.transaction().await.map_err(|e| {
+        ServerError::Internal(format!(
+            "begin transaction failed: {}",
+            db_error_summary(&e)
+        ))
+    })?;
+    let inserted = tx
         .execute(
             "INSERT INTO nullifier (issuer_key_id, value, refund_token) \
-             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-            &[&issuer_key_id, &value, &refund_token.as_bytes()],
+             SELECT * FROM unnest($1::text[], $2::bytea[], $3::bytea[]) \
+             ON CONFLICT DO NOTHING",
+            &[&key_ids, &values, &tokens],
         )
         .await
         .map_err(|e| {
-            ServerError::Internal(format!("record_nullifier failed: {}", db_error_summary(&e)))
+            ServerError::Internal(format!(
+                "record_nullifiers failed: {}",
+                db_error_summary(&e)
+            ))
         })?;
-
-    Ok(rows_affected > 0)
+    if inserted != rows.len() as u64 {
+        tx.rollback().await.map_err(|e| {
+            ServerError::Internal(format!("rollback failed: {}", db_error_summary(&e)))
+        })?;
+        return Ok(false);
+    }
+    tx.commit()
+        .await
+        .map_err(|e| ServerError::Internal(format!("commit failed: {}", db_error_summary(&e))))?;
+    Ok(true)
 }
 
 /// Store a sealed refund token on an existing nullifier row. Only a
