@@ -215,6 +215,11 @@ pub enum ChatBehavior {
     /// used to persist as a completed answer: the only thing wrong with it is
     /// that the upstream never claimed it was finished.
     StreamingEndsWithoutDone,
+    /// **The gateway cut the stream short** (its client left, its deadline,
+    /// an engine failure): content deltas, no terminal `finish_reason`, then
+    /// the metadata event carrying the refund the gateway settled on, and no
+    /// `[DONE]`. The answer did not finish; its refund is in band.
+    StreamingCutShortWithRefund,
     /// The first chat request answers ordinarily; every later one is
     /// [`ChatBehavior::StreamingEndsWithoutDone`]. Whichever transport asked.
     ///
@@ -2254,6 +2259,15 @@ async fn handle_chat(
         ChatBehavior::StreamingEndsWithoutDone => {
             write_sse_unterminated_stream(stream, &[STREAM_CONTENT]).await
         }
+        ChatBehavior::StreamingCutShortWithRefund => {
+            let refund = auth
+                .and_then(Issuer::spend_proof_from_auth)
+                .and_then(|sp| issuer.refund_for(&sp))
+                .map(|refund_b64| {
+                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) })
+                });
+            write_sse_cut_short(stream, &[STREAM_CONTENT], refund).await
+        }
         ChatBehavior::OkThenStreamEndsWithoutDone if hit == 1 => {
             if request.get("stream").and_then(|s| s.as_bool()) == Some(true) {
                 return write_sse_stream(stream, true, &[STREAM_CONTENT]).await;
@@ -3143,6 +3157,41 @@ async fn write_sse_stream_with_metadata(
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// [`ChatBehavior::StreamingCutShortWithRefund`]: deltas, the metadata event
+/// with its refund, and no `[DONE]`.
+async fn write_sse_cut_short(
+    stream: &mut TcpStream,
+    content_chunks: &[&str],
+    refund: Option<serde_json::Value>,
+) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    let send_event = |payload: String| -> Vec<u8> {
+        let event = format!("data: {payload}\n\n");
+        let mut out = format!("{:x}\r\n", event.len()).into_bytes();
+        out.extend_from_slice(event.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out
+    };
+    for chunk in content_chunks {
+        let content = serde_json::json!({ "choices": [{ "delta": { "content": chunk } }] });
+        stream.write_all(&send_event(content.to_string())).await?;
+    }
+    let mut metadata = serde_json::json!({
+        "object": "eidola.chat.completion.metadata",
+        "id": "",
+    });
+    if let Some(refund) = refund {
+        metadata["refunds"] = serde_json::json!([refund]);
+    }
+    stream.write_all(&send_event(metadata.to_string())).await?;
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await
 }
 
 /// The content [`ChatBehavior::StreamingPadded`] streams, one delta each;

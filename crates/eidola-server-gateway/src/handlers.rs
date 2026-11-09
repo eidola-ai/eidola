@@ -974,30 +974,6 @@ async fn handle_streaming_request(
             }
         }
 
-        /// Send a metadata SSE event containing a refund, then [DONE].
-        ///
-        /// Abandoned at `until`, whatever ending it closes: a client that
-        /// holds its connection open without reading does not hold the task
-        /// past the request's deadline (and its grace), and the refund is
-        /// stored before this runs.
-        async fn send_metadata_event(
-            tx: &padding::EventSender,
-            refund_info: Option<RefundInfo>,
-            privacy: crate::response::PrivacyMetadata,
-            verification: crate::response::VerificationMetadata,
-            chat_id: String,
-            until: tokio::time::Instant,
-        ) {
-            let stream_meta =
-                EidolaStreamMetadata::new(chat_id, privacy, verification, refund_info);
-            let json_str = serde_json::to_string(&stream_meta).unwrap();
-            let _ = tokio::time::timeout_at(until, async {
-                let _ = tx.send(StreamEvent::Json(json_str)).await;
-                let _ = tx.send(StreamEvent::Done).await;
-            })
-            .await;
-        }
-
         // Every terminal metadata write is abandoned by then.
         let delivery_until = deadline + DEADLINE_DELIVERY_GRACE;
         let mut timing = StreamTiming::new(model_id.clone(), dispatched_at);
@@ -1045,6 +1021,7 @@ async fn handle_streaming_request(
                     privacy,
                     verification,
                     meta.chat_id.unwrap_or_default(),
+                    true,
                     delivery_until,
                 )
                 .await;
@@ -1072,12 +1049,15 @@ async fn handle_streaming_request(
                     };
                     let privacy = build_privacy_metadata(&auth_context, true, provider);
                     let verification = build_verification_metadata(None);
+                    // No `[DONE]`: the answer did not finish, and the
+                    // client must not take what arrived for a whole one.
                     send_metadata_event(
                         &tx,
                         refund_info,
                         privacy,
                         verification,
                         String::new(),
+                        false,
                         until,
                     )
                     .await;
@@ -1087,6 +1067,35 @@ async fn handle_streaming_request(
     });
 
     Ok(padding::padded_sse_response(padded))
+}
+
+/// Send the stream's metadata event, carrying its refund, then `[DONE]` when
+/// `finished` (the engine said it was done). A stream that ended early gets
+/// the metadata and no `[DONE]`, so a client reads it as the interrupted
+/// answer it is and still finds its refund in band.
+///
+/// Abandoned at `until`, whatever ending it closes: a client that holds its
+/// connection open without reading does not hold the task past the request's
+/// deadline (and its grace), and the refund is stored before this runs.
+#[allow(clippy::too_many_arguments)]
+async fn send_metadata_event(
+    tx: &padding::EventSender,
+    refund_info: Option<RefundInfo>,
+    privacy: crate::response::PrivacyMetadata,
+    verification: crate::response::VerificationMetadata,
+    chat_id: String,
+    finished: bool,
+    until: tokio::time::Instant,
+) {
+    let stream_meta = EidolaStreamMetadata::new(chat_id, privacy, verification, refund_info);
+    let json_str = serde_json::to_string(&stream_meta).unwrap();
+    let _ = tokio::time::timeout_at(until, async {
+        let _ = tx.send(StreamEvent::Json(json_str)).await;
+        if finished {
+            let _ = tx.send(StreamEvent::Done).await;
+        }
+    })
+    .await;
 }
 
 /// Why a stream ended before the engine said it was done.
@@ -1788,6 +1797,39 @@ pub(crate) mod tests {
             assert!(matches!(ending, StreamEnding::Early(EarlyEnding::Deadline)));
             assert_eq!(usage.map(|u| u.completion_tokens), Some(4));
             assert!(up_tx.is_closed());
+        }
+
+        /// **An early ending carries its refund and no `[DONE]`**, so a
+        /// client reads it as the interrupted answer it is; a finished one
+        /// ends with `[DONE]` as always.
+        #[tokio::test]
+        async fn an_early_ending_sends_its_refund_and_no_done() {
+            use futures_util::StreamExt;
+            for finished in [false, true] {
+                let (tx, padded) = padding::channel(CADENCE);
+                let auth = AuthContext {
+                    method: AuthMethod::AnonymousCredential,
+                };
+                let refund = RefundInfo {
+                    refund: "r".to_string(),
+                    issuer_key_id: "k".to_string(),
+                };
+                send_metadata_event(
+                    &tx,
+                    Some(refund),
+                    build_privacy_metadata(&auth, true, "p"),
+                    build_verification_metadata(None),
+                    String::new(),
+                    finished,
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                )
+                .await;
+                drop(tx);
+                let bytes: Vec<u8> = padded.map(|frame| frame.unwrap().to_vec()).concat().await;
+                let text = String::from_utf8(bytes).unwrap();
+                assert!(text.contains("\"refunds\""), "{text}");
+                assert_eq!(text.contains("[DONE]"), finished, "{text}");
+            }
         }
 
         /// A completed stream forwards no running count to the client: only

@@ -4376,6 +4376,37 @@ fn mid_sse_abort_emits_user_turn_and_keeps_the_post() {
     });
 }
 
+/// **A stream the gateway cut short is not an answer, and it settles from
+/// the refund it carried.** The gateway ends a cut-short stream with its
+/// metadata event (the refund it settled on) and no `[DONE]`: the turn fails
+/// as a stream that never finished, writes no answer (a regeneration keeps
+/// what it would have replaced), and the hold settles from the in-band refund
+/// without asking recovery.
+#[test]
+fn a_stream_cut_short_is_not_an_answer_and_settles_in_band() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingCutShortWithRefund,
+            refund: RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let (tx, _events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let err = core
+            .runtime()
+            .block_on(core.chat_stream("stream me".into(), MODEL.into(), None, tx))
+            .expect_err("an interrupted stream is not an answer");
+        assert!(matches!(err, AppError::Network { .. }), "got {err:?}");
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(only_space(&core)))
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "only the user's turn: {messages:?}");
+        assert_eq!(mock.refund_hits(), 0, "settled from the refund in band");
+        assert_settled(&core);
+    });
+}
+
 /// **A stream the gateway cut short settles on what was generated.** When a
 /// stream ends early (its client went away, it reached its deadline, or its
 /// engine failed), the gateway releases the engine and stores a final refund
