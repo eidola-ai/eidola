@@ -398,9 +398,10 @@ fn check_sufficient_charge(
 /// any unspent credits.
 ///
 /// `model` is `tag`, `tag@sha256:<hex>` or `sha256:<hex>` (a full SHA-256 in
-/// lowercase hex), resolved to the model's weights hash before anything else;
-/// the response's `model` is `tag@sha256:<hex>` (or `sha256:<hex>` for a
-/// hash named alone).
+/// lowercase hex), resolved to the model's weights hash before anything else.
+/// A digest, when present, decides alone; a bare tag resolves through this
+/// build's catalog. The response's `model` is `tag@sha256:<hex>` (or
+/// `sha256:<hex>` for a hash named alone).
 #[utoipa::path(
     post,
     path = "/v1/chat/completions",
@@ -415,7 +416,7 @@ fn check_sufficient_charge(
         (status = 401, description = "Authentication failed", body = ErrorResponse),
         (status = 402, description = "Insufficient charge amount", body = ErrorResponse),
         (status = 404, description = "The model reference names no model (`model_not_found`); refunded in full", body = ErrorResponse),
-        (status = 409, description = "Credential already spent, or a `tag@sha256:<hex>` reference whose tag does not resolve to that hash (`model_reference_mismatch`, refunded in full)", body = ErrorResponse),
+        (status = 409, description = "Credential already spent", body = ErrorResponse),
         (status = 410, description = "The model reference names a retired model (`model_retired`); refunded in full", body = ErrorResponse),
         (status = 502, description = "Upstream provider error", body = ErrorResponse),
         (status = 503, description = "No upstream is available for the model", body = ErrorResponse)

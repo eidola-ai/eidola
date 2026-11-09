@@ -896,11 +896,15 @@ pub(crate) mod tests {
             catalog.resolve("retired-fixture").unwrap_err(),
             ModelRefError::Retired
         );
+        // The digest is authoritative: a pin keeps its weights whatever its
+        // tag names now.
+        let pinned_elsewhere = catalog
+            .resolve(&format!("engine-fixture@sha256:{STANDARD_SHA}"))
+            .unwrap();
+        assert_eq!(pinned_elsewhere.model.sha256, STANDARD_SHA);
         assert_eq!(
-            catalog
-                .resolve(&format!("engine-fixture@sha256:{STANDARD_SHA}"))
-                .unwrap_err(),
-            ModelRefError::Mismatch
+            pinned_elsewhere.echo,
+            format!("engine-fixture@sha256:{STANDARD_SHA}")
         );
     }
 

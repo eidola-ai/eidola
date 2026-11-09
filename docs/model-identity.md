@@ -6,11 +6,11 @@ A model the Eidola server sells is identified by its **weights hash**: a SHA-256
 
 A request's `model` field takes one of three forms:
 
-- **`tag`**, such as `mimo-v2.6-flash`: whatever weights the tag resolves to in this server build. A tag matches `[A-Za-z0-9._-]+` and names exactly one hash at a time. Tags move only with a server release, so following a tag means accepting the release's choice.
-- **`tag@sha256:<64 lowercase hex digits>`**: the tag, asserted to resolve to exactly that hash. The server accepts it only while the tag resolves to that hash in its build, and refuses it once the tag has moved.
-- **`sha256:<64 lowercase hex digits>`**: those weights, under whatever tags. Accepted while the server serves them; this is the form that keeps the same weights across a tag moving.
+- **`tag`**, such as `mimo-v2.6-flash`: whatever weights the tag resolves to in this server build. A tag matches `[A-Za-z0-9._-]+`, is at most 64 characters, and names exactly one hash at a time. Tags move only with a server release, so following a tag means accepting the release's choice.
+- **`tag@sha256:<64 lowercase hex digits>`**: a pin. As in a container image reference, **the digest is authoritative**: the server serves exactly those weights, and reads the tag only as the client's label for them, whether it names that hash now, named it once, or never did. A pin keeps its weights across a release that moves its tag, for as long as the server serves them.
+- **`sha256:<64 lowercase hex digits>`**: those weights, with no label.
 
-Only full digests are accepted. The server resolves the reference to a hash as the request arrives; everything after that point works with the hash alone. A response's `model` names what was resolved: `tag@sha256:<hex>` for a request that named a tag, `sha256:<hex>` for one that named the hash alone. A reference that names no model, a retired model, or a tag together with a hash it does not resolve to is refused, with a full refund of the request's charge.
+Only full digests are accepted. The server resolves the reference to a hash as the request arrives; everything after that point works with the hash alone. A response's `model` names what was resolved: the reference as the client sent it, normalised (`tag@sha256:<hex>` for a tag, with the hash it resolved to, or for a pin; `sha256:<hex>` for a hash named alone). A reference that is malformed, names no model the server serves, or names a retired model is refused, with a full refund of the request's charge. Telling a user that a tag they pinned now names other weights is the client's job, from the catalog compiled into it.
 
 Every model's catalog entry is a file in the source tree, `models/<family>/<label>.toml`, compiled into the server, so the catalog a server publishes is part of what its enclave measurement covers. A model is **current** or **deprecated** (still served, with a retirement date announced) while it is listed, and **retired** when a release stops serving it; a retired model is refused by name, tag or hash.
 

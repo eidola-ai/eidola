@@ -93,6 +93,35 @@ fn the_hash_is_the_manifests_aggregate() {
     assert!(parse(&resized).is_ok());
 }
 
+/// The fixture's files exist (`tests/fixtures/models/fixture-family/weights/`)
+/// and hash, one by one and in aggregate, to what the row says: the same
+/// directory `scripts/test-weights-hash.sh` runs the standalone recompute
+/// script over, so the script and this code are held to one hash.
+#[test]
+fn the_fixtures_weights_directory_hashes_to_its_row() {
+    use sha2::{Digest, Sha256};
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/models/fixture-family/weights");
+    let row = fixture();
+    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    on_disk.sort();
+    let mut listed: Vec<String> = row.files.iter().map(|f| f.path.clone()).collect();
+    listed.sort();
+    assert_eq!(on_disk, listed);
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+    let mut manifest = String::new();
+    for file in &row.files {
+        let bytes = std::fs::read(dir.join(&file.path)).unwrap();
+        assert_eq!(bytes.len() as u64, file.size, "{}", file.path);
+        assert_eq!(hex(&Sha256::digest(&bytes)), file.sha256, "{}", file.path);
+        manifest.push_str(&format!("{}  {}\n", file.sha256, file.path));
+    }
+    assert_eq!(hex(&Sha256::digest(manifest.as_bytes())), FIXTURE_SHA);
+}
+
 #[test]
 fn the_file_set_is_what_the_engine_hashes() {
     // A file the engine does not read.
@@ -134,12 +163,12 @@ fn tags_are_plain_names() {
         "has space",
         "",
         "a/b",
-        &"x".repeat(129),
+        &"x".repeat(65),
     ] {
         let text = FIXTURE.replace("\"fixture-latest\"", &format!("{bad:?}"));
         assert!(parse(&text).unwrap_err().contains("tag"), "{bad:?}");
     }
-    for good in ["A.b_c-9", "mimo-v2.6-flash", &"x".repeat(128)] {
+    for good in ["A.b_c-9", "mimo-v2.6-flash", &"x".repeat(64)] {
         let text = FIXTURE.replace("\"fixture-latest\"", &format!("{good:?}"));
         assert!(parse(&text).is_ok(), "{good:?}");
     }
@@ -403,7 +432,6 @@ fn refusals_are_typed_and_say_nothing_of_the_reference() {
     for (e, status, kind) in [
         (ModelRefError::Malformed, 400, "invalid_model_reference"),
         (ModelRefError::Unknown, 404, "model_not_found"),
-        (ModelRefError::Mismatch, 409, "model_reference_mismatch"),
         (ModelRefError::Retired, 410, "model_retired"),
     ] {
         assert_eq!((e.status(), e.error_type()), (status, kind));
@@ -428,9 +456,9 @@ const ROWS: &[CatalogRow] = &[
     },
 ];
 
-/// The resolution rule: a tag follows; a pin holds only while its tag
-/// resolves to that hash; a hash alone holds while its row is served; a
-/// retired row is refused however it is named.
+/// The resolution rule: a bare tag follows; in a reference with a digest
+/// the digest is authoritative and the tag only a label; a retired row is
+/// refused however it is named.
 #[test]
 fn references_resolve_by_the_documented_rule() {
     let current = ROWS[0].sha256;
@@ -446,10 +474,15 @@ fn references_resolve_by_the_documented_rule() {
         resolve(&format!("flash@sha256:{current}")),
         Ok((current, format!("flash@sha256:{current}")))
     );
-    // The tag resolves elsewhere: the pin is refused, the hash alone holds.
+    // The tag resolves elsewhere now, or never named that hash at all: the
+    // digest decides, and the tag is echoed as the client sent it.
     assert_eq!(
         resolve(&format!("flash@sha256:{previous}")),
-        Err(ModelRefError::Mismatch)
+        Ok((previous, format!("flash@sha256:{previous}")))
+    );
+    assert_eq!(
+        resolve(&format!("nothing@sha256:{current}")),
+        Ok((current, format!("nothing@sha256:{current}")))
     );
     assert_eq!(
         resolve(&format!("sha256:{previous}")),
@@ -468,8 +501,13 @@ fn references_resolve_by_the_documented_rule() {
     // Unknown.
     assert_eq!(resolve("nothing"), Err(ModelRefError::Unknown));
     assert_eq!(
-        resolve(&format!("nothing@sha256:{current}")),
+        resolve(&format!("flash@sha256:{}", "e".repeat(64))),
         Err(ModelRefError::Unknown)
+    );
+    // A label past the tag bound is malformed, so an echo stays bounded.
+    assert_eq!(
+        resolve(&format!("{}@sha256:{current}", "x".repeat(65))),
+        Err(ModelRefError::Malformed)
     );
     assert_eq!(
         resolve(&format!("sha256:{}", "e".repeat(64))),
@@ -499,7 +537,7 @@ fn a_listed_id_never_holds_an_at_sign() {
 #[test]
 fn the_runtime_and_the_build_read_tags_alike() {
     assert_eq!(super::MAX_TAG_LEN, file::MAX_TAG_LEN);
-    let long = "x".repeat(129);
+    let long = "x".repeat(65);
     for tag in [
         "a",
         "A.b_c-9",

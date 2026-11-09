@@ -12,8 +12,8 @@
 //! `docs/model-identity.md`). A tag is a name that resolves to exactly one
 //! hash in a given build, and moves only with a release. A client names a
 //! model by [`ModelReference`]: `tag` (follow the tag), `tag@sha256:<hex>`
-//! (the tag, asserted to resolve to that hash) or `sha256:<hex>` (the hash
-//! alone). The gateway resolves the reference to a hash at the edge, and
+//! (a pin: the digest is authoritative and the tag a label, as in a container
+//! image reference) or `sha256:<hex>` (the hash alone). The gateway resolves the reference to a hash at the edge, and
 //! everything after it (routing, placement, billing, logs, telemetry) sees
 //! only the hash.
 
@@ -129,7 +129,9 @@ impl CatalogRow {
 pub enum ModelReference<'a> {
     /// `tag`: whatever the tag resolves to.
     Follow { tag: &'a str },
-    /// `tag@sha256:<hex>`: the tag, which must resolve to `sha256`.
+    /// `tag@sha256:<hex>`: the weights `sha256`. The digest is
+    /// authoritative; the tag is the client's label for it, syntax-checked
+    /// and echoed, never resolved.
     Pin { tag: &'a str, sha256: &'a str },
     /// `sha256:<hex>`: the weights, under whatever tags.
     Hash { sha256: &'a str },
@@ -175,8 +177,10 @@ pub fn is_tag(tag: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// The longest tag accepted (`file::MAX_TAG_LEN`).
-pub const MAX_TAG_LEN: usize = 128;
+/// The longest tag accepted (`file::MAX_TAG_LEN`), in a catalog row and in
+/// a reference alike. Bounded so a reference's label cannot grow what is
+/// echoed into every response and stream chunk.
+pub const MAX_TAG_LEN: usize = 64;
 
 /// Why a reference was refused. Every message is fixed text, never the
 /// reference itself.
@@ -188,8 +192,6 @@ pub enum ModelRefError {
     Unknown,
     /// The row is retired.
     Retired,
-    /// `tag@sha256:<hex>` where the tag resolves to another hash.
-    Mismatch,
 }
 
 impl ModelRefError {
@@ -198,7 +200,6 @@ impl ModelRefError {
         match self {
             ModelRefError::Malformed => 400,
             ModelRefError::Unknown => 404,
-            ModelRefError::Mismatch => 409,
             ModelRefError::Retired => 410,
         }
     }
@@ -208,7 +209,6 @@ impl ModelRefError {
         match self {
             ModelRefError::Malformed => "invalid_model_reference",
             ModelRefError::Unknown => "model_not_found",
-            ModelRefError::Mismatch => "model_reference_mismatch",
             ModelRefError::Retired => "model_retired",
         }
     }
@@ -221,10 +221,6 @@ impl ModelRefError {
                  sha256:<64 lowercase hex digits>"
             }
             ModelRefError::Unknown => "unknown model",
-            ModelRefError::Mismatch => {
-                "the tag does not resolve to that hash; name the hash alone (sha256:<hex>) to \
-                 keep these weights, or the tag alone to follow it"
-            }
             ModelRefError::Retired => "this model is retired",
         }
     }
@@ -237,40 +233,33 @@ impl std::fmt::Display for ModelRefError {
 }
 
 /// Resolve `reference` against `rows`: the row it names and the reference
-/// a response echoes (`tag@sha256:<hex>`, or `sha256:<hex>` for a hash
-/// named alone).
+/// a response echoes, normalised (`tag@sha256:<hex>` for a tag or a pin,
+/// `sha256:<hex>` for a hash named alone).
 ///
-/// The rule: a tag resolves to the one row listing it; a pin is accepted
-/// only when its tag resolves to exactly that hash **now**; a hash is
-/// accepted when a row has it. In every case a retired row is refused. A
-/// client that wants specific weights to survive a tag moving names the hash
-/// alone.
+/// The rule: a bare tag resolves to the one row listing it now. **In a
+/// reference carrying a digest, the digest is authoritative**: the row with
+/// that hash, whatever the tag part says and whether that tag names the
+/// hash now, named it once, or never did. A pin therefore keeps its weights
+/// across a release that moves its tag, while those weights are served.
+/// In every case a retired row is refused. Telling a user that a tag has
+/// moved is the client's job, from its own compiled-in catalog.
 pub fn resolve<'r>(
     rows: &'r [CatalogRow],
     reference: &str,
 ) -> Result<(&'r CatalogRow, String), ModelRefError> {
     let by_tag = |tag: &str| rows.iter().find(|r| r.tags.contains(&tag));
+    let by_hash = |sha256: &str| rows.iter().find(|r| r.sha256 == sha256);
     let (row, echo) = match ModelReference::parse(reference)? {
         ModelReference::Follow { tag } => {
             let row = by_tag(tag).ok_or(ModelRefError::Unknown)?;
             (row, format!("{tag}@sha256:{}", row.sha256))
         }
         ModelReference::Pin { tag, sha256 } => {
-            let row = by_tag(tag).ok_or(ModelRefError::Unknown)?;
-            if row.sha256 != sha256 {
-                return Err(if row.lifecycle.is_retired() {
-                    ModelRefError::Retired
-                } else {
-                    ModelRefError::Mismatch
-                });
-            }
-            (row, format!("{tag}@sha256:{sha256}"))
+            let row = by_hash(sha256).ok_or(ModelRefError::Unknown)?;
+            (row, format!("{tag}@{DIGEST_PREFIX}{sha256}"))
         }
         ModelReference::Hash { sha256 } => {
-            let row = rows
-                .iter()
-                .find(|r| r.sha256 == sha256)
-                .ok_or(ModelRefError::Unknown)?;
+            let row = by_hash(sha256).ok_or(ModelRefError::Unknown)?;
             (row, format!("{DIGEST_PREFIX}{sha256}"))
         }
     };

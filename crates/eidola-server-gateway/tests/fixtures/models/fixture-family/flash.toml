@@ -1,6 +1,7 @@
 # A synthetic catalog row, used by the gateway's model-catalog tests. Laid
-# out as a real one is: models/<family>/<label>.toml. The files are not real
-# weights; their hashes are of the short strings the tests describe.
+# out as a real one is: models/<family>/<label>.toml. The files it lists are
+# in weights/ beside it: not real weights, but a real weights directory, which
+# the gateway's tests and scripts/test-weights-hash.sh both hash.
 sha256 = "a13d92b1d4bdf20dcffe052429ac50ca86b8423b8cea5682ae55f90b286072cf"
 architecture = "MimoV26Flash"
 tags = ["fixture-flash", "fixture-latest"]

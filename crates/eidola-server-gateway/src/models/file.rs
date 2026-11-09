@@ -18,7 +18,7 @@
 //!   every file the engine's weights hash covers is listed with its size and
 //!   SHA-256, and nothing else;
 //! - `architecture` names an [`Architecture`] that is **implemented**;
-//! - every tag matches `[A-Za-z0-9._-]+` (at most 128 bytes, so never `@` or
+//! - every tag matches `[A-Za-z0-9._-]+` (at most 64 bytes, so never `@` or
 //!   `:`, the reference syntax's separators), and none is listed twice;
 //! - the source is `<owner>/<name>` at a 40-hex-digit revision;
 //! - display and capabilities are complete (a context window, a ceiling
@@ -46,7 +46,7 @@ use sha2::{Digest, Sha256};
 pub const MODELS_ROOT: &str = "models";
 
 /// The longest tag accepted.
-pub const MAX_TAG_LEN: usize = 128;
+pub const MAX_TAG_LEN: usize = 64;
 
 /// One checked catalog file.
 #[derive(Debug, Clone, PartialEq)]
