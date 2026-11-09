@@ -215,29 +215,29 @@ pub const PER_MESSAGE_TOKENS: u64 = 8;
 pub const PER_REQUEST_TOKENS: u64 = 32;
 
 /// `T_settle`: the longest a spend's stored refund can stay provisional
-/// without a gateway crash, measured from when the client sent the request.
+/// without a gateway crash, measured from when the gateway recorded the spend.
 ///
 /// When the gateway records a spend's nullifier it stores, in the same
-/// statement, a refund that returns nothing (`t = 0`), marked provisional; when
-/// the request ends, for any reason, it overwrites that with the final refund.
-/// A recovery that finds the provisional one says so, and the client keeps
-/// the spend pending rather than settle on a successor whose final sibling
-/// (the same nullifier, a larger balance) may still come. Once `T_SETTLE` has
-/// passed since it sent the request, no final refund can come except after a
-/// crash, and the client accepts the provisional one.
+/// statement, a refund that returns nothing (`t = 0`), marked provisional and
+/// carrying the recording instant inside its seal; when the request ends, for
+/// any reason, it overwrites that with the final refund. A recovery that finds
+/// the provisional one says so, and the client keeps the spend pending rather
+/// than settle on a successor whose final sibling (the same nullifier, a
+/// larger balance) may still come. Once `T_SETTLE` has passed since the
+/// recording, by the gateway's clock, the gateway calls the provisional refund
+/// final (only a crash leaves one standing that long) and stores no final
+/// refund any more, so its answer cannot change after it says so. The client
+/// never estimates this instant: it cannot see when the gateway recorded.
 pub const T_SETTLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// The longest the gateway lets a paid request run, from the moment it records
 /// the spend's nullifier: a request still running then is ended, and settled
 /// as a stream that ended early.
 ///
-/// Shorter than [`T_SETTLE`] by [`SETTLE_MARGIN`], because the two are
-/// measured from different instants on different machines: the client's
-/// clock starts before its request leaves (connection, attestation, upload),
-/// and the gateway's when the nullifier is recorded, after verification. The
-/// margin also covers settlement itself, which writes the final refund after
-/// the request ends. Each side measures its own interval on its own clock, so
-/// clock disagreement between them does not enter.
+/// Shorter than [`T_SETTLE`] by [`SETTLE_MARGIN`], which covers settlement's
+/// own write after the request ends and the clock disagreement between the
+/// gateway instance that recorded a spend and the one that answers its
+/// recovery (bounded far below the margin by the gateway's own skew check).
 pub const MAX_REQUEST_DURATION: std::time::Duration =
     std::time::Duration::from_secs(T_SETTLE.as_secs() - SETTLE_MARGIN.as_secs());
 

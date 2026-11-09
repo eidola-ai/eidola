@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 18;
+const LATEST_VERSION: i64 = 17;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -828,11 +828,10 @@ pub async fn insert_pre_credential_refund(
     spend_amount: i64,
     spend_proof_data: &[u8],
     created_at: i64,
-    spend_started_at: i64,
 ) -> Result<(), AppError> {
     conn.execute(
-        "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, spend_amount, spend_proof_data, spend_started_at, created_at) \
-         VALUES (?1, 'refund', ?2, ?3, ?4, NULL, ?5, ?6, ?8, ?7)",
+        "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, spend_amount, spend_proof_data, created_at) \
+         VALUES (?1, 'refund', ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
         (
             Value::Text(id.to_string()),
             Value::Text(credential_nonce.to_string()),
@@ -841,7 +840,6 @@ pub async fn insert_pre_credential_refund(
             Value::Integer(spend_amount),
             Value::Blob(spend_proof_data.to_vec()),
             Value::Integer(created_at),
-            Value::Integer(spend_started_at),
         ),
     )
     .await
@@ -967,8 +965,6 @@ pub struct SpendingCredentialRow {
     pub spend_proof_data: Vec<u8>,
     pub issuer_key_id: String,
     pub public_key_data: Vec<u8>,
-    /// When the hold was taken, just before its request was sent (ms).
-    pub spend_started_at: i64,
     /// The spent key's `spend_until` (ms): past it, nothing waits for a
     /// final refund.
     pub spend_until: i64,
@@ -981,7 +977,7 @@ pub async fn list_spending_credentials(
         .prepare(
             "SELECT c.nonce, c.credits, c.generation, c.created_at, \
                     pc.spend_amount, pc.id, pc.data, pc.spend_proof_data, \
-                    pc.issuer_key_id, ik.public_key_data, pc.spend_started_at, ik.spend_until \
+                    pc.issuer_key_id, ik.public_key_data, ik.spend_until \
              FROM credential_lifecycle cl \
              JOIN credential c ON c.nonce = cl.nonce \
              JOIN pre_credential pc ON pc.credential_nonce = c.nonce AND pc.type = 'refund' \
@@ -1005,8 +1001,7 @@ pub async fn list_spending_credentials(
             spend_proof_data: row.get::<Vec<u8>>(7).map_err(AppError::db)?,
             issuer_key_id: row.get::<String>(8).map_err(AppError::db)?,
             public_key_data: row.get::<Vec<u8>>(9).map_err(AppError::db)?,
-            spend_started_at: row.get::<i64>(10).map_err(AppError::db)?,
-            spend_until: row.get::<i64>(11).map_err(AppError::db)?,
+            spend_until: row.get::<i64>(10).map_err(AppError::db)?,
         });
     }
     Ok(results)
@@ -11617,7 +11612,7 @@ mod tests {
             .await
             .unwrap();
         insert_pre_credential_refund(
-            conn, "pc-2", "nonce-1", "ik-1", b"pre2", 700, b"proof", 2_000, 2_000,
+            conn, "pc-2", "nonce-1", "ik-1", b"pre2", 700, b"proof", 2_000,
         )
         .await
         .unwrap();
@@ -12034,7 +12029,6 @@ mod tests {
             4,
             b"proof",
             2_000,
-            2_000,
         )
         .await
         .unwrap();
@@ -12051,7 +12045,6 @@ mod tests {
             b"pre-refund",
             4,
             b"proof",
-            2_000,
             2_000,
         )
         .await

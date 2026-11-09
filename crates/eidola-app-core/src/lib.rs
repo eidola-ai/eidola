@@ -4180,14 +4180,8 @@ impl Inner {
             // The spend exactly as it was presented.
             let presented =
                 PresentedSpend::new(&issuer_key_hash, &spend_proof_cbor, &row.pre_refund_data);
-            if let Ok(refund_obj) = recover_refund(
-                &client,
-                base_url,
-                &presented,
-                row.spend_started_at,
-                Some(row.spend_until),
-            )
-            .await
+            if let Ok(refund_obj) =
+                recover_refund(&client, base_url, &presented, Some(row.spend_until)).await
                 && process_refund(
                     &refund_obj,
                     &params,
@@ -7988,11 +7982,6 @@ impl Inner {
             set: Arc::clone(&self.live_spends),
             pre_cred_id: pre_cred_id.clone(),
         };
-        // When the hold is taken, just before the request is sent: what a
-        // provisional refund's `T_SETTLE` is counted from. The clock is read
-        // here, not taken from `now` (a turn's later rounds pass the turn's
-        // start).
-        let started_at = now_ms();
         db::insert_pre_credential_refund(
             db_conn,
             &pre_cred_id,
@@ -8002,7 +7991,6 @@ impl Inner {
             charge_credits as i64,
             &spend_proof_cbor,
             now,
-            started_at,
         )
         .await?;
         // Credential flipped to "spending" — wallet state changed regardless
@@ -8019,7 +8007,6 @@ impl Inner {
             spend_proof,
             pre_refund,
             presented,
-            started_at,
             pre_cred_id,
             _live: live,
         })
@@ -11401,28 +11388,6 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    /// **Test-only seam.** Move every in-flight spend's `spend_started_at`
-    /// `by_ms` into the past, so a test can reach `eidola_common::T_SETTLE`
-    /// without waiting half an hour.
-    #[cfg(feature = "test-support")]
-    pub async fn test_age_spends(&self, by_ms: i64) -> Result<(), AppError> {
-        let inner = self.inner.clone();
-        self.runtime
-            .spawn(async move {
-                let conn = inner.db_conn().await?;
-                conn.execute(
-                    "UPDATE pre_credential SET spend_started_at = spend_started_at - ?1 \
-                     WHERE type = 'refund'",
-                    [turso::Value::Integer(by_ms)],
-                )
-                .await
-                .map(|_| ())
-                .map_err(AppError::db)
-            })
-            .await
-            .map_err(join_err)?
-    }
-
     /// **Test-only seam.** How old a pending issuance must be before it is
     /// asked for again ([`ISSUANCE_SETTLE_AGE`]), so a test can recover one
     /// without waiting ten minutes.
@@ -14043,8 +14008,6 @@ struct SpendPrep {
     /// [`refund_recovery_key`] of its stored `PreRefund` bytes. Sent with the
     /// spend and with any recovery of it.
     presented: PresentedSpend,
-    /// When the hold was taken (`pre_credential.spend_started_at`).
-    started_at: i64,
     pre_cred_id: String,
     /// Marks this hold as one a request is in flight for, for as long as
     /// these materials exist. `SpendPrep` is the only in-memory handle to a
@@ -14218,15 +14181,7 @@ impl TurnPrep {
         let Some(spend) = &self.spend else {
             return false;
         };
-        match recover_refund(
-            &self.client,
-            &self.base_url,
-            &spend.presented,
-            spend.started_at,
-            None,
-        )
-        .await
-        {
+        match recover_refund(&self.client, &self.base_url, &spend.presented, None).await {
             Ok(refund_obj) => self.process_refund_obj(&refund_obj).await.is_ok(),
             Err(_) => false,
         }
@@ -15115,20 +15070,21 @@ async fn process_refund(
 /// and refund recovery key in the body's `credentials` member. The server
 /// stores the refund sealed under that key and opens it only for the same key.
 ///
-/// **A provisional answer is not a settlement.** While the spend's request is
-/// still being served, the server holds a refund of nothing (`t = 0`) for it,
-/// and says so. Its successor shares a nullifier with the final refund's, so
-/// spending it would destroy the larger one when it comes. It is refused here
-/// (an error, so the spend stays `spending` for a later ask) until
-/// `eidola_common::T_SETTLE` has passed since `started_at`, when no final
-/// refund can come except after a crash, or until the spent key's
-/// `spend_until` has passed, when the successor must be taken while it is
-/// worth anything.
+/// **A provisional answer is not a settlement.** While the spend's request
+/// may still be served, the server holds a refund of nothing (`t = 0`) for
+/// it, and says so (`"provisional": true`). Its successor shares a nullifier
+/// with the final refund's, so spending it would destroy the larger one when
+/// it comes. It is refused here (an error, so the spend stays `spending` for
+/// a later ask) until the server answers `"provisional": false`, which it
+/// does once the provisional refund is the spend's last word
+/// (`eidola_common::T_SETTLE` after it recorded the spend, by its own clock,
+/// which only a crash lets a provisional refund reach), or until the spent
+/// key's `spend_until` has passed (`spend_until`, when known), when the
+/// successor must be taken while it is worth anything.
 async fn recover_refund(
     client: &reqwest::Client,
     base_url: &str,
     spend: &PresentedSpend,
-    started_at: i64,
     spend_until: Option<i64>,
 ) -> Result<serde_json::Value, AppError> {
     let resp = client
@@ -15163,7 +15119,7 @@ async fn recover_refund(
         .ok_or_else(|| AppError::Credential {
             message: "recovery response missing its provisional marker".into(),
         })?;
-    if provisional && !accepts_provisional_refund(started_at, spend_until, now_ms()) {
+    if provisional && !accepts_provisional_refund(spend_until, now_ms()) {
         return Err(AppError::Credential {
             message: "the spend's request has not ended yet; its refund is provisional".into(),
         });
@@ -15175,12 +15131,13 @@ async fn recover_refund(
         })
 }
 
-/// Whether a provisional refund (`t = 0`) may be settled on at `now`: once
-/// `eidola_common::T_SETTLE` has passed since the hold was taken
-/// (`started_at`), or once the spent key's `spend_until` has. All in ms.
-fn accepts_provisional_refund(started_at: i64, spend_until: Option<i64>, now: i64) -> bool {
-    let settle_ms = i64::try_from(eidola_common::T_SETTLE.as_millis()).unwrap_or(i64::MAX);
-    now >= started_at.saturating_add(settle_ms) || spend_until.is_some_and(|until| now >= until)
+/// Whether a refund the server still calls provisional may be settled on at
+/// `now`: only once the spent key's `spend_until` has passed, when waiting
+/// longer would leave the successor worth nothing. Whether the request may
+/// still settle is the server's to say: it alone knows when it recorded the
+/// spend. All in ms.
+fn accepts_provisional_refund(spend_until: Option<i64>, now: i64) -> bool {
+    spend_until.is_some_and(|until| now >= until)
 }
 
 /// The one refund a response carries for a one-spend request: the single
@@ -19040,32 +18997,18 @@ mod tests {
         assert!(!format!("{bearer:?}").contains("sk-x"));
     }
 
-    /// **A provisional refund is settled on only when no final one can
-    /// come**: `T_SETTLE` after the hold was taken, or at the spent key's
-    /// `spend_until`, whichever is first.
+    /// **A refund the server still calls provisional is settled on only when
+    /// waiting longer would leave it worth nothing**: at the spent key's
+    /// `spend_until`, and never on this client's own reckoning of when the
+    /// request might have ended.
     #[test]
-    fn a_provisional_refund_is_accepted_only_once_settlement_is_over() {
-        let settle = i64::try_from(eidola_common::T_SETTLE.as_millis()).unwrap();
-        let started = 1_000_000;
-        assert!(!accepts_provisional_refund(started, None, started));
-        assert!(!accepts_provisional_refund(
-            started,
-            None,
-            started + settle - 1
-        ));
-        assert!(accepts_provisional_refund(started, None, started + settle));
-        assert!(!accepts_provisional_refund(
-            started,
-            Some(started + 60_000),
-            started + 59_999
-        ));
-        assert!(accepts_provisional_refund(
-            started,
-            Some(started + 60_000),
-            started + 60_000
-        ));
-        // The gateway ends a request inside that window, with room for the
-        // time between taking the hold and the gateway recording it.
+    fn a_provisional_refund_is_accepted_only_at_the_spend_deadline() {
+        let until = 1_000_000;
+        assert!(!accepts_provisional_refund(None, i64::MAX));
+        assert!(!accepts_provisional_refund(Some(until), until - 1));
+        assert!(accepts_provisional_refund(Some(until), until));
+        // The gateway ends a request inside the window after which it calls a
+        // provisional refund final.
         assert!(eidola_common::MAX_REQUEST_DURATION < eidola_common::T_SETTLE);
     }
 

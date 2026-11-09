@@ -2310,7 +2310,7 @@
         "properties": {
           "provisional": {
             "type": "boolean",
-            "description": "Whether the refund is the provisional one stored when the spend was\nrecorded (`t = 0`), because its request has not ended. A client keeps\nthe spend pending and asks again; it accepts a provisional refund as\nfinal only once `T_settle` (`eidola_common::T_SETTLE`) has passed since\nit sent the request, since the final refund's successor shares its\nnullifier and spending either destroys the other."
+            "description": "Whether the refund is the provisional one stored when the spend was\nrecorded (`t = 0`) and its request may still end with a larger one. A\nclient keeps the spend pending and asks again, since the final\nrefund's successor shares its nullifier and spending either destroys\nthe other. `false` once the stored refund is the spend's last word: a\nfinal refund, or a provisional one `T_settle`\n(`eidola_common::T_SETTLE`) after its spend was recorded, which only a\ngateway crash leaves standing that long."
           },
           "refunds": {
             "type": "array",

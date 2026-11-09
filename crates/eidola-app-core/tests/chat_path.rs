@@ -481,16 +481,17 @@ fn a_spend_travels_in_the_body_and_the_record_never_keeps_it() {
 /// still be served, the gateway's recovery answers with a refund of nothing
 /// marked `provisional`; its successor shares a nullifier with the final
 /// refund's, so settling on it could destroy the larger one. The turn and the
-/// startup sweep both leave the hold `spending` (no successor, no `Wallet`
-/// for it) until `T_SETTLE` has passed since the hold was taken; then the
-/// sweep accepts the provisional successor, whose balance is the credential's
+/// startup sweep both leave the hold `spending` (no successor, no `Wallet` for
+/// it) while the gateway calls the refund provisional. Once the gateway says
+/// it is the spend's last word (a crash, `T_SETTLE` after it recorded the
+/// spend), the sweep settles on it, and the successor holds the credential's
 /// untouched remainder.
 #[test]
-fn a_provisional_refund_is_settled_on_only_after_t_settle() {
+fn a_provisional_refund_is_settled_on_only_when_the_gateway_calls_it_final() {
     run(|| {
         let (mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::OkBlockingNoInlineRefund,
-            refund: RefundMode::Provisional,
+            refund: RefundMode::ProvisionalFirst(2),
             ..MockConfig::default()
         });
         with_account(&core);
@@ -498,8 +499,9 @@ fn a_provisional_refund_is_settled_on_only_after_t_settle() {
         core.runtime()
             .block_on(core.chat("hello".into(), MODEL.into(), None))
             .expect("the answer arrives; only its settlement waits");
-        assert!(
-            mock.refund_hits() >= 1,
+        assert_eq!(
+            mock.refund_hits(),
+            1,
             "no inline refund, so recovery was asked"
         );
         let spending = |core: &AppCore| {
@@ -519,7 +521,7 @@ fn a_provisional_refund_is_settled_on_only_after_t_settle() {
         let hold = held[0].spend_amount.expect("a spend amount");
         let before = held[0].credits;
 
-        // The sweep, too, waits while the request may still end.
+        // The sweep, too, waits while the gateway calls it provisional.
         let mut rx = core.subscribe_changes();
         let recovered = core
             .runtime()
@@ -529,12 +531,8 @@ fn a_provisional_refund_is_settled_on_only_after_t_settle() {
         assert_eq!(spending(&core).len(), 1);
         assert!(!drain(&mut rx).contains(&Change::Wallet));
 
-        // Past `T_SETTLE` since the hold was taken, no final refund can come
-        // but after a crash: the provisional successor is the settlement.
-        let settle_ms = i64::try_from(eidola_common::T_SETTLE.as_millis()).unwrap();
-        core.runtime()
-            .block_on(core.test_age_spends(settle_ms))
-            .expect("age");
+        // The gateway now calls it final: the provisional successor is the
+        // settlement.
         let recovered = core
             .runtime()
             .block_on(core.recover_spending_credentials())

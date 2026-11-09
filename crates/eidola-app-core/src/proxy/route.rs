@@ -2020,15 +2020,9 @@ impl Inner {
         let Some(spend) = spend else { return };
         let refund_obj = match inline {
             Some(object) => Some(object.clone()),
-            None => recover_refund(
-                &route.client,
-                &route.base_url,
-                &spend.presented,
-                spend.started_at,
-                None,
-            )
-            .await
-            .ok(),
+            None => recover_refund(&route.client, &route.base_url, &spend.presented, None)
+                .await
+                .ok(),
         };
         let Some(refund_obj) = refund_obj else {
             eprintln!("warning: a proxied call's credential refund could not be recovered");

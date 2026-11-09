@@ -274,6 +274,11 @@ pub(crate) async fn issue_refund_async(
     })
 }
 
+/// How long a stream ended at its deadline offers its terminal metadata to a
+/// client that is not reading: the refund is already stored, so this bounds
+/// only how long the task waits to hand it over in band.
+const DEADLINE_DELIVERY_GRACE: Duration = Duration::from_secs(5);
+
 /// The answer to a request ended at its deadline
 /// (`eidola_common::MAX_REQUEST_DURATION` after its nullifier was recorded).
 fn request_deadline_error() -> ServerError {
@@ -508,8 +513,14 @@ async fn chat_completions_phases(
     // stored beside it in the same statement. After this succeeds, the
     // credential is consumed and we MUST issue a refund on every subsequent
     // code path; the final one overwrites the provisional one.
-    let recorded =
-        credentials::record_spend(state, act, RefundStage::Provisional, &provisional).await?;
+    let recorded_at = SystemTime::now();
+    let recorded = credentials::record_spend(
+        state,
+        act,
+        RefundStage::provisional_at(recorded_at),
+        &provisional,
+    )
+    .await?;
     if !recorded {
         return Err(ServerError::Conflict {
             message: "credential already spent (duplicate nullifier)".to_string(),
@@ -520,6 +531,10 @@ async fn chat_completions_phases(
     // From here on, we MUST issue a refund on any error, and the request ends
     // by `deadline` whatever the engine does.
     let deadline = tokio::time::Instant::now() + eidola_common::MAX_REQUEST_DURATION;
+    let act = &crate::auth::ActSpend {
+        recorded_at: Some(recorded_at),
+        ..act.clone()
+    };
 
     // Phase 3: Validate the request (model, charge amount). On failure, issue
     // a full refund of the charge amount back to the client.
@@ -916,8 +931,11 @@ async fn handle_streaming_request(
 
         /// The request reached its deadline mid-stream: settled as a stream
         /// that ended early, with a refund of nothing (the blind remaining
-        /// value `c - s` comes back). Dropping the upstream receiver, as the
-        /// caller does by returning, ends the engine's work.
+        /// value `c - s` comes back). The caller drops the upstream receiver
+        /// first, which ends the engine's work. The terminal metadata is
+        /// offered for at most `DEADLINE_DELIVERY_GRACE`: a client that holds
+        /// its connection open without reading does not hold this task past
+        /// its deadline, and the refund is stored either way.
         async fn end_at_deadline(
             state: &AppState,
             spent: &ActSpend,
@@ -931,7 +949,11 @@ async fn handle_streaming_request(
             let refund_info = try_refund(state, spent, 0).await;
             let privacy = build_privacy_metadata(auth_context, true, provider);
             let verification = build_verification_metadata(None);
-            send_metadata_event(tx, refund_info, privacy, verification, String::new()).await;
+            let _ = tokio::time::timeout(
+                DEADLINE_DELIVERY_GRACE,
+                send_metadata_event(tx, refund_info, privacy, verification, String::new()),
+            )
+            .await;
         }
 
         let mut final_usage: Option<Usage> = None;
@@ -942,6 +964,7 @@ async fn handle_streaming_request(
                 Ok(Some(event_result)) => event_result,
                 Ok(None) => break,
                 Err(_) => {
+                    drop(upstream_rx);
                     end_at_deadline(&state, &spent, &tx, timing, &auth_context, provider).await;
                     return;
                 }
@@ -975,6 +998,7 @@ async fn handle_streaming_request(
                         // holds the request past its deadline no more than an
                         // engine does.
                         Err(_) => {
+                            drop(upstream_rx);
                             end_at_deadline(&state, &spent, &tx, timing, &auth_context, provider)
                                 .await;
                             return;

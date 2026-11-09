@@ -560,12 +560,15 @@ pub enum RefundMode {
     /// in `spending` for good, which `Fail` cannot model (it omits the in-band
     /// token too) and `Succeed` cannot detect (recovery would answer).
     NotStored,
-    /// **The request is still being served.** `/v1/credentials/refund`
-    /// answers with the gateway's provisional refund: a refund of nothing
-    /// (`t = 0`), marked `"provisional": true`, as the real endpoint does for
-    /// a spend whose request has not ended. Inline refunds are omitted, as for
-    /// `Fail`.
-    Provisional,
+    /// **The request is still being served, then its gateway crashed.** The
+    /// first `n` calls to `/v1/credentials/refund` answer with the gateway's
+    /// provisional refund: a refund of nothing (`t = 0`), marked
+    /// `"provisional": true`, as the real endpoint does for a spend whose
+    /// request may still end. Every later call answers the same refund marked
+    /// `"provisional": false`, as the real endpoint does once `T_SETTLE` has
+    /// passed since it recorded the spend and the provisional refund is the
+    /// spend's last word. Inline refunds are omitted, as for `Fail`.
+    ProvisionalFirst(u64),
 }
 
 /// Mock upstream configuration.
@@ -1999,7 +2002,7 @@ async fn handle_refund(
     let failing = match config.refund {
         RefundMode::Fail => true,
         RefundMode::FailFirst(n) => attempt <= n,
-        RefundMode::Succeed | RefundMode::Provisional => false,
+        RefundMode::Succeed | RefundMode::ProvisionalFirst(_) => false,
         RefundMode::NotStored => {
             return write_json(stream, 404, &error_body("refund token not found")).await;
         }
@@ -2007,9 +2010,10 @@ async fn handle_refund(
     if failing {
         return write_json(stream, 500, &error_body("refund unavailable")).await;
     }
-    let provisional = matches!(config.refund, RefundMode::Provisional);
+    let stored_provisional = matches!(config.refund, RefundMode::ProvisionalFirst(_));
+    let provisional = matches!(config.refund, RefundMode::ProvisionalFirst(n) if attempt <= n);
     let refund = auth.and_then(Issuer::spend_proof_from_auth).and_then(|sp| {
-        if provisional {
+        if stored_provisional {
             issuer.refund_of(&sp, 0)
         } else {
             issuer.refund_for(&sp)

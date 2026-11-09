@@ -68,11 +68,6 @@ CREATE TABLE pre_credential (
     issuance_request BLOB,
     account_id       TEXT,
     abandoned_at     INTEGER,
-    -- Refund only: when the hold was taken, just before its request was
-    -- sent (ms). A recovery answered with the gateway's provisional refund
-    -- is accepted as final only once T_settle (eidola_common::T_SETTLE) has
-    -- passed since this instant.
-    spend_started_at INTEGER,
     created_at       INTEGER NOT NULL,
 
     CHECK (
@@ -80,7 +75,6 @@ CREATE TABLE pre_credential (
             AND credential_nonce IS NULL
             AND spend_amount IS NULL
             AND spend_proof_data IS NULL
-            AND spend_started_at IS NULL
             AND credits IS NOT NULL
             AND length(idempotency_key) = 32
             AND issuance_request IS NOT NULL
@@ -90,7 +84,6 @@ CREATE TABLE pre_credential (
             AND credential_nonce IS NOT NULL
             AND spend_amount IS NOT NULL
             AND spend_proof_data IS NOT NULL
-            AND spend_started_at IS NOT NULL
             AND credits IS NULL
             AND idempotency_key IS NULL
             AND issuance_request IS NULL

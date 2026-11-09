@@ -75,6 +75,10 @@ pub struct ActSpend {
     /// The client's refund recovery key for this spend, from the same
     /// `credentials` element: what the stored refund is sealed under.
     pub refund_key: RefundKey,
+    /// When this gateway recorded the spend's nullifier, once it has: what
+    /// decides whether its final refund may still be stored
+    /// (`credentials::final_refund_still_storable`).
+    pub recorded_at: Option<std::time::SystemTime>,
 }
 
 /// A client's refund recovery key (`eidola_common::refund_key`), held only in
@@ -198,6 +202,7 @@ fn parse_token(credential: &DecodedCredential) -> Result<ActSpend, ServerError> 
         issuer_key_hash,
         spend_proof,
         refund_key: RefundKey::from_bytes(credential.refund_key),
+        recorded_at: None,
     })
 }
 
