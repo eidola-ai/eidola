@@ -714,11 +714,18 @@ COMMENT ON FUNCTION prune_expired_nullifiers(INTERVAL) IS
 -- Record an issuance idempotently. Locks the account row (debit_account would
 -- take the same lock) before looking for an earlier issuance under the key, so
 -- a retry racing its own original waits for it and then finds its row rather
--- than debiting a second time. Returns the stored row's columns:
+-- than debiting a second time. Under that lock, and on the database's own
+-- clock read after it is taken (clock_timestamp(), not the statement's now()),
+-- the named key must still be issuing: an attempt that passed the gateway's
+-- current-key check and then stalled past the key's issue_until debits
+-- nothing, so a retry refused for that key (resolve_issuance_off_current_key)
+-- is never followed by a debit under it. Returns the stored row's columns:
 --   outcome 'issued'  — debited now, row written, response is p_response;
 --   outcome 'stored'  — an earlier attempt under this key was debited; its
 --                       stored response, digest, key and amount are returned
 --                       and nothing is debited (the caller compares digests);
+--   outcome 'retired' — the named key has stopped issuing (or is unknown);
+--                       nothing debited or written;
 --   outcome 'insufficient' — balance too low, nothing debited or written.
 CREATE OR REPLACE FUNCTION record_credential_issuance(
     p_account_id      UUID,
@@ -754,6 +761,14 @@ BEGIN
         RETURN;
     END IF;
 
+    IF NOT EXISTS (SELECT 1 FROM issuer_key ik
+                   WHERE ik.id = p_issuer_key_id
+                     AND ik.issue_until > clock_timestamp()) THEN
+        RETURN QUERY SELECT 'retired'::TEXT, NULL::BYTEA, NULL::TEXT,
+                            NULL::BIGINT, NULL::BYTEA, NULL::UUID;
+        RETURN;
+    END IF;
+
     v_ids := debit_account(p_account_id, p_credits, 'credential_issuance',
                            NULL, p_issuer_key_id, TRUE);
     IF v_ids IS NULL OR cardinality(v_ids) = 0 THEN
@@ -776,7 +791,72 @@ $$;
 COMMENT ON FUNCTION record_credential_issuance IS
     'Idempotent issuance debit. Serialized per account by the account row lock; '
     'answers an idempotency key already used with the row stored for it and '
-    'debits nothing, otherwise debits and stores in one transaction.';
+    'debits nothing; refuses a key whose issue window has closed by the '
+    'database clock read under the lock; otherwise debits and stores in one '
+    'transaction.';
+
+-- Decide an issuance naming a key that is not the gateway's current issuing
+-- key, under the same account lock record_credential_issuance takes, so the
+-- verdict is ordered against every attempt under the idempotency key that may
+-- still be in flight. Returns the same columns:
+--   outcome 'stored'  — an earlier attempt under this key was debited; its
+--                       stored row is returned (the caller compares digests);
+--   outcome 'retired' — nothing is stored and the named key's issue window
+--                       has closed by the database clock read under the lock
+--                       (or the key is unknown). record_credential_issuance
+--                       refuses such a key on the same clock, so no attempt
+--                       under this idempotency key can ever debit: final;
+--   outcome 'issuing' — nothing is stored but the named key may still issue
+--                       (the gateway's clock or key cache disagrees with the
+--                       database). An attempt may yet debit under it: not
+--                       final, and the caller answers so.
+CREATE OR REPLACE FUNCTION resolve_issuance_off_current_key(
+    p_account_id      UUID,
+    p_idempotency_key BYTEA,
+    p_issuer_key_id   TEXT
+)
+RETURNS TABLE (
+    outcome           TEXT,
+    request_digest    BYTEA,
+    issuer_key_id     TEXT,
+    credits           BIGINT,
+    issuance_response BYTEA,
+    ledger_entry_id   UUID
+)
+LANGUAGE plpgsql
+AS $$
+#variable_conflict use_column
+BEGIN
+    PERFORM 1 FROM account WHERE id = p_account_id FOR UPDATE;
+
+    RETURN QUERY
+        SELECT 'stored'::TEXT, ci.request_digest, ci.issuer_key_id, ci.credits,
+               ci.issuance_response, ci.ledger_entry_id
+        FROM credential_issuance ci
+        WHERE ci.account_id = p_account_id
+          AND ci.idempotency_key = p_idempotency_key;
+    IF FOUND THEN
+        RETURN;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM issuer_key ik
+               WHERE ik.id = p_issuer_key_id
+                 AND ik.issue_until > clock_timestamp()) THEN
+        RETURN QUERY SELECT 'issuing'::TEXT, NULL::BYTEA, NULL::TEXT,
+                            NULL::BIGINT, NULL::BYTEA, NULL::UUID;
+    ELSE
+        RETURN QUERY SELECT 'retired'::TEXT, NULL::BYTEA, NULL::TEXT,
+                            NULL::BIGINT, NULL::BYTEA, NULL::UUID;
+    END IF;
+END;
+$$;
+
+COMMENT ON FUNCTION resolve_issuance_off_current_key IS
+    'Decides an issuance naming a key that is not the current issuing key, '
+    'serialized with record_credential_issuance by the account row lock: the '
+    'stored row if an earlier attempt was debited, otherwise whether the key '
+    'has stopped issuing by the database clock (final: nothing can debit under '
+    'it again) or may still issue (not final).';
 
 CREATE OR REPLACE FUNCTION prune_expired_issuances(p_retain_past_accept INTERVAL)
 RETURNS BIGINT

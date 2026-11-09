@@ -237,7 +237,7 @@
           "Linked"
         ],
         "summary": "`POST /v1/account/credentials` — issue anonymous credentials (authenticated).",
-        "description": "Idempotent per `(account, idempotency_key)`: the first request debits and\nstores the signed response in one transaction, and a retry with the same\nkey and request is answered from what was stored, so a response lost on the\nway back costs nothing. A stored issuance is answered before the terms gate\nand the current-key check, because it was already paid for.",
+        "description": "Idempotent per `(account, idempotency_key)`: the first request debits and\nstores the signed response in one transaction, and a retry with the same\nkey and request is answered from what was stored, so a response lost on the\nway back costs nothing. A stored issuance is answered before the terms gate\nand the current-key check, because it was already paid for. A key that is\nnot current is refused with `409` only once the database, under the account\nlock, has it no longer issuing, so no attempt under the idempotency key can\ndebit afterwards; otherwise `503`.",
         "operationId": "issue_credentials",
         "requestBody": {
           "content": {
@@ -291,7 +291,7 @@
             }
           },
           "409": {
-            "description": "The idempotency key was used for a different request, or the named issuer key is not the current one; nothing was debited",
+            "description": "The idempotency key was used for a different request, or the named issuer key has stopped issuing; nothing was or will be debited under the idempotency key",
             "content": {
               "application/json": {
                 "schema": {
@@ -311,7 +311,7 @@
             }
           },
           "503": {
-            "description": "Credential issuance not configured",
+            "description": "Credential issuance not configured, or the named issuer key is not yet this gateway's current issuing key; try again",
             "content": {
               "application/json": {
                 "schema": {
