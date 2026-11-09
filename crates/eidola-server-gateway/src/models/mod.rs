@@ -60,13 +60,17 @@ pub struct CatalogRow {
     /// rather than derived from `reasoning`, so a model can be moved between
     /// ladders without the catalog having to lie about what it does.
     pub output_budget_class: OutputBudgetClass,
-    /// USD per million input tokens (0.0 for per-request models).
-    pub input_per_m: f64,
-    /// USD per million output tokens (0.0 for per-request models).
-    pub output_per_m: f64,
-    /// USD per request (0.0 for token-based models).
-    pub per_request_usd: f64,
+    /// The base price, USD before the markup. The variant is the row's
+    /// pricing shape, whatever the amounts (a zero price keeps its shape).
+    pub price: RowPrice,
     pub lifecycle: Lifecycle,
+}
+
+/// A row's base price, USD before the markup.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RowPrice {
+    PerToken { input_per_m: f64, output_per_m: f64 },
+    PerRequest { usd: f64 },
 }
 
 /// One file the weights hash covers.

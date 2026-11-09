@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::engine_trust::{self, PinnedModel};
-use crate::models::{self, CatalogRow, Lifecycle, MODEL_CATALOG, ModelRefError};
+use crate::models::{self, CatalogRow, Lifecycle, MODEL_CATALOG, ModelRefError, RowPrice};
 use crate::types::{
     Capability, ChatCompletionChunk, ChatCompletionResponse, EngineDeploymentPin, LifecycleStatus,
     Model, ModelCapabilities, ModelLifecycle, ModelPricing, ModelsResponse,
@@ -175,7 +175,7 @@ pub fn parse_pricing_overrides(
                      model (keys are weights hashes, 64 lowercase hex digits)"
                 )
             })?;
-        let per_request = row.per_request_usd > 0.0;
+        let per_request = matches!(row.price, RowPrice::PerRequest { .. });
         let shape_ok = if per_request {
             ovr.input.is_none() && ovr.output.is_none() && ovr.request.is_some()
         } else {
@@ -339,35 +339,41 @@ fn published(
     markup: f64,
     ovr: Option<&PricingOverride>,
 ) -> Model {
-    let pricing = if row.per_request_usd > 0.0 {
-        let per_req = ovr.and_then(|o| o.request).unwrap_or(row.per_request_usd);
-        ModelPricing {
-            per_prompt_token: ScaledPrice {
-                value: 0,
-                scale_factor: PRICING_SCALE_FACTOR,
-            },
-            per_completion_token: ScaledPrice {
-                value: 0,
-                scale_factor: PRICING_SCALE_FACTOR,
-            },
-            per_request: Some(ScaledPrice {
-                value: usd_per_req_to_scaled_credits(per_req, markup),
-                scale_factor: PRICING_SCALE_FACTOR,
-            }),
+    let pricing = match row.price {
+        RowPrice::PerRequest { usd } => {
+            let per_req = ovr.and_then(|o| o.request).unwrap_or(usd);
+            ModelPricing {
+                per_prompt_token: ScaledPrice {
+                    value: 0,
+                    scale_factor: PRICING_SCALE_FACTOR,
+                },
+                per_completion_token: ScaledPrice {
+                    value: 0,
+                    scale_factor: PRICING_SCALE_FACTOR,
+                },
+                per_request: Some(ScaledPrice {
+                    value: usd_per_req_to_scaled_credits(per_req, markup),
+                    scale_factor: PRICING_SCALE_FACTOR,
+                }),
+            }
         }
-    } else {
-        let input = ovr.and_then(|o| o.input).unwrap_or(row.input_per_m);
-        let output = ovr.and_then(|o| o.output).unwrap_or(row.output_per_m);
-        ModelPricing {
-            per_prompt_token: ScaledPrice {
-                value: usd_per_m_to_scaled_credits(input, markup),
-                scale_factor: PRICING_SCALE_FACTOR,
-            },
-            per_completion_token: ScaledPrice {
-                value: usd_per_m_to_scaled_credits(output, markup),
-                scale_factor: PRICING_SCALE_FACTOR,
-            },
-            per_request: None,
+        RowPrice::PerToken {
+            input_per_m,
+            output_per_m,
+        } => {
+            let input = ovr.and_then(|o| o.input).unwrap_or(input_per_m);
+            let output = ovr.and_then(|o| o.output).unwrap_or(output_per_m);
+            ModelPricing {
+                per_prompt_token: ScaledPrice {
+                    value: usd_per_m_to_scaled_credits(input, markup),
+                    scale_factor: PRICING_SCALE_FACTOR,
+                },
+                per_completion_token: ScaledPrice {
+                    value: usd_per_m_to_scaled_credits(output, markup),
+                    scale_factor: PRICING_SCALE_FACTOR,
+                },
+                per_request: None,
+            }
         }
     };
     let (prompt_cache, pinned_weights) = engine_capabilities(pin);
@@ -558,9 +564,10 @@ pub(crate) mod tests {
             output_modalities: &[Modality::Text],
             max_output_tokens: Some(4_096),
             output_budget_class: OutputBudgetClass::Reasoning,
-            input_per_m: 1.0,
-            output_per_m: 2.0,
-            per_request_usd: 0.0,
+            price: RowPrice::PerToken {
+                input_per_m: 1.0,
+                output_per_m: 2.0,
+            },
             lifecycle: Lifecycle::Current,
         }
     }
@@ -575,8 +582,10 @@ pub(crate) mod tests {
             context_length: 1_048_576,
             input_modalities: &[Modality::Text, Modality::Image],
             max_output_tokens: Some(32_768),
-            input_per_m: 1.80,
-            output_per_m: 5.75,
+            price: RowPrice::PerToken {
+                input_per_m: 1.80,
+                output_per_m: 5.75,
+            },
             ..row(ENGINE_SHA, &["engine-fixture", "engine-latest"])
         },
         CatalogRow {
@@ -586,8 +595,10 @@ pub(crate) mod tests {
             tool_calling: false,
             reasoning: false,
             output_budget_class: OutputBudgetClass::Standard,
-            input_per_m: 0.20,
-            output_per_m: 0.60,
+            price: RowPrice::PerToken {
+                input_per_m: 0.20,
+                output_per_m: 0.60,
+            },
             lifecycle: Lifecycle::Deprecated {
                 retire_after: "2027-01-01",
             },
@@ -682,27 +693,28 @@ pub(crate) mod tests {
                 assert_eq!(model.capabilities.input_modalities, row.input_modalities);
                 assert_eq!(model.capabilities.output_modalities, row.output_modalities);
 
-                if row.per_request_usd > 0.0 {
-                    assert_eq!(
+                match row.price {
+                    RowPrice::PerRequest { usd } => assert_eq!(
                         model.pricing.per_request.as_ref().map(|p| p.value),
-                        Some(usd_per_req_to_scaled_credits(
-                            row.per_request_usd,
-                            DEFAULT_PRICING_MARKUP
-                        )),
+                        Some(usd_per_req_to_scaled_credits(usd, DEFAULT_PRICING_MARKUP)),
                         "{id} request price"
-                    );
-                } else {
-                    assert!(model.pricing.per_request.is_none(), "{id} request price");
-                    assert_eq!(
-                        model.pricing.per_prompt_token.value,
-                        usd_per_m_to_scaled_credits(row.input_per_m, DEFAULT_PRICING_MARKUP),
-                        "{id} prompt price"
-                    );
-                    assert_eq!(
-                        model.pricing.per_completion_token.value,
-                        usd_per_m_to_scaled_credits(row.output_per_m, DEFAULT_PRICING_MARKUP),
-                        "{id} completion price"
-                    );
+                    ),
+                    RowPrice::PerToken {
+                        input_per_m,
+                        output_per_m,
+                    } => {
+                        assert!(model.pricing.per_request.is_none(), "{id} request price");
+                        assert_eq!(
+                            model.pricing.per_prompt_token.value,
+                            usd_per_m_to_scaled_credits(input_per_m, DEFAULT_PRICING_MARKUP),
+                            "{id} prompt price"
+                        );
+                        assert_eq!(
+                            model.pricing.per_completion_token.value,
+                            usd_per_m_to_scaled_credits(output_per_m, DEFAULT_PRICING_MARKUP),
+                            "{id} completion price"
+                        );
+                    }
                 }
             }
             for retired in rows.iter().filter(|r| r.lifecycle.is_retired()) {
@@ -728,7 +740,10 @@ pub(crate) mod tests {
                         && row.output_modalities.contains(&Modality::Text),
                     "{id} does not take text in and give text back"
                 );
-                assert_eq!(row.per_request_usd, 0.0, "{id} is priced per request");
+                assert!(
+                    matches!(row.price, RowPrice::PerToken { .. }),
+                    "{id} is priced per request"
+                );
             }
         }
     }
@@ -803,9 +818,7 @@ pub(crate) mod tests {
         reasoning: false,
         max_output_tokens: None,
         output_budget_class: OutputBudgetClass::Standard,
-        input_per_m: 0.0,
-        output_per_m: 0.0,
-        per_request_usd: 0.01,
+        price: RowPrice::PerRequest { usd: 0.01 },
         ..row(PER_REQUEST_SHA, &["per-request-fixture"])
     }];
     const PER_REQUEST_PINS: &[PinnedModel] = &[pin(PER_REQUEST_SHA, false)];
@@ -836,6 +849,19 @@ pub(crate) mod tests {
                 .value,
             20_000_000_000
         );
+        // A zero base price keeps its shape: still per request, and still
+        // overridable per request.
+        const FREE: &[CatalogRow] = &[CatalogRow {
+            price: RowPrice::PerRequest { usd: 0.0 },
+            ..PER_REQUEST_FIXTURE[0]
+        }];
+        let free = Catalog::from_parts(FREE, PER_REQUEST_PINS, 1.0, Some(&overrides)).unwrap();
+        let free = &free.list().data[0];
+        assert_eq!(
+            free.pricing.per_request.as_ref().unwrap().value,
+            20_000_000_000
+        );
+        assert_eq!(free.pricing.per_prompt_token.value, 0);
         let wrong_shape = format!(r#"{{"{PER_REQUEST_SHA}": {{"input": 0.02}}}}"#);
         assert!(
             Catalog::from_parts(
