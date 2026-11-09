@@ -565,10 +565,17 @@ pub enum RefundMode {
     /// provisional refund: a refund of nothing (`t = 0`), marked
     /// `"provisional": true`, as the real endpoint does for a spend whose
     /// request may still end. Every later call answers the same refund marked
-    /// `"provisional": false`, as the real endpoint does once `T_SETTLE` has
-    /// passed since it recorded the spend and the provisional refund is the
-    /// spend's last word. Inline refunds are omitted, as for `Fail`.
+    /// `"provisional": false`, as the real endpoint does once no request is
+    /// serving the spend any more and the provisional refund is its last
+    /// word. Inline refunds are omitted, as for `Fail`.
     ProvisionalFirst(u64),
+    /// **The gateway settled a stream it cut short on what was generated.**
+    /// `/v1/credentials/refund` answers a final refund returning the hold less
+    /// `n` credits (the prompt and the output generated before the cut), as
+    /// the real endpoint does for a stream that ended early (its client went
+    /// away, it reached its deadline, or its engine failed). Inline refunds
+    /// are omitted, as for `Fail`.
+    ChargedEarly(u128),
 }
 
 /// Mock upstream configuration.
@@ -2002,7 +2009,9 @@ async fn handle_refund(
     let failing = match config.refund {
         RefundMode::Fail => true,
         RefundMode::FailFirst(n) => attempt <= n,
-        RefundMode::Succeed | RefundMode::ProvisionalFirst(_) => false,
+        RefundMode::Succeed | RefundMode::ProvisionalFirst(_) | RefundMode::ChargedEarly(_) => {
+            false
+        }
         RefundMode::NotStored => {
             return write_json(stream, 404, &error_body("refund token not found")).await;
         }
@@ -2015,6 +2024,9 @@ async fn handle_refund(
     let refund = auth.and_then(Issuer::spend_proof_from_auth).and_then(|sp| {
         if stored_provisional {
             issuer.refund_of(&sp, 0)
+        } else if let RefundMode::ChargedEarly(charged) = config.refund {
+            let hold = scalar_to_credit::<ACT_L>(&sp.charge()).ok()?;
+            issuer.refund_of(&sp, hold.checked_sub(charged)?)
         } else {
             issuer.refund_for(&sp)
         }

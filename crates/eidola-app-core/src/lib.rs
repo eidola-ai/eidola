@@ -15076,10 +15076,9 @@ async fn process_refund(
 /// with the final refund's, so spending it would destroy the larger one when
 /// it comes. It is refused here (an error, so the spend stays `spending` for
 /// a later ask) until the server answers `"provisional": false`, which it
-/// does once the provisional refund is the spend's last word
-/// (`eidola_common::T_SETTLE` after it recorded the spend, by its own clock,
-/// which only a crash lets a provisional refund reach), or until the spent
-/// key's `spend_until` has passed (`spend_until`, when known), when the
+/// does once the provisional refund is the spend's last word (no request is
+/// serving the spend any more: a crash or a restart left it), or until the
+/// spent key's `spend_until` has passed (`spend_until`, when known), when the
 /// successor must be taken while it is worth anything.
 async fn recover_refund(
     client: &reqwest::Client,
@@ -15134,8 +15133,8 @@ async fn recover_refund(
 /// Whether a refund the server still calls provisional may be settled on at
 /// `now`: only once the spent key's `spend_until` has passed, when waiting
 /// longer would leave the successor worth nothing. Whether the request may
-/// still settle is the server's to say: it alone knows when it recorded the
-/// spend. All in ms.
+/// still settle is the server's to say: it alone knows whether it is still
+/// serving it. All in ms.
 fn accepts_provisional_refund(spend_until: Option<i64>, now: i64) -> bool {
     spend_until.is_some_and(|until| now >= until)
 }
@@ -19007,9 +19006,6 @@ mod tests {
         assert!(!accepts_provisional_refund(None, i64::MAX));
         assert!(!accepts_provisional_refund(Some(until), until - 1));
         assert!(accepts_provisional_refund(Some(until), until));
-        // The gateway ends a request inside the window after which it calls a
-        // provisional refund final.
-        assert!(eidola_common::MAX_REQUEST_DURATION < eidola_common::T_SETTLE);
     }
 
     /// **One spend, one refund.** A response's `refunds` is read only when it

@@ -98,11 +98,11 @@ A background issuance is timed too: it follows, by one random interval of 10 to 
 
 ### A crash mid-spend costs the request's hold
 
-**Current behavior.** A spend records its nullifier, with a provisional refund of nothing stored on the same row in the same statement, before the request is served, and replaces that with the final refund when the request ends ([anonymous-credits.md § Provisional refunds and the request deadline](anonymous-credits.md#provisional-refunds-and-the-request-deadline)). If the gateway stops in between (a crash, a restart), the provisional refund is the spend's last: once `T_SETTLE` (30 minutes) has passed since the spend was recorded, recovery calls it final, and the client gets back the token's balance less the hold. The hold itself, which the request may or may not have used, is lost.
+**Current behavior.** A spend records its nullifier, with a provisional refund of nothing stored on the same row in the same statement, before the request is served, and replaces that with the final refund when the request ends ([anonymous-credits.md § Provisional refunds, the live set, and ending a request early](anonymous-credits.md#provisional-refunds-the-live-set-and-ending-a-request-early)). If the gateway stops in between (a crash, a restart), the provisional refund is the spend's last: as soon as the gateway is back, recovery finds no request serving the spend, calls the provisional refund final, and the client gets back the token's balance less the hold. The hold itself, which the request may or may not have used, is lost. The same is true, for the request's partial return only, when a client recovers a spend that is still running on a *different* live gateway instance: that instance's live set is not the one recovery asks.
 
-**What constrains it today.** The window is the duration of one request on one instance, and no request runs longer than 28 minutes after its nullifier is recorded. The client keeps the spend's state and keeps retrying recovery until the key stops accepting.
+**What constrains it today.** The window is the duration of one request on one instance, and the client's wait is the gateway's restart time. Production runs one gateway instance, so the cross-instance case is at most a deploy overlap. The client keeps the spend's state and keeps retrying recovery until the key stops accepting.
 
-**Future.** Charging a crashed request what it actually used would need its usage to outlive the process, which the gateway deliberately keeps nowhere outside enclave memory.
+**Future.** Charging a crashed request what it actually used would need its usage to outlive the process, which the gateway deliberately keeps nowhere outside enclave memory. Running several instances side by side would need recovery to ask the instance that holds the spend, without the database learning which requests are in flight.
 
 ### A client's first sight of an epoch's key
 

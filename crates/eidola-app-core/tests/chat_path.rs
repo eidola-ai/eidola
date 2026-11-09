@@ -483,8 +483,8 @@ fn a_spend_travels_in_the_body_and_the_record_never_keeps_it() {
 /// refund's, so settling on it could destroy the larger one. The turn and the
 /// startup sweep both leave the hold `spending` (no successor, no `Wallet` for
 /// it) while the gateway calls the refund provisional. Once the gateway says
-/// it is the spend's last word (a crash, `T_SETTLE` after it recorded the
-/// spend), the sweep settles on it, and the successor holds the credential's
+/// it is the spend's last word (no request is serving it any more: a crash
+/// or a restart left it), the sweep settles on it, and the successor holds the credential's
 /// untouched remainder.
 #[test]
 fn a_provisional_refund_is_settled_on_only_when_the_gateway_calls_it_final() {
@@ -4373,6 +4373,55 @@ fn mid_sse_abort_emits_user_turn_and_keeps_the_post() {
             .expect("messages");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
+    });
+}
+
+/// **A stream the gateway cut short settles on what was generated.** When a
+/// stream ends early (its client went away, it reached its deadline, or its
+/// engine failed), the gateway releases the engine and stores a final refund
+/// charging the prompt and the output generated up to the cut: never the
+/// whole hold for what was not produced, never nothing. The client recovers
+/// it like any refund, and its successor holds the credential's balance less
+/// exactly that charge.
+#[test]
+fn a_stream_cut_short_settles_on_what_was_generated() {
+    run(|| {
+        const CHARGED: u128 = 17;
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingMidAbort,
+            refund: RefundMode::ChargedEarly(CHARGED),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let lifecycle = |core: &AppCore| {
+            core.runtime()
+                .block_on(core.wallet_lifecycle())
+                .expect("lifecycle")
+        };
+        let mut rx = core.subscribe_changes();
+
+        let (tx, _events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.chat_stream("stream me".into(), MODEL.into(), None, tx))
+            .expect_err("the stream was cut short");
+
+        assert!(mock.refund_hits() >= 1, "the hold went to recovery");
+        assert!(drain(&mut rx).contains(&Change::Wallet));
+        let spent = lifecycle(&core)
+            .into_iter()
+            .find(|c| c.state == "spent")
+            .expect("the spent credential");
+        let hold = spent.spend_amount.expect("its hold");
+        let successor = lifecycle(&core)
+            .into_iter()
+            .find(|c| c.state == "active")
+            .expect("its successor");
+        assert_eq!(
+            successor.credits,
+            spent.credits - i64::try_from(CHARGED).unwrap(),
+            "charged {CHARGED} of a {hold}-credit hold"
+        );
+        assert_settled(&core);
     });
 }
 

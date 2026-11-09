@@ -344,7 +344,7 @@ const REFUND_TOKEN_KEY_INFO: &[u8] = b"eidola-refund-token-v1";
 /// First byte of every sealed refund token. A CBOR `RefundMsg` (a five-entry
 /// map) begins with `0xa5`, so a bare token is told apart by this byte as
 /// well as by failing to open.
-const SEALED_REFUND_VERSION: u8 = 0x02;
+const SEALED_REFUND_VERSION: u8 = 0x03;
 
 /// Whether a stored refund is the one a spend will finally get.
 ///
@@ -357,72 +357,101 @@ const SEALED_REFUND_VERSION: u8 = 0x02;
 /// recovery says which this is, so a client never spends the provisional one
 /// while the final one may still come.
 ///
-/// A provisional refund carries the instant its spend was recorded, so the
-/// gateway itself can say when the final one can no longer come
-/// ([`RefundStage::settled_at`]): the client never has to guess when the
-/// gateway recorded a spend from when it sent one.
-///
-/// The stage and the instant are the sealed plaintext's first nine bytes, so
-/// the database sees only that the row was written again, which it already
-/// did; only the client's key opens them.
+/// The stage is the sealed plaintext's first byte, so the database sees only
+/// that the row was written again, which it already did; only the client's
+/// key opens it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefundStage {
-    /// Stored when the nullifier was recorded, at `recorded_at` (whole Unix
-    /// seconds on the recording instance's clock); the request had not ended.
-    Provisional { recorded_at: u64 },
-    /// Stored when the request ended.
+    /// Stored when the nullifier was recorded; the request had not ended.
+    Provisional,
+    /// Stored when the request ended, or declared by recovery once no
+    /// request was serving the spend.
     Final,
 }
 
-/// Length of the stage prefix of a sealed refund's plaintext: a stage byte and
-/// a big-endian `u64` (the recording instant, or zero for a final refund).
-const REFUND_STAGE_LEN: usize = 9;
+/// Length of the stage prefix of a sealed refund's plaintext.
+const REFUND_STAGE_LEN: usize = 1;
 
 impl RefundStage {
-    /// A provisional refund for a spend recorded at `now`.
-    pub fn provisional_at(now: SystemTime) -> Self {
-        RefundStage::Provisional {
-            recorded_at: now
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-        }
-    }
-
-    /// When this stage's refund may be declared the spend's last word: now for
-    /// a final refund, and for a provisional one `T_SETTLE` after its spend
-    /// was recorded. By then the request has ended at its deadline
-    /// (`eidola_common::MAX_REQUEST_DURATION`, shorter by a margin that covers
-    /// clock disagreement between instances and settlement's own write), so
-    /// only a crash leaves one provisional that long. Recovery declares it by
-    /// rewriting the row as final, a compare-and-swap that a final refund
-    /// still in flight cannot then overwrite ([`recover_presented_refund`]).
-    pub fn settled_at(self) -> SystemTime {
-        match self {
-            RefundStage::Final => UNIX_EPOCH,
-            RefundStage::Provisional { recorded_at } => {
-                UNIX_EPOCH + Duration::from_secs(recorded_at) + eidola_common::T_SETTLE
-            }
-        }
-    }
-
     fn encode(self) -> [u8; REFUND_STAGE_LEN] {
-        let mut out = [0u8; REFUND_STAGE_LEN];
-        if let RefundStage::Provisional { recorded_at } = self {
-            out[1..].copy_from_slice(&recorded_at.to_be_bytes());
-        } else {
-            out[0] = 0x01;
+        match self {
+            RefundStage::Provisional => [0x00],
+            RefundStage::Final => [0x01],
         }
-        out
     }
 
     fn decode(bytes: &[u8]) -> Option<Self> {
-        let (&stage, instant) = bytes.split_first()?;
-        let instant = u64::from_be_bytes(instant.try_into().ok()?);
-        match (stage, instant) {
-            (0x00, recorded_at) => Some(RefundStage::Provisional { recorded_at }),
-            (0x01, 0) => Some(RefundStage::Final),
+        match bytes {
+            [0x00] => Some(RefundStage::Provisional),
+            [0x01] => Some(RefundStage::Final),
             _ => None,
+        }
+    }
+}
+
+/// The spends this gateway process is serving right now, by issuer key id and
+/// nullifier: what lets recovery tell a provisional refund whose request is
+/// still running from one a crash or a restart left behind.
+///
+/// A spend enters before its nullifier is recorded and leaves when the last
+/// holder of its [`LiveSpend`] lets go, which is after its request's final
+/// refund has been written, or its write attempted, whatever the outcome. So
+/// when recovery finds a provisional refund and this set does not hold its
+/// spend, no request in this process can still settle it, and recovery
+/// declares it final at once (by a compare-and-swap, so a final refund from
+/// anywhere that wins the row first is what the client gets instead).
+///
+/// The set is per process and in memory, never in the database (which is
+/// outside the enclave and would learn when each request ran), and counted,
+/// so two requests presenting one nullifier (a double spend, refused at
+/// recording) do not end each other's entry.
+#[derive(Default)]
+pub struct LiveSpends(std::sync::Mutex<HashMap<(String, Vec<u8>), usize>>);
+
+impl LiveSpends {
+    /// Mark `act` as being served by this process until the returned guard,
+    /// and every clone of the `Arc` it is held in, is dropped.
+    pub fn serve(self: &Arc<Self>, act: &crate::auth::ActSpend) -> LiveSpend {
+        let entry = (
+            hex::encode(act.issuer_key_hash),
+            act.spend_proof.nullifier().as_bytes().to_vec(),
+        );
+        *self
+            .0
+            .lock()
+            .expect("live spends lock")
+            .entry(entry.clone())
+            .or_default() += 1;
+        LiveSpend {
+            set: Arc::clone(self),
+            entry,
+        }
+    }
+
+    /// Whether this process is serving the spend `(issuer_key_id, nullifier)`.
+    pub fn is_live(&self, issuer_key_id: &str, nullifier: &[u8]) -> bool {
+        self.0
+            .lock()
+            .expect("live spends lock")
+            .contains_key(&(issuer_key_id.to_string(), nullifier.to_vec()))
+    }
+}
+
+/// One entry in [`LiveSpends`], held for exactly as long as the request it
+/// names may still write its final refund.
+pub struct LiveSpend {
+    set: Arc<LiveSpends>,
+    entry: (String, Vec<u8>),
+}
+
+impl Drop for LiveSpend {
+    fn drop(&mut self) {
+        let mut set = self.set.0.lock().expect("live spends lock");
+        if let Some(count) = set.get_mut(&self.entry) {
+            *count -= 1;
+            if *count == 0 {
+                set.remove(&self.entry);
+            }
         }
     }
 }
@@ -443,7 +472,7 @@ const SEALED_REFUND_NONCE_LEN: usize = 12;
 /// [`seal_refund_token`] is the only way to make one from a token.
 ///
 /// Layout: `version (1) || nonce (12) || ciphertext || tag (16)`, the
-/// plaintext being `stage (9) || CBOR` ([`RefundStage`]). The ciphertext is
+/// plaintext being `stage (1) || CBOR` ([`RefundStage`]). The ciphertext is
 /// exactly as long as that, and the CBOR is fixed-size (four 32-byte scalars
 /// and a 32-byte point), so the length says nothing, and a provisional token
 /// and a final one are the same length.
@@ -1659,13 +1688,12 @@ pub struct RefundRecoveryResponse {
     /// The spend's refund: an array of one, mirroring `credentials`.
     pub refunds: Vec<RefundInfo>,
     /// Whether the refund is the provisional one stored when the spend was
-    /// recorded (`t = 0`) and its request may still end with a larger one. A
-    /// client keeps the spend pending and asks again, since the final
-    /// refund's successor shares its nullifier and spending either destroys
-    /// the other. `false` once the stored refund is the spend's last word: a
-    /// final refund, or a provisional one asked for `T_settle`
-    /// (`eidola_common::T_SETTLE`) after its spend was recorded, which only a
-    /// gateway crash leaves standing that long, and which recovery then
+    /// recorded (`t = 0`) and its request is still being served, so it may
+    /// end with a larger one. A client keeps the spend pending and asks again,
+    /// since the final refund's successor shares its nullifier and spending
+    /// either destroys the other. `false` once the stored refund is the
+    /// spend's last word: a final refund, or a provisional one no request is
+    /// serving any more (a crash or a restart left it), which recovery then
     /// rewrites as final, so no later write can change it.
     pub provisional: bool,
 }
@@ -1781,12 +1809,13 @@ pub(crate) async fn recover_presented_refund(
                 message: "no refund token is stored for this credential".to_string(),
             });
         };
-        if stage == RefundStage::Final || SystemTime::now() < stage.settled_at() {
+        if stage == RefundStage::Final || state.live_spends.is_live(&key_id, &nullifier_bytes) {
             return Ok(RefundRecoveryResponse::new(&refund_cbor, key_id, stage));
         }
-        // A provisional refund that may now be declared the spend's last
-        // word. Declared by rewriting the row as final, a compare-and-swap on
-        // exactly what was read: a final refund that a stalled request
+        // A provisional refund no request in this process is serving: a
+        // crash or a restart left it, so it is the spend's last word.
+        // Declared by rewriting the row as final, a compare-and-swap on
+        // exactly what was read: a final refund that a request elsewhere
         // writes after this can then change nothing, and one written before
         // it fails this swap, and is what the client gets.
         let declared = seal_refund_token(
@@ -2321,6 +2350,7 @@ mod tests {
             spend_proof,
             refund_key: RefundKey::from_bytes([0x11; 32]),
             provisional: None,
+            live: None,
         };
         (act, pre_refund)
     }
@@ -2643,7 +2673,7 @@ mod tests {
             &RefundKey::from_bytes([1; 32]),
             KEY_ID,
             &[7u8; 32],
-            RefundStage::provisional_at(SystemTime::now()),
+            RefundStage::Provisional,
             b"refund",
         )
         .unwrap()
@@ -2784,24 +2814,21 @@ mod tests {
         );
     }
 
-    /// A stored refund says whether it is provisional, and when its spend
-    /// was recorded, inside the seal: a provisional token and a final one of
-    /// the same spend are the same length, and each opens to its own stage.
+    /// A stored refund says whether it is provisional inside the seal: a
+    /// provisional token and a final one of the same spend are the same
+    /// length, and each opens to its own stage.
     #[test]
     fn a_refunds_stage_travels_inside_the_seal() {
         let ck = client_key(7);
         let (_, _, proof, _, cbor) = refund_fixture(1000, 300, 117);
         let nullifier = proof.nullifier().as_bytes().to_vec();
-        let recorded = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        let stage = RefundStage::provisional_at(recorded);
-        let provisional = seal_refund_token(&ck, KEY_ID, &nullifier, stage, &cbor).unwrap();
+        let provisional =
+            seal_refund_token(&ck, KEY_ID, &nullifier, RefundStage::Provisional, &cbor).unwrap();
         let final_ = seal_refund_token(&ck, KEY_ID, &nullifier, RefundStage::Final, &cbor).unwrap();
         assert_eq!(provisional.as_bytes().len(), final_.as_bytes().len());
         assert_eq!(
             open_refund_token(&ck, KEY_ID, &nullifier, &provisional).map(|(stage, _)| stage),
-            Some(RefundStage::Provisional {
-                recorded_at: 1_800_000_000
-            })
+            Some(RefundStage::Provisional)
         );
         assert_eq!(
             open_refund_token(&ck, KEY_ID, &nullifier, &final_).map(|(stage, _)| stage),
@@ -2809,16 +2836,34 @@ mod tests {
         );
     }
 
-    /// **A provisional refund may be declared the last word** `T_SETTLE`
-    /// after its spend was recorded, by when the request has ended at its
-    /// shorter deadline. A final refund is the last word at once.
+    /// **The live set is held exactly as long as some holder serves the
+    /// spend**: counted, so a second request presenting the same nullifier
+    /// (a double spend, refused at recording) does not end the first one's
+    /// entry when it goes away.
     #[test]
-    fn a_provisional_refund_settles_t_settle_after_its_spend_was_recorded() {
-        let recorded = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        let settled = RefundStage::provisional_at(recorded).settled_at();
-        assert_eq!(settled, recorded + eidola_common::T_SETTLE);
-        assert!(recorded + eidola_common::MAX_REQUEST_DURATION < settled);
-        assert_eq!(RefundStage::Final.settled_at(), UNIX_EPOCH);
+    fn a_spend_is_live_until_its_last_holder_lets_go() {
+        let mut keys = Cache::new();
+        let hash = add_key(&mut keys, SystemTime::now() + DAY);
+        let (act, _) = spend(&keys[&hash], 1000, 300);
+        let key_id = hex::encode(act.issuer_key_hash);
+        let nullifier = act.spend_proof.nullifier().as_bytes().to_vec();
+        let live = Arc::new(LiveSpends::default());
+        assert!(!live.is_live(&key_id, &nullifier));
+        let first = Arc::new(live.serve(&act));
+        let task_copy = Arc::clone(&first);
+        let duplicate = live.serve(&act);
+        drop(duplicate);
+        assert!(
+            live.is_live(&key_id, &nullifier),
+            "the duplicate ended nothing"
+        );
+        drop(first);
+        assert!(
+            live.is_live(&key_id, &nullifier),
+            "the stream task still holds it"
+        );
+        drop(task_copy);
+        assert!(!live.is_live(&key_id, &nullifier));
     }
 
     /// **No forks.** A spend can be answered by two refunds: the provisional
@@ -3147,6 +3192,7 @@ mod tests {
             spend_proof: proof,
             refund_key,
             provisional: None,
+            live: None,
         };
         let answer = |proof: SpendProof<ACT_L>, refund_key: RefundKey| {
             let state = state.clone();
@@ -3219,11 +3265,13 @@ mod tests {
         };
         assert_eq!(scalar_to_credit::<ACT_L>(&next.credits()).unwrap(), 1000);
 
-        // A spend the chat path recorded: its row holds the provisional
+        // A spend the chat path is serving: it is in this process's live set
+        // before its nullifier is recorded, its row holds the provisional
         // refund (`t = 0`) from the moment it is recorded, and recovery says
         // so; once the request settles, the final one replaces it.
         let (in_flight, in_flight_pre) = spend(1000, 300).await;
         let in_flight_act = act_of(in_flight.clone(), ck.clone());
+        let serving = Arc::new(state.live_spends.serve(&in_flight_act));
         let provisional = {
             let cache = cache.read().await;
             verify_presented_spend(cache.get(&key_hash).unwrap(), &in_flight_act).unwrap()
@@ -3231,7 +3279,7 @@ mod tests {
         let recorded = record_spend(
             &state,
             &in_flight_act,
-            RefundStage::provisional_at(SystemTime::now()),
+            RefundStage::Provisional,
             &provisional,
         )
         .await
@@ -3241,7 +3289,7 @@ mod tests {
             record_spend(
                 &state,
                 &in_flight_act,
-                RefundStage::provisional_at(SystemTime::now()),
+                RefundStage::Provisional,
                 &provisional
             )
             .await
@@ -3251,11 +3299,14 @@ mod tests {
         );
         let in_flight_act = ActSpend {
             provisional: Some(Arc::new(recorded)),
+            live: Some(serving),
             ..in_flight_act
         };
         let (refund, is_provisional) = answer(in_flight.clone(), ck.clone()).await.unwrap();
-        assert!(is_provisional);
+        assert!(is_provisional, "provisional while this process serves it");
         assert_eq!(URL_SAFE_NO_PAD.decode(&refund).unwrap(), provisional.cbor);
+        let (_, is_provisional) = answer(in_flight.clone(), ck.clone()).await.unwrap();
+        assert!(is_provisional, "and on every ask while it does");
         let settled = {
             let cache = cache.read().await;
             sign_refund(&cache, &in_flight_act, 117, SystemTime::now()).unwrap()
@@ -3263,6 +3314,7 @@ mod tests {
         store_sealed_refund(&state, &in_flight_act, &key_id, &settled.0)
             .await
             .unwrap();
+        drop(in_flight_act);
         let (refund, is_provisional) = answer(in_flight.clone(), ck.clone()).await.unwrap();
         assert!(!is_provisional);
         let refund = Refund::from_cbor(&URL_SAFE_NO_PAD.decode(&refund).unwrap()).unwrap();
@@ -3278,20 +3330,19 @@ mod tests {
             1000 - 300 + 117
         );
 
-        // A spend recorded longer than `T_SETTLE` ago whose request never
-        // settled (its gateway crashed): the provisional refund is its last
-        // word, and recovery says so.
+        // A spend no request in this process is serving (its gateway crashed,
+        // or restarted): the provisional refund is its last word, and
+        // recovery declares it so at once.
         let (crashed, _) = spend(1000, 300).await;
         let crashed_act = act_of(crashed.clone(), ck.clone());
         let crashed_refund = {
             let cache = cache.read().await;
             verify_presented_spend(cache.get(&key_hash).unwrap(), &crashed_act).unwrap()
         };
-        let long_ago = SystemTime::now() - eidola_common::T_SETTLE - Duration::from_secs(1);
         let crashed_recorded = record_spend(
             &state,
             &crashed_act,
-            RefundStage::provisional_at(long_ago),
+            RefundStage::Provisional,
             &crashed_refund,
         )
         .await
@@ -3300,15 +3351,15 @@ mod tests {
         let (refund, is_provisional) = answer(crashed.clone(), ck.clone()).await.unwrap();
         assert!(
             !is_provisional,
-            "past T_SETTLE the provisional refund is final"
+            "nothing serves it, so the provisional refund is final"
         );
         assert_eq!(
             URL_SAFE_NO_PAD.decode(&refund).unwrap(),
             crashed_refund.cbor
         );
-        // Recovery rewrote the row as final, so a final refund that a
-        // stalled request writes now (a compare-and-swap on the provisional
-        // refund it recorded) changes nothing.
+        // Recovery rewrote the row as final, so a final refund that a request
+        // elsewhere writes now (a compare-and-swap on the provisional refund
+        // it recorded) loses the swap and changes nothing.
         assert_ne!(
             stored_row(&nullifier_of(&crashed)).await,
             crashed_recorded.as_bytes()
@@ -3340,7 +3391,7 @@ mod tests {
             &client_key(9),
             &key_id,
             &other_nullifier,
-            RefundStage::provisional_at(SystemTime::now()),
+            RefundStage::Provisional,
             &first_cbor,
         )
         .unwrap();

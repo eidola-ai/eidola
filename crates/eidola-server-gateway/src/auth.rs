@@ -79,6 +79,11 @@ pub struct ActSpend {
     /// once this gateway has recorded it: what the final refund replaces, and
     /// the only thing it may replace (`credentials::store_sealed_refund`).
     pub provisional: Option<std::sync::Arc<crate::credentials::SealedRefundToken>>,
+    /// This spend's entry in the gateway's live set
+    /// (`credentials::LiveSpends`), shared by every clone, so the entry
+    /// leaves only when the last holder (the handler, or the stream task that
+    /// writes the final refund) is done.
+    pub live: Option<std::sync::Arc<crate::credentials::LiveSpend>>,
 }
 
 /// A client's refund recovery key (`eidola_common::refund_key`), held only in
@@ -203,6 +208,7 @@ fn parse_token(credential: &DecodedCredential) -> Result<ActSpend, ServerError> 
         spend_proof,
         refund_key: RefundKey::from_bytes(credential.refund_key),
         provisional: None,
+        live: None,
     })
 }
 

@@ -414,13 +414,13 @@ COMMENT ON COLUMN nullifier.value IS
     'the primary key — a duplicate insert fails, indicating a double-spend.';
 
 COMMENT ON COLUMN nullifier.refund_token IS
-    'The refund token for this spend, sealed: a version byte (0x02), a '
-    '12-byte random nonce, then a stage byte (0x00 provisional, 0x01 final), '
-    'the provisional refund''s recording instant (8 bytes, zero when final) '
+    'The refund token for this spend, sealed: a version byte (0x03), a '
+    '12-byte random nonce, then a stage byte (0x00 provisional, 0x01 final) '
     'and the CBOR RefundMsg, under AES-256-GCM with its tag. Written with the '
     'nullifier in one statement, as the provisional refund (t = 0), and '
-    'overwritten with the final refund when the request ends; the stage and '
-    'instant are inside the seal, so the database sees only the second write. The key is HKDF-SHA256 (salt = issuer_key_id, info = '
+    'overwritten with the final refund when the request ends, or by recovery '
+    'declaring the provisional one final, each a compare-and-swap; the stage '
+    'is inside the seal, so the database sees only the second write. The key is HKDF-SHA256 (salt = issuer_key_id, info = '
     'eidola-refund-token-v1) over the refund recovery key the client sent with '
     'the spend, and nothing else, derived in enclave memory and kept nowhere: '
     'the client key is never stored or logged, so no one without the client '
@@ -438,10 +438,10 @@ COMMENT ON COLUMN nullifier.refund_token IS
     'does not open for the presented key is answered as no token stored.';
 
 -- A database holding refund tokens in an earlier format (bare CBOR, which
--- begins 0xa5, or the stage-less 0x01 seal) is cleared by hand, idempotently:
+-- begins 0xa5, or an earlier seal version) is cleared by hand, idempotently:
 --
 --   UPDATE nullifier SET refund_token = NULL
---    WHERE substring(refund_token FROM 1 FOR 1) <> '\x02'::bytea;
+--    WHERE substring(refund_token FROM 1 FOR 1) <> '\x03'::bytea;
 --
 -- That clears current values only: WAL, base backups and replicas keep the
 -- old ones until they age out.
