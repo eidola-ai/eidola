@@ -33,31 +33,31 @@ echo "── verify accepts the fixture's directory ──"
 python3 -I "$script" verify "$fixture" "$weights" >/dev/null
 echo "  ok"
 
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
 refused() {
-  if python3 -I "$script" verify "$fixture" "$work/w" >"$work/out" 2>&1; then
+  if python3 -I "$script" verify "$fixture" "$tmp/w" >"$tmp/out" 2>&1; then
     echo "verify accepted $1" >&2; exit 1
   fi
-  grep -q "$2" "$work/out" || { echo "verify refused $1, but not with \"$2\":" >&2; cat "$work/out" >&2; exit 1; }
+  grep -q "$2" "$tmp/out" || { echo "verify refused $1, but not with \"$2\":" >&2; cat "$tmp/out" >&2; exit 1; }
   echo "  refused: $1"
 }
-fresh() { rm -rf "$work/w"; cp -R "$weights" "$work/w"; }
+fresh() { rm -rf "$tmp/w"; cp -R "$weights" "$tmp/w"; }
 
 echo "── verify refuses each way a directory can be wrong ──"
-fresh; printf 'x' > "$work/w/model-00003-of-00002.safetensors"
+fresh; printf 'x' > "$tmp/w/model-00003-of-00002.safetensors"
 refused "an extra shard the engine would hash" "the engine would hash it"
-fresh; printf 'shard 1ne' > "$work/w/model-00001-of-00002.safetensors"
+fresh; printf 'shard 1ne' > "$tmp/w/model-00001-of-00002.safetensors"
 refused "a file with other bytes of the same size" "sha256"
-fresh; printf 'shard one!' > "$work/w/model-00001-of-00002.safetensors"
+fresh; printf 'shard one!' > "$tmp/w/model-00001-of-00002.safetensors"
 refused "a file of another size" "bytes, the catalog says"
-fresh; rm "$work/w/tokenizer.json"
+fresh; rm "$tmp/w/tokenizer.json"
 refused "a missing file" "tokenizer.json: missing"
-fresh; python3 -I -c 'import sys; t = open(sys.argv[1]).read(); open(sys.argv[2], "w").write(t.replace(sys.argv[3], "0" * 64))' "$fixture" "$work/bad.toml" "$expected"
-if python3 -I "$script" verify "$work/bad.toml" "$weights" >"$work/out" 2>&1; then
+fresh; python3 -I -c 'import sys; t = open(sys.argv[1]).read(); open(sys.argv[2], "w").write(t.replace(sys.argv[3], "0" * 64))' "$fixture" "$tmp/bad.toml" "$expected"
+if python3 -I "$script" verify "$tmp/bad.toml" "$weights" >"$tmp/out" 2>&1; then
   echo "verify accepted a catalog whose sha256 is not its manifest's" >&2; exit 1
 fi
-grep -q "the manifest of the listed files hashes to" "$work/out"
+grep -q "the manifest of the listed files hashes to" "$tmp/out"
 echo "  refused: a catalog whose sha256 is not its manifest's aggregate"
 
 echo "weights-hash script: agrees with the gateway's hash, and refuses what it should."
