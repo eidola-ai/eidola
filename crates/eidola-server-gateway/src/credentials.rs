@@ -19,12 +19,13 @@ use tracing::{info, warn};
 use utoipa::ToSchema;
 
 use crate::AppState;
-use crate::auth::{BasicAuth, RefundKey, TokenAuth};
+use crate::auth::{BasicAuth, RefundKey};
 use crate::db;
 use crate::error::ServerError;
 use crate::helpers::system_time_to_iso_lossy;
 use crate::response::RefundInfo;
 use eidola_common::issuer_calendar::{EpochWindows, ISSUER_CALENDAR, rfc3339_utc};
+use eidola_common::spend_credentials::ACT_L;
 
 // ---------------------------------------------------------------------------
 // Key cache types
@@ -343,7 +344,45 @@ const REFUND_TOKEN_KEY_INFO: &[u8] = b"eidola-refund-token-v1";
 /// First byte of every sealed refund token. A CBOR `RefundMsg` (a five-entry
 /// map) begins with `0xa5`, so a bare token is told apart by this byte as
 /// well as by failing to open.
-const SEALED_REFUND_VERSION: u8 = 0x01;
+const SEALED_REFUND_VERSION: u8 = 0x02;
+
+/// Whether a stored refund is the one a spend will finally get.
+///
+/// Recording a spend's nullifier stores, in the same statement, a refund that
+/// returns nothing (`t = 0`): a crash before settlement then costs the spend
+/// its hold, never the credential's untouched balance `c − s`. Settlement
+/// overwrites it with the final refund. Both successors of one spend share a
+/// nullifier (it is fixed by the commitment inside the spend proof, which
+/// every refund of that proof signs), so a client can spend only one of them;
+/// recovery says which this is, so a client never spends the provisional one
+/// while the final one may still come.
+///
+/// The stage is the first byte of the sealed plaintext, so the database sees
+/// only that the row was written again, which it already did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefundStage {
+    /// Stored when the nullifier was recorded; the request has not ended.
+    Provisional,
+    /// Stored when the request ended.
+    Final,
+}
+
+impl RefundStage {
+    fn byte(self) -> u8 {
+        match self {
+            RefundStage::Provisional => 0x00,
+            RefundStage::Final => 0x01,
+        }
+    }
+
+    fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x00 => Some(RefundStage::Provisional),
+            0x01 => Some(RefundStage::Final),
+            _ => None,
+        }
+    }
+}
 
 const SEALED_REFUND_NONCE_LEN: usize = 12;
 
@@ -360,9 +399,11 @@ const SEALED_REFUND_NONCE_LEN: usize = 12;
 /// between. The database layer accepts and returns only this type, and
 /// [`seal_refund_token`] is the only way to make one from a token.
 ///
-/// Layout: `version (1) || nonce (12) || ciphertext || tag (16)`. The
-/// ciphertext is exactly as long as the CBOR, which is fixed-size (four
-/// 32-byte scalars and a 32-byte point), so the length says nothing either.
+/// Layout: `version (1) || nonce (12) || ciphertext || tag (16)`, the
+/// plaintext being `stage (1) || CBOR` ([`RefundStage`]). The ciphertext is
+/// exactly as long as that, and the CBOR is fixed-size (four 32-byte scalars
+/// and a 32-byte point), so the length says nothing, and a provisional token
+/// and a final one are the same length.
 pub struct SealedRefundToken(Vec<u8>);
 
 impl SealedRefundToken {
@@ -411,16 +452,17 @@ fn refund_token_aad(issuer_key_id: &str, nullifier: &[u8]) -> Vec<u8> {
     aad
 }
 
-/// Seal a CBOR refund token for storage on the nullifier row
+/// Seal a CBOR refund token, at `stage`, for storage on the nullifier row
 /// `(issuer_key_id, nullifier)`.
 ///
-/// The nonce is random rather than derived from the nullifier: the row is
-/// written once per spend today, but a random nonce stays safe if a path ever
-/// writes a row twice, where a derived one would repeat a nonce under a key.
+/// The nonce is random rather than derived from the nullifier: a spend's row
+/// is written twice (provisional, then final), and a derived nonce would
+/// repeat under one key.
 pub fn seal_refund_token(
     refund_key: &RefundKey,
     issuer_key_id: &str,
     nullifier: &[u8],
+    stage: RefundStage,
     refund_cbor: &[u8],
 ) -> Result<SealedRefundToken, ServerError> {
     let key = derive_refund_token_key(refund_key, issuer_key_id);
@@ -431,12 +473,15 @@ pub fn seal_refund_token(
     rand_core::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from(nonce_bytes);
     let aad = refund_token_aad(issuer_key_id, nullifier);
+    let mut plaintext = zeroize::Zeroizing::new(Vec::with_capacity(1 + refund_cbor.len()));
+    plaintext.push(stage.byte());
+    plaintext.extend_from_slice(refund_cbor);
 
     let ciphertext = cipher
         .encrypt(
             &nonce,
             Payload {
-                msg: refund_cbor,
+                msg: &plaintext,
                 aad: &aad,
             },
         )
@@ -449,7 +494,8 @@ pub fn seal_refund_token(
     Ok(SealedRefundToken(out))
 }
 
-/// Open a stored refund token for the row `(issuer_key_id, nullifier)`.
+/// Open a stored refund token for the row `(issuer_key_id, nullifier)`: its
+/// stage and its CBOR.
 ///
 /// `None` for anything that is not a token sealed for this row under this
 /// client key: a recovery presenting another key, a
@@ -460,7 +506,7 @@ pub fn open_refund_token(
     issuer_key_id: &str,
     nullifier: &[u8],
     sealed: &SealedRefundToken,
-) -> Option<Vec<u8>> {
+) -> Option<(RefundStage, Vec<u8>)> {
     let bytes = sealed.as_bytes();
     let (&version, rest) = bytes.split_first()?;
     if version != SEALED_REFUND_VERSION || rest.len() < SEALED_REFUND_NONCE_LEN {
@@ -471,7 +517,7 @@ pub fn open_refund_token(
     let key = derive_refund_token_key(refund_key, issuer_key_id);
     let cipher = Aes256Gcm::new_from_slice(key.as_ref()).ok()?;
     let aad = refund_token_aad(issuer_key_id, nullifier);
-    cipher
+    let plaintext = cipher
         .decrypt(
             &nonce,
             Payload {
@@ -479,12 +525,14 @@ pub fn open_refund_token(
                 aad: &aad,
             },
         )
-        .ok()
+        .ok()?;
+    let (&stage, cbor) = plaintext.split_first()?;
+    Some((RefundStage::from_byte(stage)?, cbor.to_vec()))
 }
 
-/// Seal a spend's refund under its client's refund recovery key and store it
-/// on the spend's nullifier row: the one way a refund reaches Postgres, for
-/// every path that signs one ([`sign_refund`], [`verify_and_sign_full_refund`]).
+/// Seal a spend's final refund under its client's refund recovery key and
+/// store it over the provisional one on the spend's nullifier row: what every
+/// ending of a request writes ([`sign_refund`]).
 pub async fn store_sealed_refund(
     state: &AppState,
     act: &crate::auth::ActSpend,
@@ -492,8 +540,39 @@ pub async fn store_sealed_refund(
     refund_cbor: &[u8],
 ) -> Result<(), ServerError> {
     let nullifier = act.spend_proof.nullifier().as_bytes().to_vec();
-    let sealed = seal_refund_token(&act.refund_key, issuer_key_id, &nullifier, refund_cbor)?;
+    let sealed = seal_refund_token(
+        &act.refund_key,
+        issuer_key_id,
+        &nullifier,
+        RefundStage::Final,
+        refund_cbor,
+    )?;
     db::store_refund_token(&state.db_pool, issuer_key_id, &nullifier, &sealed).await
+}
+
+/// Record a spend's nullifier with `refund` stored on its row, sealed at
+/// `stage`, in one statement: `true` if this call recorded it, `false` if it
+/// was already recorded (and nothing was written).
+///
+/// The chat spend records with its provisional refund (`t = 0`, the one its
+/// pre-flight verification signed); recovery of a spend that never arrived
+/// records with the final, full one. Either way no row is ever without a
+/// refund, so a crash after recording loses at most the spend's hold.
+pub async fn record_spend(
+    state: &AppState,
+    act: &crate::auth::ActSpend,
+    stage: RefundStage,
+    refund: &SignedRefund,
+) -> Result<bool, ServerError> {
+    let nullifier = act.spend_proof.nullifier().as_bytes().to_vec();
+    let sealed = seal_refund_token(
+        &act.refund_key,
+        &refund.issuer_key_id,
+        &nullifier,
+        stage,
+        &refund.cbor,
+    )?;
+    db::record_nullifier(&state.db_pool, &refund.issuer_key_id, &nullifier, &sealed).await
 }
 
 // ---------------------------------------------------------------------------
@@ -945,7 +1024,7 @@ fn verify_and_refund(
     #[cfg(test)]
     verification_count::record(&act.spend_proof);
     key.secret_key
-        .refund::<128>(&key.params, &act.spend_proof, t, OsRng)
+        .refund::<ACT_L>(&key.params, &act.spend_proof, t, OsRng)
 }
 
 /// The refusal for a presented spend whose request context is not `key`'s.
@@ -970,18 +1049,21 @@ fn invalid_spend_proof() -> ServerError {
 /// Check a presented spend proof against the key it names: its request
 /// context must be this key's, and the proof must verify under this key.
 ///
-/// Nothing is recorded and nothing is kept: the refund the verifier signs for
-/// `t = 0` is discarded (see [`verify_and_refund`] on why). The chat spend
-/// calls this before it records the nullifier, so a proof that does not
-/// verify never reaches the database. Recovery, which knows its refund
-/// already, verifies with [`verify_and_sign_full_refund`] instead.
+/// Nothing is recorded. The refund the one verification signs, for `t = 0`
+/// (see [`verify_and_refund`] on why it signs one), is returned: it is the
+/// spend's provisional refund, stored with its nullifier ([`record_spend`])
+/// so a crash before settlement still leaves the credential's untouched
+/// balance recoverable. The chat spend calls this before it records the
+/// nullifier, so a proof that does not verify never reaches the database.
+/// Recovery, which knows its refund already, verifies with
+/// [`verify_and_sign_full_refund`] instead.
 pub fn verify_presented_spend(
     key: &DecryptedIssuerKey,
     act: &crate::auth::ActSpend,
-) -> Result<(), ServerError> {
+) -> Result<SignedRefund, ServerError> {
     check_presented_context(key, act)?;
-    verify_and_refund(key, act, Scalar::ZERO).map_err(|_| invalid_spend_proof())?;
-    Ok(())
+    let refund = verify_and_refund(key, act, Scalar::ZERO).map_err(|_| invalid_spend_proof())?;
+    SignedRefund::encode(act, refund)
 }
 
 /// A refund signed for a spend, CBOR-encoded, with the id of the key that
@@ -1045,7 +1127,7 @@ pub fn sign_refund(
     refund_credits: u128,
     now: SystemTime,
 ) -> Result<(Vec<u8>, String), ServerError> {
-    let t = credit_to_scalar::<128>(refund_credits)
+    let t = credit_to_scalar::<ACT_L>(refund_credits)
         .map_err(|e| ServerError::Internal(format!("invalid refund amount: {e:?}")))?;
     let key = usable_key(cache, &act.issuer_key_hash, KeyUse::Refund, now)?;
     let refund = verify_and_refund(key, act, t)
@@ -1069,7 +1151,7 @@ pub(crate) mod verification_count {
         COUNTS.get_or_init(Default::default)
     }
 
-    pub(crate) fn record(proof: &SpendProof<128>) {
+    pub(crate) fn record(proof: &SpendProof<{ super::ACT_L }>) {
         *counts()
             .lock()
             .unwrap()
@@ -1078,7 +1160,7 @@ pub(crate) mod verification_count {
     }
 
     /// How many times `proof` has been verified so far.
-    pub(crate) fn of(proof: &SpendProof<128>) -> usize {
+    pub(crate) fn of(proof: &SpendProof<{ super::ACT_L }>) -> usize {
         counts()
             .lock()
             .unwrap()
@@ -1379,10 +1461,11 @@ pub async fn issue_credentials(
             message: "invalid CBOR issuance request".to_string(),
         })?;
 
-    let credit_scalar =
-        credit_to_scalar::<128>(request.credits as u128).map_err(|e| ServerError::BadRequest {
+    let credit_scalar = credit_to_scalar::<ACT_L>(request.credits as u128).map_err(|e| {
+        ServerError::BadRequest {
             message: format!("invalid credit amount: {}", e),
-        })?;
+        }
+    })?;
 
     let digest = issuance_request_digest(&issuance_cbor, request.credits, &request.issuer_key_id);
 
@@ -1419,7 +1502,7 @@ pub async fn issue_credentials(
             ServerError::Internal("current key evicted from cache unexpectedly".to_string())
         })?;
         key.secret_key
-            .issue::<128>(
+            .issue::<ACT_L>(
                 &key.params,
                 &issuance_request,
                 credit_scalar,
@@ -1487,21 +1570,52 @@ pub async fn issue_credentials(
 // Refund recovery
 // ---------------------------------------------------------------------------
 
+/// Body of the refund recovery endpoint: the spend to recover, in the same
+/// `credentials` form it was presented in.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RefundRecoveryRequest {
+    /// Exactly one spend: its Token and its refund recovery key.
+    #[schema(value_type = Vec<crate::types::SpendCredential>, min_items = 1, max_items = 1)]
+    pub credentials: crate::types::Credentials,
+}
+
 /// Response from the refund recovery endpoint.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RefundRecoveryResponse {
-    /// The refund token.
-    pub refund: RefundInfo,
+    /// The spend's refund: an array of one, mirroring `credentials`.
+    pub refunds: Vec<RefundInfo>,
+    /// Whether the refund is the provisional one stored when the spend was
+    /// recorded (`t = 0`), because its request has not ended. A client keeps
+    /// the spend pending and asks again; it accepts a provisional refund as
+    /// final only once `T_settle` (`eidola_common::T_SETTLE`) has passed since
+    /// it sent the request, since the final refund's successor shares its
+    /// nullifier and spending either destroys the other.
+    pub provisional: bool,
+}
+
+impl RefundRecoveryResponse {
+    fn new(refund_cbor: &[u8], issuer_key_id: String, stage: RefundStage) -> Json<Self> {
+        Json(Self {
+            refunds: vec![RefundInfo {
+                refund: URL_SAFE_NO_PAD.encode(refund_cbor),
+                issuer_key_id,
+            }],
+            provisional: stage == RefundStage::Provisional,
+        })
+    }
 }
 
 /// Recover a refund token for a previously spent ACT.
 ///
-/// If the ACT's nullifier was already recorded (the server received and
-/// processed the original request), the stored refund token is returned.
+/// If the ACT's nullifier was already recorded (the server received the
+/// original request), the refund stored with it is returned: the final one
+/// if the request has ended, or the provisional one (`t = 0`, marked
+/// `provisional`) if it is still being served.
 ///
 /// If the nullifier was NOT recorded (the original request never arrived),
-/// the server verifies the spend proof, records the nullifier, issues a
-/// full refund (no credits consumed), stores it, and returns it.
+/// the server verifies the spend proof, records the nullifier with a full
+/// refund (no credits consumed) stored beside it, and returns that refund.
 ///
 /// In both cases, the client gets a refund token it can combine with its
 /// local `PreRefund` state to reconstruct a credential.
@@ -1513,20 +1627,29 @@ pub struct RefundRecoveryResponse {
     post,
     path = "/v1/credentials/refund",
     tag = "Unlinked",
-    params(
-        ("x-eidola-refund-key" = String, Header, description = "The refund recovery key sent with the spend: 64 lowercase hex digits")
-    ),
+    request_body = RefundRecoveryRequest,
     responses(
         (status = 200, description = "Refund token recovered or issued", body = RefundRecoveryResponse),
-        (status = 400, description = "Missing or malformed refund recovery key", body = crate::types::ErrorResponse),
-        (status = 401, description = "Invalid spend proof", body = crate::types::ErrorResponse),
-        (status = 404, description = "Nullifier found but no refund token is available for this key yet", body = crate::types::ErrorResponse),
+        (status = 400, description = "A malformed refund recovery key, more than one credential, or a credential in a header", body = crate::types::ErrorResponse),
+        (status = 401, description = "Missing credential, or an invalid spend proof", body = crate::types::ErrorResponse),
+        (status = 404, description = "Nullifier found but no refund token is available for this key", body = crate::types::ErrorResponse),
         (status = 500, description = "Internal error", body = crate::types::ErrorResponse)
     )
 )]
 pub async fn recover_refund(
-    TokenAuth(act): TokenAuth,
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    crate::handlers::LoggedJson(body): crate::handlers::LoggedJson<RefundRecoveryRequest>,
+) -> Result<Json<RefundRecoveryResponse>, ServerError> {
+    crate::auth::refuse_header_credentials(&headers)?;
+    let act = crate::auth::presented_spend(&body.credentials.0)?;
+    recover_presented_refund(&state, &act).await
+}
+
+/// [`recover_refund`] for one parsed spend.
+pub(crate) async fn recover_presented_refund(
+    state: &AppState,
+    act: &crate::auth::ActSpend,
 ) -> Result<Json<RefundRecoveryResponse>, ServerError> {
     let master_key = &state.credential_master_key;
 
@@ -1560,7 +1683,7 @@ pub async fn recover_refund(
     // dropped.
     let full_refund = {
         let cache = state.credential_key_cache.read().await;
-        verify_and_sign_full_refund(&cache, &act, SystemTime::now())?
+        verify_and_sign_full_refund(&cache, act, SystemTime::now())?
     };
 
     let key_id = hex::encode(act.issuer_key_hash);
@@ -1568,13 +1691,13 @@ pub async fn recover_refund(
 
     // Check if the nullifier was already recorded (original request arrived).
     if let Some(sealed) = db::get_refund_token(&state.db_pool, &key_id, &nullifier_bytes).await? {
-        // Nullifier exists and has a stored refund token — return it. A
-        // token that does not open for this row under the presented refund
-        // key (another key, moved from another row, or altered) is no token:
-        // the row exists, so this is the same permanent 404 a client gets
-        // when the best-effort store never happened, and the client settles
-        // the hold the way it does then.
-        let Some(refund_cbor) =
+        // Nullifier exists and has a stored refund token — return it, with
+        // its stage. A token that does not open for this row under the
+        // presented refund key (another key, moved from another row, or
+        // altered) is no token: the row exists, so this is the same
+        // permanent 404 a client gets when nothing was stored, and the client
+        // settles the hold the way it does then.
+        let Some((stage, refund_cbor)) =
             open_refund_token(&act.refund_key, &key_id, &nullifier_bytes, &sealed)
         else {
             warn!("stored refund token did not open; answering as if none were stored");
@@ -1582,12 +1705,7 @@ pub async fn recover_refund(
                 message: "no refund token is stored for this credential".to_string(),
             });
         };
-        return Ok(Json(RefundRecoveryResponse {
-            refund: RefundInfo {
-                refund: URL_SAFE_NO_PAD.encode(&refund_cbor),
-                issuer_key_id: key_id,
-            },
-        }));
+        return Ok(RefundRecoveryResponse::new(&refund_cbor, key_id, stage));
     }
 
     // Anything past here may record a fresh nullifier, which is accepting a
@@ -1602,14 +1720,15 @@ pub async fn recover_refund(
         )?;
     }
 
-    // Either the nullifier doesn't exist (request never arrived) or it exists
-    // but the refund token hasn't been stored yet (race with in-flight request).
-    // Try to record the nullifier — if it succeeds, we own it.
-    let recorded = db::record_nullifier(&state.db_pool, &key_id, &nullifier_bytes).await?;
+    // The nullifier has no stored token: it was never recorded (the request
+    // never arrived), or a spend recorded it a moment ago. Record it with the
+    // full refund (the charge returned in full, since no work was done)
+    // stored beside it, in one statement; if that wins, the spend is ours.
+    let recorded = record_spend(state, act, RefundStage::Final, &full_refund).await?;
 
     if !recorded {
-        // Nullifier exists but no refund token stored yet. The original
-        // request is likely still in flight. The client should retry shortly.
+        // Recorded by someone else between the read and the insert: the
+        // original request, arriving now. The client should retry shortly.
         return Err(ServerError::NotFound {
             message: "nullifier recorded but refund token not yet available — \
                       the original request may still be in flight, retry shortly"
@@ -1617,23 +1736,15 @@ pub async fn recover_refund(
         });
     }
 
-    // Nullifier was not previously recorded — the original request never
-    // arrived. The full refund (the charge returned in full, since no work
-    // was done) was signed when the proof was verified above.
     let SignedRefund {
         cbor: refund_cbor,
         issuer_key_id: key_id,
     } = full_refund;
-
-    // Store the refund token for idempotency, sealed (it carries the amount).
-    store_sealed_refund(&state, &act, &key_id, &refund_cbor).await?;
-
-    Ok(Json(RefundRecoveryResponse {
-        refund: RefundInfo {
-            refund: URL_SAFE_NO_PAD.encode(&refund_cbor),
-            issuer_key_id: key_id,
-        },
-    }))
+    Ok(RefundRecoveryResponse::new(
+        &refund_cbor,
+        key_id,
+        RefundStage::Final,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2057,15 +2168,15 @@ mod tests {
         let request = pre.request(&key.params, OsRng);
         let response = key
             .secret_key
-            .issue::<128>(
+            .issue::<ACT_L>(
                 &key.params,
                 &request,
-                credit_to_scalar::<128>(credits).unwrap(),
+                credit_to_scalar::<ACT_L>(credits).unwrap(),
                 key.request_context_scalar,
                 OsRng,
             )
             .unwrap();
-        pre.to_credit_token::<128>(&key.params, key.secret_key.public(), &request, &response)
+        pre.to_credit_token::<ACT_L>(&key.params, key.secret_key.public(), &request, &response)
             .unwrap()
     }
 
@@ -2078,7 +2189,11 @@ mod tests {
     ) -> (crate::auth::ActSpend, anonymous_credit_tokens::PreRefund) {
         let token = credential(key, credits);
         let (spend_proof, pre_refund) = token
-            .prove_spend::<128>(&key.params, credit_to_scalar::<128>(charge).unwrap(), OsRng)
+            .prove_spend::<ACT_L>(
+                &key.params,
+                credit_to_scalar::<ACT_L>(charge).unwrap(),
+                OsRng,
+            )
             .unwrap();
         let act = crate::auth::ActSpend {
             challenge_digest: compute_challenge_digest(),
@@ -2243,15 +2358,15 @@ mod tests {
             let refund = anonymous_credit_tokens::Refund::from_cbor(&refund_cbor).unwrap();
             let params = Params::new(DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION);
             let token = pre_refund
-                .to_credit_token::<128>(&params, &act.spend_proof, &refund, &old_public)
+                .to_credit_token::<ACT_L>(&params, &act.spend_proof, &refund, &old_public)
                 .expect("refund completes under the spent credential's key");
             assert_eq!(
-                scalar_to_credit::<128>(&token.credits()).unwrap(),
+                scalar_to_credit::<ACT_L>(&token.credits()).unwrap(),
                 100 - 10 + 7
             );
             assert!(
                 pre_refund
-                    .to_credit_token::<128>(&params, &act.spend_proof, &refund, &current_public)
+                    .to_credit_token::<ACT_L>(&params, &act.spend_proof, &refund, &current_public)
                     .is_err(),
                 "a refund must not complete under any other key"
             );
@@ -2310,7 +2425,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(
-                db::record_nullifier(&pool, &key.id, &[7u8; 32])
+                db::record_nullifier(&pool, &key.id, &[7u8; 32], &any_sealed_token())
                     .await
                     .unwrap()
             );
@@ -2337,12 +2452,12 @@ mod tests {
         // The lapsing key's nullifier survives: recording it again is refused
         // as a duplicate. The retired key's is gone.
         assert!(
-            !db::record_nullifier(&pool, &lapsing.id, &[7u8; 32])
+            !db::record_nullifier(&pool, &lapsing.id, &[7u8; 32], &any_sealed_token())
                 .await
                 .unwrap()
         );
         assert!(
-            db::record_nullifier(&pool, &retired.id, &[7u8; 32])
+            db::record_nullifier(&pool, &retired.id, &[7u8; 32], &any_sealed_token())
                 .await
                 .unwrap()
         );
@@ -2366,34 +2481,52 @@ mod tests {
         credits: u128,
         charge: u128,
         t: u128,
-    ) -> (PrivateKey, Params, SpendProof<128>, PreRefund, Vec<u8>) {
+    ) -> (PrivateKey, Params, SpendProof<ACT_L>, PreRefund, Vec<u8>) {
         let params = Params::new(DS_ORG, DS_SERVICE, DS_DEPLOYMENT, DS_VERSION);
         let sk = PrivateKey::random(OsRng);
         let pre = PreIssuance::random(OsRng);
         let request = pre.request(&params, OsRng);
         let response = sk
-            .issue::<128>(
+            .issue::<ACT_L>(
                 &params,
                 &request,
-                credit_to_scalar::<128>(credits).unwrap(),
+                credit_to_scalar::<ACT_L>(credits).unwrap(),
                 Scalar::ZERO,
                 OsRng,
             )
             .unwrap();
         let token = pre
-            .to_credit_token::<128>(&params, sk.public(), &request, &response)
+            .to_credit_token::<ACT_L>(&params, sk.public(), &request, &response)
             .unwrap();
         let (proof, prerefund) = token
-            .prove_spend::<128>(&params, credit_to_scalar::<128>(charge).unwrap(), OsRng)
+            .prove_spend::<ACT_L>(&params, credit_to_scalar::<ACT_L>(charge).unwrap(), OsRng)
             .unwrap();
         let refund = sk
-            .refund(&params, &proof, credit_to_scalar::<128>(t).unwrap(), OsRng)
+            .refund(
+                &params,
+                &proof,
+                credit_to_scalar::<ACT_L>(t).unwrap(),
+                OsRng,
+            )
             .unwrap();
         let cbor = refund.to_cbor().unwrap();
         (sk, params, proof, prerefund, cbor)
     }
 
     const KEY_ID: &str = "4f1c0d5e2a7b9c3d6e8f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d";
+
+    /// A sealed token to record a nullifier with, where the token itself is
+    /// beside the point.
+    fn any_sealed_token() -> SealedRefundToken {
+        seal_refund_token(
+            &RefundKey::from_bytes([1; 32]),
+            KEY_ID,
+            &[7u8; 32],
+            RefundStage::Provisional,
+            b"refund",
+        )
+        .unwrap()
+    }
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
@@ -2409,8 +2542,9 @@ mod tests {
         let (sk, params, proof, prerefund, cbor) = refund_fixture(1000, 300, 117);
         let nullifier = proof.nullifier().as_bytes().to_vec();
 
-        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, &cbor).unwrap();
-        let opened = open_refund_token(&ck, KEY_ID, &nullifier, &sealed).unwrap();
+        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, RefundStage::Final, &cbor).unwrap();
+        let (stage, opened) = open_refund_token(&ck, KEY_ID, &nullifier, &sealed).unwrap();
+        assert_eq!(stage, RefundStage::Final);
         assert_eq!(opened, cbor);
 
         // What recovery hands back still completes the client's credential.
@@ -2419,7 +2553,7 @@ mod tests {
             .to_credit_token(&params, &proof, &refund, sk.public())
             .unwrap();
         assert_eq!(
-            scalar_to_credit::<128>(&next.credits()).unwrap(),
+            scalar_to_credit::<ACT_L>(&next.credits()).unwrap(),
             1000 - 300 + 117
         );
     }
@@ -2429,7 +2563,7 @@ mod tests {
         let ck = client_key(7);
         let (_, _, proof, _, cbor) = refund_fixture(1000, 300, 117);
         let nullifier = proof.nullifier().as_bytes().to_vec();
-        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, &cbor).unwrap();
+        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, RefundStage::Final, &cbor).unwrap();
 
         // Moved to another nullifier under the same key.
         let (_, _, other_proof, _, _) = refund_fixture(1000, 300, 117);
@@ -2462,25 +2596,33 @@ mod tests {
     #[test]
     fn a_sealed_refund_token_carries_no_plaintext_amount() {
         let ck = client_key(7);
-        let t: u128 = 0x0123_4567_89ab_cdef_0011_2233_4455_6677;
-        let (_, _, proof, _, cbor) = refund_fixture(u128::MAX >> 1, t, t);
+        // As wide an amount as `L` allows, so its bytes are distinctive.
+        let t: u128 = 0x89ab_cdef;
+        let (_, _, proof, _, cbor) = refund_fixture((1 << ACT_L) - 1, t, t);
         let nullifier = proof.nullifier().as_bytes().to_vec();
-        let t_bytes = credit_to_scalar::<128>(t).unwrap().to_bytes();
+        let t_bytes = credit_to_scalar::<ACT_L>(t).unwrap().to_bytes();
         // The bare token does carry the amount: that is what is being hidden.
         assert!(contains(&cbor, &t_bytes));
 
-        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, &cbor).unwrap();
+        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, RefundStage::Final, &cbor).unwrap();
         let bytes = sealed.as_bytes();
         assert!(!contains(bytes, &t_bytes));
         // Nor the amount's own bytes, nor any run of the CBOR.
-        assert!(!contains(bytes, &t.to_le_bytes()));
+        assert!(!contains(bytes, &(t as u32).to_le_bytes()));
         assert!(!cbor.windows(12).any(|w| contains(bytes, w)));
 
         // And the length is the same whatever the amount.
         let (_, _, p0, _, c0) = refund_fixture(1000, 300, 0);
-        let s0 = seal_refund_token(&ck, KEY_ID, p0.nullifier().as_bytes(), &c0).unwrap();
+        let s0 = seal_refund_token(
+            &ck,
+            KEY_ID,
+            p0.nullifier().as_bytes(),
+            RefundStage::Final,
+            &c0,
+        )
+        .unwrap();
         assert_eq!(s0.as_bytes().len(), bytes.len());
-        assert_eq!(bytes.len(), 1 + 12 + cbor.len() + 16);
+        assert_eq!(bytes.len(), 1 + 12 + 1 + cbor.len() + 16);
     }
 
     #[test]
@@ -2508,7 +2650,7 @@ mod tests {
         let ck = client_key(7);
         let (_, _, proof, _, cbor) = refund_fixture(1000, 300, 117);
         let nullifier = proof.nullifier().as_bytes().to_vec();
-        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, &cbor).unwrap();
+        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, RefundStage::Final, &cbor).unwrap();
 
         // A recovery presenting any other key opens nothing.
         for other in [client_key(8), client_key(0)] {
@@ -2521,100 +2663,217 @@ mod tests {
         );
     }
 
-    /// A spend arrives with its refund recovery key or is refused by the
-    /// extractor, before the handler that records the nullifier runs.
-    #[tokio::test]
-    async fn a_spend_without_its_refund_key_is_refused_before_it_is_taken() {
-        use axum::extract::FromRequestParts;
-        use eidola_common::refund_key::{REFUND_KEY_HEADER, encode_refund_key};
+    /// A stored refund says whether it is provisional, inside the seal: a
+    /// provisional token and a final one of the same spend are the same
+    /// length, and each opens to its own stage.
+    #[test]
+    fn a_refunds_stage_travels_inside_the_seal() {
+        let ck = client_key(7);
+        let (_, _, proof, _, cbor) = refund_fixture(1000, 300, 117);
+        let nullifier = proof.nullifier().as_bytes().to_vec();
+        let provisional =
+            seal_refund_token(&ck, KEY_ID, &nullifier, RefundStage::Provisional, &cbor).unwrap();
+        let final_ = seal_refund_token(&ck, KEY_ID, &nullifier, RefundStage::Final, &cbor).unwrap();
+        assert_eq!(provisional.as_bytes().len(), final_.as_bytes().len());
+        assert_eq!(
+            open_refund_token(&ck, KEY_ID, &nullifier, &provisional).map(|(stage, _)| stage),
+            Some(RefundStage::Provisional)
+        );
+        assert_eq!(
+            open_refund_token(&ck, KEY_ID, &nullifier, &final_).map(|(stage, _)| stage),
+            Some(RefundStage::Final)
+        );
+    }
 
-        let (_, _, proof, _, _) = refund_fixture(1000, 300, 0);
+    /// **No forks.** A spend can be answered by two refunds: the provisional
+    /// one (`t = 0`) stored with its nullifier, and the final one stored at
+    /// settlement (or, after a lost response, either of them through
+    /// recovery). Both complete, but to successors with one nullifier, fixed
+    /// by the commitment inside the spend proof that every refund of it
+    /// signs: spending either records that nullifier, and the other is then
+    /// refused as a double spend. So however many refunds a spend gets, at
+    /// most one successor is ever spendable, and no value is created.
+    #[test]
+    fn the_provisional_and_final_successors_of_one_spend_cannot_both_be_spent() {
+        let mut keys = Cache::new();
+        let hash = add_key(&mut keys, SystemTime::now() + DAY);
+        let key = &keys[&hash];
+        let (act, prerefund) = spend(key, 1000, 300);
+
+        // Both refunds, as the chat path signs them: `t = 0` at pre-flight,
+        // the settled `t` at the end.
+        let provisional = verify_presented_spend(key, &act).unwrap();
+        let (final_cbor, _) = sign_refund(&keys, &act, 117, SystemTime::now()).unwrap();
+        let complete = |cbor: &[u8]| {
+            prerefund
+                .to_credit_token(
+                    &key.params,
+                    &act.spend_proof,
+                    &Refund::from_cbor(cbor).unwrap(),
+                    key.secret_key.public(),
+                )
+                .unwrap()
+        };
+        let from_provisional = complete(&provisional.cbor);
+        let from_final = complete(&final_cbor);
+        assert_eq!(
+            scalar_to_credit::<ACT_L>(&from_provisional.credits()).unwrap(),
+            1000 - 300
+        );
+        assert_eq!(
+            scalar_to_credit::<ACT_L>(&from_final.credits()).unwrap(),
+            1000 - 300 + 117
+        );
+
+        // Each successor's next spend reveals the same nullifier...
+        let next = |token: &anonymous_credit_tokens::CreditToken| {
+            token
+                .prove_spend::<ACT_L>(&key.params, credit_to_scalar::<ACT_L>(10).unwrap(), OsRng)
+                .unwrap()
+                .0
+                .nullifier()
+        };
+        assert_eq!(next(&from_provisional), next(&from_final));
+        // ...which is what the nullifier table refuses the second time
+        // (`db::record_nullifier`: the `(issuer_key_id, value)` primary key).
+        let mut recorded = std::collections::HashSet::new();
+        assert!(recorded.insert(next(&from_final).as_bytes().to_vec()));
+        assert!(!recorded.insert(next(&from_provisional).as_bytes().to_vec()));
+    }
+
+    /// The body form of one spend, from `act`'s Token bytes, with `refund_key`
+    /// as given.
+    fn credential_wire(
+        token: &[u8],
+        refund_key: &str,
+    ) -> eidola_common::spend_credentials::CredentialWire {
+        eidola_common::spend_credentials::CredentialWire::from_parts(
+            eidola_common::spend_credentials::encode_token(token),
+            refund_key.to_string(),
+        )
+    }
+
+    fn token_bytes(proof: &SpendProof<ACT_L>) -> Vec<u8> {
         let mut token = Vec::new();
         token.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
         token.extend_from_slice(&compute_challenge_digest());
         token.extend_from_slice(&[9u8; 32]);
         token.extend_from_slice(&proof.to_cbor().unwrap());
-        let authorization = eidola_common::private_token::authorization_value(&token);
+        token
+    }
+
+    /// A spend arrives with its refund recovery key or is refused, before the
+    /// handler records anything.
+    #[test]
+    fn a_spend_without_its_refund_key_is_refused_before_it_is_taken() {
+        use crate::auth::presented_spend;
+        use eidola_common::refund_key::encode_refund_key;
+
+        let (_, _, proof, _, _) = refund_fixture(1000, 300, 0);
+        let token = token_bytes(&proof);
         let key = [0x5au8; 32];
         let good = encode_refund_key(&key);
         let good = std::str::from_utf8(&good).unwrap().to_string();
 
-        let extract = |refund_key: Option<String>| {
-            let authorization = authorization.clone();
-            async move {
-                let mut request =
-                    axum::http::Request::builder().header("authorization", authorization);
-                if let Some(value) = refund_key {
-                    request = request.header(REFUND_KEY_HEADER, value);
-                }
-                let (mut parts, ()) = request.body(()).unwrap().into_parts();
-                TokenAuth::from_request_parts(&mut parts, &()).await
-            }
-        };
-
         for refused in [
-            None,
-            Some(String::new()),
-            Some(good.to_ascii_uppercase()),
-            Some(good[..63].to_string()),
-            Some(format!("{good}0")),
+            String::new(),
+            good.to_ascii_uppercase(),
+            good[..63].to_string(),
+            format!("{good}0"),
         ] {
-            match extract(refused).await {
+            match presented_spend(&[credential_wire(&token, &refused)]) {
                 Err(ServerError::BadRequest { .. }) => {}
                 Err(e) => panic!("expected 400, got {e:?}"),
                 Ok(_) => panic!("a spend without a well-formed refund key was accepted"),
             }
         }
-        let TokenAuth(act) = extract(Some(good)).await.unwrap();
+        let act = presented_spend(&[credential_wire(&token, &good)]).unwrap();
         assert_eq!(act.refund_key.as_bytes(), &key);
         assert_eq!(format!("{:?}", act.refund_key), "RefundKey(<redacted>)");
     }
 
-    /// A spend's token is read only in the spelling RFC 9577 requires and
-    /// the client writes: padded base64url. The same Token without its
-    /// padding is refused as unauthenticated by the extractor, before the
-    /// handler that records the nullifier runs.
-    #[tokio::test]
-    async fn a_spend_token_is_accepted_only_as_padded_base64url() {
-        use axum::extract::FromRequestParts;
+    /// A spend's token is read only in the one spelling the client writes:
+    /// padded base64url. The same Token without its padding, or with bytes
+    /// after its spend proof, is refused as unauthenticated; no spend at all
+    /// is unauthenticated too, and more than one is refused before any is
+    /// decoded.
+    #[test]
+    fn a_spend_token_is_accepted_only_as_padded_base64url() {
+        use crate::auth::presented_spend;
         use base64::engine::general_purpose::URL_SAFE;
-        use eidola_common::refund_key::{REFUND_KEY_HEADER, encode_refund_key};
+        use eidola_common::refund_key::encode_refund_key;
+        use eidola_common::spend_credentials::CredentialWire;
 
         let (_, _, proof, _, _) = refund_fixture(1000, 300, 0);
-        let mut token = Vec::new();
-        token.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
-        token.extend_from_slice(&compute_challenge_digest());
-        token.extend_from_slice(&[9u8; 32]);
-        token.extend_from_slice(&proof.to_cbor().unwrap());
+        let token = token_bytes(&proof);
         // The fixture's Token needs padding, so the two spellings differ.
         assert_ne!(token.len() % 3, 0);
         let refund_key = encode_refund_key(&[0x5au8; 32]);
         let refund_key = std::str::from_utf8(&refund_key).unwrap().to_string();
 
-        let extract = |authorization: String| {
-            let refund_key = refund_key.clone();
-            async move {
-                let request = axum::http::Request::builder()
-                    .header("authorization", authorization)
-                    .header(REFUND_KEY_HEADER, refund_key);
-                let (mut parts, ()) = request.body(()).unwrap().into_parts();
-                TokenAuth::from_request_parts(&mut parts, &()).await
-            }
-        };
-
-        let padded = format!("PrivateToken token=\"{}\"", URL_SAFE.encode(&token));
         assert_eq!(
-            padded,
-            eidola_common::private_token::authorization_value(&token)
+            eidola_common::spend_credentials::encode_token(&token),
+            URL_SAFE.encode(&token)
         );
-        let TokenAuth(act) = extract(padded).await.unwrap();
+        let act = presented_spend(&[credential_wire(&token, &refund_key)]).unwrap();
         assert_eq!(act.spend_proof.nullifier(), proof.nullifier());
 
-        let unpadded = format!("PrivateToken token=\"{}\"", URL_SAFE_NO_PAD.encode(&token));
-        match extract(unpadded).await {
-            Err(ServerError::Unauthorized { .. }) => {}
-            Err(e) => panic!("expected 401, got {e:?}"),
-            Ok(_) => panic!("an unpadded token was accepted"),
+        let unpadded =
+            CredentialWire::from_parts(URL_SAFE_NO_PAD.encode(&token), refund_key.clone());
+        let mut trailing = token.clone();
+        trailing.push(0);
+        for (name, wires) in [
+            ("unpadded", vec![unpadded]),
+            (
+                "trailing bytes",
+                vec![credential_wire(&trailing, &refund_key)],
+            ),
+            ("none", vec![]),
+        ] {
+            match presented_spend(&wires) {
+                Err(ServerError::Unauthorized { .. }) => {}
+                Err(e) => panic!("{name}: expected 401, got {e:?}"),
+                Ok(_) => panic!("{name}: accepted"),
+            }
+        }
+        let two = vec![
+            credential_wire(&token, &refund_key),
+            credential_wire(&token, &refund_key),
+        ];
+        assert!(matches!(
+            presented_spend(&two),
+            Err(ServerError::BadRequest { .. })
+        ));
+    }
+
+    /// A credential travels in the body and nowhere else: a spend request
+    /// carrying one in a header (the RFC 9577 `Authorization` header, or a
+    /// refund-key header) is refused before its body is read.
+    #[test]
+    fn a_credential_in_a_header_is_refused() {
+        use crate::auth::refuse_header_credentials;
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let mut clean = HeaderMap::new();
+        clean.insert("content-type", HeaderValue::from_static("application/json"));
+        assert!(refuse_header_credentials(&clean).is_ok());
+        for (name, value) in [
+            ("authorization", "PrivateToken token=\"-_-_5a0=\""),
+            ("Authorization", "Bearer x"),
+            ("x-eidola-refund-key", "ab"),
+        ] {
+            let mut headers = clean.clone();
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_static(value),
+            );
+            assert!(
+                matches!(
+                    refuse_header_credentials(&headers),
+                    Err(ServerError::BadRequest { .. })
+                ),
+                "{name}"
+            );
         }
     }
 
@@ -2632,7 +2891,7 @@ mod tests {
         let ck = random_key();
         let (_, _, proof, _, cbor) = refund_fixture(1000, 300, 117);
         let nullifier = proof.nullifier().as_bytes().to_vec();
-        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, &cbor).unwrap();
+        let sealed = seal_refund_token(&ck, KEY_ID, &nullifier, RefundStage::Final, &cbor).unwrap();
         let row = sealed.as_bytes();
 
         let as_key = |bytes: &[u8]| {
@@ -2651,8 +2910,8 @@ mod tests {
             assert!(open_refund_token(guess, KEY_ID, &nullifier, &sealed).is_none());
         }
         assert_eq!(
-            open_refund_token(&ck, KEY_ID, &nullifier, &sealed).as_deref(),
-            Some(cbor.as_slice())
+            open_refund_token(&ck, KEY_ID, &nullifier, &sealed).map(|(_, cbor)| cbor),
+            Some(cbor)
         );
     }
 
@@ -2683,7 +2942,7 @@ mod tests {
     }
 
     async fn recovery_stores_only_sealed_tokens() {
-        use crate::auth::{ActSpend, TokenAuth};
+        use crate::auth::ActSpend;
         use crate::backend::Catalog;
 
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
@@ -2721,16 +2980,16 @@ mod tests {
                 let request = pre.request(&key.params, OsRng);
                 let response = key
                     .secret_key
-                    .issue::<128>(
+                    .issue::<ACT_L>(
                         &key.params,
                         &request,
-                        credit_to_scalar::<128>(credits).unwrap(),
+                        credit_to_scalar::<ACT_L>(credits).unwrap(),
                         key.request_context_scalar,
                         OsRng,
                     )
                     .unwrap();
                 let token = pre
-                    .to_credit_token::<128>(
+                    .to_credit_token::<ACT_L>(
                         &key.params,
                         key.secret_key.public(),
                         &request,
@@ -2738,29 +2997,34 @@ mod tests {
                     )
                     .unwrap();
                 token
-                    .prove_spend::<128>(
+                    .prove_spend::<ACT_L>(
                         &key.params,
-                        credit_to_scalar::<128>(charge).unwrap(),
+                        credit_to_scalar::<ACT_L>(charge).unwrap(),
                         OsRng,
                     )
                     .unwrap()
             }
         };
-        let recover = |proof: SpendProof<128>, refund_key: RefundKey| {
+        let act_of = |proof: SpendProof<ACT_L>, refund_key: RefundKey| ActSpend {
+            challenge_digest: compute_challenge_digest(),
+            issuer_key_hash: key_hash,
+            spend_proof: proof,
+            refund_key,
+        };
+        let answer = |proof: SpendProof<ACT_L>, refund_key: RefundKey| {
             let state = state.clone();
             async move {
-                recover_refund(
-                    TokenAuth(ActSpend {
-                        challenge_digest: compute_challenge_digest(),
-                        issuer_key_hash: key_hash,
-                        spend_proof: proof,
-                        refund_key,
-                    }),
-                    State(state),
-                )
-                .await
-                .map(|Json(r)| r.refund.refund)
+                recover_presented_refund(&state, &act_of(proof, refund_key))
+                    .await
+                    .map(|Json(r)| {
+                        assert_eq!(r.refunds.len(), 1, "an array of one, mirroring credentials");
+                        (r.refunds[0].refund.clone(), r.provisional)
+                    })
             }
+        };
+        let recover = |proof: SpendProof<ACT_L>, refund_key: RefundKey| {
+            let answer = &answer;
+            async move { answer(proof, refund_key).await.map(|(refund, _)| refund) }
         };
         let client = pool.get().await.unwrap();
         let stored_row = async |nullifier: &[u8]| -> Vec<u8> {
@@ -2788,7 +3052,7 @@ mod tests {
         // ...and what Postgres holds is the sealed token, not the CBOR.
         let row = stored_row(&nullifier).await;
         assert_eq!(row[0], SEALED_REFUND_VERSION);
-        let t_bytes = credit_to_scalar::<128>(300).unwrap().to_bytes();
+        let t_bytes = credit_to_scalar::<ACT_L>(300).unwrap().to_bytes();
         assert!(contains(&first_cbor, &t_bytes));
         assert!(!contains(&row, &t_bytes));
         assert!(!first_cbor.windows(12).any(|w| contains(&row, w)));
@@ -2815,14 +3079,77 @@ mod tests {
                 .to_credit_token(&key.params, &proof, &refund, key.secret_key.public())
                 .unwrap()
         };
-        assert_eq!(scalar_to_credit::<128>(&next.credits()).unwrap(), 1000);
+        assert_eq!(scalar_to_credit::<ACT_L>(&next.credits()).unwrap(), 1000);
+
+        // A spend the chat path recorded: its row holds the provisional
+        // refund (`t = 0`) from the moment it is recorded, and recovery says
+        // so; once the request settles, the final one replaces it.
+        let (in_flight, in_flight_pre) = spend(1000, 300).await;
+        let in_flight_act = act_of(in_flight.clone(), ck.clone());
+        let provisional = {
+            let cache = cache.read().await;
+            verify_presented_spend(cache.get(&key_hash).unwrap(), &in_flight_act).unwrap()
+        };
+        assert!(
+            record_spend(
+                &state,
+                &in_flight_act,
+                RefundStage::Provisional,
+                &provisional
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !record_spend(
+                &state,
+                &in_flight_act,
+                RefundStage::Provisional,
+                &provisional
+            )
+            .await
+            .unwrap(),
+            "a nullifier is recorded once"
+        );
+        let (refund, is_provisional) = answer(in_flight.clone(), ck.clone()).await.unwrap();
+        assert!(is_provisional);
+        assert_eq!(URL_SAFE_NO_PAD.decode(&refund).unwrap(), provisional.cbor);
+        let settled = {
+            let cache = cache.read().await;
+            sign_refund(&cache, &in_flight_act, 117, SystemTime::now()).unwrap()
+        };
+        store_sealed_refund(&state, &in_flight_act, &key_id, &settled.0)
+            .await
+            .unwrap();
+        let (refund, is_provisional) = answer(in_flight.clone(), ck.clone()).await.unwrap();
+        assert!(!is_provisional);
+        let refund = Refund::from_cbor(&URL_SAFE_NO_PAD.decode(&refund).unwrap()).unwrap();
+        let next = {
+            let cache = cache.read().await;
+            let key = cache.get(&key_hash).unwrap();
+            in_flight_pre
+                .to_credit_token(&key.params, &in_flight, &refund, key.secret_key.public())
+                .unwrap()
+        };
+        assert_eq!(
+            scalar_to_credit::<ACT_L>(&next.credits()).unwrap(),
+            1000 - 300 + 117
+        );
 
         // Another spend whose row exists: the first row's sealed token copied
         // onto it, or a plaintext token, recovers nothing.
         let (other, _) = spend(1000, 50).await;
         let other_nullifier = other.nullifier().as_bytes().to_vec();
+        let placeholder = seal_refund_token(
+            &client_key(9),
+            &key_id,
+            &other_nullifier,
+            RefundStage::Provisional,
+            &first_cbor,
+        )
+        .unwrap();
         assert!(
-            db::record_nullifier(&pool, &key_id, &other_nullifier)
+            db::record_nullifier(&pool, &key_id, &other_nullifier, &placeholder)
                 .await
                 .unwrap()
         );
@@ -2910,7 +3237,7 @@ mod tests {
         );
         let recover = |act: crate::auth::ActSpend| {
             let state = state.clone();
-            async move { recover_refund(TokenAuth(act), State(state)).await }
+            async move { recover_presented_refund(&state, &act).await }
         };
 
         // The forged proof reaches the verifier once; a proof under another
@@ -3065,7 +3392,7 @@ mod tests {
                 key.secret_key.public(),
             )
             .unwrap();
-        assert_eq!(scalar_to_credit::<128>(&next.credits()).unwrap(), 100);
+        assert_eq!(scalar_to_credit::<ACT_L>(&next.credits()).unwrap(), 100);
     }
 
     /// Two issuances of one account's whole balance cannot both pass the
@@ -3381,7 +3708,7 @@ mod tests {
             &URL_SAFE_NO_PAD.decode(&again.issuance_response).unwrap(),
         )
         .unwrap();
-        pre.to_credit_token::<128>(&params, &public_key, &request, &response)
+        pre.to_credit_token::<ACT_L>(&params, &public_key, &request, &response)
             .expect("the stored response completes the credential");
 
         // The same key with a different request is refused, debiting nothing.

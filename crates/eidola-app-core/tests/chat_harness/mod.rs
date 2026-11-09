@@ -51,6 +51,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use eidola_app_core::AppCore;
 use eidola_common::issuer_calendar::{ISSUER_CALENDAR, IssuerCalendar};
+use eidola_common::spend_credentials::ACT_L;
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -559,6 +560,12 @@ pub enum RefundMode {
     /// in `spending` for good, which `Fail` cannot model (it omits the in-band
     /// token too) and `Succeed` cannot detect (recovery would answer).
     NotStored,
+    /// **The request is still being served.** `/v1/credentials/refund`
+    /// answers with the gateway's provisional refund: a refund of nothing
+    /// (`t = 0`), marked `"provisional": true`, as the real endpoint does for
+    /// a spend whose request has not ended. Inline refunds are omitted, as for
+    /// `Fail`.
+    Provisional,
 }
 
 /// Mock upstream configuration.
@@ -901,9 +908,13 @@ pub struct MockServer {
     /// header, in arrival order — local turns must send none (no spend).
     chat_auths: Arc<std::sync::Mutex<Vec<bool>>>,
     /// The raw `Authorization` header of each `POST /v1/chat/completions`,
-    /// in arrival order — lets tests distinguish a spend's `PrivateToken`
-    /// from an external backend's `Bearer` key.
+    /// in arrival order — an external backend's `Bearer` key; a spend never
+    /// travels in a header.
     chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    /// The `token` of each `POST /v1/chat/completions` body's one
+    /// `credentials` element, in arrival order — `None` for a request that
+    /// spent nothing (a local or external turn).
+    chat_spends: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     /// Number of `POST /v1/credentials/refund` requests received.
     refund_hits: Arc<AtomicU64>,
     /// The mock issuer, for what it remembers about spends.
@@ -930,6 +941,11 @@ impl MockServer {
     /// spend without one is refused, as the real server refuses it).
     pub fn keyed_spends(&self) -> usize {
         self.issuer.keyed_spends()
+    }
+    /// Spends whose hold was not exactly the request's worst-case cost (each
+    /// refused, as the gateway refuses it).
+    pub fn hold_mismatches(&self) -> u64 {
+        self.issuer.hold_mismatches.load(Ordering::SeqCst)
     }
     /// The issuance endpoint's switches (see [`MockConfig::issuance`]).
     pub fn issuance_knobs(&self) -> IssuanceKnobs {
@@ -979,16 +995,20 @@ impl MockServer {
     pub fn chat_auth_values(&self) -> Vec<Option<String>> {
         self.chat_auth_values.lock().unwrap().clone()
     }
+    /// Per-chat-request spend tokens (see `chat_spends`).
+    pub fn chat_spends(&self) -> Vec<Option<String>> {
+        self.chat_spends.lock().unwrap().clone()
+    }
     /// The charge each `POST /v1/chat/completions` spend proof carried, in
     /// arrival order — `None` for a request that spent nothing. This is the
     /// hold the client sized, read off the wire the way the server reads it.
     pub fn chat_charges(&self) -> Vec<Option<u128>> {
-        self.chat_auth_values()
+        self.chat_spends()
             .iter()
             .map(|auth| {
                 auth.as_deref()
                     .and_then(Issuer::spend_proof_from_auth)
-                    .and_then(|proof| scalar_to_credit::<128>(&proof.charge()).ok())
+                    .and_then(|proof| scalar_to_credit::<ACT_L>(&proof.charge()).ok())
             })
             .collect()
     }
@@ -1294,6 +1314,8 @@ struct Issuer {
     /// The key (id, base64 public key) the mock listed as current for each
     /// epoch, first listing wins — what it lists as that epoch's key later.
     listed: std::sync::Mutex<std::collections::HashMap<u64, (String, String)>>,
+    /// Spends whose hold was not exactly the request's worst-case cost.
+    hold_mismatches: AtomicU64,
 }
 
 impl Issuer {
@@ -1326,13 +1348,14 @@ impl Issuer {
                 .to_cbor()
                 .expect("encode decoy public key"),
             listed: std::sync::Mutex::new(std::collections::HashMap::new()),
+            hold_mismatches: AtomicU64::new(0),
         }
     }
 
     /// Remember the refund recovery key a spend (or a recovery that found no
     /// spend) arrived with, and say whether `key` is the one on record: what
     /// decides whether the real server's stored copy opens.
-    fn spend_key_matches(&self, proof: &SpendProof<128>, key: [u8; 32]) -> bool {
+    fn spend_key_matches(&self, proof: &SpendProof<ACT_L>, key: [u8; 32]) -> bool {
         let nullifier = proof.nullifier().as_bytes().to_vec();
         let mut keys = self.spend_keys.lock().unwrap();
         *keys.entry(nullifier).or_insert(key) == key
@@ -1357,10 +1380,10 @@ impl Issuer {
     ) -> Option<String> {
         let req_cbor = URL_SAFE_NO_PAD.decode(issuance_request_b64).ok()?;
         let req = IssuanceRequest::from_cbor(&req_cbor).ok()?;
-        let credit_scalar = credit_to_scalar::<128>(credits as u128).ok()?;
+        let credit_scalar = credit_to_scalar::<ACT_L>(credits as u128).ok()?;
         let resp = self
             .key
-            .issue::<128>(
+            .issue::<ACT_L>(
                 &self.params,
                 &req,
                 credit_scalar,
@@ -1373,37 +1396,42 @@ impl Issuer {
 
     /// Produce a refund for a parsed spend proof, refunding the full charge
     /// (no work performed). Returns the base64url CBOR `Refund`.
-    fn refund_for(&self, spend_proof: &SpendProof<128>) -> Option<String> {
+    fn refund_for(&self, spend_proof: &SpendProof<ACT_L>) -> Option<String> {
+        let charge = scalar_to_credit::<ACT_L>(&spend_proof.charge()).ok()?;
+        self.refund_of(spend_proof, charge)
+    }
+
+    /// Produce a refund returning `t` credits of a parsed spend proof's
+    /// charge. Returns the base64url CBOR `Refund`.
+    fn refund_of(&self, spend_proof: &SpendProof<ACT_L>, t: u128) -> Option<String> {
         if spend_proof.context() != self.request_context_scalar {
             return None;
         }
-        let charge = scalar_to_credit::<128>(&spend_proof.charge()).ok()?;
-        let t = credit_to_scalar::<128>(charge).ok()?;
+        let t = credit_to_scalar::<ACT_L>(t).ok()?;
         let refund = self
             .key
-            .refund::<128>(&self.params, spend_proof, t, OsRng)
+            .refund::<ACT_L>(&self.params, spend_proof, t, OsRng)
             .ok()?;
         Some(URL_SAFE_NO_PAD.encode(refund.to_cbor().ok()?))
     }
 
-    /// Parse a `PrivateToken token="..."` header into its embedded spend proof
-    /// (mirrors the server's `TokenAuth` extractor). Like the server, it reads
-    /// only the spelling RFC 9577 requires, padded base64url, decoded here
-    /// with the `base64` crate's canonical padded engine rather than the
-    /// shared `eidola_common::private_token` rule the client writes with, so
-    /// the client's spelling is checked against an independent reading.
-    fn spend_proof_from_auth(auth: &str) -> Option<SpendProof<128>> {
-        let payload = auth
-            .strip_prefix("PrivateToken token=\"")
-            .and_then(|s| s.strip_suffix('"'))?;
+    /// Parse a `credentials` element's `token` into its embedded spend proof
+    /// (mirrors the server's `auth::presented_spend`). Like the server, it
+    /// reads only the one spelling, padded base64url, decoded here with the
+    /// `base64` crate's canonical padded engine and a re-encoding check rather
+    /// than the shared `eidola_common::spend_credentials` rule the client
+    /// writes with, so the client's spelling is checked against an
+    /// independent reading.
+    fn spend_proof_from_auth(token: &str) -> Option<SpendProof<ACT_L>> {
         let bytes = base64::engine::general_purpose::URL_SAFE
-            .decode(payload)
-            .ok()?;
+            .decode(token)
+            .ok()
+            .filter(|bytes| base64::engine::general_purpose::URL_SAFE.encode(bytes) == token)?;
         if bytes.len() < 67 {
             return None;
         }
         // [token_type(2)][challenge_digest(32)][issuer_key_id(32)][spend_proof(..)]
-        SpendProof::<128>::from_cbor(&bytes[66..]).ok()
+        SpendProof::<ACT_L>::from_cbor(&bytes[66..]).ok()
     }
 }
 
@@ -1426,6 +1454,8 @@ pub async fn start(config: MockConfig) -> MockServer {
     let chat_auths: Arc<std::sync::Mutex<Vec<bool>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
+    let chat_spends: Arc<std::sync::Mutex<Vec<Option<String>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let refund_hits = Arc::new(AtomicU64::new(0));
     let models_hits = Arc::new(AtomicU64::new(0));
 
@@ -1436,6 +1466,7 @@ pub async fn start(config: MockConfig) -> MockServer {
         let chat_raw_bodies = chat_raw_bodies.clone();
         let chat_auths = chat_auths.clone();
         let chat_auth_values = chat_auth_values.clone();
+        let chat_spends = chat_spends.clone();
         let refund_hits = refund_hits.clone();
         let models_hits = models_hits.clone();
         tokio::spawn(async move {
@@ -1460,6 +1491,7 @@ pub async fn start(config: MockConfig) -> MockServer {
                 let chat_raw_bodies = chat_raw_bodies.clone();
                 let chat_auths = chat_auths.clone();
                 let chat_auth_values = chat_auth_values.clone();
+                let chat_spends = chat_spends.clone();
                 let refund_hits = refund_hits.clone();
                 let models_hits = models_hits.clone();
                 tokio::spawn(async move {
@@ -1472,6 +1504,7 @@ pub async fn start(config: MockConfig) -> MockServer {
                         chat_raw_bodies,
                         chat_auths,
                         chat_auth_values,
+                        chat_spends,
                         refund_hits,
                         models_hits,
                     )
@@ -1488,6 +1521,7 @@ pub async fn start(config: MockConfig) -> MockServer {
         chat_raw_bodies,
         chat_auths,
         chat_auth_values,
+        chat_spends,
         refund_hits,
         issuer,
         models_hits,
@@ -1500,11 +1534,71 @@ pub async fn start(config: MockConfig) -> MockServer {
 struct Req {
     method: String,
     path: String,
+    /// The `Authorization` header (an external backend's key; never a spend).
     auth: Option<String>,
-    /// The refund recovery key header, decoded (`None` when absent or not
+    /// Whether the request carried the refund-key header the gateway refuses.
+    refund_key_header: bool,
+    /// The body's spend: the one `credentials` element's `token` text, when
+    /// the member is an array of exactly one `{token, refund_key}` element.
+    spend_token: Option<String>,
+    /// That element's refund recovery key, decoded (`None` when absent or not
     /// exactly the wire form — the real server refuses both alike).
     refund_key: Option<[u8; 32]>,
+    /// Whether the body carried a `credentials` member at all.
+    has_credentials: bool,
     body: Vec<u8>,
+}
+
+/// The body's one spend, read independently of the client's writer: the
+/// `credentials` member must be an array of exactly one object with exactly
+/// the members `token` and `refund_key`, as the gateway reads it.
+fn body_spend(body: &[u8]) -> (bool, Option<String>, Option<[u8; 32]>) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return (false, None, None);
+    };
+    let Some(member) = value.get("credentials") else {
+        return (false, None, None);
+    };
+    let element = match member.as_array().map(Vec::as_slice) {
+        Some([element]) => element,
+        _ => return (true, None, None),
+    };
+    let Some(object) = element.as_object().filter(|o| o.len() == 2) else {
+        return (true, None, None);
+    };
+    let token = object
+        .get("token")
+        .and_then(|t| t.as_str())
+        .map(str::to_owned);
+    let key = object
+        .get("refund_key")
+        .and_then(|k| k.as_str())
+        .and_then(|k| eidola_common::refund_key::decode_refund_key(k.as_bytes()));
+    (true, token, key)
+}
+
+/// `raw` without its `credentials` member: what a test asserting bytes
+/// compares, since the member is the spend's and changes every request. The
+/// member's values (padded base64url, hex) hold no `]`, so the array ends at
+/// the first one.
+fn without_credentials(raw: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(raw) else {
+        return raw.to_vec();
+    };
+    let Some(start) = text.find("\"credentials\":[") else {
+        return raw.to_vec();
+    };
+    let Some(close) = text[start..].find(']') else {
+        return raw.to_vec();
+    };
+    let mut end = start + close + 1;
+    let mut start = start;
+    if text[end..].starts_with(',') {
+        end += 1;
+    } else if text[..start].ends_with(',') {
+        start -= 1;
+    }
+    format!("{}{}", &text[..start], &text[end..]).into_bytes()
 }
 
 async fn read_request(stream: &mut TcpStream) -> Option<Req> {
@@ -1534,7 +1628,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
 
     let mut content_length = 0usize;
     let mut auth = None;
-    let mut refund_key = None;
+    let mut refund_key_header = false;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim().to_ascii_lowercase();
@@ -1543,8 +1637,8 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
                 content_length = value.parse().unwrap_or(0);
             } else if name == "authorization" {
                 auth = Some(value.to_string());
-            } else if name == eidola_common::refund_key::REFUND_KEY_HEADER {
-                refund_key = eidola_common::refund_key::decode_refund_key(value.as_bytes());
+            } else if name == "x-eidola-refund-key" {
+                refund_key_header = true;
             }
         }
     }
@@ -1558,11 +1652,15 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
         body.extend_from_slice(&tmp[..n]);
     }
 
+    let (has_credentials, spend_token, refund_key) = body_spend(&body);
     Some(Req {
         method,
         path,
         auth,
+        refund_key_header,
+        spend_token,
         refund_key,
+        has_credentials,
         body,
     })
 }
@@ -1577,6 +1675,7 @@ async fn handle_conn(
     chat_raw_bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     chat_auths: Arc<std::sync::Mutex<Vec<bool>>>,
     chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    chat_spends: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     refund_hits: Arc<AtomicU64>,
     models_hits: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
@@ -1620,9 +1719,16 @@ async fn handle_conn(
         }
         ("POST", "/v1/credentials/refund") => {
             let attempt = refund_hits.fetch_add(1, Ordering::SeqCst) + 1;
-            // The real endpoint refuses a recovery without its key, and opens
-            // a stored refund only for the key the spend arrived with.
-            let proof = req.auth.as_deref().and_then(Issuer::spend_proof_from_auth);
+            // The real endpoint refuses a credential in a header, and a
+            // recovery without its key, and opens a stored refund only for the
+            // key the spend arrived with.
+            if req.auth.is_some() || req.refund_key_header {
+                return write_json(&mut stream, 400, &error_body("credential in a header")).await;
+            }
+            let proof = req
+                .spend_token
+                .as_deref()
+                .and_then(Issuer::spend_proof_from_auth);
             match (proof, req.refund_key) {
                 (_, None) => {
                     return write_json(&mut stream, 400, &error_body("refund key required")).await;
@@ -1633,7 +1739,14 @@ async fn handle_conn(
                 }
                 _ => {}
             }
-            handle_refund(&mut stream, &issuer, &config, req.auth.as_deref(), attempt).await?;
+            handle_refund(
+                &mut stream,
+                &issuer,
+                &config,
+                req.spend_token.as_deref(),
+                attempt,
+            )
+            .await?;
         }
         ("POST", "/v1/chat/completions") => {
             // 1-based index of this chat request — the tool-calling
@@ -1645,15 +1758,35 @@ async fn handle_conn(
                 .and_then(|b| b.get("model"))
                 .and_then(|m| m.as_str())
                 .is_some_and(|m| m == ROUTER_MODEL || m == ROUTER_REMOTE_MODEL);
-            if let Some(body) = parsed {
+            if let Some(mut body) = parsed {
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("credentials");
+                }
                 chat_bodies.lock().unwrap().push(body);
             }
-            chat_raw_bodies.lock().unwrap().push(req.body.clone());
+            chat_raw_bodies
+                .lock()
+                .unwrap()
+                .push(without_credentials(&req.body));
             chat_auths.lock().unwrap().push(req.auth.is_some());
             chat_auth_values.lock().unwrap().push(req.auth.clone());
+            chat_spends.lock().unwrap().push(req.spend_token.clone());
+            // A spend travels in the body and nowhere else: one in a header,
+            // or a `credentials` member that is not one well-formed spend, is
+            // refused before anything is taken, as the gateway refuses it.
+            if req.has_credentials && (req.auth.is_some() || req.refund_key_header) {
+                return write_json(&mut stream, 400, &error_body("credential in a header")).await;
+            }
+            if req.has_credentials && req.spend_token.is_none() {
+                return write_json(&mut stream, 401, &error_body("malformed credentials")).await;
+            }
             // A spend without its refund recovery key is refused before it is
-            // taken, as the real server's extractor refuses it.
-            if let Some(proof) = req.auth.as_deref().and_then(Issuer::spend_proof_from_auth) {
+            // taken, as the real server refuses it.
+            if let Some(proof) = req
+                .spend_token
+                .as_deref()
+                .and_then(Issuer::spend_proof_from_auth)
+            {
                 match req.refund_key {
                     Some(key) => {
                         issuer.spend_key_matches(&proof, key);
@@ -1666,6 +1799,27 @@ async fn handle_conn(
             }
             let parsed: serde_json::Value =
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            // **The hold is exactly the worst case**, as the gateway requires:
+            // computed here from the body as it arrived and the catalog row it
+            // names, through the shared contract. A spend holding anything
+            // else is refused after it is taken, with a full refund, as the
+            // gateway refuses it (and counted, so a test can say none was).
+            if let Some(proof) = req
+                .spend_token
+                .as_deref()
+                .and_then(Issuer::spend_proof_from_auth)
+                && let Some(worst) = worst_case_cost(&config, &parsed)
+                && scalar_to_credit::<ACT_L>(&proof.charge()).ok() != Some(worst)
+            {
+                issuer.hold_mismatches.fetch_add(1, Ordering::SeqCst);
+                let mut body: serde_json::Value =
+                    serde_json::from_str(&error_body("the hold must equal the worst-case cost"))
+                        .expect("error body");
+                if let Some(refund_b64) = issuer.refund_for(&proof) {
+                    body["refunds"] = serde_json::json!([{ "refund": refund_b64, "issuer_key_id": refund_key_id(&issuer, &config) }]);
+                }
+                return write_json(&mut stream, 400, &body.to_string()).await;
+            }
             // A branch-summary request is recognized by its system prompt (it
             // shares the router's model) and answered first, so a test can
             // script the summarizer, the router, and the turns independently.
@@ -1731,7 +1885,7 @@ async fn handle_conn(
                         &mut stream,
                         &issuer,
                         &config,
-                        req.auth.as_deref(),
+                        req.spend_token.as_deref(),
                         hit,
                         &parsed,
                     )
@@ -1845,7 +1999,7 @@ async fn handle_refund(
     let failing = match config.refund {
         RefundMode::Fail => true,
         RefundMode::FailFirst(n) => attempt <= n,
-        RefundMode::Succeed => false,
+        RefundMode::Succeed | RefundMode::Provisional => false,
         RefundMode::NotStored => {
             return write_json(stream, 404, &error_body("refund token not found")).await;
         }
@@ -1853,13 +2007,19 @@ async fn handle_refund(
     if failing {
         return write_json(stream, 500, &error_body("refund unavailable")).await;
     }
-    let refund = auth
-        .and_then(Issuer::spend_proof_from_auth)
-        .and_then(|sp| issuer.refund_for(&sp));
+    let provisional = matches!(config.refund, RefundMode::Provisional);
+    let refund = auth.and_then(Issuer::spend_proof_from_auth).and_then(|sp| {
+        if provisional {
+            issuer.refund_of(&sp, 0)
+        } else {
+            issuer.refund_for(&sp)
+        }
+    });
     match refund {
         Some(refund_b64) => {
             let body = serde_json::json!({
-                "refund": { "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) },
+                "refunds": [{ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) }],
+                "provisional": provisional,
             });
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1906,7 +2066,7 @@ async fn handle_chat(
             if matches!(config.chat, ChatBehavior::OkBlocking)
                 && let Some(refund) = inline_refund
             {
-                body["refund"] = refund;
+                body["refunds"] = serde_json::json!([refund]);
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1939,7 +2099,7 @@ async fn handle_chat(
                 .and_then(Issuer::spend_proof_from_auth)
                 .and_then(|sp| issuer.refund_for(&sp))
             {
-                body["refund"] = serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) });
+                body["refunds"] = serde_json::json!([{ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) }]);
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1953,7 +2113,7 @@ async fn handle_chat(
                 .and_then(Issuer::spend_proof_from_auth)
                 .and_then(|sp| issuer.refund_for(&sp))
             {
-                body["refund"] = serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) });
+                body["refunds"] = serde_json::json!([{ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) }]);
             }
             write_json(stream, status, &body.to_string()).await
         }
@@ -2090,7 +2250,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = serde_json::json!([refund]);
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2101,7 +2261,7 @@ async fn handle_chat(
             if hit <= rounds {
                 let mut body = tool_call_body(&tool_call_object(hit, &tool_arguments(hit)));
                 if let Some(refund) = inline_refund {
-                    body["refund"] = refund;
+                    body["refunds"] = serde_json::json!([refund]);
                 }
                 write_json(stream, 200, &body.to_string()).await
             } else {
@@ -2113,7 +2273,7 @@ async fn handle_chat(
                     "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
                 });
                 if let Some(refund) = inline_refund {
-                    body["refund"] = refund;
+                    body["refunds"] = serde_json::json!([refund]);
                 }
                 write_json(stream, 200, &body.to_string()).await
             }
@@ -2126,7 +2286,7 @@ async fn handle_chat(
             });
             let mut body = tool_call_body(&call);
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = serde_json::json!([refund]);
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2143,7 +2303,7 @@ async fn handle_chat(
                 })
             };
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = serde_json::json!([refund]);
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2173,7 +2333,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = serde_json::json!([refund]);
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2187,7 +2347,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = serde_json::json!([refund]);
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2195,7 +2355,7 @@ async fn handle_chat(
         ChatBehavior::DeclineBlocking => {
             let mut body = tool_call_body(&decline_call_object());
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = serde_json::json!([refund]);
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2237,7 +2397,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = serde_json::json!([refund]);
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2253,7 +2413,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = serde_json::json!([refund]);
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2274,7 +2434,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = serde_json::json!([refund]);
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2295,7 +2455,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = serde_json::json!([refund]);
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2342,7 +2502,7 @@ async fn handle_chat(
                 }
                 let mut body = tool_call_body(&tool_call_object(1, &tool_arguments(1)));
                 if let Some(refund) = inline_refund {
-                    body["refund"] = refund;
+                    body["refunds"] = serde_json::json!([refund]);
                 }
                 return write_json(stream, 200, &body.to_string()).await;
             }
@@ -2382,7 +2542,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = serde_json::json!([refund]);
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2406,7 +2566,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = serde_json::json!([refund]);
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2429,7 +2589,7 @@ async fn handle_chat(
             }
             let mut body = tool_call_body(&tool_call_object(hit, &tool_arguments(hit)));
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = serde_json::json!([refund]);
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2477,7 +2637,7 @@ async fn handle_chat(
                 })
             };
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = serde_json::json!([refund]);
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2810,7 +2970,7 @@ async fn write_ending(
             body["choices"][0]["continuable"] = serde_json::json!(exact);
         }
         if let Some(refund) = inline_refund {
-            body["refund"] = refund;
+            body["refunds"] = serde_json::json!([refund]);
         }
         return write_json(stream, 200, &body.to_string()).await;
     }
@@ -2960,7 +3120,7 @@ async fn write_sse_stream_with_metadata(
         "id": "chatcmpl-mock",
     });
     if let Some(refund) = refund {
-        metadata["refund"] = refund;
+        metadata["refunds"] = serde_json::json!([refund]);
     }
     stream.write_all(&send_event(metadata.to_string())).await?;
     stream.write_all(&send_event("[DONE]".to_string())).await?;
@@ -3038,7 +3198,7 @@ async fn write_padded_sse_stream(
         "privacy": { "note": "m".repeat(eidola_server_gateway::padding::FRAME_BYTES) },
     });
     if let Some(refund) = refund {
-        metadata["refund"] = refund;
+        metadata["refunds"] = serde_json::json!([refund]);
     }
     framer.push(&StreamEvent::Json(metadata.to_string()));
     framer.push(&StreamEvent::Done);
@@ -3171,7 +3331,7 @@ async fn write_sse_stream_split_data(
         "id": "chatcmpl-mock",
     });
     if let Some(refund) = refund {
-        metadata["refund"] = refund;
+        metadata["refunds"] = serde_json::json!([refund]);
     }
     stream.write_all(&send_event(&metadata)).await?;
     let done = "data: [DONE]\n\n";
@@ -3332,6 +3492,49 @@ async fn write_sse_stream_with_terminator(
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// The worst-case cost of `request` under the catalog row it names, as the
+/// gateway computes it: the flat per-request price, or the prompt priced by
+/// the shared contract plus the completion ceiling (the request's own, or the
+/// row's declared one) at the completion rate, each rounded up. `None` for a
+/// model the catalog does not list.
+fn worst_case_cost(config: &MockConfig, request: &serde_json::Value) -> Option<u128> {
+    let catalog: serde_json::Value = serde_json::from_str(&models_body(config)).ok()?;
+    let model = request.get("model")?.as_str()?;
+    let row = catalog
+        .get("data")?
+        .as_array()?
+        .iter()
+        .find(|row| row.get("id").and_then(|id| id.as_str()) == Some(model))?;
+    let price = |key: &str| -> Option<(u128, u128)> {
+        let p = row.get("pricing")?.get(key)?;
+        Some((
+            u128::from(p.get("value")?.as_u64()?),
+            u128::from(p.get("scale_factor")?.as_u64()?),
+        ))
+    };
+    if let Some((value, scale)) = price("per_request") {
+        return Some(value.div_ceil(scale));
+    }
+    let (prompt_rate, scale) = price("per_prompt_token")?;
+    let (completion_rate, _) = price("per_completion_token")?;
+    let messages = request.get("messages")?.as_array()?;
+    let tools = request
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(Vec::as_slice);
+    let prompt =
+        u128::from(eidola_common::prompt_charge(messages, tools).chargeable_prompt_tokens());
+    let completion = request
+        .get("max_completion_tokens")
+        .and_then(|m| m.as_u64())
+        .or_else(|| row.get("max_output_tokens").and_then(|m| m.as_u64()))
+        .or_else(|| row.get("context_length").and_then(|m| m.as_u64()))?;
+    Some(
+        (prompt * prompt_rate).div_ceil(scale)
+            + (u128::from(completion) * completion_rate).div_ceil(scale),
+    )
 }
 
 fn models_body(config: &MockConfig) -> String {

@@ -1,16 +1,18 @@
-//! Authorization middleware for the Eidola server.
+//! Authorization for the Eidola server.
 //!
-//! Supports the PrivateToken authentication scheme with ACT (Anonymous Credit
-//! Token) spend proofs, following draft-schlesinger-privacypass-act-01.
+//! A metered request pays with ACT (Anonymous Credit Token) spend proofs,
+//! following draft-schlesinger-privacypass-act-01, presented in the request
+//! body's `credentials` member (`eidola_common::spend_credentials`); account
+//! endpoints take HTTP Basic auth.
 
 use anonymous_credit_tokens::SpendProof;
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use base64::Engine;
-use eidola_common::private_token::{self, TokenAuthorizationError};
-use eidola_common::refund_key::{
-    REFUND_KEY_BYTES, REFUND_KEY_HEADER, REFUND_KEY_TEXT_LEN, decode_refund_key,
+use eidola_common::refund_key::REFUND_KEY_BYTES;
+use eidola_common::spend_credentials::{
+    ACT_L, CredentialWire, CredentialsError, DecodedCredential, decode_credentials,
 };
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -47,10 +49,11 @@ impl AuthMethod {
 }
 
 // ---------------------------------------------------------------------------
-// ACT spend data extracted from the Authorization header
+// ACT spends presented in the request body
 // ---------------------------------------------------------------------------
 
-/// Parsed ACT Token from an `Authorization: PrivateToken token="..."` header.
+/// One presented ACT Token, from an element of the request body's
+/// `credentials` member (`eidola_common::spend_credentials`).
 ///
 /// Token structure (draft-schlesinger-privacypass-act-01, Section 9.1):
 /// ```text
@@ -68,9 +71,9 @@ pub struct ActSpend {
     /// SHA-256(pkI_serialized) — identifies which issuer key signed the credential.
     pub issuer_key_hash: [u8; 32],
     /// The zero-knowledge spend proof.
-    pub spend_proof: SpendProof<128>,
-    /// The client's refund recovery key for this spend, from the
-    /// [`REFUND_KEY_HEADER`] header: what the stored refund is sealed under.
+    pub spend_proof: SpendProof<ACT_L>,
+    /// The client's refund recovery key for this spend, from the same
+    /// `credentials` element: what the stored refund is sealed under.
     pub refund_key: RefundKey,
 }
 
@@ -81,7 +84,7 @@ pub struct ActSpend {
 /// value, so neither the database nor anyone holding the gateway's own
 /// secrets can open it without the client. It is never stored, logged or
 /// traced: `Debug` is redacted, and the bytes are zeroed on drop. (The
-/// request's own header map, which axum owns, is not scrubbed.)
+/// request body's bytes, which the HTTP stack owns, are not scrubbed.)
 #[derive(Clone)]
 pub struct RefundKey(zeroize::Zeroizing<[u8; REFUND_KEY_BYTES]>);
 
@@ -93,22 +96,6 @@ impl RefundKey {
     pub(crate) fn as_bytes(&self) -> &[u8; REFUND_KEY_BYTES] {
         &self.0
     }
-
-    /// The key from a request's headers. Refused when absent or not exactly
-    /// the wire form: a spend whose refund could not be sealed for its
-    /// client is not taken, so every stored refund is one only its client
-    /// can open, and every spend can be recovered.
-    fn from_headers(headers: &axum::http::HeaderMap) -> Result<Self, ServerError> {
-        headers
-            .get(REFUND_KEY_HEADER)
-            .and_then(|v| decode_refund_key(v.as_bytes()))
-            .map(Self::from_bytes)
-            .ok_or_else(|| ServerError::BadRequest {
-                message: format!(
-                    "a {REFUND_KEY_HEADER} header of {REFUND_KEY_TEXT_LEN} lowercase hex digits is required"
-                ),
-            })
-    }
 }
 
 impl std::fmt::Debug for RefundKey {
@@ -117,87 +104,101 @@ impl std::fmt::Debug for RefundKey {
     }
 }
 
-// ---------------------------------------------------------------------------
-// TokenAuth extractor (for chat completions / metered endpoints)
-// ---------------------------------------------------------------------------
+/// The request headers a credential could travel in outside the body: the
+/// RFC 9577 `Authorization` header, and a refund-key header. A spend endpoint
+/// takes no other authorization, so any `Authorization` header is refused.
+const CREDENTIAL_HEADERS: [&str; 2] = ["authorization", "x-eidola-refund-key"];
 
-/// Axum extractor that parses an ACT Token from the Authorization header.
-///
-/// Expected format: `Authorization: PrivateToken token="<base64url(Token)>"`,
-/// the value padded as RFC 9577 requires and spelled exactly as
-/// `eidola_common::private_token` writes it (anything else is refused), plus the client's refund recovery key in [`REFUND_KEY_HEADER`] (required:
-/// see [`RefundKey::from_headers`]).
-///
-/// Per RFC 9577 Section 2.2.2 and draft-schlesinger-privacypass-act-01 Section 9.1.
-pub struct TokenAuth(pub ActSpend);
-
-// It reads nothing from the state, so it extracts under any.
-impl<S: Send + Sync> FromRequestParts<S> for TokenAuth {
-    type Rejection = ServerError;
-
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let header = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| ServerError::Unauthorized {
-                message: "missing Authorization header".to_string(),
-            })?;
-
-        // PrivateToken token="<padded base64url>", the one spelling the
-        // client writes (RFC 9577); every other spelling is refused.
-        let token_bytes = private_token::token_bytes(header).map_err(|e| match e {
-            TokenAuthorizationError::Scheme => ServerError::Unauthorized {
-                message: "expected PrivateToken authorization scheme".to_string(),
-            },
-            TokenAuthorizationError::Encoding => ServerError::Unauthorized {
-                message: "invalid base64url in PrivateToken (padded base64url is required)"
-                    .to_string(),
-            },
-        })?;
-
-        // Minimum size: 2 (token_type) + 32 (challenge_digest) + 32 (issuer_key_id) + 1 (spend proof)
-        if token_bytes.len() < 67 {
-            return Err(ServerError::Unauthorized {
-                message: "token too short".to_string(),
-            });
-        }
-
-        // Parse token_type (2 bytes, big-endian)
-        let token_type = u16::from_be_bytes([token_bytes[0], token_bytes[1]]);
-        if token_type != ACT_TOKEN_TYPE {
-            // The presented token type is caller-derived and this message
-            // reaches the logs via `Unauthorized`'s `Display`, so only the
-            // expected constant is interpolated.
-            return Err(ServerError::Unauthorized {
-                message: format!("unsupported token type, expected 0x{ACT_TOKEN_TYPE:04X}"),
-            });
-        }
-
-        // Parse challenge_digest (32 bytes)
-        let mut challenge_digest = [0u8; 32];
-        challenge_digest.copy_from_slice(&token_bytes[2..34]);
-
-        // Parse issuer_key_id (32 bytes)
-        let mut issuer_key_hash = [0u8; 32];
-        issuer_key_hash.copy_from_slice(&token_bytes[34..66]);
-
-        // Parse spend proof (remaining bytes are CBOR)
-        let spend_proof = SpendProof::<128>::from_cbor(&token_bytes[66..]).map_err(|_| {
-            ServerError::Unauthorized {
-                message: "invalid CBOR spend proof in token".to_string(),
-            }
-        })?;
-
-        let refund_key = RefundKey::from_headers(&parts.headers)?;
-
-        Ok(TokenAuth(ActSpend {
-            challenge_digest,
-            issuer_key_hash,
-            spend_proof,
-            refund_key,
-        }))
+/// Refuse a spend request that carries a credential in a header. A
+/// credential travels in the body's `credentials` member and nowhere else,
+/// so there is one transport and nothing to reconcile between two. Checked
+/// before the body is read.
+pub fn refuse_header_credentials(headers: &axum::http::HeaderMap) -> Result<(), ServerError> {
+    if CREDENTIAL_HEADERS
+        .iter()
+        .any(|name| headers.contains_key(*name))
+    {
+        return Err(ServerError::BadRequest {
+            message: "a credential travels in the request body's `credentials` member, \
+                      never in a header"
+                .to_string(),
+        });
     }
+    Ok(())
+}
+
+/// The spends a request body's `credentials` member presents, in input order,
+/// each parsed as a Token: the count first, then each value's spelling, then
+/// each Token's layout. Nothing here verifies a proof or touches the
+/// database; a refusal is answered before anything is recorded.
+pub fn presented_spends(wires: &[CredentialWire]) -> Result<Vec<ActSpend>, ServerError> {
+    let decoded = decode_credentials(wires).map_err(|e| match e {
+        CredentialsError::RefundKeyEncoding | CredentialsError::TooMany => {
+            ServerError::BadRequest {
+                message: e.to_string(),
+            }
+        }
+        CredentialsError::Missing | CredentialsError::TokenEncoding => ServerError::Unauthorized {
+            message: e.to_string(),
+        },
+    })?;
+    decoded.iter().map(parse_token).collect()
+}
+
+/// Exactly one spend: the shape every endpoint takes today
+/// (`MAX_CREDENTIALS_PER_REQUEST`).
+pub fn presented_spend(wires: &[CredentialWire]) -> Result<ActSpend, ServerError> {
+    let mut spends = presented_spends(wires)?;
+    match (spends.pop(), spends.is_empty()) {
+        (Some(spend), true) => Ok(spend),
+        _ => Err(ServerError::BadRequest {
+            message: CredentialsError::TooMany.to_string(),
+        }),
+    }
+}
+
+/// One Token's layout: `token_type`, `challenge_digest`, `issuer_key_id`, and
+/// a CBOR spend proof with no trailing bytes.
+fn parse_token(credential: &DecodedCredential) -> Result<ActSpend, ServerError> {
+    let token_bytes = &credential.token;
+    // Minimum size: 2 (token_type) + 32 (challenge_digest) + 32 (issuer_key_id) + 1 (spend proof)
+    if token_bytes.len() < 67 {
+        return Err(ServerError::Unauthorized {
+            message: "token too short".to_string(),
+        });
+    }
+
+    let token_type = u16::from_be_bytes([token_bytes[0], token_bytes[1]]);
+    if token_type != ACT_TOKEN_TYPE {
+        // The presented token type is caller-derived and this message
+        // reaches the logs via `Unauthorized`'s `Display`, so only the
+        // expected constant is interpolated.
+        return Err(ServerError::Unauthorized {
+            message: format!("unsupported token type, expected 0x{ACT_TOKEN_TYPE:04X}"),
+        });
+    }
+
+    let mut challenge_digest = [0u8; 32];
+    challenge_digest.copy_from_slice(&token_bytes[2..34]);
+    let mut issuer_key_hash = [0u8; 32];
+    issuer_key_hash.copy_from_slice(&token_bytes[34..66]);
+
+    // The spend proof is the rest of the Token, as one CBOR item and nothing
+    // after it: the proof re-encodes to exactly the bytes presented.
+    let proof_bytes = &token_bytes[66..];
+    let spend_proof = SpendProof::<ACT_L>::from_cbor(proof_bytes)
+        .ok()
+        .filter(|proof| proof.to_cbor().is_ok_and(|cbor| cbor == proof_bytes))
+        .ok_or_else(|| ServerError::Unauthorized {
+            message: "invalid CBOR spend proof in token".to_string(),
+        })?;
+
+    Ok(ActSpend {
+        challenge_digest,
+        issuer_key_hash,
+        spend_proof,
+        refund_key: RefundKey::from_bytes(credential.refund_key),
+    })
 }
 
 // ---------------------------------------------------------------------------

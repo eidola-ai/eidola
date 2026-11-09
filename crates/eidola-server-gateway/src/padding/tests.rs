@@ -737,10 +737,10 @@ async fn every_refusal_on_the_router_is_padded_and_echoes_nothing() {
     use tower::ServiceExt;
 
     async fn chat(
-        _auth: crate::auth::TokenAuth,
-        crate::handlers::ChatRequest(_): crate::handlers::ChatRequest,
-    ) -> &'static str {
-        "ok"
+        crate::handlers::ChatRequest(validated): crate::handlers::ChatRequest,
+    ) -> Result<&'static str, crate::error::ServerError> {
+        crate::auth::presented_spend(&validated.request().credentials.0)?;
+        Ok("ok")
     }
     async fn body_only(
         crate::handlers::ChatRequest(_): crate::handlers::ChatRequest,
@@ -762,8 +762,8 @@ async fn every_refusal_on_the_router_is_padded_and_echoes_nothing() {
         (
             Method::POST,
             "/v1/chat/completions",
-            None,
-            "{}".into(),
+            Some("application/json"),
+            r#"{"model":"m","messages":[]}"#.into(),
             StatusCode::UNAUTHORIZED,
         ),
         (

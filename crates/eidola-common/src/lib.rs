@@ -8,8 +8,9 @@
 //! ([`engine_protocol`]: the prefix-cache key's shape and the weights
 //! header), the refund recovery key's wire form ([`refund_key`]), the public
 //! calendar issuer key windows are checked against ([`issuer_calendar`]), the
-//! spelling of a spend's `Authorization` value (`private_token`, behind the
-//! `private-token` feature), and the
+//! `credentials` member a spend travels in and the ACT parameter `L`
+//! (`spend_credentials`, behind the `spend-credentials` feature), the longest a
+//! request may run before it is settled ([`T_SETTLE`]), and the
 //! embed-marker recognition rule shared between the
 //! markdown editor's embed plugin and app-core's upstream quote expansion
 //! ([`embed`]). It is intentionally lib-only, pure Rust, and float-free so
@@ -28,8 +29,8 @@
 //! > consumer's graph and is required for contract fidelity.** Today that
 //! > set is `serde_json`, plus `argon2` behind the optional `argon2` feature
 //! > and `serde_yaml`, `serde` (derive) and `unsafe-libyaml` behind the
-//! > optional `deployment` feature, and `base64` behind the optional
-//! > `private-token` feature. Any addition needs the same argument written
+//! > optional `deployment` feature, and `base64` and `serde` behind the
+//! > optional `spend-credentials` feature. Any addition needs the same argument written
 //! > down.
 //!
 //! `argon2` qualifies because it is optional: it enters a graph only when a
@@ -42,11 +43,11 @@
 //! readers of engine deployment configs, so the one deployment check
 //! (`engine_deployment::deployment`) parses YAML once for both; `unsafe-libyaml`
 //! is the parser `serde_yaml` is built on, read directly for its event stream.
-//! `base64` is optional on the same terms: `private-token` is enabled by the
-//! two sides of a spend's `Authorization` header, app-core and the gateway,
-//! both of which depend on `base64 0.23` directly, so one function writes the
-//! padded base64url value RFC 9577 requires and one refuses every other
-//! spelling.
+//! `base64` and `serde` are optional on the same terms: `spend-credentials` is
+//! enabled by the two sides of a request's `credentials` member, app-core and
+//! the gateway, both of which depend on `base64 0.23` and `serde` (derive)
+//! directly, so one function writes the padded base64url a Token travels as,
+//! and one strict element type and one function refuse every other spelling.
 //!
 //! `serde_json` qualifies on both counts: every consumer (app-core, gateway,
 //! inference node, gui; cli via app-core) already carries it, so admitting it
@@ -128,9 +129,9 @@ pub mod embed;
 pub mod engine_deployment;
 pub mod engine_protocol;
 pub mod issuer_calendar;
-#[cfg(feature = "private-token")]
-pub mod private_token;
 pub mod refund_key;
+#[cfg(feature = "spend-credentials")]
+pub mod spend_credentials;
 
 use serde_json::Value;
 
@@ -212,6 +213,36 @@ pub const PER_MESSAGE_TOKENS: u64 = 8;
 
 /// Per-request token allowance, covering BOS/system-preamble slack.
 pub const PER_REQUEST_TOKENS: u64 = 32;
+
+/// `T_settle`: the longest a spend's stored refund can stay provisional
+/// without a gateway crash, measured from when the client sent the request.
+///
+/// When the gateway records a spend's nullifier it stores, in the same
+/// statement, a refund that returns nothing (`t = 0`), marked provisional; when
+/// the request ends, for any reason, it overwrites that with the final refund.
+/// A recovery that finds the provisional one says so, and the client keeps
+/// the spend pending rather than settle on a successor whose final sibling
+/// (the same nullifier, a larger balance) may still come. Once `T_SETTLE` has
+/// passed since it sent the request, no final refund can come except after a
+/// crash, and the client accepts the provisional one.
+pub const T_SETTLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// The longest the gateway lets a paid request run, from the moment it records
+/// the spend's nullifier: a request still running then is ended, and settled
+/// as a stream that ended early.
+///
+/// Shorter than [`T_SETTLE`] by [`SETTLE_MARGIN`], because the two are
+/// measured from different instants on different machines: the client's
+/// clock starts before its request leaves (connection, attestation, upload),
+/// and the gateway's when the nullifier is recorded, after verification. The
+/// margin also covers settlement itself, which writes the final refund after
+/// the request ends. Each side measures its own interval on its own clock, so
+/// clock disagreement between them does not enter.
+pub const MAX_REQUEST_DURATION: std::time::Duration =
+    std::time::Duration::from_secs(T_SETTLE.as_secs() - SETTLE_MARGIN.as_secs());
+
+/// What separates [`MAX_REQUEST_DURATION`] from [`T_SETTLE`].
+pub const SETTLE_MARGIN: std::time::Duration = std::time::Duration::from_secs(2 * 60);
 
 /// The shared prompt-token formula of the client/server pricing contract:
 ///

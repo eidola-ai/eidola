@@ -9,16 +9,16 @@ use axum::extract::{FromRequest, Request, State};
 use axum::response::IntoResponse;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use eidola_common::spend_credentials::ACT_L;
 use opentelemetry::KeyValue;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 
 use crate::AppState;
-use crate::auth::{ActSpend, AuthContext, AuthMethod, TokenAuth};
+use crate::auth::{ActSpend, AuthContext, AuthMethod};
 use crate::backend::{BackendStreamEvent, PRICING_SCALE_FACTOR};
-use crate::credentials::{self, KeyUse};
-use crate::db;
+use crate::credentials::{self, KeyUse, RefundStage, SignedRefund};
 use crate::engine_trust::protocol::ValidatedRequest;
 use crate::error::ServerError;
 use crate::padding::{self, Cadence, StreamEvent};
@@ -274,6 +274,16 @@ pub(crate) async fn issue_refund_async(
     })
 }
 
+/// The answer to a request ended at its deadline
+/// (`eidola_common::MAX_REQUEST_DURATION` after its nullifier was recorded).
+fn request_deadline_error() -> ServerError {
+    ServerError::Backend {
+        status: 504,
+        error_type: "timeout".to_string(),
+        message: "the request reached its deadline and was ended".to_string(),
+    }
+}
+
 /// Build an HTTP error response that includes a refund token.
 fn error_response_with_refund(
     error: &ServerError,
@@ -281,7 +291,10 @@ fn error_response_with_refund(
 ) -> axum::response::Response {
     let status = error.status_code();
     let mut body = error.to_error_response();
-    body.refund = refund.map(|r| serde_json::to_value(r).unwrap());
+    body.refunds = refund
+        .map(|r| serde_json::to_value(r).unwrap())
+        .into_iter()
+        .collect();
     (status, Json(body)).into_response()
 }
 
@@ -289,7 +302,8 @@ fn error_response_with_refund(
 // Chat completions
 // ---------------------------------------------------------------------------
 
-/// Cryptographically verify the spend proof.
+/// Cryptographically verify the spend proof, returning the refund of nothing
+/// (`t = 0`) that verification signs: the spend's provisional refund.
 ///
 /// Checks challenge_digest, loads the issuer key, validates request_context,
 /// and verifies the proof itself. Does NOT record the nullifier — errors here
@@ -298,11 +312,13 @@ fn error_response_with_refund(
 /// The refund signed at settlement verifies the proof once more: the ACT
 /// crate verifies only as part of signing a refund for a fixed amount, and
 /// this request's amount is not known until its response is settled
-/// (`credentials::verify_and_refund`).
+/// (`credentials::verify_and_refund`). The `t = 0` refund this verification
+/// signs is stored with the nullifier, so a crash before settlement costs the
+/// spend its hold and never the credential's untouched balance.
 pub(crate) async fn verify_spend_proof(
     state: &AppState,
     act: &ActSpend,
-) -> Result<(), ServerError> {
+) -> Result<SignedRefund, ServerError> {
     let master_key = &state.credential_master_key;
 
     // Verify the challenge_digest matches our expected TokenChallenge.
@@ -346,7 +362,7 @@ fn validate_request(
     request: &ChatCompletionRequest,
 ) -> Result<(Model, u128), ServerError> {
     // Decode the charge amount from the spend proof.
-    let charge_credits = scalar_to_credit::<128>(&act.spend_proof.charge()).map_err(|_| {
+    let charge_credits = scalar_to_credit::<ACT_L>(&act.spend_proof.charge()).map_err(|_| {
         ServerError::BadRequest {
             message: "invalid charge amount in spend proof".to_string(),
         }
@@ -364,17 +380,24 @@ fn validate_request(
     // No completion past the declared ceiling, whatever the client.
     check_completion_ceiling(request, &model)?;
 
-    // Pre-flight go/no-go: the presented charge must cover the worst-case
-    // cost (the shared contract's minimum hold).
-    check_sufficient_charge(charge_credits, request, &model)?;
+    // The presented hold must be exactly the worst-case cost (the shared
+    // contract's hold), neither less nor more.
+    check_hold_equals_worst_case(charge_credits, request, &model)?;
 
     Ok((model, charge_credits))
 }
 
-/// Pre-flight go/no-go: reject a spend that presents less than the
+/// Pre-flight go/no-go: refuse a spend whose hold is not exactly the
 /// worst-case cost — the same formula the client used to size its hold —
 /// before anything is sent upstream. Pure so it is directly unit-testable.
-fn check_sufficient_charge(
+///
+/// **Exactly, not at least.** A hold below the worst case could be charged
+/// more than it holds; a hold above it is a number the client chose beyond
+/// what the request needs, a degree of freedom it could be recognised by, and
+/// with an exact hold a request settled without reported usage is charged
+/// the worst case and never more. Refused after the nullifier is recorded,
+/// like every validation refusal, so it is answered with a full refund.
+fn check_hold_equals_worst_case(
     charge_credits: u128,
     request: &ChatCompletionRequest,
     model: &Model,
@@ -389,35 +412,40 @@ fn check_sufficient_charge(
             available: charge_credits as i64,
         });
     }
+    if charge_credits > wc {
+        // No amount in the message: `BadRequest` is logged as it reads.
+        return Err(ServerError::BadRequest {
+            message: "the hold exceeds this request's worst-case cost; it must equal it"
+                .to_string(),
+        });
+    }
     Ok(())
 }
 
 /// Create a chat completion.
 ///
-/// Requires an ACT (Anonymous Credit Token) for authorization. The spend proof
-/// is verified, the nullifier is recorded, and a refund token is issued with
-/// any unspent credits.
+/// Paid with an ACT (Anonymous Credit Token) spend in the body's
+/// `credentials` member. The spend proof is verified, the nullifier is
+/// recorded with a provisional refund of nothing, and when the request ends
+/// that is replaced by the final refund, returning the unspent credits.
 #[utoipa::path(
     post,
     path = "/v1/chat/completions",
     tag = "Unlinked",
     request_body = ChatCompletionRequest,
-    params(
-        ("x-eidola-refund-key" = String, Header, description = "The client's refund recovery key for this spend, 64 lowercase hex digits: the stored copy of the refund is sealed under it, and recovery must present it again")
-    ),
     responses(
         (status = 200, description = "Chat completion response with privacy and verification metadata", body = EidolaResponse),
-        (status = 400, description = "Invalid request, or a missing or malformed refund recovery key (refused before the credential is spent)", body = ErrorResponse),
+        (status = 400, description = "Invalid request; a malformed refund recovery key, more than one credential, or a credential in a header (refused before the credential is spent); or a hold above the worst-case cost (refunded in full)", body = ErrorResponse),
         (status = 401, description = "Authentication failed", body = ErrorResponse),
-        (status = 402, description = "Insufficient charge amount", body = ErrorResponse),
+        (status = 402, description = "A hold below the worst-case cost (refunded in full)", body = ErrorResponse),
         (status = 409, description = "Credential already spent", body = ErrorResponse),
         (status = 502, description = "Upstream provider error", body = ErrorResponse),
         (status = 503, description = "No upstream is available for the model", body = ErrorResponse)
     )
 )]
 pub async fn chat_completions(
-    TokenAuth(act): TokenAuth,
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     ChatRequest(mut validated): ChatRequest,
 ) -> Result<axum::response::Response, ServerError> {
     let model = state.catalog.lookup_model(&validated.request().model);
@@ -435,7 +463,12 @@ pub async fn chat_completions(
     let model_label = model.map(|m| m.id).unwrap_or_else(|| "other".to_string());
     let stream = request.stream;
 
-    let result = chat_completions_phases(&state, &act, &validated).await;
+    let result = match crate::auth::refuse_header_credentials(&headers)
+        .and_then(|()| crate::auth::presented_spend(&request.credentials.0))
+    {
+        Ok(act) => chat_completions_phases(&state, &act, &validated).await,
+        Err(e) => Err(e),
+    };
 
     // An `Ok` from the phases can still be an error *response* — a
     // refund-bearing 4xx/5xx built after the credential was spent — so
@@ -469,14 +502,14 @@ async fn chat_completions_phases(
     let request = validated.request();
     // Phase 1: Verify the ACT cryptographically. Errors here mean the token
     // is invalid/malformed — no nullifier recorded, no refund needed.
-    verify_spend_proof(state, act).await?;
+    let provisional = verify_spend_proof(state, act).await?;
 
-    // Phase 2: Record the nullifier. After this succeeds, the credential is
-    // consumed and we MUST issue a refund on every subsequent code path.
-    let key_id = hex::encode(act.issuer_key_hash);
-    let nullifier = act.spend_proof.nullifier();
-    let nullifier_bytes = nullifier.as_bytes().to_vec();
-    let recorded = db::record_nullifier(&state.db_pool, &key_id, &nullifier_bytes).await?;
+    // Phase 2: Record the nullifier, with the provisional refund (`t = 0`)
+    // stored beside it in the same statement. After this succeeds, the
+    // credential is consumed and we MUST issue a refund on every subsequent
+    // code path; the final one overwrites the provisional one.
+    let recorded =
+        credentials::record_spend(state, act, RefundStage::Provisional, &provisional).await?;
     if !recorded {
         return Err(ServerError::Conflict {
             message: "credential already spent (duplicate nullifier)".to_string(),
@@ -484,7 +517,9 @@ async fn chat_completions_phases(
     }
 
     // --- POINT OF NO RETURN: nullifier is recorded ---
-    // From here on, we MUST issue a refund on any error.
+    // From here on, we MUST issue a refund on any error, and the request ends
+    // by `deadline` whatever the engine does.
+    let deadline = tokio::time::Instant::now() + eidola_common::MAX_REQUEST_DURATION;
 
     // Phase 3: Validate the request (model, charge amount). On failure, issue
     // a full refund of the charge amount back to the client.
@@ -493,7 +528,7 @@ async fn chat_completions_phases(
         Err(e) => {
             // Decode charge for the refund. If this also fails, fall back to
             // zero refund (returns blind remaining value c - s).
-            let refund_credits = scalar_to_credit::<128>(&act.spend_proof.charge()).unwrap_or(0);
+            let refund_credits = scalar_to_credit::<ACT_L>(&act.spend_proof.charge()).unwrap_or(0);
             warn!("Request validation failed after nullifier recorded, issuing full refund: {e}");
             let refund = issue_refund_async(state, act, refund_credits).await;
             return Ok(error_response_with_refund(&e, refund.ok()));
@@ -502,9 +537,17 @@ async fn chat_completions_phases(
 
     // Phase 4: Handle the request.
     if request.stream {
-        handle_streaming_request(state.clone(), validated, act, &model, charge_credits).await
+        handle_streaming_request(
+            state.clone(),
+            validated,
+            act,
+            &model,
+            charge_credits,
+            deadline,
+        )
+        .await
     } else {
-        handle_non_streaming_request(state, validated, act, &model, charge_credits).await
+        handle_non_streaming_request(state, validated, act, &model, charge_credits, deadline).await
     }
 }
 
@@ -515,6 +558,7 @@ async fn handle_non_streaming_request(
     act: &ActSpend,
     model: &Model,
     charge_credits: u128,
+    deadline: tokio::time::Instant,
 ) -> Result<axum::response::Response, ServerError> {
     let request = validated.request();
     let auth_context = AuthContext {
@@ -523,13 +567,26 @@ async fn handle_non_streaming_request(
 
     // Make the backend request. On error, issue a full refund.
     let dispatched_at = Instant::now();
-    let backend_response = match dispatch(state, validated).await {
-        Ok(resp) => resp,
-        Err(e) => {
+    let backend_response = match tokio::time::timeout_at(deadline, dispatch(state, validated)).await
+    {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => {
             // Known error — backend didn't charge. Full refund.
             warn!("Backend error, issuing full refund: {}", e);
             let refund = issue_refund_async(state, act, charge_credits).await;
             return Ok(error_response_with_refund(&e, refund.ok()));
+        }
+        Err(_) => {
+            // The request outlived `MAX_REQUEST_DURATION`. The engine may have
+            // done the work, and how much is unknown: settled as a stream that
+            // ended early is, with a refund of nothing (the blind remaining
+            // value `c - s` comes back).
+            warn!("Request reached its deadline, issuing zero refund");
+            let refund = issue_refund_async(state, act, 0).await;
+            return Ok(error_response_with_refund(
+                &request_deadline_error(),
+                refund.ok(),
+            ));
         }
     };
     crate::telemetry::metrics::CHAT_DURATION.record(
@@ -764,6 +821,7 @@ async fn handle_streaming_request(
     act: &ActSpend,
     model: &Model,
     charge_credits: u128,
+    deadline: tokio::time::Instant,
 ) -> Result<axum::response::Response, ServerError> {
     let request = validated.request();
     let auth_context = AuthContext {
@@ -774,15 +832,25 @@ async fn handle_streaming_request(
     // arrival: everything before this point is our own verification work,
     // which the HTTP-level histogram already covers.
     let dispatched_at = Instant::now();
-    let mut upstream_rx = match dispatch_stream(&state, validated).await {
-        Ok(rx) => rx,
-        Err(e) => {
-            // Known error — upstream didn't process any tokens. Full refund.
-            warn!("Stream start error, issuing full refund: {}", e);
-            let refund = issue_refund_async(&state, act, charge_credits).await;
-            return Ok(error_response_with_refund(&e, refund.ok()));
-        }
-    };
+    let mut upstream_rx =
+        match tokio::time::timeout_at(deadline, dispatch_stream(&state, validated)).await {
+            Ok(Ok(rx)) => rx,
+            Ok(Err(e)) => {
+                // Known error — upstream didn't process any tokens. Full refund.
+                warn!("Stream start error, issuing full refund: {}", e);
+                let refund = issue_refund_async(&state, act, charge_credits).await;
+                return Ok(error_response_with_refund(&e, refund.ok()));
+            }
+            Err(_) => {
+                // Not even opened by the deadline; the engine may have started.
+                warn!("Stream reached its deadline before opening, issuing zero refund");
+                let refund = issue_refund_async(&state, act, 0).await;
+                return Ok(error_response_with_refund(
+                    &request_deadline_error(),
+                    refund.ok(),
+                ));
+            }
+        };
 
     // Events for the client, framed by `padding` into fixed-size writes on a
     // fixed tick, the waiting bytes bounded (see `padding::EventSender::send`).
@@ -846,10 +914,38 @@ async fn handle_streaming_request(
             let _ = tx.send(StreamEvent::Done).await;
         }
 
+        /// The request reached its deadline mid-stream: settled as a stream
+        /// that ended early, with a refund of nothing (the blind remaining
+        /// value `c - s` comes back). Dropping the upstream receiver, as the
+        /// caller does by returning, ends the engine's work.
+        async fn end_at_deadline(
+            state: &AppState,
+            spent: &ActSpend,
+            tx: &padding::EventSender,
+            timing: StreamTiming,
+            auth_context: &AuthContext,
+            provider: &str,
+        ) {
+            warn!("Stream reached its deadline, issuing zero refund");
+            timing.finish("deadline", None, Instant::now());
+            let refund_info = try_refund(state, spent, 0).await;
+            let privacy = build_privacy_metadata(auth_context, true, provider);
+            let verification = build_verification_metadata(None);
+            send_metadata_event(tx, refund_info, privacy, verification, String::new()).await;
+        }
+
         let mut final_usage: Option<Usage> = None;
         let mut timing = StreamTiming::new(model_id.clone(), dispatched_at);
 
-        while let Some(event_result) = upstream_rx.recv().await {
+        loop {
+            let event_result = match tokio::time::timeout_at(deadline, upstream_rx.recv()).await {
+                Ok(Some(event_result)) => event_result,
+                Ok(None) => break,
+                Err(_) => {
+                    end_at_deadline(&state, &spent, &tx, timing, &auth_context, provider).await;
+                    return;
+                }
+            };
             match event_result {
                 Ok(BackendStreamEvent::Chunk(chunk, at)) => {
                     if carries_output(&chunk) {
@@ -860,15 +956,29 @@ async fn handle_streaming_request(
                         final_usage.clone_from(&chunk.usage);
                     }
                     let json_str = serde_json::to_string(&chunk).unwrap();
-                    if tx.send(StreamEvent::Json(json_str)).await.is_err() {
-                        // Client disconnected — we were likely billed for tokens
-                        // already streamed but don't know how much. Refund 0
-                        // (returns blind remaining value c - s). The client can't
-                        // receive this, but we issue it for consistency.
-                        warn!("Client disconnected mid-stream, issuing zero refund");
-                        timing.finish("client_disconnect", None, at);
-                        let _ = try_refund(&state, &spent, 0).await;
-                        return;
+                    match tokio::time::timeout_at(deadline, tx.send(StreamEvent::Json(json_str)))
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => {
+                            // Client disconnected — we were likely billed for
+                            // tokens already streamed but don't know how much.
+                            // Refund 0 (returns blind remaining value c - s).
+                            // The client can't receive this, but we issue it
+                            // for consistency.
+                            warn!("Client disconnected mid-stream, issuing zero refund");
+                            timing.finish("client_disconnect", None, at);
+                            let _ = try_refund(&state, &spent, 0).await;
+                            return;
+                        }
+                        // A client reading too slowly to take the stream
+                        // holds the request past its deadline no more than an
+                        // engine does.
+                        Err(_) => {
+                            end_at_deadline(&state, &spent, &tx, timing, &auth_context, provider)
+                                .await;
+                            return;
+                        }
                     }
                 }
                 Ok(BackendStreamEvent::Done(meta, at)) => {
@@ -1426,21 +1536,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn preflight_rejects_hold_below_minimum() {
+    fn preflight_requires_the_hold_to_equal_the_worst_case() {
         let req = request(&["hello world!"], 100);
         let model = test_model();
         let wc = worst_case_cost(&req, &model);
 
         // One credit short → 402 PaymentRequired, before anything upstream.
-        let err = check_sufficient_charge(wc - 1, &req, &model)
+        let err = check_hold_equals_worst_case(wc - 1, &req, &model)
             .expect_err("hold below the minimum must be rejected");
         assert!(
             matches!(err, ServerError::PaymentRequired { .. }),
             "got {err:?}"
         );
 
-        // Exactly the minimum → accepted.
-        check_sufficient_charge(wc, &req, &model).expect("exact minimum hold is sufficient");
+        // One credit over → refused too, and the log line names no amount.
+        let err = check_hold_equals_worst_case(wc + 1, &req, &model)
+            .expect_err("a hold above the worst case must be rejected");
+        assert!(matches!(err, ServerError::BadRequest { .. }), "got {err:?}");
+        assert!(!err.to_string().contains(&(wc + 1).to_string()));
+
+        // Exactly the worst case → accepted.
+        check_hold_equals_worst_case(wc, &req, &model).expect("the exact hold is accepted");
     }
 
     #[test]
@@ -1455,7 +1571,7 @@ pub(crate) mod tests {
         let model = test_model();
         let old_style_hold = 40 + 100 * 2;
         assert!(
-            check_sufficient_charge(old_style_hold, &req, &model).is_err(),
+            check_hold_equals_worst_case(old_style_hold, &req, &model).is_err(),
             "bytes-as-tokens hold must be below the contract minimum"
         );
     }
@@ -1584,7 +1700,7 @@ pub(crate) mod tests {
             .find("check_completion_ceiling(")
             .expect("validate_request refuses a ceiling past the declared one");
         let charge = validate
-            .find("check_sufficient_charge(")
+            .find("check_hold_equals_worst_case(")
             .expect("and checks the charge");
         assert!(check < charge, "{validate}");
     }

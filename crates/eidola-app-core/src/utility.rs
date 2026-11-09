@@ -290,9 +290,8 @@ impl Inner {
                         ),
                     });
                 }
-                let (prep, auth) = self.acquire_spend(&cfg, db_conn, charge, now).await?;
-                spend = Some(prep);
-                Some(auth)
+                spend = Some(self.acquire_spend(&cfg, db_conn, charge, now).await?);
+                None
             }
         };
 
@@ -305,19 +304,18 @@ impl Inner {
         let mut request = route
             .client
             .post(format!("{}/v1/chat/completions", route.base_url))
-            .json(&body);
-        request = crate::with_credentials(
-            request,
-            auth_value.as_deref(),
-            spend.as_ref().map(|s| &*s.refund_key),
-        );
+            .json(&*crate::body_with_spend(
+                &body,
+                spend.as_ref().map(|s| &s.presented),
+            ));
+        request = crate::with_authorization(request, auth_value.as_deref());
 
         let response = match request.send().await {
             Ok(resp) => resp,
             Err(e) => {
                 // The server may have received the request: recover the refund
                 // rather than abandoning the credential.
-                self.settle_utility_refund(db_conn, &spend, &auth_value, &route, None, now)
+                self.settle_utility_refund(db_conn, &spend, &route, None, now)
                     .await;
                 return Err(AppError::from_request(e));
             }
@@ -350,7 +348,7 @@ impl Inner {
             {
                 Ok(text) => text,
                 Err(e) => {
-                    self.settle_utility_refund(db_conn, &spend, &auth_value, &route, None, now)
+                    self.settle_utility_refund(db_conn, &spend, &route, None, now)
                         .await;
                     return Err(AppError::Network {
                         message: format!("failed to read the {} response: {e}", target.chore),
@@ -360,15 +358,8 @@ impl Inner {
         let parsed: serde_json::Value =
             serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
 
-        self.settle_utility_refund(
-            db_conn,
-            &spend,
-            &auth_value,
-            &route,
-            parsed.get("refund"),
-            now,
-        )
-        .await;
+        self.settle_utility_refund(db_conn, &spend, &route, crate::inline_refund(&parsed), now)
+            .await;
 
         if !status.is_success() {
             return Err(AppError::Server {
@@ -396,7 +387,6 @@ impl Inner {
         &self,
         db_conn: &turso::Connection,
         spend: &Option<crate::SpendPrep>,
-        auth_value: &Option<String>,
         route: &UtilityRoute,
         inline: Option<&serde_json::Value>,
         now: i64,
@@ -404,14 +394,15 @@ impl Inner {
         let Some(spend) = spend else { return };
         let refund_obj = match inline {
             Some(obj) => Some(obj.clone()),
-            None => match auth_value {
-                Some(auth) => {
-                    recover_refund(&route.client, &route.base_url, auth, &spend.refund_key)
-                        .await
-                        .ok()
-                }
-                None => None,
-            },
+            None => recover_refund(
+                &route.client,
+                &route.base_url,
+                &spend.presented,
+                spend.started_at,
+                None,
+            )
+            .await
+            .ok(),
         };
         let Some(refund_obj) = refund_obj else {
             eprintln!("warning: a utility call's credential refund could not be recovered");

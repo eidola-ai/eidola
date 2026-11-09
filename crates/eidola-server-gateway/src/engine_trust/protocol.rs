@@ -136,6 +136,9 @@ impl ValidatedRequest {
 /// first position and its last value, `serde_json`'s reading of it). The
 /// output is compact.
 ///
+/// `credentials`, the anonymous credits that paid for the request, is the
+/// gateway's alone and is never forwarded.
+///
 /// Three top-level members are the gateway's to decide, and are written last:
 ///
 /// - `stream` / `stream_options`: for a streaming request, `"stream":true`
@@ -183,6 +186,8 @@ pub fn engine_request_body(request: &ValidatedRequest) -> Zeroizing<Vec<u8>> {
                 })
             }
             "cache_key" => value.scrub(),
+            // The spends paid the gateway, not the node: never forwarded.
+            "credentials" => value.scrub(),
             // The fields the strict type narrows (`f32` sampling values) are
             // written from the typed request, exactly as `serde_json`
             // serializes them, so the engine receives the value the gateway

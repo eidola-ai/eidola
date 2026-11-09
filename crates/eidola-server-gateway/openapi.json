@@ -523,19 +523,8 @@
           "Unlinked"
         ],
         "summary": "Create a chat completion.",
-        "description": "Requires an ACT (Anonymous Credit Token) for authorization. The spend proof\nis verified, the nullifier is recorded, and a refund token is issued with\nany unspent credits.",
+        "description": "Paid with an ACT (Anonymous Credit Token) spend in the body's\n`credentials` member. The spend proof is verified, the nullifier is\nrecorded with a provisional refund of nothing, and when the request ends\nthat is replaced by the final refund, returning the unspent credits.",
         "operationId": "chat_completions",
-        "parameters": [
-          {
-            "name": "x-eidola-refund-key",
-            "in": "header",
-            "description": "The client's refund recovery key for this spend, 64 lowercase hex digits: the stored copy of the refund is sealed under it, and recovery must present it again",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -558,7 +547,7 @@
             }
           },
           "400": {
-            "description": "Invalid request, or a missing or malformed refund recovery key (refused before the credential is spent)",
+            "description": "Invalid request; a malformed refund recovery key, more than one credential, or a credential in a header (refused before the credential is spent); or a hold above the worst-case cost (refunded in full)",
             "content": {
               "application/json": {
                 "schema": {
@@ -578,7 +567,7 @@
             }
           },
           "402": {
-            "description": "Insufficient charge amount",
+            "description": "A hold below the worst-case cost (refunded in full)",
             "content": {
               "application/json": {
                 "schema": {
@@ -626,19 +615,18 @@
           "Unlinked"
         ],
         "summary": "Recover a refund token for a previously spent ACT.",
-        "description": "If the ACT's nullifier was already recorded (the server received and\nprocessed the original request), the stored refund token is returned.\n\nIf the nullifier was NOT recorded (the original request never arrived),\nthe server verifies the spend proof, records the nullifier, issues a\nfull refund (no credits consumed), stores it, and returns it.\n\nIn both cases, the client gets a refund token it can combine with its\nlocal `PreRefund` state to reconstruct a credential.\n\nThe stored token is sealed under the refund recovery key the client sent\nwith the spend, so recovery must present the same key: a different one\nopens nothing and is answered as no token stored (404).",
+        "description": "If the ACT's nullifier was already recorded (the server received the\noriginal request), the refund stored with it is returned: the final one\nif the request has ended, or the provisional one (`t = 0`, marked\n`provisional`) if it is still being served.\n\nIf the nullifier was NOT recorded (the original request never arrived),\nthe server verifies the spend proof, records the nullifier with a full\nrefund (no credits consumed) stored beside it, and returns that refund.\n\nIn both cases, the client gets a refund token it can combine with its\nlocal `PreRefund` state to reconstruct a credential.\n\nThe stored token is sealed under the refund recovery key the client sent\nwith the spend, so recovery must present the same key: a different one\nopens nothing and is answered as no token stored (404).",
         "operationId": "recover_refund",
-        "parameters": [
-          {
-            "name": "x-eidola-refund-key",
-            "in": "header",
-            "description": "The refund recovery key sent with the spend: 64 lowercase hex digits",
-            "required": true,
-            "schema": {
-              "type": "string"
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefundRecoveryRequest"
+              }
             }
-          }
-        ],
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "description": "Refund token recovered or issued",
@@ -651,7 +639,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed refund recovery key",
+            "description": "A malformed refund recovery key, more than one credential, or a credential in a header",
             "content": {
               "application/json": {
                 "schema": {
@@ -661,7 +649,7 @@
             }
           },
           "401": {
-            "description": "Invalid spend proof",
+            "description": "Missing credential, or an invalid spend proof",
             "content": {
               "application/json": {
                 "schema": {
@@ -671,7 +659,7 @@
             }
           },
           "404": {
-            "description": "Nullifier found but no refund token is available for this key yet",
+            "description": "Nullifier found but no refund token is available for this key",
             "content": {
               "application/json": {
                 "schema": {
@@ -1095,6 +1083,15 @@
               }
             ]
           },
+          "credentials": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SpendCredential"
+            },
+            "description": "The anonymous credits paying for this request: one element per spend,\neach an ACT Token and its refund recovery key\n(`eidola_common::spend_credentials`). Required; a request without it is\nrefused before anything is recorded, as is one that carries a\ncredential in a header instead.\n\n**Secret, and never serialized**, like `cache_key`: it prints\nredacted, `Serialize` skips it, and the body forwarded to an engine\nleaves it out (`engine_trust::protocol::engine_request_body`).",
+            "maxItems": 1,
+            "minItems": 1
+          },
           "max_completion_tokens": {
             "type": [
               "integer",
@@ -1514,16 +1511,12 @@
             "$ref": "#/components/schemas/PrivacyMetadata",
             "description": "Privacy metadata describing data exposure and authorization."
           },
-          "refund": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/RefundInfo",
-                "description": "Refund token for unspent credits (only present for ACT-authenticated requests)."
-              },
-              {
-                "type": "null"
-              }
-            ]
+          "refunds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RefundInfo"
+            },
+            "description": "One refund per spend, in the order the request presented them."
           },
           "usage": {
             "oneOf": [
@@ -1564,16 +1557,12 @@
             "$ref": "#/components/schemas/PrivacyMetadata",
             "description": "Privacy metadata."
           },
-          "refund": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/RefundInfo",
-                "description": "Refund token for unspent credits."
-              },
-              {
-                "type": "null"
-              }
-            ]
+          "refunds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RefundInfo"
+            },
+            "description": "One refund per spend, in the order the request presented them."
           },
           "verification": {
             "$ref": "#/components/schemas/VerificationMetadata",
@@ -1612,8 +1601,10 @@
           "error": {
             "$ref": "#/components/schemas/ErrorDetail"
           },
-          "refund": {
-            "description": "Refund token for unspent credits (present when an error occurs after\nthe ACT nullifier has been recorded)."
+          "refunds": {
+            "type": "array",
+            "items": {},
+            "description": "One refund per spend, in the order the request presented them\n(present when an error occurs after the spends' nullifiers were\nrecorded)."
           }
         }
       },
@@ -2290,16 +2281,43 @@
           }
         }
       },
+      "RefundRecoveryRequest": {
+        "type": "object",
+        "description": "Body of the refund recovery endpoint: the spend to recover, in the same\n`credentials` form it was presented in.",
+        "required": [
+          "credentials"
+        ],
+        "properties": {
+          "credentials": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SpendCredential"
+            },
+            "description": "Exactly one spend: its Token and its refund recovery key.",
+            "maxItems": 1,
+            "minItems": 1
+          }
+        },
+        "additionalProperties": false
+      },
       "RefundRecoveryResponse": {
         "type": "object",
         "description": "Response from the refund recovery endpoint.",
         "required": [
-          "refund"
+          "refunds",
+          "provisional"
         ],
         "properties": {
-          "refund": {
-            "$ref": "#/components/schemas/RefundInfo",
-            "description": "The refund token."
+          "provisional": {
+            "type": "boolean",
+            "description": "Whether the refund is the provisional one stored when the spend was\nrecorded (`t = 0`), because its request has not ended. A client keeps\nthe spend pending and asks again; it accepts a provisional refund as\nfinal only once `T_settle` (`eidola_common::T_SETTLE`) has passed since\nit sent the request, since the final refund's successor shares its\nnullifier and spending either destroys the other."
+          },
+          "refunds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RefundInfo"
+            },
+            "description": "The spend's refund: an array of one, mirroring `credentials`."
           }
         }
       },
@@ -2359,6 +2377,28 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "SpendCredential": {
+        "type": "object",
+        "description": "One element of a request body's `credentials` member, as documented.",
+        "required": [
+          "token",
+          "refund_key"
+        ],
+        "properties": {
+          "refund_key": {
+            "type": "string",
+            "description": "The spend's refund recovery key: exactly 64 lowercase hex digits. The\nstored copy of the spend's refund is sealed under it, and recovery\nmust present it again.",
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "token": {
+            "type": "string",
+            "description": "One ACT Token (`token_type`, `challenge_digest`, `issuer_key_id`, the\nencoded spend proof) as base64url with padding: the one spelling, so a\nvalue that does not re-encode to itself is refused.",
+            "pattern": "^[A-Za-z0-9_-]*={0,2}$"
           }
         }
       },
