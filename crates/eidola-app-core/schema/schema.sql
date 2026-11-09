@@ -53,6 +53,12 @@ CREATE TABLE pre_credential (
     credits          INTEGER,
     spend_amount     INTEGER,
     spend_proof_data BLOB,
+    -- Spend only: the request this spend is an input of. A request presents
+    -- one input or two (a drain and a fill), each its own row, written in one
+    -- transaction; every input of one request shares this id, so the
+    -- request's Record finds all of them. Recovery and settlement stay per
+    -- row: each input is final when its own refund is.
+    spend_group      TEXT,
     -- Issuance only, all written before the request is first sent, so a
     -- retry after a lost response or a crash sends the same request under the
     -- same idempotency key and the server answers it from what it stored:
@@ -75,6 +81,7 @@ CREATE TABLE pre_credential (
             AND credential_nonce IS NULL
             AND spend_amount IS NULL
             AND spend_proof_data IS NULL
+            AND spend_group IS NULL
             AND credits IS NOT NULL
             AND length(idempotency_key) = 32
             AND issuance_request IS NOT NULL
@@ -84,6 +91,7 @@ CREATE TABLE pre_credential (
             AND credential_nonce IS NOT NULL
             AND spend_amount IS NOT NULL
             AND spend_proof_data IS NOT NULL
+            AND spend_group IS NOT NULL
             AND credits IS NULL
             AND idempotency_key IS NULL
             AND issuance_request IS NULL
@@ -94,6 +102,10 @@ CREATE TABLE pre_credential (
 
 CREATE UNIQUE INDEX idx_one_spend_per_credential
     ON pre_credential (credential_nonce)
+    WHERE type = 'refund';
+
+CREATE INDEX idx_spend_group
+    ON pre_credential (spend_group)
     WHERE type = 'refund';
 
 CREATE TABLE credential (
@@ -1326,6 +1338,10 @@ WHERE d.depth > 0;
 
 -- ============================================================
 -- Spend trail: credential -> request -> action -> space
+--
+-- A request row names its first input's credential; a request
+-- with two inputs reaches the second through their shared
+-- `spend_group`, so every input of a request shows its request.
 -- ============================================================
 CREATE VIEW spend_trail AS
 SELECT
@@ -1347,7 +1363,10 @@ SELECT
     s.title             AS space_title,
     s.linkability
 FROM credential_lifecycle cl
-JOIN request r        ON r.credential_nonce = cl.nonce
+JOIN pre_credential pc_input ON pc_input.id = cl.pending_spend_id
+JOIN pre_credential pc_group ON pc_group.spend_group = pc_input.spend_group
+                            AND pc_group.type = 'refund'
+JOIN request r        ON r.credential_nonce = pc_group.credential_nonce
 LEFT JOIN action a    ON a.id = r.action_id
 LEFT JOIN space s     ON s.id = a.space_id
 WHERE cl.state IN ('spending', 'spent');

@@ -26,7 +26,7 @@
 use crate::error::AppError;
 use crate::{
     Change, ChargePricing, EidolaResolved, Inner, backends, db, estimate_charge_credits,
-    fetch_models, local_models, now_ms, process_refund, recover_refund,
+    fetch_models, local_models, now_ms,
 };
 
 /// Where a chore call would go, and what it would cost — resolved without
@@ -304,10 +304,7 @@ impl Inner {
         let mut request = route
             .client
             .post(format!("{}/v1/chat/completions", route.base_url))
-            .json(&*crate::body_with_spend(
-                &body,
-                spend.as_ref().map(|s| &s.presented),
-            ));
+            .json(&*crate::body_with_spend(&body, spend.as_ref()));
         request = crate::with_authorization(request, auth_value.as_deref());
 
         let response = match request.send().await {
@@ -315,7 +312,7 @@ impl Inner {
             Err(e) => {
                 // The server may have received the request: recover the refund
                 // rather than abandoning the credential.
-                self.settle_utility_refund(db_conn, &spend, &route, None, now)
+                self.settle_utility_refund(db_conn, &mut spend, &route, None, now)
                     .await;
                 return Err(AppError::from_request(e));
             }
@@ -348,7 +345,7 @@ impl Inner {
             {
                 Ok(text) => text,
                 Err(e) => {
-                    self.settle_utility_refund(db_conn, &spend, &route, None, now)
+                    self.settle_utility_refund(db_conn, &mut spend, &route, None, now)
                         .await;
                     return Err(AppError::Network {
                         message: format!("failed to read the {} response: {e}", target.chore),
@@ -358,8 +355,14 @@ impl Inner {
         let parsed: serde_json::Value =
             serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
 
-        self.settle_utility_refund(db_conn, &spend, &route, crate::inline_refund(&parsed), now)
-            .await;
+        self.settle_utility_refund(
+            db_conn,
+            &mut spend,
+            &route,
+            crate::inline_refund(&parsed),
+            now,
+        )
+        .await;
 
         if !status.is_success() {
             return Err(AppError::Server {
@@ -379,44 +382,27 @@ impl Inner {
             .to_string())
     }
 
-    /// Settle a remote chore call's credential: apply the inline refund when
-    /// the response carried one, otherwise try the recovery endpoint. A no-op
-    /// for the zero-spend backends. Best-effort throughout — a chore must never
-    /// turn a wallet hiccup into a failed post.
+    /// Settle a remote chore call's inputs: apply the inline refunds when
+    /// the response carried them, otherwise try the recovery endpoint, input
+    /// by input. A no-op for the zero-spend backends. Best-effort throughout
+    /// — a chore must never turn a wallet hiccup into a failed post.
     async fn settle_utility_refund(
         &self,
         db_conn: &turso::Connection,
-        spend: &Option<crate::SpendPrep>,
+        spend: &mut Option<crate::SpendPrep>,
         route: &UtilityRoute,
         inline: Option<&serde_json::Value>,
         now: i64,
     ) {
         let Some(spend) = spend else { return };
-        let refund_obj = match inline {
-            Some(obj) => Some(obj.clone()),
-            None => recover_refund(&route.client, &route.base_url, &spend.presented, None)
-                .await
-                .ok(),
-        };
-        let Some(refund_obj) = refund_obj else {
-            eprintln!("warning: a utility call's credential refund could not be recovered");
-            return;
-        };
-        let applied = process_refund(
-            &refund_obj,
-            &spend.params,
-            &spend.spend_proof,
-            &spend.pre_refund,
-            &spend.public_key,
-            db_conn,
-            &spend.pre_cred_id,
-            spend.cred.generation + 1,
-            now,
-        )
-        .await;
-        match applied {
-            Ok(()) => self.bus.emit(Change::Wallet),
-            Err(e) => eprintln!("warning: a utility call's refund failed to apply: {e}"),
+        let (written, error) = spend
+            .settle(&route.client, &route.base_url, db_conn, inline, now)
+            .await;
+        if written > 0 {
+            self.bus.emit(Change::Wallet);
+        }
+        if let Some(e) = error {
+            eprintln!("warning: a utility call's credential refund was not applied: {e}");
         }
     }
 }

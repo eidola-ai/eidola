@@ -1841,16 +1841,33 @@ pub const DEFAULT_ALLOCATION_CREDITS: i64 = 1_000_000;
 // `AppCore::start_credential_provisioner` and docs/anonymous-credits.md.
 
 /// The buffer the provisioner keeps: when the credits the wallet can spend
-/// for at least [`PROVISION_HORIZON`] fall below this, it issues one
-/// credential of [`DEFAULT_ALLOCATION_CREDITS`].
+/// for at least [`PROVISION_HORIZON`] fall below this, it issues credentials
+/// of [`DEFAULT_ALLOCATION_CREDITS`] ([`PROVISION_CREDENTIALS_PER_KEY`]).
 ///
 /// A quarter of an allocation: about eight worst-case holds of the most
 /// expensive catalogued model and forty of the default one, so the credential
 /// already held normally carries the requests made between the provisioner's
 /// looks, and the new one is first spent only once that runs out, at a time
 /// set by the reader's own use rather than by the issuance. Small, so what is
-/// held at once is at most this plus one allocation.
+/// held at once is at most this plus [`PROVISION_CREDENTIALS_PER_KEY`]
+/// allocations.
 pub const PROVISION_THRESHOLD_CREDITS: i64 = DEFAULT_ALLOCATION_CREDITS / 4;
+
+/// How many credentials of [`DEFAULT_ALLOCATION_CREDITS`] the provisioner
+/// sees this account issued under each key it provisions under: when it
+/// issues under a key, it issues until the account holds this many issuances
+/// under it (one more, once it has), in one pass.
+///
+/// A request presenting two inputs under one key shows that its client was
+/// issued at least two credentials under that key, which narrows its
+/// anonymity set to the accounts issued that many. Two per key makes that
+/// every account that provisioned, not the heavy users: a drain-and-fill
+/// request is then as anonymous as a single spend among provisioning
+/// accounts. Both are the one public denomination, so no new amount appears
+/// on the issuance surface. With at most two inputs per request
+/// (`eidola_common::spend_credentials::MAX_CREDENTIALS_PER_REQUEST`), nothing
+/// a request presents can tell two issuances from more.
+pub const PROVISION_CREDENTIALS_PER_KEY: i64 = 2;
 
 /// What still counts toward the buffer: credentials whose key lets a spend
 /// begin at least this far ahead. One about to lapse cannot carry the next
@@ -1910,8 +1927,10 @@ const PROVISION_PASS_DEADLINE: std::time::Duration = std::time::Duration::from_s
 /// What one pass of the provisioner did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProvisionOutcome {
-    /// Issued one credential of [`DEFAULT_ALLOCATION_CREDITS`].
-    Issued { nonce: String },
+    /// Issued credentials of [`DEFAULT_ALLOCATION_CREDITS`]: as many as bring
+    /// the account to [`PROVISION_CREDENTIALS_PER_KEY`] issuances under the
+    /// key, or one once it has them, as far as the balance covers.
+    Issued { nonces: Vec<String> },
     /// The wallet already holds at least [`PROVISION_THRESHOLD_CREDITS`]
     /// spendable past [`PROVISION_HORIZON`].
     Covered,
@@ -3873,8 +3892,10 @@ impl Inner {
 
     /// One pass of the **ahead-of-need provisioner** (see
     /// [`AppCore::start_credential_provisioner`]): recover any issuance whose
-    /// response was lost, then decide whether to issue one credential of the
-    /// standard size now. Every rule here is a public constant or a fact about
+    /// response was lost, then decide whether to issue credentials of the
+    /// standard size now: enough to bring the account to
+    /// [`PROVISION_CREDENTIALS_PER_KEY`] issuances under the current key, or
+    /// one more once it has them. Every rule here is a public constant or a fact about
     /// the wallet; nothing about a request that is about to be made enters it.
     async fn provision_once(&self) -> Result<ProvisionOutcome, AppError> {
         let _issuing = self
@@ -3958,17 +3979,38 @@ impl Inner {
         if balances.available < DEFAULT_ALLOCATION_CREDITS {
             return Ok(ProvisionOutcome::LowBalance);
         }
-        let issued = Box::pin(self.allocate_with_key(
-            &cfg,
-            &client,
-            &eidola.base_url,
-            &key,
-            DEFAULT_ALLOCATION_CREDITS,
-        ))
-        .await?;
-        Ok(ProvisionOutcome::Issued {
-            nonce: issued.nonce,
-        })
+        // Two issuances under each key this account provisions under, so a
+        // request draining one credential and filling from another under the
+        // key is placed among every provisioning account, not the heavy users
+        // ([`PROVISION_CREDENTIALS_PER_KEY`]). Issuances this account already
+        // has under the key, just-in-time and unresolved ones included, count.
+        let already = db::issuances_under_key(&db_conn, account_id, &key.listed.id).await?;
+        let wanted = (PROVISION_CREDENTIALS_PER_KEY - already)
+            .max(1)
+            .min(balances.available / DEFAULT_ALLOCATION_CREDITS);
+        let mut nonces = Vec::new();
+        for _ in 0..wanted {
+            match Box::pin(self.allocate_with_key(
+                &cfg,
+                &client,
+                &eidola.base_url,
+                &key,
+                DEFAULT_ALLOCATION_CREDITS,
+            ))
+            .await
+            {
+                Ok(issued) => nonces.push(issued.nonce),
+                // The first issuance's error is the pass's; a later one's
+                // leaves what was issued standing (a lost response stays
+                // pending, to be asked for again).
+                Err(e) if nonces.is_empty() => return Err(e),
+                Err(e) => {
+                    eprintln!("warning: a background issuance did not complete: {e}");
+                    break;
+                }
+            }
+        }
+        Ok(ProvisionOutcome::Issued { nonces })
     }
 
     async fn wallet_credentials(&self) -> Result<Vec<CredentialInfo>, AppError> {
@@ -6591,44 +6633,48 @@ impl Inner {
         })
     }
 
-    /// Find a credential that can cover `charge_credits`, auto-provisioning
-    /// one from the account balance when none exists — the pooled body of the
-    /// **ACT provisioning queue**.
+    /// Choose the credentials that pay for a request whose worst case is
+    /// `charge_credits`, by the input rule ([`choose_inputs`]), provisioning
+    /// one from the account balance when the wallet cannot cover it — the
+    /// pooled body of the **ACT provisioning queue**. Returns each input and
+    /// its share, in presentation order: one credential with the whole hold,
+    /// or a drain (its whole balance) and a fill (the rest).
     ///
     /// **The caller must hold [`Inner::spend_gate`]** across this call *and* the
-    /// spend-proof + `insert_pre_credential_refund` that follow, so the whole
+    /// spend proofs + `insert_spend_inputs` that follow, so the whole
     /// acquire→spend→flip-to-`spending` step is atomic per wallet. Two
     /// concurrent turns therefore never both grab the same active credential:
-    /// the first flips it to `spending` inside the lock; the second, entering
-    /// next, no longer sees it as spendable.
+    /// the first flips its inputs to `spending` inside the lock; the second,
+    /// entering next, no longer sees them as spendable.
     ///
     /// Resolution order (retried in a bounded loop):
-    /// 1. An active local credential with enough credits → use it.
-    /// 2. No usable credential and no account configured →
-    ///    [`AppError::NoAccount`] (the UI routes to account creation).
-    /// 3. Account exists and the available balance covers a fresh allocation →
-    ///    allocate `min(available, max(DEFAULT_ALLOCATION_CREDITS, charge))`
-    ///    (the pool) and retry.
-    /// 4. Balance can't cover another allocation but a mid-spend credential
-    ///    whose own `credits` cover the charge exists (a concurrent turn holds
-    ///    usable coverage) → wait bounded for its refund recovery to write a
-    ///    successor, then retry. A mid-spend credential *smaller* than the
-    ///    charge is ignored — its refund can never yield a covering successor
-    ///    (a successor is worth at most the original face value) and refunds
+    /// 1. The wallet covers the hold, alone or as a drain and a fill → use it.
+    /// 2. Otherwise `need` is what is missing: the whole hold, or the hold
+    ///    less the first credential's balance when that one is to be drained.
+    ///    No account configured → [`AppError::NoAccount`] (the UI routes to
+    ///    account creation).
+    /// 3. Account exists and the available balance covers `need` → allocate
+    ///    `min(available, max(DEFAULT_ALLOCATION_CREDITS, need))` (the pool)
+    ///    and choose again: the new credential is the fill, or the whole.
+    /// 4. Balance can't cover it but a mid-spend credential whose own
+    ///    `credits` cover `need` exists (a concurrent turn holds usable
+    ///    coverage) → wait bounded for its refund to write a successor, then
+    ///    retry. A mid-spend credential *smaller* than `need` is ignored — a
+    ///    successor is worth at most the original face value, and refunds
     ///    don't top up balance, so waiting on it is futile.
     /// 5. Bounded wait elapses with a covering credential still in flight →
     ///    [`AppError::ProvisioningTimeout`]; no covering credential in flight
     ///    (true shortfall) → [`AppError::InsufficientBalance`] *immediately*.
-    async fn ensure_spendable_credential(
+    async fn ensure_spend_inputs(
         &self,
         cfg: &Config,
         db_conn: &turso::Connection,
         charge_credits: i64,
-    ) -> Result<db::SpendableCredential, AppError> {
+    ) -> Result<Vec<(db::SpendableCredential, i64)>, AppError> {
         let deadline = tokio::time::Instant::now() + self.provision_wait();
         loop {
-            if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
-                return Ok(cred);
+            if let Ok(inputs) = chosen_inputs(db_conn, charge_credits).await? {
+                return Ok(inputs);
             }
 
             if cfg.account_id.is_none() || cfg.account_secret.is_none() {
@@ -6639,84 +6685,82 @@ impl Inner {
             // never converts beside the ahead-of-need provisioner, and looks
             // again once it has it: a background issuance that landed while it
             // waited covers this turn without a second conversion.
-            let balances = {
+            let (balances, need) = {
                 // Bounded by the queue's own deadline: this wait happens with
                 // `spend_gate` held, so an unbounded one would stall every
                 // paid turn behind it.
                 let _issuing = self.lock_issuance_gate(deadline).await?;
-                if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
-                    return Ok(cred);
-                }
+                let need = match chosen_inputs(db_conn, charge_credits).await? {
+                    Ok(inputs) => return Ok(inputs),
+                    Err(need) => need,
+                };
                 let balances = self.account_balances_bounded().await?;
-                if balances.available >= charge_credits {
-                    // Enough to allocate at least the charge — grow the pool.
-                    let amount = auto_allocation_amount(balances.available, charge_credits)?;
+                if balances.available >= need {
+                    // Enough to allocate at least what is missing — grow the
+                    // pool, and choose again.
+                    let amount = auto_allocation_amount(balances.available, need)?;
                     self.allocate_on_its_own_task(amount).await?;
                     continue;
                 }
-                balances
+                (balances, need)
             };
 
             // Balance can't cover a fresh allocation. Waiting only helps if a
             // concurrent turn holds coverage this turn could actually use once
             // its refund lands. A refund recovers a *wallet successor* worth at
             // most the original credential's face value (a full refund on a
-            // failed turn) — it never tops up the account balance, and a spend
-            // consumes one credential (no combining balance + a credential, or
-            // two credentials, to fund one turn). So an in-flight credential can
-            // only become spendable for THIS turn if its own `credits` already
-            // cover the charge; a smaller one — even fully refunded — never
+            // failed turn) — it never tops up the account balance. So an
+            // in-flight credential can only cover what is missing if its own
+            // `credits` already do; a smaller one — even fully refunded — never
             // will, and no allocation is possible either. Wait only when such a
             // credential exists; otherwise this is a true shortfall.
             let recoverable = db::list_spending_credentials(db_conn)
                 .await?
                 .into_iter()
-                .any(|c| c.credits >= charge_credits);
+                .any(|c| c.credits >= need);
             if recoverable && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
                 continue;
             }
 
-            // Before any terminal verdict, re-check for a spendable credential.
-            // This closes the split-read window between the top-of-iteration
-            // `find_spendable_credential` and the `list_spending_credentials`
-            // above: a sibling credential can *settle* (spending → spent) in
-            // that gap, and settlement is a single atomic insert that flips the
-            // original out of `spending` AND makes an active successor
-            // queryable at the same instant — so mid-settle both prior reads
-            // are stale (successor not yet active, original no longer spending)
-            // and `recoverable` reads false even though funding just landed.
-            // The re-read observes the successor.
+            // Before any terminal verdict, choose once more. This closes the
+            // split-read window between the top-of-iteration choice and the
+            // `list_spending_credentials` above: a sibling credential can
+            // *settle* (spending → spent) in that gap, and settlement is a
+            // single atomic insert that flips the original out of `spending`
+            // AND makes an active successor queryable at the same instant — so
+            // mid-settle both prior reads are stale (successor not yet active,
+            // original no longer spending) and `recoverable` reads false even
+            // though funding just landed. The re-read observes the successor.
             //
             // This makes the terminal verdict *instant-consistent*. We hold
             // `spend_gate` across this whole function, and the only active →
-            // `spending` flip (`insert_pre_credential_refund`) is under that
-            // same gate, so no credential can enter `spending` while we run:
-            // the covering-`spending` set only shrinks (via settlement) from
-            // the `list_spending` read to this re-read. Hence a terminal
+            // `spending` flip (`insert_spend_inputs`) is under that same gate,
+            // so no credential can enter `spending` while we run: the
+            // covering-`spending` set only shrinks (via settlement) from the
+            // `list_spending` read to this re-read. Hence a terminal
             // `InsufficientBalance`/`ProvisioningTimeout` reflects a real
             // instant with no covering credential in any state — it can NOT be
-            // a false negative from an in-flight sibling refund (the property
-            // the original bug violated). It does NOT promise to see funding
-            // that arrives *after* this re-read from a write exogenous to the
-            // turn machinery (an explicit `account_allocate`, startup
-            // recovery); that is an ordinary post-read TOCTOU no non-serialized
-            // check can exclude, and the recoverable error routes the caller to
-            // retry, which finds it.
-            if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
-                return Ok(cred);
+            // a false negative from an in-flight sibling refund. It does NOT
+            // promise to see funding that arrives *after* this re-read from a
+            // write exogenous to the turn machinery (an explicit
+            // `account_allocate`, startup recovery); that is an ordinary
+            // post-read TOCTOU no non-serialized check can exclude, and the
+            // recoverable error routes the caller to retry, which finds it.
+            if let Ok(inputs) = chosen_inputs(db_conn, charge_credits).await? {
+                return Ok(inputs);
             }
             if recoverable {
                 return Err(AppError::ProvisioningTimeout {
                     message: format!(
                         "timed out waiting for an in-flight credential refund to free \
-                         {charge_credits} credits for this turn"
+                         {need} credits for this turn"
                     ),
                 });
             }
             return Err(AppError::InsufficientBalance {
                 available: balances.available,
-                required: charge_credits,
+                required: need,
             });
         }
     }
@@ -7798,7 +7842,6 @@ impl Inner {
                 (charge_credits, Some(spend), None)
             }
         };
-        let spend_is_none = spend.is_none();
 
         Ok(TurnPrep {
             db_conn,
@@ -7838,9 +7881,6 @@ impl Inner {
             charge_credits,
             total_credits: charge_credits,
             spend,
-            // The turn's first hold is unsettled until its round processes a
-            // refund; a turn with no spend at all has nothing to settle.
-            spend_settled: spend_is_none,
             external_auth: auth_value,
             plain_route: backend_kind != BackendKind::Eidola,
             bus: self.bus.clone(),
@@ -7910,7 +7950,8 @@ impl Inner {
 
     /// Acquire the credential spend for one request: the ACT provisioning
     /// queue's acquire → spend-proof → flip-to-`spending` step, with the
-    /// spend as it will be presented in the request body ([`PresentedSpend`]).
+    /// inputs as they will be presented in the request body
+    /// ([`PresentedSpend`]): one credential, or a drain and a fill.
     ///
     /// Factored out of `prepare_turn` because a tool loop needs it **once per
     /// round**: the ACT protocol consumes a credential per request (the spend
@@ -7920,9 +7961,15 @@ impl Inner {
     /// discipline therefore applies per round too, which is exactly what this
     /// keeps intact.
     ///
-    /// Emits `Change::Wallet` after `insert_pre_credential_refund` — the
-    /// credential is in `spending` state from that instant regardless of
-    /// whether the rest of the round succeeds.
+    /// **Every input is taken at once.** Each input's proof is made, and then
+    /// every input is marked `spending` with its `PreRefund` in one local
+    /// transaction (`insert_spend_inputs`), all under `spend_gate`: a crash
+    /// cannot leave one input marked and another not, and a concurrent turn
+    /// can pick neither.
+    ///
+    /// Emits `Change::Wallet` after `insert_spend_inputs` — the inputs are in
+    /// `spending` state from that instant regardless of whether the rest of
+    /// the round succeeds.
     async fn acquire_spend(
         &self,
         cfg: &Config,
@@ -7933,83 +7980,95 @@ impl Inner {
         // ACT provisioning queue: serialize acquire → spend-proof →
         // flip-to-`spending` across concurrent turns so two turns fired at
         // once can never both spend the same credential. The gate is held only
-        // through `insert_pre_credential_refund` below (the point the
-        // credential becomes `spending`); the HTTP request runs outside it.
+        // through `insert_spend_inputs` below (the point the inputs become
+        // `spending`); the HTTP request runs outside it.
         let _spend_guard = self.spend_gate.lock().await;
         // Boxed: the provisioning queue's own future (with an issuance inside
         // it) is large, and it sits inside every turn's.
-        let cred =
-            Box::pin(self.ensure_spendable_credential(cfg, db_conn, charge_credits as i64)).await?;
-
-        let credit_token =
-            CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
-                message: format!("failed to decode credential: {e}"),
-            })?;
-        let public_key =
-            PublicKey::from_cbor(&cred.public_key_data).map_err(|e| AppError::Credential {
-                message: format!("failed to decode public key: {e}"),
-            })?;
+        let chosen =
+            Box::pin(self.ensure_spend_inputs(cfg, db_conn, charge_credits as i64)).await?;
 
         let params = params_from_domain_separator(cfg.domain_separator())?;
-
-        let charge_scalar =
-            credit_to_scalar::<ACT_L>(charge_credits).map_err(|e| AppError::Credential {
-                message: format!("invalid charge amount: {e:?}"),
+        let mut inputs = Vec::with_capacity(chosen.len());
+        let mut proofs = Vec::with_capacity(chosen.len());
+        for (cred, share) in chosen {
+            let credit_token =
+                CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
+                    message: format!("failed to decode credential: {e}"),
+                })?;
+            let public_key =
+                PublicKey::from_cbor(&cred.public_key_data).map_err(|e| AppError::Credential {
+                    message: format!("failed to decode public key: {e}"),
+                })?;
+            let share = u128::try_from(share).map_err(|_| AppError::Credential {
+                message: "a negative share".into(),
             })?;
-        let (spend_proof, pre_refund) = credit_token
-            .prove_spend::<ACT_L>(&params, charge_scalar, OsRng)
-            .map_err(|e| AppError::Credential {
-                message: format!("failed to create spend proof: {e:?}"),
+            let charge_scalar =
+                credit_to_scalar::<ACT_L>(share).map_err(|e| AppError::Credential {
+                    message: format!("invalid charge amount: {e:?}"),
+                })?;
+            let (spend_proof, pre_refund) = credit_token
+                .prove_spend::<ACT_L>(&params, charge_scalar, OsRng)
+                .map_err(|e| AppError::Credential {
+                    message: format!("failed to create spend proof: {e:?}"),
+                })?;
+            let pre_refund_cbor = pre_refund.to_cbor().map_err(|e| AppError::Credential {
+                message: format!("failed to encode pre_refund: {e}"),
             })?;
-
-        let pre_refund_cbor = pre_refund.to_cbor().map_err(|e| AppError::Credential {
-            message: format!("failed to encode pre_refund: {e}"),
-        })?;
-        let spend_proof_cbor = spend_proof.to_cbor().map_err(|e| AppError::Credential {
-            message: format!("failed to encode spend proof: {e}"),
-        })?;
-        let pre_cred_id = Uuid::now_v7().to_string();
-        // Claimed **before** the row that makes this credential `spending`,
-        // so there is no instant where the database says "in flight" and this
-        // process has not yet said whose flight it is. Recovery reads the two
-        // in the other order, so the overlap can only ever protect a live
-        // hold, never expose one.
-        self.live_spends
-            .lock()
-            .expect("live spends lock poisoned")
-            .insert(pre_cred_id.clone());
-        let live = LiveSpend {
-            set: Arc::clone(&self.live_spends),
-            pre_cred_id: pre_cred_id.clone(),
-        };
-        db::insert_pre_credential_refund(
-            db_conn,
-            &pre_cred_id,
-            &cred.nonce,
-            &cred.issuer_key_id,
-            &pre_refund_cbor,
-            charge_credits as i64,
-            &spend_proof_cbor,
-            now,
-        )
-        .await?;
-        // Credential flipped to "spending" — wallet state changed regardless
-        // of whether the rest of the operation succeeds.
+            let spend_proof_cbor = spend_proof.to_cbor().map_err(|e| AppError::Credential {
+                message: format!("failed to encode spend proof: {e}"),
+            })?;
+            let pre_cred_id = Uuid::now_v7().to_string();
+            // Claimed **before** the rows that make these credentials
+            // `spending`, so there is no instant where the database says "in
+            // flight" and this process has not yet said whose flight it is.
+            // Recovery reads the two in the other order, so the overlap can
+            // only ever protect a live hold, never expose one.
+            self.live_spends
+                .lock()
+                .expect("live spends lock poisoned")
+                .insert(pre_cred_id.clone());
+            let live = LiveSpend {
+                set: Arc::clone(&self.live_spends),
+                pre_cred_id: pre_cred_id.clone(),
+            };
+            let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
+            let presented =
+                PresentedSpend::new(&issuer_key_hash, &spend_proof_cbor, &pre_refund_cbor);
+            proofs.push((pre_refund_cbor, spend_proof_cbor));
+            inputs.push(SpendInput {
+                cred,
+                public_key,
+                spend_proof,
+                pre_refund,
+                presented,
+                pre_cred_id,
+                share,
+                settled: None,
+                _live: live,
+            });
+        }
+        let records: Vec<db::SpendInputRecord<'_>> = inputs
+            .iter()
+            .zip(&proofs)
+            .map(
+                |(input, (pre_refund_cbor, spend_proof_cbor))| db::SpendInputRecord {
+                    id: &input.pre_cred_id,
+                    credential_nonce: &input.cred.nonce,
+                    issuer_key_id: &input.cred.issuer_key_id,
+                    data: pre_refund_cbor,
+                    spend_amount: input.share as i64,
+                    spend_proof_data: spend_proof_cbor,
+                },
+            )
+            .collect();
+        let spend_group = Uuid::now_v7().to_string();
+        db::insert_spend_inputs(db_conn, &spend_group, &records, now).await?;
+        // Inputs flipped to "spending" — wallet state changed regardless of
+        // whether the rest of the operation succeeds.
         self.bus.emit(Change::Wallet);
 
-        let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
-        let presented = PresentedSpend::new(&issuer_key_hash, &spend_proof_cbor, &pre_refund_cbor);
-
-        Ok(SpendPrep {
-            cred,
-            public_key,
-            params,
-            spend_proof,
-            pre_refund,
-            presented,
-            pre_cred_id,
-            _live: live,
-        })
+        Ok(SpendPrep { params, inputs })
     }
 
     /// Begin the next round of a turn's tool loop: re-estimate the charge over
@@ -8034,7 +8093,9 @@ impl Inner {
         // against an endpoint that has not settled the first. The guard lives
         // here, at the one place `spend` is replaced, so no present or future
         // caller has to remember it.
-        if prep.spend.is_some() && !prep.spend_settled && !prep.try_refund_recovery().await {
+        if prep.spend.as_ref().is_some_and(|s| !s.all_settled())
+            && !prep.try_refund_recovery().await
+        {
             return Err(AppError::Credential {
                 message: "the previous round's credential could not be settled — its hold is \
                           recoverable with `eidola wallet credentials recover`"
@@ -8060,7 +8121,6 @@ impl Inner {
         prep.charge_credits = charge_credits;
         prep.total_credits += charge_credits;
         prep.spend = Some(spend);
-        prep.spend_settled = false;
         Ok(())
     }
 
@@ -13940,21 +14000,19 @@ struct TurnPrep {
     /// for the common case.
     total_credits: u128,
     /// The in-flight credential spend — `None` for local turns, which have
-    /// no billing. Its absence disables the ACT header, the refund
+    /// no billing. Its absence disables the spend in the body, the refund
     /// machinery, and the `Wallet` emissions throughout the transports.
-    spend: Option<SpendPrep>,
-    /// Whether [`Self::spend`]'s hold has been **settled** — a refund applied
-    /// and its successor credential written.
     ///
-    /// A hold is settled by the round that took it. This exists because
-    /// `spend` is the only in-memory handle to the materials that mint that
-    /// successor (`SpendPrep`'s proof, pre-refund and public key), so
-    /// replacing it while unsettled abandons them: the credential then sits
-    /// `spending` until the next startup recovery sweep, its face value locked
-    /// out of the wallet. [`Inner::begin_next_round`] refuses to replace an
-    /// unsettled hold, which is what makes that unrepresentable rather than
-    /// merely avoided at each call site.
-    spend_settled: bool,
+    /// A hold is settled by the round that took it, input by input
+    /// ([`SpendPrep::all_settled`]). `spend` is the only in-memory handle to
+    /// the materials that mint each input's successor (proof, pre-refund and
+    /// public key), so replacing it while any input is unsettled abandons
+    /// them: that credential then sits `spending` until the next startup
+    /// recovery sweep, its face value locked out of the wallet.
+    /// [`Inner::begin_next_round`] refuses to replace an unsettled hold, which
+    /// is what makes that unrepresentable rather than merely avoided at each
+    /// call site.
+    spend: Option<SpendPrep>,
     /// An external backend's own `Authorization` value (an OpenAI-compatible
     /// backend's key); `None` for every Eidola turn, whose spend travels in
     /// the body ([`TurnPrep::with_body`]).
@@ -13996,12 +14054,19 @@ impl Drop for LiveSpend {
     }
 }
 
-/// The credential-spend half of a prepared (remote) turn: the spendable
-/// credential, the proof materials, and the pending-refund row id.
-struct SpendPrep {
+/// The credential-spend half of a prepared (remote) request: its inputs, in
+/// the order the request presents them (one credential, or a drain and a
+/// fill), each with its proof materials and pending-refund row.
+pub(crate) struct SpendPrep {
+    params: Params,
+    inputs: Vec<SpendInput>,
+}
+
+/// One input of a request: the credential it spends, the materials that
+/// mint its successor, and its share of the hold.
+struct SpendInput {
     cred: db::SpendableCredential,
     public_key: PublicKey,
-    params: Params,
     spend_proof: SpendProof<ACT_L>,
     pre_refund: PreRefund,
     /// The spend as the request body presents it: its Token and the
@@ -14009,10 +14074,221 @@ struct SpendPrep {
     /// spend and with any recovery of it.
     presented: PresentedSpend,
     pre_cred_id: String,
-    /// Marks this hold as one a request is in flight for, for as long as
+    /// This input's share of the hold: the whole hold for a lone input, the
+    /// credential's whole balance for a drain, the rest for a fill.
+    share: u128,
+    /// The successor's balance once this input is settled.
+    settled: Option<i64>,
+    /// Marks this input as one a request is in flight for, for as long as
     /// these materials exist. `SpendPrep` is the only in-memory handle to a
     /// hold, so its lifetime *is* the window recovery must stay out of.
     _live: LiveSpend,
+}
+
+impl SpendPrep {
+    /// The `credentials` member's value: one element per input, in input
+    /// order.
+    pub(crate) fn credentials(&self) -> serde_json::Value {
+        let presented: Vec<&PresentedSpend> =
+            self.inputs.iter().map(|input| &input.presented).collect();
+        PresentedSpend::credentials_of(&presented)
+    }
+
+    /// The credential a request row names: the first input's. A request
+    /// with two inputs reaches the second through their shared spend group.
+    fn first_nonce(&self) -> &str {
+        &self.inputs[0].cred.nonce
+    }
+
+    /// Whether every input's successor is written.
+    fn all_settled(&self) -> bool {
+        self.inputs.iter().all(|input| input.settled.is_some())
+    }
+
+    /// Settle every input not yet settled: from `inline`, the `refunds`
+    /// array a response carried, when there is one (its element `i` answers
+    /// input `i`), and otherwise through recovery, each input by its own
+    /// nullifier and key. **The refund the server handed us first, and
+    /// recovery only for its absence**: the server's own stored copy is
+    /// best-effort, so asking recovery while an in-band token exists could
+    /// spend a credential and get nothing back. An in-band token that fails
+    /// to apply is not retried through recovery here — the server would hand
+    /// back the same token — and its input stays unsettled for a later
+    /// attempt and the startup sweep.
+    ///
+    /// Returns the number of successors written, and the first error any
+    /// input met. Once every input is settled at once, the partial returns
+    /// are checked against the in-order allocation the server must follow
+    /// ([`check_partial_returns`]); a mismatch is the server's fault, and is
+    /// surfaced as a warning, never corrected locally.
+    async fn settle(
+        &mut self,
+        client: &reqwest::Client,
+        base_url: &str,
+        db_conn: &turso::Connection,
+        inline: Option<&serde_json::Value>,
+        now: i64,
+    ) -> (usize, Option<AppError>) {
+        let inline = inline.and_then(serde_json::Value::as_array);
+        let count = self.inputs.len();
+        let was_unsettled = self.inputs.iter().all(|input| input.settled.is_none());
+        let mut written = 0;
+        let mut first_error = None;
+        for (i, input) in self.inputs.iter_mut().enumerate() {
+            if input.settled.is_some() {
+                continue;
+            }
+            let refund_obj = match inline {
+                Some(refunds) if refunds.len() == count => Ok(refunds[i].clone()),
+                Some(_) => Err(AppError::Credential {
+                    message: "the response's refunds do not answer each input".into(),
+                }),
+                None => recover_refund(client, base_url, &input.presented, None).await,
+            };
+            let applied = match refund_obj {
+                Ok(refund_obj) => {
+                    process_refund(
+                        &refund_obj,
+                        &self.params,
+                        &input.spend_proof,
+                        &input.pre_refund,
+                        &input.public_key,
+                        db_conn,
+                        &input.pre_cred_id,
+                        input.cred.generation + 1,
+                        now,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            };
+            match applied {
+                Ok(credits) => {
+                    input.settled = Some(credits);
+                    written += 1;
+                }
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        if was_unsettled && self.all_settled() {
+            let settled: Vec<(i64, u128, i64)> = self
+                .inputs
+                .iter()
+                .map(|input| (input.cred.credits, input.share, input.settled.unwrap_or(0)))
+                .collect();
+            if !check_partial_returns(&settled) {
+                eprintln!(
+                    "warning: a response's refunds do not follow the in-order allocation of \
+                     its charge; the server is at fault"
+                );
+            }
+        }
+        (written, first_error)
+    }
+}
+
+/// Whether the partial returns a request's refunds carry follow the in-order
+/// allocation of its charge (`eidola_common::spend_credentials::
+/// partial_returns`), given each input's `(balance, share, successor
+/// balance)` in input order: each input's partial return is its successor's
+/// balance less its untouched remainder, the charge is the hold less their
+/// sum, and the allocation of that charge must give them back exactly.
+fn check_partial_returns(inputs: &[(i64, u128, i64)]) -> bool {
+    let mut shares = Vec::with_capacity(inputs.len());
+    let mut returns = Vec::with_capacity(inputs.len());
+    for (balance, share, successor) in inputs {
+        let (Ok(balance), Ok(successor)) = (u128::try_from(*balance), u128::try_from(*successor))
+        else {
+            return false;
+        };
+        let Some(t) = balance
+            .checked_sub(*share)
+            .and_then(|remainder| successor.checked_sub(remainder))
+        else {
+            return false;
+        };
+        shares.push(*share);
+        returns.push(t);
+    }
+    let Some(hold) = eidola_common::spend_credentials::hold(&shares) else {
+        return false;
+    };
+    let Some(charge) = hold.checked_sub(returns.iter().sum()) else {
+        return false;
+    };
+    eidola_common::spend_credentials::partial_returns(&shares, charge).as_deref()
+        == Some(returns.as_slice())
+}
+
+/// The inputs a request whose worst case is `worst` spends from the wallet
+/// as it is now, by [`choose_inputs`]: each credential with its share, or
+/// `Err(need)`, what a new credential must cover.
+async fn chosen_inputs(
+    db_conn: &turso::Connection,
+    worst: i64,
+) -> Result<Result<Vec<(db::SpendableCredential, i64)>, i64>, AppError> {
+    let mut wallet = db::spendable_credentials(db_conn).await?;
+    let balances: Vec<i64> = wallet.iter().map(|c| c.credits).collect();
+    Ok(match choose_inputs(&balances, worst) {
+        InputChoice::One(i) => Ok(vec![(wallet.swap_remove(i), worst)]),
+        InputChoice::Two { drain, fill } => {
+            let a = balances[drain];
+            // Take the later index first, so the earlier one stays put.
+            let fill_cred = wallet.swap_remove(fill);
+            let drain_cred = wallet.swap_remove(drain);
+            Ok(vec![(drain_cred, a), (fill_cred, worst - a)])
+        }
+        InputChoice::Allocate { need } => Err(need),
+    })
+}
+
+/// Which credentials pay for a request, chosen from the wallet in its spend
+/// order ([`db::spendable_credentials`]: soonest-lapsing key first, then
+/// smallest, then nullifier), by a rule with no thresholds
+/// (`docs/specs/act-multi-spend.md` §7.2):
+///
+/// 1. If the first credential covers the hold `W`, it pays alone, its share
+///    `W`.
+/// 2. Otherwise the first, with balance `a < W`, is drained: presented first
+///    with its whole balance as its share, then the first later credential
+///    that covers `W − a`, with share `W − a`.
+/// 3. If no later credential covers `W − a` (or the wallet is empty), a new
+///    credential is allocated, and the rule runs again.
+///
+/// Every share is `W`, a drained balance, or the rest of `W` after a drain,
+/// so the shares sum to exactly `W` and reveal nothing but the drained
+/// balance. Exact drains, no rounding, and no deferral.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InputChoice {
+    /// The credential at this index pays alone.
+    One(usize),
+    /// The credential at `drain` is drained and the one at `fill` (later in
+    /// the order) pays the rest.
+    Two { drain: usize, fill: usize },
+    /// Nothing in the wallet covers what is missing (`need`): the whole hold,
+    /// or the hold less the first credential's balance.
+    Allocate { need: i64 },
+}
+
+/// [`InputChoice`] for `balances` in the wallet's spend order and a hold of
+/// `worst`.
+pub(crate) fn choose_inputs(balances: &[i64], worst: i64) -> InputChoice {
+    let Some(&first) = balances.first() else {
+        return InputChoice::Allocate { need: worst };
+    };
+    if first >= worst {
+        return InputChoice::One(0);
+    }
+    let rest = worst - first;
+    match balances[1..].iter().position(|&balance| balance >= rest) {
+        Some(i) => InputChoice::Two {
+            drain: 0,
+            fill: i + 1,
+        },
+        None => InputChoice::Allocate { need: rest },
+    }
 }
 
 /// Persist-time verdict for a mechanical report. Ordinary turns skip the
@@ -14109,7 +14385,7 @@ impl TurnPrep {
         request: reqwest::RequestBuilder,
         body: &serde_json::Value,
     ) -> reqwest::RequestBuilder {
-        let body = body_with_spend(body, self.spend.as_ref().map(|s| &s.presented));
+        let body = body_with_spend(body, self.spend.as_ref());
         if self.cache_scope.is_none() {
             return request.json(&*body);
         }
@@ -14138,52 +14414,61 @@ impl TurnPrep {
         Ok(())
     }
 
-    /// Apply a refund object (inline from a response body, or recovered) to
-    /// the pending spend — writes the successor credential. A no-op for
-    /// local turns (nothing was spent).
+    /// Apply a response's `refunds` array to the pending spend — writes each
+    /// input's successor credential (element `i` answers input `i`). A no-op
+    /// for local turns (nothing was spent). An error when the array does not
+    /// answer each input, or any input's refund fails to apply; the inputs
+    /// that did settle stay settled.
     ///
-    /// **This is where a settled hold emits `Change::Wallet`.** Writing the
-    /// successor is the durable commit — the credential leaves `spending` at
+    /// **This is where a settled hold emits `Change::Wallet`.** Writing a
+    /// successor is the durable commit — its credential leaves `spending` at
     /// that instant — and every refund the turn applies, inline or recovered,
     /// arrives through here. Emitting at the write rather than at each caller
     /// is what keeps the crate's emit-after-every-durable-commit rule true by
     /// construction: a caller that forgets (or an exit that returns before its
     /// own emit could run) cannot leave subscribers showing a credential as
     /// spending when it is not.
-    async fn process_refund_obj(&mut self, refund_obj: &serde_json::Value) -> Result<(), AppError> {
-        let Some(spend) = &self.spend else {
-            return Ok(());
-        };
-        process_refund(
-            refund_obj,
-            &spend.params,
-            &spend.spend_proof,
-            &spend.pre_refund,
-            &spend.public_key,
-            &self.db_conn,
-            &spend.pre_cred_id,
-            spend.cred.generation + 1,
-            self.now,
-        )
-        .await
-        .inspect(|()| {
-            self.spend_settled = true;
-            self.bus.emit(Change::Wallet);
-        })
+    async fn process_refund_obj(&mut self, refunds: &serde_json::Value) -> Result<(), AppError> {
+        self.settle_spend(Some(refunds)).await
     }
 
-    /// Best-effort refund recovery via `/v1/credentials/refund`. Returns
-    /// whether a successor credential was written — the `Wallet` emission for
-    /// it is [`Self::process_refund_obj`]'s, so a caller reads this only to
-    /// decide its own control flow, never to decide whether to emit. Always
-    /// `false` for local turns — there is no spend to recover.
+    /// Best-effort refund recovery via `/v1/credentials/refund`, input by
+    /// input. Returns whether every input is now settled — the `Wallet`
+    /// emission for a written successor is [`Self::settle_spend`]'s, so a
+    /// caller reads this only to decide its own control flow, never to decide
+    /// whether to emit. Always `false` for local turns — there is no spend to
+    /// recover.
     async fn try_refund_recovery(&mut self) -> bool {
-        let Some(spend) = &self.spend else {
+        if self.spend.is_none() {
             return false;
+        }
+        self.settle_spend(None).await.is_ok()
+    }
+
+    /// [`SpendPrep::settle`] for this turn's spend, emitting `Change::Wallet`
+    /// when any successor was written. `Ok` once every input is settled.
+    async fn settle_spend(&mut self, inline: Option<&serde_json::Value>) -> Result<(), AppError> {
+        let Some(spend) = self.spend.as_mut() else {
+            return Ok(());
         };
-        match recover_refund(&self.client, &self.base_url, &spend.presented, None).await {
-            Ok(refund_obj) => self.process_refund_obj(&refund_obj).await.is_ok(),
-            Err(_) => false,
+        let (written, error) = spend
+            .settle(
+                &self.client,
+                &self.base_url,
+                &self.db_conn,
+                inline,
+                self.now,
+            )
+            .await;
+        if written > 0 {
+            self.bus.emit(Change::Wallet);
+        }
+        match error {
+            Some(e) => Err(e),
+            None if spend.all_settled() => Ok(()),
+            None => Err(AppError::Credential {
+                message: "a spend's input is not settled".into(),
+            }),
         }
     }
 
@@ -14215,21 +14500,20 @@ impl TurnPrep {
     /// hand back the same token — and stays unsettled for
     /// [`Inner::begin_next_round`]'s last-chance attempt and the startup sweep.
     ///
-    /// Returns whether a successor was written; the `Wallet` emission is
-    /// [`Self::process_refund_obj`]'s. A no-op for a turn with no spend.
+    /// Returns whether every input is settled; the `Wallet` emission is
+    /// [`Self::settle_spend`]'s. A no-op for a turn with no spend.
     async fn settle(&mut self, inline: Option<&serde_json::Value>) -> bool {
         if self.spend.is_none() {
             return false;
         }
-        match inline {
-            Some(refund_obj) => match self.process_refund_obj(refund_obj).await {
-                Ok(()) => true,
-                Err(e) => {
+        match self.settle_spend(inline).await {
+            Ok(()) => true,
+            Err(e) => {
+                if inline.is_some() {
                     eprintln!("warning: a turn's in-band refund failed to apply: {e}");
-                    false
                 }
-            },
-            None => self.try_refund_recovery().await,
+                false
+            }
         }
     }
 
@@ -14267,7 +14551,7 @@ impl TurnPrep {
     /// Recorded on request rows; `None` keeps local turns honest in the
     /// Record.
     fn credential_nonce(&self) -> Option<String> {
-        self.spend.as_ref().map(|s| s.cred.nonce.clone())
+        self.spend.as_ref().map(|s| s.first_nonce().to_string())
     }
 
     /// Record a raw request/response with **no action to attach it to**.
@@ -14980,11 +15264,12 @@ impl TurnPrep {
     }
 }
 
-/// Apply a refund object to a pending spend: decode + verify the refund
-/// against the spend proof and write the successor credential. Called from
-/// `TurnPrep::process_refund_obj` (live turns) and from the startup wallet
-/// recovery (which reconstructs the spend materials from persisted rows —
-/// which is why this stays a free function taking them piecewise).
+/// Apply a refund object to one pending input: decode + verify the refund
+/// against the input's spend proof and write the successor credential,
+/// returning its balance. Called from `SpendPrep::settle` (live requests)
+/// and from the startup wallet recovery (which reconstructs the spend
+/// materials from persisted rows — which is why this stays a free function
+/// taking them piecewise).
 #[allow(clippy::too_many_arguments)]
 async fn process_refund(
     refund_obj: &serde_json::Value,
@@ -14996,7 +15281,7 @@ async fn process_refund(
     pre_cred_id: &str,
     generation: i64,
     now: i64,
-) -> Result<(), AppError> {
+) -> Result<i64, AppError> {
     let refund_b64 = refund_obj
         .get("refund")
         .and_then(|v| v.as_str())
@@ -15059,7 +15344,7 @@ async fn process_refund(
     )
     .await?;
 
-    Ok(())
+    Ok(new_credits as i64)
 }
 
 /// Attempt to recover a refund token from the server via
@@ -15124,11 +15409,15 @@ async fn recover_refund(
             message: "the spend's request has not ended yet; its refund is provisional".into(),
         });
     }
-    inline_refund(&body)
-        .cloned()
-        .ok_or_else(|| AppError::Credential {
+    match inline_refund(&body)
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+    {
+        Some([refund]) => Ok(refund.clone()),
+        _ => Err(AppError::Credential {
             message: "recovery response missing its refund".into(),
-        })
+        }),
+    }
 }
 
 /// Whether a refund the server still calls provisional may be settled on at
@@ -15140,18 +15429,14 @@ fn accepts_provisional_refund(spend_until: Option<i64>, now: i64) -> bool {
     spend_until.is_some_and(|until| now >= until)
 }
 
-/// The one refund a response carries for a one-spend request: the single
-/// element of its `refunds` array. Anything else (no array, an empty one, more
-/// than one) is no refund, and the hold is recovered instead.
+/// The refunds a response carries: its `refunds` array, one element per
+/// input in input order, when it is a non-empty array. Anything else (no
+/// array, an empty one) is no refund, and every input is recovered instead;
+/// an array that does not answer each input is refused where it is applied
+/// ([`SpendPrep::settle`]).
 pub(crate) fn inline_refund(body: &serde_json::Value) -> Option<&serde_json::Value> {
-    match body
-        .get(eidola_common::spend_credentials::REFUNDS_MEMBER)?
-        .as_array()?
-        .as_slice()
-    {
-        [refund] => Some(refund),
-        _ => None,
-    }
+    body.get(eidola_common::spend_credentials::REFUNDS_MEMBER)
+        .filter(|refunds| refunds.as_array().is_some_and(|a| !a.is_empty()))
 }
 
 // ============================================================================
@@ -18586,7 +18871,17 @@ impl PresentedSpend {
 
     /// The `credentials` member's value: an array of this one spend.
     pub(crate) fn credentials(&self) -> serde_json::Value {
-        eidola_common::spend_credentials::credentials_member(&[(&self.token, &self.refund_key)])
+        Self::credentials_of(&[self])
+    }
+
+    /// The `credentials` member's value for a request's inputs, in input
+    /// order.
+    fn credentials_of(inputs: &[&PresentedSpend]) -> serde_json::Value {
+        let inputs: Vec<(&[u8], &[u8; 32])> = inputs
+            .iter()
+            .map(|input| (input.token.as_slice(), &*input.refund_key))
+            .collect();
+        eidola_common::spend_credentials::credentials_member(&inputs)
     }
 }
 
@@ -18596,21 +18891,30 @@ impl std::fmt::Debug for PresentedSpend {
     }
 }
 
-/// `body` as sent: with `spend` in its `credentials` member when there is
-/// one, and `body` itself otherwise. A copy, so the caller's `body` (what the
-/// Record keeps) never holds a credential.
+/// `body` as sent: with `spend`'s inputs in its `credentials` member when
+/// there is one, and `body` itself otherwise. A copy, so the caller's `body`
+/// (what the Record keeps) never holds a credential.
 pub(crate) fn body_with_spend<'a>(
     body: &'a serde_json::Value,
-    spend: Option<&PresentedSpend>,
+    spend: Option<&SpendPrep>,
 ) -> std::borrow::Cow<'a, serde_json::Value> {
-    match spend {
+    with_credentials(body, spend.map(SpendPrep::credentials))
+}
+
+/// `body` with `credentials` as its `credentials` member, on a copy; `body`
+/// itself when there are none.
+fn with_credentials(
+    body: &serde_json::Value,
+    credentials: Option<serde_json::Value>,
+) -> std::borrow::Cow<'_, serde_json::Value> {
+    match credentials {
         None => std::borrow::Cow::Borrowed(body),
-        Some(spend) => {
+        Some(credentials) => {
             let mut sent = body.clone();
             if let Some(object) = sent.as_object_mut() {
                 object.insert(
                     eidola_common::spend_credentials::CREDENTIALS_MEMBER.to_string(),
-                    spend.credentials(),
+                    credentials,
                 );
             }
             std::borrow::Cow::Owned(sent)
@@ -18954,32 +19258,40 @@ mod tests {
     }
 
     /// **A spend travels in the body it is sent with, and nowhere else.** The
-    /// copy that goes to the wire carries the `credentials` member, exactly
-    /// as the gateway reads it; the body the caller keeps (what the Record
-    /// stores) does not, and no header carries any of it. Printed, the spend
-    /// is nothing.
+    /// copy that goes to the wire carries the `credentials` member, one
+    /// element per input in input order, exactly as the gateway reads it; the
+    /// body the caller keeps (what the Record stores) does not, and no header
+    /// carries any of it. Printed, the spend is nothing.
     #[test]
     fn a_spend_travels_only_in_the_sent_body() {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let spend = PresentedSpend::new(&[7u8; 32], b"spend-proof", b"pre-refund");
+        let fill = PresentedSpend::new(&[8u8; 32], b"fill-proof", b"fill-pre-refund");
         let key_text = String::from_utf8(
             eidola_common::refund_key::encode_refund_key(&spend.refund_key).to_vec(),
         )
         .unwrap();
         let recorded = serde_json::json!({ "model": "m", "messages": [] });
 
-        let sent = body_with_spend(&recorded, Some(&spend));
+        let sent = with_credentials(
+            &recorded,
+            Some(PresentedSpend::credentials_of(&[&spend, &fill])),
+        );
         assert!(
             recorded.get("credentials").is_none(),
             "the kept body has none"
         );
         let credentials = sent["credentials"].as_array().unwrap();
-        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials.len(), 2);
         assert_eq!(
             credentials[0]["token"],
             eidola_common::spend_credentials::encode_token(&spend.token)
         );
         assert_eq!(credentials[0]["refund_key"], key_text.as_str());
+        assert_eq!(
+            credentials[1]["token"],
+            eidola_common::spend_credentials::encode_token(&fill.token)
+        );
         assert_eq!(&spend.token[..2], &ACT_TOKEN_TYPE.to_be_bytes());
         // No spend, no member, and no copy.
         assert!(matches!(
@@ -19012,22 +19324,86 @@ mod tests {
         assert!(eidola_common::MAX_REQUEST_DURATION < eidola_common::T_SETTLE);
     }
 
-    /// **One spend, one refund.** A response's `refunds` is read only when it
-    /// is an array of exactly one; anything else is no refund, and the hold is
+    /// **One refund per input.** A response's `refunds` is read only when it
+    /// is a non-empty array (whether it answers each input is checked where
+    /// it is applied); anything else is no refund, and every input is
     /// recovered.
     #[test]
-    fn a_response_refund_is_its_refunds_array_of_one() {
+    fn a_response_refund_is_its_refunds_array() {
         let one = serde_json::json!({ "refunds": [{ "refund": "r", "issuer_key_id": "k" }] });
-        assert_eq!(inline_refund(&one).unwrap()["refund"], "r");
+        assert_eq!(inline_refund(&one).unwrap()[0]["refund"], "r");
+        let two = serde_json::json!({ "refunds": [{ "refund": "a" }, { "refund": "b" }] });
+        assert_eq!(inline_refund(&two).unwrap()[1]["refund"], "b");
         for none in [
             serde_json::json!({}),
             serde_json::json!({ "refunds": [] }),
-            serde_json::json!({ "refunds": [{ "refund": "a" }, { "refund": "b" }] }),
             serde_json::json!({ "refunds": { "refund": "r" } }),
             serde_json::json!({ "refund": { "refund": "r", "issuer_key_id": "k" } }),
         ] {
             assert!(inline_refund(&none).is_none(), "{none}");
         }
+    }
+
+    /// **The input rule** (`docs/specs/act-multi-spend.md` §7.2), over a
+    /// wallet already in its spend order: the first credential alone when it
+    /// covers the hold; otherwise drained, with the first *later* credential
+    /// that covers the rest; otherwise a new credential for what is missing.
+    #[test]
+    fn inputs_are_the_first_credential_or_a_drain_and_the_first_fill() {
+        use InputChoice::*;
+        let w = 6_200;
+        // Empty wallet: a new credential covers the whole hold.
+        assert_eq!(choose_inputs(&[], w), Allocate { need: w });
+        // The first covers it: alone, even when a later one fits better.
+        assert_eq!(choose_inputs(&[6_200, 9_000], w), One(0));
+        assert_eq!(choose_inputs(&[10_000, 6_200], w), One(0));
+        // The first does not: drained, and the first later credential that
+        // covers the rest fills, not the smallest or the largest.
+        assert_eq!(
+            choose_inputs(&[3_000, 1_000, 3_200, 9_000], w),
+            Two { drain: 0, fill: 2 }
+        );
+        assert_eq!(
+            choose_inputs(&[3_000, 5_000, 3_200], w),
+            Two { drain: 0, fill: 1 }
+        );
+        // Exactly the rest is enough.
+        assert_eq!(choose_inputs(&[1, 6_199], w), Two { drain: 0, fill: 1 });
+        // No later credential covers the rest: a new one, for the rest only.
+        assert_eq!(choose_inputs(&[3_000, 3_199], w), Allocate { need: 3_200 });
+        assert_eq!(choose_inputs(&[3_000], w), Allocate { need: 3_200 });
+    }
+
+    /// **The partial returns a response carries are checked against the
+    /// in-order allocation** (`docs/specs/act-multi-spend.md` §7.7): a drain
+    /// consumed first and the change on the fill passes; change landing on
+    /// the drain while the fill was charged does not, nor does a successor
+    /// worth more than its predecessor.
+    #[test]
+    fn partial_returns_are_checked_against_the_in_order_allocation() {
+        // (balance, share, successor) per input.
+        assert!(check_partial_returns(&[(10_000, 6_200, 4_000)]));
+        assert!(check_partial_returns(&[(10_000, 6_200, 10_000)]));
+        // Drain 3,000 and fill 3,200 of a 9,000 credential, charged 4,000.
+        assert!(check_partial_returns(&[
+            (3_000, 3_000, 0),
+            (9_000, 3_200, 8_000)
+        ]));
+        // Charged 500: the drain keeps 2,500 and the fill is untouched.
+        assert!(check_partial_returns(&[
+            (3_000, 3_000, 2_500),
+            (9_000, 3_200, 9_000)
+        ]));
+        // The same 500 taken from the fill instead: not the rule.
+        assert!(!check_partial_returns(&[
+            (3_000, 3_000, 3_000),
+            (9_000, 3_200, 8_500)
+        ]));
+        // A successor worth more than its predecessor.
+        assert!(!check_partial_returns(&[
+            (3_000, 3_000, 3_001),
+            (9_000, 3_200, 9_000)
+        ]));
     }
 
     /// **An event ends at any two line terminators the format allows.**
