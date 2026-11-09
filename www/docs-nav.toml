@@ -23,6 +23,7 @@ pages = [
     ["client.md", "The client"],
     ["server.md", "The server"],
     ["engine.md", "Inference engine"],
+    ["anonymous-credits.md", "Anonymous credits"],
 ]
 
 [[sections]]

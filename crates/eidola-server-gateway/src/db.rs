@@ -10,6 +10,7 @@ use tokio_postgres::config::SslMode;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
+use crate::credentials::SealedRefundToken;
 use crate::error::ServerError;
 
 /// A row from the `account` table.
@@ -618,15 +619,17 @@ pub struct IssuerKeyRow {
 
 /// Insert a new issuer key within a serializable transaction to prevent races.
 ///
-/// The `check` callback receives the latest key (if any) inside the transaction
-/// and returns `Ok(Some(key))` to insert or `Ok(None)` to skip. This ensures
-/// the "is a new key needed?" check and the insert are atomic.
+/// The `check` callback receives, inside the transaction, every key whose
+/// `issue_from` is one of `issue_froms` (the epochs the caller needs), and
+/// returns `Ok(Some(key))` to insert or `Ok(None)` to skip. This ensures the
+/// "is a new key needed?" check and the insert are atomic.
 pub async fn insert_issuer_key_checked<F>(
     pool: &Pool,
+    issue_froms: &[SystemTime],
     check: F,
 ) -> Result<Option<IssuerKeyRow>, ServerError>
 where
-    F: FnOnce(Option<&IssuerKeyRow>) -> Result<Option<IssuerKeyRow>, ServerError>,
+    F: FnOnce(&[IssuerKeyRow]) -> Result<Option<IssuerKeyRow>, ServerError>,
 {
     let mut client = pool
         .get()
@@ -645,25 +648,25 @@ where
             ))
         })?;
 
-    // Read the latest key inside the transaction.
-    let latest_row = tx
-        .query_opt(
+    // Read the keys for the wanted epochs inside the transaction.
+    let rows = tx
+        .query(
             "SELECT id, private_key_enc, public_key, domain_separator, \
                     issue_from, issue_until, accept_until \
-             FROM issuer_key ORDER BY issue_from DESC LIMIT 1",
-            &[],
+             FROM issuer_key WHERE issue_from = ANY($1)",
+            &[&issue_froms],
         )
         .await
         .map_err(|e| {
             ServerError::Internal(format!(
-                "query latest issuer_key failed: {}",
+                "query issuer_keys by epoch failed: {}",
                 db_error_summary(&e)
             ))
         })?;
 
-    let latest = latest_row.as_ref().map(map_issuer_key_row);
+    let present: Vec<IssuerKeyRow> = rows.iter().map(map_issuer_key_row).collect();
 
-    let key = match check(latest.as_ref())? {
+    let key = match check(&present)? {
         Some(k) => k,
         None => {
             tx.rollback().await.map_err(|e| {
@@ -743,18 +746,106 @@ fn map_issuer_key_row(r: &tokio_postgres::Row) -> IssuerKeyRow {
     }
 }
 
-/// Atomically debit credits from an account for credential issuance.
-///
-/// Credits are drawn from balance pools in FIFO order (earliest expiry
-/// first, permanent last) so each debit row inherits the pool's
-/// `expires_at`.  Returns `Some(first_ledger_entry_id)` if the debit
-/// succeeded, `None` if the account has insufficient balance.
-pub async fn insert_credential_issuance(
+/// What [`record_credential_issuance`] found or did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IssuanceRecord {
+    /// Debited now and stored under the idempotency key.
+    Issued { ledger_entry_id: Uuid },
+    /// An earlier attempt under this idempotency key was debited; this is
+    /// what it stored. Nothing was debited now.
+    Stored(StoredIssuance),
+    /// The named key's issue window has closed by the database clock, read
+    /// under the account lock; nothing debited or stored.
+    Retired,
+    /// The balance could not cover the amount; nothing debited or stored.
+    Insufficient,
+}
+
+/// What [`resolve_issuance_off_current_key`] found, for an issuance naming a
+/// key that is not the gateway's current issuing key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OffCurrentKey {
+    /// An earlier attempt under this idempotency key was debited.
+    Stored(StoredIssuance),
+    /// Nothing is stored and the named key has stopped issuing (or is
+    /// unknown) by the database clock under the account lock, so nothing can
+    /// ever be debited under this idempotency key.
+    Retired,
+    /// Nothing is stored, but the database still has the named key issuing:
+    /// an attempt under this idempotency key may yet debit.
+    Issuing,
+}
+
+/// A stored issuance response (a `credential_issuance` row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredIssuance {
+    pub request_digest: Vec<u8>,
+    pub issuer_key_id: String,
+    pub credits: i64,
+    pub issuance_response: Vec<u8>,
+    pub ledger_entry_id: Uuid,
+}
+
+fn map_stored_issuance(r: &tokio_postgres::Row) -> StoredIssuance {
+    StoredIssuance {
+        request_digest: r.get("request_digest"),
+        issuer_key_id: r.get("issuer_key_id"),
+        credits: r.get("credits"),
+        issuance_response: r.get("issuance_response"),
+        ledger_entry_id: r.get("ledger_entry_id"),
+    }
+}
+
+/// The issuance stored under `(account_id, idempotency_key)`, if any. A
+/// lock-free read, used only to answer a retry early; the decision that
+/// debits is [`record_credential_issuance`]'s, under the account lock.
+#[tracing::instrument(skip_all, name = "db.find_credential_issuance", err)]
+pub async fn find_credential_issuance(
     pool: &Pool,
     account_id: Uuid,
-    credits: i64,
+    idempotency_key: &[u8],
+) -> Result<Option<StoredIssuance>, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    let row = client
+        .query_opt(
+            "SELECT request_digest, issuer_key_id, credits, issuance_response, ledger_entry_id \
+             FROM credential_issuance WHERE account_id = $1 AND idempotency_key = $2",
+            &[&account_id, &idempotency_key],
+        )
+        .await
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "credential issuance lookup failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
+    Ok(row.as_ref().map(map_stored_issuance))
+}
+
+/// Debit an account for a credential issuance and store its response, once
+/// per idempotency key.
+///
+/// One transaction, serialized per account by the account row lock: an
+/// issuance already stored under the key is returned and nothing is debited;
+/// a key whose issue window has closed by the database clock, read under the
+/// lock, is refused ([`IssuanceRecord::Retired`]) however long ago this
+/// attempt passed the gateway's current-key check; otherwise the debit
+/// (pool-aware, FIFO by expiry, through `debit_account`)
+/// and the stored response commit together, so a row exists exactly when the
+/// account paid for it.
+#[tracing::instrument(skip_all, name = "db.record_credential_issuance", err)]
+pub async fn record_credential_issuance(
+    pool: &Pool,
+    account_id: Uuid,
+    idempotency_key: &[u8],
+    request_digest: &[u8],
     credential_key_id: &str,
-) -> Result<Option<Uuid>, ServerError> {
+    credits: i64,
+    issuance_response: &[u8],
+) -> Result<IssuanceRecord, ServerError> {
     let client = pool
         .get()
         .await
@@ -762,8 +853,16 @@ pub async fn insert_credential_issuance(
 
     let row = client
         .query_one(
-            "SELECT debit_account($1, $2, 'credential_issuance', NULL, $3, TRUE) AS ids",
-            &[&account_id, &credits, &credential_key_id],
+            "SELECT outcome, request_digest, issuer_key_id, credits, issuance_response, \
+             ledger_entry_id FROM record_credential_issuance($1, $2, $3, $4, $5, $6)",
+            &[
+                &account_id,
+                &idempotency_key,
+                &request_digest,
+                &credential_key_id,
+                &credits,
+                &issuance_response,
+            ],
         )
         .await
         .map_err(|e| {
@@ -773,8 +872,88 @@ pub async fn insert_credential_issuance(
             ))
         })?;
 
-    let ids: Option<Vec<Uuid>> = row.get("ids");
-    Ok(ids.and_then(|v| v.into_iter().next()))
+    let outcome: String = row.get("outcome");
+    Ok(match outcome.as_str() {
+        "issued" => IssuanceRecord::Issued {
+            ledger_entry_id: row.get("ledger_entry_id"),
+        },
+        "stored" => IssuanceRecord::Stored(map_stored_issuance(&row)),
+        "retired" => IssuanceRecord::Retired,
+        "insufficient" => IssuanceRecord::Insufficient,
+        other => {
+            return Err(ServerError::Internal(format!(
+                "unexpected issuance outcome {other:?}"
+            )));
+        }
+    })
+}
+
+/// Decide an issuance that names a key other than the current issuing key,
+/// under the account lock [`record_credential_issuance`] takes and on the
+/// same database clock, so a refusal is ordered against every attempt under
+/// the idempotency key still in flight.
+#[tracing::instrument(skip_all, name = "db.resolve_issuance_off_current_key", err)]
+pub async fn resolve_issuance_off_current_key(
+    pool: &Pool,
+    account_id: Uuid,
+    idempotency_key: &[u8],
+    issuer_key_id: &str,
+) -> Result<OffCurrentKey, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    let row = client
+        .query_one(
+            "SELECT outcome, request_digest, issuer_key_id, credits, issuance_response, \
+             ledger_entry_id FROM resolve_issuance_off_current_key($1, $2, $3)",
+            &[&account_id, &idempotency_key, &issuer_key_id],
+        )
+        .await
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "credential issuance key check failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
+    let outcome: String = row.get("outcome");
+    Ok(match outcome.as_str() {
+        "stored" => OffCurrentKey::Stored(map_stored_issuance(&row)),
+        "retired" => OffCurrentKey::Retired,
+        "issuing" => OffCurrentKey::Issuing,
+        other => {
+            return Err(ServerError::Internal(format!(
+                "unexpected issuance key outcome {other:?}"
+            )));
+        }
+    })
+}
+
+/// Delete the stored issuance responses of every key retired at least
+/// `retain_past_accept` ago: the deadline nullifiers are pruned on.
+#[tracing::instrument(skip_all, name = "db.prune_expired_issuances", err)]
+pub async fn prune_expired_issuances(
+    pool: &Pool,
+    retain_past_accept: std::time::Duration,
+) -> Result<i64, ServerError> {
+    let retain_secs = retain_past_accept.as_secs_f64();
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    let row = client
+        .query_one(
+            "SELECT prune_expired_issuances(make_interval(secs => $1)) AS pruned",
+            &[&retain_secs],
+        )
+        .await
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "prune_expired_issuances failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
+    Ok(row.get("pruned"))
 }
 
 /// Debit an account for a Stripe-originated event (refund or clawback).
@@ -1057,13 +1236,15 @@ pub async fn record_nullifier(
     Ok(rows_affected > 0)
 }
 
-/// Store a CBOR-encoded refund token on an existing nullifier row.
+/// Store a sealed refund token on an existing nullifier row. Only a
+/// [`SealedRefundToken`] is accepted: the CBOR token carries the refund
+/// amount and is never written to Postgres in the clear.
 #[tracing::instrument(skip_all, name = "db.store_refund_token", err)]
 pub async fn store_refund_token(
     pool: &Pool,
     issuer_key_id: &str,
     nullifier_value: &[u8],
-    refund_token: &[u8],
+    refund_token: &SealedRefundToken,
 ) -> Result<(), ServerError> {
     let client = pool
         .get()
@@ -1074,7 +1255,7 @@ pub async fn store_refund_token(
         .execute(
             "UPDATE nullifier SET refund_token = $3 \
              WHERE issuer_key_id = $1 AND value = $2",
-            &[&issuer_key_id, &nullifier_value, &refund_token],
+            &[&issuer_key_id, &nullifier_value, &refund_token.as_bytes()],
         )
         .await
         .map_err(|e| {
@@ -1087,14 +1268,15 @@ pub async fn store_refund_token(
     Ok(())
 }
 
-/// Retrieve a stored refund token for a nullifier. Returns `None` if the
-/// nullifier does not exist or no refund token has been stored yet.
+/// Retrieve the sealed refund token stored for a nullifier. Returns `None` if
+/// the nullifier does not exist or no refund token has been stored yet; the
+/// caller opens what comes back ([`crate::credentials::open_refund_token`]).
 #[tracing::instrument(skip_all, name = "db.get_refund_token", err)]
 pub async fn get_refund_token(
     pool: &Pool,
     issuer_key_id: &str,
     nullifier_value: &[u8],
-) -> Result<Option<Vec<u8>>, ServerError> {
+) -> Result<Option<SealedRefundToken>, ServerError> {
     let client = pool
         .get()
         .await
@@ -1111,7 +1293,9 @@ pub async fn get_refund_token(
             ServerError::Internal(format!("get_refund_token failed: {}", db_error_summary(&e)))
         })?;
 
-    Ok(row.and_then(|r| r.get::<_, Option<Vec<u8>>>("refund_token")))
+    Ok(row
+        .and_then(|r| r.get::<_, Option<Vec<u8>>>("refund_token"))
+        .map(SealedRefundToken::from_stored))
 }
 
 /// A single ledger entry row.

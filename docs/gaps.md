@@ -60,11 +60,57 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 
 **Future.** The set grows with the user base. If population per window stays small, the epoch length can be raised (a release-visible constant change) to trade key-rotation hygiene for coarser partitions.
 
+### Spend timing at the database
+
+**Current behavior.** A spend writes its nullifier row twice: the nullifier when the request is accepted, and the sealed refund when the request completes ([server.md § Unlinkability](server.md#unlinkability)). The row carries no timestamp, but Postgres runs outside the enclave, so whoever can watch it live — or read its write-ahead log, a replica, or a backup, whose commit records are timed — can see when each write happened, and so how long each request took. Duration follows the length of the answer, so this is a coarse, per-request content-size signal in the operator's hands, and the same database holds per-account issuance timestamps in the credit ledger.
+
+**What constrains it today.** The refund amount itself is stored sealed under a key that needs the client's own secret, at a fixed length; nothing written names an account; and the timing is the signal a network observer of the server already has from each response's total duration ([Passive traffic analysis](#passive-traffic-analysis)). The database is treated as adversarial, so this is a real gap rather than a theoretical one.
+
+**Future.** Decouple the second write from completion: hold completed refunds in enclave memory and write them in batches on a fixed interval, so a write says only which interval a request finished in. Recording the nullifier only at completion would hide the start too, but gives up refusing a double spend before it is served once more than one gateway instance shares the database, and is not planned.
+
+### Credit left in a credential when its key lapses
+
+**Current behavior.** Each anonymous credential is issued under one issuer key, and the change from every spend is issued under that same key, so a credential's whole remaining value lives and dies with the key. The server accepts a key's credentials until its `accept_until` — one full epoch after the key stops issuing ([server.md § Anonymity set](server.md#anonymity-set)) — and the client spends a credential until shortly before that deadline (`CREDENTIAL_SPEND_MARGIN`, a few minutes, so a spend begun at the edge still lands inside the window; a spend already in flight stays recoverable until the deadline itself). Whatever is still in the credential after that is lost: it was debited from the account when the credential was issued, and nothing exchanges it for a credential under a newer key.
+
+**What constrains it today.** Every credential gets at least one full epoch of spendable life, however late in its key's issuing window it was minted, and automatic provisioning allocates a modest amount at a time ([`DEFAULT_ALLOCATION_CREDITS`](../crates/eidola-app-core/src/lib.rs)), so the exposure is bounded by one allocation's unspent change per key. Issuance ahead of need adds at most one allocation to what is held at a time, keeps no buffer for a wallet that has not spent within a week, and prefers a key's early life, when its credentials have the longest to be spent ([anonymous-credits.md § Issuance timing](anonymous-credits.md#issuance-timing)). Issuance is refused outright under a key whose spend deadline has already passed, so the account is never debited into a credential that could not be spent.
+
+**Future.** A rollover: exchanging what remains in an expiring credential for a fresh one under the current key, without that exchange linking the two. That needs its own unlinkability analysis and is not designed yet.
+
 ### Multi-jurisdiction attestant distribution
 
 **Current behavior.** Attestants share a small operational surface and may share a jurisdiction.
 
 **Future.** Distributing pinned attestants across hardware vendors, custody arrangements, and jurisdictions raises the cost of coordinated legal compulsion — the central concern of the no-coercion attestation claims in [privacy-guarantees.md §6.4](privacy-guarantees.md#6-release-integrity) and the bounded claim in [§8.7](privacy-guarantees.md#8-bounded-claims-what-this-document-does-not-promise). This is a matter of organizational rollout, not engineering, but it is named here because it is part of what the guarantee depends on.
+
+## Anonymous credits
+
+The decisions behind anonymous payment, and the reasons for them, are in [anonymous-credits.md](anonymous-credits.md). These are the residuals it names, beside two listed above: [Spend timing at the database](#spend-timing-at-the-database) and [Credit left in a credential when its key lapses](#credit-left-in-a-credential-when-its-key-lapses).
+
+### Issuance-to-first-spend timing
+
+**Current behavior.** The app keeps a small buffer of credit tokens issued ahead of need, at random intervals unrelated to any request, so a token's first spend normally comes long after its issuance ([anonymous-credits.md § Issuance timing](anonymous-credits.md#issuance-timing)). When nothing held covers a request, the client still converts credits and spends the new token immediately: on a fresh install, on the first request after a week without spending (no buffer is kept for an idle wallet), from a CLI used while the app is not running, when the balance is below one standard allocation, or for a request larger than what is held. The database records each issuance with its account and time and sees each spend's nullifier as it is written, so whoever can watch it, or the server's traffic, can pair such an issuance with the spend that follows it a moment later, linking that token's first spend to its account. A prompt-cache key on that request then links the rest of its conversation lineage ([privacy-guarantees.md §2.7](privacy-guarantees.md#2-unlinkability)).
+
+A background issuance is timed too: it follows, by one random interval of 10 to 50 minutes, the spend that took the buffer below its threshold. That says some spend in the preceding hour drained a token, which every spend in that window shares; it does not pair the issuance with a spend.
+
+**What constrains it today.** Allocations are large enough (about $1.00) that a token pays for many requests, so even the fallback is rare for an active user; tokens can be converted ahead of time by hand (`eidola account allocate`).
+
+**Future.** A buffer for the CLI-only case, which needs a long-lived process the CLI does not have.
+
+### A crash mid-spend strands the token's remaining value
+
+**Current behavior.** A spend records its nullifier before the request is served and stores the refund when it completes. If the gateway stops between the two (a crash, a restart), the nullifier is recorded with no refund. Recovery then answers that the refund is not yet available, indefinitely, and the token's whole remaining balance is lost, not just the request's charge.
+
+**What constrains it today.** The window is the duration of one request on one instance. The client keeps the spend's state and keeps retrying recovery until the key stops accepting.
+
+**Future.** Let recovery return the remaining balance of a spend whose refund never arrived: a refund of nothing returns the token's balance less the charge, so the server keeps everything it was paid. Telling an abandoned spend from one still in flight without a per-spend timestamp in the database is the design question.
+
+### A client's first sight of an epoch's key
+
+**Current behavior.** Issuer keys sit on a public calendar (one per seven-day epoch, with windows anyone can compute), each key's windows are bound into the encryption of its private key so that the database cannot edit them, and each client records the key it first sees for every epoch and refuses any other for that epoch ([anonymous-credits.md § Key rotation and partitioning](anonymous-credits.md#key-rotation-and-partitioning)). What remains is the first sight: a client with no record for an epoch (a new install, or one that fetched no key listing since the previous epoch began) accepts the key it is shown. A gateway, or a database that made a gateway mint a second key by hiding rows from it, could show that client a key nobody else has, and the client would have nothing to compare it with. A gateway brought up on an empty database is the honest form of the same thing: it mints new keys, which new clients take and existing clients refuse for up to two epochs.
+
+**What constrains it today.** Every listing carries the next epoch's key, so a client that issues at least once an epoch records each key an epoch before it issues; singling it out means starting that early and keeping every listing it fetches consistent. A gateway refuses to mint a second key for an epoch it already holds one for, and refuses to issue at all while it holds two, so a hidden row splits the set only at an instance's start, and only for clients without a record. The client checks that every key it uses is named by the hash of its public key, and that every token and refund it receives is under that key with the request context every client under the key shares.
+
+**Future.** Publish the sequence of keys somewhere clients can compare against without trusting the gateway that serves it (a transparency log, or keys derived from the enclave's measured state), so that a client's first sight is checked too.
 
 ## Hardware
 

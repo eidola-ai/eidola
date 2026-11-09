@@ -104,6 +104,15 @@ pub enum AppError {
     #[error("credential error: {message}")]
     Credential { message: String },
 
+    /// The server's current issuer key failed a check this client makes for
+    /// itself, against the public issuer calendar or against the key it
+    /// already saw for the epoch (see [`IssuerKeyRefusal`]). Refused before
+    /// anything is requested, so nothing was charged; credentials already
+    /// held are untouched. Typed so a surface can say what it means: unlike
+    /// a network failure, retrying now will not help.
+    #[error("credential error: {refusal}")]
+    IssuerKeyRefused { refusal: IssuerKeyRefusal },
+
     /// A chat was attempted with no usable credential and no account
     /// configured — onboarding has not begun (or the account was reset).
     /// Distinct from [`AppError::NotConfigured`] so UIs can route to the
@@ -260,6 +269,58 @@ pub enum AppError {
     /// **Data, not prose**: the item whose generation is being replaced.
     #[error("this response is already being regenerated")]
     RegenerationInFlight { item_id: String },
+}
+
+/// Why the client refused the server's current issuer key.
+///
+/// Every token issued under one key hides among every other token under it,
+/// so the key decides whom a client's spends look like. An honest gateway has
+/// exactly one key per epoch of the public issuer calendar
+/// (`eidola_common::issuer_calendar`), with that epoch's windows, and never
+/// rotates within an epoch. These are the two ways a key can fail that, and
+/// the client checks both for itself: they do not depend on trusting the
+/// gateway, its operator or its database.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IssuerKeyRefusal {
+    /// The key's windows are not exactly one epoch's on the calendar.
+    NotOnCalendar,
+    /// The key is not the one this client already saw for its epoch. A
+    /// second key for an epoch is what a server would show a client it was
+    /// singling out, and the client cannot tell an emergency rotation from
+    /// that, so there is none: issuance stops until the next epoch.
+    SecondKeyForEpoch { epoch: u64 },
+    /// The same key offered for two epochs — in one listing, or for an epoch
+    /// other than the one this client already recorded it for. An honest
+    /// gateway mints a distinct key for every epoch, so a key reused across
+    /// epochs is one the per-epoch record could not otherwise hold to
+    /// anything: listed as next epoch's too, it would leave next epoch
+    /// unrecorded for a different key to fill.
+    OneKeyForSeveralEpochs { epoch: u64 },
+}
+
+impl std::fmt::Display for IssuerKeyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IssuerKeyRefusal::NotOnCalendar => f.write_str(
+                "the server's current issuer key does not sit on the public issuer calendar, \
+                 so no credential was requested under it (nothing was charged)",
+            ),
+            IssuerKeyRefusal::SecondKeyForEpoch { epoch } => write!(
+                f,
+                "the server offered a different issuer key for epoch {epoch} from the one this \
+                 client already saw; an honest server has one key per epoch, so no credential \
+                 was requested (nothing was charged, and credentials already held keep \
+                 working). Issuance resumes with the next epoch's key"
+            ),
+            IssuerKeyRefusal::OneKeyForSeveralEpochs { epoch } => write!(
+                f,
+                "the server offered, for epoch {epoch}, an issuer key it also offers for another \
+                 epoch; an honest server has a distinct key for every epoch, so no credential \
+                 was requested (nothing was charged, and credentials already held keep working)"
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

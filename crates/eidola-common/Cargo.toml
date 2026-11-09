@@ -31,7 +31,13 @@ serde = { version = "1", features = ["derive"], optional = true }
 # aliases, tags, key styles) in the same module; already in the graph of every
 # consumer of `serde_yaml`.
 unsafe-libyaml = { version = "0.2.11", optional = true }
+# `private_token`: the one spelling of a spend's `Authorization` value (padded
+# base64url, RFC 9577). Optional, enabled only by the two sides of that
+# header, app-core and the gateway, both of which depend on `base64 0.23`
+# themselves.
+base64 = { version = "0.23", optional = true }
 
 [features]
 argon2 = ["dep:argon2"]
 deployment = ["argon2", "dep:serde_yaml", "dep:serde", "dep:unsafe-libyaml"]
+private-token = ["dep:base64"]

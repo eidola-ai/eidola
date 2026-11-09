@@ -34,6 +34,8 @@ use anonymous_credit_tokens::{
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use eidola_common::engine_protocol::ContinueField;
+use eidola_common::issuer_calendar::{ISSUER_CALENDAR, IssuerCalendar, rfc3339_utc};
+use eidola_common::refund_key::REFUND_KEY_HEADER;
 use rand_core::OsRng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -47,7 +49,7 @@ use changes::{BroadcastSource, Change, ChangeSource};
 use config::Config;
 pub use config::DEFAULT_TEMPLATE_ID;
 pub use db::HUMAN_PARTICIPANT_ID;
-use error::AppError;
+use error::{AppError, IssuerKeyRefusal};
 pub use local_models::{
     ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
     LocalModelStatus, LocalModelsState, ModelDownloadTarget, RunningEngine, resolve_model_download,
@@ -1697,7 +1699,9 @@ impl OutputBudgetClass {
 /// One credential row with its lifecycle state, as computed by the local
 /// `credential_lifecycle` view: `active` (spendable), `spending` (a spend
 /// proof is in flight / unsettled), `spent` (settled into a successor), or
-/// `expired` (issuer key past its expiry).
+/// `expired` (an unspent credential past its key's spend deadline, or any
+/// credential past the key's acceptance deadline — see
+/// [`CREDENTIAL_SPEND_MARGIN`]).
 /// **Serialized by the local control protocol** ([`crate::ipc`]): a field
 /// rename here is a wire change.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -1828,6 +1832,212 @@ pub struct SpendTrailEntry {
 /// at a time, large enough that re-allocation (an account-linked,
 /// timing-correlatable operation) stays infrequent.
 pub const DEFAULT_ALLOCATION_CREDITS: i64 = 1_000_000;
+
+// --- Ahead-of-need provisioning ---------------------------------------------
+//
+// Every value below is a public constant of the client: an observer of the
+// account surface learns from an issuance only what these already say, never
+// anything about the request that will follow it. See
+// `AppCore::start_credential_provisioner` and docs/anonymous-credits.md.
+
+/// The buffer the provisioner keeps: when the credits the wallet can spend
+/// for at least [`PROVISION_HORIZON`] fall below this, it issues one
+/// credential of [`DEFAULT_ALLOCATION_CREDITS`].
+///
+/// A quarter of an allocation: about eight worst-case holds of the most
+/// expensive catalogued model and forty of the default one, so the credential
+/// already held normally carries the requests made between the provisioner's
+/// looks, and the new one is first spent only once that runs out, at a time
+/// set by the reader's own use rather than by the issuance. Small, so what is
+/// held at once is at most this plus one allocation.
+pub const PROVISION_THRESHOLD_CREDITS: i64 = DEFAULT_ALLOCATION_CREDITS / 4;
+
+/// What still counts toward the buffer: credentials whose key lets a spend
+/// begin at least this far ahead. One about to lapse cannot carry the next
+/// day's requests, so it is replaced while there is still time to replace it
+/// ahead of need.
+pub const PROVISION_HORIZON: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// How recently the wallet must have begun a spend for the provisioner to keep
+/// a buffer at all. A credential's value dies with its key at most two epochs
+/// after issuance, so issuing ahead for a profile nobody is using converts
+/// credit that will most likely lapse unspent. Only *whether* a buffer is kept
+/// reads this local history; when and how much is issued never does.
+pub const PROVISION_ACTIVITY_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The provisioner looks at the wallet at intervals drawn uniformly from
+/// `[PROVISION_CHECK_MIN, PROVISION_CHECK_MAX]`, fresh each time, starting one
+/// such interval after it is started (never at launch, which a first request
+/// often follows within seconds). It does not watch for spends: an issuance
+/// happens at the first look after the buffer runs low, so its time is a
+/// random draw, not a reaction to any request.
+pub const PROVISION_CHECK_MIN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// See [`PROVISION_CHECK_MIN`].
+pub const PROVISION_CHECK_MAX: std::time::Duration = std::time::Duration::from_secs(50 * 60);
+
+/// Late in a key's issuing window — within this of `issue_until` — the
+/// provisioner waits for the next key while what is held is at least
+/// [`PROVISION_DEFER_FLOOR_CREDITS`]. A credential issued early in a window
+/// is spendable for up to two epochs; one issued at its end, for one.
+pub const PROVISION_LATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+
+/// See [`PROVISION_LATE_WINDOW`]: enough for a few worst-case holds of the
+/// most expensive model.
+pub const PROVISION_DEFER_FLOOR_CREDITS: i64 = DEFAULT_ALLOCATION_CREDITS / 10;
+
+/// How old a pending issuance must be before it is asked for again. Longer
+/// than any issuance request can take on the server, so a retry never races an
+/// original attempt still being processed there (the server would serialize
+/// the two, but a retry refused while the original is still signing would
+/// abandon a row the original then pays for).
+const ISSUANCE_SETTLE_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The deadline on every request an issuance makes (the key listing, the
+/// balance read, the issuance itself), connection to last byte. The attesting
+/// client bounds only the connect, so without this a server that accepts and
+/// then stalls would hold [`Inner::issuance_gate`] — and through a turn
+/// waiting on it under `spend_gate`, every paid turn after it — for as long as
+/// it liked. A request cut off here leaves its pending issuance to be asked
+/// for again, so nothing is lost by giving up.
+const ISSUANCE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The backstop on a whole provisioner pass, the gate included: a pass that
+/// recovers several pending issuances makes several requests, each bounded by
+/// [`ISSUANCE_REQUEST_TIMEOUT`], and this bounds their sum.
+const PROVISION_PASS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// What one pass of the provisioner did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProvisionOutcome {
+    /// Issued one credential of [`DEFAULT_ALLOCATION_CREDITS`].
+    Issued { nonce: String },
+    /// The wallet already holds at least [`PROVISION_THRESHOLD_CREDITS`]
+    /// spendable past [`PROVISION_HORIZON`].
+    Covered,
+    /// No spend began within [`PROVISION_ACTIVITY_WINDOW`]; no buffer is kept.
+    Idle,
+    /// No account is configured.
+    NoAccount,
+    /// The available balance is below one standard allocation.
+    LowBalance,
+    /// The current key lapses within [`PROVISION_HORIZON`], so a credential
+    /// issued under it would not count toward the buffer.
+    NoUsableKey,
+    /// An earlier issuance for this account has not resolved — its response
+    /// was lost and it has not been answered on a retry yet — so it may
+    /// already have been paid for. Nothing new is issued until it resolves.
+    Unresolved,
+    /// The Eidola backend is disabled or removed: nothing is sent to it, and
+    /// no balance is converted for a service the reader has turned off.
+    BackendDisabled,
+    /// Late in the key's issuing window with enough still held; the next key
+    /// will be issued under instead.
+    Deferred,
+}
+
+/// How long before an issuer key's acceptance deadline (`accept_until`) the
+/// client stops *beginning* spends under it.
+///
+/// The server honours a key's credentials until `accept_until` — one epoch
+/// after the key stops issuing — so that, not `issue_until`, is what bounds a
+/// credential's spendable life. A spend chosen at the very edge of that window
+/// still has to reach the server inside it: a connection and attested TLS
+/// handshake, a transport retry or two, and whatever disagreement there is
+/// between this machine's clock and the server's. Ten minutes covers all of
+/// that with room for a clock that has drifted by minutes, and costs about a
+/// thousandth of the default seven-day acceptance window. A spend already in
+/// flight when the margin begins is unaffected: it stays recoverable until
+/// `accept_until` itself (see the `credential_lifecycle` view).
+pub const CREDENTIAL_SPEND_MARGIN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The local lifecycle deadlines for an issuer key the server stops accepting
+/// at `accept_until_ms`: new spends may begin until [`CREDENTIAL_SPEND_MARGIN`]
+/// before it, and an in-flight spend stays recoverable until it.
+pub fn issuer_key_deadlines(accept_until_ms: i64) -> db::IssuerKeyDeadlines {
+    let margin_ms = i64::try_from(CREDENTIAL_SPEND_MARGIN.as_millis()).unwrap_or(i64::MAX);
+    db::IssuerKeyDeadlines {
+        spend_until: accept_until_ms.saturating_sub(margin_ms),
+        accept_until: accept_until_ms,
+    }
+}
+
+/// The epoch of the public issuer calendar a listed key's windows are
+/// exactly, or `None` if they are not one epoch's windows.
+///
+/// "Exactly" is byte for byte: each instant must be the calendar's one
+/// spelling of its epoch's instant (`issuer_calendar::rfc3339_utc`, which
+/// the gateway serves). A parse is used only to find which epoch to compare
+/// against, never to decide; so a fraction of a second, an offset, a missing
+/// `Z` or a normalized date (a February 30th) cannot round a key onto the
+/// calendar.
+fn listed_key_epoch(calendar: &IssuerCalendar, key: &IssuerKeyResponse) -> Option<u64> {
+    let from_ms = iso_to_ms(&key.issue_from).ok()?;
+    let epoch = calendar.epoch_at(u64::try_from(from_ms.div_euclid(1000)).ok()?)?;
+    let w = calendar.windows(epoch)?;
+    let spelled = |secs: u64, listed: &str| rfc3339_utc(secs) == listed;
+    (spelled(w.issue_from, &key.issue_from)
+        && spelled(w.issue_until, &key.issue_until)
+        && spelled(w.accept_until, &key.accept_until))
+    .then_some(epoch)
+}
+
+/// Whether a listed key's id is the hash of its public key.
+fn listed_key_is_its_hash(key: &IssuerKeyResponse) -> bool {
+    URL_SAFE_NO_PAD
+        .decode(&key.public_key)
+        .is_ok_and(|pk| issuer_key_id_of(&pk) == key.id)
+}
+
+/// How many epochs of the per-epoch key record are kept: a year's. Rows are
+/// one per epoch per server, and a longer memory is what lets the client
+/// notice a key it already saw for one epoch being offered for another.
+const ISSUER_KEY_RECORD_EPOCHS: u64 = 52;
+
+/// The keys a `/v1/keys` listing offers under `ds`, each with its epoch, in
+/// epoch order — **once the whole listing is one an honest gateway could
+/// have served**. An honest gateway lists only keys on the calendar, each
+/// named by the hash of its public key, one key per epoch and a distinct key
+/// for every epoch. A listing that breaks any of that is refused whole,
+/// whichever entry breaks it: an entry that escaped the check (a next
+/// epoch's key off the calendar, or with a mislabelled id, or listed twice)
+/// would escape being recorded, and the record is what holds the server to
+/// its keys later. Keys under another domain separator are not this
+/// deployment's and are ignored.
+fn checked_listing<'a>(
+    calendar: &IssuerCalendar,
+    keys: &'a [IssuerKeyResponse],
+    ds: &str,
+) -> Result<Vec<(u64, &'a IssuerKeyResponse)>, AppError> {
+    let refused = |refusal| AppError::IssuerKeyRefused { refusal };
+    let mut by_epoch: std::collections::BTreeMap<u64, &IssuerKeyResponse> =
+        std::collections::BTreeMap::new();
+    let mut epoch_of_id: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for key in keys.iter().filter(|k| k.domain_separator == ds) {
+        let epoch =
+            listed_key_epoch(calendar, key).ok_or(refused(IssuerKeyRefusal::NotOnCalendar))?;
+        if !listed_key_is_its_hash(key) {
+            return Err(AppError::Credential {
+                message: "the server listed an issuer key whose id is not the hash of its \
+                          public key"
+                    .into(),
+            });
+        }
+        if by_epoch.get(&epoch).is_some_and(|k| k.id != key.id) {
+            return Err(refused(IssuerKeyRefusal::SecondKeyForEpoch { epoch }));
+        }
+        if let Some(&other) = epoch_of_id.get(key.id.as_str())
+            && other != epoch
+        {
+            return Err(refused(IssuerKeyRefusal::OneKeyForSeveralEpochs {
+                epoch: other.max(epoch),
+            }));
+        }
+        by_epoch.insert(epoch, key);
+        epoch_of_id.insert(&key.id, epoch);
+    }
+    Ok(by_epoch.into_iter().collect())
+}
 
 /// How long the ACT provisioning queue waits for an in-flight credential
 /// refund (a concurrent turn's recovery) to free spendable balance before
@@ -1991,6 +2201,26 @@ struct Inner {
     /// pool), or waits bounded for an in-flight refund. Held only around the
     /// provisioning step in `prepare_turn`; the HTTP request runs outside it.
     spend_gate: tokio::sync::Mutex<()>,
+    /// Serializes every issuance this process makes — the explicit
+    /// `account_allocate`, the just-in-time path inside the provisioning queue,
+    /// the ahead-of-need provisioner, and the recovery of lost issuance
+    /// responses — so two of them never convert credit for the same need, and
+    /// a pending issuance is never retried while this process still has it in
+    /// flight. Never held across a spend; the just-in-time path takes it under
+    /// `spend_gate`, nothing takes them in the other order.
+    issuance_gate: tokio::sync::Mutex<()>,
+    /// Latch so `start_credential_provisioner` spawns at most one loop.
+    provisioner_started: std::sync::atomic::AtomicBool,
+    /// The provisioner's look interval bounds in milliseconds (see
+    /// [`PROVISION_CHECK_MIN`]); only a test moves them.
+    provision_check_ms: Mutex<(u64, u64)>,
+    /// [`ISSUANCE_SETTLE_AGE`] in milliseconds; only a test moves it.
+    issuance_settle_ms: std::sync::atomic::AtomicU64,
+    /// [`ISSUANCE_REQUEST_TIMEOUT`] in milliseconds; only a test moves it.
+    issuance_request_timeout_ms: std::sync::atomic::AtomicU64,
+    /// [`PROVISION_WAIT_TIMEOUT`] in milliseconds — how long anything waits
+    /// for [`Inner::issuance_gate`] or an in-flight refund; only a test moves it.
+    provision_wait_ms: std::sync::atomic::AtomicU64,
     /// The holds this process has a request in flight for — see
     /// [`LiveSpends`]. Recovery consults it so it never refunds a credential
     /// that is `spending` because it is *being spent right now*.
@@ -2207,6 +2437,12 @@ struct Inner {
     /// test can hold the write and its cleanup to one transaction.
     #[cfg(feature = "test-support")]
     fail_cache_key_cleanup: std::sync::atomic::AtomicBool,
+    /// The calendar issuer key windows are checked against. A release build
+    /// has no field here and reads [`ISSUER_CALENDAR`], the one the gateway
+    /// uses; under `test-support` a test may stand a boundary seconds from
+    /// now ([`AppCore::test_set_issuer_calendar`]).
+    #[cfg(feature = "test-support")]
+    issuer_calendar: Mutex<IssuerCalendar>,
     /// The process-lifetime exclusive advisory lock on the local database
     /// (`<data_dir>/eidola.db.lock`). Taken in [`AppCore::build`] — a second
     /// opener is refused *there* with [`AppError::DatabaseInUse`] rather than
@@ -3314,194 +3550,424 @@ impl Inner {
         })
     }
 
+    fn issuance_request_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.issuance_request_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    fn provision_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.provision_wait_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Take [`Inner::issuance_gate`], waiting no later than `deadline`. Every
+    /// holder's network requests are bounded ([`ISSUANCE_REQUEST_TIMEOUT`]), so
+    /// a wait this long means something is wrong, and the caller is told so
+    /// rather than left waiting — a turn waits here holding `spend_gate`.
+    async fn lock_issuance_gate(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, AppError> {
+        tokio::time::timeout_at(deadline, self.issuance_gate.lock())
+            .await
+            .map_err(|_| AppError::ProvisioningTimeout {
+                message: "timed out waiting for another credential issuance to finish".into(),
+            })
+    }
+
+    /// The account balance, read under the issuance deadline.
+    async fn account_balances_bounded(&self) -> Result<BalancesResult, AppError> {
+        tokio::time::timeout(self.issuance_request_timeout(), self.account_balances())
+            .await
+            .map_err(|_| AppError::Network {
+                message: "timed out reading the account balance".into(),
+            })?
+    }
+
+    /// Whether the Eidola backend is configured to be used at all.
+    async fn eidola_enabled(&self) -> Result<bool, AppError> {
+        let conn = self.db_conn().await?;
+        Ok(db::get_backend(&conn, backends::EIDOLA_BACKEND_ID)
+            .await?
+            .is_some_and(|row| row.enabled && row.removed_at.is_none()))
+    }
+
+    /// The calendar issuer key windows are checked against: the production
+    /// [`ISSUER_CALENDAR`], the gateway's own, in every release build.
+    fn issuer_calendar(&self) -> IssuerCalendar {
+        #[cfg(feature = "test-support")]
+        {
+            *self
+                .issuer_calendar
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            ISSUER_CALENDAR
+        }
+    }
+
+    /// Convert `credits` from the account into a new credential: the explicit
+    /// `account allocate` door. Serialized with every other issuance in this
+    /// process by [`Inner::issuance_gate`].
     async fn account_allocate(&self, credits: i64) -> Result<AllocateResult, AppError> {
+        let _issuing = self
+            .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
+            .await?;
+        Box::pin(self.allocate_locked(credits)).await
+    }
+
+    /// [`Inner::account_allocate`] for a caller already holding
+    /// [`Inner::issuance_gate`].
+    async fn allocate_locked(&self, credits: i64) -> Result<AllocateResult, AppError> {
         if credits <= 0 {
             return Err(AppError::Credential {
                 message: "credits must be greater than 0".into(),
             });
         }
-
         let cfg = self.load_config();
         let eidola = self.eidola_resolved().await?;
-        let base_url = eidola.base_url.as_str();
-        let (account_id, secret) = self.require_credentials(&cfg)?;
         let client = self.build_client(&eidola, None).await?;
+        let key = current_issuer_key(
+            &client,
+            &eidola.base_url,
+            cfg.domain_separator(),
+            self.issuance_request_timeout(),
+            &self.issuer_calendar(),
+            &self.db_conn().await?,
+        )
+        .await?;
+        Box::pin(self.allocate_with_key(&cfg, &client, &eidola.base_url, &key, credits)).await
+    }
 
-        // 1. Fetch issuer keys
-        let resp = client
-            .get(format!("{base_url}/v1/keys"))
-            .send()
+    /// [`Inner::allocate_locked`] on a task of its own, for the just-in-time
+    /// path inside a turn. A turn's future is deep already, and an issuance
+    /// builds and checks 128-bit credentials on the stack, so it runs from the
+    /// top of a worker's stack rather than from the bottom of the turn's. It
+    /// also finishes if the turn is dropped meanwhile, so a request the server
+    /// may have debited for is never abandoned half-sent.
+    async fn allocate_on_its_own_task(&self, credits: i64) -> Result<AllocateResult, AppError> {
+        let Some(inner) = self.self_ref.upgrade() else {
+            return Err(AppError::Credential {
+                message: "the core is shutting down".into(),
+            });
+        };
+        tokio::spawn(async move { inner.allocate_locked(credits).await })
             .await
-            .map_err(AppError::from_request)?;
-        let (status, body) = read_response(resp).await?;
-        check_status(status, &body)?;
+            .map_err(join_err)?
+    }
 
-        let keys: ListKeysResponse =
-            serde_json::from_str(&body).map_err(|e| AppError::Network {
-                message: format!("failed to parse keys response: {e}"),
-            })?;
-
-        let expected_ds = cfg.domain_separator();
+    /// Issue a credential of `credits` under `key`, which the caller has just
+    /// read as the current issuing key. The caller holds
+    /// [`Inner::issuance_gate`].
+    ///
+    /// **Everything a retry needs is written before the request is sent**: the
+    /// client's secret issuance state, the request exactly as it goes out (its
+    /// proof is randomized, so it could not be rebuilt), a random idempotency
+    /// key, and the account it is for. A response that never arrives therefore
+    /// leaves a pending issuance [`Inner::recover_pending_issuances_locked`]
+    /// can ask for again, and the server answers that retry from what it stored
+    /// rather than debiting twice. An answer meaning nothing was debited
+    /// abandons the row; a dropped connection or a server error leaves it.
+    async fn allocate_with_key(
+        &self,
+        cfg: &Config,
+        client: &reqwest::Client,
+        base_url: &str,
+        key: &CurrentIssuerKey,
+        credits: i64,
+    ) -> Result<AllocateResult, AppError> {
+        let (account_id, secret) = self.require_credentials(cfg)?;
         let now = now_ms();
-        // Every issuer key shares the same domain separator — rotation mints
-        // new keys, never new separators — so the separator alone does not
-        // identify a single key. `/v1/keys` lists all still-accepted keys
-        // oldest-first, which during a rotation grace window includes the
-        // just-rotated-out key whose accept window has not yet closed.
-        // Issuance always signs with the *current* key (the server's
-        // `get_current_issuer_key`, newest by `issue_from`), so we must verify
-        // against that same key: select the key whose issuing window covers
-        // now (`issue_from <= now < issue_until`), preferring the newest such
-        // key. Selecting the first separator match (the old behavior) grabbed
-        // the oldest accepted key and failed proof verification whenever an
-        // out-of-issuance-but-still-accepted key preceded the current one.
-        let key = keys
-            .data
-            .iter()
-            .filter(|k| k.domain_separator == expected_ds)
-            .filter_map(|k| {
-                let issue_from = iso_to_ms(&k.issue_from).ok()?;
-                let issue_until = iso_to_ms(&k.issue_until).ok()?;
-                (issue_from <= now && now < issue_until).then_some((issue_from, k))
-            })
-            .max_by_key(|(issue_from, _)| *issue_from)
-            .map(|(_, k)| k)
-            .ok_or_else(|| {
-                let server_ds: Vec<&str> = keys
-                    .data
-                    .iter()
-                    .map(|k| k.domain_separator.as_str())
-                    .collect();
-                AppError::Credential {
-                    message: format!(
-                        "no issuer key currently valid for issuance matches expected \
-                         domain separator \"{expected_ds}\"\n\
-                         server advertised: {server_ds:?}"
-                    ),
-                }
-            })?;
+        // The account is debited at issuance, so a credential that would be
+        // born past its own spend deadline is value thrown away. The server's
+        // grace window is a full epoch, so this is only reachable against a
+        // misconfigured (or hostile) server; refuse before any debit.
+        if key.deadlines.spend_until <= now {
+            return Err(AppError::Credential {
+                message: format!(
+                    "the current issuer key stops being accepted at {}, too soon for a new \
+                     credential to be spent under it",
+                    key.listed.accept_until
+                ),
+            });
+        }
 
-        let public_key_cbor =
-            URL_SAFE_NO_PAD
-                .decode(&key.public_key)
-                .map_err(|e| AppError::Credential {
-                    message: format!("invalid base64 public key: {e}"),
-                })?;
-
-        let public_key =
-            PublicKey::from_cbor(&public_key_cbor).map_err(|e| AppError::Credential {
-                message: format!("invalid public key CBOR: {e}"),
-            })?;
-
-        let params = params_from_domain_separator(expected_ds)?;
-
-        // 2. Open DB and store issuer key
         let db_conn = self.db_conn().await?;
-        let params_hash = blake3::hash(key.domain_separator.as_bytes())
-            .to_hex()
-            .to_string();
-        let expires_at = iso_to_ms(&key.issue_until)?;
-
         db::upsert_issuer_key(
             &db_conn,
-            &key.id,
-            &params_hash,
-            &public_key_cbor,
-            key.domain_separator.as_bytes(),
-            expires_at,
+            &key.listed.id,
+            blake3::hash(key.listed.domain_separator.as_bytes())
+                .to_hex()
+                .as_str(),
+            &key.public_key_cbor,
+            key.listed.domain_separator.as_bytes(),
+            key.deadlines,
             now,
         )
         .await?;
 
-        // 3. Create PreIssuance checkpoint
         let pre_issuance = PreIssuance::random(OsRng);
         let pre_issuance_cbor = pre_issuance.to_cbor().map_err(|e| AppError::Credential {
             message: format!("failed to encode pre_issuance: {e}"),
         })?;
-        let pre_credential_id = Uuid::now_v7().to_string();
-        db::insert_pre_credential_issuance(
-            &db_conn,
-            &pre_credential_id,
-            &key.id,
-            &pre_issuance_cbor,
-            credits,
-            now,
-        )
-        .await?;
-
-        // 4. Send issuance request
-        let issuance_request = pre_issuance.request(&params, OsRng);
+        let issuance_request = pre_issuance.request(&key.params, OsRng);
         let request_cbor = issuance_request
             .to_cbor()
             .map_err(|e| AppError::Credential {
                 message: format!("failed to encode issuance request: {e}"),
             })?;
-
-        let resp = client
-            .post(format!("{base_url}/v1/account/credentials"))
-            .basic_auth(account_id, Some(secret))
-            .json(&serde_json::json!({
-                "issuance_request": URL_SAFE_NO_PAD.encode(&request_cbor),
-                "credits": credits,
-            }))
-            .send()
-            .await
-            .map_err(AppError::from_request)?;
-        let (status, body) = read_response(resp).await?;
-        check_status(status, &body)?;
-
-        let issued: IssueCredentialsResponse =
-            serde_json::from_str(&body).map_err(|e| AppError::Network {
-                message: format!("failed to parse issuance response: {e}"),
-            })?;
-
-        // 5. Construct CreditToken
-        let response_cbor = URL_SAFE_NO_PAD
-            .decode(&issued.issuance_response)
-            .map_err(|e| AppError::Credential {
-                message: format!("invalid issuance response base64: {e}"),
-            })?;
-        let issuance_response =
-            IssuanceResponse::from_cbor(&response_cbor).map_err(|e| AppError::Credential {
-                message: format!("invalid issuance response CBOR: {e}"),
-            })?;
-        let credit_token = pre_issuance
-            .to_credit_token::<128>(&params, &public_key, &issuance_request, &issuance_response)
-            .map_err(|e| AppError::Credential {
-                message: format!("failed to construct credit token: {e}"),
-            })?;
-
-        // 6. Store credential
-        let token_cbor = credit_token.to_cbor().map_err(|e| AppError::Credential {
-            message: format!("failed to encode credit token: {e}"),
-        })?;
-        let nonce_hex = hex_encode(&credit_token.nullifier().to_bytes());
-        let token_credits =
-            scalar_to_credit::<128>(&credit_token.credits()).map_err(|e| AppError::Credential {
-                message: format!("invalid credit amount in token: {e}"),
-            })?;
-
-        db::insert_credential(
+        let mut idempotency_key = [0u8; 32];
+        rand_core::RngCore::fill_bytes(&mut OsRng, &mut idempotency_key);
+        let pre_credential_id = Uuid::now_v7().to_string();
+        db::insert_pre_credential_issuance(
             &db_conn,
-            &nonce_hex,
-            &pre_credential_id,
-            &issued.issuer_key_id,
-            &token_cbor,
-            token_credits as i64,
-            0,
-            now,
+            &db::PreIssuanceRecord {
+                id: &pre_credential_id,
+                issuer_key_id: &key.listed.id,
+                data: &pre_issuance_cbor,
+                credits,
+                idempotency_key: &idempotency_key,
+                issuance_request: &request_cbor,
+                account_id,
+                created_at: now,
+            },
         )
         .await?;
 
-        // Allocation moves credits from the account balance into a credential:
-        // both the wallet and account domains changed.
-        self.bus.emit(Change::Wallet);
-        self.bus.emit(Change::Account);
+        let pending = PendingIssuanceRef {
+            id: &pre_credential_id,
+            issuer_key_id: &key.listed.id,
+            pre_issuance: Box::new(pre_issuance),
+            issuance_request: Box::new(issuance_request),
+            request_cbor: &request_cbor,
+            credits,
+            idempotency_key: &idempotency_key,
+            public_key: &key.public_key,
+            params: &key.params,
+        };
+        let answer = send_issuance(
+            client,
+            base_url,
+            account_id,
+            secret,
+            &pending,
+            self.issuance_request_timeout(),
+            IssuanceAttempt::First,
+        )
+        .await;
+        Box::pin(self.settle_issuance(&db_conn, pending, answer, now)).await
+    }
 
-        Ok(AllocateResult {
-            nonce: nonce_hex,
-            credits: issued.credits,
-            issuer_key_id: issued.issuer_key_id,
+    /// Act on the server's answer to an issuance request: build and store the
+    /// credential from a response, or abandon the pre-credential when the
+    /// answer means nothing was debited for it. A response that was debited
+    /// but does not verify is abandoned too — a retry would only be answered
+    /// with the same stored response.
+    async fn settle_issuance(
+        &self,
+        db_conn: &turso::Connection,
+        pending: PendingIssuanceRef<'_>,
+        answer: IssuanceAnswer,
+        now: i64,
+    ) -> Result<AllocateResult, AppError> {
+        let issued = match answer {
+            IssuanceAnswer::Issued(issued) => issued,
+            IssuanceAnswer::Refused(e) => {
+                db::abandon_pre_credential_issuance(db_conn, pending.id, now_ms()).await?;
+                return Err(e);
+            }
+            IssuanceAnswer::Unknown(e) => return Err(e),
+        };
+        match complete_issuance(db_conn, &pending, &issued, now).await {
+            Ok(result) => {
+                // Allocation moves credits from the account balance into a
+                // credential: both the wallet and account domains changed.
+                self.bus.emit(Change::Wallet);
+                self.bus.emit(Change::Account);
+                Ok(result)
+            }
+            Err(e @ AppError::Credential { .. }) => {
+                db::abandon_pre_credential_issuance(db_conn, pending.id, now_ms()).await?;
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Ask again for every issuance whose response never landed, and store the
+    /// credentials the server answers with. The caller holds
+    /// [`Inner::issuance_gate`], so no issuance of this process's is in flight;
+    /// a row younger than [`ISSUANCE_SETTLE_AGE`] is still left alone, so an
+    /// original attempt the server may still be processing is never raced by
+    /// its retry. Only the account each row was sent for is asked. With
+    /// nothing pending, nothing is sent. Returns the recovered nonces.
+    async fn recover_pending_issuances_locked(&self) -> Result<Vec<String>, AppError> {
+        let cfg = self.load_config();
+        let Ok((account_id, secret)) = self.require_credentials(&cfg) else {
+            return Ok(Vec::new());
+        };
+        let db_conn = self.db_conn().await?;
+        let now = now_ms();
+        let settle_ms = i64::try_from(
+            self.issuance_settle_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .unwrap_or(i64::MAX);
+        let rows: Vec<db::PendingIssuance> = db::list_pending_issuances(&db_conn, now)
+            .await?
+            .into_iter()
+            .filter(|r| r.account_id == account_id && r.created_at <= now - settle_ms)
+            .collect();
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let eidola = self.eidola_resolved().await?;
+        let client = self.build_client(&eidola, None).await?;
+        let params = params_from_domain_separator(cfg.domain_separator())?;
+        let mut recovered = Vec::new();
+        for row in rows {
+            let Ok(idempotency_key) = <[u8; 32]>::try_from(row.idempotency_key.as_slice()) else {
+                continue;
+            };
+            let (Ok(pre_issuance), Ok(issuance_request), Ok(public_key)) = (
+                PreIssuance::from_cbor(&row.data),
+                anonymous_credit_tokens::IssuanceRequest::from_cbor(&row.issuance_request),
+                PublicKey::from_cbor(&row.public_key_data),
+            ) else {
+                continue;
+            };
+            let pending = PendingIssuanceRef {
+                id: &row.id,
+                issuer_key_id: &row.issuer_key_id,
+                pre_issuance: Box::new(pre_issuance),
+                issuance_request: Box::new(issuance_request),
+                request_cbor: &row.issuance_request,
+                credits: row.credits,
+                idempotency_key: &idempotency_key,
+                public_key: &public_key,
+                params: &params,
+            };
+            let answer = send_issuance(
+                &client,
+                &eidola.base_url,
+                account_id,
+                secret,
+                &pending,
+                self.issuance_request_timeout(),
+                IssuanceAttempt::Retry,
+            )
+            .await;
+            if let Ok(result) = Box::pin(self.settle_issuance(&db_conn, pending, answer, now)).await
+            {
+                recovered.push(result.nonce);
+            }
+        }
+        Ok(recovered)
+    }
+
+    /// One pass of the **ahead-of-need provisioner** (see
+    /// [`AppCore::start_credential_provisioner`]): recover any issuance whose
+    /// response was lost, then decide whether to issue one credential of the
+    /// standard size now. Every rule here is a public constant or a fact about
+    /// the wallet; nothing about a request that is about to be made enters it.
+    async fn provision_once(&self) -> Result<ProvisionOutcome, AppError> {
+        let _issuing = self
+            .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
+            .await?;
+        // A disabled backend is asked for nothing, not even a recovery: the
+        // reader has turned the service off, and nothing unattended converts
+        // balance for it.
+        if !self.eidola_enabled().await? {
+            return Ok(ProvisionOutcome::BackendDisabled);
+        }
+        let cfg = self.load_config();
+        let Ok((account_id, _)) = self.require_credentials(&cfg) else {
+            return Ok(ProvisionOutcome::NoAccount);
+        };
+        let _ = Box::pin(self.recover_pending_issuances_locked()).await;
+
+        let db_conn = self.db_conn().await?;
+        let now = now_ms();
+        let horizon_until = now.saturating_add(duration_ms(PROVISION_HORIZON));
+        // An issuance whose response was lost may already have been paid for,
+        // so it counts toward the buffer — and while one is unresolved nothing
+        // new is issued beside it, retry hold-off included. Otherwise every
+        // pass whose recovery failed would convert another allocation, and
+        // what is held would no longer be bounded by the threshold plus one.
+        let pending: Vec<db::PendingIssuance> = db::list_pending_issuances(&db_conn, now)
+            .await?
+            .into_iter()
+            .filter(|r| r.account_id == account_id)
+            .collect();
+        let held = db::spendable_credits_until(&db_conn, now, horizon_until)
+            .await?
+            .saturating_add(pending.iter().map(|r| r.credits).sum::<i64>());
+        if held >= PROVISION_THRESHOLD_CREDITS {
+            return Ok(ProvisionOutcome::Covered);
+        }
+        if !pending.is_empty() {
+            return Ok(ProvisionOutcome::Unresolved);
+        }
+        // A wallet that has not spent lately keeps no buffer: a credential
+        // issued for it would most likely lapse unspent.
+        let active_since = now.saturating_sub(duration_ms(PROVISION_ACTIVITY_WINDOW));
+        if !db::last_spend_at(&db_conn)
+            .await?
+            .is_some_and(|at| at >= active_since)
+        {
+            return Ok(ProvisionOutcome::Idle);
+        }
+
+        let eidola = self.eidola_resolved().await?;
+        let client = self.build_client(&eidola, None).await?;
+        let key = current_issuer_key(
+            &client,
+            &eidola.base_url,
+            cfg.domain_separator(),
+            self.issuance_request_timeout(),
+            &self.issuer_calendar(),
+            &self.db_conn().await?,
+        )
+        .await?;
+        // A credential that would not count toward the buffer once issued is
+        // never issued for it — under a key that lapses within the horizon it
+        // could not carry the days ahead, and would leave the next pass just
+        // as short.
+        if key.deadlines.spend_until <= horizon_until {
+            return Ok(ProvisionOutcome::NoUsableKey);
+        }
+        // Prefer a key's early life: late in its issuing window, while what is
+        // held still covers the next while, wait for the next key, whose
+        // credentials live a full epoch longer.
+        let issue_until = iso_to_ms(&key.listed.issue_until)?;
+        if issue_until.saturating_sub(now) < duration_ms(PROVISION_LATE_WINDOW)
+            && held >= PROVISION_DEFER_FLOOR_CREDITS
+        {
+            return Ok(ProvisionOutcome::Deferred);
+        }
+        // Background issuance is always the standard size. A balance that
+        // cannot cover it is left for the just-in-time path to convert when a
+        // request needs it.
+        let balances = self.account_balances_bounded().await?;
+        if balances.available < DEFAULT_ALLOCATION_CREDITS {
+            return Ok(ProvisionOutcome::LowBalance);
+        }
+        let issued = Box::pin(self.allocate_with_key(
+            &cfg,
+            &client,
+            &eidola.base_url,
+            &key,
+            DEFAULT_ALLOCATION_CREDITS,
+        ))
+        .await?;
+        Ok(ProvisionOutcome::Issued {
+            nonce: issued.nonce,
         })
     }
 
@@ -3712,16 +4178,11 @@ impl Inner {
             };
 
             // Reconstruct the PrivateToken auth header
-            let challenge_digest = compute_challenge_digest();
-            let mut token_bytes = Vec::new();
-            token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
-            token_bytes.extend_from_slice(&challenge_digest);
-            token_bytes.extend_from_slice(&issuer_key_hash);
-            token_bytes.extend_from_slice(&spend_proof_cbor);
-            let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
-            let auth_value = format!("PrivateToken token=\"{token_b64}\"");
+            let auth_value = spend_authorization(&issuer_key_hash, &spend_proof_cbor);
 
-            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await
+            let refund_key = refund_recovery_key(&row.pre_refund_data);
+            if let Ok(refund_obj) =
+                recover_refund(&client, base_url, &auth_value, &refund_key).await
                 && process_refund(
                     &refund_obj,
                     &params,
@@ -3740,8 +4201,21 @@ impl Inner {
             }
         }
 
+        // Announced before anything below can fail: the successors above are
+        // durable, and a caller that gets an error from what follows does not
+        // re-read, so the bus is what tells it.
         if !recovered.is_empty() {
             self.bus.emit(Change::Wallet);
+        }
+
+        // A lost issuance response strands its allocation the same way a lost
+        // refund strands a balance, so the explicit recovery asks for those
+        // too. Each one it recovers announces itself (`settle_issuance`).
+        {
+            let _issuing = self
+                .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
+                .await?;
+            recovered.extend(Box::pin(self.recover_pending_issuances_locked()).await?);
         }
 
         Ok(recovered)
@@ -6152,7 +6626,7 @@ impl Inner {
         db_conn: &turso::Connection,
         charge_credits: i64,
     ) -> Result<db::SpendableCredential, AppError> {
-        let deadline = tokio::time::Instant::now() + PROVISION_WAIT_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + self.provision_wait();
         loop {
             if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
                 return Ok(cred);
@@ -6162,13 +6636,27 @@ impl Inner {
                 return Err(AppError::NoAccount);
             }
 
-            let balances = self.account_balances().await?;
-            if balances.available >= charge_credits {
-                // Enough to allocate at least the charge — grow the pool.
-                let amount = auto_allocation_amount(balances.available, charge_credits)?;
-                self.account_allocate(amount).await?;
-                continue;
-            }
+            // The just-in-time fallback. It takes the issuance gate, so it
+            // never converts beside the ahead-of-need provisioner, and looks
+            // again once it has it: a background issuance that landed while it
+            // waited covers this turn without a second conversion.
+            let balances = {
+                // Bounded by the queue's own deadline: this wait happens with
+                // `spend_gate` held, so an unbounded one would stall every
+                // paid turn behind it.
+                let _issuing = self.lock_issuance_gate(deadline).await?;
+                if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
+                    return Ok(cred);
+                }
+                let balances = self.account_balances_bounded().await?;
+                if balances.available >= charge_credits {
+                    // Enough to allocate at least the charge — grow the pool.
+                    let amount = auto_allocation_amount(balances.available, charge_credits)?;
+                    self.allocate_on_its_own_task(amount).await?;
+                    continue;
+                }
+                balances
+            };
 
             // Balance can't cover a fresh allocation. Waiting only helps if a
             // concurrent turn holds coverage this turn could actually use once
@@ -7449,9 +7937,10 @@ impl Inner {
         // through `insert_pre_credential_refund` below (the point the
         // credential becomes `spending`); the HTTP request runs outside it.
         let _spend_guard = self.spend_gate.lock().await;
-        let cred = self
-            .ensure_spendable_credential(cfg, db_conn, charge_credits as i64)
-            .await?;
+        // Boxed: the provisioning queue's own future (with an issuance inside
+        // it) is large, and it sits inside every turn's.
+        let cred =
+            Box::pin(self.ensure_spendable_credential(cfg, db_conn, charge_credits as i64)).await?;
 
         let credit_token =
             CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
@@ -7510,16 +7999,7 @@ impl Inner {
         self.bus.emit(Change::Wallet);
 
         let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
-        let challenge_digest = compute_challenge_digest();
-
-        let mut token_bytes = Vec::new();
-        token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
-        token_bytes.extend_from_slice(&challenge_digest);
-        token_bytes.extend_from_slice(&issuer_key_hash);
-        token_bytes.extend_from_slice(&spend_proof_cbor);
-
-        let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
-        let auth_value = format!("PrivateToken token=\"{token_b64}\"");
+        let auth_value = spend_authorization(&issuer_key_hash, &spend_proof_cbor);
 
         Ok((
             SpendPrep {
@@ -7528,6 +8008,7 @@ impl Inner {
                 params,
                 spend_proof,
                 pre_refund,
+                refund_key: refund_recovery_key(&pre_refund_cbor),
                 pre_cred_id,
                 _live: live,
             },
@@ -7788,9 +8269,11 @@ impl Inner {
                 .post(format!("{}/v1/chat/completions", prep.base_url)),
             &request_body_json,
         );
-        if let Some(auth_value) = &prep.auth_value {
-            request = request.header("Authorization", auth_value);
-        }
+        request = with_credentials(
+            request,
+            prep.auth_value.as_deref(),
+            prep.spend.as_ref().map(|s| &*s.refund_key),
+        );
         let chat_result = prep.send(request).await;
         let response_at = now_ms();
 
@@ -8609,9 +9092,11 @@ impl Inner {
                 .header("Accept", "text/event-stream"),
             &request_body_json,
         );
-        if let Some(auth_value) = &prep.auth_value {
-            request = request.header("Authorization", auth_value);
-        }
+        request = with_credentials(
+            request,
+            prep.auth_value.as_deref(),
+            prep.spend.as_ref().map(|s| &*s.refund_key),
+        );
         let chat_result = prep.send(request).await;
 
         let resp = match chat_result {
@@ -10222,6 +10707,19 @@ impl AppCore {
             .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// **Test-only seam.** Check issuer key windows against `calendar` instead
+    /// of the production one, so a test can put a key's deadlines seconds
+    /// from now and still be on a calendar.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_set_issuer_calendar(&self, calendar: IssuerCalendar) {
+        *self
+            .inner
+            .issuer_calendar
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = calendar;
+    }
+
     /// **Test-only seam.** Advance the prefix-cache clock by `delta_ms` each
     /// time a turn hands a request to the transport — after the request is
     /// built, before the connection is set up — modelling a slow connection,
@@ -10267,6 +10765,22 @@ impl AppCore {
                 bus,
                 local: Arc::new(local_models::LocalRuntime::default()),
                 spend_gate: tokio::sync::Mutex::new(()),
+                issuance_gate: tokio::sync::Mutex::new(()),
+                provisioner_started: std::sync::atomic::AtomicBool::new(false),
+                provision_check_ms: Mutex::new((
+                    duration_ms(PROVISION_CHECK_MIN) as u64,
+                    duration_ms(PROVISION_CHECK_MAX) as u64,
+                )),
+                issuance_request_timeout_ms: std::sync::atomic::AtomicU64::new(duration_ms(
+                    ISSUANCE_REQUEST_TIMEOUT,
+                )
+                    as u64),
+                provision_wait_ms: std::sync::atomic::AtomicU64::new(duration_ms(
+                    PROVISION_WAIT_TIMEOUT,
+                ) as u64),
+                issuance_settle_ms: std::sync::atomic::AtomicU64::new(duration_ms(
+                    ISSUANCE_SETTLE_AGE,
+                ) as u64),
                 live_spends: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 backend_config_gates: Mutex::new(std::collections::HashMap::new()),
                 #[cfg(feature = "test-support")]
@@ -10318,6 +10832,8 @@ impl AppCore {
                 cache_clock: CacheClock::default(),
                 #[cfg(feature = "test-support")]
                 fail_cache_key_cleanup: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(feature = "test-support")]
+                issuer_calendar: Mutex::new(ISSUER_CALENDAR),
                 _db_lock: db_lock,
             }),
         })
@@ -10812,6 +11328,120 @@ impl AppCore {
         let bus = self.bus.subscribe();
         self.runtime
             .spawn(async move { subspace_driver::supervise(inner, bus).await });
+    }
+
+    /// Start the **ahead-of-need credential provisioner** in this process.
+    ///
+    /// When a request needs a credential and none covers it, the provisioning
+    /// queue converts one just in time and spends it at once — so the
+    /// issuance, which the server sees with its account, is followed a moment
+    /// later by that credential's first spend, linking the two. This keeps a
+    /// small buffer instead, issued at times unrelated to any request: at
+    /// random intervals ([`PROVISION_CHECK_MIN`]..[`PROVISION_CHECK_MAX`], the
+    /// first one interval after start) it recovers any issuance whose response
+    /// was lost, and issues one credential of [`DEFAULT_ALLOCATION_CREDITS`]
+    /// when what the wallet can spend past [`PROVISION_HORIZON`] is below
+    /// [`PROVISION_THRESHOLD_CREDITS`]. It keeps no buffer for a wallet that
+    /// has not spent within [`PROVISION_ACTIVITY_WINDOW`], issues nothing
+    /// without an account, below a standard allocation of balance, or under a
+    /// key that would lapse within the horizon, and prefers a key's early life
+    /// ([`PROVISION_LATE_WINDOW`]). The just-in-time path stays as the
+    /// fallback when nothing held covers a request.
+    ///
+    /// **For the long-lived process only** — the app, which holds the profile
+    /// and answers for it over the control socket. A one-shot CLI invocation
+    /// does not start it: it would exit before its first look. **On by
+    /// default, with no setting**: the amounts and times are public constants,
+    /// what is held at once is bounded by the threshold plus one allocation,
+    /// an idle wallet is left alone, and turning it off would only restore the
+    /// linkable default. Idempotent — at most one loop is ever spawned.
+    pub fn start_credential_provisioner(&self) {
+        if self
+            .inner
+            .provisioner_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let inner = self.inner.clone();
+        self.runtime.spawn(async move {
+            loop {
+                let (min, max) = *inner
+                    .provision_check_ms
+                    .lock()
+                    .expect("provision timing lock poisoned");
+                tokio::time::sleep(provision_delay(
+                    std::time::Duration::from_millis(min),
+                    std::time::Duration::from_millis(max),
+                ))
+                .await;
+                // Offline, signed out, a server error: each is simply another
+                // look later. Nothing here is the reader's to see.
+                // Nobody is waiting on these writes.
+                let _ = tokio::time::timeout(
+                    PROVISION_PASS_DEADLINE,
+                    changes::with_origin(
+                        changes::ChangeOrigin::Unattended,
+                        Box::pin(inner.provision_once()),
+                    ),
+                )
+                .await;
+            }
+        });
+    }
+
+    /// **Test-only seam.** One provisioner pass, now, rather than at the next
+    /// random look.
+    #[cfg(feature = "test-support")]
+    pub async fn test_provision_once(&self) -> Result<ProvisionOutcome, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { Box::pin(inner.provision_once()).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// **Test-only seam.** How old a pending issuance must be before it is
+    /// asked for again ([`ISSUANCE_SETTLE_AGE`]), so a test can recover one
+    /// without waiting ten minutes.
+    #[cfg(feature = "test-support")]
+    pub fn test_set_issuance_settle_age(&self, age: std::time::Duration) {
+        self.inner.issuance_settle_ms.store(
+            duration_ms(age) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// **Test-only seam.** The deadline on each issuance request
+    /// ([`ISSUANCE_REQUEST_TIMEOUT`]) and how long anything waits for the
+    /// issuance gate ([`PROVISION_WAIT_TIMEOUT`]), so a test can stall the
+    /// server without waiting half a minute.
+    #[cfg(feature = "test-support")]
+    pub fn test_set_issuance_timeouts(
+        &self,
+        request: std::time::Duration,
+        gate_wait: std::time::Duration,
+    ) {
+        self.inner.issuance_request_timeout_ms.store(
+            duration_ms(request) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.inner.provision_wait_ms.store(
+            duration_ms(gate_wait) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// **Test-only seam.** The bounds the provisioner draws its look interval
+    /// from, so a test can watch the loop act inside a short window.
+    #[cfg(feature = "test-support")]
+    pub fn test_set_provision_interval(&self, min: std::time::Duration, max: std::time::Duration) {
+        *self
+            .inner
+            .provision_check_ms
+            .lock()
+            .expect("provision timing lock poisoned") =
+            (duration_ms(min) as u64, duration_ms(max) as u64);
     }
 
     // -----------------------------------------------------------------------
@@ -12902,14 +13532,13 @@ struct ListKeysResponse {
     data: Vec<IssuerKeyResponse>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct IssuerKeyResponse {
     id: String,
     public_key: String,
     domain_separator: String,
     issue_from: String,
     issue_until: String,
-    #[allow(dead_code)]
     accept_until: String,
 }
 
@@ -13386,6 +14015,9 @@ struct SpendPrep {
     params: Params,
     spend_proof: SpendProof<128>,
     pre_refund: PreRefund,
+    /// [`refund_recovery_key`] of this spend's stored `PreRefund` bytes: sent
+    /// with the spend and with any recovery of it.
+    refund_key: zeroize::Zeroizing<[u8; 32]>,
     pre_cred_id: String,
     /// Marks this hold as one a request is in flight for, for as long as
     /// these materials exist. `SpendPrep` is the only in-memory handle to a
@@ -13551,11 +14183,12 @@ impl TurnPrep {
     /// decide its own control flow, never to decide whether to emit. Always
     /// `false` for local turns — there is no spend to recover.
     async fn try_refund_recovery(&mut self) -> bool {
-        let (Some(_), Some(auth_value)) = (&self.spend, &self.auth_value) else {
+        let (Some(spend), Some(auth_value)) = (&self.spend, &self.auth_value) else {
             return false;
         };
         let auth_value = auth_value.clone();
-        match recover_refund(&self.client, &self.base_url, &auth_value).await {
+        let refund_key = spend.refund_key.clone();
+        match recover_refund(&self.client, &self.base_url, &auth_value, &refund_key).await {
             Ok(refund_obj) => self.process_refund_obj(&refund_obj).await.is_ok(),
             Err(_) => false,
         }
@@ -14383,6 +15016,19 @@ async fn process_refund(
         .ok_or_else(|| AppError::Credential {
             message: "missing issuer_key_id in refund".into(),
         })?;
+    // A refund is a credential under the spent credential's own key: it is
+    // verified against that key below, and it is stored under that key's id,
+    // never one the response names. A refund naming another key is refused
+    // rather than stored under a label that would misstate when it lapses.
+    let spent_key_id =
+        issuer_key_id_of(&public_key.to_cbor().map_err(|e| AppError::Credential {
+            message: format!("failed to encode issuer public key: {e}"),
+        })?);
+    if refund_key_id != spent_key_id {
+        return Err(AppError::Credential {
+            message: "the refund names a different issuer key from the spent credential's".into(),
+        });
+    }
 
     let refund_cbor = URL_SAFE_NO_PAD
         .decode(refund_b64)
@@ -14412,7 +15058,7 @@ async fn process_refund(
         db_conn,
         &new_nonce,
         pre_cred_id,
-        refund_key_id,
+        &spent_key_id,
         &new_token_cbor,
         new_credits as i64,
         generation,
@@ -14425,17 +15071,23 @@ async fn process_refund(
 
 /// Attempt to recover a refund token from the server via
 /// `POST /v1/credentials/refund`. Returns the refund JSON object on success.
+///
+/// `refund_key` is the spend's [`refund_recovery_key`]: the server stores the
+/// refund sealed under it and opens it only for the same key.
 async fn recover_refund(
     client: &reqwest::Client,
     base_url: &str,
     auth_value: &str,
+    refund_key: &[u8; 32],
 ) -> Result<serde_json::Value, AppError> {
-    let resp = client
-        .post(format!("{base_url}/v1/credentials/refund"))
-        .header("Authorization", auth_value)
-        .send()
-        .await
-        .map_err(AppError::from_request)?;
+    let resp = with_credentials(
+        client.post(format!("{base_url}/v1/credentials/refund")),
+        Some(auth_value),
+        Some(refund_key),
+    )
+    .send()
+    .await
+    .map_err(AppError::from_request)?;
 
     let (status, body_text) =
         crate::peer_read::read_api_answer(resp, "the recovery response").await?;
@@ -17423,6 +18075,414 @@ fn truncate_on_word_boundary(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// The issuer key the server is issuing under now, as read from
+/// `GET /v1/keys` and checked: its id is the hash of its public key.
+struct CurrentIssuerKey {
+    listed: IssuerKeyResponse,
+    public_key_cbor: Vec<u8>,
+    public_key: PublicKey,
+    params: Params,
+    deadlines: db::IssuerKeyDeadlines,
+}
+
+/// Read the current issuing key from `GET /v1/keys`, and hold the server to
+/// the keys it has listed before.
+///
+/// Every issuer key shares the same domain separator — rotation mints new
+/// keys, never new separators — so the separator alone does not identify a
+/// single key. `/v1/keys` lists every still-accepted key (the previous
+/// epoch's, the current one's) and the next epoch's. The whole listing is
+/// checked first: every key on the calendar, one per epoch, a distinct key per
+/// epoch (`checked_listing`). A key whose windows nobody could have computed in
+/// advance is one a server could have timed around this client. Issuance signs
+/// with the *current* key: the current epoch's.
+///
+/// One key per epoch, and one epoch per key, is then checked against what
+/// this client has already seen. **Every** listed key is recorded,
+/// first-seen-wins (the next epoch's key a whole epoch before it issues), and
+/// every one must agree with the record. Any disagreement refuses the key
+/// ([`AppError::IssuerKeyRefused`]) before any issuance request is built, for
+/// every door that issues — explicit, just in time and in the background
+/// alike: the client cannot tell an emergency rotation from a server singling
+/// it out, and the honest design has no rotation within an epoch.
+async fn current_issuer_key(
+    client: &reqwest::Client,
+    base_url: &str,
+    expected_ds: &str,
+    timeout: std::time::Duration,
+    calendar: &IssuerCalendar,
+    db_conn: &turso::Connection,
+) -> Result<CurrentIssuerKey, AppError> {
+    let resp = client
+        .get(format!("{base_url}/v1/keys"))
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(AppError::from_request)?;
+    let (status, body) = read_response(resp).await?;
+    check_status(status, &body)?;
+    let keys: ListKeysResponse = serde_json::from_str(&body).map_err(|e| AppError::Network {
+        message: format!("failed to parse keys response: {e}"),
+    })?;
+    let now = now_ms();
+    let listing = checked_listing(calendar, &keys.data, expected_ds)?;
+    let now_epoch = u64::try_from(now.div_euclid(1000))
+        .ok()
+        .and_then(|secs| calendar.epoch_at(secs));
+    let Some(&(epoch, key)) = listing.iter().find(|(e, _)| Some(*e) == now_epoch) else {
+        let server_ds: Vec<&str> = keys
+            .data
+            .iter()
+            .map(|k| k.domain_separator.as_str())
+            .collect();
+        return Err(AppError::Credential {
+            message: format!(
+                "no issuer key currently valid for issuance matches expected \
+                 domain separator \"{expected_ds}\"\n\
+                 server advertised: {server_ds:?}"
+            ),
+        });
+    };
+
+    let public_key_cbor =
+        URL_SAFE_NO_PAD
+            .decode(&key.public_key)
+            .map_err(|e| AppError::Credential {
+                message: format!("invalid base64 public key: {e}"),
+            })?;
+    let public_key = PublicKey::from_cbor(&public_key_cbor).map_err(|e| AppError::Credential {
+        message: format!("invalid public key CBOR: {e}"),
+    })?;
+    // A key's id is SHA-256 of its public key, and the id is what every
+    // spend names. Stored under any other id, a credential is unusable
+    // (its spends name a key the server cannot find) or mislabelled.
+    // (`checked_listing` already refused a listing with any such key;
+    // this is the check the credential is stored under.)
+    if key.id != issuer_key_id_of(&public_key_cbor) {
+        return Err(AppError::Credential {
+            message: "the server's issuer key id is not the hash of its public key".into(),
+        });
+    }
+
+    let oldest_kept = epoch.saturating_sub(ISSUER_KEY_RECORD_EPOCHS);
+    let mut refusal = None;
+    for &(listed_epoch, listed) in &listing {
+        let pinned = db::pin_issuer_key_epoch(
+            db_conn,
+            base_url,
+            listed_epoch,
+            &listed.id,
+            oldest_kept,
+            now,
+        )
+        .await?;
+        let disagreement = if pinned.key_id != listed.id {
+            Some(IssuerKeyRefusal::SecondKeyForEpoch {
+                epoch: listed_epoch,
+            })
+        } else if pinned.also_recorded_for.is_some() {
+            Some(IssuerKeyRefusal::OneKeyForSeveralEpochs {
+                epoch: listed_epoch,
+            })
+        } else {
+            None
+        };
+        refusal = refusal.or(disagreement);
+    }
+    if let Some(refusal) = refusal {
+        return Err(AppError::IssuerKeyRefused { refusal });
+    }
+
+    let params = params_from_domain_separator(expected_ds)?;
+    // A credential's spendable life is bounded by when the server stops
+    // *accepting* the key, not when it stops issuing under it: a credential
+    // issued in the last moments of `issue_until` is spendable for a whole
+    // further epoch.
+    let deadlines = issuer_key_deadlines(iso_to_ms(&key.accept_until)?);
+    Ok(CurrentIssuerKey {
+        listed: key.clone(),
+        public_key_cbor,
+        public_key,
+        params,
+        deadlines,
+    })
+}
+
+/// One issuance as it is sent and settled: what the pre-credential row holds,
+/// decoded.
+struct PendingIssuanceRef<'a> {
+    id: &'a str,
+    issuer_key_id: &'a str,
+    pre_issuance: Box<PreIssuance>,
+    issuance_request: Box<anonymous_credit_tokens::IssuanceRequest>,
+    request_cbor: &'a [u8],
+    credits: i64,
+    idempotency_key: &'a [u8; 32],
+    public_key: &'a PublicKey,
+    params: &'a Params,
+}
+
+/// What an issuance request's answer means for its pre-credential.
+enum IssuanceAnswer {
+    /// The server answered with a signed response (fresh, or the one it
+    /// stored for this idempotency key).
+    Issued(IssueCredentialsResponse),
+    /// The server refused it in a way that proves nothing was or will be
+    /// debited under its idempotency key (see [`IssuanceAttempt`]).
+    Refused(AppError),
+    /// No answer, or a server error: it may or may not have been debited, and
+    /// a retry under the same key will say which.
+    Unknown(AppError),
+}
+
+/// Whether an issuance request is the first ever sent under its idempotency
+/// key, which decides what a refusal proves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IssuanceAttempt {
+    /// The first send. Any 4xx is the gateway (or something in front of it)
+    /// declining this one request, and it is the only one: nothing was
+    /// debited, and abandoning it strands nothing.
+    First,
+    /// A retry after an answer that never arrived. The first attempt may have
+    /// been debited and its response stored, or may still be in flight at the
+    /// gateway and debit later, so only a refusal decided by the request bytes
+    /// alone, or one the gateway decides under the account lock in a way no
+    /// later attempt can change, proves the issuance is dead
+    /// ([`retry_refusal_is_final`]).
+    Retry,
+}
+
+/// Whether a retry's `status` proves that nothing was, or will be, debited
+/// under its idempotency key. A retry's refusal answers only the retry: the
+/// original attempt may have passed every check before it and still be on
+/// its way to the debit, so a refusal that turns on state that can change
+/// (the balance, the terms in force) proves nothing about it. Every 4xx the
+/// gateway's issuance path returns, classified explicitly:
+///
+/// * `400`: the request is malformed (credits, idempotency key, base64, CBOR,
+///   amount, or a commitment the key cannot sign). Decided by the bytes alone,
+///   which are the first attempt's bytes, so that attempt was refused the
+///   same way. Final.
+/// * `422`: the body did not deserialize. The same argument. Final.
+/// * `409`: the idempotency key answers a different request (a stored row,
+///   so nothing else can debit under the key), or the named key has stopped
+///   issuing. The gateway decides the second under the account lock on the
+///   database clock, and refuses any later debit under a key it has seen
+///   stop issuing on that same clock, so an original still in flight can
+///   never land after it. Final.
+/// * `402`: the balance at the retry's own debit. An original that stalled
+///   before its debit may still land, if the balance has grown by then. Kept.
+/// * `428`: the terms gate, which the original may have passed before the
+///   terms changed. Kept.
+/// * `401` / `403`: authentication, decided **before** the stored lookup. A
+///   relinked account with a mistyped secret is refused here although its
+///   paid issuance is stored and answers once the secret is right. Kept.
+/// * `429`, `404`, `408`, `413` and any other: not the issuance handler's own
+///   verdict on this key. Kept.
+///
+/// A kept issuance still ends: once its key stops issuing, the next retry is
+/// answered with the stored response or the final `409`, and the stored
+/// response outlives the key's spend window, after which the issuance is no
+/// longer asked for (`db::list_pending_issuances`).
+fn retry_refusal_is_final(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 400 | 409 | 422)
+}
+
+/// Send one issuance request.
+async fn send_issuance(
+    client: &reqwest::Client,
+    base_url: &str,
+    account_id: &str,
+    secret: &str,
+    pending: &PendingIssuanceRef<'_>,
+    timeout: std::time::Duration,
+    attempt: IssuanceAttempt,
+) -> IssuanceAnswer {
+    let sent = client
+        .post(format!("{base_url}/v1/account/credentials"))
+        .timeout(timeout)
+        .basic_auth(account_id, Some(secret))
+        .json(&serde_json::json!({
+            "issuance_request": URL_SAFE_NO_PAD.encode(pending.request_cbor),
+            "credits": pending.credits,
+            "idempotency_key": hex_encode(pending.idempotency_key),
+            "issuer_key_id": pending.issuer_key_id,
+        }))
+        .send()
+        .await;
+    let resp = match sent {
+        Ok(resp) => resp,
+        Err(e) => return IssuanceAnswer::Unknown(AppError::from_request(e)),
+    };
+    let (status, body) = match read_response(resp).await {
+        Ok(read) => read,
+        Err(e) => return IssuanceAnswer::Unknown(e),
+    };
+    if let Err(e) = check_status(status, &body) {
+        let refused = status.is_client_error()
+            && (attempt == IssuanceAttempt::First || retry_refusal_is_final(status));
+        return if refused {
+            IssuanceAnswer::Refused(e)
+        } else {
+            IssuanceAnswer::Unknown(e)
+        };
+    }
+    match serde_json::from_str::<IssueCredentialsResponse>(&body) {
+        Ok(issued) => IssuanceAnswer::Issued(issued),
+        // A 200 whose body did not parse was debited; asking again under the
+        // same key gets the same stored response, which may parse this time.
+        Err(e) => IssuanceAnswer::Unknown(AppError::Network {
+            message: format!("failed to parse issuance response: {e}"),
+        }),
+    }
+}
+
+/// Build the credential from an issuance response, check what the issuer
+/// chose, and store it.
+async fn complete_issuance(
+    db_conn: &turso::Connection,
+    pending: &PendingIssuanceRef<'_>,
+    issued: &IssueCredentialsResponse,
+    now: i64,
+) -> Result<AllocateResult, AppError> {
+    // The response is verified against the pending issuance's key below; it
+    // must also say it is that key, since the id it names is the one the
+    // credential is stored and later spent under.
+    if issued.issuer_key_id != pending.issuer_key_id {
+        return Err(AppError::Credential {
+            message: "the server issued under a different key from the one it listed as \
+                      current"
+                .into(),
+        });
+    }
+    let response_cbor = URL_SAFE_NO_PAD
+        .decode(&issued.issuance_response)
+        .map_err(|e| AppError::Credential {
+            message: format!("invalid issuance response base64: {e}"),
+        })?;
+    let issuance_response =
+        IssuanceResponse::from_cbor(&response_cbor).map_err(|e| AppError::Credential {
+            message: format!("invalid issuance response CBOR: {e}"),
+        })?;
+    let credit_token = pending
+        .pre_issuance
+        .to_credit_token::<128>(
+            pending.params,
+            pending.public_key,
+            &pending.issuance_request,
+            &issuance_response,
+        )
+        .map_err(|e| AppError::Credential {
+            message: format!("failed to construct credit token: {e}"),
+        })?;
+    let token_credits =
+        scalar_to_credit::<128>(&credit_token.credits()).map_err(|e| AppError::Credential {
+            message: format!("invalid credit amount in token: {e}"),
+        })?;
+    check_issued_credential(
+        &credit_token,
+        pending.params,
+        pending.issuer_key_id,
+        pending.credits,
+        token_credits,
+    )?;
+    let token_cbor = credit_token.to_cbor().map_err(|e| AppError::Credential {
+        message: format!("failed to encode credit token: {e}"),
+    })?;
+    let nonce_hex = hex_encode(&credit_token.nullifier().to_bytes());
+    db::insert_credential(
+        db_conn,
+        &nonce_hex,
+        pending.id,
+        pending.issuer_key_id,
+        &token_cbor,
+        token_credits as i64,
+        0,
+        now,
+    )
+    .await?;
+    Ok(AllocateResult {
+        nonce: nonce_hex,
+        credits: issued.credits,
+        issuer_key_id: issued.issuer_key_id.clone(),
+    })
+}
+
+fn duration_ms(d: std::time::Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// The wait before the provisioner's next look at the wallet: uniform over
+/// `[min, max]`, drawn fresh each time from the OS RNG.
+fn provision_delay(min: std::time::Duration, max: std::time::Duration) -> std::time::Duration {
+    let (lo, hi) = (
+        duration_ms(min).max(0) as u64,
+        duration_ms(max).max(0) as u64,
+    );
+    if hi <= lo {
+        return min;
+    }
+    let span = hi - lo + 1;
+    std::time::Duration::from_millis(lo + rand_core::RngCore::next_u64(&mut OsRng) % span)
+}
+
+/// The request context every credential under the key `key_id` must carry:
+/// `SHA-256(issuer_name ‖ origin_info ‖ issuer_key_id)` reduced to a scalar,
+/// with the credential context empty, exactly as the server derives it.
+fn expected_request_context(key_id: &str) -> Result<anonymous_credit_tokens::Scalar, AppError> {
+    let key_hash = hex_decode(key_id)?;
+    let mut ctx = Vec::with_capacity(ISSUER_NAME.len() + ORIGIN_INFO.len() + key_hash.len());
+    ctx.extend_from_slice(ISSUER_NAME.as_bytes());
+    ctx.extend_from_slice(ORIGIN_INFO.as_bytes());
+    ctx.extend_from_slice(&key_hash);
+    let digest: [u8; 32] = Sha256::digest(&ctx).into();
+    Ok(anonymous_credit_tokens::Scalar::from_bytes_mod_order(
+        digest,
+    ))
+}
+
+/// Refuse a freshly issued credential whose issuer-chosen values could mark
+/// it. The issuance response fixes two values the issuance proof does not
+/// constrain to what the client asked for: the request context, which every
+/// later spend under this credential and its successors reveals in the
+/// clear, and the amount. A context other than the one every client under
+/// the key shares would make each of those spends recognisable as this
+/// issuance's, so it is checked before anything is stored; so is the amount.
+/// The context is read from a spend proof of nothing, built here and never
+/// sent, because the crate exposes a credential's context only that way.
+fn check_issued_credential(
+    token: &CreditToken,
+    params: &Params,
+    key_id: &str,
+    requested: i64,
+    issued: u128,
+) -> Result<(), AppError> {
+    if u128::try_from(requested).ok() != Some(issued) {
+        return Err(AppError::Credential {
+            message: "the server issued a different amount from the one requested".into(),
+        });
+    }
+    let (probe, _) = token
+        .prove_spend::<128>(params, anonymous_credit_tokens::Scalar::ZERO, OsRng)
+        .map_err(|e| AppError::Credential {
+            message: format!("failed to check the issued credential: {e:?}"),
+        })?;
+    if probe.context() != expected_request_context(key_id)? {
+        return Err(AppError::Credential {
+            message: "the server issued a credential under a request context other clients \
+                      under this key do not share"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+/// The ACT issuer key id of a CBOR-encoded public key: hex SHA-256 of its
+/// bytes, as the server computes it and every spend names it.
+fn issuer_key_id_of(public_key_cbor: &[u8]) -> String {
+    hex_encode(&Sha256::digest(public_key_cbor))
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -17461,6 +18521,89 @@ fn serialize_token_challenge() -> Vec<u8> {
 
 fn compute_challenge_digest() -> [u8; 32] {
     Sha256::digest(serialize_token_challenge()).into()
+}
+
+/// The `Authorization` value presenting one spend: the ACT Token
+/// (`token_type`, `challenge_digest`, `issuer_key_id`, the encoded spend
+/// proof) in the `PrivateToken` scheme, spelled by
+/// `eidola_common::private_token` (padded base64url, RFC 9577), the one
+/// spelling the gateway accepts. The spend and every recovery of it build
+/// the value here.
+fn spend_authorization(issuer_key_hash: &[u8], spend_proof_cbor: &[u8]) -> String {
+    let mut token = Vec::with_capacity(2 + 32 + issuer_key_hash.len() + spend_proof_cbor.len());
+    token.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+    token.extend_from_slice(&compute_challenge_digest());
+    token.extend_from_slice(issuer_key_hash);
+    token.extend_from_slice(spend_proof_cbor);
+    eidola_common::private_token::authorization_value(&token)
+}
+
+/// Domain separator for [`refund_recovery_key`].
+const REFUND_RECOVERY_KEY_DOMAIN: &[u8] = b"eidola-refund-recovery-key-v1\0";
+
+/// The refund recovery key for one spend
+/// (`eidola_common::refund_key`): SHA-256 over a domain separator and the
+/// spend's encoded `PreRefund`, the client-only state already kept for it.
+///
+/// The gateway seals the copy of the refund it stores under this key, and
+/// opens it on recovery only when the same key is presented, so it must be
+/// something only this client knows, and something every path that recovers
+/// a spend can rebuild. The `PreRefund` is both: its blinding factor `r` for
+/// the successor credential never leaves this client in the clear (spending
+/// the successor proves knowledge of it in zero knowledge), and the encoded
+/// bytes are stored beside the spend (`pre_credential_refund.pre_refund_data`)
+/// before the request is sent. Deriving the key from those bytes means no new
+/// secret to store and no state for a recovery to lose; hashing the exact
+/// stored bytes means the spend and every later recovery derive it from the
+/// same input. The domain separator keeps this use of the secret apart from
+/// its use inside the credential scheme.
+fn refund_recovery_key(pre_refund_cbor: &[u8]) -> zeroize::Zeroizing<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(REFUND_RECOVERY_KEY_DOMAIN);
+    hasher.update(pre_refund_cbor);
+    zeroize::Zeroizing::new(hasher.finalize().into())
+}
+
+/// Put a request's secrets on it: the `Authorization` value (an ACT spend
+/// proof, or an external backend's key) and an ACT spend's refund recovery
+/// key, each as a header value marked sensitive so an HTTP client's own
+/// `Debug` never shows it.
+///
+/// **The one place these headers are built** for the app's own requests (the
+/// turn transports, the chores, refund recovery); the local proxy builds its
+/// enumerated set through `proxy::route::is_secret_header`, which marks the
+/// same two. A value that cannot be a header value is passed through as the
+/// string, so the builder refuses it exactly as it did before (the refusal
+/// carries no value).
+pub(crate) fn with_credentials(
+    request: reqwest::RequestBuilder,
+    authorization: Option<&str>,
+    refund_key: Option<&[u8; 32]>,
+) -> reqwest::RequestBuilder {
+    let mut request = request;
+    if let Some(auth) = authorization {
+        request = match reqwest::header::HeaderValue::from_str(auth) {
+            Ok(mut value) => {
+                value.set_sensitive(true);
+                request.header(reqwest::header::AUTHORIZATION, value)
+            }
+            Err(_) => request.header(reqwest::header::AUTHORIZATION, auth),
+        };
+    }
+    if let Some(key) = refund_key {
+        request = request.header(REFUND_KEY_HEADER, refund_key_header_value(key));
+    }
+    request
+}
+
+/// The [`eidola_common::refund_key::REFUND_KEY_HEADER`] value for `key`,
+/// marked sensitive so it is never shown by an HTTP client's own debug output.
+fn refund_key_header_value(key: &[u8; 32]) -> reqwest::header::HeaderValue {
+    let text = zeroize::Zeroizing::new(eidola_common::refund_key::encode_refund_key(key));
+    let mut value = reqwest::header::HeaderValue::from_bytes(text.as_ref())
+        .expect("lowercase hex is a valid header value");
+    value.set_sensitive(true);
+    value
 }
 
 /// Current time as milliseconds since Unix epoch.
@@ -17695,6 +18838,101 @@ async fn insert_plain_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A spend's refund recovery key is a function of its stored
+    /// `PreRefund` bytes, and of nothing the server sees.** The spend and every
+    /// later recovery (in the turn, or the startup sweep from the stored row)
+    /// must rebuild the same key, and two spends must not share one.
+    #[test]
+    fn the_refund_recovery_key_is_rebuilt_from_the_stored_pre_refund() {
+        let params = Params::new("eidola", "inference", "production", "2026-03-05");
+        let issuer = anonymous_credit_tokens::PrivateKey::random(OsRng);
+        let pre = anonymous_credit_tokens::PreIssuance::random(OsRng);
+        let request = pre.request(&params, OsRng);
+        let response = issuer
+            .issue::<128>(
+                &params,
+                &request,
+                credit_to_scalar::<128>(1000).unwrap(),
+                anonymous_credit_tokens::Scalar::ZERO,
+                OsRng,
+            )
+            .unwrap();
+        let token = pre
+            .to_credit_token::<128>(&params, issuer.public(), &request, &response)
+            .unwrap();
+        let spend = |token: &CreditToken| {
+            let (proof, pre_refund) = token
+                .prove_spend::<128>(&params, credit_to_scalar::<128>(300).unwrap(), OsRng)
+                .unwrap();
+            (proof, pre_refund.to_cbor().unwrap())
+        };
+        let (proof, stored) = spend(&token);
+        let key = refund_recovery_key(&stored);
+
+        // Rebuilt from the stored bytes, and from a decode/re-encode of them.
+        assert_eq!(*refund_recovery_key(&stored.clone()), *key);
+        let reencoded = PreRefund::from_cbor(&stored).unwrap().to_cbor().unwrap();
+        assert_eq!(*refund_recovery_key(&reencoded), *key);
+
+        // Another spend's key is another key.
+        let (_, other) = spend(&token);
+        assert_ne!(*refund_recovery_key(&other), *key);
+
+        // Domain-separated: not a bare hash of the secret state, and not
+        // derivable from what the server is sent.
+        assert_ne!(<[u8; 32]>::from(Sha256::digest(&stored)), *key);
+        let proof_cbor = proof.to_cbor().unwrap();
+        assert_ne!(*refund_recovery_key(&proof_cbor), *key);
+        let text = eidola_common::refund_key::encode_refund_key(&key);
+        assert_eq!(
+            eidola_common::refund_key::decode_refund_key(&text),
+            Some(*key)
+        );
+        assert!(refund_key_header_value(&key).is_sensitive());
+    }
+
+    /// **A request's secrets travel as sent and print as nothing.** Both the
+    /// spend proof (or an external key) and the refund recovery key go on
+    /// marked sensitive, so the built request's `Debug` shows neither.
+    #[test]
+    fn a_requests_credentials_are_sensitive_headers() {
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let client = reqwest::Client::builder().build().unwrap();
+        let proof = "PrivateToken token=\"c3BlbmQtcHJvb2Y=\"";
+        let key = [0x6du8; 32];
+        let key_text =
+            String::from_utf8(eidola_common::refund_key::encode_refund_key(&key).to_vec()).unwrap();
+        let request = with_credentials(
+            client.post("http://127.0.0.1:9/v1/chat/completions"),
+            Some(proof),
+            Some(&key),
+        )
+        .build()
+        .unwrap();
+
+        let auth = request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .unwrap();
+        assert!(auth.is_sensitive());
+        assert_eq!(auth.as_bytes(), proof.as_bytes());
+        let sent_key = request.headers().get(REFUND_KEY_HEADER).unwrap();
+        assert!(sent_key.is_sensitive());
+        assert_eq!(sent_key.as_bytes(), key_text.as_bytes());
+
+        let shown = format!("{request:?}");
+        assert!(!shown.contains("c3BlbmQtcHJvb2Y"), "{shown}");
+        assert!(!shown.contains(&key_text), "{shown}");
+
+        // An external backend's bearer key, with no spend, is sensitive too.
+        let bearer = with_credentials(client.get("http://127.0.0.1:9/"), Some("Bearer sk-x"), None)
+            .build()
+            .unwrap();
+        assert!(bearer.headers()[reqwest::header::AUTHORIZATION].is_sensitive());
+        assert!(bearer.headers().get(REFUND_KEY_HEADER).is_none());
+        assert!(!format!("{bearer:?}").contains("sk-x"));
+    }
 
     /// **An event ends at any two line terminators the format allows.**
     ///
@@ -17963,6 +19201,149 @@ mod tests {
         assert_eq!(ms, 1767225600000);
     }
 
+    // --- Issuer key listings against the public calendar ---
+
+    const LISTED_DS: &str = "ACT-v1:eidola:inference:production:2026-03-05";
+
+    /// A listed key for `epoch` on the production calendar, whose public key
+    /// is `fill` repeated (the listing check hashes it, never decodes it).
+    fn listed(epoch: u64, fill: u8) -> IssuerKeyResponse {
+        let pk = vec![fill; 32];
+        let w = ISSUER_CALENDAR.windows(epoch).unwrap();
+        IssuerKeyResponse {
+            id: issuer_key_id_of(&pk),
+            public_key: URL_SAFE_NO_PAD.encode(&pk),
+            domain_separator: LISTED_DS.into(),
+            issue_from: rfc3339_utc(w.issue_from),
+            issue_until: rfc3339_utc(w.issue_until),
+            accept_until: rfc3339_utc(w.accept_until),
+        }
+    }
+
+    fn refusal_of(keys: &[IssuerKeyResponse]) -> Option<IssuerKeyRefusal> {
+        match checked_listing(&ISSUER_CALENDAR, keys, LISTED_DS) {
+            Err(AppError::IssuerKeyRefused { refusal }) => Some(refusal),
+            Err(e) => panic!("refused, but not by the calendar checks: {e}"),
+            Ok(_) => None,
+        }
+    }
+
+    #[test]
+    fn an_honest_listing_is_accepted_in_epoch_order() {
+        let mut other_ds = listed(2967, 9);
+        other_ds.domain_separator = "ACT-v1:someone:else:x:y".into();
+        let keys = [listed(2967, 3), listed(2965, 1), other_ds, listed(2966, 2)];
+        let checked = checked_listing(&ISSUER_CALENDAR, &keys, LISTED_DS).unwrap();
+        let epochs: Vec<u64> = checked.iter().map(|(e, _)| *e).collect();
+        assert_eq!(
+            epochs,
+            [2965, 2966, 2967],
+            "another separator's key is ignored"
+        );
+        // A key listed twice, identically, is one key.
+        assert_eq!(refusal_of(&[listed(2966, 2), listed(2966, 2)]), None);
+    }
+
+    /// The windows must be the calendar's own spelling, byte for byte: a
+    /// parse that rounds would let an off-calendar instant through.
+    #[test]
+    fn a_window_that_only_rounds_onto_the_calendar_is_refused() {
+        type Respell = fn(&mut IssuerKeyResponse);
+        let spellings: [(&str, Respell); 7] = [
+            ("a fraction of a second", |k| {
+                k.issue_from = k.issue_from.replace('Z', ".500Z")
+            }),
+            ("a fraction on the acceptance deadline", |k| {
+                k.accept_until = k.accept_until.replace('Z', ".999Z")
+            }),
+            ("no Z", |k| {
+                k.issue_until = k.issue_until.trim_end_matches('Z').into()
+            }),
+            ("an offset", |k| {
+                k.issue_from = k.issue_from.replace('Z', "+00:00")
+            }),
+            ("lower case", |k| k.issue_from = k.issue_from.to_lowercase()),
+            ("surrounding space", |k| {
+                k.issue_from = format!(" {}", k.issue_from)
+            }),
+            ("a signed year", |k| {
+                k.issue_from = format!("+{}", k.issue_from)
+            }),
+        ];
+        for (what, spell) in spellings {
+            let mut key = listed(2966, 2);
+            spell(&mut key);
+            assert_eq!(
+                refusal_of(&[key]),
+                Some(IssuerKeyRefusal::NotOnCalendar),
+                "{what} was accepted"
+            );
+        }
+        // A normalized instant: 24:00 on the 4th is the 5th to a lenient parser.
+        let mut key = listed(2966, 2);
+        let w = ISSUER_CALENDAR.windows(2966).unwrap();
+        assert_eq!(rfc3339_utc(w.issue_from), "2026-11-05T00:00:00Z");
+        key.issue_from = "2026-11-04T24:00:00Z".into();
+        assert_eq!(refusal_of(&[key]), Some(IssuerKeyRefusal::NotOnCalendar));
+    }
+
+    /// One key for two epochs is refused, whichever epochs and whatever the
+    /// order: listed as next epoch's too, it would leave next epoch
+    /// unrecorded for a different key to fill when it arrives.
+    #[test]
+    fn one_key_listed_for_two_epochs_is_refused() {
+        let mut next = listed(2966, 2);
+        let w = ISSUER_CALENDAR.windows(2967).unwrap();
+        next.issue_from = rfc3339_utc(w.issue_from);
+        next.issue_until = rfc3339_utc(w.issue_until);
+        next.accept_until = rfc3339_utc(w.accept_until);
+        for keys in [
+            vec![listed(2966, 2), next.clone()],
+            vec![next.clone(), listed(2966, 2)],
+            vec![listed(2965, 1), next, listed(2966, 2)],
+        ] {
+            assert_eq!(
+                refusal_of(&keys),
+                Some(IssuerKeyRefusal::OneKeyForSeveralEpochs { epoch: 2967 })
+            );
+        }
+    }
+
+    /// Two keys for one epoch are refused wherever they sit in the listing —
+    /// the next epoch's included, which no check at issuance would otherwise
+    /// look at, and in either order, so the server's ordering decides nothing.
+    #[test]
+    fn two_keys_for_any_one_epoch_are_refused() {
+        for keys in [
+            vec![listed(2966, 2), listed(2967, 3), listed(2967, 4)],
+            vec![listed(2967, 4), listed(2966, 2), listed(2967, 3)],
+            vec![listed(2966, 5), listed(2966, 2)],
+        ] {
+            assert!(matches!(
+                refusal_of(&keys),
+                Some(IssuerKeyRefusal::SecondKeyForEpoch { .. })
+            ));
+        }
+    }
+
+    /// Every entry is held to the checks, not only the current key: an entry
+    /// that escaped them would escape being recorded.
+    #[test]
+    fn every_listed_key_is_held_to_the_checks() {
+        let mut off = listed(2967, 3);
+        off.issue_from = off.issue_from.replace("T00", "T01");
+        assert_eq!(
+            refusal_of(&[listed(2966, 2), off]),
+            Some(IssuerKeyRefusal::NotOnCalendar)
+        );
+        let mut mislabelled = listed(2967, 3);
+        mislabelled.id = listed(2967, 4).id;
+        assert!(matches!(
+            checked_listing(&ISSUER_CALENDAR, &[listed(2966, 2), mislabelled], LISTED_DS),
+            Err(AppError::Credential { .. })
+        ));
+    }
+
     #[test]
     fn token_challenge_serialization() {
         let buf = serialize_token_challenge();
@@ -18221,6 +19602,23 @@ mod tests {
         // A document the server has stopped requiring is not a problem.
         let recorded = [doc("terms_of_service", 1), doc("retired_notice", 9)];
         assert!(documents_not_covered(&[doc("terms_of_service", 1)], &recorded).is_empty());
+    }
+
+    #[test]
+    fn only_a_retry_refusal_no_attempt_in_flight_can_overturn_is_final() {
+        let status = |code: u16| reqwest::StatusCode::from_u16(code).unwrap();
+        for code in [400, 409, 422] {
+            assert!(
+                retry_refusal_is_final(status(code)),
+                "{code} should be final"
+            );
+        }
+        for code in [401, 402, 403, 404, 408, 413, 428, 429, 500, 502, 503] {
+            assert!(
+                !retry_refusal_is_final(status(code)),
+                "{code} must stay pending"
+            );
+        }
     }
 
     #[test]

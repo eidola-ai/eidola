@@ -23,3 +23,6 @@ space-answer-cut-off = Cette réponse s’est arrêtée à sa limite de longueur
 space-continue-answer = Continuer
 space-continue-answer-label = Poursuivre cette réponse là où elle s’est arrêtée
 space-continuing = Poursuite de la réponse…
+space-error-issuer-key-off-calendar = Le serveur d’Eidola a proposé une clé de paiement qui ne suit pas le calendrier public des clés ; cette application ne l’a donc pas utilisée. Rien n’a été envoyé ni facturé, et les crédits que vous détenez déjà fonctionnent toujours.
+space-error-issuer-key-second-for-epoch = Le serveur d’Eidola a proposé cette semaine une clé de paiement différente de celle que cette application connaît déjà. Un serveur honnête n’utilise qu’une clé par semaine : cette application n’acceptera donc pas de nouveaux crédits sous cette clé avant celle de la semaine prochaine. Rien n’a été envoyé ni facturé, et les crédits que vous détenez déjà fonctionnent toujours.
+space-error-issuer-key-reused = Le serveur d’Eidola a proposé la même clé de paiement pour deux semaines différentes, ce qu’un serveur honnête ne fait jamais ; cette application ne l’a donc pas utilisée. Rien n’a été envoyé ni facturé, et les crédits que vous détenez déjà fonctionnent toujours.

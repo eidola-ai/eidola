@@ -139,6 +139,10 @@ pub fn open_app_core() -> Result<Arc<AppCore>, eidola_app_core::error::AppError>
     // Eidola builds its core, it cannot be forgotten. It costs an install with
     // no delegated conversations exactly one empty sweep.
     core.start_subspace_driver();
+    // **And it keeps credits issued ahead of need.** The provisioner belongs to
+    // the long-lived process for the same reason: a one-shot CLI exits long
+    // before its first look, and this is the process that holds the profile.
+    core.start_credential_provisioner();
     Ok(core)
 }
 

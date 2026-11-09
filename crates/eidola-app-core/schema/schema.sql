@@ -9,8 +9,39 @@ CREATE TABLE issuer_key (
     params_hash     TEXT NOT NULL,
     public_key_data BLOB NOT NULL,
     params_data     BLOB NOT NULL,
-    expires_at      INTEGER NOT NULL,         -- ms since epoch
-    created_at      INTEGER NOT NULL
+    -- Two deadlines, both ms since epoch, both derived from the server's
+    -- `accept_until` (the instant it stops accepting this key's credentials;
+    -- one epoch after the key stops *issuing* at `issue_until`, which is why
+    -- neither deadline is read from `issue_until`).
+    --   spend_until:  the last instant a new spend may begin —
+    --                 `accept_until` minus `CREDENTIAL_SPEND_MARGIN`, so a
+    --                 spend started at the deadline still reaches the server
+    --                 inside its acceptance window.
+    --   accept_until: the server's deadline itself. A spend already in flight
+    --                 stays recoverable until here.
+    spend_until     INTEGER NOT NULL,
+    accept_until    INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL,
+
+    CHECK (spend_until <= accept_until)
+);
+
+-- The issuer key this client has seen for each epoch of the public issuer
+-- calendar, per server (`scope`: the eidola backend's base URL). The first
+-- key seen for an epoch is the only one this client will issue under for
+-- it: an honest server has exactly one key per epoch and never rotates
+-- within one, so a second key for an epoch already recorded is refused
+-- (`AppError::IssuerKeyRefused`). Written from every `GET /v1/keys` listing
+-- the client acts on, which includes the next epoch's key a whole epoch
+-- before it issues. Rows whose epoch can no longer be listed are pruned.
+CREATE TABLE issuer_key_epoch (
+    scope         TEXT NOT NULL,
+    epoch         INTEGER NOT NULL,
+    issuer_key_id TEXT NOT NULL,
+    -- ms since epoch; for the reader, nothing decides on it.
+    first_seen    INTEGER NOT NULL,
+
+    PRIMARY KEY (scope, epoch)
 );
 
 CREATE TABLE pre_credential (
@@ -22,6 +53,21 @@ CREATE TABLE pre_credential (
     credits          INTEGER,
     spend_amount     INTEGER,
     spend_proof_data BLOB,
+    -- Issuance only, all written before the request is first sent, so a
+    -- retry after a lost response or a crash sends the same request under the
+    -- same idempotency key and the server answers it from what it stored:
+    --   idempotency_key:  32 random bytes naming this issuance to the server.
+    --   issuance_request: the CBOR IssuanceRequest exactly as sent (its proof
+    --                     is randomized, so it cannot be rebuilt).
+    --   account_id:       the account it was sent for; a retry is only ever
+    --                     sent for that account.
+    --   abandoned_at:     set when the server answered in a way that means
+    --                     nothing was or will be debited for it, so nothing
+    --                     is left to recover.
+    idempotency_key  BLOB,
+    issuance_request BLOB,
+    account_id       TEXT,
+    abandoned_at     INTEGER,
     created_at       INTEGER NOT NULL,
 
     CHECK (
@@ -29,13 +75,20 @@ CREATE TABLE pre_credential (
             AND credential_nonce IS NULL
             AND spend_amount IS NULL
             AND spend_proof_data IS NULL
-            AND credits IS NOT NULL)
+            AND credits IS NOT NULL
+            AND length(idempotency_key) = 32
+            AND issuance_request IS NOT NULL
+            AND account_id IS NOT NULL)
         OR
         (type = 'refund'
             AND credential_nonce IS NOT NULL
             AND spend_amount IS NOT NULL
             AND spend_proof_data IS NOT NULL
-            AND credits IS NULL)
+            AND credits IS NULL
+            AND idempotency_key IS NULL
+            AND issuance_request IS NULL
+            AND account_id IS NULL
+            AND abandoned_at IS NULL)
     )
 );
 
@@ -1118,9 +1171,16 @@ SELECT
     c.generation,
     c.created_at,
     c.issuer_key_id,
+    -- `expired` is reached two ways. A credential with no spend begun lapses
+    -- at its key's `spend_until`: no new spend may start under it. One with a
+    -- spend in flight (or settled) lapses only at `accept_until`, so recovery
+    -- of an interrupted spend is still attempted while the server would honour
+    -- it.
     CASE
-        WHEN ik.expires_at IS NOT NULL
-             AND ik.expires_at < (strftime('%s', 'now') * 1000)
+        WHEN ik.accept_until <= (strftime('%s', 'now') * 1000)
+                                                    THEN 'expired'
+        WHEN pc_spend.id IS NULL
+             AND ik.spend_until <= (strftime('%s', 'now') * 1000)
                                                     THEN 'expired'
         WHEN pc_spend.id IS NULL                    THEN 'active'
         WHEN c_next.nonce IS NULL                   THEN 'spending'

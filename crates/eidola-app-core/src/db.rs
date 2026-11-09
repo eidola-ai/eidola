@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 14;
+const LATEST_VERSION: i64 = 17;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -507,24 +507,36 @@ async fn set_user_version(conn: &Connection, version: i64) -> Result<(), AppErro
 // Layer 0 — Wallet: Issuer key operations
 // ---------------------------------------------------------------------------
 
+/// The local lifecycle deadlines of one issuer key, both ms since epoch (see
+/// the `issuer_key` table in `schema.sql`): `spend_until` is the last instant a
+/// new spend may begin under the key, `accept_until` the server's own
+/// acceptance deadline, until which an in-flight spend stays recoverable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IssuerKeyDeadlines {
+    pub spend_until: i64,
+    pub accept_until: i64,
+}
+
 pub async fn upsert_issuer_key(
     conn: &Connection,
     id: &str,
     params_hash: &str,
     public_key_data: &[u8],
     params_data: &[u8],
-    expires_at: i64,
+    deadlines: IssuerKeyDeadlines,
     created_at: i64,
 ) -> Result<(), AppError> {
     conn.execute(
-        "INSERT OR IGNORE INTO issuer_key (id, params_hash, public_key_data, params_data, expires_at, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR IGNORE INTO issuer_key \
+             (id, params_hash, public_key_data, params_data, spend_until, accept_until, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         (
             Value::Text(id.to_string()),
             Value::Text(params_hash.to_string()),
             Value::Blob(public_key_data.to_vec()),
             Value::Blob(params_data.to_vec()),
-            Value::Integer(expires_at),
+            Value::Integer(deadlines.spend_until),
+            Value::Integer(deadlines.accept_until),
             Value::Integer(created_at),
         ),
     )
@@ -535,27 +547,149 @@ pub async fn upsert_issuer_key(
     Ok(())
 }
 
+/// What the per-epoch key record says about one listed key
+/// ([`pin_issuer_key_epoch`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinnedIssuerKey {
+    /// The key recorded for the epoch: the first one seen for it.
+    pub key_id: String,
+    /// Another epoch this same key is recorded for, if any. An honest server
+    /// has a distinct key for every epoch.
+    pub also_recorded_for: Option<u64>,
+}
+
+/// Record `issuer_key_id` as the key for `epoch` at `scope` unless one is
+/// already recorded, and say what the record holds either way: the key
+/// recorded for the epoch (the first key seen for an epoch is the one that
+/// stands; see the `issuer_key_epoch` table), and any other epoch the same
+/// key is recorded for. Epochs before `oldest_kept` are pruned in the same
+/// transaction.
+pub async fn pin_issuer_key_epoch(
+    conn: &Connection,
+    scope: &str,
+    epoch: u64,
+    issuer_key_id: &str,
+    oldest_kept: u64,
+    now: i64,
+) -> Result<PinnedIssuerKey, AppError> {
+    let epoch = i64::try_from(epoch).map_err(|_| AppError::Credential {
+        message: "issuer epoch out of range".into(),
+    })?;
+    let oldest = i64::try_from(oldest_kept).unwrap_or(i64::MAX);
+    begin_write(conn).await?;
+    match pin_issuer_key_epoch_body(conn, scope, epoch, issuer_key_id, oldest, now).await {
+        Ok(pinned) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(pinned)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn pin_issuer_key_epoch_body(
+    conn: &Connection,
+    scope: &str,
+    epoch: i64,
+    issuer_key_id: &str,
+    oldest: i64,
+    now: i64,
+) -> Result<PinnedIssuerKey, AppError> {
+    conn.execute(
+        "DELETE FROM issuer_key_epoch WHERE scope = ?1 AND epoch < ?2",
+        (Value::Text(scope.to_string()), Value::Integer(oldest)),
+    )
+    .await
+    .map_err(AppError::db)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO issuer_key_epoch (scope, epoch, issuer_key_id, first_seen) \
+         VALUES (?1, ?2, ?3, ?4)",
+        (
+            Value::Text(scope.to_string()),
+            Value::Integer(epoch),
+            Value::Text(issuer_key_id.to_string()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+    let mut rows = conn
+        .query(
+            "SELECT issuer_key_id FROM issuer_key_epoch WHERE scope = ?1 AND epoch = ?2",
+            (Value::Text(scope.to_string()), Value::Integer(epoch)),
+        )
+        .await
+        .map_err(AppError::db)?;
+    let key_id = match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<String>(0).map_err(AppError::db)?,
+        None => {
+            return Err(AppError::Database {
+                message: "issuer key epoch record vanished".into(),
+            });
+        }
+    };
+    drop(rows);
+    let mut rows = conn
+        .query(
+            "SELECT epoch FROM issuer_key_epoch \
+             WHERE scope = ?1 AND issuer_key_id = ?2 AND epoch != ?3 ORDER BY epoch LIMIT 1",
+            (
+                Value::Text(scope.to_string()),
+                Value::Text(issuer_key_id.to_string()),
+                Value::Integer(epoch),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    let also_recorded_for = match rows.next().await.map_err(AppError::db)? {
+        Some(row) => u64::try_from(row.get::<i64>(0).map_err(AppError::db)?).ok(),
+        None => None,
+    };
+    Ok(PinnedIssuerKey {
+        key_id,
+        also_recorded_for,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Layer 0 — Wallet: Pre-credential operations
 // ---------------------------------------------------------------------------
 
+/// What an issuance's pre-credential row records, written before the request
+/// is first sent (see the `pre_credential` table).
+pub struct PreIssuanceRecord<'a> {
+    pub id: &'a str,
+    pub issuer_key_id: &'a str,
+    /// The CBOR `PreIssuance` (the client's secret issuance state).
+    pub data: &'a [u8],
+    pub credits: i64,
+    pub idempotency_key: &'a [u8; 32],
+    /// The CBOR `IssuanceRequest` exactly as it is sent.
+    pub issuance_request: &'a [u8],
+    pub account_id: &'a str,
+    pub created_at: i64,
+}
+
 pub async fn insert_pre_credential_issuance(
     conn: &Connection,
-    id: &str,
-    issuer_key_id: &str,
-    data: &[u8],
-    credits: i64,
-    created_at: i64,
+    record: &PreIssuanceRecord<'_>,
 ) -> Result<(), AppError> {
     conn.execute(
-        "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, spend_amount, created_at) \
-         VALUES (?1, 'issuance', NULL, ?2, ?3, ?4, NULL, ?5)",
+        "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, \
+         spend_amount, idempotency_key, issuance_request, account_id, created_at) \
+         VALUES (?1, 'issuance', NULL, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8)",
         (
-            Value::Text(id.to_string()),
-            Value::Text(issuer_key_id.to_string()),
-            Value::Blob(data.to_vec()),
-            Value::Integer(credits),
-            Value::Integer(created_at),
+            Value::Text(record.id.to_string()),
+            Value::Text(record.issuer_key_id.to_string()),
+            Value::Blob(record.data.to_vec()),
+            Value::Integer(record.credits),
+            Value::Blob(record.idempotency_key.to_vec()),
+            Value::Blob(record.issuance_request.to_vec()),
+            Value::Text(record.account_id.to_string()),
+            Value::Integer(record.created_at),
         ),
     )
     .await
@@ -563,6 +697,125 @@ pub async fn insert_pre_credential_issuance(
         message: format!("failed to insert pre_credential: {e}"),
     })?;
     Ok(())
+}
+
+/// An issuance whose response never landed: its pre-credential row has no
+/// credential, was not abandoned, and its key still lets a new spend begin.
+pub struct PendingIssuance {
+    pub id: String,
+    pub issuer_key_id: String,
+    pub data: Vec<u8>,
+    pub credits: i64,
+    pub idempotency_key: Vec<u8>,
+    pub issuance_request: Vec<u8>,
+    pub account_id: String,
+    pub created_at: i64,
+    pub public_key_data: Vec<u8>,
+}
+
+/// Every [`PendingIssuance`] at `now`, oldest first.
+pub async fn list_pending_issuances(
+    conn: &Connection,
+    now: i64,
+) -> Result<Vec<PendingIssuance>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT pc.id, pc.issuer_key_id, pc.data, pc.credits, pc.idempotency_key, \
+             pc.issuance_request, pc.account_id, pc.created_at, ik.public_key_data \
+             FROM pre_credential pc \
+             JOIN issuer_key ik ON ik.id = pc.issuer_key_id \
+             WHERE pc.type = 'issuance' \
+               AND pc.abandoned_at IS NULL \
+               AND ik.spend_until > ?1 \
+               AND NOT EXISTS (SELECT 1 FROM credential c WHERE c.pre_credential_id = pc.id) \
+             ORDER BY pc.created_at",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query([now]).await.map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(PendingIssuance {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            issuer_key_id: row.get::<String>(1).map_err(AppError::db)?,
+            data: row.get::<Vec<u8>>(2).map_err(AppError::db)?,
+            credits: row.get::<i64>(3).map_err(AppError::db)?,
+            idempotency_key: row.get::<Vec<u8>>(4).map_err(AppError::db)?,
+            issuance_request: row.get::<Vec<u8>>(5).map_err(AppError::db)?,
+            account_id: row.get::<String>(6).map_err(AppError::db)?,
+            created_at: row.get::<i64>(7).map_err(AppError::db)?,
+            public_key_data: row.get::<Vec<u8>>(8).map_err(AppError::db)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Mark an issuance the server answered as debiting nothing, so recovery
+/// stops asking for it. Idempotent.
+pub async fn abandon_pre_credential_issuance(
+    conn: &Connection,
+    id: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE pre_credential SET abandoned_at = ?2 \
+         WHERE id = ?1 AND type = 'issuance' AND abandoned_at IS NULL",
+        (Value::Text(id.to_string()), Value::Integer(now)),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to abandon pre_credential: {e}"),
+    })?;
+    Ok(())
+}
+
+/// The credits the wallet can still spend at `now` from credentials whose key
+/// lets a spend begin until at least `horizon_until`: every active
+/// credential's balance, plus what an in-flight spend's successor is worth at
+/// least (its balance less the charge held). A credential about to lapse is
+/// left out, since it cannot carry the next few days' spending.
+pub async fn spendable_credits_until(
+    conn: &Connection,
+    now: i64,
+    horizon_until: i64,
+) -> Result<i64, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT COALESCE(SUM(CASE \
+                 WHEN pc.id IS NULL THEN c.credits \
+                 WHEN c_next.nonce IS NULL THEN MAX(c.credits - pc.spend_amount, 0) \
+                 ELSE 0 END), 0) \
+             FROM credential c \
+             JOIN issuer_key ik ON ik.id = c.issuer_key_id \
+             LEFT JOIN pre_credential pc \
+                 ON pc.credential_nonce = c.nonce AND pc.type = 'refund' \
+             LEFT JOIN credential c_next ON c_next.pre_credential_id = pc.id \
+             WHERE ik.spend_until > ?2 AND ik.accept_until > ?1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Integer(now), Value::Integer(horizon_until)))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<i64>(0).map_err(AppError::db),
+        None => Ok(0),
+    }
+}
+
+/// When this wallet last began a spend (the newest spend pre-credential), if
+/// it ever has.
+pub async fn last_spend_at(conn: &Connection) -> Result<Option<i64>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT MAX(created_at) FROM pre_credential WHERE type = 'refund'")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<Option<i64>>(0).map_err(AppError::db),
+        None => Ok(None),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11328,14 +11581,29 @@ mod tests {
             "ph",
             b"pub",
             b"params",
-            99_999_999_999_999,
+            IssuerKeyDeadlines {
+                spend_until: 99_999_999_999_999,
+                accept_until: 99_999_999_999_999,
+            },
             1_000,
         )
         .await
         .unwrap();
-        insert_pre_credential_issuance(conn, "pc-1", "ik-1", b"pre", 10_000, 1_000)
-            .await
-            .unwrap();
+        insert_pre_credential_issuance(
+            conn,
+            &PreIssuanceRecord {
+                id: "pc-1",
+                issuer_key_id: "ik-1",
+                data: b"pre",
+                credits: 10_000,
+                idempotency_key: &[0u8; 32],
+                issuance_request: b"request",
+                account_id: "account",
+                created_at: 1_000,
+            },
+        )
+        .await
+        .unwrap();
         insert_credential(conn, "nonce-1", "pc-1", "ik-1", b"cred", 10_000, 0, 1_100)
             .await
             .unwrap();
@@ -11572,18 +11840,236 @@ mod tests {
         assert_eq!(states, vec![("nonce-2", "active"), ("nonce-1", "spent")]);
 
         // An expired issuer key flips its credentials to expired.
-        upsert_issuer_key(&conn, "ik-exp", "ph", b"pub", b"params", 1, 1_000)
-            .await
-            .unwrap();
-        insert_pre_credential_issuance(&conn, "pc-exp", "ik-exp", b"pre", 5, 4_000)
-            .await
-            .unwrap();
+        upsert_issuer_key(
+            &conn,
+            "ik-exp",
+            "ph",
+            b"pub",
+            b"params",
+            IssuerKeyDeadlines {
+                spend_until: 1,
+                accept_until: 1,
+            },
+            1_000,
+        )
+        .await
+        .unwrap();
+        insert_pre_credential_issuance(
+            &conn,
+            &PreIssuanceRecord {
+                id: "pc-exp",
+                issuer_key_id: "ik-exp",
+                data: b"pre",
+                credits: 5,
+                idempotency_key: &[0u8; 32],
+                issuance_request: b"request",
+                account_id: "account",
+                created_at: 4_000,
+            },
+        )
+        .await
+        .unwrap();
         insert_credential(&conn, "nonce-exp", "pc-exp", "ik-exp", b"c", 5, 0, 4_000)
             .await
             .unwrap();
         let lc = list_credential_lifecycle(&conn).await.unwrap();
         let exp = lc.iter().find(|r| r.nonce == "nonce-exp").unwrap();
         assert_eq!(exp.state, "expired");
+    }
+
+    /// The first key recorded for an epoch stands: a second one for the same
+    /// epoch reads back the first, another epoch's key is recorded on its
+    /// own, a key recorded for one epoch is reported when it turns up for
+    /// another, another server's record is separate, and epochs past the
+    /// record's horizon are pruned.
+    #[tokio::test]
+    async fn the_first_key_seen_for_an_epoch_stands() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+        let a = "https://a.example";
+        let b = "https://b.example";
+        let pin = |scope: &'static str, epoch: u64, id: &'static str, oldest: u64| {
+            let conn = conn.clone();
+            async move {
+                pin_issuer_key_epoch(&conn, scope, epoch, id, oldest, 1)
+                    .await
+                    .unwrap()
+            }
+        };
+        let first = |id: &str| PinnedIssuerKey {
+            key_id: id.to_string(),
+            also_recorded_for: None,
+        };
+
+        assert_eq!(pin(a, 10, "k10", 9).await, first("k10"));
+        assert_eq!(
+            pin(a, 10, "other", 9).await,
+            first("k10"),
+            "a second key for a seen epoch does not replace the first"
+        );
+        assert_eq!(pin(a, 11, "k11", 9).await, first("k11"));
+        assert_eq!(
+            pin(b, 10, "b10", 9).await,
+            first("b10"),
+            "each server's epochs are its own"
+        );
+        // The same key offered for another epoch is recorded there too, and
+        // the record says where else it stands.
+        assert_eq!(
+            pin(a, 13, "k10", 9).await,
+            PinnedIssuerKey {
+                key_id: "k10".into(),
+                also_recorded_for: Some(10),
+            }
+        );
+        assert_eq!(
+            pin(b, 11, "k10", 9).await,
+            first("k10"),
+            "another server's record is not consulted"
+        );
+
+        // Moving on prunes epochs before the horizon for that server only.
+        assert_eq!(
+            pin(a, 12, "k12", 11).await,
+            PinnedIssuerKey {
+                key_id: "k12".into(),
+                also_recorded_for: None,
+            }
+        );
+        let mut rows = conn
+            .query(
+                "SELECT scope, epoch FROM issuer_key_epoch ORDER BY scope, epoch",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            seen.push((row.get::<String>(0).unwrap(), row.get::<i64>(1).unwrap()));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (a.to_string(), 11),
+                (a.to_string(), 12),
+                (a.to_string(), 13),
+                (b.to_string(), 10),
+                (b.to_string(), 11)
+            ]
+        );
+    }
+
+    /// A key's two deadlines split the lifecycle: past `spend_until` an unspent
+    /// credential is `expired` (no new spend may start, so the provisioning
+    /// queue cannot pick it), but one whose spend is already in flight stays
+    /// `spending` — recoverable — until `accept_until`, when everything under
+    /// the key is `expired`.
+    #[tokio::test]
+    async fn spend_and_accept_deadlines_split_the_lifecycle() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+        let now = crate::now_ms();
+        let hour = 3_600_000;
+
+        async fn credential_under(conn: &Connection, key: &str, nonce: &str, credits: i64) {
+            let pc = format!("pc-{nonce}");
+            insert_pre_credential_issuance(
+                conn,
+                &PreIssuanceRecord {
+                    id: &pc,
+                    issuer_key_id: key,
+                    data: b"pre",
+                    credits,
+                    idempotency_key: &[0u8; 32],
+                    issuance_request: b"request",
+                    account_id: "account",
+                    created_at: 1_000,
+                },
+            )
+            .await
+            .unwrap();
+            insert_credential(conn, nonce, &pc, key, b"cred", credits, 0, 1_000)
+                .await
+                .unwrap();
+        }
+        async fn key(
+            conn: &Connection,
+            id: &str,
+            spend_until: i64,
+            accept_until: i64,
+        ) -> Result<(), AppError> {
+            let deadlines = IssuerKeyDeadlines {
+                spend_until,
+                accept_until,
+            };
+            upsert_issuer_key(conn, id, "ph", b"pub", b"params", deadlines, 1_000).await
+        }
+
+        // Spend deadline still ahead: spendable.
+        key(&conn, "ik-live", now + hour, now + 2 * hour)
+            .await
+            .unwrap();
+        credential_under(&conn, "ik-live", "live", 50).await;
+        // Spend deadline passed, acceptance deadline ahead.
+        key(&conn, "ik-margin", now - 1_000, now + hour)
+            .await
+            .unwrap();
+        credential_under(&conn, "ik-margin", "margin-idle", 10).await;
+        credential_under(&conn, "ik-margin", "margin-flying", 10).await;
+        insert_pre_credential_refund(
+            &conn,
+            "pc-margin-refund",
+            "margin-flying",
+            "ik-margin",
+            b"pre-refund",
+            4,
+            b"proof",
+            2_000,
+        )
+        .await
+        .unwrap();
+        // Acceptance deadline passed: everything lapses, in flight or not.
+        key(&conn, "ik-gone", now - 2_000, now - 1_000)
+            .await
+            .unwrap();
+        credential_under(&conn, "ik-gone", "gone-flying", 10).await;
+        insert_pre_credential_refund(
+            &conn,
+            "pc-gone-refund",
+            "gone-flying",
+            "ik-gone",
+            b"pre-refund",
+            4,
+            b"proof",
+            2_000,
+        )
+        .await
+        .unwrap();
+
+        let lc = list_credential_lifecycle(&conn).await.unwrap();
+        let state = |nonce: &str| {
+            lc.iter()
+                .find(|r| r.nonce == nonce)
+                .map(|r| r.state.clone())
+                .unwrap()
+        };
+        assert_eq!(state("live"), "active");
+        assert_eq!(state("margin-idle"), "expired");
+        assert_eq!(state("margin-flying"), "spending");
+        assert_eq!(state("gone-flying"), "expired");
+
+        // The provisioning queue reads the same view: the smaller credential
+        // past its spend deadline is never the best fit, the live one is.
+        let picked = find_spendable_credential(&conn, 1).await.unwrap().unwrap();
+        assert_eq!(picked.nonce, "live");
+        // Recovery still sees the in-flight spend inside the acceptance window.
+        let flying: Vec<String> = list_spending_credentials(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.nonce)
+            .collect();
+        assert_eq!(flying, vec!["margin-flying".to_string()]);
     }
 
     #[tokio::test]
