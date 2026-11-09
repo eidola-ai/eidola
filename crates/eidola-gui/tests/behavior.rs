@@ -17418,6 +17418,66 @@ async fn an_archived_conversations_refusal_is_localized(cx: &mut gpui::TestAppCo
     }
 }
 
+/// A refused issuer key is the reader's protection, not a network blip, and
+/// says so in their language: each refusal has its own words, never the
+/// error's English `Display`, and they follow a locale change.
+#[gpui::test]
+async fn a_refused_issuer_key_says_so_in_the_readers_language(cx: &mut gpui::TestAppContext) {
+    use eidola_app_core::error::IssuerKeyRefusal;
+    for (refusal, english_start, french_start) in [
+        (
+            IssuerKeyRefusal::NotOnCalendar,
+            "Eidola’s server offered a payment key that doesn’t follow the public key schedule",
+            "Le serveur d’Eidola a proposé une clé de paiement qui ne suit pas",
+        ),
+        (
+            IssuerKeyRefusal::SecondKeyForEpoch { epoch: 2966 },
+            "Eidola’s server offered a different payment key this week",
+            "Le serveur d’Eidola a proposé cette semaine une clé de paiement différente",
+        ),
+        (
+            IssuerKeyRefusal::OneKeyForSeveralEpochs { epoch: 2967 },
+            "Eidola’s server offered the same payment key for two different weeks",
+            "Le serveur d’Eidola a proposé la même clé de paiement pour deux semaines",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+        let stores = stub_stores_with_agents(cx, "s");
+        let (window, view) = open_space(cx, &stores, Some("s".into()));
+        let space = view.read_with(cx, |v, _| v.space().clone());
+        cx.update_window(window, |_, _, cx| {
+            space.update(cx, |s, cx| {
+                s.set_post_tree_for_test(vec![fixture_user_post("a1", "the only post")], cx)
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let error = AppError::IssuerKeyRefused {
+            refusal: refusal.clone(),
+        };
+        let display = error.to_string();
+        cx.update_window(window, |_, _, cx| {
+            space.update(cx, |s, cx| {
+                s.apply_turn_failure_for_test("agent-b", "a1", error, cx)
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        let english = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+        assert!(english.starts_with(english_start), "{refusal:?}: {english}");
+        assert_ne!(
+            english, display,
+            "the raw Display must not be what a reader sees"
+        );
+        cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+        cx.run_until_parked();
+        let french = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+        assert!(french.starts_with(french_start), "{refusal:?}: {french}");
+    }
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+}
+
 /// **A selection that has gone stale fails honestly, by name, and nothing
 /// answers in its place.**
 ///

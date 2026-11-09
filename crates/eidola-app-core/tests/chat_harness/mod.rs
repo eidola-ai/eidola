@@ -50,6 +50,7 @@ use anonymous_credit_tokens::{
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use eidola_app_core::AppCore;
+use eidola_common::issuer_calendar::{ISSUER_CALENDAR, IssuerCalendar};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -624,6 +625,182 @@ pub struct MockConfig {
     /// answers instantly, which makes an in-flight turn unobservable, so a test
     /// about *concurrency* asks for a window it can act inside.
     pub chat_delay_ms: u64,
+    /// When set, the issuance response names this issuer key id instead of the
+    /// key that actually signed it. `None` — the default — names the real key.
+    pub issued_key_id: Option<String>,
+    /// When set, every refund (in band and recovered) names this issuer key id
+    /// instead of the key that actually signed it. `None` names the real key.
+    pub refund_key_id: Option<String>,
+    /// When set, issuance signs under this request context instead of the one
+    /// every credential under the key shares. `None` uses the shared one.
+    pub issuance_context: Option<Scalar>,
+    /// Credits added to what the client asked for at issuance. Zero issues
+    /// exactly the requested amount.
+    pub issuance_extra_credits: i64,
+    /// The current issuer key's `(issue_from, issue_until, accept_until)` as
+    /// `GET /v1/keys` advertises them. `None` — the default — is the current
+    /// epoch's windows on [`MockConfig::issuer_calendar`], so no test written
+    /// before key deadlines mattered can meet one. A test about a key's
+    /// deadlines sets them relative to now ([`KeyWindow::epoch_ending_at`]),
+    /// with the calendar that puts them on one.
+    pub key_window: Option<KeyWindow>,
+    /// The issuer calendar the mock lists windows on and the client checks
+    /// them against (`AppCore::test_set_issuer_calendar`, applied by
+    /// [`core_for`]). `None` is the production calendar.
+    pub issuer_calendar: Option<IssuerCalendar>,
+    /// Switch the mock to a second, real issuer key: listed as current and
+    /// signing issuances, in the same epoch as the first. What a server
+    /// rotating within an epoch (or singling a client out) looks like.
+    pub key_swap: KeySwap,
+    /// Stop listing the previous epoch's key: a listing that leaves out the
+    /// one entry a key reused from it would otherwise collide with.
+    pub omit_previous_key: Arc<std::sync::atomic::AtomicBool>,
+    /// How `POST /v1/account/credentials` misbehaves, switchable mid-test
+    /// (see [`IssuanceKnobs`]). The default answers every request.
+    pub issuance: IssuanceKnobs,
+}
+
+/// See [`MockConfig::key_swap`].
+#[derive(Clone, Default)]
+pub struct KeySwap(Arc<KeySwapState>);
+
+#[derive(Default)]
+struct KeySwapState {
+    on: std::sync::atomic::AtomicBool,
+    second: std::sync::OnceLock<Issuer>,
+}
+
+impl KeySwap {
+    /// From now on, list and issue under the second key.
+    pub fn swap(&self) {
+        self.0.on.store(true, Ordering::SeqCst);
+    }
+
+    /// The second key's id.
+    pub fn second_key_id(&self) -> String {
+        self.second().key_id_hex.clone()
+    }
+
+    fn second(&self) -> &Issuer {
+        self.0.second.get_or_init(Issuer::new)
+    }
+
+    /// The issuer that lists and issues: the second one once swapped.
+    fn active<'a>(&'a self, first: &'a Issuer) -> &'a Issuer {
+        if self.0.on.load(Ordering::SeqCst) {
+            self.second()
+        } else {
+            first
+        }
+    }
+}
+
+/// Switches on the mock's issuance endpoint, shared with the running server so
+/// a test can flip one between two requests.
+#[derive(Clone, Default)]
+pub struct IssuanceKnobs(Arc<IssuanceKnobState>);
+
+#[derive(Default)]
+struct IssuanceKnobState {
+    /// How many upcoming issuances are recorded (debited and stored, as the
+    /// real server does) and then answered with nothing: the connection is
+    /// closed before a response is written — a lost response.
+    lose: std::sync::atomic::AtomicU32,
+    /// When non-zero, every issuance not already stored is refused with this
+    /// status before anything is debited.
+    refuse_with: std::sync::atomic::AtomicU32,
+    /// Answer every retry — a request whose idempotency key is already
+    /// stored — with `503`, while fresh issuances still go through: a lost
+    /// response whose recovery keeps failing.
+    fail_retries: std::sync::atomic::AtomicBool,
+    /// Accept every issuance request and never answer it.
+    stall: std::sync::atomic::AtomicBool,
+    /// Refuse every issuance request with `401` before anything else, as the
+    /// gateway's `BasicAuth` does for a wrong secret.
+    unauthorized: std::sync::atomic::AtomicBool,
+}
+
+impl IssuanceKnobs {
+    /// Lose the responses of the next `n` issuances (see [`IssuanceKnobState`]).
+    pub fn lose_next(&self, n: u32) {
+        self.0.lose.store(n, Ordering::SeqCst);
+    }
+    /// Refuse every fresh issuance with `status`; `None` answers again.
+    pub fn refuse_with(&self, status: Option<u16>) {
+        self.0
+            .refuse_with
+            .store(status.map(u32::from).unwrap_or(0), Ordering::SeqCst);
+    }
+    /// Fail every retry (see [`IssuanceKnobState`]); `false` answers again.
+    pub fn fail_retries(&self, on: bool) {
+        self.0.fail_retries.store(on, Ordering::SeqCst);
+    }
+    /// Refuse every issuance as unauthenticated (see [`IssuanceKnobState`]).
+    pub fn unauthorized(&self, on: bool) {
+        self.0.unauthorized.store(on, Ordering::SeqCst);
+    }
+    /// Stall every issuance request (see [`IssuanceKnobState`]).
+    pub fn stall(&self, on: bool) {
+        self.0.stall.store(on, Ordering::SeqCst);
+    }
+    fn take_loss(&self) -> bool {
+        self.0
+            .lose
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    }
+    fn refusal(&self) -> Option<u16> {
+        match self.0.refuse_with.load(Ordering::SeqCst) {
+            0 => None,
+            status => Some(status as u16),
+        }
+    }
+}
+
+/// An issuer key's advertised window, as the ISO 8601 strings `/v1/keys`
+/// carries (see [`MockConfig::key_window`]).
+#[derive(Clone, Debug)]
+pub struct KeyWindow {
+    pub issue_from: String,
+    pub issue_until: String,
+    pub accept_until: String,
+}
+
+impl KeyWindow {
+    /// The windows of the epoch that ends issuing at `issue_until`, on a
+    /// calendar of `epoch_secs`-long epochs aligned to it: the pair a test
+    /// about a key's deadlines needs, since the client refuses any key whose
+    /// windows are not on its calendar.
+    pub fn epoch_ending_at(issue_until: i64, epoch_secs: u64) -> (Self, IssuerCalendar) {
+        let until = u64::try_from(issue_until).expect("a deadline after 1970");
+        let calendar = IssuerCalendar {
+            anchor_unix_secs: until % epoch_secs,
+            epoch_secs,
+        };
+        let epoch = calendar.epoch_at(until).expect("on the calendar") - 1;
+        (Self::of_epoch(&calendar, epoch), calendar)
+    }
+
+    /// Epoch `epoch`'s windows on `calendar`.
+    pub fn of_epoch(calendar: &IssuerCalendar, epoch: u64) -> Self {
+        let w = calendar.windows(epoch).expect("epoch in range");
+        let secs = |s: u64| i64::try_from(s).expect("in range");
+        Self::from_unix_secs(
+            secs(w.issue_from),
+            secs(w.issue_until),
+            secs(w.accept_until),
+        )
+    }
+
+    /// A window given as unix seconds.
+    pub fn from_unix_secs(issue_from: i64, issue_until: i64, accept_until: i64) -> Self {
+        use eidola_server_gateway::helpers::unix_to_iso;
+        Self {
+            issue_from: unix_to_iso(issue_from),
+            issue_until: unix_to_iso(issue_until),
+            accept_until: unix_to_iso(accept_until),
+        }
+    }
 }
 
 impl Default for MockConfig {
@@ -643,8 +820,26 @@ impl Default for MockConfig {
             close_switch: CloseSwitch::default(),
             list_flat_model: false,
             chat_delay_ms: 0,
+            issued_key_id: None,
+            refund_key_id: None,
+            issuance_context: None,
+            issuance_extra_credits: 0,
+            key_window: None,
+            issuance: IssuanceKnobs::default(),
+            issuer_calendar: None,
+            key_swap: KeySwap::default(),
+            omit_previous_key: Arc::default(),
         }
     }
+}
+
+/// The issuer key id a refund names: the real one unless the test asked for
+/// another ([`MockConfig::refund_key_id`]).
+fn refund_key_id(issuer: &Issuer, config: &MockConfig) -> String {
+    config
+        .refund_key_id
+        .clone()
+        .unwrap_or_else(|| issuer.key_id_hex.clone())
 }
 
 /// See [`MockConfig::close_switch`].
@@ -711,12 +906,16 @@ pub struct MockServer {
     chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     /// Number of `POST /v1/credentials/refund` requests received.
     refund_hits: Arc<AtomicU64>,
+    /// The mock issuer, for what it remembers about spends.
+    issuer: Arc<Issuer>,
     /// Number of `GET /v1/models` requests received — the catalogue fetch a
     /// turn's *setup* makes, and so the earliest thing on the wire that says
     /// preparation got as far as building a client. Tests that assert a turn
     /// was refused before it did any work read this rather than `chat_hits`,
     /// which only notices once the turn is fully prepared.
     models_hits: Arc<AtomicU64>,
+    /// The issuance switches the server was started with.
+    issuance: IssuanceKnobs,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -726,6 +925,28 @@ impl MockServer {
     }
     pub fn refund_hits(&self) -> u64 {
         self.refund_hits.load(Ordering::SeqCst)
+    }
+    /// How many distinct spends arrived carrying a refund recovery key (a
+    /// spend without one is refused, as the real server refuses it).
+    pub fn keyed_spends(&self) -> usize {
+        self.issuer.keyed_spends()
+    }
+    /// The issuance endpoint's switches (see [`MockConfig::issuance`]).
+    pub fn issuance_knobs(&self) -> IssuanceKnobs {
+        self.issuance.clone()
+    }
+    /// Issuance requests received, retries included.
+    pub fn issuance_requests(&self) -> u64 {
+        self.issuer.issuance_requests.load(Ordering::SeqCst)
+    }
+    /// Issuances that debited the account: a retry answered from what was
+    /// stored is not one.
+    pub fn issuance_debits(&self) -> u64 {
+        self.issuer.issuance_debits.load(Ordering::SeqCst)
+    }
+    /// The credits converted by every debiting issuance.
+    pub fn issuance_debited_credits(&self) -> i64 {
+        self.issuer.issuance_debited_credits.load(Ordering::SeqCst) as i64
     }
     /// Catalogue fetches (see `models_hits`).
     pub fn models_hits(&self) -> u64 {
@@ -1054,6 +1275,25 @@ struct Issuer {
     params: Params,
     key_id_hex: String,
     request_context_scalar: Scalar,
+    /// The refund recovery key each spend arrived with, by nullifier: the
+    /// key the real server seals that spend's stored refund under, and so
+    /// the only one its recovery endpoint opens it for.
+    spend_keys: std::sync::Mutex<std::collections::HashMap<Vec<u8>, [u8; 32]>>,
+    /// Idempotent issuance, as the real server keeps it: idempotency key →
+    /// (the request it answered, the response body it was given).
+    issuances: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+    /// Every `POST /v1/account/credentials` received.
+    issuance_requests: AtomicU64,
+    /// Every issuance that debited (a fresh one, not a stored answer).
+    issuance_debits: AtomicU64,
+    /// The credits all those debits converted.
+    issuance_debited_credits: AtomicU64,
+    /// A public key listed as the previous epoch's, for an epoch the mock
+    /// never listed a current key for: stable for the mock's life.
+    decoy_public_key: Vec<u8>,
+    /// The key (id, base64 public key) the mock listed as current for each
+    /// epoch, first listing wins — what it lists as that epoch's key later.
+    listed: std::sync::Mutex<std::collections::HashMap<u64, (String, String)>>,
 }
 
 impl Issuer {
@@ -1076,7 +1316,31 @@ impl Issuer {
             params,
             key_id_hex,
             request_context_scalar,
+            spend_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
+            issuances: std::sync::Mutex::new(std::collections::HashMap::new()),
+            issuance_requests: AtomicU64::new(0),
+            issuance_debits: AtomicU64::new(0),
+            issuance_debited_credits: AtomicU64::new(0),
+            decoy_public_key: PrivateKey::random(OsRng)
+                .public()
+                .to_cbor()
+                .expect("encode decoy public key"),
+            listed: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Remember the refund recovery key a spend (or a recovery that found no
+    /// spend) arrived with, and say whether `key` is the one on record: what
+    /// decides whether the real server's stored copy opens.
+    fn spend_key_matches(&self, proof: &SpendProof<128>, key: [u8; 32]) -> bool {
+        let nullifier = proof.nullifier().as_bytes().to_vec();
+        let mut keys = self.spend_keys.lock().unwrap();
+        *keys.entry(nullifier).or_insert(key) == key
+    }
+
+    /// How many distinct spends arrived with a refund recovery key.
+    fn keyed_spends(&self) -> usize {
+        self.spend_keys.lock().unwrap().len()
     }
 
     fn public_key_b64(&self) -> String {
@@ -1085,7 +1349,12 @@ impl Issuer {
 
     /// Issue a credential for a base64url CBOR `IssuanceRequest` and credit
     /// amount. Returns the base64url CBOR `IssuanceResponse`.
-    fn issue(&self, issuance_request_b64: &str, credits: i64) -> Option<String> {
+    fn issue(
+        &self,
+        issuance_request_b64: &str,
+        credits: i64,
+        context: Option<Scalar>,
+    ) -> Option<String> {
         let req_cbor = URL_SAFE_NO_PAD.decode(issuance_request_b64).ok()?;
         let req = IssuanceRequest::from_cbor(&req_cbor).ok()?;
         let credit_scalar = credit_to_scalar::<128>(credits as u128).ok()?;
@@ -1095,7 +1364,7 @@ impl Issuer {
                 &self.params,
                 &req,
                 credit_scalar,
-                self.request_context_scalar,
+                context.unwrap_or(self.request_context_scalar),
                 OsRng,
             )
             .ok()?;
@@ -1118,12 +1387,18 @@ impl Issuer {
     }
 
     /// Parse a `PrivateToken token="..."` header into its embedded spend proof
-    /// (mirrors the server's `TokenAuth` extractor).
+    /// (mirrors the server's `TokenAuth` extractor). Like the server, it reads
+    /// only the spelling RFC 9577 requires, padded base64url, decoded here
+    /// with the `base64` crate's canonical padded engine rather than the
+    /// shared `eidola_common::private_token` rule the client writes with, so
+    /// the client's spelling is checked against an independent reading.
     fn spend_proof_from_auth(auth: &str) -> Option<SpendProof<128>> {
         let payload = auth
             .strip_prefix("PrivateToken token=\"")
             .and_then(|s| s.strip_suffix('"'))?;
-        let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+        let bytes = base64::engine::general_purpose::URL_SAFE
+            .decode(payload)
+            .ok()?;
         if bytes.len() < 67 {
             return None;
         }
@@ -1138,6 +1413,7 @@ pub async fn start(config: MockConfig) -> MockServer {
         tokio::sync::mpsc::unbounded_channel::<tokio::sync::oneshot::Sender<()>>();
     config.close_switch.install(close_tx);
     let issuer = Arc::new(Issuer::new());
+    let issuance = config.issuance.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
     let base_url = format!("http://{addr}");
@@ -1213,7 +1489,9 @@ pub async fn start(config: MockConfig) -> MockServer {
         chat_auths,
         chat_auth_values,
         refund_hits,
+        issuer,
         models_hits,
+        issuance,
         _task: task,
     }
 }
@@ -1223,6 +1501,9 @@ struct Req {
     method: String,
     path: String,
     auth: Option<String>,
+    /// The refund recovery key header, decoded (`None` when absent or not
+    /// exactly the wire form — the real server refuses both alike).
+    refund_key: Option<[u8; 32]>,
     body: Vec<u8>,
 }
 
@@ -1253,6 +1534,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
 
     let mut content_length = 0usize;
     let mut auth = None;
+    let mut refund_key = None;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim().to_ascii_lowercase();
@@ -1261,6 +1543,8 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
                 content_length = value.parse().unwrap_or(0);
             } else if name == "authorization" {
                 auth = Some(value.to_string());
+            } else if name == eidola_common::refund_key::REFUND_KEY_HEADER {
+                refund_key = eidola_common::refund_key::decode_refund_key(value.as_bytes());
             }
         }
     }
@@ -1278,6 +1562,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
         method,
         path,
         auth,
+        refund_key,
         body,
     })
 }
@@ -1319,7 +1604,7 @@ async fn handle_conn(
             }
         }
         ("GET", "/v1/keys") => {
-            write_json(&mut stream, 200, &keys_body(&issuer)).await?;
+            write_json(&mut stream, 200, &keys_body(&issuer, &config)).await?;
         }
         ("GET", "/v1/account/balances") => {
             let body = serde_json::json!({
@@ -1329,27 +1614,25 @@ async fn handle_conn(
             write_json(&mut stream, 200, &body.to_string()).await?;
         }
         ("POST", "/v1/account/credentials") => {
-            let parsed: serde_json::Value =
-                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
-            let ir = parsed.get("issuance_request").and_then(|v| v.as_str());
-            let credits = parsed.get("credits").and_then(|v| v.as_i64()).unwrap_or(0);
-            match ir.and_then(|ir| issuer.issue(ir, credits)) {
-                Some(issuance_response) => {
-                    let body = serde_json::json!({
-                        "issuance_response": issuance_response,
-                        "issuer_key_id": issuer.key_id_hex,
-                        "credits": credits,
-                        "ledger_entry_id": uuid_like(),
-                    });
-                    write_json(&mut stream, 200, &body.to_string()).await?;
-                }
-                None => {
-                    write_json(&mut stream, 400, &error_body("issuance failed")).await?;
-                }
-            }
+            // Its own boxed future: every route's locals share this one, which
+            // runs on the core's worker threads beside the turn it answers.
+            Box::pin(handle_issuance(&mut stream, &issuer, &config, &req.body)).await?;
         }
         ("POST", "/v1/credentials/refund") => {
             let attempt = refund_hits.fetch_add(1, Ordering::SeqCst) + 1;
+            // The real endpoint refuses a recovery without its key, and opens
+            // a stored refund only for the key the spend arrived with.
+            let proof = req.auth.as_deref().and_then(Issuer::spend_proof_from_auth);
+            match (proof, req.refund_key) {
+                (_, None) => {
+                    return write_json(&mut stream, 400, &error_body("refund key required")).await;
+                }
+                (Some(proof), Some(key)) if !issuer.spend_key_matches(&proof, key) => {
+                    return write_json(&mut stream, 404, &error_body("refund token not found"))
+                        .await;
+                }
+                _ => {}
+            }
             handle_refund(&mut stream, &issuer, &config, req.auth.as_deref(), attempt).await?;
         }
         ("POST", "/v1/chat/completions") => {
@@ -1368,6 +1651,19 @@ async fn handle_conn(
             chat_raw_bodies.lock().unwrap().push(req.body.clone());
             chat_auths.lock().unwrap().push(req.auth.is_some());
             chat_auth_values.lock().unwrap().push(req.auth.clone());
+            // A spend without its refund recovery key is refused before it is
+            // taken, as the real server's extractor refuses it.
+            if let Some(proof) = req.auth.as_deref().and_then(Issuer::spend_proof_from_auth) {
+                match req.refund_key {
+                    Some(key) => {
+                        issuer.spend_key_matches(&proof, key);
+                    }
+                    None => {
+                        return write_json(&mut stream, 400, &error_body("refund key required"))
+                            .await;
+                    }
+                }
+            }
             let parsed: serde_json::Value =
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
             // A branch-summary request is recognized by its system prompt (it
@@ -1450,6 +1746,94 @@ async fn handle_conn(
     Ok(())
 }
 
+/// `POST /v1/account/credentials`: idempotent issuance, as the real server
+/// answers it (see [`IssuanceKnobs`] for the misbehaviours a test can ask for).
+async fn handle_issuance(
+    stream: &mut TcpStream,
+    issuer: &Issuer,
+    config: &MockConfig,
+    body: &[u8],
+) -> std::io::Result<()> {
+    issuer.issuance_requests.fetch_add(1, Ordering::SeqCst);
+    if config.issuance.0.unauthorized.load(Ordering::SeqCst) {
+        return write_json(stream, 401, &error_body("invalid credentials")).await;
+    }
+    if config.issuance.0.stall.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        return Ok(());
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+    let ir = parsed.get("issuance_request").and_then(|v| v.as_str());
+    let credits = parsed.get("credits").and_then(|v| v.as_i64()).unwrap_or(0);
+    let named_key = parsed.get("issuer_key_id").and_then(|v| v.as_str());
+    let Some(idem) = parsed
+        .get("idempotency_key")
+        .and_then(|v| v.as_str())
+        .filter(|k| k.len() == 64)
+        .map(str::to_string)
+    else {
+        return write_json(stream, 400, &error_body("idempotency_key required")).await;
+    };
+    // What a retry must agree on to be answered from the store.
+    let request_digest = format!("{}|{credits}|{}", ir.unwrap_or(""), named_key.unwrap_or(""));
+    let stored = issuer.issuances.lock().unwrap().get(&idem).cloned();
+    if stored.is_some() && config.issuance.0.fail_retries.load(Ordering::SeqCst) {
+        return write_json(stream, 503, &error_body("issuance unavailable")).await;
+    }
+    if let Some((digest, body)) = stored {
+        if digest != request_digest {
+            return write_json(stream, 409, &error_body("idempotency key reused")).await;
+        }
+        return write_json(stream, 200, &body).await;
+    }
+    if let Some(status) = config.issuance.refusal() {
+        return write_json(stream, status, &error_body("issuance refused")).await;
+    }
+    // The key listed as current — the second one once a test swapped it.
+    let issuing = config.key_swap.active(issuer);
+    if named_key != Some(issuing.key_id_hex.as_str()) {
+        return write_json(stream, 409, &error_body("issuer key is not current")).await;
+    }
+    match ir.and_then(|ir| {
+        issuing.issue(
+            ir,
+            credits + config.issuance_extra_credits,
+            config.issuance_context,
+        )
+    }) {
+        Some(issuance_response) => {
+            let body = serde_json::json!({
+                "issuance_response": issuance_response,
+                "issuer_key_id": config
+                    .issued_key_id
+                    .clone()
+                    .unwrap_or_else(|| issuing.key_id_hex.clone()),
+                "credits": credits,
+                "ledger_entry_id": uuid_like(),
+            })
+            .to_string();
+            issuer.issuance_debits.fetch_add(1, Ordering::SeqCst);
+            issuer
+                .issuance_debited_credits
+                .fetch_add(credits.max(0) as u64, Ordering::SeqCst);
+            issuer
+                .issuances
+                .lock()
+                .unwrap()
+                .insert(idem, (request_digest, body.clone()));
+            if config.issuance.take_loss() {
+                // Debited and stored; the client hears nothing.
+                return Ok(());
+            }
+            write_json(stream, 200, &body).await?;
+        }
+        None => {
+            write_json(stream, 400, &error_body("issuance failed")).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn handle_refund(
     stream: &mut TcpStream,
     issuer: &Issuer,
@@ -1475,7 +1859,7 @@ async fn handle_refund(
     match refund {
         Some(refund_b64) => {
             let body = serde_json::json!({
-                "refund": { "refund": refund_b64, "issuer_key_id": issuer.key_id_hex },
+                "refund": { "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) },
             });
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1499,7 +1883,7 @@ async fn handle_chat(
         auth.and_then(Issuer::spend_proof_from_auth)
             .and_then(|sp| issuer.refund_for(&sp))
             .map(|refund_b64| {
-                serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex })
+                serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) })
             })
     } else {
         None
@@ -1555,8 +1939,7 @@ async fn handle_chat(
                 .and_then(Issuer::spend_proof_from_auth)
                 .and_then(|sp| issuer.refund_for(&sp))
             {
-                body["refund"] =
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex });
+                body["refund"] = serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) });
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1570,8 +1953,7 @@ async fn handle_chat(
                 .and_then(Issuer::spend_proof_from_auth)
                 .and_then(|sp| issuer.refund_for(&sp))
             {
-                body["refund"] =
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex });
+                body["refund"] = serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) });
             }
             write_json(stream, status, &body.to_string()).await
         }
@@ -1621,7 +2003,7 @@ async fn handle_chat(
                 .and_then(Issuer::spend_proof_from_auth)
                 .and_then(|sp| issuer.refund_for(&sp))
                 .map(|refund_b64| {
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex })
+                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) })
                 });
             write_sse_stream_with_metadata(stream, &[STREAM_CONTENT], refund).await
         }
@@ -1630,7 +2012,7 @@ async fn handle_chat(
                 .and_then(Issuer::spend_proof_from_auth)
                 .and_then(|sp| issuer.refund_for(&sp))
                 .map(|refund_b64| {
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex })
+                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) })
                 });
             let idle_frames = if matches!(config.chat, ChatBehavior::StreamingPaddedPastReadCeiling)
             {
@@ -1647,7 +2029,7 @@ async fn handle_chat(
                 .and_then(Issuer::spend_proof_from_auth)
                 .and_then(|sp| issuer.refund_for(&sp))
                 .map(|refund_b64| {
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex })
+                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) })
                 });
             write_sse_stream_split_data(stream, &[STREAM_CONTENT], refund).await
         }
@@ -3016,41 +3398,73 @@ fn models_body(config: &MockConfig) -> String {
     serde_json::json!({ "data": listed }).to_string()
 }
 
-fn keys_body(issuer: &Issuer) -> String {
+fn keys_body(issuer: &Issuer, config: &MockConfig) -> String {
     let ds = format!("ACT-v1:{DS_ORG}:{DS_SERVICE}:{DS_DEPLOYMENT}:{DS_VERSION}");
-    // Reproduce the production `/v1/keys` shape during a rotation grace
-    // window: a just-retired key (out of its `issue_from..issue_until` issuing
-    // window but still within `accept_until`) sorts *ahead* of the current
-    // key. It carries a different public key, so a client that selected by
-    // domain separator alone — every key shares one — would pick the decoy and
-    // fail proof verification against the current issuer (the original bug).
-    // The client must skip the out-of-window decoy and choose the current key.
-    let decoy_pk = PrivateKey::random(OsRng)
-        .public()
-        .to_cbor()
-        .expect("encode decoy public key");
-    let decoy_key_hash: [u8; 32] = Sha256::digest(&decoy_pk).into();
-    serde_json::json!({
-        "data": [
-            {
-                "id": hex::encode(decoy_key_hash),
-                "public_key": URL_SAFE_NO_PAD.encode(&decoy_pk),
-                "domain_separator": ds,
-                "issue_from": "2026-01-01T00:00:00Z",
-                "issue_until": "2026-02-01T00:00:00Z",
-                "accept_until": "2030-01-01T00:00:00Z",
-            },
-            {
-                "id": issuer.key_id_hex,
-                "public_key": issuer.public_key_b64(),
-                "domain_separator": ds,
-                "issue_from": "2026-02-01T00:00:00Z",
-                "issue_until": "2030-01-01T00:00:00Z",
-                "accept_until": "2030-01-01T00:00:00Z",
-            }
-        ]
-    })
-    .to_string()
+    // Reproduce the production `/v1/keys` shape: the previous epoch's key
+    // (out of its issuing window but still within `accept_until`) sorts
+    // *ahead* of the current key. It carries a different public key, so a
+    // client that selected by domain separator alone — every key shares one
+    // — would pick the decoy and fail proof verification against the current
+    // issuer (the original bug). The client must skip the out-of-window
+    // decoy and choose the current key.
+    //
+    // Like an honest server, the mock remembers which key it listed for each
+    // epoch: the previous epoch's entry is the key it listed as current then
+    // (the decoy only for an epoch it never listed). So a mock that keeps one
+    // key across a boundary lists that key for two epochs, as a dishonest
+    // server would; a test wanting the next epoch accepted gives it a new key
+    // ([`KeySwap`]).
+    let calendar = config.issuer_calendar.unwrap_or(ISSUER_CALENDAR);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs();
+    let window = config.key_window.clone().unwrap_or_else(|| {
+        KeyWindow::of_epoch(&calendar, calendar.epoch_at(now).expect("on the calendar"))
+    });
+    let current_epoch = eidola_app_core::iso_to_ms(&window.issue_from)
+        .ok()
+        .and_then(|ms| u64::try_from(ms.div_euclid(1000)).ok())
+        .and_then(|secs| calendar.epoch_at(secs))
+        .unwrap_or(0);
+    let current = config.key_swap.active(issuer);
+    let previous = {
+        let mut listed = issuer.listed.lock().unwrap();
+        listed
+            .entry(current_epoch)
+            .or_insert_with(|| (current.key_id_hex.clone(), current.public_key_b64()));
+        listed.get(&current_epoch.wrapping_sub(1)).cloned()
+    };
+    let (previous_id, previous_pk) = previous.unwrap_or_else(|| {
+        let hash: [u8; 32] = Sha256::digest(&issuer.decoy_public_key).into();
+        (
+            hex::encode(hash),
+            URL_SAFE_NO_PAD.encode(&issuer.decoy_public_key),
+        )
+    });
+    let decoy = KeyWindow::of_epoch(&calendar, current_epoch.saturating_sub(1));
+    let previous_entry = serde_json::json!({
+        "id": previous_id,
+        "public_key": previous_pk,
+        "domain_separator": ds,
+        "issue_from": decoy.issue_from,
+        "issue_until": decoy.issue_until,
+        "accept_until": decoy.accept_until,
+    });
+    let current_entry = serde_json::json!({
+        "id": current.key_id_hex,
+        "public_key": current.public_key_b64(),
+        "domain_separator": ds,
+        "issue_from": window.issue_from,
+        "issue_until": window.issue_until,
+        "accept_until": window.accept_until,
+    });
+    let data = if config.omit_previous_key.load(Ordering::SeqCst) {
+        vec![current_entry]
+    } else {
+        vec![previous_entry, current_entry]
+    };
+    serde_json::json!({ "data": data }).to_string()
 }
 
 fn error_body(message: &str) -> String {
@@ -3066,7 +3480,10 @@ async fn write_json(stream: &mut TcpStream, status: u16, body: &str) -> std::io:
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        402 => "Payment Required",
         404 => "Not Found",
+        409 => "Conflict",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Status",
@@ -3204,6 +3621,9 @@ pub fn core_for(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) 
         .build()
         .expect("plain http client");
     let core = AppCore::with_test_http_client(config_dir, data_dir, client).expect("open core");
+    if let Some(calendar) = config.issuer_calendar {
+        core.test_set_issuer_calendar(calendar);
+    }
     let mock = core.runtime().block_on(async { start(config).await });
     core.runtime()
         .block_on(core.set_base_url(mock.base_url.clone()))
@@ -3235,6 +3655,13 @@ pub fn reopen_core(dir: &tempfile::TempDir, base_url: &str) -> AppCore {
 /// Configure account credentials so auto-provisioning can reach the balance /
 /// allocate endpoints. The actual basic-auth password is never verified by the
 /// mock, so any non-empty values work.
+/// A request context no other credential shares, for
+/// [`MockConfig::issuance_context`].
+#[allow(dead_code)]
+pub fn distinct_context() -> Scalar {
+    Scalar::from(7u64)
+}
+
 pub fn with_account(core: &AppCore) {
     core.set_account_credentials(uuid_account_id(), "mock-secret".into())
         .expect("set account credentials");

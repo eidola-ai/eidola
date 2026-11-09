@@ -573,6 +573,7 @@ pub(crate) fn app_error_response(error: &AppError) -> Response<ProxyBody> {
         AppError::NoAccount
         | AppError::InsufficientBalance { .. }
         | AppError::Credential { .. }
+        | AppError::IssuerKeyRefused { .. }
         | AppError::ProvisioningTimeout { .. } => (
             StatusCode::PAYMENT_REQUIRED,
             "insufficient_quota",

@@ -111,3 +111,22 @@ space-highlight-picker-nth = { $label } ({ $n })
 # truncates discriminates nothing. Keep it in step with
 # `space-highlight-picker-nth`, whose tail it is.
 space-highlight-picker-ordinal = ({ $n })
+
+# Shown in the conversation's recovery notice when this app refused the
+# server's current payment key (the issuer key credits are converted under)
+# because its windows do not follow the public key schedule every client can
+# compute for itself. Nothing was charged; credits already held still work.
+# "Payment key" is deliberately plain: the reader needs to know the app
+# protected them, not the protocol's vocabulary.
+space-error-issuer-key-off-calendar = Eidola’s server offered a payment key that doesn’t follow the public key schedule, so this app didn’t use it. Nothing was sent and nothing was charged, and the credits you already hold still work.
+# The same notice when the server offered a different payment key for this
+# week from the one this app already saw. An honest server has one per week,
+# and a second one is what a server singling a reader out would show, so the
+# app refuses it until the next week's key. Retrying now will not help, which
+# is what the last sentence is for.
+space-error-issuer-key-second-for-epoch = Eidola’s server offered a different payment key this week from the one this app already has. An honest server uses one key per week, so this app won’t take new credits under it until next week’s key. Nothing was sent and nothing was charged, and the credits you already hold still work.
+# The same notice when the server offered one payment key for two different
+# weeks. An honest server has a distinct key every week, and a key reused
+# across weeks would let the server swap another key in unnoticed later, so
+# the app refuses it.
+space-error-issuer-key-reused = Eidola’s server offered the same payment key for two different weeks, which an honest server never does, so this app didn’t use it. Nothing was sent and nothing was charged, and the credits you already hold still work.

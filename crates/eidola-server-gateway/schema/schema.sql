@@ -138,18 +138,20 @@ CREATE TABLE issuer_key (
 
     CONSTRAINT id_is_key_hash CHECK (id = encode(sha256(public_key), 'hex')),
     CONSTRAINT issue_window CHECK (issue_from < issue_until),
-    CONSTRAINT grace_window CHECK (issue_until <= accept_until)
+    CONSTRAINT grace_window CHECK (issue_until <= accept_until),
+    -- One key per epoch: an honest gateway never mints a second.
+    CONSTRAINT one_key_per_epoch UNIQUE (issue_from)
 );
 
--- Non-unique index for efficient lookup by issuance period.
-CREATE INDEX idx_issuer_key_issue_from ON issuer_key (issue_from);
-
 COMMENT ON TABLE issuer_key IS
-    'Credential issuer key pairs, rotated periodically (default: every 7 days). '
-    'Each key''s issue_from chains from its predecessor''s issue_until. The '
-    'private key is encrypted at rest (application-layer encryption using a '
-    'TEE-held master key). The public key and domain separator are served '
-    'publicly via GET /v1/keys. Race-safe provisioning is handled by '
+    'Credential issuer key pairs, one per epoch of the public issuer calendar '
+    '(eidola_common::issuer_calendar: 7-day epochs from the Unix epoch; a key '
+    'issues for its epoch and is accepted for one more). The private key is '
+    'encrypted at rest under a TEE-held master key, with the id, public key, '
+    'domain separator and all three windows bound into the encryption as '
+    'associated data: a row whose plain columns were edited does not decrypt, '
+    'and the gateway refuses it. The public key and domain separator are '
+    'served publicly via GET /v1/keys. Race-safe provisioning is handled by '
     'serializable transactions in the application layer.';
 
 COMMENT ON COLUMN issuer_key.id IS
@@ -159,9 +161,11 @@ COMMENT ON COLUMN issuer_key.id IS
     'to identify keys in Token structures and credential requests.';
 
 COMMENT ON COLUMN issuer_key.private_key_enc IS
-    'AES-256-GCM encrypted credential private key (Ristretto255 scalar). '
-    'Decrypted only inside the TEE at runtime. The encryption key is derived '
-    'from the TEE''s sealing key.';
+    'AES-256-GCM encrypted credential private key (Ristretto255 scalar), as '
+    'nonce || ciphertext+tag. Decrypted only inside the TEE at runtime. The '
+    'encryption key is derived from CREDENTIAL_MASTER_KEY and the key id; the '
+    'associated data binds the id, public key, domain separator, issue_from, '
+    'issue_until and accept_until.';
 
 COMMENT ON COLUMN issuer_key.public_key IS
     'Credential public key (compressed Ristretto255 point, 32 bytes). Served '
@@ -181,7 +185,7 @@ COMMENT ON COLUMN issuer_key.issue_until IS
 
 COMMENT ON COLUMN issuer_key.accept_until IS
     'Grace period end. Credentials signed by this key are accepted for spending '
-    'until this timestamp. Defaults to one epoch duration after issue_until. '
+    'until this timestamp: one epoch after issue_until. '
     'Nullifiers for this key are pruned only once the gateway''s retention '
     'margin past this timestamp has also passed (prune_expired_nullifiers).';
 
@@ -325,6 +329,55 @@ CREATE INDEX idx_ledger_payment_intent ON credit_ledger (stripe_payment_intent)
     WHERE stripe_payment_intent IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
+-- Credential Issuance
+-- ---------------------------------------------------------------------------
+--
+-- One row per idempotent issuance: the signed response, kept so a client whose
+-- response was lost can ask again under the same idempotency key and receive
+-- the same response instead of being debited a second time. Account-surface
+-- data only, beside the ledger row it was debited by (which already records
+-- the account, amount, key and time). No timestamp of its own: the ledger
+-- row has one, and nothing here needs a second.
+
+CREATE TABLE credential_issuance (
+    account_id        UUID   NOT NULL REFERENCES account(id),
+    idempotency_key   BYTEA  NOT NULL CHECK (octet_length(idempotency_key) = 32),
+    request_digest    BYTEA  NOT NULL CHECK (octet_length(request_digest) = 32),
+    issuer_key_id     TEXT   NOT NULL REFERENCES issuer_key(id),
+    credits           BIGINT NOT NULL CHECK (credits > 0),
+    issuance_response BYTEA  NOT NULL,
+    ledger_entry_id   UUID   NOT NULL UNIQUE REFERENCES credit_ledger(id),
+    PRIMARY KEY (account_id, idempotency_key)
+);
+
+-- Pruning walks a key's rows at once.
+CREATE INDEX idx_credential_issuance_key ON credential_issuance (issuer_key_id);
+
+COMMENT ON TABLE credential_issuance IS
+    'Stored responses of idempotent credential issuances, keyed by the account '
+    'and the client-chosen idempotency key. A retry with the same key and the '
+    'same request is answered from here without a second debit; one with the '
+    'same key and a different request is refused. Written in the same '
+    'transaction as the debit (record_credential_issuance), so a row exists '
+    'exactly when the account was debited for it. Pruned with the key''s '
+    'nullifiers (prune_expired_issuances), once the key can be used for nothing.';
+
+COMMENT ON COLUMN credential_issuance.idempotency_key IS
+    '32 random bytes the client generated and persisted before it first sent '
+    'the request. Used on this surface only; it is never sent with a spend.';
+
+COMMENT ON COLUMN credential_issuance.request_digest IS
+    'SHA-256 over the request the response answers (the CBOR issuance request '
+    'and the credit amount), so a retry naming this idempotency key with any '
+    'other request is refused rather than answered with a response to a '
+    'different commitment.';
+
+COMMENT ON COLUMN credential_issuance.issuance_response IS
+    'The CBOR IssuanceResponse as returned. The issuer computed it and could '
+    'always have kept it: issuance is blind, so it carries nothing that '
+    'recognises the credential when it is later spent.';
+
+-- ---------------------------------------------------------------------------
 -- Nullifier
 -- ---------------------------------------------------------------------------
 
@@ -361,10 +414,32 @@ COMMENT ON COLUMN nullifier.value IS
     'the primary key — a duplicate insert fails, indicating a double-spend.';
 
 COMMENT ON COLUMN nullifier.refund_token IS
-    'The CBOR-encoded refund token issued for this spend. Stored so the client '
-    'can recover it via POST /v1/credentials/refund if the original response '
-    'was lost (network error, timeout, etc.). The token is already blinded — '
-    'it is only useful to the client holding the matching PreRefund state.';
+    'The refund token issued for this spend, sealed: a version byte (0x01), a '
+    '12-byte random nonce, then the CBOR RefundMsg under AES-256-GCM with its '
+    'tag. The key is HKDF-SHA256 (salt = issuer_key_id, info = '
+    'eidola-refund-token-v1) over the refund recovery key the client sent with '
+    'the spend, and nothing else, derived in enclave memory and kept nowhere: '
+    'the client key is never stored or logged, so no one without the client '
+    '(the operator included) can open the value; the client presents its key '
+    'again to recover the token. The associated '
+    'data is the version byte, the length-prefixed issuer_key_id and the '
+    'nullifier value, so a token opens only on its own row. Sealed because the '
+    'RefundMsg carries the refund amount t as a plain scalar (only its '
+    'signature parts are useful solely to the client holding the matching '
+    'PreRefund), and t is a function of the request''s content lengths. The '
+    'ciphertext is as long as the fixed-size CBOR, so its length says nothing. '
+    'Stored so the client can recover the token via POST '
+    '/v1/credentials/refund if the original response was lost; a value that '
+    'does not open for the presented key is answered as no token stored.';
+
+-- A database holding bare CBOR tokens from before this column was sealed
+-- (they begin 0xa5, a five-entry map) is cleared by hand, idempotently:
+--
+--   UPDATE nullifier SET refund_token = NULL
+--    WHERE substring(refund_token FROM 1 FOR 1) <> '\x01'::bytea;
+--
+-- That clears current values only: WAL, base backups and replicas keep the
+-- old ones until they age out.
 
 -- ---------------------------------------------------------------------------
 -- Engine Placement
@@ -429,7 +504,7 @@ COMMENT ON FUNCTION available_balance IS
 -- ledger entry IDs on success, NULL if p_require_balance is TRUE and the
 -- account has insufficient balance, or an empty array if the stripe_event_id
 -- has already been processed (idempotent duplicate).
-CREATE FUNCTION debit_account(
+CREATE OR REPLACE FUNCTION debit_account(
     p_account_id       UUID,
     p_amount           BIGINT,
     p_reason           TEXT,
@@ -448,6 +523,14 @@ DECLARE
     v_pool_idx  INT := 0;
     v_event_id  TEXT;
 BEGIN
+    -- One debit per account at a time. Without the lock, two concurrent
+    -- issuances each read the same balance, each pass the check below, and
+    -- both convert it into anonymous credentials: an overdraft no later step
+    -- can recover, because the credentials cannot be traced once issued.
+    -- Under READ COMMITTED each statement below takes a fresh snapshot, so a
+    -- debit that waited here sees the one it waited for.
+    PERFORM 1 FROM account WHERE id = p_account_id FOR UPDATE;
+
     -- Balance check (credential issuance).
     IF p_require_balance AND available_balance(p_account_id) < p_amount THEN
         RETURN NULL;
@@ -582,7 +665,9 @@ END;
 $$;
 
 COMMENT ON FUNCTION debit_account IS
-    'Pool-aware debit function.  Allocates a negative delta across credit '
+    'Pool-aware debit function.  Holds the account row lock for the rest of '
+    'the calling transaction, so concurrent debits of one account serialize '
+    'and a balance check cannot pass twice on the same balance.  Allocates a negative delta across credit '
     'pools in FIFO order (earliest expiry first, permanent last) so that '
     'each debit row carries the expires_at of the pool it draws from. '
     'Returns NULL when p_require_balance is TRUE and the balance is '
@@ -625,5 +710,100 @@ COMMENT ON FUNCTION prune_expired_nullifiers(INTERVAL) IS
     'during which it still signs refunds under a key, so no nullifier is '
     'pruned while its key could accept a spend. Do not call it by hand with '
     'a smaller interval. Returns the number of nullifiers pruned.';
+
+-- Record an issuance idempotently. Locks the account row (debit_account would
+-- take the same lock) before looking for an earlier issuance under the key, so
+-- a retry racing its own original waits for it and then finds its row rather
+-- than debiting a second time. Returns the stored row's columns:
+--   outcome 'issued'  — debited now, row written, response is p_response;
+--   outcome 'stored'  — an earlier attempt under this key was debited; its
+--                       stored response, digest, key and amount are returned
+--                       and nothing is debited (the caller compares digests);
+--   outcome 'insufficient' — balance too low, nothing debited or written.
+CREATE OR REPLACE FUNCTION record_credential_issuance(
+    p_account_id      UUID,
+    p_idempotency_key BYTEA,
+    p_request_digest  BYTEA,
+    p_issuer_key_id   TEXT,
+    p_credits         BIGINT,
+    p_response        BYTEA
+)
+RETURNS TABLE (
+    outcome           TEXT,
+    request_digest    BYTEA,
+    issuer_key_id     TEXT,
+    credits           BIGINT,
+    issuance_response BYTEA,
+    ledger_entry_id   UUID
+)
+LANGUAGE plpgsql
+AS $$
+#variable_conflict use_column
+DECLARE
+    v_ids UUID[];
+BEGIN
+    PERFORM 1 FROM account WHERE id = p_account_id FOR UPDATE;
+
+    RETURN QUERY
+        SELECT 'stored'::TEXT, ci.request_digest, ci.issuer_key_id, ci.credits,
+               ci.issuance_response, ci.ledger_entry_id
+        FROM credential_issuance ci
+        WHERE ci.account_id = p_account_id
+          AND ci.idempotency_key = p_idempotency_key;
+    IF FOUND THEN
+        RETURN;
+    END IF;
+
+    v_ids := debit_account(p_account_id, p_credits, 'credential_issuance',
+                           NULL, p_issuer_key_id, TRUE);
+    IF v_ids IS NULL OR cardinality(v_ids) = 0 THEN
+        RETURN QUERY SELECT 'insufficient'::TEXT, NULL::BYTEA, NULL::TEXT,
+                            NULL::BIGINT, NULL::BYTEA, NULL::UUID;
+        RETURN;
+    END IF;
+
+    INSERT INTO credential_issuance (account_id, idempotency_key, request_digest,
+                                     issuer_key_id, credits, issuance_response,
+                                     ledger_entry_id)
+    VALUES (p_account_id, p_idempotency_key, p_request_digest, p_issuer_key_id,
+            p_credits, p_response, v_ids[1]);
+
+    RETURN QUERY SELECT 'issued'::TEXT, p_request_digest, p_issuer_key_id,
+                        p_credits, p_response, v_ids[1];
+END;
+$$;
+
+COMMENT ON FUNCTION record_credential_issuance IS
+    'Idempotent issuance debit. Serialized per account by the account row lock; '
+    'answers an idempotency key already used with the row stored for it and '
+    'debits nothing, otherwise debits and stores in one transaction.';
+
+CREATE OR REPLACE FUNCTION prune_expired_issuances(p_retain_past_accept INTERVAL)
+RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    pruned BIGINT;
+BEGIN
+    IF p_retain_past_accept IS NULL OR p_retain_past_accept <= interval '0' THEN
+        RAISE EXCEPTION 'prune_expired_issuances: retention past accept_until must be positive';
+    END IF;
+    DELETE FROM credential_issuance
+    WHERE issuer_key_id IN (
+        SELECT id FROM issuer_key
+        WHERE accept_until + p_retain_past_accept < now()
+    );
+    GET DIAGNOSTICS pruned = ROW_COUNT;
+    RETURN pruned;
+END;
+$$;
+
+COMMENT ON FUNCTION prune_expired_issuances(INTERVAL) IS
+    'Removes stored issuance responses for keys retired at least '
+    'p_retain_past_accept ago, on the same deadline as their nullifiers. A '
+    'credential built from a pruned response could no longer be spent, and the '
+    'issuance endpoint refuses any key that is not the current one before it '
+    'debits, so a retry arriving after pruning is refused rather than debited '
+    'again. Returns the number of rows pruned.';
 
 COMMIT;

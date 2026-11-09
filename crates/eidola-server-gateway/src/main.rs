@@ -14,7 +14,6 @@ use tracing::{error, info, warn};
 use eidola_server_gateway::AppState;
 use eidola_server_gateway::backend::Catalog;
 use eidola_server_gateway::credentials;
-use eidola_server_gateway::helpers::EpochConfig;
 use eidola_server_gateway::stripe::StripeClient;
 use eidola_server_gateway::telemetry;
 
@@ -314,9 +313,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         warn!("STRIPE_WEBHOOK_SECRET not set — webhook endpoint will return 503");
     }
 
-    // Credential key cache and epoch configuration
+    // Credential key cache. Key windows come from the public calendar
+    // (`eidola_common::issuer_calendar`), not from configuration.
     let credential_key_cache: credentials::KeyCache = Default::default();
-    let epoch_config = EpochConfig::default();
 
     // The router to Eidola-hosted engines, when this build pins any. Each
     // upstream's client attests against its model's compiled-in pins; the
@@ -370,7 +369,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.stripe_webhook_secret,
         config.credential_master_key,
         credential_key_cache,
-        epoch_config,
     );
 
     // Verify that this server's clock agrees with the database clock
@@ -440,7 +438,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &state.credential_key_cache,
         &state.credential_master_key,
         &state.db_pool,
-        &state.epoch_config,
     )
     .await
     {
@@ -452,7 +449,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         state.credential_key_cache.clone(),
         state.credential_master_key,
         state.db_pool.clone(),
-        state.epoch_config.clone(),
     );
 
     // Keep the database connection pool warm and prevent serverless Postgres

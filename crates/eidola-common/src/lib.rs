@@ -6,7 +6,11 @@
 //! outer chat-request construction ([`chat_completion_request_body`]), the
 //! wire contract shared by clients, the gateway and the inference nodes
 //! ([`engine_protocol`]: the prefix-cache key's shape and the weights
-//! header), and the embed-marker recognition rule shared between the
+//! header), the refund recovery key's wire form ([`refund_key`]), the public
+//! calendar issuer key windows are checked against ([`issuer_calendar`]), the
+//! spelling of a spend's `Authorization` value (`private_token`, behind the
+//! `private-token` feature), and the
+//! embed-marker recognition rule shared between the
 //! markdown editor's embed plugin and app-core's upstream quote expansion
 //! ([`embed`]). It is intentionally lib-only, pure Rust, and float-free so
 //! `eidola-app-core`, `eidola-server-gateway`, `eidola-server-engine`, and
@@ -24,8 +28,9 @@
 //! > consumer's graph and is required for contract fidelity.** Today that
 //! > set is `serde_json`, plus `argon2` behind the optional `argon2` feature
 //! > and `serde_yaml`, `serde` (derive) and `unsafe-libyaml` behind the
-//! > optional `deployment` feature. Any addition needs the same argument
-//! > written down.
+//! > optional `deployment` feature, and `base64` behind the optional
+//! > `private-token` feature. Any addition needs the same argument written
+//! > down.
 //!
 //! `argon2` qualifies because it is optional: it enters a graph only when a
 //! consumer enables the feature, and the two that do (the inference node and
@@ -37,6 +42,11 @@
 //! readers of engine deployment configs, so the one deployment check
 //! (`engine_deployment::deployment`) parses YAML once for both; `unsafe-libyaml`
 //! is the parser `serde_yaml` is built on, read directly for its event stream.
+//! `base64` is optional on the same terms: `private-token` is enabled by the
+//! two sides of a spend's `Authorization` header, app-core and the gateway,
+//! both of which depend on `base64 0.23` directly, so one function writes the
+//! padded base64url value RFC 9577 requires and one refuses every other
+//! spelling.
 //!
 //! `serde_json` qualifies on both counts: every consumer (app-core, gateway,
 //! inference node, gui; cli via app-core) already carries it, so admitting it
@@ -117,6 +127,10 @@
 pub mod embed;
 pub mod engine_deployment;
 pub mod engine_protocol;
+pub mod issuer_calendar;
+#[cfg(feature = "private-token")]
+pub mod private_token;
+pub mod refund_key;
 
 use serde_json::Value;
 

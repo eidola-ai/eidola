@@ -237,6 +237,7 @@
           "Linked"
         ],
         "summary": "`POST /v1/account/credentials` — issue anonymous credentials (authenticated).",
+        "description": "Idempotent per `(account, idempotency_key)`: the first request debits and\nstores the signed response in one transaction, and a retry with the same\nkey and request is answered from what was stored, so a response lost on the\nway back costs nothing. A stored issuance is answered before the terms gate\nand the current-key check, because it was already paid for.",
         "operationId": "issue_credentials",
         "requestBody": {
           "content": {
@@ -250,7 +251,7 @@
         },
         "responses": {
           "200": {
-            "description": "Credential issued",
+            "description": "Credential issued, or the stored response to an earlier attempt under the same idempotency key",
             "content": {
               "application/json": {
                 "schema": {
@@ -281,6 +282,16 @@
           },
           "402": {
             "description": "Insufficient credit balance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The idempotency key was used for a different request, or the named issuer key is not the current one; nothing was debited",
             "content": {
               "application/json": {
                 "schema": {
@@ -514,6 +525,17 @@
         "summary": "Create a chat completion.",
         "description": "Requires an ACT (Anonymous Credit Token) for authorization. The spend proof\nis verified, the nullifier is recorded, and a refund token is issued with\nany unspent credits.",
         "operationId": "chat_completions",
+        "parameters": [
+          {
+            "name": "x-eidola-refund-key",
+            "in": "header",
+            "description": "The client's refund recovery key for this spend, 64 lowercase hex digits: the stored copy of the refund is sealed under it, and recovery must present it again",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -536,7 +558,7 @@
             }
           },
           "400": {
-            "description": "Invalid request",
+            "description": "Invalid request, or a missing or malformed refund recovery key (refused before the credential is spent)",
             "content": {
               "application/json": {
                 "schema": {
@@ -604,8 +626,19 @@
           "Unlinked"
         ],
         "summary": "Recover a refund token for a previously spent ACT.",
-        "description": "If the ACT's nullifier was already recorded (the server received and\nprocessed the original request), the stored refund token is returned.\n\nIf the nullifier was NOT recorded (the original request never arrived),\nthe server verifies the spend proof, records the nullifier, issues a\nfull refund (no credits consumed), stores it, and returns it.\n\nIn both cases, the client gets a refund token it can combine with its\nlocal `PreRefund` state to reconstruct a credential.",
+        "description": "If the ACT's nullifier was already recorded (the server received and\nprocessed the original request), the stored refund token is returned.\n\nIf the nullifier was NOT recorded (the original request never arrived),\nthe server verifies the spend proof, records the nullifier, issues a\nfull refund (no credits consumed), stores it, and returns it.\n\nIn both cases, the client gets a refund token it can combine with its\nlocal `PreRefund` state to reconstruct a credential.\n\nThe stored token is sealed under the refund recovery key the client sent\nwith the spend, so recovery must present the same key: a different one\nopens nothing and is answered as no token stored (404).",
         "operationId": "recover_refund",
+        "parameters": [
+          {
+            "name": "x-eidola-refund-key",
+            "in": "header",
+            "description": "The refund recovery key sent with the spend: 64 lowercase hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Refund token recovered or issued",
@@ -613,6 +646,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RefundRecoveryResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed refund recovery key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -628,7 +671,7 @@
             }
           },
           "404": {
-            "description": "Nullifier found but refund token not yet available",
+            "description": "Nullifier found but no refund token is available for this key yet",
             "content": {
               "application/json": {
                 "schema": {
@@ -1632,7 +1675,9 @@
         "description": "Request body for `POST /v1/account/credentials`.",
         "required": [
           "issuance_request",
-          "credits"
+          "credits",
+          "idempotency_key",
+          "issuer_key_id"
         ],
         "properties": {
           "credits": {
@@ -1640,9 +1685,17 @@
             "format": "int64",
             "description": "Number of credits to issue."
           },
+          "idempotency_key": {
+            "type": "string",
+            "description": "64 lowercase hex digits (32 random bytes) the client chose for this\nissuance and kept before sending it. A retry under the same key and the\nsame request receives the response the first attempt was given, with no\nsecond debit; the same key with any other request is refused (`409`)."
+          },
           "issuance_request": {
             "type": "string",
             "description": "Base64-encoded CBOR `IssuanceRequest`."
+          },
+          "issuer_key_id": {
+            "type": "string",
+            "description": "The issuer key the client expects to be signed under: the current\nissuing key it read from `GET /v1/keys`. Refused (`409`) before any\ndebit when it is not the current key, so a credential is never paid for\nunder a key the client would not accept."
           }
         }
       },

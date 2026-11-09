@@ -345,7 +345,9 @@ impl DelegationFailure {
             AppError::NoAccount
             | AppError::InsufficientBalance { .. }
             | AppError::ProvisioningTimeout { .. }
-            | AppError::TermsAcceptanceRequired { .. } => Self::Funding,
+            | AppError::TermsAcceptanceRequired { .. }
+            // No credential could be issued under the server's key.
+            | AppError::IssuerKeyRefused { .. } => Self::Funding,
             AppError::NotConfigured { .. }
             | AppError::ModelUnavailable { .. }
             | AppError::Config { .. }

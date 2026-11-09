@@ -306,9 +306,11 @@ impl Inner {
             .client
             .post(format!("{}/v1/chat/completions", route.base_url))
             .json(&body);
-        if let Some(auth) = &auth_value {
-            request = request.header("Authorization", auth);
-        }
+        request = crate::with_credentials(
+            request,
+            auth_value.as_deref(),
+            spend.as_ref().map(|s| &*s.refund_key),
+        );
 
         let response = match request.send().await {
             Ok(resp) => resp,
@@ -403,9 +405,11 @@ impl Inner {
         let refund_obj = match inline {
             Some(obj) => Some(obj.clone()),
             None => match auth_value {
-                Some(auth) => recover_refund(&route.client, &route.base_url, auth)
-                    .await
-                    .ok(),
+                Some(auth) => {
+                    recover_refund(&route.client, &route.base_url, auth, &spend.refund_key)
+                        .await
+                        .ok()
+                }
                 None => None,
             },
         };

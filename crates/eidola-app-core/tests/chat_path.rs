@@ -24,14 +24,14 @@
 mod chat_harness;
 
 use chat_harness::{
-    ChatBehavior, DEFAULT_AGENT_LABEL, FLAT_MODEL, FLAT_PRICE, HUMAN_LABEL, MODEL, MockConfig,
-    MockServer, RefundMode, Stamps, THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE, TRAILING_BLOCK_NOTE,
-    flat_messages, map_entry, roster, system_message, system_message_with, thread_map, trailing,
-    with_account,
+    ChatBehavior, DEFAULT_AGENT_LABEL, FLAT_MODEL, FLAT_PRICE, HUMAN_LABEL, KeyWindow, MODEL,
+    MockConfig, MockServer, RefundMode, Stamps, THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE,
+    TRAILING_BLOCK_NOTE, flat_messages, map_entry, roster, system_message, system_message_with,
+    thread_map, trailing, with_account,
 };
 use eidola_app_core::changes::{Change, ChangeEvent};
-use eidola_app_core::error::AppError;
-use eidola_app_core::{AppCore, ChatStreamEvent};
+use eidola_app_core::error::{AppError, IssuerKeyRefusal};
+use eidola_app_core::{AppCore, ChatStreamEvent, DEFAULT_ALLOCATION_CREDITS, ProvisionOutcome};
 
 /// The generic system prompt the seeded default template agent carries (mirrors
 /// `db::DEFAULT_AGENT_SYSTEM_PROMPT`). Participant-aware turns prepend it as the
@@ -428,6 +428,42 @@ fn blocking_chat_recovers_refund_when_no_inline_refund() {
         assert!(
             !creds.is_empty(),
             "a recovered successor credential should be active"
+        );
+    });
+}
+
+/// **Recovery opens the stored refund only with the key the spend carried.**
+/// The server seals the refund it stores under the spend's refund recovery
+/// key and refuses a spend without one; the mock holds both rules, answering
+/// a recovery that presents any other key with the real endpoint's 404. So a
+/// successor here means the spend sent a key and the recovery rebuilt the
+/// same one.
+#[test]
+fn recovery_presents_the_refund_key_its_spend_carried() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat should succeed");
+
+        assert_eq!(mock.chat_hits(), 1);
+        assert_eq!(mock.keyed_spends(), 1, "the spend carried its refund key");
+        assert!(
+            mock.refund_hits() >= 1,
+            "no inline refund, so recovery was asked"
+        );
+        let creds = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert!(
+            !creds.is_empty(),
+            "recovery presented the spend's own key, so the stored refund opened"
         );
     });
 }
@@ -849,6 +885,550 @@ fn auto_provisioning_empty_wallet_funded_account_succeeds() {
         assert!(
             !after.is_empty(),
             "a successor credential should remain after the spend"
+        );
+    });
+}
+
+/// A credential is stored under the key that signed it and that the client
+/// verified it against, never under an id the issuance response names. An
+/// issuance naming another key is refused, and nothing enters the wallet.
+#[test]
+fn an_issuance_naming_another_key_is_refused() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            issued_key_id: Some("ab".repeat(32)),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let mut rx = core.subscribe_changes();
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(100_000))
+            .expect_err("an issuance naming another key must be refused");
+        assert!(
+            matches!(err, AppError::Credential { .. }),
+            "unexpected error: {err:?}"
+        );
+        let changes = drain(&mut rx);
+        assert!(
+            !changes.contains(&Change::Wallet) && !changes.contains(&Change::Account),
+            "a refused issuance announced a wallet or account change: {changes:?}"
+        );
+        let wallet = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert!(wallet.is_empty(), "nothing may be stored: {wallet:?}");
+    });
+}
+
+/// A refund is a credential under the spent credential's own key. One naming
+/// another key is not stored, so the spent credential stays `spending` rather
+/// than gaining a successor labelled with a key it does not belong to.
+#[test]
+fn a_refund_naming_another_key_is_not_stored() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            refund_key_id: Some("ab".repeat(32)),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // The blocking turn reports the refund it could not apply as its own
+        // failure; what matters here is what reached the wallet.
+        if let Err(err) = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+        {
+            assert!(
+                matches!(err, AppError::Credential { .. }),
+                "unexpected error: {err:?}"
+            );
+        }
+        let wallet = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert!(
+            wallet.is_empty(),
+            "a successor was stored from a refund naming another key: {wallet:?}"
+        );
+        let spending = core
+            .runtime()
+            .block_on(core.wallet_spending_credentials())
+            .expect("spending");
+        assert_eq!(spending.len(), 1, "the spent credential stays in flight");
+    });
+}
+
+/// The request context is revealed by every spend of a credential and of all
+/// its successors, so a credential issued under a context other clients do
+/// not share is recognisable at each of them. The client refuses one, and
+/// one carrying a different amount from the one it asked for, before
+/// anything enters the wallet.
+#[test]
+fn an_issuance_that_could_mark_its_credential_is_refused() {
+    for (what, config) in [
+        (
+            "a context of its own",
+            MockConfig {
+                issuance_context: Some(chat_harness::distinct_context()),
+                ..MockConfig::default()
+            },
+        ),
+        (
+            "an amount other than the one asked for",
+            MockConfig {
+                issuance_extra_credits: 1,
+                ..MockConfig::default()
+            },
+        ),
+    ] {
+        run(move || {
+            let (_mock, core, _dir) = setup(config);
+            with_account(&core);
+            let err = core
+                .runtime()
+                .block_on(core.account_allocate(100_000))
+                .expect_err(what);
+            assert!(
+                matches!(err, AppError::Credential { .. }),
+                "{what}: unexpected error: {err:?}"
+            );
+            let wallet = core
+                .runtime()
+                .block_on(core.wallet_credentials())
+                .expect("wallet");
+            assert!(wallet.is_empty(), "{what}: stored {wallet:?}");
+        });
+    }
+}
+
+// ===========================================================================
+// Credential lifetime: bounded by the key's acceptance deadline
+// ===========================================================================
+
+const WEEK_SECS: i64 = 7 * 86_400;
+
+fn now_unix_secs() -> i64 {
+    eidola_app_core::now_ms().div_euclid(1_000)
+}
+
+/// Sleep until the wall clock is safely past `secs` (unix seconds). The
+/// lifecycle view reads the database's own clock, so a deadline is crossed by
+/// waiting for it rather than by moving a test clock.
+fn sleep_past_unix_secs(secs: i64) {
+    let target_ms = secs * 1_000 + 300;
+    let wait = target_ms - eidola_app_core::now_ms();
+    if wait > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(wait as u64));
+    }
+}
+
+fn margin_secs() -> i64 {
+    eidola_app_core::CREDENTIAL_SPEND_MARGIN.as_secs() as i64
+}
+
+fn credential_states(core: &AppCore) -> Vec<(String, i64)> {
+    core.runtime()
+        .block_on(core.wallet_lifecycle())
+        .expect("lifecycle")
+        .into_iter()
+        .map(|c| (c.state, c.generation))
+        .collect()
+}
+
+/// Allocations the wallet has seen: every allocation mints a generation-0
+/// credential, and every spend's successor is a later generation.
+fn allocations(core: &AppCore) -> usize {
+    credential_states(core)
+        .iter()
+        .filter(|(_, generation)| *generation == 0)
+        .count()
+}
+
+/// A credential issued moments before its key stops *issuing* is still
+/// spendable after that moment: the server accepts it for a further epoch,
+/// and the client must not strand the balance it debited at issuance.
+#[test]
+fn a_credential_issued_just_before_its_key_stops_issuing_stays_spendable() {
+    run(|| {
+        let now = now_unix_secs();
+        let issue_until = now + 2;
+        let (window, calendar) = KeyWindow::epoch_ending_at(issue_until, WEEK_SECS as u64);
+        let (mock, core, _dir) = setup(MockConfig {
+            key_window: Some(window),
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("first".into(), MODEL.into(), None))
+            .expect("the first turn provisions and spends");
+        assert_eq!(allocations(&core), 1);
+
+        sleep_past_unix_secs(issue_until);
+        assert!(
+            credential_states(&core)
+                .iter()
+                .any(|(state, _)| state == "active"),
+            "past issue_until but inside accept_until the change stays spendable: {:?}",
+            credential_states(&core)
+        );
+
+        core.runtime()
+            .block_on(core.chat("second".into(), MODEL.into(), None))
+            .expect("the second turn spends the change");
+        assert_eq!(mock.chat_hits(), 2);
+        assert_eq!(
+            allocations(&core),
+            1,
+            "the second turn must spend the existing credential, not allocate again"
+        );
+    });
+}
+
+/// The spendable life does end — `CREDENTIAL_SPEND_MARGIN` before the key's
+/// acceptance deadline. Past it the credential reads `expired`, and the
+/// provisioning queue no longer picks it: the next turn goes to allocate a
+/// fresh credential instead (and here finds no key still issuing, so fails
+/// before any completion request).
+#[test]
+fn a_credential_lapses_its_spend_margin_before_the_keys_acceptance_deadline() {
+    run(|| {
+        let now = now_unix_secs();
+        let spend_until = now + 3;
+        // Issuing ends at now + 2 and acceptance one epoch later, at the spend
+        // deadline plus the margin: an epoch of margin + 1 seconds.
+        let (window, calendar) =
+            KeyWindow::epoch_ending_at(now + 2, (spend_until + margin_secs() - (now + 2)) as u64);
+        let (mock, core, _dir) = setup(MockConfig {
+            key_window: Some(window),
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("first".into(), MODEL.into(), None))
+            .expect("the first turn provisions and spends");
+        assert!(
+            credential_states(&core)
+                .iter()
+                .any(|(state, _)| state == "active"),
+            "before the spend deadline the change is spendable"
+        );
+
+        sleep_past_unix_secs(spend_until);
+        // The unspent change lapses; the settled spend keeps saying what it was
+        // until the key's acceptance deadline itself.
+        let mut states = credential_states(&core);
+        states.sort_by_key(|(_, generation)| *generation);
+        assert_eq!(
+            states,
+            vec![("spent".to_string(), 0), ("expired".to_string(), 1)],
+            "past accept_until less the margin, no credential under the key is spendable"
+        );
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("second".into(), MODEL.into(), None))
+            .expect_err("no spendable credential and no key still issuing");
+        assert!(matches!(err, AppError::Credential { .. }), "got {err:?}");
+        assert_eq!(
+            mock.chat_hits(),
+            1,
+            "the lapsed credential must never be spent"
+        );
+    });
+}
+
+/// The account is debited at issuance, so a credential that would be born
+/// already past its spend deadline is refused before the issuance request: a
+/// server advertising an acceptance window shorter than the margin gets no
+/// allocation, and the turn fails having written and announced nothing of
+/// the wallet.
+#[test]
+fn issuance_is_refused_when_the_key_could_not_be_spent_under() {
+    run(|| {
+        let now = now_unix_secs();
+        // Issuing until now + 30, accepted until a minute short of the margin
+        // from now: an epoch shorter than the margin.
+        let (window, calendar) =
+            KeyWindow::epoch_ending_at(now + 30, (margin_secs() - 60 - 30) as u64);
+        let (mock, core, _dir) = setup(MockConfig {
+            key_window: Some(window),
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect_err("issuance under a key about to lapse is refused");
+        assert!(matches!(err, AppError::Credential { .. }), "got {err:?}");
+        assert_eq!(mock.chat_hits(), 0);
+        assert!(credential_states(&core).is_empty(), "nothing was issued");
+
+        let changes = drain(&mut rx);
+        assert!(
+            !changes.contains(&Change::Wallet) && !changes.contains(&Change::Account),
+            "a refused issuance announces no wallet or account write; got {changes:?}"
+        );
+        assert!(changes.contains(&Change::SpaceIndex), "the post survives");
+    });
+}
+
+// ===========================================================================
+// Issuer keys against the public calendar, one per epoch
+// ===========================================================================
+
+/// A key whose windows are not one epoch's on the public calendar is refused
+/// before anything is requested: a window nobody could have computed in
+/// advance is one a server could have timed around this client.
+#[test]
+fn a_key_off_the_calendar_is_refused_before_issuance() {
+    run(|| {
+        let now = now_unix_secs();
+        // An issuing window covering now that starts at an arbitrary instant,
+        // the shape keys had before they were put on a calendar.
+        let (mock, core, _dir) = setup(MockConfig {
+            key_window: Some(KeyWindow::from_unix_secs(
+                now - 3_600,
+                now - 3_600 + WEEK_SECS,
+                now - 3_600 + 2 * WEEK_SECS,
+            )),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect_err("a key off the calendar is refused");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::NotOnCalendar
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(mock.chat_hits(), 0);
+        assert!(credential_states(&core).is_empty(), "nothing was issued");
+        let changes = drain(&mut rx);
+        assert!(
+            !changes.contains(&Change::Wallet) && !changes.contains(&Change::Account),
+            "a refused key announces no wallet or account write; got {changes:?}"
+        );
+    });
+}
+
+/// The same key the client checks is the one the calendar's production
+/// constants describe: with no test calendar, the mock's windows are the
+/// production epoch's, and they are accepted.
+#[test]
+fn the_production_calendars_current_epoch_is_accepted() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the current epoch's key on the production calendar issues");
+    });
+}
+
+/// An honest server has one key per epoch. Once this client has seen the
+/// epoch's key, a different one for the same epoch is refused — before any
+/// issuance request, though the second key is real and would have signed —
+/// and the refusal lasts until the next epoch, whose key is accepted.
+#[test]
+fn a_second_key_for_a_seen_epoch_is_refused_until_the_next_epoch() {
+    run(|| {
+        let now = now_unix_secs();
+        // An epoch boundary a few seconds from now, on week-long epochs (a
+        // key's acceptance has to outlast the spend margin).
+        let boundary = now + 6;
+        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
+        let config = MockConfig {
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        };
+        let key_swap = config.key_swap.clone();
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.account_allocate(1_000_000))
+            .expect("the epoch's first key issues");
+        let before = credential_states(&core).len();
+        assert_eq!(before, 1);
+
+        key_swap.swap();
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect_err("a second key for the epoch is refused");
+        let epoch = calendar
+            .epoch_at(u64::try_from(now).unwrap())
+            .expect("on the calendar");
+        assert!(
+            matches!(
+                &err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::SecondKeyForEpoch { epoch: e }
+                } if *e == epoch
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            credential_states(&core).len(),
+            before,
+            "nothing was issued under the second key"
+        );
+        // The credential already held is untouched and still spends.
+        core.runtime()
+            .block_on(core.chat("still works".into(), MODEL.into(), None))
+            .expect("a held credential keeps working");
+        assert_eq!(mock.chat_hits(), 1);
+
+        // Asking again is refused the same way: nothing about the refusal
+        // wears off within the epoch.
+        let refused_again = core.runtime().block_on(core.account_allocate(1_000));
+        assert!(
+            matches!(refused_again, Err(AppError::IssuerKeyRefused { .. })),
+            "got {refused_again:?}"
+        );
+
+        sleep_past_unix_secs(boundary);
+        let next = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the next epoch's key issues");
+        assert_eq!(next.issuer_key_id, key_swap.second_key_id());
+        assert_ne!(next.issuer_key_id, first.issuer_key_id);
+    });
+}
+
+/// An honest server has a distinct key for every epoch. One that keeps its
+/// key across a boundary lists it for the epoch just ended and for the new
+/// one, and the client refuses it: a key the record could hold for one epoch
+/// only would leave the other to be filled by whatever the server shows next.
+#[test]
+fn a_key_kept_across_an_epoch_boundary_is_refused() {
+    run(|| {
+        let now = now_unix_secs();
+        let boundary = now + 6;
+        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
+        let (_mock, core, _dir) = setup(MockConfig {
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the epoch's key issues");
+
+        sleep_past_unix_secs(boundary);
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect_err("the same key for the next epoch is refused");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::OneKeyForSeveralEpochs { .. }
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(credential_states(&core).len(), 1, "nothing more was issued");
+    });
+}
+
+/// The record remembers which epoch each key was seen for, so a key reused
+/// for a later epoch is refused even when the listing leaves out the entry
+/// it would have collided with.
+#[test]
+fn a_key_seen_for_one_epoch_is_refused_for_the_next() {
+    run(|| {
+        let now = now_unix_secs();
+        let boundary = now + 6;
+        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
+        let config = MockConfig {
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        };
+        let omit = config.omit_previous_key.clone();
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the epoch's key issues");
+
+        omit.store(true, std::sync::atomic::Ordering::SeqCst);
+        sleep_past_unix_secs(boundary);
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect_err("a key already seen for the previous epoch is refused");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::OneKeyForSeveralEpochs { .. }
+                }
+            ),
+            "got {err:?}"
+        );
+    });
+}
+
+/// The record is kept on disk: a client that restarts still refuses a
+/// second key for an epoch it saw before the restart.
+#[test]
+fn the_key_seen_for_an_epoch_survives_a_restart() {
+    run(|| {
+        // The upstream runs on a runtime of its own so it outlives the core.
+        let config = MockConfig::default();
+        let key_swap = config.key_swap.clone();
+        let mock_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("mock runtime");
+        let mock = mock_rt.block_on(chat_harness::start(config.clone()));
+        let (_unused, core, dir) = setup(config);
+        core.runtime()
+            .block_on(core.set_base_url(mock.base_url.clone()))
+            .expect("point at the lasting upstream");
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the epoch's first key issues");
+        drop(core);
+
+        key_swap.swap();
+        let core = chat_harness::reopen_core(&dir, &mock.base_url);
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect_err("a second key for the epoch is refused after a restart");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::SecondKeyForEpoch { .. }
+                }
+            ),
+            "got {err:?}"
         );
     });
 }
@@ -9661,5 +10241,700 @@ fn a_configuration_write_and_its_key_cleanup_are_one_transaction() {
             .block_on(core.set_base_url(elsewhere.base_url.clone()))
             .expect("without the fault, the write lands");
         assert!(lineages(&core).is_empty());
+    });
+}
+
+// ===========================================================================
+// Issuance ahead of need, and issuance that survives a lost response
+// ===========================================================================
+
+/// A wallet that has spent lately and holds less than the provisioner's
+/// threshold: an explicit small allocation, then one turn spent from it.
+fn spend_from_a_small_credential(core: &AppCore, credits: i64) {
+    with_account(core);
+    core.runtime()
+        .block_on(core.account_allocate(credits))
+        .expect("a small explicit allocation");
+    core.runtime()
+        .block_on(core.chat("hello".into(), MODEL.into(), None))
+        .expect("the turn spends the small credential");
+}
+
+fn active_credentials(core: &AppCore) -> Vec<(i64, i64)> {
+    core.runtime()
+        .block_on(core.wallet_credentials())
+        .expect("active credentials")
+        .into_iter()
+        .map(|c| (c.credits, c.generation))
+        .collect()
+}
+
+fn provision(core: &AppCore) -> ProvisionOutcome {
+    core.runtime()
+        .block_on(core.test_provision_once())
+        .expect("a provisioner pass")
+}
+
+/// Below the threshold, with recent spending and a funded account, one pass
+/// issues one credential of the standard size; the next pass finds the buffer
+/// covered and issues nothing.
+#[test]
+fn the_provisioner_tops_up_a_wallet_running_low() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        spend_from_a_small_credential(&core, 100_000);
+        assert_eq!(mock.issuance_debits(), 1);
+
+        let outcome = provision(&core);
+        assert!(
+            matches!(outcome, ProvisionOutcome::Issued { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(mock.issuance_debits(), 2);
+        assert!(
+            active_credentials(&core).contains(&(DEFAULT_ALLOCATION_CREDITS, 0)),
+            "the background credential is the standard size: {:?}",
+            active_credentials(&core)
+        );
+
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+        assert_eq!(mock.issuance_debits(), 2, "a covered wallet issues nothing");
+    });
+}
+
+/// The credential the provisioner issues is not the one the next request
+/// spends: what was already held still covers it, so the new credential's
+/// first spend waits for the reader's own use to exhaust the old one rather
+/// than following its issuance.
+#[test]
+fn a_background_credential_is_not_spent_by_the_next_request() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        spend_from_a_small_credential(&core, 100_000);
+        assert!(matches!(provision(&core), ProvisionOutcome::Issued { .. }));
+
+        core.runtime()
+            .block_on(core.chat("again".into(), MODEL.into(), None))
+            .expect("the next turn");
+        assert_eq!(mock.chat_hits(), 2);
+        assert_eq!(mock.issuance_debits(), 2, "the next turn converted nothing");
+        assert!(
+            active_credentials(&core).contains(&(DEFAULT_ALLOCATION_CREDITS, 0)),
+            "the background credential is still unspent after the next turn: {:?}",
+            active_credentials(&core)
+        );
+    });
+}
+
+/// No buffer is kept for a wallet that has not spent: a credential issued for
+/// it would most likely lapse unspent. Nothing is sent to the server at all.
+#[test]
+fn the_provisioner_keeps_no_buffer_for_a_wallet_that_has_not_spent() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        assert_eq!(provision(&core), ProvisionOutcome::Idle);
+        assert_eq!(mock.issuance_requests(), 0);
+        assert!(credential_states(&core).is_empty());
+    });
+}
+
+/// Without an account the provisioner does nothing.
+#[test]
+fn the_provisioner_does_nothing_without_an_account() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        assert_eq!(provision(&core), ProvisionOutcome::NoAccount);
+        assert_eq!(mock.issuance_requests(), 0);
+    });
+}
+
+/// Below one standard allocation of balance nothing is issued in the
+/// background; the remainder is left for the just-in-time path, which still
+/// converts it when a request needs it.
+#[test]
+fn the_provisioner_never_issues_from_a_balance_below_a_standard_allocation() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            balance: DEFAULT_ALLOCATION_CREDITS - 1,
+            ..MockConfig::default()
+        });
+        spend_from_a_small_credential(&core, 100_000);
+        assert_eq!(provision(&core), ProvisionOutcome::LowBalance);
+        assert_eq!(mock.issuance_debits(), 1);
+    });
+}
+
+/// A key whose credentials lapse within the provisioner's horizon is never
+/// issued under in the background: the credential would not count toward the
+/// buffer, and would lapse before it could carry the days ahead.
+#[test]
+fn the_provisioner_never_issues_under_a_key_about_to_lapse() {
+    run(|| {
+        // Six-hour epochs: the current key stops issuing in an hour and is
+        // accepted for six more, well inside the 24-hour horizon.
+        let (window, calendar) = KeyWindow::epoch_ending_at(now_unix_secs() + 3_600, 6 * 3_600);
+        let (mock, core, _dir) = setup(MockConfig {
+            key_window: Some(window),
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        });
+        spend_from_a_small_credential(&core, 100_000);
+        assert_eq!(provision(&core), ProvisionOutcome::NoUsableKey);
+        assert_eq!(mock.issuance_debits(), 1);
+    });
+}
+
+/// Late in a key's issuing window, with enough still held, the provisioner
+/// waits for the next key; with too little held it issues anyway.
+#[test]
+fn the_provisioner_prefers_a_keys_early_life() {
+    // The current key stops issuing in an hour, inside the late window, and
+    // its credentials are accepted for a further week.
+    let config = || {
+        let (window, calendar) =
+            KeyWindow::epoch_ending_at(now_unix_secs() + 3_600, WEEK_SECS as u64);
+        MockConfig {
+            key_window: Some(window),
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        }
+    };
+    run(move || {
+        let (mock, core, _dir) = setup(config());
+        spend_from_a_small_credential(&core, 200_000);
+        assert_eq!(provision(&core), ProvisionOutcome::Deferred);
+        assert_eq!(mock.issuance_debits(), 1);
+    });
+    run(move || {
+        let (mock, core, _dir) = setup(config());
+        spend_from_a_small_credential(&core, 50_000);
+        assert!(matches!(provision(&core), ProvisionOutcome::Issued { .. }));
+        assert_eq!(mock.issuance_debits(), 2);
+    });
+}
+
+/// The running provisioner looks only after an interval drawn from its
+/// window — never at start, never in reaction to a request — and then issues.
+#[test]
+fn the_provisioner_issues_only_after_its_interval() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        spend_from_a_small_credential(&core, 100_000);
+        let min = std::time::Duration::from_millis(600);
+        core.test_set_provision_interval(min, std::time::Duration::from_millis(900));
+        let started = std::time::Instant::now();
+        core.start_credential_provisioner();
+
+        // A request made right after start provokes nothing.
+        core.runtime()
+            .block_on(core.chat("right away".into(), MODEL.into(), None))
+            .expect("a turn");
+        assert_eq!(mock.issuance_debits(), 1, "nothing was issued at start");
+
+        let deadline = started + std::time::Duration::from_secs(10);
+        while mock.issuance_debits() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(mock.issuance_debits(), 2, "the provisioner issued once");
+        assert!(
+            elapsed >= min,
+            "the first look came {elapsed:?} after start, inside its {min:?} floor"
+        );
+    });
+}
+
+/// The just-in-time path still provisions a turn the wallet cannot cover,
+/// whatever the provisioner is doing.
+#[test]
+fn the_just_in_time_path_remains_the_fallback() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.start_credential_provisioner();
+        core.runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect("an empty wallet still gets its turn");
+        assert_eq!(mock.issuance_debits(), 1);
+        assert_eq!(mock.chat_hits(), 1);
+    });
+}
+
+/// A response lost after the server debited (the connection closed before
+/// anything came back) is not lost value: the pending issuance survives a
+/// restart, and asking again under the same idempotency key gets the stored
+/// response — one debit, one credential.
+#[test]
+fn a_lost_issuance_response_is_recovered_without_a_second_debit() {
+    run(|| {
+        // The upstream runs on a runtime of its own so it outlives the core.
+        let mock_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("mock runtime");
+        let mock = mock_rt.block_on(chat_harness::start(MockConfig::default()));
+        let (_unused, core, dir) = setup(MockConfig::default());
+        core.runtime()
+            .block_on(core.set_base_url(mock.base_url.clone()))
+            .expect("point at the lasting upstream");
+        with_account(&core);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("the response never arrived");
+        assert_eq!(mock.issuance_debits(), 1);
+        assert!(credential_states(&core).is_empty());
+
+        // Too young to be asked for again: an original attempt could still be
+        // in flight on the server.
+        assert!(
+            core.runtime()
+                .block_on(core.recover_spending_credentials())
+                .expect("recovery")
+                .is_empty()
+        );
+        assert_eq!(mock.issuance_requests(), 1, "nothing was resent");
+
+        // The process dies; the next one recovers it.
+        let base_url = mock.base_url.clone();
+        drop(core);
+        let core = chat_harness::reopen_core(&dir, &base_url);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_spending_credentials())
+            .expect("recovery");
+        assert_eq!(recovered.len(), 1, "the lost issuance came back");
+        assert_eq!(mock.issuance_requests(), 2);
+        assert_eq!(mock.issuance_debits(), 1, "the retry was not debited again");
+        assert_eq!(
+            active_credentials(&core),
+            vec![(DEFAULT_ALLOCATION_CREDITS, 0)]
+        );
+
+        // Recovered once, it is never asked for again.
+        assert!(
+            core.runtime()
+                .block_on(core.recover_spending_credentials())
+                .expect("recovery")
+                .is_empty()
+        );
+        assert_eq!(mock.issuance_requests(), 2);
+    });
+}
+
+/// The provisioner's own pass recovers a lost issuance before deciding, so a
+/// background issuance whose response was lost is answered, not repeated.
+#[test]
+fn the_provisioner_recovers_a_lost_issuance_instead_of_issuing_again() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        spend_from_a_small_credential(&core, 100_000);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.test_provision_once())
+            .expect_err("the background issuance's response was lost");
+        assert_eq!(mock.issuance_debits(), 2);
+
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+        assert_eq!(mock.issuance_debits(), 2, "recovered, not issued again");
+        assert!(active_credentials(&core).contains(&(DEFAULT_ALLOCATION_CREDITS, 0)));
+    });
+}
+
+/// An issuance the server refused debited nothing, so it is abandoned rather
+/// than asked for again.
+#[test]
+fn a_refused_issuance_is_not_asked_for_again() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        let knobs = mock.issuance_knobs();
+        with_account(&core);
+        knobs.refuse_with(Some(402));
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("refused");
+        knobs.refuse_with(None);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        assert!(
+            core.runtime()
+                .block_on(core.recover_spending_credentials())
+                .expect("recovery")
+                .is_empty()
+        );
+        assert_eq!(mock.issuance_requests(), 1, "a refusal is final");
+    });
+}
+
+/// A retry is only ever sent for the account the issuance was made for.
+#[test]
+fn a_pending_issuance_is_never_retried_for_another_account() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("lost");
+        core.reset_account().expect("sign out");
+        core.set_account_credentials(
+            "00000000-0000-0000-0000-000000000002".into(),
+            "other-secret".into(),
+        )
+        .expect("switch account");
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        assert!(
+            core.runtime()
+                .block_on(core.recover_spending_credentials())
+                .expect("recovery")
+                .is_empty()
+        );
+        assert_eq!(mock.issuance_requests(), 1);
+    });
+}
+
+/// **What is held stays within the threshold plus one allocation**, even when
+/// a background issuance's response is lost and every retry of it fails. The
+/// lost issuance may already have been paid for, so it counts toward the
+/// buffer and nothing is issued beside it; without that, each pass whose
+/// recovery failed would convert another allocation. The mock refunds every
+/// charge in full, so everything it ever debited is still held.
+#[test]
+fn what_is_held_stays_within_the_threshold_plus_one_allocation() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        spend_from_a_small_credential(&core, 100_000);
+        let bound = eidola_app_core::PROVISION_THRESHOLD_CREDITS + DEFAULT_ALLOCATION_CREDITS;
+
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.test_provision_once())
+            .expect_err("the background issuance's response was lost");
+        assert_eq!(mock.issuance_debits(), 2);
+
+        // Inside the retry hold-off, and then with every retry failing.
+        let _ = provision(&core);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        mock.issuance_knobs().fail_retries(true);
+        for _ in 0..6 {
+            let _ = core.runtime().block_on(core.test_provision_once());
+            assert!(
+                mock.issuance_debited_credits() <= bound,
+                "{} credits converted, past the bound of {bound}",
+                mock.issuance_debited_credits()
+            );
+        }
+        assert_eq!(mock.issuance_debits(), 2, "nothing was issued beside it");
+
+        // Once a retry is answered, the stored response is what lands.
+        mock.issuance_knobs().fail_retries(false);
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+        assert_eq!(mock.issuance_debits(), 2);
+        assert!(active_credentials(&core).contains(&(DEFAULT_ALLOCATION_CREDITS, 0)));
+    });
+}
+
+/// An unresolved issuance too small to cover the buffer still holds off a
+/// fresh one: it may have been paid for, and issuing beside it is how what is
+/// held escapes its bound.
+#[test]
+fn an_unresolved_issuance_holds_off_a_fresh_one() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        spend_from_a_small_credential(&core, 50_000);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(50_000))
+            .expect_err("lost");
+        assert_eq!(mock.issuance_debits(), 2);
+
+        assert_eq!(provision(&core), ProvisionOutcome::Unresolved);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        mock.issuance_knobs().fail_retries(true);
+        assert_eq!(provision(&core), ProvisionOutcome::Unresolved);
+        assert_eq!(mock.issuance_debits(), 2);
+    });
+}
+
+/// With the Eidola backend switched off, the provisioner sends nothing:
+/// neither a fresh issuance nor the retry of a pending one.
+#[test]
+fn the_provisioner_leaves_a_disabled_backend_alone() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        spend_from_a_small_credential(&core, 100_000);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(50_000))
+            .expect_err("lost");
+        let requests = mock.issuance_requests();
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        core.runtime()
+            .block_on(core.set_backend_enabled("eidola".into(), false))
+            .expect("disable eidola");
+
+        assert_eq!(provision(&core), ProvisionOutcome::BackendDisabled);
+        assert_eq!(mock.issuance_requests(), requests, "nothing was sent");
+    });
+}
+
+/// A server that accepts an issuance and never answers holds nothing for
+/// long: the request is cut off at its deadline, the gate is free again, and
+/// the issuance is left pending to be asked for once the server answers.
+#[test]
+fn a_stalled_issuance_gives_up_at_its_deadline() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        spend_from_a_small_credential(&core, 100_000);
+        core.test_set_issuance_timeouts(
+            std::time::Duration::from_millis(400),
+            std::time::Duration::from_secs(5),
+        );
+        mock.issuance_knobs().stall(true);
+        let started = std::time::Instant::now();
+        core.runtime()
+            .block_on(core.test_provision_once())
+            .expect_err("the stalled request is cut off");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the pass took {:?}",
+            started.elapsed()
+        );
+
+        mock.issuance_knobs().stall(false);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+        assert_eq!(
+            mock.issuance_debits(),
+            2,
+            "the pending issuance landed once"
+        );
+    });
+}
+
+/// Waiting for the issuance gate is bounded: a turn that needs a just-in-time
+/// conversion while another issuance holds the gate — and it waits with
+/// `spend_gate` held, so every later paid turn would wait behind it — gives up
+/// with a typed timeout instead of waiting for that issuance's server.
+#[test]
+fn a_turn_waiting_on_a_stalled_issuance_times_out() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.test_set_issuance_timeouts(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(400),
+        );
+        mock.issuance_knobs().stall(true);
+        std::thread::scope(|scope| {
+            let holder = scope.spawn(|| {
+                let _ = core
+                    .runtime()
+                    .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS));
+            });
+            while mock.issuance_requests() == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let started = std::time::Instant::now();
+            let err = core
+                .runtime()
+                .block_on(core.chat("hi".into(), MODEL.into(), None))
+                .expect_err("the gate is held by a stalled issuance");
+            assert!(
+                matches!(err, AppError::ProvisioningTimeout { .. }),
+                "got {err:?}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "the turn waited {:?}",
+                started.elapsed()
+            );
+            assert_eq!(mock.chat_hits(), 0);
+            mock.issuance_knobs().stall(false);
+            holder.join().unwrap();
+        });
+    });
+}
+
+/// A retry the gateway refuses at authentication (a relinked account whose
+/// secret was mistyped) proves nothing about the issuance it retries: the
+/// gateway checks the secret before it looks for the stored response. So the
+/// issuance stays pending, and once the secret is right it lands, debited
+/// once.
+#[test]
+fn a_retry_refused_at_authentication_is_kept_until_the_secret_is_right() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("lost");
+        assert_eq!(mock.issuance_debits(), 1);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+
+        // The same account relinked with a secret the gateway refuses.
+        mock.issuance_knobs().unauthorized(true);
+        assert!(
+            core.runtime()
+                .block_on(core.recover_spending_credentials())
+                .expect("recovery")
+                .is_empty()
+        );
+        assert_eq!(
+            mock.issuance_requests(),
+            2,
+            "the retry was sent and refused"
+        );
+
+        // The secret corrected: the stored response is what lands.
+        mock.issuance_knobs().unauthorized(false);
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_spending_credentials())
+            .expect("recovery");
+        assert_eq!(recovered.len(), 1, "the paid issuance was not abandoned");
+        assert_eq!(mock.issuance_debits(), 1);
+        assert_eq!(
+            active_credentials(&core),
+            vec![(DEFAULT_ALLOCATION_CREDITS, 0)]
+        );
+    });
+}
+
+/// A recovery that settles a stranded hold and then fails — here waiting for
+/// the issuance gate a stalled issuance holds — has still written the
+/// successor, and says so on the bus before it fails: the caller that gets
+/// the error does not re-read on its own.
+#[test]
+fn a_recovery_that_fails_after_settling_a_hold_still_announces_it() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            refund: RefundMode::FailFirst(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the turn answers though its hold did not settle");
+        assert_eq!(
+            core.runtime()
+                .block_on(core.wallet_spending_credentials())
+                .expect("wallet")
+                .len(),
+            1
+        );
+
+        core.test_set_issuance_timeouts(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(400),
+        );
+        mock.issuance_knobs().stall(true);
+        let mut rx = core.subscribe_changes();
+        std::thread::scope(|scope| {
+            let requests = mock.issuance_requests();
+            let holder = scope.spawn(|| {
+                let _ = core
+                    .runtime()
+                    .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS));
+            });
+            while mock.issuance_requests() == requests {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let err = core
+                .runtime()
+                .block_on(core.recover_spending_credentials())
+                .expect_err("the issuance gate is held by a stalled issuance");
+            assert!(
+                matches!(err, AppError::ProvisioningTimeout { .. }),
+                "got {err:?}"
+            );
+            mock.issuance_knobs().stall(false);
+            holder.join().unwrap();
+        });
+
+        assert!(
+            core.runtime()
+                .block_on(core.wallet_spending_credentials())
+                .expect("wallet")
+                .is_empty(),
+            "the hold was settled before the failure"
+        );
+        assert!(
+            drain(&mut rx).contains(&Change::Wallet),
+            "the settled hold was announced although recovery failed"
+        );
+    });
+}
+
+/// The provisioner issues only under a key the client's calendar and epoch
+/// record accept: a server that lists a second key for an epoch the client
+/// already holds a key for is refused before anything is debited, in the
+/// background as at every other door.
+#[test]
+fn the_provisioner_never_issues_under_a_refused_key() {
+    run(|| {
+        let config = MockConfig::default();
+        let swap = config.key_swap.clone();
+        let (mock, core, _dir) = setup(config);
+        spend_from_a_small_credential(&core, 100_000);
+        swap.swap();
+        let err = core
+            .runtime()
+            .block_on(core.test_provision_once())
+            .expect_err("a second key for the epoch is refused");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::SecondKeyForEpoch { .. }
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(mock.issuance_debits(), 1, "nothing was issued under it");
+    });
+}
+
+/// A pending issuance is asked for again under the key it was made under,
+/// even once the epoch has moved and the server lists another key as current:
+/// the stored response answers it, whatever is current now. (Recovery stops
+/// at the key's spend deadline, inside the server's retention of the stored
+/// response.)
+#[test]
+fn a_pending_issuance_is_retried_under_its_own_key_after_the_epoch_moves() {
+    run(|| {
+        // Twenty-minute epochs, the current one ending in three seconds.
+        let boundary = now_unix_secs() + 3;
+        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, 20 * 60);
+        let config = MockConfig {
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        };
+        let swap = config.key_swap.clone();
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("lost");
+
+        sleep_past_unix_secs(boundary);
+        // The next epoch, honestly under a key of its own.
+        swap.swap();
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_spending_credentials())
+            .expect("recovery");
+        assert_eq!(
+            recovered.len(),
+            1,
+            "a retry naming the new key would not match what was stored"
+        );
+        assert_eq!(mock.issuance_debits(), 1);
     });
 }

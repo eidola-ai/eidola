@@ -81,8 +81,9 @@ hmac = "0.13"
 sha2 = { version = "0.11", features = ["zeroize"] }
 subtle = "2"
 
-# Shared client/server contract logic (pricing formula)
-eidola-common = { path = "../eidola-common", features = ["argon2"] }
+# Shared client/server contract logic (pricing formula; `private-token`: the
+# one spelling of a spend's `Authorization` value)
+eidola-common = { path = "../eidola-common", features = ["argon2", "private-token"] }
 
 # Attestation verification of the engine deployments, on every handshake
 tinfoil-verifier = { path = "../tinfoil-verifier" }

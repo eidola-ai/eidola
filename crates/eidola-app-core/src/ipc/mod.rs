@@ -1093,6 +1093,9 @@ impl WireError {
                 ("Server", json!({ "status": status, "message": message }))
             }
             AppError::Credential { message } => ("Credential", json!({ "message": message })),
+            AppError::IssuerKeyRefused { refusal } => {
+                ("IssuerKeyRefused", json!({ "refusal": refusal }))
+            }
             AppError::NoAccount => ("NoAccount", json!({})),
             AppError::InsufficientBalance {
                 available,
@@ -1189,6 +1192,9 @@ impl WireError {
                 message: msg(),
             },
             "Credential" => AppError::Credential { message: msg() },
+            "IssuerKeyRefused" => AppError::IssuerKeyRefused {
+                refusal: serde_json::from_value(f.get("refusal")?.clone()).ok()?,
+            },
             "NoAccount" => AppError::NoAccount,
             "InsufficientBalance" => AppError::InsufficientBalance {
                 available: i("available")?,
