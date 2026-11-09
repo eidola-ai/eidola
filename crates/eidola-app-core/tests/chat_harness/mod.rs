@@ -1190,9 +1190,12 @@ struct Issuer {
     /// key the real server seals that spend's stored refund under, and so
     /// the only one its recovery endpoint opens it for.
     spend_keys: std::sync::Mutex<std::collections::HashMap<Vec<u8>, [u8; 32]>>,
-    /// A public key listed as the previous epoch's: stable for the mock's
-    /// life, as a real server's previous key is.
+    /// A public key listed as the previous epoch's, for an epoch the mock
+    /// never listed a current key for: stable for the mock's life.
     decoy_public_key: Vec<u8>,
+    /// The key (id, base64 public key) the mock listed as current for each
+    /// epoch, first listing wins — what it lists as that epoch's key later.
+    listed: std::sync::Mutex<std::collections::HashMap<u64, (String, String)>>,
 }
 
 impl Issuer {
@@ -1220,6 +1223,7 @@ impl Issuer {
                 .public()
                 .to_cbor()
                 .expect("encode decoy public key"),
+            listed: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -3230,24 +3234,47 @@ fn keys_body(issuer: &Issuer, config: &MockConfig) -> String {
     // — would pick the decoy and fail proof verification against the current
     // issuer (the original bug). The client must skip the out-of-window
     // decoy and choose the current key.
+    //
+    // Like an honest server, the mock remembers which key it listed for each
+    // epoch: the previous epoch's entry is the key it listed as current then
+    // (the decoy only for an epoch it never listed). So a mock that keeps one
+    // key across a boundary lists that key for two epochs, as a dishonest
+    // server would; a test wanting the next epoch accepted gives it a new key
+    // ([`KeySwap`]).
     let calendar = config.issuer_calendar.unwrap_or(ISSUER_CALENDAR);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("after 1970")
         .as_secs();
-    let epoch = calendar.epoch_at(now).expect("on the calendar");
-    let decoy_key_hash: [u8; 32] = Sha256::digest(&issuer.decoy_public_key).into();
-    let decoy = KeyWindow::of_epoch(&calendar, epoch.saturating_sub(1));
+    let window = config.key_window.clone().unwrap_or_else(|| {
+        KeyWindow::of_epoch(&calendar, calendar.epoch_at(now).expect("on the calendar"))
+    });
+    let current_epoch = eidola_app_core::iso_to_ms(&window.issue_from)
+        .ok()
+        .and_then(|ms| u64::try_from(ms.div_euclid(1000)).ok())
+        .and_then(|secs| calendar.epoch_at(secs))
+        .unwrap_or(0);
     let current = config.key_swap.active(issuer);
-    let window = config
-        .key_window
-        .clone()
-        .unwrap_or_else(|| KeyWindow::of_epoch(&calendar, epoch));
+    let previous = {
+        let mut listed = issuer.listed.lock().unwrap();
+        listed
+            .entry(current_epoch)
+            .or_insert_with(|| (current.key_id_hex.clone(), current.public_key_b64()));
+        listed.get(&current_epoch.wrapping_sub(1)).cloned()
+    };
+    let (previous_id, previous_pk) = previous.unwrap_or_else(|| {
+        let hash: [u8; 32] = Sha256::digest(&issuer.decoy_public_key).into();
+        (
+            hex::encode(hash),
+            URL_SAFE_NO_PAD.encode(&issuer.decoy_public_key),
+        )
+    });
+    let decoy = KeyWindow::of_epoch(&calendar, current_epoch.saturating_sub(1));
     serde_json::json!({
         "data": [
             {
-                "id": hex::encode(decoy_key_hash),
-                "public_key": URL_SAFE_NO_PAD.encode(&issuer.decoy_public_key),
+                "id": previous_id,
+                "public_key": previous_pk,
                 "domain_separator": ds,
                 "issue_from": decoy.issue_from,
                 "issue_until": decoy.issue_until,

@@ -290,6 +290,13 @@ pub enum IssuerKeyRefusal {
     /// singling out, and the client cannot tell an emergency rotation from
     /// that, so there is none: issuance stops until the next epoch.
     SecondKeyForEpoch { epoch: u64 },
+    /// The same key offered for two epochs — in one listing, or for an epoch
+    /// other than the one this client already recorded it for. An honest
+    /// gateway mints a distinct key for every epoch, so a key reused across
+    /// epochs is one the per-epoch record could not otherwise hold to
+    /// anything: listed as next epoch's too, it would leave next epoch
+    /// unrecorded for a different key to fill.
+    OneKeyForSeveralEpochs { epoch: u64 },
 }
 
 impl std::fmt::Display for IssuerKeyRefusal {
@@ -305,6 +312,12 @@ impl std::fmt::Display for IssuerKeyRefusal {
                  client already saw; an honest server has one key per epoch, so no credential \
                  was requested (nothing was charged, and credentials already held keep \
                  working). Issuance resumes with the next epoch's key"
+            ),
+            IssuerKeyRefusal::OneKeyForSeveralEpochs { epoch } => write!(
+                f,
+                "the server offered, for epoch {epoch}, an issuer key it also offers for another \
+                 epoch; an honest server has a distinct key for every epoch, so no credential \
+                 was requested (nothing was charged, and credentials already held keep working)"
             ),
         }
     }

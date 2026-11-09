@@ -2937,6 +2937,9 @@ fn error_copy(e: &AppError, cx: &gpui::App) -> String {
             IssuerKeyRefusal::SecondKeyForEpoch { .. } => {
                 crate::i18n::msg::space_error_issuer_key_second_for_epoch(cx).to_string()
             }
+            IssuerKeyRefusal::OneKeyForSeveralEpochs { .. } => {
+                crate::i18n::msg::space_error_issuer_key_reused(cx).to_string()
+            }
         },
         other => other.to_string(),
     }

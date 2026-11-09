@@ -1317,6 +1317,43 @@ fn a_second_key_for_a_seen_epoch_is_refused_until_the_next_epoch() {
     });
 }
 
+/// An honest server has a distinct key for every epoch. One that keeps its
+/// key across a boundary lists it for the epoch just ended and for the new
+/// one, and the client refuses it: a key the record could hold for one epoch
+/// only would leave the other to be filled by whatever the server shows next.
+#[test]
+fn a_key_kept_across_an_epoch_boundary_is_refused() {
+    run(|| {
+        let now = now_unix_secs();
+        let boundary = now + 6;
+        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
+        let (_mock, core, _dir) = setup(MockConfig {
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the epoch's key issues");
+
+        sleep_past_unix_secs(boundary);
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect_err("the same key for the next epoch is refused");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::OneKeyForSeveralEpochs { .. }
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(credential_states(&core).len(), 1, "nothing more was issued");
+    });
+}
+
 /// The record is kept on disk: a client that restarts still refuses a
 /// second key for an epoch it saw before the restart.
 #[test]

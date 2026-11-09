@@ -26,7 +26,7 @@ use crate::db;
 use crate::error::ServerError;
 use crate::helpers::system_time_to_iso_lossy;
 use crate::response::RefundInfo;
-use eidola_common::issuer_calendar::{EpochWindows, ISSUER_CALENDAR};
+use eidola_common::issuer_calendar::{EpochWindows, ISSUER_CALENDAR, rfc3339_utc};
 
 // ---------------------------------------------------------------------------
 // Key cache types
@@ -170,6 +170,11 @@ fn calendar_windows(
         issue_until: whole_unix_secs(issue_until)?,
         accept_until: whole_unix_secs(accept_until)?,
     })
+}
+
+/// An instant as `GET /v1/keys` spells it ([`rfc3339_utc`]).
+fn wire_instant(t: SystemTime) -> String {
+    rfc3339_utc(whole_unix_secs(t).unwrap_or(0))
 }
 
 /// The epoch a key with these windows belongs to, or `None` if they are not
@@ -1116,9 +1121,11 @@ pub async fn list_keys(
             id: hex::encode(k.key_hash),
             public_key: URL_SAFE_NO_PAD.encode(&k.public_key),
             domain_separator: domain_separator(),
-            issue_from: system_time_to_iso_lossy(k.issue_from),
-            issue_until: system_time_to_iso_lossy(k.issue_until),
-            accept_until: system_time_to_iso_lossy(k.accept_until),
+            // The calendar's one spelling, which the client compares
+            // byte for byte. Every cached key's instants are whole seconds.
+            issue_from: wire_instant(k.issue_from),
+            issue_until: wire_instant(k.issue_until),
+            accept_until: wire_instant(k.accept_until),
         })
         .collect();
 
