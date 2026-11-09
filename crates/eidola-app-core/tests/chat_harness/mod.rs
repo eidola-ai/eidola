@@ -565,14 +565,21 @@ pub enum RefundMode {
     /// provisional refund: a refund of nothing (`t = 0`), marked
     /// `"provisional": true`, as the real endpoint does for a spend whose
     /// request may still end. Every later call answers the same refund marked
-    /// `"provisional": false`, as the real endpoint does once `T_SETTLE` has
-    /// passed since it recorded the spend and the provisional refund is the
-    /// spend's last word. Inline refunds are omitted, as for `Fail`.
+    /// `"provisional": false`, as the real endpoint does once no request is
+    /// serving the spend any more and the provisional refund is its last
+    /// word. Inline refunds are omitted, as for `Fail`.
     ProvisionalFirst(u64),
     /// The first `n` calls to `/v1/credentials/refund` succeed and every
     /// later one never answers: a recovery that stalls part-way through a
     /// request's inputs. Inline refunds are omitted.
     StallAfter(u64),
+    /// **The gateway settled a stream it cut short on what was generated.**
+    /// `/v1/credentials/refund` answers a final refund returning the hold less
+    /// `n` credits (the prompt and the output generated before the cut), as
+    /// the real endpoint does for a stream that ended early (its client went
+    /// away, it reached its deadline, or its engine failed). Inline refunds
+    /// are omitted, as for `Fail`.
+    ChargedEarly(u128),
 }
 
 /// Mock upstream configuration.
@@ -2120,7 +2127,9 @@ async fn handle_refund(
     let failing = match config.refund {
         RefundMode::Fail => true,
         RefundMode::FailFirst(n) => attempt <= n,
-        RefundMode::Succeed | RefundMode::ProvisionalFirst(_) => false,
+        RefundMode::Succeed | RefundMode::ProvisionalFirst(_) | RefundMode::ChargedEarly(_) => {
+            false
+        }
         RefundMode::StallAfter(n) if attempt > n => {
             std::future::pending::<()>().await;
             unreachable!()
@@ -2135,11 +2144,14 @@ async fn handle_refund(
     }
     let stored_provisional = matches!(config.refund, RefundMode::ProvisionalFirst(_));
     let provisional = matches!(config.refund, RefundMode::ProvisionalFirst(n) if attempt <= n);
-    // The stored provisional refund returns nothing; any other returns the
-    // share whole. Signed under the key the input names.
+    // The stored provisional refund returns nothing; a stream cut short is
+    // charged what it generated; any other returns the share whole. Signed
+    // under the key the input names.
     let refunds = input.and_then(|input| {
         let charge = if stored_provisional {
             input.share()?
+        } else if let RefundMode::ChargedEarly(charged) = config.refund {
+            charged
         } else {
             0
         };

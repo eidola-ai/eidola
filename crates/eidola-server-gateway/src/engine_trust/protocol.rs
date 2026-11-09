@@ -85,6 +85,7 @@ pub fn engine_request_headers(token: &EngineToken, model: &PinnedModel) -> Heade
 /// prompt), and the gateway's parse (`serde_json`'s sorted maps) does not keep
 /// it. So a request bound for a node keeps its bytes, and the only
 /// constructor parses exactly those bytes, so the two cannot disagree.
+#[derive(Clone)]
 pub struct ValidatedRequest {
     raw: bytes::Bytes,
     parsed: ChatCompletionRequest,

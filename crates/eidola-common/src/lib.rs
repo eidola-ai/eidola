@@ -9,8 +9,7 @@
 //! header), the refund recovery key's wire form ([`refund_key`]), the public
 //! calendar issuer key windows are checked against ([`issuer_calendar`]), the
 //! `credentials` member a spend travels in and the ACT parameter `L`
-//! (`spend_credentials`, behind the `spend-credentials` feature), the longest a
-//! request may run before it is settled ([`T_SETTLE`]), and the
+//! (`spend_credentials`, behind the `spend-credentials` feature), and the
 //! embed-marker recognition rule shared between the
 //! markdown editor's embed plugin and app-core's upstream quote expansion
 //! ([`embed`]). It is intentionally lib-only, pure Rust, and float-free so
@@ -213,37 +212,6 @@ pub const PER_MESSAGE_TOKENS: u64 = 8;
 
 /// Per-request token allowance, covering BOS/system-preamble slack.
 pub const PER_REQUEST_TOKENS: u64 = 32;
-
-/// `T_settle`: the longest a spend's stored refund can stay provisional
-/// without a gateway crash, measured from when the gateway recorded the spend.
-///
-/// When the gateway records a spend's nullifier it stores, in the same
-/// statement, a refund that returns nothing (`t = 0`), marked provisional and
-/// carrying the recording instant inside its seal; when the request ends, for
-/// any reason, it overwrites that with the final refund. A recovery that finds
-/// the provisional one says so, and the client keeps the spend pending rather
-/// than settle on a successor whose final sibling (the same nullifier, a
-/// larger balance) may still come. Once `T_SETTLE` has passed since the
-/// recording, by the gateway's clock, recovery declares the provisional refund
-/// final (only a crash leaves one standing that long) by rewriting the row as
-/// final in a compare-and-swap, which a final refund still in flight cannot
-/// then overwrite, so its answer cannot change after it says so. The client
-/// never estimates this instant: it cannot see when the gateway recorded.
-pub const T_SETTLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-/// The longest the gateway lets a paid request run, from the moment it records
-/// the spend's nullifier: a request still running then is ended, and settled
-/// as a stream that ended early.
-///
-/// Shorter than [`T_SETTLE`] by [`SETTLE_MARGIN`], which covers settlement's
-/// own write after the request ends and the clock disagreement between the
-/// gateway instance that recorded a spend and the one that answers its
-/// recovery (bounded far below the margin by the gateway's own skew check).
-pub const MAX_REQUEST_DURATION: std::time::Duration =
-    std::time::Duration::from_secs(T_SETTLE.as_secs() - SETTLE_MARGIN.as_secs());
-
-/// What separates [`MAX_REQUEST_DURATION`] from [`T_SETTLE`].
-pub const SETTLE_MARGIN: std::time::Duration = std::time::Duration::from_secs(2 * 60);
 
 /// The shared prompt-token formula of the client/server pricing contract:
 ///

@@ -805,7 +805,17 @@ async fn relay_stream(
         upstream.breaker().on_failure(Instant::now(), &breaker);
         Err(e)
     };
-    while let Some(read) = stream.next().await {
+    loop {
+        // The handler dropping its receiver (the client went away, or the
+        // request reached its deadline) ends the relay at once, even while
+        // the engine is still sending nothing (a long prefill): dropping the
+        // response closes the connection, which cancels the node's request.
+        let read = tokio::select! {
+            biased;
+            () = tx.closed() => return,
+            read = stream.next() => read,
+        };
+        let Some(read) = read else { break };
         let bytes = match read {
             Ok(bytes) => bytes,
             Err(e) => {
