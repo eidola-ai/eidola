@@ -706,6 +706,11 @@ struct IssuanceKnobState {
     /// real server does) and then answered with nothing: the connection is
     /// closed before a response is written — a lost response.
     lose: std::sync::atomic::AtomicU32,
+    /// How many upcoming issuances are signed and then held, neither debited
+    /// nor stored, and answered with nothing: an original attempt that
+    /// stalled before its debit, which lands only when a test calls
+    /// [`MockServer::land_held_issuances`].
+    hold: std::sync::atomic::AtomicU32,
     /// When non-zero, every issuance not already stored is refused with this
     /// status before anything is debited.
     refuse_with: std::sync::atomic::AtomicU32,
@@ -725,6 +730,11 @@ impl IssuanceKnobs {
     pub fn lose_next(&self, n: u32) {
         self.0.lose.store(n, Ordering::SeqCst);
     }
+    /// Hold the next `n` issuances before their debit (see
+    /// [`IssuanceKnobState`]).
+    pub fn hold_next(&self, n: u32) {
+        self.0.hold.store(n, Ordering::SeqCst);
+    }
     /// Refuse every fresh issuance with `status`; `None` answers again.
     pub fn refuse_with(&self, status: Option<u16>) {
         self.0
@@ -742,6 +752,12 @@ impl IssuanceKnobs {
     /// Stall every issuance request (see [`IssuanceKnobState`]).
     pub fn stall(&self, on: bool) {
         self.0.stall.store(on, Ordering::SeqCst);
+    }
+    fn take_hold(&self) -> bool {
+        self.0
+            .hold
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
     }
     fn take_loss(&self) -> bool {
         self.0
@@ -947,6 +963,14 @@ impl MockServer {
     /// The credits converted by every debiting issuance.
     pub fn issuance_debited_credits(&self) -> i64 {
         self.issuer.issuance_debited_credits.load(Ordering::SeqCst) as i64
+    }
+    /// Debit and store every issuance [`IssuanceKnobs::hold_next`] held, as
+    /// a stalled original reaching its debit late would.
+    pub fn land_held_issuances(&self) {
+        let held: Vec<_> = std::mem::take(&mut *self.issuer.held.lock().unwrap());
+        for held in held {
+            self.issuer.record_issuance(held);
+        }
     }
     /// Catalogue fetches (see `models_hits`).
     pub fn models_hits(&self) -> u64 {
@@ -1269,6 +1293,15 @@ pub fn flat_messages(body: &serde_json::Value) -> Vec<(String, String)> {
         .collect()
 }
 
+/// An issuance signed and ready to debit: its idempotency key, the digest a
+/// retry must match, the response body, and the credits it converts.
+struct SignedIssuance {
+    idem: String,
+    request_digest: String,
+    body: String,
+    credits: i64,
+}
+
 /// The mock issuer: an ACT keypair plus the params/context the server derives.
 struct Issuer {
     key: PrivateKey,
@@ -1282,6 +1315,8 @@ struct Issuer {
     /// Idempotent issuance, as the real server keeps it: idempotency key →
     /// (the request it answered, the response body it was given).
     issuances: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+    /// Issuances signed but not yet debited (see [`IssuanceKnobs::hold_next`]).
+    held: std::sync::Mutex<Vec<SignedIssuance>>,
     /// Every `POST /v1/account/credentials` received.
     issuance_requests: AtomicU64,
     /// Every issuance that debited (a fresh one, not a stored answer).
@@ -1297,6 +1332,19 @@ struct Issuer {
 }
 
 impl Issuer {
+    /// Debit for a signed issuance and store its response, once per
+    /// idempotency key, as the real server's `record_credential_issuance`.
+    fn record_issuance(&self, signed: SignedIssuance) {
+        let mut issuances = self.issuances.lock().unwrap();
+        if issuances.contains_key(&signed.idem) {
+            return;
+        }
+        self.issuance_debits.fetch_add(1, Ordering::SeqCst);
+        self.issuance_debited_credits
+            .fetch_add(signed.credits.max(0) as u64, Ordering::SeqCst);
+        issuances.insert(signed.idem, (signed.request_digest, signed.body));
+    }
+
     fn new() -> Self {
         let key = PrivateKey::random(OsRng);
         let public_key_cbor = key.public().to_cbor().expect("encode public key");
@@ -1318,6 +1366,7 @@ impl Issuer {
             request_context_scalar,
             spend_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
             issuances: std::sync::Mutex::new(std::collections::HashMap::new()),
+            held: std::sync::Mutex::new(Vec::new()),
             issuance_requests: AtomicU64::new(0),
             issuance_debits: AtomicU64::new(0),
             issuance_debited_credits: AtomicU64::new(0),
@@ -1812,15 +1861,18 @@ async fn handle_issuance(
                 "ledger_entry_id": uuid_like(),
             })
             .to_string();
-            issuer.issuance_debits.fetch_add(1, Ordering::SeqCst);
-            issuer
-                .issuance_debited_credits
-                .fetch_add(credits.max(0) as u64, Ordering::SeqCst);
-            issuer
-                .issuances
-                .lock()
-                .unwrap()
-                .insert(idem, (request_digest, body.clone()));
+            let signed = SignedIssuance {
+                idem,
+                request_digest,
+                body: body.clone(),
+                credits,
+            };
+            if config.issuance.take_hold() {
+                // Signed, not yet debited; the client hears nothing.
+                issuer.held.lock().unwrap().push(signed);
+                return Ok(());
+            }
+            issuer.record_issuance(signed);
             if config.issuance.take_loss() {
                 // Debited and stored; the client hears nothing.
                 return Ok(());
