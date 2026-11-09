@@ -753,17 +753,48 @@ pub async fn recover_refund(
         })
     };
 
+    // What a recorded spend's row answers with. A settled token is final. A
+    // provisional one is the chat path's zero refund from before dispatch:
+    // final only once nothing can still settle the spend — while this
+    // process has a handler or stream task for it (`state.settling`), the
+    // settled token is still coming, and a client recovering now would spend
+    // its one successor on the full hold. A row without a token predates
+    // provisional refunds and can never be served.
+    let still_in_flight = || {
+        Err(ServerError::NotFound {
+            message: "nullifier recorded but refund token not yet available — \
+                      the original request may still be in flight, retry shortly"
+                .to_string(),
+        })
+    };
+    let serve_recorded = |stored: db::StoredRefund, key_id: String| match stored {
+        db::StoredRefund {
+            refund_token: Some(refund_cbor),
+            standing: db::RefundStanding::Settled,
+        } => Ok(answer(&refund_cbor, key_id)),
+        db::StoredRefund {
+            refund_token: Some(refund_cbor),
+            standing: db::RefundStanding::Provisional,
+        } => {
+            if state.settling.is_settling(&key_id, &nullifier_bytes) {
+                still_in_flight()
+            } else {
+                Ok(answer(&refund_cbor, key_id))
+            }
+        }
+        db::StoredRefund {
+            refund_token: None, ..
+        } => still_in_flight(),
+    };
+
     // Check if the nullifier was already recorded (original request arrived).
-    if let Some(refund_cbor) =
-        db::get_refund_token(&state.db_pool, &key_id, &nullifier_bytes).await?
-    {
-        return Ok(answer(&refund_cbor, key_id));
+    if let Some(stored) = db::get_refund_token(&state.db_pool, &key_id, &nullifier_bytes).await? {
+        return serve_recorded(stored, key_id);
     }
 
-    // Either the nullifier doesn't exist (request never arrived) or it exists
-    // but the refund token hasn't been stored yet (race with in-flight
-    // request). Prepare a full refund (charge_credits returned in full since
-    // no work was done) — computing it releases nothing.
+    // The nullifier doesn't exist: the original request never arrived.
+    // Prepare a full refund (charge_credits returned in full since no work
+    // was done) — computing it releases nothing.
     let charge_credits = scalar_to_credit::<128>(&act.spend_proof.charge()).map_err(|_| {
         ServerError::BadRequest {
             message: "invalid charge amount in spend proof".to_string(),
@@ -793,22 +824,23 @@ pub async fn recover_refund(
     // durable before the refund is released (the forking-attack rule), and
     // no interruption — a dropped connection, a restart — can leave it
     // recorded without the token every retry has to find.
-    if db::record_nullifier_with_refund(&state.db_pool, &key_id, &nullifier_bytes, &refund_cbor)
-        .await?
+    if db::record_nullifier_with_refund(
+        &state.db_pool,
+        &key_id,
+        &nullifier_bytes,
+        &refund_cbor,
+        db::RefundStanding::Settled,
+    )
+    .await?
     {
         return Ok(answer(&refund_cbor, key_id));
     }
 
-    // Recorded by someone else meanwhile. A concurrent recovery records its
-    // token with its nullifier, so it is there now; the chat path stores its
-    // own afterwards, so an in-flight request may not have yet.
+    // Recorded by someone else meanwhile: a concurrent recovery (settled) or
+    // the chat path (provisional, and in flight in this process).
     match db::get_refund_token(&state.db_pool, &key_id, &nullifier_bytes).await? {
-        Some(refund_cbor) => Ok(answer(&refund_cbor, key_id)),
-        None => Err(ServerError::NotFound {
-            message: "nullifier recorded but refund token not yet available — \
-                      the original request may still be in flight, retry shortly"
-                .to_string(),
-        }),
+        Some(stored) => serve_recorded(stored, key_id),
+        None => still_in_flight(),
     }
 }
 
@@ -1348,6 +1380,107 @@ mod tests {
         // Nothing settled the request, so its hold is charged in full (the
         // stream's own rule for a request whose cost is unknown); the rest of
         // the credential comes back.
+        assert_eq!(successor.credits(), Scalar::from(900_000u128));
+    }
+
+    /// The provisional refund is final only once nothing can still settle
+    /// the spend. While this process has the handler, recovery must say
+    /// "retry shortly" as before: a client handed the provisional token now
+    /// would spend its one successor on the full hold, and the settled
+    /// refund would land on a row nobody reads. Once the client has dropped
+    /// the request — and hyper the handler with it — the provisional refund
+    /// is the right answer.
+    #[tokio::test]
+    #[ignore]
+    async fn recovery_waits_for_a_spend_that_is_still_settling() {
+        let upstream = upstream_that_never_answers().await;
+        let (state, key_hash) =
+            recovery_state_at(crate::helpers::EpochConfig::default(), Some(upstream)).await;
+        let (act, pre_refund) = spend_under(&state, key_hash, None, 1_000_000, 100_000).await;
+        let key_id = hex::encode(act.issuer_key_hash);
+        let nullifier = act.spend_proof.nullifier().as_bytes().to_vec();
+
+        let (router, _) = crate::build_router()
+            .with_state(state.clone())
+            .split_for_parts();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        // A blocking ask that stays in flight: the upstream never answers and
+        // this client does not give up on its own.
+        let authorization = authorization(&act);
+        let in_flight = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .header("authorization", authorization)
+                .json(&serde_json::json!({
+                    "model": "glm-5-3-flash",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_completion_tokens": 16,
+                }))
+                .send()
+                .await
+        });
+        for _ in 0..100 {
+            if nullifier_rows(&state, &act).await == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            nullifier_rows(&state, &act).await,
+            1,
+            "the credential was spent"
+        );
+        assert!(
+            state.settling.is_settling(&key_id, &nullifier),
+            "the handler holds the settling mark while the request is in flight"
+        );
+
+        let early = recover_refund(TokenAuth(copy_of(&act)), State(state.clone())).await;
+        match early {
+            Err(ServerError::NotFound { .. }) => {}
+            other => panic!(
+                "recovery must wait for a spend that is still settling, got {:?}",
+                other.err()
+            ),
+        }
+
+        // The client gives up, as Ctrl-C does: its connection closes and hyper
+        // drops the handler, which releases the mark. Nothing can settle the
+        // spend now, so the provisional refund is served.
+        in_flight.abort();
+        let _ = in_flight.await;
+        for _ in 0..100 {
+            if !state.settling.is_settling(&key_id, &nullifier) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !state.settling.is_settling(&key_id, &nullifier),
+            "a dropped handler releases its settling mark"
+        );
+
+        let refund = recover_refund(TokenAuth(copy_of(&act)), State(state.clone()))
+            .await
+            .map(|Json(r)| r.refund)
+            .unwrap_or_else(|e| panic!("the abandoned spend must be recoverable, got {e:?}"));
+        let cache = state.credential_key_cache.read().await;
+        let key = cache.get(&key_hash).unwrap();
+        let refund = anonymous_credit_tokens::Refund::from_cbor(
+            &URL_SAFE_NO_PAD.decode(refund.refund).unwrap(),
+        )
+        .unwrap();
+        let successor = pre_refund
+            .to_credit_token(
+                &key.params,
+                &act.spend_proof,
+                &refund,
+                key.secret_key.public(),
+            )
+            .expect("refund applies");
         assert_eq!(successor.credits(), Scalar::from(900_000u128));
     }
 }

@@ -51,6 +51,8 @@ pub struct AppStateInner {
     pub credential_master_key: [u8; 32],
     pub credential_key_cache: credentials::KeyCache,
     pub epoch_config: helpers::EpochConfig,
+    /// The spends this process is still settling (`handlers::SettlingSpends`).
+    pub settling: handlers::SettlingSpends,
 }
 
 impl AppState {
@@ -73,6 +75,7 @@ impl AppState {
                 credential_master_key,
                 credential_key_cache,
                 epoch_config,
+                settling: handlers::SettlingSpends::default(),
             }),
         }
     }

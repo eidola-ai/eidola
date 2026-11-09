@@ -972,28 +972,51 @@ pub async fn record_nullifier(
     Ok(rows_affected > 0)
 }
 
+/// Whether a refund token stored on a nullifier row is the spend's final word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefundStanding {
+    /// The zero refund the chat path records with the nullifier before it
+    /// dispatches. Settlement replaces it; recovery hands it out only once
+    /// nothing can still settle the spend.
+    Provisional,
+    /// A refund that is the settlement: the real cost, or a full refund for a
+    /// request that never did work.
+    Settled,
+}
+
+/// The refund side of a nullifier row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredRefund {
+    /// `None` only on a row written before refunds were recorded with the
+    /// nullifier; recovery can never serve such a row.
+    pub refund_token: Option<Vec<u8>>,
+    pub standing: RefundStanding,
+}
+
 /// Atomically record a nullifier **together with** the refund token it was
 /// spent for. Returns `true` if recorded, `false` if the nullifier was already
-/// present. For a spend whose refund is known before it is recorded (refund
-/// recovery): one statement means no interruption can leave the nullifier
-/// recorded without the token a retry has to find.
+/// present. One statement means no interruption can leave the nullifier
+/// recorded without the token a retry has to find — whether the token is the
+/// settlement (refund recovery) or the chat path's provisional zero refund.
 #[tracing::instrument(skip_all, name = "db.record_nullifier_with_refund", err)]
 pub async fn record_nullifier_with_refund(
     pool: &Pool,
     issuer_key_id: &str,
     value: &[u8],
     refund_token: &[u8],
+    standing: RefundStanding,
 ) -> Result<bool, ServerError> {
     let client = pool
         .get()
         .await
         .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
 
+    let provisional = standing == RefundStanding::Provisional;
     let rows_affected = client
         .execute(
-            "INSERT INTO nullifier (issuer_key_id, value, refund_token) \
-             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-            &[&issuer_key_id, &value, &refund_token],
+            "INSERT INTO nullifier (issuer_key_id, value, refund_token, provisional) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+            &[&issuer_key_id, &value, &refund_token, &provisional],
         )
         .await
         .map_err(|e| {
@@ -1006,7 +1029,8 @@ pub async fn record_nullifier_with_refund(
     Ok(rows_affected > 0)
 }
 
-/// Store a CBOR-encoded refund token on an existing nullifier row.
+/// Store the settled CBOR-encoded refund token on an existing nullifier row,
+/// replacing the provisional one.
 #[tracing::instrument(skip_all, name = "db.store_refund_token", err)]
 pub async fn store_refund_token(
     pool: &Pool,
@@ -1021,7 +1045,7 @@ pub async fn store_refund_token(
 
     client
         .execute(
-            "UPDATE nullifier SET refund_token = $3 \
+            "UPDATE nullifier SET refund_token = $3, provisional = false \
              WHERE issuer_key_id = $1 AND value = $2",
             &[&issuer_key_id, &nullifier_value, &refund_token],
         )
@@ -1036,14 +1060,14 @@ pub async fn store_refund_token(
     Ok(())
 }
 
-/// Retrieve a stored refund token for a nullifier. Returns `None` if the
-/// nullifier does not exist or no refund token has been stored yet.
+/// Retrieve the refund side of a nullifier row. Returns `None` if the
+/// nullifier does not exist.
 #[tracing::instrument(skip_all, name = "db.get_refund_token", err)]
 pub async fn get_refund_token(
     pool: &Pool,
     issuer_key_id: &str,
     nullifier_value: &[u8],
-) -> Result<Option<Vec<u8>>, ServerError> {
+) -> Result<Option<StoredRefund>, ServerError> {
     let client = pool
         .get()
         .await
@@ -1051,7 +1075,7 @@ pub async fn get_refund_token(
 
     let row = client
         .query_opt(
-            "SELECT refund_token FROM nullifier \
+            "SELECT refund_token, provisional FROM nullifier \
              WHERE issuer_key_id = $1 AND value = $2",
             &[&issuer_key_id, &nullifier_value],
         )
@@ -1060,7 +1084,14 @@ pub async fn get_refund_token(
             ServerError::Internal(format!("get_refund_token failed: {}", db_error_summary(&e)))
         })?;
 
-    Ok(row.and_then(|r| r.get::<_, Option<Vec<u8>>>("refund_token")))
+    Ok(row.map(|r| StoredRefund {
+        refund_token: r.get::<_, Option<Vec<u8>>>("refund_token"),
+        standing: if r.get::<_, bool>("provisional") {
+            RefundStanding::Provisional
+        } else {
+            RefundStanding::Settled
+        },
+    }))
 }
 
 /// A single ledger entry row.

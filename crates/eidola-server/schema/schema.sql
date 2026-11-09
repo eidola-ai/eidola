@@ -337,6 +337,7 @@ CREATE TABLE nullifier (
     issuer_key_id TEXT NOT NULL REFERENCES issuer_key(id),
     value         BYTEA NOT NULL,
     refund_token  BYTEA,
+    provisional   BOOLEAN NOT NULL DEFAULT false,
     PRIMARY KEY (issuer_key_id, value)
 );
 
@@ -364,6 +365,12 @@ COMMENT ON COLUMN nullifier.refund_token IS
     'can recover it via POST /v1/credentials/refund if the original response '
     'was lost (network error, timeout, etc.). The token is already blinded — '
     'it is only useful to the client holding the matching PreRefund state.';
+
+COMMENT ON COLUMN nullifier.provisional IS
+    'True while refund_token is the zero refund the chat path records with the '
+    'nullifier before it dispatches, and settlement has not yet replaced it. '
+    'Recovery hands a provisional token out only once nothing can still settle '
+    'the spend (the handler is gone); a settled token is final.';
 
 -- ---------------------------------------------------------------------------
 -- Helper Functions

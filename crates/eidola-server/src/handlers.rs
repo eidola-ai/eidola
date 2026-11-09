@@ -206,6 +206,62 @@ async fn issue_refund_async(
     })
 }
 
+/// The spends this process is still settling: every nullifier whose handler
+/// (or stream task) is alive between recording it and storing its settled
+/// refund. Refund recovery consults it before handing out a provisional
+/// refund — while the spend is in here, settlement is still coming, and the
+/// client that recovered the provisional token would have spent its one
+/// successor on the full hold. A dropped handler releases its entry, a
+/// restart empties the set, and in both cases nothing can settle the spend
+/// any more, so the provisional refund is the right answer. One process per
+/// database today; replicas would need this marker shared.
+#[derive(Clone, Default)]
+pub struct SettlingSpends {
+    inner: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<SpendKey>>>,
+}
+
+/// `(issuer_key_id, nullifier)`, the nullifier table's primary key.
+type SpendKey = (String, Vec<u8>);
+
+impl SettlingSpends {
+    /// Mark a spend as settling until the returned guard drops.
+    pub fn begin(&self, issuer_key_id: String, nullifier: Vec<u8>) -> SettlingSpend {
+        let key = (issuer_key_id, nullifier);
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone());
+        SettlingSpend {
+            set: self.clone(),
+            key,
+        }
+    }
+
+    /// Whether this process still has a handler that will settle the spend.
+    pub fn is_settling(&self, issuer_key_id: &str, nullifier: &[u8]) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&(issuer_key_id.to_string(), nullifier.to_vec()))
+    }
+}
+
+/// A spend's place in [`SettlingSpends`]; dropping it releases the spend.
+pub struct SettlingSpend {
+    set: SettlingSpends,
+    key: SpendKey,
+}
+
+impl Drop for SettlingSpend {
+    fn drop(&mut self) {
+        self.set
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
+    }
+}
+
 /// Sign a refund of `refund_credits` for `spend_proof`, without storing it.
 ///
 /// Every refund of one spend mints a successor with the **same** nullifier
@@ -432,18 +488,32 @@ async fn chat_completions_phases(
     // `POST /v1/credentials/refund` instead of a row recovery can never serve.
     // Settlement overwrites it with the real refund. Zero is the rule the
     // stream already applies when the cost is unknown.
+    //
+    // Until settlement, the spend is marked as settling in `state.settling`,
+    // held by `settling` below for as long as something in this process can
+    // still settle it: this handler for a blocking request, the stream task
+    // for a stream. Recovery refuses to hand out the provisional refund while
+    // the mark is held, so a client that recovers in the window between the
+    // last chunk and the settled refund's UPDATE waits instead of spending
+    // its one successor on the full hold.
     let key_id = hex::encode(act.issuer_key_hash);
     let nullifier = act.spend_proof.nullifier();
     let nullifier_bytes = nullifier.as_bytes().to_vec();
     let provisional = mint_refund(state, &act.spend_proof, &act.issuer_key_hash, 0).await?;
-    let recorded =
-        db::record_nullifier_with_refund(&state.db_pool, &key_id, &nullifier_bytes, &provisional)
-            .await?;
+    let recorded = db::record_nullifier_with_refund(
+        &state.db_pool,
+        &key_id,
+        &nullifier_bytes,
+        &provisional,
+        db::RefundStanding::Provisional,
+    )
+    .await?;
     if !recorded {
         return Err(ServerError::Conflict {
             message: "credential already spent (duplicate nullifier)".to_string(),
         });
     }
+    let settling = state.settling.begin(key_id, nullifier_bytes);
 
     // --- POINT OF NO RETURN: nullifier is recorded ---
     // From here on, we MUST issue a refund on any error.
@@ -470,9 +540,17 @@ async fn chat_completions_phases(
 
     // Phase 4: Handle the request.
     if request.stream {
-        handle_streaming_request(state.clone(), request, act, &model, charge_credits).await
+        handle_streaming_request(
+            state.clone(),
+            request,
+            act,
+            &model,
+            charge_credits,
+            settling,
+        )
+        .await
     } else {
-        handle_non_streaming_request(state, request, act, &model, charge_credits).await
+        handle_non_streaming_request(state, request, act, &model, charge_credits, settling).await
     }
 }
 
@@ -483,6 +561,10 @@ async fn handle_non_streaming_request(
     act: &ActSpend,
     model: &Model,
     charge_credits: u128,
+    // Held until this function returns, i.e. until the settled refund is
+    // stored; a client that abandons the request drops the handler, and the
+    // mark with it.
+    _settling: SettlingSpend,
 ) -> Result<axum::response::Response, ServerError> {
     let auth_context = AuthContext {
         method: AuthMethod::AnonymousCredential,
@@ -742,6 +824,7 @@ async fn handle_streaming_request(
     act: &ActSpend,
     model: &Model,
     charge_credits: u128,
+    settling: SettlingSpend,
 ) -> Result<axum::response::Response, ServerError> {
     let auth_context = AuthContext {
         method: AuthMethod::AnonymousCredential,
@@ -796,6 +879,11 @@ async fn handle_streaming_request(
     let max_completion = effective_max_completion(request, model);
 
     tokio::spawn(async move {
+        // The settling mark moves into the task, which outlives the handler
+        // and the client's connection: it is released when the task ends,
+        // after the settled refund is stored on every arm below.
+        let _settling = settling;
+
         /// Re-parse the spend proof and issue a refund with the given amount.
         /// Returns None only if the cryptographic operations themselves fail.
         async fn try_refund(
