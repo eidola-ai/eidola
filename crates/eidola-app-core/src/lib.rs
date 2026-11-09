@@ -6779,8 +6779,15 @@ impl Inner {
             // `account_allocate`, startup recovery); that is an ordinary
             // post-read TOCTOU no non-serialized check can exclude, and the
             // recoverable error routes the caller to retry, which finds it.
-            if let Ok(inputs) = chosen_inputs(db_conn, charge_credits).await? {
-                return Ok(inputs);
+            //
+            // A sibling that settled in that gap can also have made the missing
+            // amount smaller (its successor is now the drain), so small that
+            // the balance read above covers it: then the allocation decision
+            // is taken again rather than refused on the stale amount.
+            match chosen_inputs(db_conn, charge_credits).await? {
+                Ok(inputs) => return Ok(inputs),
+                Err(missing) if missing < need && balances.available >= missing => continue,
+                Err(_) => {}
             }
             if recoverable {
                 return Err(AppError::ProvisioningTimeout {
