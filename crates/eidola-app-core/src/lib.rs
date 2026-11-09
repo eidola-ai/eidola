@@ -6733,8 +6733,10 @@ impl Inner {
             // most the original credential's face value (a full refund on a
             // failed turn) — it never tops up the account balance. So waiting
             // helps only when some in-flight credential, at its face value,
-            // could pay alone or as one of two inputs ([`settlement_could_cover`]);
-            // otherwise no allocation is possible either, and this is a true
+            // could pay alone or as one of two inputs ([`settlement_could_cover`]),
+            // the other being a held credential or one the available balance
+            // can still be converted into (the in-flight credential drained,
+            // the allocation filling the rest); otherwise this is a true
             // shortfall.
             let in_flight: Vec<i64> = db::list_spending_credentials(db_conn)
                 .await?
@@ -6745,6 +6747,7 @@ impl Inner {
                 .await?
                 .into_iter()
                 .map(|c| c.credits)
+                .chain(std::iter::once(balances.available))
                 .collect();
             let recoverable = settlement_could_cover(&in_flight, &held, charge_credits);
             if recoverable && tokio::time::Instant::now() < deadline {
@@ -14261,8 +14264,10 @@ fn check_partial_returns(inputs: &[(i64, u128, i64)]) -> bool {
 /// Whether settling the credentials now in flight could let a request whose
 /// worst case is `worst` be paid from the wallet: some in-flight credential,
 /// at its face value (the most its successor can hold), covers `worst` alone,
-/// or does so together with one other credential, in flight or `held`. Only
-/// then is waiting for in-flight refunds worth anything.
+/// or does so together with one other credential, in flight or `held` (which
+/// the caller includes the convertible account balance in, as a credential
+/// an allocation could make). Only then is waiting for in-flight refunds
+/// worth anything.
 fn settlement_could_cover(in_flight: &[i64], held: &[i64], worst: i64) -> bool {
     in_flight.iter().enumerate().any(|(i, &face)| {
         face >= worst
@@ -19440,6 +19445,9 @@ mod tests {
         assert!(!settlement_could_cover(&[], &[3_000, 4_000], 6_200));
         assert!(!settlement_could_cover(&[3_000], &[], 6_200));
         assert!(!settlement_could_cover(&[3_000, 3_000], &[100], 6_200));
+        // 4,000 of convertible balance, passed as one more held credential,
+        // fills beside a drained 3,000.
+        assert!(settlement_could_cover(&[3_000], &[0, 4_000], 6_200));
     }
 
     /// **The partial returns a response carries are checked against the
