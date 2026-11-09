@@ -1892,6 +1892,20 @@ pub const PROVISION_DEFER_FLOOR_CREDITS: i64 = DEFAULT_ALLOCATION_CREDITS / 10;
 /// abandon a row the original then pays for).
 const ISSUANCE_SETTLE_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+/// The deadline on every request an issuance makes (the key listing, the
+/// balance read, the issuance itself), connection to last byte. The attesting
+/// client bounds only the connect, so without this a server that accepts and
+/// then stalls would hold [`Inner::issuance_gate`] — and through a turn
+/// waiting on it under `spend_gate`, every paid turn after it — for as long as
+/// it liked. A request cut off here leaves its pending issuance to be asked
+/// for again, so nothing is lost by giving up.
+const ISSUANCE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The backstop on a whole provisioner pass, the gate included: a pass that
+/// recovers several pending issuances makes several requests, each bounded by
+/// [`ISSUANCE_REQUEST_TIMEOUT`], and this bounds their sum.
+const PROVISION_PASS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// What one pass of the provisioner did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProvisionOutcome {
@@ -1909,6 +1923,13 @@ pub enum ProvisionOutcome {
     /// The current key lapses within [`PROVISION_HORIZON`], so a credential
     /// issued under it would not count toward the buffer.
     NoUsableKey,
+    /// An earlier issuance for this account has not resolved — its response
+    /// was lost and it has not been answered on a retry yet — so it may
+    /// already have been paid for. Nothing new is issued until it resolves.
+    Unresolved,
+    /// The Eidola backend is disabled or removed: nothing is sent to it, and
+    /// no balance is converted for a service the reader has turned off.
+    BackendDisabled,
     /// Late in the key's issuing window with enough still held; the next key
     /// will be issued under instead.
     Deferred,
@@ -2117,6 +2138,11 @@ struct Inner {
     provision_check_ms: Mutex<(u64, u64)>,
     /// [`ISSUANCE_SETTLE_AGE`] in milliseconds; only a test moves it.
     issuance_settle_ms: std::sync::atomic::AtomicU64,
+    /// [`ISSUANCE_REQUEST_TIMEOUT`] in milliseconds; only a test moves it.
+    issuance_request_timeout_ms: std::sync::atomic::AtomicU64,
+    /// [`PROVISION_WAIT_TIMEOUT`] in milliseconds — how long anything waits
+    /// for [`Inner::issuance_gate`] or an in-flight refund; only a test moves it.
+    provision_wait_ms: std::sync::atomic::AtomicU64,
     /// The holds this process has a request in flight for — see
     /// [`LiveSpends`]. Recovery consults it so it never refunds a credential
     /// that is `spending` because it is *being spent right now*.
@@ -3443,8 +3469,56 @@ impl Inner {
     /// Convert `credits` from the account into a new credential: the explicit
     /// `account allocate` door. Serialized with every other issuance in this
     /// process by [`Inner::issuance_gate`].
+    fn issuance_request_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.issuance_request_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    fn provision_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.provision_wait_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Take [`Inner::issuance_gate`], waiting no later than `deadline`. Every
+    /// holder's network requests are bounded ([`ISSUANCE_REQUEST_TIMEOUT`]), so
+    /// a wait this long means something is wrong, and the caller is told so
+    /// rather than left waiting — a turn waits here holding `spend_gate`.
+    async fn lock_issuance_gate(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, AppError> {
+        tokio::time::timeout_at(deadline, self.issuance_gate.lock())
+            .await
+            .map_err(|_| AppError::ProvisioningTimeout {
+                message: "timed out waiting for another credential issuance to finish".into(),
+            })
+    }
+
+    /// The account balance, read under the issuance deadline.
+    async fn account_balances_bounded(&self) -> Result<BalancesResult, AppError> {
+        tokio::time::timeout(self.issuance_request_timeout(), self.account_balances())
+            .await
+            .map_err(|_| AppError::Network {
+                message: "timed out reading the account balance".into(),
+            })?
+    }
+
+    /// Whether the Eidola backend is configured to be used at all.
+    async fn eidola_enabled(&self) -> Result<bool, AppError> {
+        let conn = self.db_conn().await?;
+        Ok(db::get_backend(&conn, backends::EIDOLA_BACKEND_ID)
+            .await?
+            .is_some_and(|row| row.enabled && row.removed_at.is_none()))
+    }
+
     async fn account_allocate(&self, credits: i64) -> Result<AllocateResult, AppError> {
-        let _issuing = self.issuance_gate.lock().await;
+        let _issuing = self
+            .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
+            .await?;
         Box::pin(self.allocate_locked(credits)).await
     }
 
@@ -3459,7 +3533,13 @@ impl Inner {
         let cfg = self.load_config();
         let eidola = self.eidola_resolved().await?;
         let client = self.build_client(&eidola, None).await?;
-        let key = current_issuer_key(&client, &eidola.base_url, cfg.domain_separator()).await?;
+        let key = current_issuer_key(
+            &client,
+            &eidola.base_url,
+            cfg.domain_separator(),
+            self.issuance_request_timeout(),
+        )
+        .await?;
         Box::pin(self.allocate_with_key(&cfg, &client, &eidola.base_url, &key, credits)).await
     }
 
@@ -3569,7 +3649,15 @@ impl Inner {
             public_key: &key.public_key,
             params: &key.params,
         };
-        let answer = send_issuance(client, base_url, account_id, secret, &pending).await;
+        let answer = send_issuance(
+            client,
+            base_url,
+            account_id,
+            secret,
+            &pending,
+            self.issuance_request_timeout(),
+        )
+        .await;
         Box::pin(self.settle_issuance(&db_conn, pending, answer, now)).await
     }
 
@@ -3662,8 +3750,15 @@ impl Inner {
                 public_key: &public_key,
                 params: &params,
             };
-            let answer =
-                send_issuance(&client, &eidola.base_url, account_id, secret, &pending).await;
+            let answer = send_issuance(
+                &client,
+                &eidola.base_url,
+                account_id,
+                secret,
+                &pending,
+                self.issuance_request_timeout(),
+            )
+            .await;
             if let Ok(result) = Box::pin(self.settle_issuance(&db_conn, pending, answer, now)).await
             {
                 recovered.push(result.nonce);
@@ -3678,19 +3773,42 @@ impl Inner {
     /// standard size now. Every rule here is a public constant or a fact about
     /// the wallet; nothing about a request that is about to be made enters it.
     async fn provision_once(&self) -> Result<ProvisionOutcome, AppError> {
-        let _issuing = self.issuance_gate.lock().await;
+        let _issuing = self
+            .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
+            .await?;
+        // A disabled backend is asked for nothing, not even a recovery: the
+        // reader has turned the service off, and nothing unattended converts
+        // balance for it.
+        if !self.eidola_enabled().await? {
+            return Ok(ProvisionOutcome::BackendDisabled);
+        }
+        let cfg = self.load_config();
+        let Ok((account_id, _)) = self.require_credentials(&cfg) else {
+            return Ok(ProvisionOutcome::NoAccount);
+        };
         let _ = Box::pin(self.recover_pending_issuances_locked()).await;
 
-        let cfg = self.load_config();
-        if self.require_credentials(&cfg).is_err() {
-            return Ok(ProvisionOutcome::NoAccount);
-        }
         let db_conn = self.db_conn().await?;
         let now = now_ms();
         let horizon_until = now.saturating_add(duration_ms(PROVISION_HORIZON));
-        let held = db::spendable_credits_until(&db_conn, now, horizon_until).await?;
+        // An issuance whose response was lost may already have been paid for,
+        // so it counts toward the buffer — and while one is unresolved nothing
+        // new is issued beside it, retry hold-off included. Otherwise every
+        // pass whose recovery failed would convert another allocation, and
+        // what is held would no longer be bounded by the threshold plus one.
+        let pending: Vec<db::PendingIssuance> = db::list_pending_issuances(&db_conn, now)
+            .await?
+            .into_iter()
+            .filter(|r| r.account_id == account_id)
+            .collect();
+        let held = db::spendable_credits_until(&db_conn, now, horizon_until)
+            .await?
+            .saturating_add(pending.iter().map(|r| r.credits).sum::<i64>());
         if held >= PROVISION_THRESHOLD_CREDITS {
             return Ok(ProvisionOutcome::Covered);
+        }
+        if !pending.is_empty() {
+            return Ok(ProvisionOutcome::Unresolved);
         }
         // A wallet that has not spent lately keeps no buffer: a credential
         // issued for it would most likely lapse unspent.
@@ -3704,7 +3822,13 @@ impl Inner {
 
         let eidola = self.eidola_resolved().await?;
         let client = self.build_client(&eidola, None).await?;
-        let key = current_issuer_key(&client, &eidola.base_url, cfg.domain_separator()).await?;
+        let key = current_issuer_key(
+            &client,
+            &eidola.base_url,
+            cfg.domain_separator(),
+            self.issuance_request_timeout(),
+        )
+        .await?;
         // A credential that would not count toward the buffer once issued is
         // never issued for it — under a key that lapses within the horizon it
         // could not carry the days ahead, and would leave the next pass just
@@ -3724,7 +3848,7 @@ impl Inner {
         // Background issuance is always the standard size. A balance that
         // cannot cover it is left for the just-in-time path to convert when a
         // request needs it.
-        let balances = self.account_balances().await?;
+        let balances = self.account_balances_bounded().await?;
         if balances.available < DEFAULT_ALLOCATION_CREDITS {
             return Ok(ProvisionOutcome::LowBalance);
         }
@@ -3975,7 +4099,9 @@ impl Inner {
         // refund strands a balance, so the explicit recovery asks for those
         // too.
         {
-            let _issuing = self.issuance_gate.lock().await;
+            let _issuing = self
+                .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
+                .await?;
             recovered.extend(Box::pin(self.recover_pending_issuances_locked()).await?);
         }
 
@@ -6391,7 +6517,7 @@ impl Inner {
         db_conn: &turso::Connection,
         charge_credits: i64,
     ) -> Result<db::SpendableCredential, AppError> {
-        let deadline = tokio::time::Instant::now() + PROVISION_WAIT_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + self.provision_wait();
         loop {
             if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
                 return Ok(cred);
@@ -6406,11 +6532,14 @@ impl Inner {
             // again once it has it: a background issuance that landed while it
             // waited covers this turn without a second conversion.
             let balances = {
-                let _issuing = self.issuance_gate.lock().await;
+                // Bounded by the queue's own deadline: this wait happens with
+                // `spend_gate` held, so an unbounded one would stall every
+                // paid turn behind it.
+                let _issuing = self.lock_issuance_gate(deadline).await?;
                 if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
                     return Ok(cred);
                 }
-                let balances = self.account_balances().await?;
+                let balances = self.account_balances_bounded().await?;
                 if balances.available >= charge_credits {
                     // Enough to allocate at least the charge — grow the pool.
                     let amount = auto_allocation_amount(balances.available, charge_credits)?;
@@ -10520,6 +10649,13 @@ impl AppCore {
                     duration_ms(PROVISION_CHECK_MIN) as u64,
                     duration_ms(PROVISION_CHECK_MAX) as u64,
                 )),
+                issuance_request_timeout_ms: std::sync::atomic::AtomicU64::new(duration_ms(
+                    ISSUANCE_REQUEST_TIMEOUT,
+                )
+                    as u64),
+                provision_wait_ms: std::sync::atomic::AtomicU64::new(duration_ms(
+                    PROVISION_WAIT_TIMEOUT,
+                ) as u64),
                 issuance_settle_ms: std::sync::atomic::AtomicU64::new(duration_ms(
                     ISSUANCE_SETTLE_AGE,
                 ) as u64),
@@ -11118,9 +11254,12 @@ impl AppCore {
                 // Offline, signed out, a server error: each is simply another
                 // look later. Nothing here is the reader's to see.
                 // Nobody is waiting on these writes.
-                let _ = changes::with_origin(
-                    changes::ChangeOrigin::Unattended,
-                    Box::pin(inner.provision_once()),
+                let _ = tokio::time::timeout(
+                    PROVISION_PASS_DEADLINE,
+                    changes::with_origin(
+                        changes::ChangeOrigin::Unattended,
+                        Box::pin(inner.provision_once()),
+                    ),
                 )
                 .await;
             }
@@ -11145,6 +11284,26 @@ impl AppCore {
     pub fn test_set_issuance_settle_age(&self, age: std::time::Duration) {
         self.inner.issuance_settle_ms.store(
             duration_ms(age) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// **Test-only seam.** The deadline on each issuance request
+    /// ([`ISSUANCE_REQUEST_TIMEOUT`]) and how long anything waits for the
+    /// issuance gate ([`PROVISION_WAIT_TIMEOUT`]), so a test can stall the
+    /// server without waiting half a minute.
+    #[cfg(feature = "test-support")]
+    pub fn test_set_issuance_timeouts(
+        &self,
+        request: std::time::Duration,
+        gate_wait: std::time::Duration,
+    ) {
+        self.inner.issuance_request_timeout_ms.store(
+            duration_ms(request) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.inner.provision_wait_ms.store(
+            duration_ms(gate_wait) as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -17815,9 +17974,11 @@ async fn current_issuer_key(
     client: &reqwest::Client,
     base_url: &str,
     expected_ds: &str,
+    timeout: std::time::Duration,
 ) -> Result<CurrentIssuerKey, AppError> {
     let resp = client
         .get(format!("{base_url}/v1/keys"))
+        .timeout(timeout)
         .send()
         .await
         .map_err(AppError::from_request)?;
@@ -17917,9 +18078,11 @@ async fn send_issuance(
     account_id: &str,
     secret: &str,
     pending: &PendingIssuanceRef<'_>,
+    timeout: std::time::Duration,
 ) -> IssuanceAnswer {
     let sent = client
         .post(format!("{base_url}/v1/account/credentials"))
+        .timeout(timeout)
         .basic_auth(account_id, Some(secret))
         .json(&serde_json::json!({
             "issuance_request": URL_SAFE_NO_PAD.encode(pending.request_cbor),

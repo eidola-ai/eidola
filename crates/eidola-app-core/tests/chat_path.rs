@@ -10348,3 +10348,166 @@ fn a_pending_issuance_is_never_retried_for_another_account() {
         assert_eq!(mock.issuance_requests(), 1);
     });
 }
+
+/// **What is held stays within the threshold plus one allocation**, even when
+/// a background issuance's response is lost and every retry of it fails. The
+/// lost issuance may already have been paid for, so it counts toward the
+/// buffer and nothing is issued beside it; without that, each pass whose
+/// recovery failed would convert another allocation. The mock refunds every
+/// charge in full, so everything it ever debited is still held.
+#[test]
+fn what_is_held_stays_within_the_threshold_plus_one_allocation() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        spend_from_a_small_credential(&core, 100_000);
+        let bound = eidola_app_core::PROVISION_THRESHOLD_CREDITS + DEFAULT_ALLOCATION_CREDITS;
+
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.test_provision_once())
+            .expect_err("the background issuance's response was lost");
+        assert_eq!(mock.issuance_debits(), 2);
+
+        // Inside the retry hold-off, and then with every retry failing.
+        let _ = provision(&core);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        mock.issuance_knobs().fail_retries(true);
+        for _ in 0..6 {
+            let _ = core.runtime().block_on(core.test_provision_once());
+            assert!(
+                mock.issuance_debited_credits() <= bound,
+                "{} credits converted, past the bound of {bound}",
+                mock.issuance_debited_credits()
+            );
+        }
+        assert_eq!(mock.issuance_debits(), 2, "nothing was issued beside it");
+
+        // Once a retry is answered, the stored response is what lands.
+        mock.issuance_knobs().fail_retries(false);
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+        assert_eq!(mock.issuance_debits(), 2);
+        assert!(active_credentials(&core).contains(&(DEFAULT_ALLOCATION_CREDITS, 0)));
+    });
+}
+
+/// An unresolved issuance too small to cover the buffer still holds off a
+/// fresh one: it may have been paid for, and issuing beside it is how what is
+/// held escapes its bound.
+#[test]
+fn an_unresolved_issuance_holds_off_a_fresh_one() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        spend_from_a_small_credential(&core, 50_000);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(50_000))
+            .expect_err("lost");
+        assert_eq!(mock.issuance_debits(), 2);
+
+        assert_eq!(provision(&core), ProvisionOutcome::Unresolved);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        mock.issuance_knobs().fail_retries(true);
+        assert_eq!(provision(&core), ProvisionOutcome::Unresolved);
+        assert_eq!(mock.issuance_debits(), 2);
+    });
+}
+
+/// With the Eidola backend switched off, the provisioner sends nothing:
+/// neither a fresh issuance nor the retry of a pending one.
+#[test]
+fn the_provisioner_leaves_a_disabled_backend_alone() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        spend_from_a_small_credential(&core, 100_000);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(50_000))
+            .expect_err("lost");
+        let requests = mock.issuance_requests();
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        core.runtime()
+            .block_on(core.set_backend_enabled("eidola".into(), false))
+            .expect("disable eidola");
+
+        assert_eq!(provision(&core), ProvisionOutcome::BackendDisabled);
+        assert_eq!(mock.issuance_requests(), requests, "nothing was sent");
+    });
+}
+
+/// A server that accepts an issuance and never answers holds nothing for
+/// long: the request is cut off at its deadline, the gate is free again, and
+/// the issuance is left pending to be asked for once the server answers.
+#[test]
+fn a_stalled_issuance_gives_up_at_its_deadline() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        spend_from_a_small_credential(&core, 100_000);
+        core.test_set_issuance_timeouts(
+            std::time::Duration::from_millis(400),
+            std::time::Duration::from_secs(5),
+        );
+        mock.issuance_knobs().stall(true);
+        let started = std::time::Instant::now();
+        core.runtime()
+            .block_on(core.test_provision_once())
+            .expect_err("the stalled request is cut off");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the pass took {:?}",
+            started.elapsed()
+        );
+
+        mock.issuance_knobs().stall(false);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+        assert_eq!(
+            mock.issuance_debits(),
+            2,
+            "the pending issuance landed once"
+        );
+    });
+}
+
+/// Waiting for the issuance gate is bounded: a turn that needs a just-in-time
+/// conversion while another issuance holds the gate — and it waits with
+/// `spend_gate` held, so every later paid turn would wait behind it — gives up
+/// with a typed timeout instead of waiting for that issuance's server.
+#[test]
+fn a_turn_waiting_on_a_stalled_issuance_times_out() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.test_set_issuance_timeouts(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(400),
+        );
+        mock.issuance_knobs().stall(true);
+        std::thread::scope(|scope| {
+            let holder = scope.spawn(|| {
+                let _ = core
+                    .runtime()
+                    .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS));
+            });
+            while mock.issuance_requests() == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let started = std::time::Instant::now();
+            let err = core
+                .runtime()
+                .block_on(core.chat("hi".into(), MODEL.into(), None))
+                .expect_err("the gate is held by a stalled issuance");
+            assert!(
+                matches!(err, AppError::ProvisioningTimeout { .. }),
+                "got {err:?}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "the turn waited {:?}",
+                started.elapsed()
+            );
+            assert_eq!(mock.chat_hits(), 0);
+            mock.issuance_knobs().stall(false);
+            holder.join().unwrap();
+        });
+    });
+}

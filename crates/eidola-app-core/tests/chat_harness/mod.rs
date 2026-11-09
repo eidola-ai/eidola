@@ -660,6 +660,12 @@ struct IssuanceKnobState {
     /// When non-zero, every issuance not already stored is refused with this
     /// status before anything is debited.
     refuse_with: std::sync::atomic::AtomicU32,
+    /// Answer every retry — a request whose idempotency key is already
+    /// stored — with `503`, while fresh issuances still go through: a lost
+    /// response whose recovery keeps failing.
+    fail_retries: std::sync::atomic::AtomicBool,
+    /// Accept every issuance request and never answer it.
+    stall: std::sync::atomic::AtomicBool,
 }
 
 impl IssuanceKnobs {
@@ -672,6 +678,14 @@ impl IssuanceKnobs {
         self.0
             .refuse_with
             .store(status.map(u32::from).unwrap_or(0), Ordering::SeqCst);
+    }
+    /// Fail every retry (see [`IssuanceKnobState`]); `false` answers again.
+    pub fn fail_retries(&self, on: bool) {
+        self.0.fail_retries.store(on, Ordering::SeqCst);
+    }
+    /// Stall every issuance request (see [`IssuanceKnobState`]).
+    pub fn stall(&self, on: bool) {
+        self.0.stall.store(on, Ordering::SeqCst);
     }
     fn take_loss(&self) -> bool {
         self.0
@@ -845,6 +859,10 @@ impl MockServer {
     /// stored is not one.
     pub fn issuance_debits(&self) -> u64 {
         self.issuer.issuance_debits.load(Ordering::SeqCst)
+    }
+    /// The credits converted by every debiting issuance.
+    pub fn issuance_debited_credits(&self) -> i64 {
+        self.issuer.issuance_debited_credits.load(Ordering::SeqCst) as i64
     }
     /// Catalogue fetches (see `models_hits`).
     pub fn models_hits(&self) -> u64 {
@@ -1184,6 +1202,8 @@ struct Issuer {
     issuance_requests: AtomicU64,
     /// Every issuance that debited (a fresh one, not a stored answer).
     issuance_debits: AtomicU64,
+    /// The credits all those debits converted.
+    issuance_debited_credits: AtomicU64,
 }
 
 impl Issuer {
@@ -1210,6 +1230,7 @@ impl Issuer {
             issuances: std::sync::Mutex::new(std::collections::HashMap::new()),
             issuance_requests: AtomicU64::new(0),
             issuance_debits: AtomicU64::new(0),
+            issuance_debited_credits: AtomicU64::new(0),
         }
     }
 
@@ -1639,6 +1660,10 @@ async fn handle_issuance(
     body: &[u8],
 ) -> std::io::Result<()> {
     issuer.issuance_requests.fetch_add(1, Ordering::SeqCst);
+    if config.issuance.0.stall.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        return Ok(());
+    }
     let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
     let ir = parsed.get("issuance_request").and_then(|v| v.as_str());
     let credits = parsed.get("credits").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -1654,6 +1679,9 @@ async fn handle_issuance(
     // What a retry must agree on to be answered from the store.
     let request_digest = format!("{}|{credits}|{}", ir.unwrap_or(""), named_key.unwrap_or(""));
     let stored = issuer.issuances.lock().unwrap().get(&idem).cloned();
+    if stored.is_some() && config.issuance.0.fail_retries.load(Ordering::SeqCst) {
+        return write_json(stream, 503, &error_body("issuance unavailable")).await;
+    }
     if let Some((digest, body)) = stored {
         if digest != request_digest {
             return write_json(stream, 409, &error_body("idempotency key reused")).await;
@@ -1685,6 +1713,9 @@ async fn handle_issuance(
             })
             .to_string();
             issuer.issuance_debits.fetch_add(1, Ordering::SeqCst);
+            issuer
+                .issuance_debited_credits
+                .fetch_add(credits.max(0) as u64, Ordering::SeqCst);
             issuer
                 .issuances
                 .lock()
