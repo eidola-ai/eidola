@@ -3656,6 +3656,7 @@ impl Inner {
             secret,
             &pending,
             self.issuance_request_timeout(),
+            IssuanceAttempt::First,
         )
         .await;
         Box::pin(self.settle_issuance(&db_conn, pending, answer, now)).await
@@ -3757,6 +3758,7 @@ impl Inner {
                 secret,
                 &pending,
                 self.issuance_request_timeout(),
+                IssuanceAttempt::Retry,
             )
             .await;
             if let Ok(result) = Box::pin(self.settle_issuance(&db_conn, pending, answer, now)).await
@@ -4095,18 +4097,21 @@ impl Inner {
             }
         }
 
+        // Announced before anything below can fail: the successors above are
+        // durable, and a caller that gets an error from what follows does not
+        // re-read, so the bus is what tells it.
+        if !recovered.is_empty() {
+            self.bus.emit(Change::Wallet);
+        }
+
         // A lost issuance response strands its allocation the same way a lost
         // refund strands a balance, so the explicit recovery asks for those
-        // too.
+        // too. Each one it recovers announces itself (`settle_issuance`).
         {
             let _issuing = self
                 .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
                 .await?;
             recovered.extend(Box::pin(self.recover_pending_issuances_locked()).await?);
-        }
-
-        if !recovered.is_empty() {
-            self.bus.emit(Change::Wallet);
         }
 
         Ok(recovered)
@@ -18063,12 +18068,52 @@ enum IssuanceAnswer {
     /// The server answered with a signed response (fresh, or the one it
     /// stored for this idempotency key).
     Issued(IssueCredentialsResponse),
-    /// The server refused it (a 4xx): nothing was debited for this request,
-    /// and under its idempotency key nothing ever will be.
+    /// The server refused it in a way that proves nothing was or will be
+    /// debited under its idempotency key (see [`IssuanceAttempt`]).
     Refused(AppError),
     /// No answer, or a server error: it may or may not have been debited, and
     /// a retry under the same key will say which.
     Unknown(AppError),
+}
+
+/// Whether an issuance request is the first ever sent under its idempotency
+/// key, which decides what a refusal proves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IssuanceAttempt {
+    /// The first send. Any 4xx is the gateway (or something in front of it)
+    /// declining this one request, and it is the only one: nothing was
+    /// debited, and abandoning it strands nothing.
+    First,
+    /// A retry after an answer that never arrived. The first attempt may have
+    /// been debited and its response stored, so only a refusal the gateway
+    /// gives *after* looking for that stored response, or one decided by the
+    /// request bytes alone, proves the issuance is dead
+    /// ([`retry_refusal_is_final`]).
+    Retry,
+}
+
+/// Whether a retry's `status` proves that nothing was, or will be, debited
+/// under its idempotency key. Every 4xx the gateway's issuance path returns,
+/// classified explicitly:
+///
+/// * `400`: the request is malformed (credits, idempotency key, base64, CBOR,
+///   amount, or a commitment the key cannot sign). Decided by the bytes alone,
+///   which are the first attempt's bytes, so that attempt was refused the
+///   same way. Final.
+/// * `422`: the body did not deserialize. The same argument. Final.
+/// * `402`: the balance check inside `record_credential_issuance`, under the
+///   account lock, after its stored lookup found nothing. Final.
+/// * `409`: the idempotency key answers a different request, or the named
+///   key is no longer the current issuing key, both after the stored lookup.
+///   Final.
+/// * `428`: the terms gate, after the stored lookup found nothing. Final.
+/// * `401` / `403`: authentication, decided **before** the stored lookup. A
+///   relinked account with a mistyped secret is refused here although its
+///   paid issuance is stored and answers once the secret is right. Kept.
+/// * `429`, `404`, `408`, `413` and any other: not the issuance handler's own
+///   verdict on this key. Kept.
+fn retry_refusal_is_final(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 400 | 402 | 409 | 422 | 428)
 }
 
 /// Send one issuance request.
@@ -18079,6 +18124,7 @@ async fn send_issuance(
     secret: &str,
     pending: &PendingIssuanceRef<'_>,
     timeout: std::time::Duration,
+    attempt: IssuanceAttempt,
 ) -> IssuanceAnswer {
     let sent = client
         .post(format!("{base_url}/v1/account/credentials"))
@@ -18101,7 +18147,9 @@ async fn send_issuance(
         Err(e) => return IssuanceAnswer::Unknown(e),
     };
     if let Err(e) = check_status(status, &body) {
-        return if status.is_client_error() {
+        let refused = status.is_client_error()
+            && (attempt == IssuanceAttempt::First || retry_refusal_is_final(status));
+        return if refused {
             IssuanceAnswer::Refused(e)
         } else {
             IssuanceAnswer::Unknown(e)
@@ -19239,6 +19287,23 @@ mod tests {
         // A document the server has stopped requiring is not a problem.
         let recorded = [doc("terms_of_service", 1), doc("retired_notice", 9)];
         assert!(documents_not_covered(&[doc("terms_of_service", 1)], &recorded).is_empty());
+    }
+
+    #[test]
+    fn only_a_retry_refusal_the_gateway_gives_after_its_stored_lookup_is_final() {
+        let status = |code: u16| reqwest::StatusCode::from_u16(code).unwrap();
+        for code in [400, 402, 409, 422, 428] {
+            assert!(
+                retry_refusal_is_final(status(code)),
+                "{code} should be final"
+            );
+        }
+        for code in [401, 403, 404, 408, 413, 429, 500, 502, 503] {
+            assert!(
+                !retry_refusal_is_final(status(code)),
+                "{code} must stay pending"
+            );
+        }
     }
 
     #[test]

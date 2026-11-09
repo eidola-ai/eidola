@@ -10511,3 +10511,115 @@ fn a_turn_waiting_on_a_stalled_issuance_times_out() {
         });
     });
 }
+
+/// A retry the gateway refuses at authentication (a relinked account whose
+/// secret was mistyped) proves nothing about the issuance it retries: the
+/// gateway checks the secret before it looks for the stored response. So the
+/// issuance stays pending, and once the secret is right it lands, debited
+/// once.
+#[test]
+fn a_retry_refused_at_authentication_is_kept_until_the_secret_is_right() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("lost");
+        assert_eq!(mock.issuance_debits(), 1);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+
+        // The same account relinked with a secret the gateway refuses.
+        mock.issuance_knobs().unauthorized(true);
+        assert!(
+            core.runtime()
+                .block_on(core.recover_spending_credentials())
+                .expect("recovery")
+                .is_empty()
+        );
+        assert_eq!(
+            mock.issuance_requests(),
+            2,
+            "the retry was sent and refused"
+        );
+
+        // The secret corrected: the stored response is what lands.
+        mock.issuance_knobs().unauthorized(false);
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_spending_credentials())
+            .expect("recovery");
+        assert_eq!(recovered.len(), 1, "the paid issuance was not abandoned");
+        assert_eq!(mock.issuance_debits(), 1);
+        assert_eq!(
+            active_credentials(&core),
+            vec![(DEFAULT_ALLOCATION_CREDITS, 0)]
+        );
+    });
+}
+
+/// A recovery that settles a stranded hold and then fails — here waiting for
+/// the issuance gate a stalled issuance holds — has still written the
+/// successor, and says so on the bus before it fails: the caller that gets
+/// the error does not re-read on its own.
+#[test]
+fn a_recovery_that_fails_after_settling_a_hold_still_announces_it() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            refund: RefundMode::FailFirst(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the turn answers though its hold did not settle");
+        assert_eq!(
+            core.runtime()
+                .block_on(core.wallet_spending_credentials())
+                .expect("wallet")
+                .len(),
+            1
+        );
+
+        core.test_set_issuance_timeouts(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(400),
+        );
+        mock.issuance_knobs().stall(true);
+        let mut rx = core.subscribe_changes();
+        std::thread::scope(|scope| {
+            let requests = mock.issuance_requests();
+            let holder = scope.spawn(|| {
+                let _ = core
+                    .runtime()
+                    .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS));
+            });
+            while mock.issuance_requests() == requests {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let err = core
+                .runtime()
+                .block_on(core.recover_spending_credentials())
+                .expect_err("the issuance gate is held by a stalled issuance");
+            assert!(
+                matches!(err, AppError::ProvisioningTimeout { .. }),
+                "got {err:?}"
+            );
+            mock.issuance_knobs().stall(false);
+            holder.join().unwrap();
+        });
+
+        assert!(
+            core.runtime()
+                .block_on(core.wallet_spending_credentials())
+                .expect("wallet")
+                .is_empty(),
+            "the hold was settled before the failure"
+        );
+        assert!(
+            drain(&mut rx).contains(&Change::Wallet),
+            "the settled hold was announced although recovery failed"
+        );
+    });
+}

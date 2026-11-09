@@ -666,6 +666,9 @@ struct IssuanceKnobState {
     fail_retries: std::sync::atomic::AtomicBool,
     /// Accept every issuance request and never answer it.
     stall: std::sync::atomic::AtomicBool,
+    /// Refuse every issuance request with `401` before anything else, as the
+    /// gateway's `BasicAuth` does for a wrong secret.
+    unauthorized: std::sync::atomic::AtomicBool,
 }
 
 impl IssuanceKnobs {
@@ -682,6 +685,10 @@ impl IssuanceKnobs {
     /// Fail every retry (see [`IssuanceKnobState`]); `false` answers again.
     pub fn fail_retries(&self, on: bool) {
         self.0.fail_retries.store(on, Ordering::SeqCst);
+    }
+    /// Refuse every issuance as unauthenticated (see [`IssuanceKnobState`]).
+    pub fn unauthorized(&self, on: bool) {
+        self.0.unauthorized.store(on, Ordering::SeqCst);
     }
     /// Stall every issuance request (see [`IssuanceKnobState`]).
     pub fn stall(&self, on: bool) {
@@ -1660,6 +1667,9 @@ async fn handle_issuance(
     body: &[u8],
 ) -> std::io::Result<()> {
     issuer.issuance_requests.fetch_add(1, Ordering::SeqCst);
+    if config.issuance.0.unauthorized.load(Ordering::SeqCst) {
+        return write_json(stream, 401, &error_body("invalid credentials")).await;
+    }
     if config.issuance.0.stall.load(Ordering::SeqCst) {
         tokio::time::sleep(std::time::Duration::from_secs(120)).await;
         return Ok(());
@@ -3353,6 +3363,7 @@ async fn write_json(stream: &mut TcpStream, status: u16, body: &str) -> std::io:
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         402 => "Payment Required",
         404 => "Not Found",
         409 => "Conflict",
