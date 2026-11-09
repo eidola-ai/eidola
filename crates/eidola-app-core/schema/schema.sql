@@ -26,6 +26,24 @@ CREATE TABLE issuer_key (
     CHECK (spend_until <= accept_until)
 );
 
+-- The issuer key this client has seen for each epoch of the public issuer
+-- calendar, per server (`scope`: the eidola backend's base URL). The first
+-- key seen for an epoch is the only one this client will issue under for
+-- it: an honest server has exactly one key per epoch and never rotates
+-- within one, so a second key for an epoch already recorded is refused
+-- (`AppError::IssuerKeyRefused`). Written from every `GET /v1/keys` listing
+-- the client acts on, which includes the next epoch's key a whole epoch
+-- before it issues. Rows whose epoch can no longer be listed are pruned.
+CREATE TABLE issuer_key_epoch (
+    scope         TEXT NOT NULL,
+    epoch         INTEGER NOT NULL,
+    issuer_key_id TEXT NOT NULL,
+    -- ms since epoch; for the reader, nothing decides on it.
+    first_seen    INTEGER NOT NULL,
+
+    PRIMARY KEY (scope, epoch)
+);
+
 CREATE TABLE pre_credential (
     id               TEXT PRIMARY KEY,         -- UUIDv7
     type             TEXT NOT NULL CHECK (type IN ('issuance', 'refund')),

@@ -6,7 +6,8 @@
 //! outer chat-request construction ([`chat_completion_request_body`]), the
 //! wire contract shared by clients, the gateway and the inference nodes
 //! ([`engine_protocol`]: the prefix-cache key's shape and the weights
-//! header), the refund recovery key's wire form ([`refund_key`]), the
+//! header), the refund recovery key's wire form ([`refund_key`]), the public
+//! calendar issuer key windows are checked against ([`issuer_calendar`]), the
 //! spelling of a spend's `Authorization` value (`private_token`, behind the
 //! `private-token` feature), and the
 //! embed-marker recognition rule shared between the
@@ -126,6 +127,7 @@
 pub mod embed;
 pub mod engine_deployment;
 pub mod engine_protocol;
+pub mod issuer_calendar;
 #[cfg(feature = "private-token")]
 pub mod private_token;
 pub mod refund_key;

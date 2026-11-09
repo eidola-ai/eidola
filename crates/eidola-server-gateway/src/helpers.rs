@@ -94,44 +94,6 @@ pub fn system_time_to_iso_lossy(t: SystemTime) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Key epoch configuration
-// ---------------------------------------------------------------------------
-
-/// Default key epoch duration: 7 days.
-pub const DEFAULT_EPOCH_DURATION: Duration = Duration::from_secs(7 * 86400);
-
-/// Default grace period: credentials remain accepted for this long after
-/// the issuance window closes. Defaults to one epoch duration.
-pub const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(7 * 86400);
-
-/// Configuration for key epoch timing.
-#[derive(Debug, Clone)]
-pub struct EpochConfig {
-    /// How long each key is used for issuance.
-    pub epoch_duration: Duration,
-    /// How long after `issue_until` the key's credentials remain accepted.
-    pub grace_period: Duration,
-}
-
-impl Default for EpochConfig {
-    fn default() -> Self {
-        Self {
-            epoch_duration: DEFAULT_EPOCH_DURATION,
-            grace_period: DEFAULT_GRACE_PERIOD,
-        }
-    }
-}
-
-impl EpochConfig {
-    /// Compute `issue_until` and `accept_until` given an `issue_from` timestamp.
-    pub fn boundaries_from(&self, issue_from: SystemTime) -> (SystemTime, SystemTime) {
-        let issue_until = issue_from + self.epoch_duration;
-        let accept_until = issue_until + self.grace_period;
-        (issue_until, accept_until)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Configuration parsing
 // ---------------------------------------------------------------------------
 
@@ -243,42 +205,6 @@ mod tests {
         assert_eq!(
             system_time_to_iso(t).expect("timestamp should format"),
             "1969-12-31T23:59:59Z"
-        );
-    }
-
-    #[test]
-    fn test_epoch_config_boundaries() {
-        let config = EpochConfig::default();
-        let issue_from =
-            UNIX_EPOCH + Duration::from_secs(days_from_civil(2026, 3, 1) as u64 * 86400);
-        let (issue_until, accept_until) = config.boundaries_from(issue_from);
-        assert_eq!(system_time_to_iso_lossy(issue_from), "2026-03-01T00:00:00Z");
-        assert_eq!(
-            system_time_to_iso_lossy(issue_until),
-            "2026-03-08T00:00:00Z"
-        );
-        assert_eq!(
-            system_time_to_iso_lossy(accept_until),
-            "2026-03-15T00:00:00Z"
-        );
-    }
-
-    #[test]
-    fn test_epoch_config_custom_durations() {
-        let config = EpochConfig {
-            epoch_duration: Duration::from_secs(30 * 86400),
-            grace_period: Duration::from_secs(3 * 86400),
-        };
-        let issue_from =
-            UNIX_EPOCH + Duration::from_secs(days_from_civil(2026, 3, 1) as u64 * 86400);
-        let (issue_until, accept_until) = config.boundaries_from(issue_from);
-        assert_eq!(
-            system_time_to_iso_lossy(issue_until),
-            "2026-03-31T00:00:00Z"
-        );
-        assert_eq!(
-            system_time_to_iso_lossy(accept_until),
-            "2026-04-03T00:00:00Z"
         );
     }
 

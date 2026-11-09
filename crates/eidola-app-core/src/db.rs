@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 15;
+const LATEST_VERSION: i64 = 16;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -545,6 +545,113 @@ pub async fn upsert_issuer_key(
         message: format!("failed to upsert issuer key: {e}"),
     })?;
     Ok(())
+}
+
+/// What the per-epoch key record says about one listed key
+/// ([`pin_issuer_key_epoch`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinnedIssuerKey {
+    /// The key recorded for the epoch: the first one seen for it.
+    pub key_id: String,
+    /// Another epoch this same key is recorded for, if any. An honest server
+    /// has a distinct key for every epoch.
+    pub also_recorded_for: Option<u64>,
+}
+
+/// Record `issuer_key_id` as the key for `epoch` at `scope` unless one is
+/// already recorded, and say what the record holds either way: the key
+/// recorded for the epoch (the first key seen for an epoch is the one that
+/// stands; see the `issuer_key_epoch` table), and any other epoch the same
+/// key is recorded for. Epochs before `oldest_kept` are pruned in the same
+/// transaction.
+pub async fn pin_issuer_key_epoch(
+    conn: &Connection,
+    scope: &str,
+    epoch: u64,
+    issuer_key_id: &str,
+    oldest_kept: u64,
+    now: i64,
+) -> Result<PinnedIssuerKey, AppError> {
+    let epoch = i64::try_from(epoch).map_err(|_| AppError::Credential {
+        message: "issuer epoch out of range".into(),
+    })?;
+    let oldest = i64::try_from(oldest_kept).unwrap_or(i64::MAX);
+    begin_write(conn).await?;
+    match pin_issuer_key_epoch_body(conn, scope, epoch, issuer_key_id, oldest, now).await {
+        Ok(pinned) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(pinned)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn pin_issuer_key_epoch_body(
+    conn: &Connection,
+    scope: &str,
+    epoch: i64,
+    issuer_key_id: &str,
+    oldest: i64,
+    now: i64,
+) -> Result<PinnedIssuerKey, AppError> {
+    conn.execute(
+        "DELETE FROM issuer_key_epoch WHERE scope = ?1 AND epoch < ?2",
+        (Value::Text(scope.to_string()), Value::Integer(oldest)),
+    )
+    .await
+    .map_err(AppError::db)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO issuer_key_epoch (scope, epoch, issuer_key_id, first_seen) \
+         VALUES (?1, ?2, ?3, ?4)",
+        (
+            Value::Text(scope.to_string()),
+            Value::Integer(epoch),
+            Value::Text(issuer_key_id.to_string()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+    let mut rows = conn
+        .query(
+            "SELECT issuer_key_id FROM issuer_key_epoch WHERE scope = ?1 AND epoch = ?2",
+            (Value::Text(scope.to_string()), Value::Integer(epoch)),
+        )
+        .await
+        .map_err(AppError::db)?;
+    let key_id = match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<String>(0).map_err(AppError::db)?,
+        None => {
+            return Err(AppError::Database {
+                message: "issuer key epoch record vanished".into(),
+            });
+        }
+    };
+    drop(rows);
+    let mut rows = conn
+        .query(
+            "SELECT epoch FROM issuer_key_epoch \
+             WHERE scope = ?1 AND issuer_key_id = ?2 AND epoch != ?3 ORDER BY epoch LIMIT 1",
+            (
+                Value::Text(scope.to_string()),
+                Value::Text(issuer_key_id.to_string()),
+                Value::Integer(epoch),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    let also_recorded_for = match rows.next().await.map_err(AppError::db)? {
+        Some(row) => u64::try_from(row.get::<i64>(0).map_err(AppError::db)?).ok(),
+        None => None,
+    };
+    Ok(PinnedIssuerKey {
+        key_id,
+        also_recorded_for,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -11610,6 +11717,88 @@ mod tests {
         let lc = list_credential_lifecycle(&conn).await.unwrap();
         let exp = lc.iter().find(|r| r.nonce == "nonce-exp").unwrap();
         assert_eq!(exp.state, "expired");
+    }
+
+    /// The first key recorded for an epoch stands: a second one for the same
+    /// epoch reads back the first, another epoch's key is recorded on its
+    /// own, a key recorded for one epoch is reported when it turns up for
+    /// another, another server's record is separate, and epochs past the
+    /// record's horizon are pruned.
+    #[tokio::test]
+    async fn the_first_key_seen_for_an_epoch_stands() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+        let a = "https://a.example";
+        let b = "https://b.example";
+        let pin = |scope: &'static str, epoch: u64, id: &'static str, oldest: u64| {
+            let conn = conn.clone();
+            async move {
+                pin_issuer_key_epoch(&conn, scope, epoch, id, oldest, 1)
+                    .await
+                    .unwrap()
+            }
+        };
+        let first = |id: &str| PinnedIssuerKey {
+            key_id: id.to_string(),
+            also_recorded_for: None,
+        };
+
+        assert_eq!(pin(a, 10, "k10", 9).await, first("k10"));
+        assert_eq!(
+            pin(a, 10, "other", 9).await,
+            first("k10"),
+            "a second key for a seen epoch does not replace the first"
+        );
+        assert_eq!(pin(a, 11, "k11", 9).await, first("k11"));
+        assert_eq!(
+            pin(b, 10, "b10", 9).await,
+            first("b10"),
+            "each server's epochs are its own"
+        );
+        // The same key offered for another epoch is recorded there too, and
+        // the record says where else it stands.
+        assert_eq!(
+            pin(a, 13, "k10", 9).await,
+            PinnedIssuerKey {
+                key_id: "k10".into(),
+                also_recorded_for: Some(10),
+            }
+        );
+        assert_eq!(
+            pin(b, 11, "k10", 9).await,
+            first("k10"),
+            "another server's record is not consulted"
+        );
+
+        // Moving on prunes epochs before the horizon for that server only.
+        assert_eq!(
+            pin(a, 12, "k12", 11).await,
+            PinnedIssuerKey {
+                key_id: "k12".into(),
+                also_recorded_for: None,
+            }
+        );
+        let mut rows = conn
+            .query(
+                "SELECT scope, epoch FROM issuer_key_epoch ORDER BY scope, epoch",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            seen.push((row.get::<String>(0).unwrap(), row.get::<i64>(1).unwrap()));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (a.to_string(), 11),
+                (a.to_string(), 12),
+                (a.to_string(), 13),
+                (b.to_string(), 10),
+                (b.to_string(), 11)
+            ]
+        );
     }
 
     /// A key's two deadlines split the lifecycle: past `spend_until` an unspent

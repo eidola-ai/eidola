@@ -138,18 +138,20 @@ CREATE TABLE issuer_key (
 
     CONSTRAINT id_is_key_hash CHECK (id = encode(sha256(public_key), 'hex')),
     CONSTRAINT issue_window CHECK (issue_from < issue_until),
-    CONSTRAINT grace_window CHECK (issue_until <= accept_until)
+    CONSTRAINT grace_window CHECK (issue_until <= accept_until),
+    -- One key per epoch: an honest gateway never mints a second.
+    CONSTRAINT one_key_per_epoch UNIQUE (issue_from)
 );
 
--- Non-unique index for efficient lookup by issuance period.
-CREATE INDEX idx_issuer_key_issue_from ON issuer_key (issue_from);
-
 COMMENT ON TABLE issuer_key IS
-    'Credential issuer key pairs, rotated periodically (default: every 7 days). '
-    'Each key''s issue_from chains from its predecessor''s issue_until. The '
-    'private key is encrypted at rest (application-layer encryption using a '
-    'TEE-held master key). The public key and domain separator are served '
-    'publicly via GET /v1/keys. Race-safe provisioning is handled by '
+    'Credential issuer key pairs, one per epoch of the public issuer calendar '
+    '(eidola_common::issuer_calendar: 7-day epochs from the Unix epoch; a key '
+    'issues for its epoch and is accepted for one more). The private key is '
+    'encrypted at rest under a TEE-held master key, with the id, public key, '
+    'domain separator and all three windows bound into the encryption as '
+    'associated data: a row whose plain columns were edited does not decrypt, '
+    'and the gateway refuses it. The public key and domain separator are '
+    'served publicly via GET /v1/keys. Race-safe provisioning is handled by '
     'serializable transactions in the application layer.';
 
 COMMENT ON COLUMN issuer_key.id IS
@@ -159,9 +161,11 @@ COMMENT ON COLUMN issuer_key.id IS
     'to identify keys in Token structures and credential requests.';
 
 COMMENT ON COLUMN issuer_key.private_key_enc IS
-    'AES-256-GCM encrypted credential private key (Ristretto255 scalar). '
-    'Decrypted only inside the TEE at runtime. The encryption key is derived '
-    'from the TEE''s sealing key.';
+    'AES-256-GCM encrypted credential private key (Ristretto255 scalar), as '
+    'nonce || ciphertext+tag. Decrypted only inside the TEE at runtime. The '
+    'encryption key is derived from CREDENTIAL_MASTER_KEY and the key id; the '
+    'associated data binds the id, public key, domain separator, issue_from, '
+    'issue_until and accept_until.';
 
 COMMENT ON COLUMN issuer_key.public_key IS
     'Credential public key (compressed Ristretto255 point, 32 bytes). Served '
@@ -181,7 +185,7 @@ COMMENT ON COLUMN issuer_key.issue_until IS
 
 COMMENT ON COLUMN issuer_key.accept_until IS
     'Grace period end. Credentials signed by this key are accepted for spending '
-    'until this timestamp. Defaults to one epoch duration after issue_until. '
+    'until this timestamp: one epoch after issue_until. '
     'Nullifiers for this key are pruned only once the gateway''s retention '
     'margin past this timestamp has also passed (prune_expired_nullifiers).';
 
