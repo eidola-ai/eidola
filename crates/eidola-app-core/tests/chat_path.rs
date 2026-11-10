@@ -11164,3 +11164,59 @@ fn a_pin_is_matched_by_its_hash_and_refused_by_name_when_its_weights_are_gone() 
         );
     });
 }
+
+/// **An answer from new weights announces the roster.** A participant's
+/// "model updated" notice compares the hash its last answer came from with
+/// what the tag names now, and the surfaces that show notices refresh on
+/// `Change::Participants` — so the turn whose answer first comes from the new
+/// weights is the write that changes the notice, and it says so. The first
+/// hash ever recorded and an answer from the same weights again change no
+/// notice, and announce nothing.
+#[test]
+fn an_answer_from_new_weights_announces_the_participants_change() {
+    run(|| {
+        let config = MockConfig::default();
+        let published = config.published_sha256.clone();
+        *published.lock().unwrap() = Some(HASH_1.to_string());
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        let participants_in = |rx: &mut tokio::sync::broadcast::Receiver<ChangeEvent>| {
+            drain(rx)
+                .into_iter()
+                .filter(|c| matches!(c, Change::Participants))
+                .count()
+        };
+
+        let mut rx = core.subscribe_changes();
+        let first = core
+            .runtime()
+            .block_on(core.chat("first".into(), MODEL.into(), None))
+            .expect("turn 1");
+        let space = first.space_id.clone();
+        assert_eq!(participants_in(&mut rx), 0, "a first hash moves no notice");
+
+        core.runtime()
+            .block_on(core.chat("same weights".into(), MODEL.into(), Some(space.clone())))
+            .expect("turn 2");
+        assert_eq!(
+            participants_in(&mut rx),
+            0,
+            "the same weights again move nothing"
+        );
+
+        *published.lock().unwrap() = Some(HASH_2.to_string());
+        core.runtime()
+            .block_on(core.chat("new weights".into(), MODEL.into(), Some(space.clone())))
+            .expect("turn 3");
+        assert_eq!(
+            participants_in(&mut rx),
+            1,
+            "the answer from new weights announces the roster once"
+        );
+
+        core.runtime()
+            .block_on(core.chat("settled".into(), MODEL.into(), Some(space)))
+            .expect("turn 4");
+        assert_eq!(participants_in(&mut rx), 0);
+    });
+}

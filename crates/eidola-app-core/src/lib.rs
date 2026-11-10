@@ -7848,6 +7848,7 @@ impl Inner {
             model: model.to_string(),
             wire_model,
             resolved_sha256,
+            weights_moved: false,
             model_participant_id,
             max_completion_tokens,
             continuation,
@@ -13925,6 +13926,10 @@ struct TurnPrep {
     /// The weights hash an Eidola turn resolved to; `None` for every other
     /// backend, and for a catalog that does not publish hashes.
     resolved_sha256: Option<String>,
+    /// Set by [`Self::record_resolved_hash`] when this turn's answer is the
+    /// first from new weights after an answer from other ones, and taken by
+    /// [`Self::announce_moved_weights`] once the write has committed.
+    weights_moved: bool,
     /// The acting agent participant. Deliberately **no** scope alongside it:
     /// a turn spans HTTP round trips, and task 36's promotion can flip that
     /// scope mid-flight — so the pinned echo is derived from this id inside
@@ -14410,6 +14415,41 @@ impl TurnPrep {
     /// One transaction, like every other multi-statement action writer (the
     /// `persist_turn` rationale): the intermediate states are then not
     /// something any reader — or a crash — can keep.
+    /// Record the weights hash the turn resolved to on `action_id`, inside the
+    /// action's own transaction (`db::set_action_model_sha256`), and note
+    /// when it **moves** the participant's last recorded hash in this space
+    /// under this model: the one write that changes what the participant's
+    /// model notices say (`model_catalog::notices`' `Updated` compares the
+    /// latest recorded hash with what the tag names now). The first hash
+    /// ever recorded moves nothing a notice reads.
+    async fn record_resolved_hash(&mut self, action_id: &str) -> Result<(), AppError> {
+        let Some(sha256) = self.resolved_sha256.clone() else {
+            return Ok(());
+        };
+        let previous = db::last_model_sha256(
+            &self.db_conn,
+            &self.space_id,
+            &self.model_participant_id,
+            &self.model,
+        )
+        .await?;
+        db::set_action_model_sha256(&self.db_conn, action_id, Some(&sha256)).await?;
+        if previous.is_some_and(|p| p != sha256) {
+            self.weights_moved = true;
+        }
+        Ok(())
+    }
+
+    /// After a commit: when that write moved the participant's recorded
+    /// weights, announce `Change::Participants`, the variant of the surface
+    /// that shows model notices (`ParticipantInfo::model_notices`), so a
+    /// stale "model updated" notice is re-read rather than left standing.
+    fn announce_moved_weights(&mut self) {
+        if std::mem::take(&mut self.weights_moved) {
+            self.bus.emit(Change::Participants);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn persist_tool_call_action(
         &mut self,
@@ -14445,6 +14485,7 @@ impl TurnPrep {
                     .execute("COMMIT", ())
                     .await
                     .map_err(AppError::db)?;
+                self.announce_moved_weights();
                 Ok(id)
             }
             Err(e) => {
@@ -14494,8 +14535,7 @@ impl TurnPrep {
             },
         )
         .await?;
-        db::set_action_model_sha256(&self.db_conn, &action_id, self.resolved_sha256.as_deref())
-            .await?;
+        self.record_resolved_hash(&action_id).await?;
         if let Some(ref ante) = self.trace_reply_to {
             db::insert_action_antecedent(&self.db_conn, &action_id, ante, 0, "reply").await?;
         }
@@ -14838,6 +14878,7 @@ impl TurnPrep {
                     .execute("COMMIT", ())
                     .await
                     .map_err(AppError::db)?;
+                self.announce_moved_weights();
                 Ok(id)
             }
             Err(e) => {
@@ -14939,12 +14980,7 @@ impl TurnPrep {
             },
         )
         .await?;
-        db::set_action_model_sha256(
-            &self.db_conn,
-            &inference_action_id,
-            self.resolved_sha256.as_deref(),
-        )
-        .await?;
+        self.record_resolved_hash(&inference_action_id).await?;
         if let Some(ref ante) = self.inf_reply_to {
             db::insert_action_antecedent(&self.db_conn, &inference_action_id, ante, 0, "reply")
                 .await?;
