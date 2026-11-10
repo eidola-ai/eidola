@@ -803,10 +803,11 @@ pub enum DisputeReversal {
     /// The clawbacks recorded for the dispute, net of earlier reversals, were
     /// credited back: this many micro-dollars.
     Credited(i64),
-    /// This event was already handled.
+    /// This event, or another event for the same dispute, already reversed
+    /// it.
     Duplicate,
-    /// No clawback is on the ledger for this dispute (or it was reversed
-    /// already), so there is nothing to give back.
+    /// No clawback is on the ledger for this dispute, so there is nothing to
+    /// give back (yet: its `created` may still be on its way).
     NothingToReverse,
 }
 
@@ -842,10 +843,15 @@ pub async fn reverse_dispute_clawback(
     .await
     .map_err(db_err("dispute reversal account lock"))?;
 
+    // Duplicate by event id *or* by dispute: Stripe can emit two Event
+    // objects for one `closed` transition, and the second must read as
+    // handled, not as a dispute with nothing to reverse (which is retried).
     let duplicate: bool = tx
         .query_one(
-            "SELECT EXISTS (SELECT 1 FROM credit_ledger WHERE stripe_event_id = $1)",
-            &[&stripe_event_id],
+            "SELECT EXISTS (SELECT 1 FROM credit_ledger \
+                            WHERE stripe_event_id = $1 \
+                               OR (account_id = $2 AND reason = 'dispute_reversal' AND memo = $3))",
+            &[&stripe_event_id, &account_id, &dispute_id],
         )
         .await
         .map_err(db_err("dispute reversal duplicate check"))?

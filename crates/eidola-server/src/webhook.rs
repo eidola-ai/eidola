@@ -1547,11 +1547,23 @@ mod tests {
         assert!(!outcome.is_retryable());
         assert_eq!(get_balance(&pool, account_id).await, 50_000_000);
 
-        // Redelivered, it gives nothing back twice.
+        // Redelivered, it gives nothing back twice — whether as the same
+        // event or as a second Event object for the same transition.
         assert!(
             !handle_dispute_closed(&won, &pool, &stripe)
                 .await
                 .is_retryable()
+        );
+        let won_again = make_event(
+            &format!("evt_{}", uuid::Uuid::new_v4()),
+            "charge.dispute.closed",
+            stripe_shaped_dispute("won"),
+        );
+        assert!(
+            !handle_dispute_closed(&won_again, &pool, &stripe)
+                .await
+                .is_retryable(),
+            "a reversed dispute is a duplicate, not one awaiting its clawback"
         );
         assert_eq!(get_balance(&pool, account_id).await, 50_000_000);
     }
