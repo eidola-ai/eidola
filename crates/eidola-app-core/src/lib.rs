@@ -524,6 +524,7 @@ fn validate_persona(
 ) -> Result<db::PersonaWrite, AppError> {
     Ok(db::PersonaWrite {
         premise,
+        model_premise: None,
         role: None,
         label: match &update.label {
             Some(l) => Some(validate_label(l, "participant label")?),
@@ -5100,20 +5101,27 @@ impl Inner {
         };
         let pin = model_catalog::newer_pin(&participant.model_notices).ok_or_else(stale)?;
         let selection = backends::qualified_model_id(&pin, backends::EIDOLA_BACKEND_ID);
-        if participant.source == "referenced" {
-            self.set_space_participant_override(
+        // The notice was read from the model the participant had then; the
+        // write is conditioned on that model still being there, in its own
+        // statement, so a choice made elsewhere since is never overwritten
+        // by a notice that no longer applies.
+        let conn = self.db_conn().await?;
+        let changed = if participant.source == "referenced" {
+            db::update_space_participant_override_if(
+                &conn,
                 space_id,
                 participant_id,
-                ParticipantOverride {
-                    model_ref: Some(Some(selection.clone())),
-                    ..ParticipantOverride::default()
-                },
+                None,
+                Some(Some(&selection)),
+                None,
+                None,
+                Some(participant.model_ref.as_deref()),
+                now_ms(),
             )
-            .await?;
+            .await?
         } else {
-            self.update_space_participant(
-                participant_id,
-                ParticipantUpdate {
+            let mut persona = validate_persona(
+                &ParticipantUpdate {
                     label: None,
                     model_ref: Some(Some(selection.clone())),
                     system_prompt: None,
@@ -5122,9 +5130,17 @@ impl Inner {
                 ExpectedScope::SpaceOwned {
                     space_id: space_id.to_string(),
                 },
-            )
-            .await?;
+            )?;
+            persona.model_premise = Some(participant.model_ref.clone());
+            persona.apply(&conn, participant_id, now_ms()).await?
+        };
+        if !changed {
+            return Err(stale());
         }
+        // The schema's trigger forgot this lineage's key in the write's own
+        // statement; empty the log of its history too.
+        db::truncate_log_after_forgetting_keys(&conn).await;
+        self.bus.emit(Change::Participants);
         Ok(selection)
     }
 

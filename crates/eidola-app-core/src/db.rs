@@ -3769,6 +3769,10 @@ pub async fn update_participant_config(
             ));
         }
     }
+    if let Some(expected) = &write.model_premise {
+        params.push(opt_str(expected.as_deref()));
+        premise.push_str(&format!(" AND model_ref IS ?{}", params.len()));
+    }
     let sql = format!(
         "UPDATE participant SET {} WHERE id = ?1{premise}",
         sets.join(", ")
@@ -3899,6 +3903,10 @@ pub struct PersonaWrite {
     /// statement, the premise makes that stale write strike nothing (Codex
     /// review, PR #279).
     pub premise: ScopePremise,
+    /// **The model the caller believed the row holds**, when the write was
+    /// derived from it (the newer-weights switch). `Some` makes a row whose
+    /// model has since changed strike nothing; `None` asks nothing of it.
+    pub model_premise: Option<Option<String>>,
 }
 
 /// The scope a config write was composed against.
@@ -5171,6 +5179,37 @@ pub async fn update_space_participant_override(
     override_notify_policy: Option<Option<&str>>,
     now: i64,
 ) -> Result<bool, AppError> {
+    update_space_participant_override_if(
+        conn,
+        space_id,
+        participant_id,
+        override_label,
+        override_model_ref,
+        override_system_prompt,
+        override_notify_policy,
+        None,
+        now,
+    )
+    .await
+}
+
+/// [`update_space_participant_override`], also conditioned on the model the
+/// caller believed the membership resolves to (`COALESCE(override, base)`):
+/// `Some` makes a membership whose effective model has since changed strike
+/// nothing, so a write derived from that model (the newer-weights switch)
+/// cannot overwrite a newer choice.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_space_participant_override_if(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    override_label: Option<Option<&str>>,
+    override_model_ref: Option<Option<&str>>,
+    override_system_prompt: Option<Option<&str>>,
+    override_notify_policy: Option<Option<&str>>,
+    model_premise: Option<Option<&str>>,
+    now: i64,
+) -> Result<bool, AppError> {
     let mut sets: Vec<String> = Vec::new();
     let mut params: Vec<Value> = vec![
         Value::Text(space_id.to_string()),
@@ -5228,12 +5267,23 @@ pub async fn update_space_participant_override(
         ),
         None => String::new(),
     };
+    let model_guard = match model_premise {
+        Some(expected) => {
+            params.push(opt_str(expected));
+            format!(
+                " AND COALESCE(override_model_ref, \
+                     (SELECT p.model_ref FROM participant p WHERE p.id = ?2)) IS ?{}",
+                params.len()
+            )
+        }
+        None => String::new(),
+    };
     let sql = format!(
         "UPDATE space_participant SET {} \
          WHERE space_id = ?1 AND participant_id = ?2 AND left_at IS NULL \
            AND EXISTS ( \
                SELECT 1 FROM participant p WHERE p.id = ?2 AND p.removed_at IS NULL \
-           ){owner_guard}",
+           ){owner_guard}{model_guard}",
         sets.join(", ")
     );
     // An override is per-space configuration, so it stamps the space — before
@@ -12696,6 +12746,107 @@ mod tests {
             "a space_participant referencing a space-owned participant must \
              violate the composite FK (only globals are referenceable)"
         );
+    }
+
+    /// **A write conditioned on a model strikes nothing once the model has
+    /// moved** — on an owned row (`PersonaWrite::model_premise`) and on a
+    /// membership's effective model (`update_space_participant_override_if`).
+    #[tokio::test]
+    async fn a_model_premise_refuses_a_write_once_the_model_moved() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "space-p",
+            None,
+            "unlinked",
+            1_000,
+        )
+        .await
+        .unwrap();
+        let members = space_participants(&conn, "space-p").await.unwrap();
+        let agent = members.iter().find(|m| m.kind == "agent").unwrap().clone();
+        let human = members.iter().find(|m| m.kind == "human").unwrap().clone();
+        assert_eq!(agent.source, "owned");
+        assert_eq!(human.source, "referenced");
+        let model_of = |id: String| {
+            let conn = conn.clone();
+            async move {
+                space_participants(&conn, "space-p")
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|m| m.participant_id == id)
+                    .unwrap()
+                    .model_ref
+            }
+        };
+
+        // Owned row: a stale premise strikes nothing, the current one lands.
+        let write = |expected: Option<&str>| PersonaWrite {
+            model_ref: Some(Some("newer".into())),
+            model_premise: Some(expected.map(str::to_string)),
+            ..Default::default()
+        };
+        assert!(
+            !update_participant_config(&conn, &agent.participant_id, &write(Some("moved")), 2_000)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            model_of(agent.participant_id.clone()).await,
+            agent.model_ref
+        );
+        assert!(
+            update_participant_config(
+                &conn,
+                &agent.participant_id,
+                &write(agent.model_ref.as_deref()),
+                2_000
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            model_of(agent.participant_id.clone()).await.as_deref(),
+            Some("newer")
+        );
+
+        // Membership: the premise is the effective model, override or base.
+        let set = |expected: Option<&str>| {
+            let conn = conn.clone();
+            let expected = expected.map(str::to_string);
+            async move {
+                update_space_participant_override_if(
+                    &conn,
+                    "space-p",
+                    HUMAN_PARTICIPANT_ID,
+                    None,
+                    Some(Some("pinned")),
+                    None,
+                    None,
+                    Some(expected.as_deref()),
+                    2_000,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        assert!(!set(Some("moved")).await, "a stale base premise");
+        assert!(
+            set(human.model_ref.as_deref()).await,
+            "the base it inherits"
+        );
+        assert_eq!(
+            model_of(HUMAN_PARTICIPANT_ID.to_string()).await.as_deref(),
+            Some("pinned")
+        );
+        assert!(
+            !set(human.model_ref.as_deref()).await,
+            "the override now decides the effective model"
+        );
+        assert!(set(Some("pinned")).await);
     }
 
     #[tokio::test]
