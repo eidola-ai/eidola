@@ -10804,6 +10804,58 @@ fn a_retry_refused_at_authentication_is_kept_until_the_secret_is_right() {
     });
 }
 
+/// A retry refused on state that can change — the balance, the terms in force,
+/// or a key the gateway's database still has issuing — proves nothing about
+/// an original attempt that stalled before its debit and may still land. So
+/// the issuance stays pending through each such refusal, and once the
+/// original lands, the stored response is what the next retry recovers,
+/// debited once.
+#[test]
+fn a_retry_refused_while_its_original_may_still_land_is_kept() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        mock.issuance_knobs().hold_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("no answer");
+        assert_eq!(mock.issuance_debits(), 0, "the original has not landed");
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+
+        for status in [402, 428, 503] {
+            mock.issuance_knobs().refuse_with(Some(status));
+            let requests = mock.issuance_requests();
+            assert!(
+                core.runtime()
+                    .block_on(core.recover_spending_credentials())
+                    .expect("recovery")
+                    .is_empty()
+            );
+            assert_eq!(
+                mock.issuance_requests(),
+                requests + 1,
+                "the retry was sent and refused with {status}"
+            );
+        }
+        mock.issuance_knobs().refuse_with(None);
+
+        // The stalled original reaches its debit.
+        mock.land_held_issuances();
+        assert_eq!(mock.issuance_debits(), 1);
+
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_spending_credentials())
+            .expect("recovery");
+        assert_eq!(recovered.len(), 1, "the paid issuance was not abandoned");
+        assert_eq!(mock.issuance_debits(), 1);
+        assert_eq!(
+            active_credentials(&core),
+            vec![(DEFAULT_ALLOCATION_CREDITS, 0)]
+        );
+    });
+}
+
 /// A recovery that settles a stranded hold and then fails — here waiting for
 /// the issuance gate a stalled issuance holds — has still written the
 /// successor, and says so on the bus before it fails: the caller that gets

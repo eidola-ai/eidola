@@ -1244,6 +1244,15 @@ pub fn issuance_request_digest(
 /// The response to return for an issuance already stored under the request's
 /// idempotency key, or the refusal when the stored one answered a different
 /// request.
+/// The refusal of an issuance whose named key has stopped issuing, decided
+/// under the account lock on the database clock: nothing was or will be
+/// debited under its idempotency key.
+fn key_retired() -> ServerError {
+    ServerError::Conflict {
+        message: "the named issuer key has stopped issuing".to_string(),
+    }
+}
+
 fn answer_stored(
     stored: db::StoredIssuance,
     digest: &[u8; 32],
@@ -1323,7 +1332,10 @@ pub async fn list_keys(
 /// stores the signed response in one transaction, and a retry with the same
 /// key and request is answered from what was stored, so a response lost on the
 /// way back costs nothing. A stored issuance is answered before the terms gate
-/// and the current-key check, because it was already paid for.
+/// and the current-key check, because it was already paid for. A key that is
+/// not current is refused with `409` only once the database, under the account
+/// lock, has it no longer issuing, so no attempt under the idempotency key can
+/// debit afterwards; otherwise `503`.
 #[utoipa::path(
     post,
     path = "/v1/account/credentials",
@@ -1335,9 +1347,9 @@ pub async fn list_keys(
         (status = 400, description = "Invalid request", body = crate::types::ErrorResponse),
         (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
         (status = 402, description = "Insufficient credit balance", body = crate::types::ErrorResponse),
-        (status = 409, description = "The idempotency key was used for a different request, or the named issuer key is not the current one; nothing was debited", body = crate::types::ErrorResponse),
+        (status = 409, description = "The idempotency key was used for a different request, or the named issuer key has stopped issuing; nothing was or will be debited under the idempotency key", body = crate::types::ErrorResponse),
         (status = 428, description = "Terms acceptance required", body = crate::types::ErrorResponse),
-        (status = 503, description = "Credential issuance not configured", body = crate::types::ErrorResponse),
+        (status = 503, description = "Credential issuance not configured, or the named issuer key is not yet this gateway's current issuing key; try again", body = crate::types::ErrorResponse),
     )
 )]
 pub async fn issue_credentials(
@@ -1394,24 +1406,42 @@ pub async fn issue_credentials(
         return answer_stored(stored, &digest);
     }
 
-    // Conversion is a gated operation: the account must have accepted the
-    // currently required terms/privacy versions (no-op when unconfigured).
-    crate::account::ensure_terms_accepted(&state, account_id).await?;
-
     let key_hash = ensure_keys(&state.credential_key_cache, master_key, &state.db_pool).await?;
 
     let key_id = hex::encode(key_hash);
 
     // The client verifies the response against the key it named and refuses
     // any other, so signing under another key would debit for a credential it
-    // will never store. Refused before any debit; a key that has stopped
-    // issuing can never again be debited for, which is also what makes a
-    // retry arriving after its stored response was pruned safe.
+    // will never store. An attempt under this idempotency key may still be in
+    // flight past this check (it passed while the key was current and stalled
+    // since), so the refusal is decided under the account lock, on the
+    // database clock `record_credential_issuance` debits on: a key that has
+    // stopped issuing there can never again be debited for, which makes the
+    // `409` final for the client and a retry arriving after its stored
+    // response was pruned safe. A key the database still has issuing is a
+    // disagreement of clocks or caches, and is answered as one to try again.
     if request.issuer_key_id != key_id {
-        return Err(ServerError::Conflict {
-            message: "the named issuer key is not the current issuing key".to_string(),
-        });
+        return match db::resolve_issuance_off_current_key(
+            &state.db_pool,
+            account_id,
+            &idempotency_key,
+            &request.issuer_key_id,
+        )
+        .await?
+        {
+            db::OffCurrentKey::Stored(stored) => answer_stored(stored, &digest),
+            db::OffCurrentKey::Retired => Err(key_retired()),
+            db::OffCurrentKey::Issuing => Err(ServerError::ServiceUnavailable(
+                "the named issuer key is not this gateway's current issuing key yet".to_string(),
+            )),
+        };
     }
+
+    // Conversion is a gated operation: the account must have accepted the
+    // currently required terms/privacy versions (no-op when unconfigured).
+    // After the key check, so a retry under a retired key is answered with
+    // the final refusal whatever the terms in force.
+    crate::account::ensure_terms_accepted(&state, account_id).await?;
 
     let issuance_response = {
         let cache = state.credential_key_cache.read().await;
@@ -1454,6 +1484,7 @@ pub async fn issue_credentials(
     {
         db::IssuanceRecord::Issued { ledger_entry_id } => ledger_entry_id,
         db::IssuanceRecord::Stored(stored) => return answer_stored(stored, &digest),
+        db::IssuanceRecord::Retired => return Err(key_retired()),
         db::IssuanceRecord::Insufficient => {
             let available = match db::get_available_balance(&state.db_pool, account_id).await {
                 Ok(v) => v,
@@ -3406,11 +3437,25 @@ mod tests {
             4_000
         );
 
-        // A fresh key naming an issuer key that is not current is refused
-        // before the debit.
+        // A fresh key naming an issuer key the database does not have issuing
+        // is refused, finally, before the debit.
         match issue(body(1_000, &other, &"6b".repeat(32), &"00".repeat(32))).await {
             Err(ServerError::Conflict { .. }) => {}
             Err(e) => panic!("a stale key was refused with {e:?}"),
+            Ok(_) => panic!("an issuance under a key that is not current was answered"),
+        }
+        // One the database still has issuing, but that is not this gateway's
+        // current key, is told to try again: an attempt under it may still
+        // debit, so the refusal must not read as final.
+        let future = generate_key(
+            &master_key,
+            10_000 + u64::from(OsRng.next_u32() % 1_000_000),
+        )
+        .unwrap();
+        insert_key_row(&pool, &future).await;
+        match issue(body(1_000, &other, &"6c".repeat(32), &future.id)).await {
+            Err(ServerError::ServiceUnavailable(_)) => {}
+            Err(e) => panic!("a key still issuing elsewhere was refused with {e:?}"),
             Ok(_) => panic!("an issuance under a key that is not current was answered"),
         }
         assert_eq!(
@@ -3523,7 +3568,19 @@ mod tests {
             10_000 + u64::from(OsRng.next_u32() % 1_000_000),
         )
         .unwrap();
-        insert_key_row(&pool, &retired).await;
+        // The retired key is inserted still issuing, so an issuance can be
+        // recorded under it, and then given its own 1970s windows.
+        let open_until = SystemTime::now() + Duration::from_secs(3_600);
+        let issuing = db::IssuerKeyRow {
+            id: retired.id.clone(),
+            private_key_enc: retired.private_key_enc.clone(),
+            public_key: retired.public_key.clone(),
+            domain_separator: retired.domain_separator.clone(),
+            issue_from: retired.issue_from,
+            issue_until: open_until,
+            accept_until: open_until,
+        };
+        insert_key_row(&pool, &issuing).await;
         insert_key_row(&pool, &live).await;
         let account = uuid::Uuid::new_v4();
         db::insert_account(&pool, account, "unused").await.unwrap();
@@ -3547,6 +3604,15 @@ mod tests {
             .unwrap();
             assert!(matches!(outcome, db::IssuanceRecord::Issued { .. }));
         }
+        pool.get()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE issuer_key SET issue_until = $2, accept_until = $3 WHERE id = $1",
+                &[&retired.id, &retired.issue_until, &retired.accept_until],
+            )
+            .await
+            .unwrap();
         assert!(
             db::prune_expired_issuances(&pool, RETENTION_PAST_ACCEPT)
                 .await
@@ -3566,6 +3632,95 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "a live key's stored issuance was pruned"
+        );
+    }
+
+    /// An attempt that passed the current-key check and then stalled across
+    /// its key's issue window never debits once a retry has been refused for
+    /// that key: the client abandons on that refusal, so a later debit would
+    /// charge the account for a credential it never receives. Both decisions
+    /// are taken under the account lock on the database clock. Needs
+    /// `DATABASE_URL` with `schema.sql` applied.
+    #[tokio::test]
+    #[ignore]
+    async fn an_attempt_stalled_past_its_keys_window_never_debits_after_a_retry_is_refused() {
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let pool = db::create_pool(&url, None, None).unwrap();
+        // A key of its own whose issue window closes two seconds from now,
+        // on an issue_from no calendar key uses.
+        let mut public_key = [0u8; 32];
+        OsRng.fill_bytes(&mut public_key);
+        let key_id = hex::encode(Sha256::digest(public_key));
+        pool.get()
+            .await
+            .unwrap()
+            .execute(
+                "INSERT INTO issuer_key (id, private_key_enc, public_key, domain_separator, \
+                 issue_from, issue_until, accept_until) VALUES ($1, '\\x00', $2, 'test', \
+                 clock_timestamp() - make_interval(secs => 86400 + $3::float8), \
+                 clock_timestamp() + interval '2 seconds', \
+                 clock_timestamp() + interval '1 day')",
+                &[
+                    &key_id,
+                    &public_key.as_slice(),
+                    &f64::from(OsRng.next_u32()),
+                ],
+            )
+            .await
+            .unwrap();
+        let account = uuid::Uuid::new_v4();
+        db::insert_account(&pool, account, "unused").await.unwrap();
+        let event = format!("evt_test_{}", account.simple());
+        assert!(
+            db::insert_credit_ledger(&pool, account, 5_000, "purchase", &event, None, None)
+                .await
+                .unwrap()
+        );
+        let idem = [7u8; 32];
+
+        // While the window is open, nothing is final: the original may land.
+        assert_eq!(
+            db::resolve_issuance_off_current_key(&pool, account, &idem, &key_id)
+                .await
+                .unwrap(),
+            db::OffCurrentKey::Issuing
+        );
+
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+        // The retry, refused for the retired key: the verdict the client
+        // abandons the issuance on.
+        assert_eq!(
+            db::resolve_issuance_off_current_key(&pool, account, &idem, &key_id)
+                .await
+                .unwrap(),
+            db::OffCurrentKey::Retired
+        );
+        // The original, arriving at the debit only now, debits nothing.
+        assert_eq!(
+            db::record_credential_issuance(
+                &pool,
+                account,
+                &idem,
+                &[1u8; 32],
+                &key_id,
+                1_000,
+                b"response",
+            )
+            .await
+            .unwrap(),
+            db::IssuanceRecord::Retired
+        );
+        assert_eq!(
+            db::get_available_balance(&pool, account).await.unwrap(),
+            5_000
+        );
+        assert!(
+            db::find_credential_issuance(&pool, account, &idem)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
