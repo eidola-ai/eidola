@@ -55,18 +55,20 @@ ARG CARGO_PROFILE=release
 
 COPY crates/ ./crates/
 
-# Engine trust inputs: `build.rs` embeds the engine deployments this gateway
-# accepts (`engine-enclaves.json`) after checking every pin against the
-# committed deployment configs under `deploy/engine/`, re-deriving each TDX
-# pin's machine policy from the vendored platform endorsements
-# (`platform-endorsements/`), verified offline against the committed
-# Sigstore trusted root. Only these paths are copied, never `releases/`
-# wholesale: other files in `releases/trust/` (notably `server-enclave.json`)
-# are functions of the gateway's own image digest and would create a circular
-# cache dependency if pulled in here, and none of these depends on that
-# digest. Globs rather than directory names so a tree without either
-# directory still builds; the build script then sees no deployments.
-COPY --parents releases/trust/engine-enclaves.json releases/trust/sigstore-trusted-root.json releases/trust/platform-endorsements* deploy/engine* ./
+# Engine trust inputs and the model catalog: `build.rs` embeds the engine
+# deployments this gateway accepts (`engine-enclaves.json`) after checking
+# every pin against the committed deployment configs under `deploy/engine/`,
+# re-deriving each TDX pin's machine policy from the vendored platform
+# endorsements (`platform-endorsements/`), verified offline against the
+# committed Sigstore trusted root, and compiles in the model catalog
+# (`models/`), checked and bound to those pins by weights hash. Only these
+# paths are copied, never `releases/` wholesale: other files in
+# `releases/trust/` (notably `server-enclave.json`) are functions of the
+# gateway's own image digest and would create a circular cache dependency if
+# pulled in here, and none of these depends on that digest. Globs rather than
+# directory names so a tree without one of the directories still builds; the
+# build script then sees no deployments or no rows.
+COPY --parents releases/trust/engine-enclaves.json releases/trust/sigstore-trusted-root.json releases/trust/platform-endorsements* deploy/engine* models* ./
 
 # Ensure Cargo detects source changes over the fetch-stage stubs.
 # SOURCE_DATE_EPOCH=0 clamps COPY timestamps to epoch 0, matching the

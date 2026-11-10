@@ -344,8 +344,8 @@ fn init_otel_providers() -> Option<OtelGuard> {
 ///
 /// 1. **No caller-derived label values.** Every attribute must come from a
 ///    fixed, server-controlled set. `model` qualifies only because
-///    `lookup_model` resolves the requested id against the known catalog
-///    before it is used. An unbounded label creates a per-request time series,
+///    `Catalog::resolve` resolves the requested reference to a catalog
+///    row's weights hash before it is used. An unbounded label creates a per-request time series,
 ///    which is a per-request record wearing a metric's clothes.
 /// 2. **Prefer a ratio to a duration.** A stream's wall time is length × rate,
 ///    so it carries the response's size. Dividing by the token count cancels

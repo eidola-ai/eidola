@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 use super::{
-    CacheConfig, ExecutorSettings, GpuCc, MeasuredConfig, ModelPack, WeightsStorage,
+    Architecture, CacheConfig, ExecutorSettings, GpuCc, MeasuredConfig, ModelPack, WeightsStorage,
     artifact_data_bytes, check_container_gpu_access, check_cvm_image, check_env_names,
     check_gpu_attestation, check_kernels_dir, check_resources, check_secrets, check_shim_paths,
     check_vm_resources, check_weights_pack, env, is_safe_component, parse_cvm_version,
@@ -40,6 +40,9 @@ pub struct Deployment {
     pub cvm_version: String,
     /// The node's measured configuration.
     pub measured: MeasuredConfig,
+    /// The architecture of the weights it serves (implemented, so its shape
+    /// is known).
+    pub architecture: Architecture,
     /// The weights' provenance: `<owner>/<name>` and a 40-hex revision.
     pub weights_repo: String,
     pub weights_revision: String,
@@ -100,11 +103,15 @@ pub fn is_platform_release_tag(tag: &str) -> bool {
         })
 }
 
-/// Check one deployment of `model_id`: its config (`config_path`, read as
-/// `config`) and its sidecar (`sidecar_path`, read as `sidecar`). Errors name
-/// the file and the rule, never a secret.
+/// Check one deployment: its config (`config_path`, read as `config`) and
+/// its sidecar (`sidecar_path`, read as `sidecar`). Errors name the file and
+/// the rule, never a secret.
+///
+/// A deployment is identified by the weights it serves: its node's model id
+/// (`EIDOLA_ENGINE_MODEL_ID`) must be its weights hash
+/// (`EIDOLA_ENGINE_WEIGHTS_SHA256`), so the name a request reaches the node
+/// under is the hash the gateway resolved it to, and nothing else.
 pub fn check_deployment(
-    model_id: &str,
     config_path: &str,
     config: &[u8],
     sidecar_path: &str,
@@ -150,10 +157,11 @@ pub fn check_deployment(
     // The platform image the executor needs: the release's GPU image.
     let release = parse_cvm_version(&c.cvm_version).map_err(|e| format!("{at}: {e}"))?;
     check_cvm_image(measured.executor.kind(), &release).map_err(|e| format!("{at}: {e}"))?;
-    if measured.model_id != model_id {
+    if measured.model_id != measured.weights_sha256 {
         return Err(format!(
-            "{at}: EIDOLA_ENGINE_MODEL_ID is {:?}, but the deployment is for {model_id:?}",
-            measured.model_id
+            "{at}: EIDOLA_ENGINE_MODEL_ID is {:?}, but a pinned node is named by its weights \
+             hash, EIDOLA_ENGINE_WEIGHTS_SHA256 ({})",
+            measured.model_id, measured.weights_sha256
         ));
     }
     if measured.weights_storage != WeightsStorage::VerifiedReadonly {
@@ -224,7 +232,20 @@ pub fn check_deployment(
         .and_then(|p| p.mpk.as_deref())
         .and_then(artifact_data_bytes)
         .ok_or_else(|| format!("{at}: the weights pack has no artifact reference"))?;
+    // The CUDA executor drafts with the architecture's MTP layers, one per
+    // depth: no wider than the checkpoint ships.
+    let shape = side.architecture.shape();
+    if measured.sizing.draft_tokens > shape.mtp_layers {
+        return Err(format!(
+            "{at}: {} is {}, more than {}'s {} MTP layers",
+            env::DRAFT_TOKENS,
+            measured.sizing.draft_tokens,
+            side.architecture,
+            shape.mtp_layers
+        ));
+    }
     check_resources(
+        shape,
         &measured.sizing,
         &measured.cache,
         &measured.executor,
@@ -238,6 +259,7 @@ pub fn check_deployment(
     Ok(Deployment {
         cvm_version: c.cvm_version,
         measured,
+        architecture: side.architecture,
         weights_repo: side.repo,
         weights_revision: side.revision,
         expected_gpus: side.expected_gpus,
@@ -250,6 +272,7 @@ impl Deployment {
     pub fn model_identity(&self) -> ModelIdentity {
         ModelIdentity {
             weights_sha256: self.measured.weights_sha256.clone(),
+            architecture: self.architecture,
             weights_repo: self.weights_repo.clone(),
             weights_revision: self.weights_revision.clone(),
             prompt_cache: self.measured.cache,
@@ -257,39 +280,50 @@ impl Deployment {
     }
 }
 
-/// What every deployment of one model must agree on: the gateway publishes
-/// one model id per set of weights and one prompt-cache retention policy per
-/// model, so two deployments of a model that differ in either would make
-/// what a client is told depend on which deployment serves it.
+/// What every deployment of one model must agree on. A model is its weights
+/// hash, and the gateway publishes one provenance, one architecture and one
+/// prompt-cache retention policy per hash, so two deployments of a hash that
+/// differ in any of them would make what a client is told depend on which
+/// deployment serves it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelIdentity {
     /// The node's weights hash (lowercase hex).
     pub weights_sha256: String,
+    pub architecture: Architecture,
     /// Where the weight files came from: `<owner>/<name>` and a revision.
     pub weights_repo: String,
     pub weights_revision: String,
     pub prompt_cache: CacheConfig,
 }
 
-/// Check the deployments of `model_id`, each given as `(where, identity)`
-/// with `where` naming it in errors: the id is a safe path component, there
-/// is at least one deployment, and every deployment shares the first one's
-/// weights and prompt-cache policy. Returns that shared identity.
+/// Check the deployments of the model whose weights hash is `weights_sha256`,
+/// each given as `(where, identity)` with `where` naming it in errors: the
+/// hash is 64 lowercase hex digits, there is at least one deployment, every
+/// deployment serves exactly those weights, and every deployment shares the
+/// first one's provenance, architecture and prompt-cache policy. Returns that
+/// shared identity.
 ///
 /// The gateway's build runs this over the pinned file's models and
 /// `measure-enclave` over the deployments it is about to render, so the
 /// generator never emits a file the build refuses for disagreement.
 pub fn check_model_agreement<'a>(
-    model_id: &str,
+    weights_sha256: &str,
     deployments: impl IntoIterator<Item = (&'a str, &'a ModelIdentity)>,
 ) -> Result<ModelIdentity, String> {
-    if !is_safe_component(model_id) {
+    if !is_lower_hex(weights_sha256, 32) {
         return Err(format!(
-            "model {model_id:?}: a model id must match [a-z0-9][a-z0-9._-]*"
+            "model {weights_sha256:?}: a model is named by its weights hash, 64 lowercase hex \
+             digits"
         ));
     }
     let mut first: Option<&ModelIdentity> = None;
     for (at, identity) in deployments {
+        if identity.weights_sha256 != weights_sha256 {
+            return Err(format!(
+                "{at}: serves weights {}, not {weights_sha256}",
+                identity.weights_sha256
+            ));
+        }
         let Some(first) = first else {
             first = Some(identity);
             continue;
@@ -304,8 +338,12 @@ pub fn check_model_agreement<'a>(
             &first.weights_revision,
         ) {
             return Err(format!(
-                "{at}: weights differ from the model's other deployments; one model id names \
-                 one set of weights"
+                "{at}: weights provenance differs from the model's other deployments"
+            ));
+        }
+        if identity.architecture != first.architecture {
+            return Err(format!(
+                "{at}: architecture differs from the model's other deployments"
             ));
         }
         if identity.prompt_cache != first.prompt_cache {
@@ -317,7 +355,7 @@ pub fn check_model_agreement<'a>(
     }
     first
         .cloned()
-        .ok_or_else(|| format!("model {model_id:?}: must have at least one deployment"))
+        .ok_or_else(|| format!("model {weights_sha256}: must have at least one deployment"))
 }
 
 /// Largest config Tinfoil decodes (`tinfoil-config/decode.go`:
@@ -606,6 +644,7 @@ impl EngineConfig {
 /// A deployment's `deployment.json`: what a pin carries that the config does
 /// not determine.
 struct Sidecar {
+    architecture: Architecture,
     repo: String,
     revision: String,
     expected_gpus: Option<u64>,
@@ -621,6 +660,8 @@ struct Sidecar {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SidecarFile {
+    /// An [`Architecture`] name.
+    architecture: String,
     weights: SidecarWeights,
     #[serde(default, deserialize_with = "present")]
     expected_gpus: Option<u32>,
@@ -687,6 +728,18 @@ impl Sidecar {
     fn parse(bytes: &[u8], path: &str) -> Result<Self, String> {
         let file: SidecarFile =
             serde_json::from_slice(bytes).map_err(|e| format!("{path}: {e}"))?;
+        let architecture = Architecture::from_name(&file.architecture).ok_or_else(|| {
+            format!(
+                "{path}: architecture {:?} is not one the engine knows",
+                file.architecture
+            )
+        })?;
+        if !architecture.is_implemented() {
+            return Err(format!(
+                "{path}: architecture {architecture} is not implemented; nothing may be deployed \
+                 on it"
+            ));
+        }
         if !is_repo(&file.weights.repo) {
             return Err(format!(
                 "{path}: weights.repo must be <owner>/<name> of [A-Za-z0-9._-]"
@@ -729,6 +782,7 @@ impl Sidecar {
             })
             .transpose()?;
         Ok(Self {
+            architecture,
             repo: file.weights.repo,
             revision: file.weights.revision,
             expected_gpus: file.expected_gpus.map(u64::from),

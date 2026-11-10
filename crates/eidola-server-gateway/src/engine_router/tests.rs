@@ -1156,6 +1156,19 @@ fn catalog_model() -> Model {
     };
     Model {
         id: MODEL_A.into(),
+        sha256: MODEL_A.into(),
+        tags: vec![],
+        architecture: "MimoV26Flash".to_string(),
+        weights: crate::types::WeightsProvenance {
+            repo: "example/fixture".to_string(),
+            revision: "4".repeat(40),
+            files: vec![],
+        },
+        lifecycle: crate::types::ModelLifecycle {
+            status: crate::types::LifecycleStatus::Current,
+            retire_after: None,
+        },
+        deployments: vec![],
         name: "A".into(),
         description: String::new(),
         context_length: 8192,

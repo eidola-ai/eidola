@@ -1,17 +1,18 @@
 //! The Eidola-hosted inference engines this gateway build accepts.
 //!
-//! `releases/trust/engine-enclaves.json` is a build input: per model id, the
-//! engine deployments (`eidola-server-engine` in a confidential VM) a gateway
+//! `releases/trust/engine-enclaves.json` is a build input: per weights hash
+//! (a model's identity, `crate::models`), the engine deployments (`eidola-server-engine` in a confidential VM) a gateway
 //! built from this tree will talk to. `build.rs` checks it against the
 //! committed deployment configs it names (`manifest.rs`) and embeds it, so
 //! what this module exposes is a function of the gateway's own measured
 //! source:
 //!
 //! - [`PINNED_MODELS`] — each pinned model's weights (the engine's weights
-//!   hash and their `repo@revision` provenance) and prompt-cache retention, as
-//!   the deployments' measured configs set them. The catalog
-//!   (`backend::MODEL_CATALOG`) is bound to this list at compile time: a row
-//!   without a pin, or a pin without a row, does not build.
+//!   hash, their architecture and their `repo@revision` provenance) and
+//!   prompt-cache retention, as the deployments' measured configs and
+//!   sidecars set them. The catalog (`models::MODEL_CATALOG`) is bound to
+//!   this list by `build.rs`: a served row without a pin, or a pin without a
+//!   served row, does not build.
 //! - [`allowed_measurements`] / [`accepted_deployments`] — the attestation
 //!   pins for one model's deployments, in `tinfoil-verifier`'s shape, and the
 //!   config hash each deployment is named by.
@@ -29,6 +30,7 @@
 //! else: placement data (which node serves which model) can choose a node,
 //! never what it must be serving.
 
+use eidola_common::architecture::Architecture;
 use tinfoil_verifier::measurement::AllowedMeasurement;
 
 pub(crate) mod file;
@@ -42,6 +44,7 @@ include!(concat!(env!("OUT_DIR"), "/engine_enclaves.gen.rs"));
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PinnedModel {
     id: &'static str,
+    architecture: Architecture,
     weights: PinnedWeights,
     prompt_cache: PromptCachePolicy,
     deployments: &'static [&'static str],
@@ -70,9 +73,16 @@ pub struct PromptCachePolicy {
 }
 
 impl PinnedModel {
-    /// The model id, as the catalog and the node both name it.
+    /// The model's identity: its weights hash (lowercase hex), which the
+    /// catalog keys its row by and the node is named by
+    /// (`EIDOLA_ENGINE_MODEL_ID`).
     pub const fn id(&self) -> &'static str {
         self.id
+    }
+
+    /// The architecture of the weights.
+    pub const fn architecture(&self) -> Architecture {
+        self.architecture
     }
 
     /// The weights every deployment of this model serves.
@@ -100,6 +110,7 @@ impl PinnedModel {
     ) -> Self {
         Self {
             id,
+            architecture: Architecture::MimoV26Flash,
             weights,
             prompt_cache,
             deployments: &[],
@@ -107,7 +118,8 @@ impl PinnedModel {
     }
 }
 
-/// The compiled-in pin for `model_id`, if this build pins it.
+/// The compiled-in pin for the weights hash `model_id`, if this build pins
+/// it.
 pub fn pinned_model(model_id: &str) -> Option<&'static PinnedModel> {
     PINNED_MODELS.iter().find(|m| m.id == model_id)
 }

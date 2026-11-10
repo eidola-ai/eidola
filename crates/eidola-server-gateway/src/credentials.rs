@@ -3172,7 +3172,7 @@ mod tests {
         let cache: KeyCache = Arc::new(RwLock::new(HashMap::new()));
         let key_hash = ensure_keys(&cache, &master_key, &pool).await.unwrap();
         let state = AppState::new(
-            Catalog::new(None),
+            Catalog::new(None, None).unwrap(),
             None,
             pool.clone(),
             None,
@@ -3505,7 +3505,7 @@ mod tests {
 
         let cache: KeyCache = Arc::new(RwLock::new(keys));
         let state = AppState::new(
-            crate::backend::Catalog::new(None),
+            crate::backend::Catalog::new(None, None).unwrap(),
             None,
             pool,
             None,
@@ -3622,7 +3622,7 @@ mod tests {
         let (blocking, _) = spend(&keys[&hash], 100, 10);
         let (streaming, _) = spend(&keys[&hash], 100, 10);
         let state = AppState::new(
-            crate::backend::Catalog::new(None),
+            crate::backend::Catalog::new(None, None).unwrap(),
             None,
             pool,
             None,
@@ -3919,7 +3919,7 @@ mod tests {
         let key_hash = ensure_keys(&cache, &master_key, &pool).await.unwrap();
         let key_id = hex::encode(key_hash);
         let state = AppState::new(
-            Catalog::new(None),
+            Catalog::new(None, None).unwrap(),
             None,
             pool.clone(),
             None,

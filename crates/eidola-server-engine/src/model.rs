@@ -67,28 +67,23 @@ impl std::fmt::Display for ModelError {
 
 impl std::error::Error for ModelError {}
 
-/// The canonical manifest text for `file name → sha256 hex` (see the module docs).
+/// The canonical manifest text for `file name → sha256 hex` (see the module docs), in
+/// the spelling the gateway's build checks catalog rows with
+/// (`eidola_common::weights_manifest`).
 pub fn canonical_manifest(files: &BTreeMap<String, String>) -> Result<String, ModelError> {
-    let mut out = String::new();
-    for (name, digest) in files {
-        if !is_safe_name(name) {
-            return Err(ModelError(UNSAFE_NAME.into()));
-        }
-        out.push_str(&digest.to_ascii_lowercase());
-        out.push_str("  ");
-        out.push_str(name);
-        out.push('\n');
+    if !files.keys().all(|name| is_safe_name(name)) {
+        return Err(ModelError(UNSAFE_NAME.into()));
     }
-    Ok(out)
+    Ok(eidola_common::weights_manifest::manifest_text(
+        files
+            .iter()
+            .map(|(name, digest)| (name.as_str(), digest.as_str())),
+    ))
 }
 
 /// Whether `name` is a safe manifest name (module docs): `[A-Za-z0-9_][A-Za-z0-9._-]*`.
 pub fn is_safe_name(name: &str) -> bool {
-    let mut bytes = name.bytes();
-    bytes
-        .next()
-        .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
-        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    eidola_common::weights_manifest::is_safe_name(name)
 }
 
 const UNSAFE_NAME: &str = "a weights file name has characters other than ASCII letters, digits, \
@@ -456,6 +451,28 @@ mod tests {
         );
         m.insert("bad\nname".into(), "00".repeat(32));
         assert!(canonical_manifest(&m).is_err());
+    }
+
+    /// The files this node hashes are the files the gateway's build requires a catalog
+    /// row's manifest to list (`eidola_common::weights_manifest`): the semantic files and
+    /// chat artifacts, the shard index optional, every other covered file a shard.
+    #[test]
+    fn the_hashed_files_are_the_catalogs() {
+        use eidola_common::weights_manifest::{OPTIONAL_FILES, REQUIRED_FILES};
+        let mut node: Vec<&str> = SEMANTIC_FILES
+            .iter()
+            .chain(CHAT_FILES.iter())
+            .copied()
+            .collect();
+        node.sort_unstable();
+        let mut shared: Vec<&str> = REQUIRED_FILES
+            .iter()
+            .chain(OPTIONAL_FILES.iter())
+            .copied()
+            .collect();
+        shared.sort_unstable();
+        assert_eq!(node, shared);
+        assert_eq!(OPTIONAL_FILES, ["model.safetensors.index.json"]);
     }
 
     /// Only names the offline `sha256sum` procedure reproduces byte for byte.

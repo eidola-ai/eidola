@@ -124,6 +124,7 @@
 //! forward upstream). [`PromptCharge`] itself stays pure arithmetic — serde
 //! is for the walk, never for the accounting semantics.
 
+pub mod architecture;
 pub mod embed;
 pub mod engine_deployment;
 pub mod engine_protocol;
@@ -131,6 +132,7 @@ pub mod issuer_calendar;
 pub mod refund_key;
 #[cfg(feature = "spend-credentials")]
 pub mod spend_credentials;
+pub mod weights_manifest;
 
 use serde_json::Value;
 

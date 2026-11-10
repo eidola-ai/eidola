@@ -108,6 +108,14 @@ impl ValidatedRequest {
         &self.raw
     }
 
+    /// Name the model by the weights hash its reference resolved to
+    /// (`Catalog::resolve`): from here on the request, and the body the node
+    /// receives ([`engine_request_body`]), carry the hash and never the
+    /// client's tag.
+    pub fn resolve_model(&mut self, sha256: &str) {
+        self.parsed.model = sha256.to_owned();
+    }
+
     /// Ask for `ceiling` completion tokens when the request names no limit:
     /// the model's declared `max_output_tokens`, so what is priced and what
     /// the node is asked for are one number. A request that names a limit,
@@ -146,6 +154,10 @@ impl ValidatedRequest {
 ///   and `"stream_options":{"include_usage":true}` (usage is what the refund
 ///   is computed from); otherwise neither;
 /// - `cache_key`: re-encoded from the validated key, when there is one.
+///
+/// `model` is written from the typed request, in its place: the weights hash
+/// the gateway resolved the client's reference to
+/// ([`ValidatedRequest::resolve_model`]), which is the node's model id.
 ///
 /// And `max_completion_tokens` is written from the typed request — in its
 /// place when the client sent it, last when it did not — so a request the
@@ -189,6 +201,9 @@ pub fn engine_request_body(request: &ValidatedRequest) -> Zeroizing<Vec<u8>> {
             "cache_key" => value.scrub(),
             // The spends paid the gateway, not the node: never forwarded.
             "credentials" => value.scrub(),
+            "model" => member(&mut body, &key, &|out| {
+                serde_json::to_writer(&mut *out, &parsed.model).expect("a string serializes")
+            }),
             // The fields the strict type narrows (`f32` sampling values) are
             // written from the typed request, exactly as `serde_json`
             // serializes them, so the engine receives the value the gateway
@@ -459,6 +474,26 @@ mod tests {
 
     /// A request carrying a key reaches the node with it, in the shape the
     /// node decodes; one without reaches it without.
+    /// The node is asked for the hash the reference resolved to, never the
+    /// client's tag.
+    #[test]
+    fn the_body_names_the_resolved_hash() {
+        let hash = "3".repeat(64);
+        let mut request = ValidatedRequest::from_bytes(bytes::Bytes::from_static(
+            br#"{"model":"fixture-tag@sha256:9999","messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .unwrap();
+        request.resolve_model(&hash);
+        assert_eq!(request.request().model, hash);
+        let body = engine_request_body(&request);
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.starts_with(&format!(r#"{{"model":"{hash}","messages":"#)),
+            "{text}"
+        );
+        assert!(!text.contains("fixture-tag"), "{text}");
+    }
+
     #[test]
     fn the_body_carries_the_cache_key_only_when_the_client_sent_one() {
         let key = "_-0123456789abcdefghijklmnopqrstuvwxyzABCDE";
