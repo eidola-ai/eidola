@@ -36,10 +36,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let node = eidola_server_engine::boot(config)?;
     tracing::info!(weights_sha256 = %node.weights_hash, "weights verified; engine started");
 
+    // Only the router keeps the engine running from here on, so a shutdown that drops it
+    // lets the engine thread finish its work and stop (`run`).
+    let eidola_server_engine::Node {
+        router,
+        engine_stopped,
+        ..
+    } = node;
     eidola_server_engine::run(
         bind,
-        node.router,
-        node.engine_stopped,
+        router,
+        engine_stopped,
         eidola_server_engine::os_shutdown_signal(),
         |addr| tracing::info!(%addr, "listening"),
     )?;
