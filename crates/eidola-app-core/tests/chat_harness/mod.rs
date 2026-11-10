@@ -2420,12 +2420,7 @@ async fn handle_chat(
             write_sse_unterminated_stream(stream, &[STREAM_CONTENT]).await
         }
         ChatBehavior::StreamingCutShortWithRefund => {
-            let refund = auth
-                .and_then(Issuer::spend_proof_from_auth)
-                .and_then(|sp| issuer.refund_for(&sp))
-                .map(|refund_b64| {
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) })
-                });
+            let refund = full_refunds();
             write_sse_cut_short(stream, &[STREAM_CONTENT], refund).await
         }
         ChatBehavior::OkThenStreamEndsWithoutDone if hit == 1 => {
@@ -3347,7 +3342,7 @@ async fn write_sse_cut_short(
         "id": "",
     });
     if let Some(refund) = refund {
-        metadata["refunds"] = serde_json::json!([refund]);
+        metadata["refunds"] = refund;
     }
     stream.write_all(&send_event(metadata.to_string())).await?;
     stream.write_all(b"0\r\n\r\n").await?;
