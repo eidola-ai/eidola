@@ -1625,8 +1625,8 @@ impl SpaceView {
         let Some((verb, label, aria)) = action else {
             return line.into_any_element();
         };
-        let space_id = self.space_id(cx);
         let target = pid.to_string();
+        let notice = notice.clone();
         let button = crate::participants::ghost_button_labeled(
             SharedString::from(format!("space-inspector-p-{pid}-notice-{i}-{verb}")),
             SharedString::from(format!(
@@ -1638,21 +1638,7 @@ impl SpaceView {
             cx,
             cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
                 cx.stop_propagation();
-                let (space_id, target) = (space_id.clone(), target.clone());
-                this.stores.participants.update(cx, |store, cx| match verb {
-                    "switch" => store.switch_to_newer_weights(space_id, target, cx),
-                    _ => store.dismiss_model_update(space_id, target, cx),
-                });
-                // The notice, and this control with it, goes when the roster
-                // re-reads: hand the keyboard to its home now — the open
-                // draft or inline edit when there is one, else the view —
-                // unless a field of the panel holds it, so it is never left on
-                // an element that no longer exists, nor on a root that yields
-                // every key to a composing session.
-                if !this.inspector_field_focused(window, cx) {
-                    let home = this.keyboard_home(cx);
-                    window.focus(&home, cx);
-                }
+                this.inspector_act_on_model_notice(&target, &notice, window, cx);
             }),
         );
         h_flex()
@@ -1662,6 +1648,65 @@ impl SpaceView {
             .child(line)
             .child(button)
             .into_any_element()
+    }
+
+    /// Act on a model notice of `participant_id` — the Switch and Dismiss
+    /// buttons' one handler, `pub` so tests drive exactly what a click does.
+    ///
+    /// **An open editor over that participant follows a switch.** The editor
+    /// holds its own working model selection, and the roster re-read does not
+    /// retire it (only a vanished row or a changed `source` does), so a Save
+    /// of any other field would write the old pin back over the switch. When
+    /// its selection is still the participant's current model (the reader has
+    /// not picked another), it takes the newer pin the switch writes.
+    pub fn inspector_act_on_model_notice(
+        &mut self,
+        participant_id: &str,
+        notice: &eidola_app_core::model_catalog::ModelNotice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use eidola_app_core::model_catalog::ModelNotice;
+        let space_id = self.space_id(cx);
+        let target = participant_id.to_string();
+        match notice {
+            ModelNotice::NewerAvailable { tag, newer_sha256 } => {
+                let current = self
+                    .inspector_participants(cx)
+                    .into_iter()
+                    .find(|p| p.id == participant_id)
+                    .and_then(|p| p.model_ref);
+                let newer = eidola_app_core::qualified_model_id(
+                    &eidola_app_core::model_reference::pinned(Some(tag), newer_sha256),
+                    eidola_app_core::EIDOLA_BACKEND_ID,
+                );
+                if let Some(edit) = self.inspector_participant_edit.as_mut()
+                    && edit.participant_id == participant_id
+                    && edit.model_ref == current
+                {
+                    edit.model_ref = Some(newer);
+                }
+                self.stores.participants.update(cx, |store, cx| {
+                    store.switch_to_newer_weights(space_id, target, cx)
+                });
+            }
+            ModelNotice::Updated { .. } => {
+                self.stores.participants.update(cx, |store, cx| {
+                    store.dismiss_model_update(space_id, target, cx)
+                });
+            }
+            _ => return,
+        }
+        // The notice, and its control with it, goes when the roster re-reads:
+        // hand the keyboard to its home now — the open draft or inline edit
+        // when there is one, else the view — unless a field of the panel holds
+        // it, so it is never left on an element that no longer exists, nor on
+        // a root that yields every key to a composing session.
+        if !self.inspector_field_focused(window, cx) {
+            let home = self.keyboard_home(cx);
+            window.focus(&home, cx);
+        }
+        cx.notify();
     }
 
     /// The open disclosure's body — the fork (when referenced), name, model,

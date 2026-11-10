@@ -5008,6 +5008,46 @@ fn the_model_picker_offers_a_pin_and_shows_the_weights(cx: &mut TestAppContext) 
     probe::set_probes_enabled(false);
 }
 
+/// **An open editor follows a switch to newer weights.** The editor holds
+/// its own working model; left on the old pin, a Save of any other field
+/// would write it back over the switch. Pressing Switch while the
+/// participant's editor is open moves the editor's selection to the newer
+/// pin too.
+#[gpui::test]
+fn an_open_editor_follows_a_switch_to_newer_weights(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    let _guard = probes_on();
+    let (space, mut roster) = probe_participants();
+    let notice = ModelNotice::NewerAvailable {
+        tag: "gemma4-31b".into(),
+        newer_sha256: PICKER_HASH.into(),
+    };
+    roster[1].model_notices = vec![notice.clone()];
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some((space, roster));
+        s.space_settings = Some(("demo".into(), eidola_app_core::SpaceSettings::default()));
+    });
+    let (window, view) = open_participants_inspector_with(cx, stores);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant("agent-1", window, cx);
+            v.inspector_act_on_model_notice("agent-1", &notice, window, cx);
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/inspector/participants/editor/model",
+        gpui::Role::Button,
+        "Model",
+        "gemma4-31b, pinned to 222222222222… · Eidola",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn model_picker_options_name_their_backend(cx: &mut TestAppContext) {
     let _guard = probes_on();
