@@ -6527,7 +6527,8 @@ pub async fn action_model_sha256(
 }
 
 /// The weights hash the last answer of `participant_id` in `space_id` under
-/// model selection `model` (canonical) came from, if any did: what a
+/// model selection `model` (canonical) came from, if any did — a failed
+/// generation (`status = 'error'`) is no answer, whatever it recorded: what a
 /// followed tag last resolved to, which the "model updated" notice compares
 /// with what it resolves to now.
 pub async fn last_model_sha256(
@@ -6540,7 +6541,7 @@ pub async fn last_model_sha256(
         .prepare(
             "SELECT model_sha256 FROM action \
              WHERE space_id = ?1 AND participant_id = ?2 AND model = ?3 \
-               AND model_sha256 IS NOT NULL \
+               AND model_sha256 IS NOT NULL AND status <> 'error' \
              ORDER BY created_at DESC, id DESC LIMIT 1",
         )
         .await
