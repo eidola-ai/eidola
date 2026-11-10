@@ -78,6 +78,8 @@ jobs:
             pkg:githubactions/Swatinem/rust-cache,
             pkg:githubactions/tinfoilsh/measure-image-action,
             pkg:cargo/eidola-server-gateway,
+            pkg:cargo/eidola-billing,
+            pkg:cargo/eidola-billing-cli,
             pkg:cargo/eidola-app-core,
             pkg:cargo/eidola-cli,
             pkg:cargo/eidola-gui,

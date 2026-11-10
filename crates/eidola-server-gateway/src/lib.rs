@@ -53,6 +53,7 @@ pub struct AppStateInner {
     pub db_pool: deadpool_postgres::Pool,
     pub stripe: Option<stripe::StripeClient>,
     pub stripe_webhook_secret: Option<String>,
+    pub billing_wakeup: Arc<tokio::sync::Notify>,
     pub credential_master_key: [u8; 32],
     pub credential_key_cache: credentials::KeyCache,
     /// The spends this process is serving right now (`credentials::LiveSpends`).
@@ -77,6 +78,7 @@ impl AppState {
                 db_pool,
                 stripe,
                 stripe_webhook_secret,
+                billing_wakeup: Arc::default(),
                 credential_master_key,
                 credential_key_cache,
                 live_spends: Arc::default(),
@@ -107,6 +109,7 @@ pub fn build_router() -> OpenApiRouter<AppState> {
         .routes(routes!(account::get_subscription))
         .routes(routes!(account::create_portal_session))
         .routes(routes!(account::create_checkout))
+        .routes(routes!(account::reconcile_billing))
         .routes(routes!(account::get_balances))
         .routes(routes!(account::get_ledger))
         .routes(routes!(credentials::list_keys))

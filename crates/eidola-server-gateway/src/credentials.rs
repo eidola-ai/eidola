@@ -1568,7 +1568,7 @@ pub async fn list_keys(
         (status = 400, description = "Invalid request", body = crate::types::ErrorResponse),
         (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
         (status = 402, description = "Insufficient credit balance", body = crate::types::ErrorResponse),
-        (status = 409, description = "The idempotency key was used for a different request, or the named issuer key has stopped issuing; nothing was or will be debited under the idempotency key", body = crate::types::ErrorResponse),
+        (status = 409, description = "The idempotency key was used for a different request, the named issuer key has stopped issuing, or the account is closing or closed; no new debit can occur under this key", body = crate::types::ErrorResponse),
         (status = 428, description = "Terms acceptance required", body = crate::types::ErrorResponse),
         (status = 503, description = "Credential issuance not configured, or the named issuer key is not yet this gateway's current issuing key; try again", body = crate::types::ErrorResponse),
     )
@@ -1707,6 +1707,11 @@ pub async fn issue_credentials(
         db::IssuanceRecord::Issued { ledger_entry_id } => ledger_entry_id,
         db::IssuanceRecord::Stored(stored) => return answer_stored(stored, &digest),
         db::IssuanceRecord::Retired => return Err(key_retired()),
+        db::IssuanceRecord::Closed => {
+            return Err(ServerError::Conflict {
+                message: "account is closing or closed".into(),
+            });
+        }
         db::IssuanceRecord::Insufficient => {
             let available = match db::get_available_balance(&state.db_pool, account_id).await {
                 Ok(v) => v,

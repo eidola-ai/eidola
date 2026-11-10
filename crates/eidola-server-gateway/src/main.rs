@@ -468,6 +468,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::time::Duration::from_secs(60),
     );
 
+    eidola_server_gateway::webhook::spawn_billing_worker(state.clone());
+
     // Build the router with OpenAPI integration
     let (router, api) = eidola_server_gateway::build_router()
         .with_state(state)

@@ -291,7 +291,7 @@
             }
           },
           "409": {
-            "description": "The idempotency key was used for a different request, or the named issuer key has stopped issuing; nothing was or will be debited under the idempotency key",
+            "description": "The idempotency key was used for a different request, the named issuer key has stopped issuing, or the account is closing or closed; no new debit can occur under this key",
             "content": {
               "application/json": {
                 "schema": {
@@ -405,6 +405,62 @@
           },
           "503": {
             "description": "Stripe not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      }
+    },
+    "/v1/account/reconcile": {
+      "post": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "Reconcile this account's billing against current Stripe state. No supplied\naccount, provider object, amount or credit effect can expand its authority.\nThis remains available while reviewing terms and after account closure.",
+        "operationId": "reconcile_billing",
+        "responses": {
+          "200": {
+            "description": "Current billing reconciled; inspect review for unresolved items",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReconcileResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Billing requires review",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Billing unavailable",
             "content": {
               "application/json": {
                 "schema": {
@@ -802,14 +858,24 @@
         "tags": [
           "Linked"
         ],
-        "summary": "POST /v1/webhooks/stripe",
+        "summary": "An acknowledgment means the event is durable, not that Stripe has already\nbeen fetched. A gateway crash after this response cannot lose the work.",
         "operationId": "stripe_webhook",
         "responses": {
           "200": {
-            "description": "Event received"
+            "description": "Event durably received or type ignored"
           },
           "400": {
-            "description": "Signature verification failed",
+            "description": "Invalid signature or event",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Event was not persisted; retry delivery",
             "content": {
               "application/json": {
                 "schema": {
@@ -989,7 +1055,8 @@
         "description": "Credit balance breakdown. All amounts are credits, denominated in\nmicro-USD (1 credit = $0.000001).",
         "required": [
           "available",
-          "pools"
+          "pools",
+          "debts"
         ],
         "properties": {
           "available": {
@@ -997,12 +1064,34 @@
             "format": "int64",
             "description": "Total spendable credits (expired pools excluded)."
           },
+          "debts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CashDebt"
+            },
+            "description": "Unrecovered chargeback value, valued in the original payment currency."
+          },
           "pools": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/BalancePool"
             },
             "description": "Per-pool breakdown, earliest expiry first."
+          }
+        }
+      },
+      "BillingReview": {
+        "type": "object",
+        "required": [
+          "object_id",
+          "reason"
+        ],
+        "properties": {
+          "object_id": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
           }
         }
       },
@@ -1016,6 +1105,22 @@
           "supported": {
             "type": "boolean",
             "description": "Whether the model supports it."
+          }
+        }
+      },
+      "CashDebt": {
+        "type": "object",
+        "required": [
+          "currency",
+          "amount_minor"
+        ],
+        "properties": {
+          "amount_minor": {
+            "type": "string",
+            "description": "Decimal minor currency units. Fractional units preserve exact purchase\nvaluation internally; this is not a demand for another payment."
+          },
+          "currency": {
+            "type": "string"
           }
         }
       },
@@ -1661,9 +1766,14 @@
         "type": "object",
         "required": [
           "id",
-          "created_at"
+          "created_at",
+          "billing_state"
         ],
         "properties": {
+          "billing_state": {
+            "type": "string",
+            "description": "`open`, `closing`, or `closed`. Closing accounts remain readable."
+          },
           "created_at": {
             "type": "string"
           },
@@ -2347,6 +2457,36 @@
           "status": {
             "$ref": "#/components/schemas/AttestationStatus",
             "description": "Current attestation status."
+          }
+        }
+      },
+      "ReconcileResponse": {
+        "type": "object",
+        "required": [
+          "purchases",
+          "refunds",
+          "disputes",
+          "review"
+        ],
+        "properties": {
+          "disputes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "purchases": {
+            "type": "integer",
+            "description": "Counts of current provider objects examined, not newly granted credits.",
+            "minimum": 0
+          },
+          "refunds": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "review": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BillingReview"
+            }
           }
         }
       },

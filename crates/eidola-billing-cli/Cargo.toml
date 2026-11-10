@@ -1,0 +1,20 @@
+[package]
+name = "eidola-billing-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+license = "AGPL-3.0-only"
+
+[[bin]]
+name = "eidola-billing"
+path = "src/main.rs"
+
+[dependencies]
+eidola-billing = { path = "../eidola-billing" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+serde_json = "1"
+rustls-rustcrypto = "0.0.2-alpha"

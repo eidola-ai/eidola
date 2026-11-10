@@ -407,7 +407,7 @@ pub mod metrics {
         "db.get_issuer_key",
         "db.get_refund_token",
         "db.get_valid_issuer_keys",
-        "db.insert_credit_ledger",
+        "account.reconcile",
         "db.record_nullifier",
         "db.replace_refund_token",
         "db.store_refund_token",

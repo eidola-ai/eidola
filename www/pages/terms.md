@@ -34,7 +34,7 @@ An account consists of an identifier and a secret. The secret is shown to you ex
 
 - Possession of the secret is the only authentication. Anything done with your secret is attributed to your account. Keep it safe.
 - We cannot recover or reset a lost secret. If you lose it, you lose access to the account.
-- If you lose your secret but can demonstrate to us that you made a purchase (for example, with your payment receipt), we can locate the associated account through our payment processor, void its remaining unexpired, unconverted balance, and refund it as described in the refunds section. We cannot restore access to the account itself.
+- If you lose your secret but can demonstrate to us that you made a purchase (for example, with your payment receipt), we can locate the associated account through our payment processor and arrange cancellation and a refund as described below. This does not restore access to the account itself.
 
 You are responsible for activity under your account. Don't share the secret; there is no mechanism for shared or delegated access today.
 
@@ -51,29 +51,35 @@ Credits expire:
 
 Expiration is disclosed at the point of purchase, on your receipt, and alongside your balance. Plans whose credits expire sooner cost less per unit of capacity, the same trade found in committed-use and prepaid plans across the computing industry. When credits expire they are removed from your balance.
 
-You may cancel a subscription at any time; already-granted credits remain usable until their period ends, and no further periods are charged.
+You may cancel a subscription at any time through the billing portal or by contacting us. Already-granted credits remain usable until their period ends, and no further periods are charged. Cancellation stops renewal; to request a refund of remaining credits, follow the refunds section below.
 
 Per-model prices may change over time. Current prices are always available in the app and through the API before you spend anything.
 
 ## 5. Refunds
 
-> **In short:** Unused, unexpired credits are refundable on request. Expired credits are generally forfeited. Credits converted to anonymous tokens are beyond anyone's ability to refund — including ours.
+> **In short:** Unused, unexpired account credits are refundable on request at the price you paid for them. Expired credits are generally forfeited. Credits converted to anonymous tokens are not eligible for cash refunds under this policy. A chargeback can make your account balance negative.
 
-To request a refund, email **<hello@eidola.ai>**. We will void the unexpired, unconverted credit balance of your account and return the corresponding amount to your original payment method through our payment processor, where it supports the refund. Refund requests are handled by a person, not an automated flow, so allow a few business days.
+To request a refund, email **<hello@eidola.ai>**. We will cancel your eligible account credits and refund the corresponding amount. Eligibility is based on the unexpired, unconverted balance when we receive your request, excluding any credits you convert afterward. Time spent processing your request does not make eligible credits expire. We may hold those credits while processing the refund so they cannot also be converted.
 
-Expired credits are forfeited and we have no obligation to refund them, though we may make exceptions at our discretion; an exception is not a waiver of this section.
+The refund is the proportional amount you actually paid for those credits, after discounts, plus any refundable tax. Each purchase is valued at its own price, even if prices have since changed. Credits granted for free have no cash refund value. We round the cash refund to the nearest cent, or the nearest equivalent unit of the original payment currency; rounding does not require you to give up additional credits. We do not return the same payment twice, including amounts already returned through a payment dispute.
 
-Credits that have been converted to anonymous tokens cannot be refunded, restored, or even audited: the conversion severs, cryptographically, the link between the tokens and your account. We cannot verify any claim about what happened to converted tokens — that inability is the product's core privacy guarantee, and it binds us as much as it protects you.
+Refunds go to the original payment method through our payment processor, where it supports the refund. Allow a few business days for us to review your request; the payment processor and your bank may take additional time to return the money. If a refund fails or the original method cannot receive it, we will work with you to complete the refund another way or restore the affected credits. A failed refund does not count as money returned to you or end your refund eligibility.
 
-If you believe a charge is erroneous, contact us before disputing it with your card issuer — we can resolve genuine errors faster than a dispute can. Fraudulent chargebacks are reversed against the account's balance and may result in account closure.
+Credits that expired before your request are generally forfeited. Credits already converted to anonymous tokens are excluded from this refund policy: we can record that a conversion occurred, but the token protocol does not let us trace the resulting tokens back to the account or audit their later use through your account. This policy does not prevent you from bringing a claim if we fail to provide the service you paid for, or restrict rights that cannot be waived by contract.
+
+We may make exceptions or offer goodwill refunds in individual cases. An exception does not change this policy for other cases.
+
+If you believe a charge is erroneous, please contact us so we can investigate. A payment dispute does not by itself establish fraud or close your account. If a payment is reversed through a chargeback, we may deduct the full reversed amount from your account balance, valuing credits at what you paid for them. This can affect credits from other purchases and make your balance negative, even if the original credits were already converted or expired. We take prior refunds and reversals into account so the same amount is not deducted twice.
+
+These deductions reduce the balance available for conversion or a refund, including on account closure. Any positive balance remaining is still available under these terms, unless the account is suspended or closed as described below. If a payment reversal is undone, we will undo the corresponding deduction; restored credits retain their original expiration dates.
 
 ## 6. Anonymous tokens — the privacy boundary
 
-> **In short:** Converting credits to anonymous tokens is irreversible. The tokens expire within about two weeks, and we can never link them back to you — that is the entire point.
+> **In short:** Converting credits to anonymous tokens is irreversible. The token protocol separates your account from your use of the service. Tokens expire within about two weeks, and unused value in them is lost when they expire.
 
-The service lets you convert account credits into anonymous credit tokens (ACTs). Conversion is final. From the moment of issuance, the tokens are unlinkable to your account by us or anyone else, by cryptographic construction rather than by policy.
+The service lets you convert account credits into anonymous credit tokens (ACTs). Conversion is final. The tokens' cryptographic proofs do not reveal which account funded them. This separation is built into the protocol; the [privacy policy](/privacy/) explains the information the service and its providers handle.
 
-Tokens expire on a short schedule set by cryptographic key rotation — currently no more than about two weeks from issuance. Expired tokens are unrecoverable and unspent value in them is forfeited; because tokens are unlinkable, no exception is possible even in principle. The app provisions tokens automatically in small amounts as you use the service, precisely so that little value sits at risk of lapsing; convert manually only what you expect to use.
+Tokens expire on a short schedule set by cryptographic key rotation — currently no more than about two weeks from issuance. Their expiration is separate from the expiration of the account credits used to obtain them. The app provisions tokens automatically in small amounts as you use the service, so that little value sits at risk of lapsing; convert manually only what you expect to use.
 
 ## 7. Acceptable use
 
@@ -103,9 +109,11 @@ You are responsible for evaluating outputs before acting on them and for the con
 
 The service is provided as available. We do not guarantee uninterrupted operation, and the model catalog, features, and per-model prices may change.
 
-We may suspend or terminate an account for material violation of these terms, for fraudulent payment activity, or where the law requires. If we terminate your account for any other reason, or discontinue the service, we will refund the account's unexpired, unconverted balance.
+We may suspend or terminate an account for material violation of these terms, for fraudulent payment activity, or where the law requires. If we terminate your account for any other reason, or discontinue the service, we will refund the account's unexpired, unconverted balance under the refunds section. For these refunds, our notice of closure or discontinuation counts as the refund request. Termination for cause does not by itself forfeit any refund rights you otherwise have under these terms.
 
-You may close your account at any time; closing it refunds your unexpired, unconverted balance as described in the refunds section.
+You may close your account at any time by contacting us. Closing it stops future subscription renewals, purchases, and conversions, and refunds your unexpired, unconverted balance as described in the refunds section. Removing account credentials from your device does not close the account or cancel a subscription.
+
+Account closure does not revoke already-issued anonymous tokens. For a planned service shutdown, we will stop issuing tokens first and allow outstanding tokens to run through their remaining lifetime, subject to the same availability limits as the rest of the service.
 
 ## 10. Disclaimers
 
@@ -115,9 +123,11 @@ To the maximum extent permitted by law, the service and software are provided "a
 
 ## 11. Limit of liability
 
-> **In short:** Our total liability is capped at what you paid us in the twelve months before your claim, minus what you converted to anonymous tokens.
+> **In short:** Our total liability is capped at what you paid us in the twelve months before the problem arose. This does not reduce refunds we owe under these terms or override the exceptions below.
 
-To the maximum extent permitted by law, Eidola's aggregate liability arising out of or relating to the service is limited to the amounts you paid us in the twelve months preceding the event giving rise to the claim, less amounts converted to anonymous tokens during that period; and we are not liable for indirect, incidental, consequential, or punitive damages, or for lost profits or data.
+To the maximum extent permitted by law, Eidola's aggregate liability arising out of or relating to the service is limited to the amounts you paid us in the twelve months preceding the event giving rise to the claim. Converting credits to anonymous tokens does not reduce this cap. This cap does not reduce refunds expressly owed under these terms.
+
+We are not liable for indirect, incidental, consequential, or punitive damages, or for lost profits or data, to the maximum extent permitted by law.
 
 Nothing in these terms limits liability for gross negligence, willful misconduct, or fraud, or restricts rights you hold under law that cannot be waived by contract.
 
@@ -127,15 +137,19 @@ Nothing in these terms limits liability for gross negligence, willful misconduct
 
 Before filing any claim, you agree to email us a description of the dispute and give us sixty days to resolve it in good faith; we commit to the same before filing any claim against you.
 
+This process does not require either party to miss a legal filing or payment-dispute deadline.
+
 Either party may bring a qualifying claim in small claims court in the county where you live. All other disputes are resolved in the state or federal courts located in Delaware, and these terms are governed by Delaware law, excluding its conflict-of-laws rules, except where the law of your state of residence grants you consumer protections that cannot be varied by contract.
 
 These terms do not require arbitration or waive your right to participate in a class action.
 
 ## 13. Changes to these terms
 
-> **In short:** If these terms change materially, the app asks you to accept the new version before your next paid action. We don't pretend that silence is consent.
+> **In short:** Material changes require your acceptance before new purchases or conversions. Existing subscriptions continue to renew under the terms you accepted while you review a change, unless you cancel. We don't pretend that silence is consent.
 
-Each version of these terms carries a version number and is identified by the cryptographic hash of its exact text — both are shown at the top of this page when viewed on our website — and your acceptance of a specific version is recorded against your account. If we change these terms materially, you will be asked to review and accept the new version before making further purchases or conversions; declining means we refund your unexpired, unconverted balance and part ways. Already-issued anonymous tokens are honored under the terms in effect when they were issued, until they expire.
+Each version of these terms carries a version number and is identified by the cryptographic hash of its exact text — both are shown at the top of this page when viewed on our website — and your acceptance of a specific version is recorded against your account. If we change these terms materially, you will be asked to review and accept the new version before making new purchases or converting more account credits.
+
+Until you accept a change, the terms you last accepted continue to govern your existing subscription and account balance. Taking time to review a change does not cancel your subscription or close your account: existing subscriptions continue to renew unless you cancel, and credits keep their usual expiration dates. You do not have to accept new terms to manage existing billing, cancel a subscription, close your account, or request a refund. Already-issued anonymous tokens are honored under the terms in effect when they were issued, until they expire.
 
 Notice of changes is posted here, and this document's full history is public in the repository.
 

@@ -279,6 +279,29 @@ jobs:
         if: steps.scope.outputs.rust == 'true'
         run: cargo test
 
+      - name: Test billing transactions and recovery with PostgreSQL
+        if: steps.scope.outputs.rust == 'true'
+        env:
+          BILLING_TEST_DATABASE_URL: postgres://billing_test@127.0.0.1:55442/billing_test?sslmode=disable
+          DATABASE_URL: postgres://billing_test@127.0.0.1:55442/billing_test?sslmode=disable
+        run: |
+          set -euo pipefail
+          trap 'docker rm -f eidola-billing-tests >/dev/null 2>&1 || true' EXIT
+          docker run --detach --name eidola-billing-tests \
+            --publish 127.0.0.1:55442:5432 \
+            --env POSTGRES_USER=billing_test --env POSTGRES_DB=billing_test \
+            --env POSTGRES_HOST_AUTH_METHOD=trust \
+            postgres:17@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f
+          for attempt in $(seq 1 60); do
+            if docker exec eidola-billing-tests pg_isready -h 127.0.0.1 -U billing_test; then break; fi
+            if [ "$attempt" -eq 60 ]; then docker logs eidola-billing-tests; exit 1; fi
+            sleep 1
+          done
+          docker exec -i eidola-billing-tests psql -U billing_test -d billing_test -v ON_ERROR_STOP=1 \
+            < crates/eidola-server-gateway/schema/schema.sql
+          cargo test -p eidola-billing -- --ignored --test-threads=1
+          cargo test -p eidola-server-gateway -- --ignored --test-threads=1
+
       - name: Check OCI stub-source resolution
         # The image builds resolve the workspace from manifests plus stub
         # sources before copying real code; a target whose path cargo infers

@@ -2919,6 +2919,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "eidola-billing"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "deadpool-postgres",
+ "reqwest",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-rustcrypto",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+ "tracing",
+ "uuid",
+ "webpki-roots",
+]
+
+[[package]]
+name = "eidola-billing-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "eidola-billing",
+ "rustls-rustcrypto",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "eidola-cli"
 version = "0.1.0"
 dependencies = [
@@ -3118,6 +3150,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "deadpool-postgres",
+ "eidola-billing",
  "eidola-common",
  "futures-util",
  "hex",
@@ -3132,7 +3165,6 @@ dependencies = [
  "regex",
  "reqwest",
  "rustls",
- "rustls-pki-types",
  "rustls-rustcrypto",
  "serde",
  "serde_json",
@@ -3142,7 +3174,6 @@ dependencies = [
  "tinfoil-verifier",
  "tokio",
  "tokio-postgres",
- "tokio-postgres-rustls",
  "tower 0.5.3",
  "tracing",
  "tracing-opentelemetry",
@@ -8377,6 +8408,8 @@ dependencies = [
  "bytes",
  "fallible-iterator 0.2.0",
  "postgres-protocol",
+ "serde_core",
+ "serde_json",
  "uuid",
 ]
 

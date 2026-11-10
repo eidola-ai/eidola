@@ -2,12 +2,7 @@
 
 use std::time::SystemTime;
 
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
-use rustls_pki_types::CertificateDer;
-use rustls_pki_types::pem::PemObject;
-use tokio_postgres::NoTls;
-use tokio_postgres::config::SslMode;
-use tokio_postgres_rustls::MakeRustlsConnect;
+use deadpool_postgres::Pool;
 use uuid::Uuid;
 
 use crate::credentials::SealedRefundToken;
@@ -18,75 +13,11 @@ pub struct AccountRow {
     pub id: Uuid,
     pub secret_hash: String,
     pub stripe_customer_id: Option<String>,
+    pub billing_state: String,
     pub created_at: SystemTime,
 }
 
-/// Create a connection pool from a PostgreSQL connection string.
-pub fn create_pool(
-    database_url: &str,
-    database_password: Option<&str>,
-    database_ssl_cert: Option<&str>,
-) -> Result<Pool, String> {
-    let normalized_url = database_url.replace("sslmode=verify-full", "sslmode=require");
-    let normalized_url = normalized_url.replace("sslmode=verify-ca", "sslmode=require");
-
-    let mut pg_config: tokio_postgres::Config = normalized_url
-        .parse()
-        .map_err(|e| format!("invalid DATABASE_URL: {}", e))?;
-
-    if let Some(database_password) = database_password.filter(|value| !value.is_empty()) {
-        pg_config.password(database_password);
-    }
-
-    // `Verified` issues a cheap liveness check before handing a connection
-    // out of the pool. This costs one extra round-trip per checkout but is
-    // required when the upstream is a serverless Postgres (e.g. Neon) whose
-    // compute can autosuspend and silently kill long-lived sockets.
-    let manager_config = ManagerConfig {
-        recycling_method: RecyclingMethod::Verified,
-    };
-    let manager = match pg_config.get_ssl_mode() {
-        SslMode::Disable => Manager::from_config(pg_config, NoTls, manager_config),
-        _ => {
-            let tls = MakeRustlsConnect::new(build_tls_config(database_ssl_cert)?);
-            Manager::from_config(pg_config, tls, manager_config)
-        }
-    };
-
-    Pool::builder(manager)
-        .max_size(8)
-        .build()
-        .map_err(|e| format!("failed to build connection pool: {}", e))
-}
-
-fn build_tls_config(database_ssl_cert: Option<&str>) -> Result<rustls::ClientConfig, String> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    if let Some(database_ssl_cert) = database_ssl_cert.filter(|value| !value.is_empty()) {
-        let certificates = CertificateDer::pem_slice_iter(database_ssl_cert.as_bytes())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("invalid DATABASE_SSL_CERT PEM: {e:?}"))?;
-
-        if certificates.is_empty() {
-            return Err("DATABASE_SSL_CERT did not contain any PEM certificates".to_string());
-        }
-
-        let (added, ignored) = root_store.add_parsable_certificates(certificates);
-        if added == 0 {
-            return Err(
-                "DATABASE_SSL_CERT did not contain any usable root certificates".to_string(),
-            );
-        }
-        if ignored > 0 {
-            tracing::warn!("Ignored {ignored} invalid certificate(s) in DATABASE_SSL_CERT");
-        }
-    }
-
-    Ok(rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth())
-}
+pub use eidola_billing::connection::create_pool;
 
 /// Maximum tolerated clock skew between this server and the database.
 /// Anything beyond this is treated as a misconfigured time source and
@@ -236,7 +167,7 @@ pub async fn get_account_by_id(pool: &Pool, id: Uuid) -> Result<AccountRow, Serv
 
     let row = client
         .query_opt(
-            "SELECT id, secret_hash, stripe_customer_id, created_at \
+            "SELECT id, secret_hash, stripe_customer_id, billing_state, created_at \
              FROM account WHERE id = $1",
             &[&id],
         )
@@ -250,6 +181,7 @@ pub async fn get_account_by_id(pool: &Pool, id: Uuid) -> Result<AccountRow, Serv
             id: row.get("id"),
             secret_hash: row.get("secret_hash"),
             stripe_customer_id: row.get("stripe_customer_id"),
+            billing_state: row.get("billing_state"),
             created_at: row.get("created_at"),
         }),
         None => Err(ServerError::NotFound {
@@ -313,7 +245,7 @@ pub async fn get_account_by_stripe_customer(
 
     let row = client
         .query_opt(
-            "SELECT id, secret_hash, stripe_customer_id, created_at \
+            "SELECT id, secret_hash, stripe_customer_id, billing_state, created_at \
              FROM account WHERE stripe_customer_id = $1",
             &[&customer_id],
         )
@@ -329,54 +261,47 @@ pub async fn get_account_by_stripe_customer(
         id: row.get("id"),
         secret_hash: row.get("secret_hash"),
         stripe_customer_id: row.get("stripe_customer_id"),
+        billing_state: row.get("billing_state"),
         created_at: row.get("created_at"),
     }))
 }
 
-/// Insert a credit ledger entry. Returns true if inserted, false if duplicate
-/// (based on `stripe_event_id` uniqueness).
-///
-/// `stripe_payment_intent` links payment-originated credits to their Stripe
-/// PaymentIntent so a later refund can be matched back to the same pool.
-#[tracing::instrument(skip_all, name = "db.insert_credit_ledger", err)]
-pub async fn insert_credit_ledger(
+/// Test funding uses the same purchase operation as production; it grants a
+/// free lot so an issuance fixture needs no real payment-provider object.
+#[cfg(test)]
+pub(crate) async fn insert_credit_ledger(
     pool: &Pool,
     account_id: Uuid,
-    delta: i64,
-    reason: &str,
-    stripe_event_id: &str,
-    stripe_payment_intent: Option<&str>,
+    credits: i64,
+    _reason: &str,
+    source_id: &str,
+    _payment_intent: Option<&str>,
     expires_at: Option<SystemTime>,
 ) -> Result<bool, ServerError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
-
-    let result = client
-        .execute(
-            "INSERT INTO credit_ledger \
-                 (account_id, delta, reason, stripe_event_id, stripe_payment_intent, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (stripe_event_id) DO NOTHING",
-            &[
-                &account_id,
-                &delta,
-                &reason,
-                &stripe_event_id,
-                &stripe_payment_intent,
-                &expires_at,
-            ],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "insert credit_ledger failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
-
-    Ok(result == 1)
+    use std::time::{Duration, UNIX_EPOCH};
+    let purchased_at = UNIX_EPOCH
+        + Duration::from_secs(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
+    let purchase = eidola_billing::store::Purchase {
+        id: source_id.into(),
+        account_id,
+        charge_id: None,
+        payment_intent: None,
+        invoice_id: None,
+        currency: "usd".into(),
+        paid_minor: 0,
+        credits,
+        purchased_at,
+        expires_at: expires_at.unwrap_or(purchased_at + Duration::from_secs(365 * 86400)),
+        kind: "purchase".into(),
+    };
+    Ok(eidola_billing::store::Store::new(pool.clone())
+        .record_purchase(&purchase)
+        .await?)
 }
 
 // --- Account acceptance / required document queries ---
@@ -757,6 +682,9 @@ pub enum IssuanceRecord {
     /// The named key's issue window has closed by the database clock, read
     /// under the account lock; nothing debited or stored.
     Retired,
+    /// Account closure permanently forbids new conversions. Stored retries
+    /// are answered before this check, so no paid response is lost.
+    Closed,
     /// The balance could not cover the amount; nothing debited or stored.
     Insufficient,
 }
@@ -879,6 +807,7 @@ pub async fn record_credential_issuance(
         },
         "stored" => IssuanceRecord::Stored(map_stored_issuance(&row)),
         "retired" => IssuanceRecord::Retired,
+        "closed" => IssuanceRecord::Closed,
         "insufficient" => IssuanceRecord::Insufficient,
         other => {
             return Err(ServerError::Internal(format!(
@@ -956,350 +885,7 @@ pub async fn prune_expired_issuances(
     Ok(row.get("pruned"))
 }
 
-/// What recording a dispute's clawback did.
-#[derive(Debug, PartialEq, Eq)]
-pub enum DisputeClawback {
-    Debited,
-    /// This event, or another event for the same dispute, already clawed it
-    /// back: Stripe can emit two Event objects for one transition.
-    Duplicate,
-}
-
-/// Claw back `amount` micro-dollars for `dispute_id`, once per dispute: the
-/// idempotency key is the dispute, not only the event, because Stripe can
-/// emit two Event objects with distinct ids for one `created` transition,
-/// and a second clawback would never be reversed (a lost dispute reverses
-/// nothing; a won one reverses by dispute id, once). One transaction with
-/// the account row locked, so two deliveries cannot both pass the check.
-pub async fn claw_back_dispute(
-    pool: &Pool,
-    account_id: Uuid,
-    amount: i64,
-    stripe_event_id: &str,
-    dispute_id: &str,
-) -> Result<DisputeClawback, ServerError> {
-    let db_err = |what: &'static str| {
-        move |e: tokio_postgres::Error| {
-            ServerError::Internal(format!("{what} failed: {}", db_error_summary(&e)))
-        }
-    };
-    let mut client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
-    let tx = client
-        .transaction()
-        .await
-        .map_err(db_err("begin clawback transaction"))?;
-    tx.execute(
-        "SELECT 1 FROM account WHERE id = $1 FOR UPDATE",
-        &[&account_id],
-    )
-    .await
-    .map_err(db_err("clawback account lock"))?;
-
-    let already: bool = tx
-        .query_one(
-            "SELECT EXISTS (SELECT 1 FROM credit_ledger \
-                            WHERE stripe_event_id = $1 \
-                               OR (account_id = $2 AND reason = 'dispute_clawback' AND memo = $3))",
-            &[&stripe_event_id, &account_id, &dispute_id],
-        )
-        .await
-        .map_err(db_err("clawback duplicate check"))?
-        .get(0);
-    if already {
-        tx.rollback().await.map_err(db_err("clawback rollback"))?;
-        return Ok(DisputeClawback::Duplicate);
-    }
-
-    tx.query_one(
-        "SELECT debit_account($1, $2, 'dispute_clawback', $3, NULL, FALSE, NULL, $4)",
-        &[&account_id, &amount, &stripe_event_id, &dispute_id],
-    )
-    .await
-    .map_err(db_err("clawback debit"))?;
-    tx.commit().await.map_err(db_err("clawback commit"))?;
-    Ok(DisputeClawback::Debited)
-}
-
-/// What reversing a dispute's clawback did.
-#[derive(Debug, PartialEq, Eq)]
-pub enum DisputeReversal {
-    /// The clawbacks recorded for the dispute, net of earlier reversals, were
-    /// credited back: this many micro-dollars.
-    Credited(i64),
-    /// This event, or another event for the same dispute, already reversed
-    /// it.
-    Duplicate,
-    /// No clawback is on the ledger for this dispute, so there is nothing to
-    /// give back (yet: its `created` may still be on its way).
-    NothingToReverse,
-}
-
-/// Reverse the clawback recorded for `dispute_id`, crediting back exactly
-/// what it debited, row for row and expiry for expiry — never the amount the
-/// `charge.dispute.closed` payload names: crediting that for a dispute with
-/// no clawback on the ledger would mint balance the account never lost. One
-/// transaction with the account row locked, like `refund_charge`.
-pub async fn reverse_dispute_clawback(
-    pool: &Pool,
-    account_id: Uuid,
-    dispute_id: &str,
-    stripe_event_id: &str,
-) -> Result<DisputeReversal, ServerError> {
-    let db_err = |what: &'static str| {
-        move |e: tokio_postgres::Error| {
-            ServerError::Internal(format!("{what} failed: {}", db_error_summary(&e)))
-        }
-    };
-    let mut client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
-    let tx = client
-        .transaction()
-        .await
-        .map_err(db_err("begin dispute reversal transaction"))?;
-
-    tx.execute(
-        "SELECT 1 FROM account WHERE id = $1 FOR UPDATE",
-        &[&account_id],
-    )
-    .await
-    .map_err(db_err("dispute reversal account lock"))?;
-
-    // Duplicate by event id *or* by dispute: Stripe can emit two Event
-    // objects for one `closed` transition, and the second must read as
-    // handled, not as a dispute with nothing to reverse (which is retried).
-    let duplicate: bool = tx
-        .query_one(
-            "SELECT EXISTS (SELECT 1 FROM credit_ledger \
-                            WHERE stripe_event_id = $1 \
-                               OR (account_id = $2 AND reason = 'dispute_reversal' AND memo = $3))",
-            &[&stripe_event_id, &account_id, &dispute_id],
-        )
-        .await
-        .map_err(db_err("dispute reversal duplicate check"))?
-        .get(0);
-    if duplicate {
-        tx.rollback()
-            .await
-            .map_err(db_err("dispute reversal rollback"))?;
-        return Ok(DisputeReversal::Duplicate);
-    }
-
-    // Clawback rows are negative and reversal rows positive, so the negated
-    // sum over both is what the dispute still holds back from the account.
-    let outstanding: i64 = tx
-        .query_one(
-            "SELECT COALESCE(SUM(-delta), 0)::bigint FROM credit_ledger \
-             WHERE account_id = $1 AND memo = $2 \
-               AND reason IN ('dispute_clawback', 'dispute_reversal')",
-            &[&account_id, &dispute_id],
-        )
-        .await
-        .map_err(db_err("dispute clawback lookup"))?
-        .get(0);
-    if outstanding <= 0 {
-        tx.rollback()
-            .await
-            .map_err(db_err("dispute reversal rollback"))?;
-        return Ok(DisputeReversal::NothingToReverse);
-    }
-
-    // Row for row, each with the expiry of the clawback row it undoes: the
-    // clawback drew from live pools first and inherited their `expires_at`,
-    // so what came out of an expiring pool goes back expiring with it and
-    // only the permanent remainder comes back permanent. One reversal row
-    // with no expiry would turn subscription credits into permanent ones.
-    // Event ids follow `debit_account`: the first row carries the event id,
-    // the rest `id:N`.
-    tx.execute(
-        "INSERT INTO credit_ledger \
-             (account_id, delta, reason, stripe_event_id, memo, expires_at) \
-         SELECT account_id, -delta, 'dispute_reversal', \
-                CASE WHEN n = 1 THEN $3 ELSE $3 || ':' || (n - 1) END, memo, expires_at \
-         FROM (SELECT account_id, delta, memo, expires_at, \
-                      row_number() OVER (ORDER BY created_at, id) AS n \
-               FROM credit_ledger \
-               WHERE account_id = $1 AND memo = $2 AND reason = 'dispute_clawback') clawback",
-        &[&account_id, &dispute_id, &stripe_event_id],
-    )
-    .await
-    .map_err(db_err("dispute reversal insert"))?;
-    tx.commit()
-        .await
-        .map_err(db_err("dispute reversal commit"))?;
-    Ok(DisputeReversal::Credited(outstanding))
-}
-
-/// What [`refund_charge`] did with one `charge.refunded` event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefundOutcome {
-    /// A debit for the newly refunded part was written.
-    Debited,
-    /// This event was already processed.
-    Duplicate,
-    /// The charge's refunds so far are already debited in full (a
-    /// redelivered or out-of-order earlier event).
-    NothingNew,
-}
-
-/// Debit the part of a charge's refunds not yet debited.
-///
-/// `charge.refunded` fires once per refund, partial ones included, and
-/// carries the Charge's `amount_refunded`: its refunded **total** so far,
-/// not this refund's amount. So the debit is target-based: what the charge's
-/// refund debits should total now, less what refund rows tagged with its
-/// PaymentIntent already debited. That makes a later event that arrives
-/// first, or a redelivery, debit nothing extra.
-///
-/// When the PaymentIntent locates the credit entry the charge paid for, the
-/// target is that entry's credits in proportion to the share of the charge
-/// refunded (terms §5: a refund voids the credits the money bought, and a
-/// product's credits need not equal its price), and the debit inherits the
-/// entry's `expires_at` — even when the pool has already expired — so it
-/// nets against exactly the credits it reverses. Otherwise the target is
-/// the refunded amount at one credit per micro-dollar, debited through
-/// `debit_account`'s pool order and tagged with the PaymentIntent so the
-/// next partial refund can see it. Without a PaymentIntent there is nothing
-/// to tag, and each event debits its `amount_refunded` as before.
-///
-/// The account row is locked for the whole transaction so two refund
-/// events of one charge cannot both read the same "already debited" sum.
-pub async fn refund_charge(
-    pool: &Pool,
-    account_id: Uuid,
-    stripe_event_id: &str,
-    charge_id: &str,
-    payment_intent: Option<&str>,
-    charge_amount_cents: i64,
-    amount_refunded_cents: i64,
-) -> Result<RefundOutcome, ServerError> {
-    let db_err = |what: &'static str| {
-        move |e: tokio_postgres::Error| {
-            ServerError::Internal(format!("{what} failed: {}", db_error_summary(&e)))
-        }
-    };
-    let mut client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
-    let tx = client
-        .transaction()
-        .await
-        .map_err(db_err("begin refund transaction"))?;
-
-    tx.execute(
-        "SELECT 1 FROM account WHERE id = $1 FOR UPDATE",
-        &[&account_id],
-    )
-    .await
-    .map_err(db_err("refund account lock"))?;
-
-    let duplicate: bool = tx
-        .query_one(
-            "SELECT EXISTS (SELECT 1 FROM credit_ledger WHERE stripe_event_id = $1)",
-            &[&stripe_event_id],
-        )
-        .await
-        .map_err(db_err("refund duplicate check"))?
-        .get(0);
-    if duplicate {
-        tx.rollback().await.map_err(db_err("refund rollback"))?;
-        return Ok(RefundOutcome::Duplicate);
-    }
-
-    let original = match payment_intent {
-        Some(pi) => tx
-            .query_opt(
-                "SELECT delta, expires_at FROM credit_ledger \
-                 WHERE account_id = $1 AND stripe_payment_intent = $2 AND delta > 0 \
-                 ORDER BY created_at ASC LIMIT 1",
-                &[&account_id, &pi],
-            )
-            .await
-            .map_err(db_err("refund pool lookup"))?,
-        None => None,
-    };
-
-    let at_par = amount_refunded_cents.checked_mul(10_000).ok_or_else(|| {
-        ServerError::Internal("refund amount overflows micro-dollars".to_string())
-    })?;
-    let target = match (&original, charge_amount_cents) {
-        (Some(row), charge) if charge > 0 => {
-            let granted: i64 = row.get("delta");
-            let share = i128::from(granted) * i128::from(amount_refunded_cents.min(charge))
-                / i128::from(charge);
-            i64::try_from(share)
-                .map_err(|_| ServerError::Internal("refund share overflows credits".to_string()))?
-        }
-        _ => at_par,
-    };
-
-    // Keyed on the charge, which every charge has, not on the PaymentIntent,
-    // which a charge need not: the refund rows carry the charge id as `memo`.
-    // A refund row with no memo predates that and is counted by its
-    // PaymentIntent, which is all it carries.
-    let already: i64 = tx
-        .query_one(
-            "SELECT COALESCE(SUM(-delta), 0)::bigint FROM credit_ledger \
-             WHERE account_id = $1 AND reason = 'refund' \
-               AND (memo = $2 OR (memo IS NULL AND stripe_payment_intent = $3))",
-            &[&account_id, &charge_id, &payment_intent],
-        )
-        .await
-        .map_err(db_err("refund total lookup"))?
-        .get(0);
-    let increment = target - already;
-    if increment <= 0 {
-        tx.rollback().await.map_err(db_err("refund rollback"))?;
-        return Ok(RefundOutcome::NothingNew);
-    }
-
-    match original {
-        Some(row) => {
-            let expires_at: Option<SystemTime> = row.get("expires_at");
-            tx.execute(
-                "INSERT INTO credit_ledger \
-                     (account_id, delta, reason, stripe_event_id, stripe_payment_intent, memo, \
-                      expires_at) \
-                 VALUES ($1, $2, 'refund', $3, $4, $5, $6)",
-                &[
-                    &account_id,
-                    &-increment,
-                    &stripe_event_id,
-                    &payment_intent,
-                    &charge_id,
-                    &expires_at,
-                ],
-            )
-            .await
-            .map_err(db_err("matched refund insert"))?;
-        }
-        None => {
-            tx.query_one(
-                "SELECT debit_account($1, $2, 'refund', $3, NULL, FALSE, $4, $5)",
-                &[
-                    &account_id,
-                    &increment,
-                    &stripe_event_id,
-                    &payment_intent,
-                    &charge_id,
-                ],
-            )
-            .await
-            .map_err(db_err("refund debit"))?;
-        }
-    }
-
-    tx.commit().await.map_err(db_err("refund commit"))?;
-    Ok(RefundOutcome::Debited)
-}
-
-/// Get the current available balance for an account.
-#[tracing::instrument(skip_all, name = "db.get_available_balance", err)]
+/// Current balance, including the shared billing ledger's outstanding debt.
 pub async fn get_available_balance(pool: &Pool, account_id: Uuid) -> Result<i64, ServerError> {
     let client = pool
         .get()
@@ -1344,16 +930,11 @@ pub async fn get_balance_pools(
 
     let rows = client
         .query(
-            "SELECT cl.expires_at, SUM(cl.delta)::bigint as pool_amount, \
-               (SELECT reason FROM credit_ledger sub \
-                WHERE sub.account_id = cl.account_id \
-                  AND sub.expires_at IS NOT DISTINCT FROM cl.expires_at AND sub.delta > 0 \
-                ORDER BY sub.created_at ASC LIMIT 1) as source_reason \
-             FROM credit_ledger cl \
+            "SELECT cl.expires_at, SUM(cl.delta)::bigint AS pool_amount, p.kind AS source_reason \
+             FROM credit_ledger cl LEFT JOIN billing_purchase p ON p.id = cl.purchase_id \
              WHERE cl.account_id = $1 AND (cl.expires_at IS NULL OR cl.expires_at > now()) \
-             GROUP BY cl.account_id, cl.expires_at \
-             HAVING SUM(cl.delta)::bigint != 0 \
-             ORDER BY cl.expires_at NULLS LAST",
+             GROUP BY cl.purchase_id, cl.expires_at, p.kind \
+             HAVING SUM(cl.delta) != 0 ORDER BY cl.expires_at NULLS LAST, cl.purchase_id",
             &[&account_id],
         )
         .await
@@ -1650,14 +1231,7 @@ pub struct LedgerEntryRow {
     pub credential_credits: Option<i64>,
 }
 
-/// Whether Stripe has ever moved money for this account.
-///
-/// A `stripe_event_id` is stamped on exactly the ledger rows a Stripe
-/// webhook wrote — purchases, subscription renewals, refunds, dispute
-/// adjustments — so its presence is the honest test for "this account has a
-/// payment history", as distinct from merely having a Stripe customer
-/// record. Internal rows (credential issuance and the like) carry no event
-/// id and correctly do not count.
+/// Whether a reconciled payment has ever funded this account.
 #[tracing::instrument(skip_all, name = "db.has_stripe_ledger_history", err)]
 pub async fn has_stripe_ledger_history(pool: &Pool, account_id: Uuid) -> Result<bool, ServerError> {
     let client = pool
@@ -1668,8 +1242,8 @@ pub async fn has_stripe_ledger_history(pool: &Pool, account_id: Uuid) -> Result<
     let row = client
         .query_one(
             "SELECT EXISTS (\
-                 SELECT 1 FROM credit_ledger \
-                 WHERE account_id = $1 AND stripe_event_id IS NOT NULL\
+                 SELECT 1 FROM billing_purchase \
+                 WHERE account_id = $1\
              )",
             &[&account_id],
         )

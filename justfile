@@ -216,7 +216,13 @@ test:
 
 # Run integration tests (requires: just services && just db-reset)
 test-integration:
-    DATABASE_URL="${DATABASE_URL:-postgres://eidola@localhost/eidola}" CREDENTIAL_MASTER_KEY="${CREDENTIAL_MASTER_KEY:-0000000000000000000000000000000000000000000000000000000000000000}" cargo test -p eidola-server-gateway -- --ignored
+    BILLING_TEST_DATABASE_URL="${BILLING_TEST_DATABASE_URL:-${DATABASE_URL:-postgres://eidola@localhost/eidola}}" DATABASE_URL="${DATABASE_URL:-postgres://eidola@localhost/eidola}" CREDENTIAL_MASTER_KEY="${CREDENTIAL_MASTER_KEY:-0000000000000000000000000000000000000000000000000000000000000000}" cargo test -p eidola-server-gateway -- --ignored
+
+# Billing tests create isolated schemas; set BILLING_TEST_DATABASE_URL explicitly.
+test-billing:
+    : "${BILLING_TEST_DATABASE_URL:?set BILLING_TEST_DATABASE_URL to a disposable Postgres database}"
+    cargo test -p eidola-billing -- --ignored --test-threads=1
+    cargo test -p eidola-server-gateway --test billing_support -- --ignored --test-threads=1
 
 # Run E2E webhook smoke tests (requires STRIPE_API_KEY)
 test-webhook-smoke:
