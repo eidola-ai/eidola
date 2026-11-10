@@ -7023,6 +7023,19 @@ impl Inner {
             }
             ResponseMode::Reply | ResponseMode::Revise => None,
         };
+        // **A continuation is asked of the weights that wrote what it
+        // continues**, not of whatever its followed tag names now: the
+        // generation's recorded hash (`action.model_sha256`) pins the
+        // continuation, so a tag that moved since cannot finish another
+        // model's partial answer. Weights no longer served are refused by
+        // name below, like any selection the catalog no longer lists.
+        if continuation_basis.is_some()
+            && let Some(sha256) = db::action_model_sha256(&db_conn, target_action_id).await?
+            && let Ok(reference) =
+                eidola_common::model_reference::ModelReference::parse(&wire_model)
+        {
+            wire_model = eidola_common::model_reference::pinned(reference.tag(), &sha256);
+        }
 
         let mut engine_lease: Option<local_models::EngineLease> = None;
         let (
