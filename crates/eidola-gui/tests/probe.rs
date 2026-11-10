@@ -5048,6 +5048,76 @@ fn an_open_editor_follows_a_switch_to_newer_weights(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// **A shared agent's "Everyone" draft does not follow a per-space switch.**
+/// The switch writes this space's override; the Everyone draft is the agent's
+/// global config, and adopting the pin there would publish it to every space
+/// on the next Save. The "This space" draft follows, as an owned one does.
+#[gpui::test]
+fn an_everyone_draft_keeps_its_model_through_a_per_space_switch(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    use eidola_gui::participants::EditMode;
+    let _guard = probes_on();
+    let (space, mut roster) = probe_participants();
+    let notice = ModelNotice::NewerAvailable {
+        tag: "gemma4-31b".into(),
+        newer_sha256: PICKER_HASH.into(),
+    };
+    roster[1].scope = "global".into();
+    roster[1].source = "referenced".into();
+    roster[1].model_notices = vec![notice.clone()];
+    roster[1].reference = Some(ParticipantReference {
+        base_label: "Assistant".into(),
+        base_model_ref: Some("gemma4-31b".into()),
+        base_system_prompt: Some("Be concise.".into()),
+        base_notify_policy: "human".into(),
+        override_label: None,
+        override_model_ref: None,
+        override_system_prompt: None,
+        override_notify_policy: None,
+    });
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some((space, roster));
+        s.space_settings = Some(("demo".into(), eidola_app_core::SpaceSettings::default()));
+    });
+    let (window, view) = open_participants_inspector_with(cx, stores);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant("agent-1", window, cx);
+            v.inspector_set_edit_mode(EditMode::Everywhere, window, cx);
+            v.inspector_act_on_model_notice("agent-1", &notice, window, cx);
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/inspector/participants/editor/model",
+        gpui::Role::Button,
+        "Model",
+        "gemma4-31b · Eidola",
+    );
+
+    // The same switch with the "This space" draft open: it follows.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_set_edit_mode(EditMode::OverrideHere, window, cx);
+            v.inspector_act_on_model_notice("agent-1", &notice, window, cx);
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/inspector/participants/editor/model",
+        gpui::Role::Button,
+        "Model",
+        "gemma4-31b, pinned to 222222222222… · Eidola",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn model_picker_options_name_their_backend(cx: &mut TestAppContext) {
     let _guard = probes_on();

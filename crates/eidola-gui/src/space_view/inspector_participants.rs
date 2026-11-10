@@ -1658,7 +1658,9 @@ impl SpaceView {
     /// retire it (only a vanished row or a changed `source` does), so a Save
     /// of any other field would write the old pin back over the switch. When
     /// its selection is still the participant's current model (the reader has
-    /// not picked another), it takes the newer pin the switch writes.
+    /// not picked another), it takes the newer pin the switch writes — unless
+    /// it is a shared agent's "Everyone" draft, which the switch does not
+    /// touch.
     pub fn inspector_act_on_model_notice(
         &mut self,
         participant_id: &str,
@@ -1680,8 +1682,13 @@ impl SpaceView {
                     &eidola_app_core::model_reference::pinned(Some(tag), newer_sha256),
                     eidola_app_core::EIDOLA_BACKEND_ID,
                 );
+                // Only an editor writing to *this space* follows: a shared
+                // agent's "Everyone" draft is its global config, which the
+                // switch (this space's override) leaves alone, and adopting the
+                // pin there would publish it to every space on the next Save.
                 if let Some(edit) = self.inspector_participant_edit.as_mut()
                     && edit.participant_id == participant_id
+                    && !(edit.is_referenced && edit.mode == EditMode::Everywhere)
                     && edit.model_ref == current
                 {
                     edit.model_ref = Some(newer);
