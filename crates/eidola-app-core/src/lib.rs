@@ -3260,6 +3260,73 @@ impl Inner {
         })
     }
 
+    /// Fetch `/v1/keys` and store every still-accepted key it advertises for
+    /// this profile's domain separator, with the advertised `accept_until` as
+    /// the local expiry. Called before issuance, and before a turn decides
+    /// that it holds nothing spendable: a credential's local expiry is its
+    /// key's `accept_until`, and a row written when `issue_until` was stored
+    /// instead (a profile from before the change, or a key rotated out of
+    /// issuance since) reads its credentials as `expired` until this
+    /// overwrites it — so the refresh has to run before the lifecycle and
+    /// balance decision, not only inside the allocation that decision reaches
+    /// for when the balance allows one.
+    async fn refresh_issuer_keys(&self, cfg: &Config) -> Result<ListKeysResponse, AppError> {
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
+        let client = self.build_client(&eidola, None).await?;
+
+        let resp = client
+            .get(format!("{base_url}/v1/keys"))
+            .send()
+            .await
+            .map_err(AppError::from_request)?;
+        let (status, body) = read_response(resp).await?;
+        check_status(status, &body)?;
+
+        let keys: ListKeysResponse =
+            serde_json::from_str(&body).map_err(|e| AppError::Network {
+                message: format!("failed to parse keys response: {e}"),
+            })?;
+
+        let expected_ds = cfg.domain_separator();
+        let now = now_ms();
+        // 2. Open DB and store the issuer keys. Every still-accepted key the
+        // server advertises is stored, not only the one issuing now: a
+        // credential lives as long as the server accepts its key — the grace
+        // window past `issue_until`, not just the issuing window — and a key
+        // already on file from before that was so, or rotated out of issuance
+        // since, keeps a stale expiry unless the advertised one overwrites it.
+        let db_conn = self.db_conn().await?;
+        for advertised in keys
+            .data
+            .iter()
+            .filter(|k| k.domain_separator == expected_ds)
+        {
+            let advertised_public_key =
+                URL_SAFE_NO_PAD
+                    .decode(&advertised.public_key)
+                    .map_err(|e| AppError::Credential {
+                        message: format!("invalid base64 public key: {e}"),
+                    })?;
+            let params_hash = blake3::hash(advertised.domain_separator.as_bytes())
+                .to_hex()
+                .to_string();
+            let expires_at = iso_to_ms(&advertised.accept_until)?;
+            db::upsert_issuer_key(
+                &db_conn,
+                &advertised.id,
+                &params_hash,
+                &advertised_public_key,
+                advertised.domain_separator.as_bytes(),
+                expires_at,
+                now,
+            )
+            .await?;
+        }
+
+        Ok(keys)
+    }
+
     async fn account_allocate(&self, credits: i64) -> Result<AllocateResult, AppError> {
         if credits <= 0 {
             return Err(AppError::Credential {
@@ -3273,19 +3340,7 @@ impl Inner {
         let (account_id, secret) = self.require_credentials(&cfg)?;
         let client = self.build_client(&eidola, None).await?;
 
-        // 1. Fetch issuer keys
-        let resp = client
-            .get(format!("{base_url}/v1/keys"))
-            .send()
-            .await
-            .map_err(AppError::from_request)?;
-        let (status, body) = read_response(resp).await?;
-        check_status(status, &body)?;
-
-        let keys: ListKeysResponse =
-            serde_json::from_str(&body).map_err(|e| AppError::Network {
-                message: format!("failed to parse keys response: {e}"),
-            })?;
+        let keys = self.refresh_issuer_keys(&cfg).await?;
 
         let expected_ds = cfg.domain_separator();
         let now = now_ms();
@@ -3341,39 +3396,7 @@ impl Inner {
 
         let params = params_from_domain_separator(expected_ds)?;
 
-        // 2. Open DB and store the issuer keys. Every still-accepted key the
-        // server advertises is stored, not only the one issuing now: a
-        // credential lives as long as the server accepts its key — the grace
-        // window past `issue_until`, not just the issuing window — and a key
-        // already on file from before that was so, or rotated out of issuance
-        // since, keeps a stale expiry unless the advertised one overwrites it.
         let db_conn = self.db_conn().await?;
-        for advertised in keys
-            .data
-            .iter()
-            .filter(|k| k.domain_separator == expected_ds)
-        {
-            let advertised_public_key =
-                URL_SAFE_NO_PAD
-                    .decode(&advertised.public_key)
-                    .map_err(|e| AppError::Credential {
-                        message: format!("invalid base64 public key: {e}"),
-                    })?;
-            let params_hash = blake3::hash(advertised.domain_separator.as_bytes())
-                .to_hex()
-                .to_string();
-            let expires_at = iso_to_ms(&advertised.accept_until)?;
-            db::upsert_issuer_key(
-                &db_conn,
-                &advertised.id,
-                &params_hash,
-                &advertised_public_key,
-                advertised.domain_separator.as_bytes(),
-                expires_at,
-                now,
-            )
-            .await?;
-        }
 
         // 3. Create PreIssuance checkpoint
         let pre_issuance = PreIssuance::random(OsRng);
@@ -6094,6 +6117,7 @@ impl Inner {
         charge_credits: i64,
     ) -> Result<db::SpendableCredential, AppError> {
         let deadline = tokio::time::Instant::now() + PROVISION_WAIT_TIMEOUT;
+        let mut keys_refreshed = false;
         loop {
             if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
                 return Ok(cred);
@@ -6101,6 +6125,24 @@ impl Inner {
 
             if cfg.account_id.is_none() || cfg.account_secret.is_none() {
                 return Err(AppError::NoAccount);
+            }
+
+            // Nothing spendable on file — but "expired" here is the *local*
+            // expiry, and a stale one hides a credential the server still
+            // accepts (see `refresh_issuer_keys`). Refresh the advertised keys
+            // once before concluding anything about balance, and look again:
+            // otherwise a short balance ends in `InsufficientBalance` with a
+            // spendable credential in the wallet, and a sufficient one buys an
+            // allocation the wallet did not need. Best-effort: if the server
+            // cannot be reached, the balance read just below says so.
+            if !keys_refreshed {
+                keys_refreshed = true;
+                if self.refresh_issuer_keys(cfg).await.is_ok()
+                    && let Some(cred) =
+                        db::find_spendable_credential(db_conn, charge_credits).await?
+                {
+                    return Ok(cred);
+                }
             }
 
             let balances = self.account_balances().await?;
@@ -10950,6 +10992,22 @@ impl AppCore {
     /// entry point sets it yet (it exists for the agent loop's per-iteration
     /// ceiling — see [`MAX_TURN_ROUNDS`]). This exposes it so the chat-path
     /// tests can pin the mid-loop budget exit, which is otherwise unreachable.
+    /// Set every local issuer key's `expires_at`, as a profile written before
+    /// `accept_until` was stored (or a key rotated out of issuance since) looks
+    /// to the wallet; the harness has no other way to produce that row.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub async fn test_set_issuer_key_expiry(&self, expires_at_ms: i64) -> Result<(), AppError> {
+        let conn = self.inner.db_conn().await?;
+        conn.execute(
+            "UPDATE issuer_key SET expires_at = ?1",
+            (turso::Value::Integer(expires_at_ms),),
+        )
+        .await
+        .map_err(AppError::db)?;
+        Ok(())
+    }
+
     #[doc(hidden)]
     #[cfg(feature = "test-support")]
     pub async fn test_chat_with_budget(

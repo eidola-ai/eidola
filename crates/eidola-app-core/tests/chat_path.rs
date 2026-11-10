@@ -7666,3 +7666,60 @@ fn a_credential_held_across_a_rotation_stays_spendable() {
         );
     });
 }
+
+/// The acceptance-window expiry must reach a key row that already exists —
+/// a profile from before `accept_until` was stored holds `issue_until`, and a
+/// key rotated out of issuance keeps whatever it had — and it must reach it
+/// *before* the turn decides what it holds. A wallet that only refreshed keys
+/// inside an allocation read its held credential as expired, and either bought
+/// an allocation it did not need or, with a short balance, refused the turn
+/// outright while the server would still have taken the credential.
+#[test]
+fn a_stale_key_expiry_is_refreshed_before_the_turn_decides_to_allocate() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = turn(&core, "How do tides work?", None, None);
+        // What an older profile's row looks like: the key's expiry in the past
+        // while `/v1/keys` still advertises it accepted until 2030.
+        core.runtime()
+            .block_on(core.test_set_issuer_key_expiry(1))
+            .expect("age the key row");
+        let lifecycle = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("lifecycle");
+        assert!(
+            lifecycle.iter().any(|c| c.state == "expired"),
+            "the stale row reads the held credential as expired; got {lifecycle:?}"
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let second = core.runtime().block_on(core.chat_stream_reply(
+            "And why two per day?".into(),
+            MODEL.into(),
+            Some(first.space_id.clone()),
+            None,
+            tx,
+        ));
+        let lifecycle = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("lifecycle");
+        assert!(
+            second.is_ok(),
+            "the held credential pays for the turn: {:?}; wallet {lifecycle:?}",
+            second.err()
+        );
+        assert_eq!(
+            lifecycle.iter().filter(|c| c.generation == 0).count(),
+            1,
+            "the advertised expiry was adopted before the turn decided to allocate; \
+             got {lifecycle:?}"
+        );
+    });
+}
