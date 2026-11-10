@@ -974,6 +974,11 @@ pub struct SpaceView {
     /// *is* the editor (live inputs plus an explicit Save). See
     /// [`inspector_participants`].
     pub(crate) inspector_participant_edit: Option<inspector_participants::ParticipantEdit>,
+    /// A switch to newer weights sent and not yet seen in the roster: the
+    /// open editor follows it only once the roster shows it landed
+    /// (`sync_inspector_participant_edit`), never on the click, so a refused
+    /// switch leaves the editor as it was.
+    pub(crate) inspector_pending_switch: Option<inspector_participants::PendingSwitch>,
     /// The open add-a-participant form, if any.
     pub(crate) inspector_participant_add: Option<inspector_participants::ParticipantAdd>,
     /// The open "save these participants as a template" form, if any.
@@ -1239,6 +1244,7 @@ impl SpaceView {
             inspector_router_picker: false,
             inspector_picker_scroll: ScrollHandle::new(),
             inspector_participant_edit: None,
+            inspector_pending_switch: None,
             inspector_participant_add: None,
             inspector_template_form: None,
             inspector_invite: None,

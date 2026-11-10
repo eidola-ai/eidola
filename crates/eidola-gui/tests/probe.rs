@@ -5008,11 +5008,18 @@ fn the_model_picker_offers_a_pin_and_shows_the_weights(cx: &mut TestAppContext) 
     probe::set_probes_enabled(false);
 }
 
-/// **An open editor follows a switch to newer weights.** The editor holds
-/// its own working model; left on the old pin, a Save of any other field
-/// would write it back over the switch. Pressing Switch while the
-/// participant's editor is open moves the editor's selection to the newer
-/// pin too.
+/// The pin a switch of `gemma4-31b` to [`PICKER_HASH`] writes.
+fn switched_pin() -> String {
+    format!("gemma4-31b@sha256:{PICKER_HASH}@eidola")
+}
+
+/// **An open editor follows a switch to newer weights, once it has landed.**
+/// The editor holds its own working model; left on the old pin, a Save of any
+/// other field would write it back over the switch. Pressing Switch changes
+/// nothing in the editor until the roster shows the participant on the newer
+/// pin; then the editor's selection moves to it. A switch the roster never
+/// shows (refused, or overtaken by another window's write) leaves the editor
+/// as it was.
 #[gpui::test]
 fn an_open_editor_follows_a_switch_to_newer_weights(cx: &mut TestAppContext) {
     use eidola_app_core::model_catalog::ModelNotice;
@@ -5023,26 +5030,61 @@ fn an_open_editor_follows_a_switch_to_newer_weights(cx: &mut TestAppContext) {
         newer_sha256: PICKER_HASH.into(),
     };
     roster[1].model_notices = vec![notice.clone()];
+    let seeded = roster.clone();
     let stores = stub_stores(cx, |s| {
         s.config_state = Some(probe_config_state());
-        s.participants = Some((space, roster));
+        s.participants = Some((space.clone(), roster));
         s.space_settings = Some(("demo".into(), eidola_app_core::SpaceSettings::default()));
     });
+    let participants = stores.participants.clone();
     let (window, view) = open_participants_inspector_with(cx, stores);
+    let editor_value = |cx: &mut TestAppContext| {
+        let entries = fresh_entries(cx, window);
+        entries
+            .iter()
+            .find(|(n, _)| n == "space/inspector/participants/editor/model")
+            .and_then(|(_, e)| e.value.clone())
+            .map(|v| v.to_string())
+    };
+    let switch = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.inspector_act_on_model_notice("agent-1", &notice, window, cx);
+            });
+        })
+        .unwrap();
+    };
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
-            v.inspector_toggle_participant("agent-1", window, cx);
-            v.inspector_act_on_model_notice("agent-1", &notice, window, cx);
+            v.inspector_toggle_participant("agent-1", window, cx)
         });
     })
     .unwrap();
-    let entries = fresh_entries(cx, window);
-    assert_probe_value(
-        &entries,
-        "space/inspector/participants/editor/model",
-        gpui::Role::Button,
-        "Model",
-        "gemma4-31b, pinned to 222222222222… · Eidola",
+
+    // Sent, not landed: nothing moves.
+    switch(cx);
+    assert_eq!(editor_value(cx).as_deref(), Some("gemma4-31b · Eidola"));
+
+    // Overtaken by another write: the pending switch is dropped untouched.
+    let mut other = seeded.clone();
+    other[1].model_ref = Some("kimi-k2-6".into());
+    other[1].model_notices.clear();
+    participants.update(cx, |p, _| p.seed_for_test(&space, other));
+    assert_eq!(editor_value(cx).as_deref(), Some("gemma4-31b · Eidola"));
+    // …and a later roster on the newer pin does not revive it.
+    let mut landed = seeded.clone();
+    landed[1].model_ref = Some(switched_pin());
+    landed[1].model_notices.clear();
+    participants.update(cx, |p, _| p.seed_for_test(&space, landed.clone()));
+    assert_eq!(editor_value(cx).as_deref(), Some("gemma4-31b · Eidola"));
+
+    // A switch that lands: the editor follows.
+    participants.update(cx, |p, _| p.seed_for_test(&space, seeded.clone()));
+    switch(cx);
+    participants.update(cx, |p, _| p.seed_for_test(&space, landed));
+    assert_eq!(
+        editor_value(cx).as_deref(),
+        Some("gemma4-31b, pinned to 222222222222… · Eidola")
     );
 
     probe::set_probes_enabled(false);
@@ -5076,11 +5118,18 @@ fn an_everyone_draft_keeps_its_model_through_a_per_space_switch(cx: &mut TestApp
         override_system_prompt: None,
         override_notify_policy: None,
     });
+    let mut landed = roster.clone();
+    landed[1].model_ref = Some(switched_pin());
+    landed[1].model_notices.clear();
+    if let Some(r) = landed[1].reference.as_mut() {
+        r.override_model_ref = Some(switched_pin());
+    }
     let stores = stub_stores(cx, |s| {
         s.config_state = Some(probe_config_state());
-        s.participants = Some((space, roster));
+        s.participants = Some((space.clone(), roster));
         s.space_settings = Some(("demo".into(), eidola_app_core::SpaceSettings::default()));
     });
+    let participants = stores.participants.clone();
     let (window, view) = open_participants_inspector_with(cx, stores);
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
@@ -5090,6 +5139,7 @@ fn an_everyone_draft_keeps_its_model_through_a_per_space_switch(cx: &mut TestApp
         });
     })
     .unwrap();
+    participants.update(cx, |p, _| p.seed_for_test(&space, landed));
     let entries = fresh_entries(cx, window);
     assert_probe_value(
         &entries,

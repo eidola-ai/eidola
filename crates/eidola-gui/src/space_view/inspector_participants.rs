@@ -191,6 +191,17 @@ pub(crate) struct TemplateForm {
     title: Entity<InputState>,
 }
 
+/// A switch to newer weights sent from a notice, waiting to be seen in the
+/// roster (`SpaceView::inspector_pending_switch`).
+#[derive(Clone, Debug)]
+pub(crate) struct PendingSwitch {
+    participant_id: String,
+    /// The participant's model the switch replaces.
+    previous: Option<String>,
+    /// The pin it writes, `tag@sha256:<hex>@eidola`.
+    newer: String,
+}
+
 /// Which model picker is open. At most one at a time — they share one scroll
 /// handle, reset to the top on each open.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1192,6 +1203,7 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.apply_landed_switch(cx);
         let Some((pid, was_referenced)) = self
             .inspector_participant_edit
             .as_ref()
@@ -1219,6 +1231,57 @@ impl SpaceView {
         self.inspector_participant_edit = None;
         self.inspector_participant_picker = None;
         self.hand_back_inspector_focus(held, window, cx);
+    }
+
+    /// Apply a pending switch to newer weights to the open editor once the
+    /// roster shows it landed, and drop it once the roster shows it never
+    /// will. While the write is in flight (the row still on the model the
+    /// switch replaced) it waits.
+    ///
+    /// Landed: an editor writing to this space (an owned agent, or a shared
+    /// one's "This space" draft) whose selection is still the model the switch
+    /// replaced takes the newer pin, and a shared agent's cached per-space
+    /// source does too, so the mode fork re-seeds "This space" with it. A
+    /// shared agent's "Everyone" draft is its global config, which the switch
+    /// does not touch. Anything else — the row gone, or on a third model
+    /// (another window's write) — drops the pending switch and leaves the
+    /// editor alone.
+    fn apply_landed_switch(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.inspector_pending_switch.as_ref() else {
+            return;
+        };
+        let space_id = self.space_id(cx);
+        let row_model = {
+            let store = self.stores.participants.read(cx);
+            match store.participants(&space_id).value() {
+                Some(list) => list
+                    .iter()
+                    .find(|p| p.id == pending.participant_id)
+                    .map(|p| p.model_ref.clone()),
+                None => return,
+            }
+        };
+        match row_model {
+            Some(model) if model == pending.previous => {}
+            Some(model) if model.as_deref() == Some(pending.newer.as_str()) => {
+                let Some(pending) = self.inspector_pending_switch.take() else {
+                    return;
+                };
+                if let Some(edit) = self.inspector_participant_edit.as_mut()
+                    && edit.participant_id == pending.participant_id
+                {
+                    if !(edit.is_referenced && edit.mode == EditMode::Everywhere)
+                        && edit.model_ref == pending.previous
+                    {
+                        edit.model_ref = Some(pending.newer.clone());
+                    }
+                    if let Some(reference) = edit.reference.as_mut() {
+                        reference.override_model_ref = Some(pending.newer);
+                    }
+                }
+            }
+            _ => self.inspector_pending_switch = None,
+        }
     }
 
     pub(crate) fn inspector_toggle_participant_picker(
@@ -1653,14 +1716,14 @@ impl SpaceView {
     /// Act on a model notice of `participant_id` — the Switch and Dismiss
     /// buttons' one handler, `pub` so tests drive exactly what a click does.
     ///
-    /// **An open editor over that participant follows a switch.** The editor
-    /// holds its own working model selection, and the roster re-read does not
-    /// retire it (only a vanished row or a changed `source` does), so a Save
-    /// of any other field would write the old pin back over the switch. When
-    /// its selection is still the participant's current model (the reader has
-    /// not picked another), it takes the newer pin the switch writes — unless
-    /// it is a shared agent's "Everyone" draft, which the switch does not
-    /// touch.
+    /// **An open editor over that participant follows a switch, once it has
+    /// landed.** The editor holds its own working model selection, and the
+    /// roster re-read does not retire it (only a vanished row or a changed
+    /// `source` does), so a Save of any other field would write the old pin
+    /// back over the switch. The switch is recorded as pending and applied to
+    /// the editor by [`Self::sync_inspector_participant_edit`] when the roster
+    /// shows the participant on the newer pin; a refused switch never touches
+    /// it.
     pub fn inspector_act_on_model_notice(
         &mut self,
         participant_id: &str,
@@ -1682,26 +1745,13 @@ impl SpaceView {
                     &eidola_app_core::model_reference::pinned(Some(tag), newer_sha256),
                     eidola_app_core::EIDOLA_BACKEND_ID,
                 );
-                // Only an editor writing to *this space* follows: a shared
-                // agent's "Everyone" draft is its global config, which the
-                // switch (this space's override) leaves alone, and adopting the
-                // pin there would publish it to every space on the next Save.
-                if let Some(edit) = self.inspector_participant_edit.as_mut()
-                    && edit.participant_id == participant_id
-                {
-                    if !(edit.is_referenced && edit.mode == EditMode::Everywhere)
-                        && edit.model_ref == current
-                    {
-                        edit.model_ref = Some(newer.clone());
-                    }
-                    // The cached per-space source the mode fork re-seeds from
-                    // carries the switch too (it is this space's override), so
-                    // toggling Everyone → This space shows the newer pin; the
-                    // global source stays as it is.
-                    if let Some(reference) = edit.reference.as_mut() {
-                        reference.override_model_ref = Some(newer);
-                    }
-                }
+                // The editor follows once the roster shows the switch landed,
+                // never here: a switch the core refuses leaves it as it was.
+                self.inspector_pending_switch = Some(PendingSwitch {
+                    participant_id: participant_id.to_string(),
+                    previous: current,
+                    newer,
+                });
                 self.stores.participants.update(cx, |store, cx| {
                     store.switch_to_newer_weights(space_id, target, cx)
                 });
