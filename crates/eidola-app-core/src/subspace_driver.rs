@@ -350,6 +350,9 @@ impl DelegationFailure {
             | AppError::IssuerKeyRefused { .. } => Self::Funding,
             AppError::NotConfigured { .. }
             | AppError::ModelUnavailable { .. }
+            // Unreachable from a driven turn (only a notice's action raises
+            // it); a stale choice of model is a configuration matter.
+            | AppError::ModelNoticeStale { .. }
             | AppError::Config { .. }
             // Unreachable from a driven turn (no turn writes proxy settings);
             // placed where the variant it replaced would have landed.

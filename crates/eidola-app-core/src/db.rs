@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 18;
+const LATEST_VERSION: i64 = 19;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -2262,6 +2262,7 @@ async fn discard_space_if_pristine_body(
     scrub_cache_keys_where(conn, "space_id = ?1", (Value::Text(space_id.to_string()),)).await?;
     for stmt in [
         "DELETE FROM prefix_cache_key WHERE space_id = ?1",
+        "DELETE FROM model_update_ack WHERE space_id = ?1",
         "DELETE FROM space_participant WHERE space_id = ?1",
         "DELETE FROM participant WHERE scope = 'space' AND owner_space_id = ?1",
         "DELETE FROM space WHERE id = ?1",
@@ -6441,6 +6442,64 @@ pub async fn set_action_model_sha256(
         message: format!("failed to record the action's weights hash: {e}"),
     })?;
     Ok(())
+}
+
+/// Record that the user dismissed the "model updated" notice of
+/// `participant_id` in `space_id` under selection `model` (canonical), for
+/// the weights `sha256` the tag names now (`model_update_ack`).
+pub async fn acknowledge_model_update(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    model: &str,
+    sha256: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO model_update_ack (space_id, participant_id, model, sha256, acknowledged_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT (space_id, participant_id, model) \
+         DO UPDATE SET sha256 = excluded.sha256, acknowledged_at = excluded.acknowledged_at",
+        (
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+            Value::Text(model.to_string()),
+            Value::Text(sha256.to_string()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+/// The weights hash the user last dismissed a "model updated" notice for,
+/// for `participant_id` in `space_id` under selection `model` (canonical).
+pub async fn acknowledged_model_update(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    model: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT sha256 FROM model_update_ack \
+             WHERE space_id = ?1 AND participant_id = ?2 AND model = ?3",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+            Value::Text(model.to_string()),
+        ))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<String>(0).map(Some).map_err(AppError::db),
+        None => Ok(None),
+    }
 }
 
 /// The weights hash the last answer of `participant_id` in `space_id` under

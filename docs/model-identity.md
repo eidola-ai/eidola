@@ -21,7 +21,9 @@ The app compiles in the same catalog files the server does, so it knows what eac
 - **Choosing a model** stores the choice as you made it: a tag, which follows the tag, or a pin, which keeps the weights it names.
 - **Each answer is sent under the exact weights its turn resolved to.** A turn that follows a tag names the tag's current hash on every request it makes, tool calls included, so one answer never mixes two sets of weights. The app records which weights each answer came from.
 - **The model's identity is shown wherever you choose it:** its weights hash, the repository and revision the weights come from, and a link to this page, so you can check them yourself.
-- **It tells you when something changed.** If a tag you follow now names newer weights than your last answer came from, it says the model was updated. If you pinned weights whose tag has moved on, it offers the newer ones. If your weights are deprecated, it shows the announced retirement date, and it tells you again once they are retired.
+- **You can follow a tag or pin weights.** The model picker offers each model both ways: following its tag, or pinned to the weights it names now, shown with the start of their hash.
+- **It tells you when something changed.** If a tag you follow now names newer weights than your last answer came from, it says the model was updated, and you can dismiss that until the tag moves again. If you pinned weights whose tag has moved on, it offers the newer ones, and one click switches that conversation to them. If your weights are deprecated, it shows the announced retirement date, and it tells you again once they are retired.
+- **The command line shows the same:** `eidola model show <tag>` prints the hash, the source, every file the hash covers and how to check them, with the same notices.
 
 ## What `/v1/models` publishes
 

@@ -50,6 +50,9 @@ use changes::{BroadcastSource, Change, ChangeSource};
 use config::Config;
 pub use config::DEFAULT_TEMPLATE_ID;
 pub use db::HUMAN_PARTICIPANT_ID;
+/// The Eidola model reference grammar (`tag`, `tag@sha256:<hex>`,
+/// `sha256:<hex>`), shared with the gateway.
+pub use eidola_common::model_reference;
 use error::{AppError, IssuerKeyRefusal};
 pub use local_models::{
     ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
@@ -1606,6 +1609,13 @@ pub fn quote_snippet(block_text: &str, range_start: i64, range_end: i64) -> Opti
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ModelInfo {
     pub id: String,
+    /// For an Eidola model, its weights hash (`docs/model-identity.md`), when
+    /// the gateway's catalog publishes one; `None` on every other backend.
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// For an Eidola model, every tag that names `sha256`.
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub context_length: u64,
     /// The largest completion the backend says this model may be asked for.
     /// `None` when nothing was declared — see [`ModelCapabilities`] for why
@@ -2195,6 +2205,11 @@ struct Inner {
     update_polling: std::sync::atomic::AtomicBool,
     /// Invalidation bus — emits a [`Change`] after every durable commit.
     bus: BroadcastSource,
+    /// The Eidola model catalog this core reads (notices, identity, the
+    /// newer-weights switch): the one compiled into this build. Only a test
+    /// replaces it (`test_set_model_catalog`), because the shipped catalog is
+    /// empty until the first model is pinned.
+    model_catalog: std::sync::RwLock<&'static [model_catalog::CatalogRow]>,
     /// Runtime local-inference state (downloads in flight, running
     /// llama.cpp engines). `Arc` so core-owned transfer/supervisor tasks
     /// can hold it beyond the initiating call.
@@ -2739,6 +2754,14 @@ impl Inner {
 // --- Async infrastructure ----------------------------------------------------
 
 impl Inner {
+    /// The Eidola model catalog this core reads ([`Inner::model_catalog`]).
+    fn catalog(&self) -> &'static [model_catalog::CatalogRow] {
+        *self
+            .model_catalog
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     async fn db_conn(&self) -> Result<turso::Connection, AppError> {
         let database = self
             .db
@@ -4244,6 +4267,11 @@ impl Inner {
             .data
             .into_iter()
             .map(|m| ModelInfo {
+                sha256: m
+                    .sha256
+                    .clone()
+                    .filter(|h| eidola_common::model_reference::is_digest_hex(h)),
+                tags: m.tags.clone(),
                 context_length: m.context_length,
                 max_output_tokens: m.max_output_tokens,
                 output_budget_class: m.declared_budget_class(),
@@ -4980,6 +5008,92 @@ impl Inner {
 
     // --- Participant CRUD (per-space) -----------------------------------
 
+    /// The participant `participant_id` of `space_id` and its current model
+    /// notices, or [`AppError::ModelNoticeStale`] when it is not a member.
+    async fn participant_with_notices(
+        &self,
+        space_id: &str,
+        participant_id: &str,
+    ) -> Result<ParticipantInfo, AppError> {
+        self.list_space_participants(space_id)
+            .await?
+            .into_iter()
+            .find(|p| p.id == participant_id)
+            .ok_or_else(|| AppError::ModelNoticeStale {
+                participant_id: participant_id.to_string(),
+            })
+    }
+
+    async fn switch_to_newer_weights(
+        &self,
+        space_id: &str,
+        participant_id: &str,
+    ) -> Result<String, AppError> {
+        let participant = self
+            .participant_with_notices(space_id, participant_id)
+            .await?;
+        let stale = || AppError::ModelNoticeStale {
+            participant_id: participant_id.to_string(),
+        };
+        let pin = model_catalog::newer_pin(&participant.model_notices).ok_or_else(stale)?;
+        let selection = backends::qualified_model_id(&pin, backends::EIDOLA_BACKEND_ID);
+        if participant.source == "referenced" {
+            self.set_space_participant_override(
+                space_id,
+                participant_id,
+                ParticipantOverride {
+                    model_ref: Some(Some(selection.clone())),
+                    ..ParticipantOverride::default()
+                },
+            )
+            .await?;
+        } else {
+            self.update_space_participant(
+                participant_id,
+                ParticipantUpdate {
+                    label: None,
+                    model_ref: Some(Some(selection.clone())),
+                    system_prompt: None,
+                    notify_policy: None,
+                },
+                ExpectedScope::SpaceOwned {
+                    space_id: space_id.to_string(),
+                },
+            )
+            .await?;
+        }
+        Ok(selection)
+    }
+
+    async fn dismiss_model_update(
+        &self,
+        space_id: &str,
+        participant_id: &str,
+    ) -> Result<(), AppError> {
+        let participant = self
+            .participant_with_notices(space_id, participant_id)
+            .await?;
+        let stale = || AppError::ModelNoticeStale {
+            participant_id: participant_id.to_string(),
+        };
+        let sha256 = model_catalog::updated_to(&participant.model_notices).ok_or_else(stale)?;
+        let selection = participant.model_ref.as_deref().ok_or_else(stale)?;
+        let mref = backends::parse_model_ref(selection);
+        let canonical = backends::qualified_model_id(&mref.model, &mref.backend_id);
+        let conn = self.db_conn().await?;
+        db::acknowledge_model_update(
+            &conn,
+            space_id,
+            participant_id,
+            &canonical,
+            sha256,
+            now_ms(),
+        )
+        .await?;
+        self.bus.emit(Change::Participants);
+        Ok(())
+    }
+
     async fn list_space_participants(
         &self,
         space_id: &str,
@@ -4997,7 +5111,7 @@ impl Inner {
                 space_id,
                 &info.id,
                 info.model_ref.as_deref(),
-                model_catalog::CATALOG,
+                self.catalog(),
             )
             .await?;
             if info.source == "referenced"
@@ -10820,6 +10934,7 @@ impl AppCore {
                 backend_config_gates: Mutex::new(std::collections::HashMap::new()),
                 #[cfg(feature = "test-support")]
                 backend_config_pause: Mutex::new(None),
+                model_catalog: std::sync::RwLock::new(model_catalog::CATALOG),
                 subspace_driver_started: std::sync::atomic::AtomicBool::new(false),
                 subspace_drivers: Mutex::new(std::collections::HashMap::new()),
                 subspace_walks: Mutex::new(std::collections::HashMap::new()),
@@ -13044,6 +13159,95 @@ impl AppCore {
             .spawn(async move { inner.list_space_participants(&space_id).await })
             .await
             .map_err(join_err)?
+    }
+
+    /// The identity of the Eidola model a selection names
+    /// (`model_catalog::identity`): its weights hash, tags, source repository
+    /// and revision, per-file manifest and lifecycle, with the page that says
+    /// how to check them independently. `None` for a selection on another
+    /// backend, or one this build's catalog does not know. Reads only the
+    /// catalog compiled into this build.
+    pub fn model_identity(&self, selection: &str) -> Option<model_catalog::ModelIdentity> {
+        model_identity_in(self.inner.catalog(), selection)
+    }
+
+    /// The pinned selection and the hash for each Eidola model this build's
+    /// catalog knows and serves: what a picker offers as "pin to these
+    /// weights" beside following a tag. `(tag, pin)` per tag, where `pin` is
+    /// `tag@sha256:<hex>@eidola`.
+    pub fn model_pins(&self) -> Vec<(String, String)> {
+        self.inner
+            .catalog()
+            .iter()
+            .filter(|row| !matches!(row.lifecycle, model_catalog::Lifecycle::Retired { .. }))
+            .flat_map(|row| {
+                row.tags.iter().map(move |tag| {
+                    (
+                        (*tag).to_string(),
+                        backends::qualified_model_id(
+                            &eidola_common::model_reference::pinned(Some(tag), row.sha256),
+                            backends::EIDOLA_BACKEND_ID,
+                        ),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// **Switch a pinned participant to the newer weights its tag now names**
+    /// — the one-click answer to a `NewerAvailable` notice. Writes the new pin
+    /// (`tag@sha256:<newer>@eidola`) where the participant's model is set in
+    /// this space: its own row when the space owns it, this space's override
+    /// when it is a shared agent (the switch is a decision about this
+    /// conversation, never every space the agent is in). Refused with
+    /// [`AppError::ModelNoticeStale`] when the participant has no such notice
+    /// any more. Emits [`Change::Participants`]. Returns the new selection.
+    pub async fn switch_to_newer_weights(
+        &self,
+        space_id: String,
+        participant_id: String,
+    ) -> Result<String, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .switch_to_newer_weights(&space_id, &participant_id)
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// **Dismiss a followed tag's "model updated" notice** for this
+    /// participant in this space. The notice stays dismissed while the tag
+    /// names the weights it named when dismissed, and returns when the tag
+    /// moves again (`model_update_ack`). Refused with
+    /// [`AppError::ModelNoticeStale`] when there is no such notice any more.
+    /// Emits [`Change::Participants`].
+    pub async fn dismiss_model_update(
+        &self,
+        space_id: String,
+        participant_id: String,
+    ) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.dismiss_model_update(&space_id, &participant_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// **Test-only seam.** Replace the Eidola model catalog this core reads
+    /// (notices, identity, pins, the newer-weights switch) with `rows`. The
+    /// shipped catalog is empty until the first model is pinned, so this is
+    /// how those paths are exercised end to end. Emits nothing.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_set_model_catalog(&self, rows: &'static [model_catalog::CatalogRow]) {
+        *self
+            .inner
+            .model_catalog
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rows;
     }
 
     /// Add a new agent participant to a space. Emits [`Change::Participants`].
@@ -16491,23 +16695,16 @@ async fn model_notices_for(
     }
     let canonical = backends::qualified_model_id(&mref.model, &mref.backend_id);
     let last = db::last_model_sha256(conn, space_id, participant_id, &canonical).await?;
+    let acknowledged =
+        db::acknowledged_model_update(conn, space_id, participant_id, &canonical).await?;
     let today = &post_stamp(now_ms())[..10];
     Ok(model_catalog::notices(
         catalog,
         &mref.model,
         last.as_deref(),
+        acknowledged.as_deref(),
         today,
     ))
-}
-
-/// The identity of the Eidola model a selection names
-/// (`model_catalog::identity`): its weights hash, tags, source repository and
-/// revision, per-file manifest and lifecycle, with the page that says how to
-/// check them independently. `None` for a selection on another backend, or
-/// one this build's catalog does not know. A pure function of the catalog
-/// compiled into this build.
-pub fn model_identity(selection: &str) -> Option<model_catalog::ModelIdentity> {
-    model_identity_in(model_catalog::CATALOG, selection)
 }
 
 /// The identity of the Eidola model `selection` names in `catalog`.

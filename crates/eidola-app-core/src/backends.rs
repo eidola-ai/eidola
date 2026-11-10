@@ -829,6 +829,8 @@ impl Inner {
                             context_tokens, ..
                         } => Some(ModelInfo {
                             id: m.id,
+                            sha256: None,
+                            tags: Vec::new(),
                             context_length: context_tokens as u64,
                             // A local model is a file someone supplied. What
                             // it can do is a property of the chat template
@@ -845,6 +847,8 @@ impl Inner {
                         crate::local_models::LocalModelStatus::Available
                         | crate::local_models::LocalModelStatus::Loading => Some(ModelInfo {
                             id: m.id,
+                            sha256: None,
+                            tags: Vec::new(),
                             context_length: 0,
                             max_output_tokens: None,
                             output_budget_class: None,
@@ -867,6 +871,8 @@ impl Inner {
 fn plain_model_info(id: String) -> ModelInfo {
     ModelInfo {
         id,
+        sha256: None,
+        tags: Vec::new(),
         context_length: 0,
         max_output_tokens: None,
         output_budget_class: None,

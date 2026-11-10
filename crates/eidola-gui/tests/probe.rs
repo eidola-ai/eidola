@@ -1150,6 +1150,8 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
         s.models = vec![
             ModelInfo {
                 id: "gemma4-31b".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1160,6 +1162,8 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
             },
             ModelInfo {
                 id: "kimi-k2-6".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 262_144,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1170,6 +1174,8 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
             },
             ModelInfo {
                 id: "qwen3-coder-watt".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -4858,6 +4864,123 @@ fn same_name_on_two_backends() -> eidola_app_core::LocalModelsState {
 /// tree, and two backends serving the same model name give a screen reader two
 /// rows it cannot tell apart. On the router picker that ambiguity is also the
 /// billing difference. One helper serves both pickers, so this pins both.
+/// The Eidola model fixture the identity and pin probes read: one tag that
+/// has moved onto newer weights.
+const PICKER_HASH: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const PICKER_FILES: &[eidola_app_core::model_catalog::WeightsFile] =
+    &[eidola_app_core::model_catalog::WeightsFile {
+        path: "model.safetensors",
+        size: 9,
+        sha256: "5555555555555555555555555555555555555555555555555555555555555555",
+    }];
+const PICKER_CATALOG: &[eidola_app_core::model_catalog::CatalogRow] =
+    &[eidola_app_core::model_catalog::CatalogRow {
+        sha256: PICKER_HASH,
+        tags: &["gemma4-31b"],
+        name: "Gemma 4 31B",
+        repo: "example/fixture",
+        revision: "6666666666666666666666666666666666666666",
+        files: PICKER_FILES,
+        lifecycle: eidola_app_core::model_catalog::Lifecycle::Current,
+    }];
+
+/// **The picker can pin, and says what it pins to.** Beside following an
+/// Eidola tag, each model the catalog publishes a hash for is offered pinned
+/// to those weights (stored `tag@sha256:<hex>@eidola`, shown with the start
+/// of the hash); and the field shows the chosen model's weights hash, its
+/// source and where to check it. A notice with an action carries its button
+/// on the row.
+#[gpui::test]
+fn the_model_picker_offers_a_pin_and_shows_the_weights(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    let _guard = probes_on();
+    let (space, mut roster) = probe_participants();
+    roster[1].model_notices = vec![
+        ModelNotice::NewerAvailable {
+            tag: "gemma4-31b".into(),
+            newer_sha256: PICKER_HASH.into(),
+        },
+        ModelNotice::Updated {
+            tag: "gemma4-31b".into(),
+            previous_sha256: "1".repeat(64),
+            current_sha256: PICKER_HASH.into(),
+        },
+    ];
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some((space, roster));
+        s.space_settings = Some(("demo".into(), eidola_app_core::SpaceSettings::default()));
+        s.model_catalog = PICKER_CATALOG;
+        s.models = vec![ModelInfo {
+            id: "gemma4-31b".into(),
+            sha256: Some(PICKER_HASH.into()),
+            tags: vec!["gemma4-31b".into()],
+            context_length: 131_072,
+            max_output_tokens: None,
+            output_budget_class: None,
+            capabilities: ModelCapabilities::default(),
+            prompt_credits_per_token: 0.53,
+            completion_credits_per_token: 1.5,
+            request_credits: None,
+        }];
+    });
+    let (window, view) = open_participants_inspector_with(cx, stores);
+
+    // The notices' actions sit on the row.
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/inspector/participants/agent-1/notice/0/switch",
+        gpui::Role::Button,
+        "Switch to the newer weights",
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/participants/agent-1/notice/1/dismiss",
+        gpui::Role::Button,
+        "Dismiss",
+    );
+
+    // The add form's picker: follow, or pin to these weights.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_begin_add_participant(window, cx);
+            v.inspector_open_add_picker_for_test(cx);
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    let options: Vec<String> = entries
+        .iter()
+        .filter(|(n, _)| n.starts_with("space/inspector/participants/add/model/option/"))
+        .map(|(_, e)| e.label.to_string())
+        .collect();
+    assert!(
+        options.iter().any(|l| l.starts_with("gemma4-31b · ")),
+        "following the tag is offered: {options:?}"
+    );
+    assert!(
+        options
+            .iter()
+            .any(|l| l.starts_with("gemma4-31b, pinned to 222222222222… · ")),
+        "pinning those weights is offered: {options:?}"
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/participants/add/model/weights",
+        gpui::Role::Label,
+        "Weights 222222222222… from example/fixture@6666666",
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/participants/add/model/verify",
+        gpui::Role::Label,
+        "Check these weights yourself: https://www.eidola.ai/docs/model-identity/",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn model_picker_options_name_their_backend(cx: &mut TestAppContext) {
     let _guard = probes_on();

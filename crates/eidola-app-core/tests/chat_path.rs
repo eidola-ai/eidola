@@ -11220,3 +11220,215 @@ fn an_answer_from_new_weights_announces_the_participants_change() {
         assert_eq!(participants_in(&mut rx), 0);
     });
 }
+
+// ---------------------------------------------------------------------------
+// Notices, identity and the notice actions, end to end over a fixture catalog
+// (the shipped catalog is empty until the first model is pinned).
+// ---------------------------------------------------------------------------
+
+use eidola_app_core::model_catalog::{CatalogRow, Lifecycle, ModelNotice, WeightsFile};
+
+const FIXTURE_FILES: &[WeightsFile] = &[WeightsFile {
+    path: "model.safetensors",
+    size: 9,
+    sha256: "5555555555555555555555555555555555555555555555555555555555555555",
+}];
+
+/// The catalog a client built after a release moved [`MODEL`] from
+/// [`HASH_1`] (now deprecated) to [`HASH_2`].
+const MOVED_CATALOG: &[CatalogRow] = &[
+    CatalogRow {
+        sha256: HASH_2,
+        tags: &[MODEL],
+        name: "Fixture",
+        repo: "example/fixture",
+        revision: "6666666666666666666666666666666666666666",
+        files: FIXTURE_FILES,
+        lifecycle: Lifecycle::Current,
+    },
+    CatalogRow {
+        sha256: HASH_1,
+        tags: &[],
+        name: "Fixture (previous)",
+        repo: "example/fixture",
+        revision: "7777777777777777777777777777777777777777",
+        files: FIXTURE_FILES,
+        lifecycle: Lifecycle::Deprecated {
+            retire_after: "2099-01-01",
+        },
+    },
+];
+
+/// The participant answering as [`MODEL`] in `space`.
+fn answering(core: &AppCore, space: &str) -> eidola_app_core::ParticipantInfo {
+    core.runtime()
+        .block_on(core.list_space_participants(space.to_string()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.model_ref.as_deref() == Some(MODEL))
+        .expect("the answering agent")
+}
+
+/// A followed tag that moved shows "model updated" after an answer from the
+/// earlier weights; dismissing it writes the acknowledgement, announces the
+/// roster, and keeps it dismissed; dismissing again is refused as stale.
+#[test]
+fn a_moved_tags_update_notice_is_shown_and_can_be_dismissed() {
+    run(|| {
+        let config = MockConfig::default();
+        *config.published_sha256.lock().unwrap() = Some(HASH_1.to_string());
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        core.test_set_model_catalog(MOVED_CATALOG);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("on the old weights".into(), MODEL.into(), None))
+            .expect("turn");
+        let space = first.space_id.clone();
+        let agent = answering(&core, &space);
+        assert_eq!(
+            agent.model_notices,
+            vec![ModelNotice::Updated {
+                tag: MODEL.into(),
+                previous_sha256: HASH_1.into(),
+                current_sha256: HASH_2.into(),
+            }]
+        );
+
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.dismiss_model_update(space.clone(), agent.id.clone()))
+            .expect("dismiss");
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Change::Participants))
+        );
+        assert_eq!(answering(&core, &space).model_notices, vec![]);
+        match core
+            .runtime()
+            .block_on(core.dismiss_model_update(space, agent.id))
+        {
+            Err(AppError::ModelNoticeStale { .. }) => {}
+            other => panic!("expected ModelNoticeStale, got {other:?}"),
+        }
+    });
+}
+
+/// A pin whose tag has moved is offered the newer weights (and told its own
+/// retire); the one-click switch re-pins it to them in this conversation,
+/// after which nothing is left to say and a second switch is refused.
+#[test]
+fn a_pin_whose_tag_moved_can_switch_to_the_newer_weights() {
+    run(|| {
+        let config = MockConfig::default();
+        *config.published_sha256.lock().unwrap() = Some(HASH_1.to_string());
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        core.test_set_model_catalog(MOVED_CATALOG);
+        let first = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("turn");
+        let space = first.space_id.clone();
+        let agent = answering(&core, &space);
+        let old_pin = format!("{MODEL}@sha256:{HASH_1}@eidola");
+        if agent.source == "referenced" {
+            core.runtime()
+                .block_on(core.set_space_participant_override(
+                    space.clone(),
+                    agent.id.clone(),
+                    eidola_app_core::ParticipantOverride {
+                        model_ref: Some(Some(old_pin.clone())),
+                        ..Default::default()
+                    },
+                ))
+                .expect("pin");
+        } else {
+            core.runtime()
+                .block_on(core.update_space_participant(
+                    agent.id.clone(),
+                    eidola_app_core::ParticipantUpdate {
+                        label: None,
+                        model_ref: Some(Some(old_pin.clone())),
+                        system_prompt: None,
+                        notify_policy: None,
+                    },
+                    eidola_app_core::ExpectedScope::Any,
+                ))
+                .expect("pin");
+        }
+        let pinned = core
+            .runtime()
+            .block_on(core.list_space_participants(space.clone()))
+            .expect("participants")
+            .into_iter()
+            .find(|p| p.id == agent.id)
+            .unwrap();
+        assert_eq!(
+            pinned.model_notices,
+            vec![
+                ModelNotice::NewerAvailable {
+                    tag: MODEL.into(),
+                    newer_sha256: HASH_2.into(),
+                },
+                ModelNotice::Retiring {
+                    retire_after: "2099-01-01".into(),
+                    past: false,
+                },
+            ]
+        );
+
+        let selection = core
+            .runtime()
+            .block_on(core.switch_to_newer_weights(space.clone(), agent.id.clone()))
+            .expect("switch");
+        assert_eq!(selection, format!("{MODEL}@sha256:{HASH_2}@eidola"));
+        let switched = core
+            .runtime()
+            .block_on(core.list_space_participants(space.clone()))
+            .expect("participants")
+            .into_iter()
+            .find(|p| p.id == agent.id)
+            .unwrap();
+        assert_eq!(switched.model_ref.as_deref(), Some(selection.as_str()));
+        assert_eq!(switched.model_notices, vec![]);
+        assert!(matches!(
+            core.runtime()
+                .block_on(core.switch_to_newer_weights(space, agent.id)),
+            Err(AppError::ModelNoticeStale { .. })
+        ));
+    });
+}
+
+/// A model's identity, and the pins a picker offers, come from the catalog:
+/// the hash, its source and manifest, the page to check them against.
+#[test]
+fn a_models_identity_and_pins_come_from_the_catalog() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig::default());
+        assert!(
+            core.model_identity(MODEL).is_none(),
+            "the shipped catalog is empty"
+        );
+        core.test_set_model_catalog(MOVED_CATALOG);
+        let identity = core.model_identity(MODEL).expect("identity");
+        assert_eq!(identity.sha256, HASH_2);
+        assert_eq!(identity.repo, "example/fixture");
+        assert_eq!(identity.files.len(), 1);
+        assert_eq!(
+            identity.doc_url,
+            eidola_app_core::model_catalog::MODEL_IDENTITY_DOC
+        );
+        let pinned = core
+            .model_identity(&format!("{MODEL}@sha256:{HASH_1}@eidola"))
+            .expect("pinned identity");
+        assert_eq!(pinned.lifecycle, "deprecated");
+        assert!(core.model_identity("gemma-4-e2b@local").is_none());
+        assert_eq!(
+            core.model_pins(),
+            vec![(MODEL.to_string(), format!("{MODEL}@sha256:{HASH_2}@eidola"))]
+        );
+    });
+}

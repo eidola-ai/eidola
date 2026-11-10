@@ -2123,6 +2123,8 @@ impl Inner {
 fn engine_model_info(id: String, context_tokens: u32) -> ModelInfo {
     ModelInfo {
         id,
+        sha256: None,
+        tags: Vec::new(),
         context_length: u64::from(context_tokens),
         max_output_tokens: None,
         output_budget_class: None,

@@ -1789,6 +1789,8 @@ fn model_stores(cx: &mut App) -> Stores {
         s.models = vec![
             ModelInfo {
                 id: "gemma4-31b".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: Some(16_384),
                 output_budget_class: Some(OutputBudgetClass::Reasoning),
@@ -1804,6 +1806,8 @@ fn model_stores(cx: &mut App) -> Stores {
             },
             ModelInfo {
                 id: "kimi-k2-6".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 262_144,
                 max_output_tokens: Some(32_768),
                 output_budget_class: Some(OutputBudgetClass::Reasoning),
@@ -1822,6 +1826,8 @@ fn model_stores(cx: &mut App) -> Stores {
             // picker has to render one.
             ModelInfo {
                 id: "qwen3-coder-watt".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1836,6 +1842,8 @@ fn model_stores(cx: &mut App) -> Stores {
             // imply we sell one.
             ModelInfo {
                 id: "per-request-example".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 0,
                 max_output_tokens: None,
                 output_budget_class: None,

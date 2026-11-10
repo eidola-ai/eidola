@@ -1552,23 +1552,12 @@ impl SpaceView {
                     // updated tag, a newer model for a pin, a retirement — on
                     // the row itself, open or closed: a notice found only by
                     // opening the editor is not given.
-                    .children(p.model_notices.iter().enumerate().map(|(i, notice)| {
-                        let text = crate::participants::model_notice_text(notice, cx);
-                        div()
-                            .id(SharedString::from(format!(
-                                "space-inspector-p-{pid}-notice-{i}"
-                            )))
-                            .probe(
-                                SharedString::from(format!(
-                                    "space/inspector/participants/{pid}/notice/{i}"
-                                )),
-                                gpui::Role::Label,
-                                text.clone(),
-                            )
-                            .text_xs()
-                            .text_color(theme.warning)
-                            .child(text)
-                    })),
+                    .children(
+                        p.model_notices
+                            .iter()
+                            .enumerate()
+                            .map(|(i, notice)| self.render_model_notice(&pid, i, notice, cx)),
+                    ),
             )
             // The chevron says the row opens; its state is on the row's own node
             // (`aria_expanded`), so this is decoration.
@@ -1591,6 +1580,76 @@ impl SpaceView {
             wrap = wrap.child(self.render_inspector_participant_editor(p, cx));
         }
         wrap.into_any_element()
+    }
+
+    /// One model notice on a participant's row: the sentence, and its action
+    /// where it has one — **switch** a pin to the newer weights its tag names
+    /// now (in this conversation), or **dismiss** a followed tag's "model
+    /// updated" notice until the tag moves again. The action's click does not
+    /// reach the row behind it, which would open the editor.
+    fn render_model_notice(
+        &self,
+        pid: &str,
+        i: usize,
+        notice: &eidola_app_core::model_catalog::ModelNotice,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use eidola_app_core::model_catalog::ModelNotice;
+        let warning = cx.theme().warning;
+        let text = crate::participants::model_notice_text(notice, cx);
+        let line = div()
+            .id(SharedString::from(format!(
+                "space-inspector-p-{pid}-notice-{i}"
+            )))
+            .probe(
+                SharedString::from(format!("space/inspector/participants/{pid}/notice/{i}")),
+                gpui::Role::Label,
+                text.clone(),
+            )
+            .text_xs()
+            .text_color(warning)
+            .child(text);
+        let action = match notice {
+            ModelNotice::NewerAvailable { .. } => Some((
+                "switch",
+                crate::i18n::msg::participants_model_switch_newer(cx),
+            )),
+            ModelNotice::Updated { .. } => Some((
+                "dismiss",
+                crate::i18n::msg::participants_model_dismiss_update(cx),
+            )),
+            _ => None,
+        };
+        let Some((verb, label)) = action else {
+            return line.into_any_element();
+        };
+        let space_id = self.space_id(cx);
+        let participants = self.stores.participants.clone();
+        let target = pid.to_string();
+        let button = crate::participants::ghost_button(
+            SharedString::from(format!("space-inspector-p-{pid}-notice-{i}-{verb}")),
+            SharedString::from(format!(
+                "space/inspector/participants/{pid}/notice/{i}/{verb}"
+            )),
+            label,
+            false,
+            cx,
+            move |_, _, cx| {
+                cx.stop_propagation();
+                let (space_id, target) = (space_id.clone(), target.clone());
+                participants.update(cx, |store, cx| match verb {
+                    "switch" => store.switch_to_newer_weights(space_id, target, cx),
+                    _ => store.dismiss_model_update(space_id, target, cx),
+                });
+            },
+        );
+        h_flex()
+            .gap_2()
+            .items_center()
+            .flex_wrap()
+            .child(line)
+            .child(button)
+            .into_any_element()
     }
 
     /// The open disclosure's body — the fork (when referenced), name, model,

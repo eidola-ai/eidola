@@ -2931,6 +2931,8 @@ fn inspector_participants_render_with_scroll_indicator(cx: &mut TestAppContext) 
         s.models = (0..12)
             .map(|i| eidola_app_core::ModelInfo {
                 id: format!("model-{i:02}"),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
