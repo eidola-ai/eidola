@@ -1483,4 +1483,95 @@ mod tests {
             .expect("refund applies");
         assert_eq!(successor.credits(), Scalar::from(900_000u128));
     }
+
+    /// An upstream that answers a stream's headers and then goes quiet, so
+    /// the server's stream task sits waiting on bytes that never come.
+    async fn upstream_that_opens_a_stream_and_stalls() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0u8; 8192];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                          transfer-encoding: chunked\r\n\r\n",
+                    )
+                    .await;
+                held.push(socket);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A stream task notices a departed client only when it sends the next
+    /// chunk — and an upstream that sent its headers and then stalled never
+    /// produces one. Left at that, the task holds the settling mark for as
+    /// long as the upstream stays quiet, and recovery answers "retry shortly"
+    /// for just as long: the mark would have turned the provisional refund
+    /// this branch added back into the lost credential it replaced. The task
+    /// must notice the departure on its own and settle the spend.
+    #[tokio::test]
+    #[ignore]
+    async fn a_departed_client_releases_a_stream_the_upstream_left_idle() {
+        let upstream = upstream_that_opens_a_stream_and_stalls().await;
+        let (state, key_hash) =
+            recovery_state_at(crate::helpers::EpochConfig::default(), Some(upstream)).await;
+        let (act, _) = spend_under(&state, key_hash, None, 1_000_000, 100_000).await;
+        let key_id = hex::encode(act.issuer_key_hash);
+        let nullifier = act.spend_proof.nullifier().as_bytes().to_vec();
+
+        let (router, _) = crate::build_router()
+            .with_state(state.clone())
+            .split_for_parts();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        // The stream opens as soon as the upstream's headers arrive; the
+        // spend is recorded and marked by then.
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("authorization", authorization(&act))
+            .json(&serde_json::json!({
+                "model": "glm-5-3-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": 16,
+                "stream": true,
+            }))
+            .send()
+            .await
+            .expect("the stream opens once the upstream answers its headers");
+        assert!(response.status().is_success(), "{}", response.status());
+        assert_eq!(nullifier_rows(&state, &act).await, 1);
+        assert!(
+            state.settling.is_settling(&key_id, &nullifier),
+            "the stream task holds the settling mark while the stream is open"
+        );
+
+        // The client leaves without reading a byte. Nothing upstream will
+        // ever prompt a send, so only the task watching its receiver can
+        // notice.
+        drop(response);
+        for _ in 0..200 {
+            if !state.settling.is_settling(&key_id, &nullifier) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !state.settling.is_settling(&key_id, &nullifier),
+            "the stream task releases its mark once the client is gone"
+        );
+
+        // The departed client's spend settled with a zero refund, which is
+        // what recovery now serves.
+        recover_refund(TokenAuth(copy_of(&act)), State(state.clone()))
+            .await
+            .map(|Json(r)| r.refund)
+            .unwrap_or_else(|e| panic!("the abandoned stream must be recoverable, got {e:?}"));
+    }
 }

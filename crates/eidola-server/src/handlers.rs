@@ -215,9 +215,15 @@ async fn issue_refund_async(
 /// restart empties the set, and in both cases nothing can settle the spend
 /// any more, so the provisional refund is the right answer. One process per
 /// database today; replicas would need this marker shared.
+///
+/// The mark is taken **before** the nullifier row is written, so recovery can
+/// never observe the provisional row unmarked. Marks are therefore counted,
+/// not set: two requests presenting the same credential both mark it before
+/// the database refuses the second, and the loser's release must not unmark
+/// the winner's spend.
 #[derive(Clone, Default)]
 pub struct SettlingSpends {
-    inner: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<SpendKey>>>,
+    inner: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<SpendKey, usize>>>,
 }
 
 /// `(issuer_key_id, nullifier)`, the nullifier table's primary key.
@@ -227,10 +233,12 @@ impl SettlingSpends {
     /// Mark a spend as settling until the returned guard drops.
     pub fn begin(&self, issuer_key_id: String, nullifier: Vec<u8>) -> SettlingSpend {
         let key = (issuer_key_id, nullifier);
-        self.inner
+        *self
+            .inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key.clone());
+            .entry(key.clone())
+            .or_insert(0) += 1;
         SettlingSpend {
             set: self.clone(),
             key,
@@ -242,7 +250,7 @@ impl SettlingSpends {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(&(issuer_key_id.to_string(), nullifier.to_vec()))
+            .contains_key(&(issuer_key_id.to_string(), nullifier.to_vec()))
     }
 }
 
@@ -254,11 +262,13 @@ pub struct SettlingSpend {
 
 impl Drop for SettlingSpend {
     fn drop(&mut self) {
-        self.set
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.key);
+        let mut marks = self.set.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = marks.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                marks.remove(&self.key);
+            }
+        }
     }
 }
 
@@ -495,11 +505,18 @@ async fn chat_completions_phases(
     // for a stream. Recovery refuses to hand out the provisional refund while
     // the mark is held, so a client that recovers in the window between the
     // last chunk and the settled refund's UPDATE waits instead of spending
-    // its one successor on the full hold.
+    // its one successor on the full hold. The mark is taken before the row
+    // is written: recovery reads the row the instant the INSERT commits, and
+    // a mark taken after that commit leaves a window in which the row is
+    // visible and unmarked. If the insert loses (a duplicate nullifier) or
+    // fails, the early return drops the guard and releases the mark.
     let key_id = hex::encode(act.issuer_key_hash);
     let nullifier = act.spend_proof.nullifier();
     let nullifier_bytes = nullifier.as_bytes().to_vec();
     let provisional = mint_refund(state, &act.spend_proof, &act.issuer_key_hash, 0).await?;
+    let settling = state
+        .settling
+        .begin(key_id.clone(), nullifier_bytes.clone());
     let recorded = db::record_nullifier_with_refund(
         &state.db_pool,
         &key_id,
@@ -513,7 +530,6 @@ async fn chat_completions_phases(
             message: "credential already spent (duplicate nullifier)".to_string(),
         });
     }
-    let settling = state.settling.begin(key_id, nullifier_bytes);
 
     // --- POINT OF NO RETURN: nullifier is recorded ---
     // From here on, we MUST issue a refund on any error.
@@ -943,7 +959,25 @@ async fn handle_streaming_request(
         let mut final_usage: Option<Usage> = None;
         let mut timing = StreamTiming::new(model_id.clone(), dispatched_at);
 
-        while let Some(event_result) = upstream_rx.recv().await {
+        loop {
+            // A client that leaves is otherwise noticed only by the next
+            // `tx.send`, and an upstream that has sent its headers and then
+            // gone quiet never produces one — so this task would hold the
+            // settling mark forever and recovery would answer "retry shortly"
+            // forever. Watching the receiver's side settles such a spend as
+            // soon as the client is gone.
+            let event_result = tokio::select! {
+                event = upstream_rx.recv() => match event {
+                    Some(event) => event,
+                    None => break,
+                },
+                () = tx.closed() => {
+                    warn!("Client disconnected while the upstream was idle, issuing zero refund");
+                    timing.finish("client_disconnect", None, Instant::now());
+                    let _ = try_refund(&state, &spend_proof_cbor, &issuer_key_hash, 0).await;
+                    return;
+                }
+            };
             match event_result {
                 Ok(BackendStreamEvent::Chunk(chunk, at)) => {
                     if carries_output(&chunk) {
