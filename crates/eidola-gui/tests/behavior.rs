@@ -8863,6 +8863,141 @@ fn inspector_participant_system_prompt_round_trips(cx: &mut TestAppContext) {
     drain_runtime(&core);
 }
 
+const SWITCH_OLD: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const SWITCH_NEW: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const SWITCH_FILES: &[eidola_app_core::model_catalog::WeightsFile] =
+    &[eidola_app_core::model_catalog::WeightsFile {
+        path: "model.safetensors",
+        size: 9,
+        sha256: "5555555555555555555555555555555555555555555555555555555555555555",
+    }];
+/// A catalog whose `switch-fixture` tag has moved from [`SWITCH_OLD`] to
+/// [`SWITCH_NEW`].
+const SWITCH_CATALOG: &[eidola_app_core::model_catalog::CatalogRow] = &[
+    eidola_app_core::model_catalog::CatalogRow {
+        sha256: SWITCH_NEW,
+        tags: &["switch-fixture"],
+        name: "Switch fixture",
+        repo: "example/fixture",
+        revision: "6666666666666666666666666666666666666666",
+        files: SWITCH_FILES,
+        lifecycle: eidola_app_core::model_catalog::Lifecycle::Current,
+    },
+    eidola_app_core::model_catalog::CatalogRow {
+        sha256: SWITCH_OLD,
+        tags: &[],
+        name: "Switch fixture (previous)",
+        repo: "example/fixture",
+        revision: "7777777777777777777777777777777777777777",
+        files: SWITCH_FILES,
+        lifecycle: eidola_app_core::model_catalog::Lifecycle::Current,
+    },
+];
+
+/// **A Save while a switch to newer weights is in flight keeps the switch.**
+/// The editor shows the model the switch replaces until the roster shows the
+/// switch landed, and the store runs the Save after the switch: written whole,
+/// the Save would put the old pin back. It writes the label and leaves the
+/// model to the switch.
+#[gpui::test]
+fn a_save_racing_a_weights_switch_keeps_the_newer_pin(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    let (stores, core, _dir, space) = participants_scene(cx);
+    core.test_set_model_catalog(SWITCH_CATALOG);
+    let old_pin = format!("switch-fixture@sha256:{SWITCH_OLD}@eidola");
+    let new_pin = format!("switch-fixture@sha256:{SWITCH_NEW}@eidola");
+    let agent = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .unwrap()
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the default template seeds one agent");
+    if agent.source == "referenced" {
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                space.clone(),
+                agent.id.clone(),
+                eidola_app_core::ParticipantOverride {
+                    model_ref: Some(Some(old_pin.clone())),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+    } else {
+        core.runtime()
+            .block_on(core.update_space_participant(
+                agent.id.clone(),
+                eidola_app_core::ParticipantUpdate {
+                    label: None,
+                    model_ref: Some(Some(old_pin.clone())),
+                    system_prompt: None,
+                    notify_policy: None,
+                },
+                eidola_app_core::ExpectedScope::Any,
+            ))
+            .unwrap();
+    }
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    let agent_id = agent.id.clone();
+    wait_until(cx, "the pin's notice", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space).iter().any(|p| {
+                p.id == agent_id
+                    && p.model_notices
+                        .iter()
+                        .any(|n| matches!(n, ModelNotice::NewerAvailable { .. }))
+            })
+        })
+    });
+    let notice = ModelNotice::NewerAvailable {
+        tag: "switch-fixture".into(),
+        newer_sha256: SWITCH_NEW.into(),
+    };
+
+    // Open the editor, switch, and Save a label change before any re-read.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent_id, window, cx)
+        });
+    })
+    .unwrap();
+    let label = view
+        .read_with(cx, |v, _| v.inspector_editing_label_state())
+        .expect("the editor");
+    cx.update_window(window, |_, window, cx| {
+        label.update(cx, |s, cx| s.set_value("Renamed", window, cx));
+        view.update(cx, |v, cx| {
+            v.inspector_act_on_model_notice(&agent_id, &notice, window, cx);
+            v.inspector_save_participant_edit(window, cx);
+        });
+    })
+    .unwrap();
+
+    wait_until(cx, "both writes settled", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .any(|p| p.id == agent_id && p.label == "Renamed")
+        })
+    });
+    let stored = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .unwrap()
+        .into_iter()
+        .find(|p| p.id == agent_id)
+        .unwrap();
+    assert_eq!(stored.label, "Renamed");
+    assert_eq!(
+        stored.model_ref.as_deref(),
+        Some(new_pin.as_str()),
+        "the switch held"
+    );
+
+    drain_runtime(&core);
+}
+
 /// The headline fork: editing a **referenced global** ("You") writes either the
 /// shared config (edit everywhere) or a per-space override (override here). The
 /// view routes to the right store method per its mode.

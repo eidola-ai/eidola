@@ -647,6 +647,21 @@ impl SpaceView {
         let system_prompt = edit.system_prompt.read(cx).value().trim().to_string();
         let is_agent = edit.kind == "agent";
         let pid = edit.participant_id.clone();
+        // **A Save while a switch to newer weights is in flight leaves the
+        // model to the switch.** The editor still shows the model the switch
+        // replaces (it follows only once the roster shows the switch landed),
+        // and the store runs this write after the switch: writing that model
+        // would put the old pin back. So where both write the same place —
+        // an owned agent's row, a shared agent's "This space" override — an
+        // unchanged model is left out of the save; a model the reader picked
+        // is still written, and a shared agent's "Everyone" save writes its
+        // global config, which the switch does not touch.
+        let writes_this_space = !(edit.is_referenced && edit.mode == EditMode::Everywhere);
+        let defer_model = writes_this_space
+            && self
+                .inspector_pending_switch
+                .as_ref()
+                .is_some_and(|p| p.participant_id == pid && edit.model_ref == p.previous);
 
         if edit.is_referenced && edit.mode == EditMode::OverrideHere {
             // Per-membership overrides. An empty model/prompt on a referenced
@@ -659,14 +674,19 @@ impl SpaceView {
                 ..Default::default()
             };
             if is_agent {
-                ov.model_ref = Some(edit.model_ref.clone().filter(|s| !s.is_empty()));
+                if !defer_model {
+                    ov.model_ref = Some(edit.model_ref.clone().filter(|s| !s.is_empty()));
+                }
                 ov.system_prompt = Some((!system_prompt.is_empty()).then_some(system_prompt));
             }
             self.stores
                 .participants
                 .update(cx, |s, cx| s.set_override(space_id, pid, ov, cx));
         } else {
-            let update = edit.as_everywhere_update(cx);
+            let mut update = edit.as_everywhere_update(cx);
+            if defer_model {
+                update.model_ref = None;
+            }
             // The premise the editor was seeded on: an owned row belongs to this
             // space, a referenced one is a shared identity. Either can move
             // under an open editor (promotion), and the write is where that is
