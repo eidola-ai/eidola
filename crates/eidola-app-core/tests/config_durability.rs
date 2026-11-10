@@ -109,3 +109,32 @@ fn the_config_holding_the_secret_is_private_to_its_owner() {
         .mode();
     assert_eq!(mode & 0o077, 0, "config.toml is mode {:o}", mode & 0o777);
 }
+
+/// Two setters at once — a zoom step on the GUI thread against a background
+/// account link, say. Each save publishes only its own bytes, but each is a
+/// read-modify-write of the whole file, so without one lock from load to
+/// rename the later rename wins with the earlier snapshot, and the field the
+/// other setter wrote is gone — the account secret, if that was the field.
+#[test]
+fn concurrent_setters_lose_no_update() {
+    let (core, dir) = make_core();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            for i in 0..200 {
+                core.set_language(Some(format!("lang-{i}"))).unwrap();
+            }
+        });
+        s.spawn(|| {
+            for i in 0..200 {
+                core.set_font_scale(1.0 + (i % 50) as f32 / 100.0).unwrap();
+            }
+            core.set_account_credentials("acct-1".into(), "s3cret-never-lost".into())
+                .unwrap();
+        });
+    });
+
+    let saved = Config::load_for_update(&config_path(&dir)).unwrap();
+    assert_eq!(saved.language_override.as_deref(), Some("lang-199"));
+    assert_eq!(saved.font_scale_override, Some(1.49));
+    assert_eq!(saved.account_secret.as_deref(), Some("s3cret-never-lost"));
+}
