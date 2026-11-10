@@ -385,7 +385,17 @@ impl Config {
     pub fn save_to(&self, path: &Path) -> Result<(), AppError> {
         use std::io::Write;
 
-        if let Some(parent) = path.parent() {
+        // Directories created here are synced in *their* parents below, after
+        // the rename: a directory's own entry lives one level up, and the
+        // parent sync at the end covers only entries inside the config
+        // directory. On a fresh profile that is the whole `eidola` directory.
+        let mut created_dirs = Vec::new();
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let mut dir = Some(parent);
+            while let Some(d) = dir.filter(|d| !d.as_os_str().is_empty() && !d.exists()) {
+                created_dirs.push(d.to_path_buf());
+                dir = d.parent();
+            }
             fs::create_dir_all(parent).map_err(|e| AppError::Config {
                 message: format!("failed to create config directory: {e}"),
             })?;
@@ -433,14 +443,27 @@ impl Config {
         // despite the successful result.
         #[cfg(unix)]
         {
-            let parent = match path.parent() {
-                Some(p) if !p.as_os_str().is_empty() => p,
-                _ => Path::new("."),
+            let sync_dir = |dir: &Path| {
+                let dir = if dir.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    dir
+                };
+                fs::File::open(dir)
+                    .and_then(|dir| dir.sync_all())
+                    .map_err(write_err)
             };
-            fs::File::open(parent)
-                .and_then(|dir| dir.sync_all())
-                .map_err(write_err)?;
+            sync_dir(path.parent().unwrap_or(Path::new(".")))?;
+            // Deepest first is not required; each created directory's entry
+            // is made durable in the directory that holds it.
+            for created in &created_dirs {
+                if let Some(holder) = created.parent() {
+                    sync_dir(holder)?;
+                }
+            }
         }
+        #[cfg(not(unix))]
+        let _ = created_dirs;
         Ok(())
     }
 }
