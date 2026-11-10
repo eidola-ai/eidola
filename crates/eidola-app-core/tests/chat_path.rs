@@ -7626,8 +7626,10 @@ fn a_credential_held_across_a_rotation_stays_spendable() {
     run(|| {
         let (_mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::OkStreaming,
+            // Wide enough for setup and the first turn on a loaded debug
+            // runner; the sleep below outlasts it.
             key_issuing_until: Some(
-                std::time::SystemTime::now() + std::time::Duration::from_secs(2),
+                std::time::SystemTime::now() + std::time::Duration::from_secs(5),
             ),
             ..MockConfig::default()
         });
@@ -7635,7 +7637,7 @@ fn a_credential_held_across_a_rotation_stays_spendable() {
 
         let first = turn(&core, "How do tides work?", None, None);
         // The key stops issuing; it is still accepted.
-        std::thread::sleep(std::time::Duration::from_millis(3_000));
+        std::thread::sleep(std::time::Duration::from_millis(6_000));
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
         let second = core.runtime().block_on(core.chat_stream_reply(
