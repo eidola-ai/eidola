@@ -38,21 +38,26 @@ fn verify_signature_at(
     now: SystemTime,
 ) -> Result<(), &'static str> {
     let mut timestamp: Option<&str> = None;
-    let mut signature: Option<&str> = None;
 
-    for part in header.split(',') {
+    for part in header.split(',').map(str::trim) {
         if let Some(val) = part.strip_prefix("t=") {
             timestamp = Some(val);
-        } else if let Some(val) = part.strip_prefix("v1=") {
-            signature = Some(val);
         }
     }
 
     let timestamp = timestamp.ok_or("missing timestamp")?;
-    let signature = signature.ok_or("missing v1 signature")?;
+    let mut signatures = header
+        .split(',')
+        .filter_map(|part| part.trim().strip_prefix("v1="))
+        .peekable();
+    if signatures.peek().is_none() {
+        return Err("missing v1 signature");
+    }
 
     let ts_secs: u64 = timestamp.parse().map_err(|_| "invalid timestamp")?;
-    let event_time = UNIX_EPOCH + Duration::from_secs(ts_secs);
+    let event_time = UNIX_EPOCH
+        .checked_add(Duration::from_secs(ts_secs))
+        .ok_or("invalid timestamp")?;
     if now.duration_since(event_time).unwrap_or(Duration::MAX) > MAX_SIGNATURE_AGE {
         return Err("stale timestamp");
     }
@@ -64,9 +69,17 @@ fn verify_signature_at(
     mac.update(body);
     let expected = mac.finalize().into_bytes();
 
-    let provided = hex::decode(signature).map_err(|_| "invalid hex signature")?;
+    // Stripe sends one v1 signature per active secret during rotation. Check
+    // every well-formed candidate without making its position significant.
+    let mut matches = subtle::Choice::from(0);
+    for signature in signatures {
+        let mut provided = [0_u8; 32];
+        if hex::decode_to_slice(signature, &mut provided).is_ok() {
+            matches |= expected.as_slice().ct_eq(&provided);
+        }
+    }
 
-    if expected.as_slice().ct_eq(&provided).into() {
+    if matches.into() {
         Ok(())
     } else {
         Err("signature mismatch")
@@ -246,6 +259,118 @@ mod tests {
         let header = make_signature(ts, TEST_BODY, TEST_SECRET);
         let now = UNIX_EPOCH + Duration::from_secs(ts);
         assert!(verify_signature_at(&header, TEST_BODY, TEST_SECRET, now).is_ok());
+    }
+
+    #[test]
+    fn secret_rotation_accepts_either_secret_in_either_order() {
+        let ts = 1_700_000_000;
+        let now = UNIX_EPOCH + Duration::from_secs(ts);
+        let old = make_signature(ts, TEST_BODY, TEST_SECRET);
+        let new = make_signature(ts, TEST_BODY, "whsec_rotated");
+        for (first, second) in [(&old, &new), (&new, &old)] {
+            let header = format!("{first}, {}", second.split_once(',').unwrap().1);
+            for secret in [TEST_SECRET, "whsec_rotated"] {
+                assert_eq!(verify_signature_at(&header, TEST_BODY, secret, now), Ok(()));
+            }
+            assert_eq!(
+                verify_signature_at(&header, TEST_BODY, "whsec_unrelated", now),
+                Err("signature mismatch")
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_signatures_do_not_hide_a_valid_v1() {
+        let ts = 1_700_000_000;
+        let now = UNIX_EPOCH + Duration::from_secs(ts);
+        let valid = make_signature(ts, TEST_BODY, TEST_SECRET);
+        for malformed in [
+            String::new(),
+            "not-hex".into(),
+            "ab".repeat(31),
+            "ab".repeat(33),
+        ] {
+            for header in [
+                format!("v1={malformed},{valid}"),
+                format!("{valid},v1={malformed}"),
+            ] {
+                assert_eq!(
+                    verify_signature_at(&header, TEST_BODY, TEST_SECRET, now),
+                    Ok(())
+                );
+            }
+            assert_eq!(
+                verify_signature_at(
+                    &format!("t={ts},v1={malformed}"),
+                    TEST_BODY,
+                    TEST_SECRET,
+                    now
+                ),
+                Err("signature mismatch")
+            );
+        }
+    }
+
+    #[test]
+    fn other_signature_versions_do_not_authenticate() {
+        let ts = 1_700_000_000;
+        let now = UNIX_EPOCH + Duration::from_secs(ts);
+        let valid = make_signature(ts, TEST_BODY, TEST_SECRET);
+        for version in ["v0=", "v2=", "unknown="] {
+            let header = valid.replace("v1=", version);
+            assert_eq!(
+                verify_signature_at(&header, TEST_BODY, TEST_SECRET, now),
+                Err("missing v1 signature")
+            );
+            assert_eq!(
+                verify_signature_at(
+                    &format!("{header},v1={}", "00".repeat(32)),
+                    TEST_BODY,
+                    TEST_SECRET,
+                    now
+                ),
+                Err("signature mismatch")
+            );
+        }
+    }
+
+    #[test]
+    fn rotation_still_authenticates_the_exact_body_and_timestamp() {
+        let ts = 1_700_000_000;
+        let old = make_signature(ts, TEST_BODY, TEST_SECRET);
+        let new = make_signature(ts, TEST_BODY, "whsec_rotated");
+        let header = format!("{old},{}", new.split_once(',').unwrap().1);
+        for secret in [TEST_SECRET, "whsec_rotated"] {
+            assert_eq!(
+                verify_signature_at(
+                    &header,
+                    b"{ \"id\": \"evt_test\" }",
+                    secret,
+                    UNIX_EPOCH + Duration::from_secs(ts)
+                ),
+                Err("signature mismatch")
+            );
+            for now in [ts - 1, ts + 301] {
+                assert_eq!(
+                    verify_signature_at(
+                        &header,
+                        TEST_BODY,
+                        secret,
+                        UNIX_EPOCH + Duration::from_secs(now)
+                    ),
+                    Err("stale timestamp")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unrepresentable_timestamp_is_rejected() {
+        let header = make_signature(u64::MAX, TEST_BODY, TEST_SECRET);
+        assert_eq!(
+            verify_signature_at(&header, TEST_BODY, TEST_SECRET, UNIX_EPOCH),
+            Err("invalid timestamp")
+        );
     }
 
     #[test]
