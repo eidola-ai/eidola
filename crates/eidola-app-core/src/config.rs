@@ -396,20 +396,35 @@ impl Config {
         let write_err = |e: std::io::Error| AppError::Config {
             message: format!("failed to write config: {e}"),
         };
-        let tmp = path.with_extension("toml.tmp");
-        // A leftover from an interrupted save may carry other permissions;
-        // `create_new` below must make the file this call writes.
-        let _ = fs::remove_file(&tmp);
+        // One temporary file per call, never a shared name: two saves can
+        // overlap (a background account create against a GUI preference
+        // write), and with one shared sibling the second could unlink the
+        // first's open file and the first then rename the second's
+        // half-written one into place — a torn file, and possibly the only
+        // copy of the account secret. With its own name, a call can only
+        // publish the bytes it wrote and synced; `create_new` makes that a
+        // guarantee rather than a convention. A crash between create and
+        // rename leaves a `config.toml.<id>.tmp` behind, owner-only and
+        // inert.
+        let tmp = path.with_extension(format!("toml.{}.tmp", uuid::Uuid::new_v4().simple()));
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut file = options.open(&tmp).map_err(write_err)?;
-        file.write_all(contents.as_bytes())
+        let written = file
+            .write_all(contents.as_bytes())
             .and_then(|()| file.sync_all())
-            .map_err(write_err)?;
+            .map_err(write_err);
         drop(file);
-        fs::rename(&tmp, path).map_err(write_err)
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        fs::rename(&tmp, path).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            write_err(e)
+        })
     }
 }
 
@@ -688,5 +703,48 @@ mod tests {
             parsed.update_feed_override.as_deref(),
             Some("http://localhost:8123")
         );
+    }
+
+    /// Saves can overlap (a background account create against a GUI
+    /// preference write). Each must publish only the bytes it wrote: every
+    /// save succeeds, nothing is left beside the file, and what is on disk
+    /// is one save's whole output — never a torn or empty file.
+    #[test]
+    fn overlapping_saves_each_publish_a_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let cfg = Config {
+                        account_id: Some(format!("account-{i}")),
+                        account_secret: Some(format!("secret-{i}")),
+                        ..Config::default()
+                    };
+                    for _ in 0..50 {
+                        cfg.save_to(&path).expect("every save succeeds");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let saved = Config::load_for_update(&path).expect("the file on disk is whole");
+        let id = saved.account_id.expect("one save's account");
+        let secret = saved.account_secret.expect("with its secret");
+        assert_eq!(
+            id.strip_prefix("account-"),
+            secret.strip_prefix("secret-"),
+            "the file is one save's output, not two interleaved"
+        );
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "config.toml")
+            .collect();
+        assert!(leftovers.is_empty(), "stray temporaries: {leftovers:?}");
     }
 }
