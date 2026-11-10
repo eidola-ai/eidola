@@ -648,21 +648,7 @@ impl SpaceView {
         let system_prompt = edit.system_prompt.read(cx).value().trim().to_string();
         let is_agent = edit.kind == "agent";
         let pid = edit.participant_id.clone();
-        // **A Save while a switch to newer weights is in flight leaves the
-        // model to the switch.** The editor still shows the model the switch
-        // replaces (it follows only once the roster shows the switch landed),
-        // and the store runs this write after the switch: writing that model
-        // would put the old pin back. So where both write the same place —
-        // an owned agent's row, a shared agent's "This space" override — an
-        // unchanged model is left out of the save; a model the reader picked
-        // is still written, and a shared agent's "Everyone" save writes its
-        // global config, which the switch does not touch.
-        let writes_this_space = !(edit.is_referenced && edit.mode == EditMode::Everywhere);
-        let defer_model = writes_this_space
-            && self
-                .inspector_pending_switches
-                .get(&pid)
-                .is_some_and(|p| edit.model_ref == p.previous);
+        let defer_model = self.defers_model_to_switch(&edit);
 
         if edit.is_referenced && edit.mode == EditMode::OverrideHere {
             // Per-membership overrides. An empty model/prompt on a referenced
@@ -773,13 +759,35 @@ impl SpaceView {
     /// carries the everywhere-vs-here fork this one was seeded without. Nothing
     /// else is view work — the roster's "shared" tag falls out of the same
     /// re-list.
+    /// **A write from the editor while a switch to newer weights is in flight
+    /// leaves the model to the switch.** The editor still shows the model the
+    /// switch replaces (it follows only once the roster shows the switch
+    /// landed), and the store runs a Save or Share after the switch: writing
+    /// that model would put the old pin back. So where both write the same
+    /// place — an owned agent's row (Save, or the persona Share carries), a
+    /// shared agent's "This space" override — an unchanged model is left out;
+    /// a model the reader picked is still written, and a shared agent's
+    /// "Everyone" save writes its global config, which the switch does not
+    /// touch.
+    fn defers_model_to_switch(&self, edit: &ParticipantEdit) -> bool {
+        let writes_this_space = !(edit.is_referenced && edit.mode == EditMode::Everywhere);
+        writes_this_space
+            && self
+                .inspector_pending_switches
+                .get(&edit.participant_id)
+                .is_some_and(|p| edit.model_ref == p.previous)
+    }
+
     pub fn inspector_confirm_promote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let space_id = self.space_id(cx);
         let held = self.inspector_field_focused(window, cx);
         let Some(edit) = self.inspector_participant_edit.take() else {
             return;
         };
-        let update = edit.as_everywhere_update(cx);
+        let mut update = edit.as_everywhere_update(cx);
+        if self.defers_model_to_switch(&edit) {
+            update.model_ref = None;
+        }
         if update.label.as_deref().is_some_and(str::is_empty) {
             self.inspector_participant_edit = Some(edit);
             return;

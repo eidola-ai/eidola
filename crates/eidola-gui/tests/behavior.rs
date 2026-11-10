@@ -8998,6 +8998,94 @@ fn a_save_racing_a_weights_switch_keeps_the_newer_pin(cx: &mut TestAppContext) {
     drain_runtime(&core);
 }
 
+/// **A Share while a switch to newer weights is in flight keeps the switch.**
+/// Share carries the editor's persona into the shared agent, and the store
+/// runs it after the switch; the persona leaves the model to the switch, so
+/// the shared agent has the newer pin.
+#[gpui::test]
+fn a_share_racing_a_weights_switch_keeps_the_newer_pin(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    let (stores, core, _dir, space) = participants_scene(cx);
+    core.test_set_model_catalog(SWITCH_CATALOG);
+    let old_pin = format!("switch-fixture@sha256:{SWITCH_OLD}@eidola");
+    let new_pin = format!("switch-fixture@sha256:{SWITCH_NEW}@eidola");
+    let agent = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .unwrap()
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the default template seeds one agent");
+    assert_eq!(agent.source, "owned", "the seeded agent starts space-owned");
+    core.runtime()
+        .block_on(core.update_space_participant(
+            agent.id.clone(),
+            eidola_app_core::ParticipantUpdate {
+                label: None,
+                model_ref: Some(Some(old_pin.clone())),
+                system_prompt: None,
+                notify_policy: None,
+            },
+            eidola_app_core::ExpectedScope::Any,
+        ))
+        .unwrap();
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    let agent_id = agent.id.clone();
+    wait_until(cx, "the pin's notice", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space).iter().any(|p| {
+                p.id == agent_id
+                    && p.model_notices
+                        .iter()
+                        .any(|n| matches!(n, ModelNotice::NewerAvailable { .. }))
+            })
+        })
+    });
+    let notice = ModelNotice::NewerAvailable {
+        tag: "switch-fixture".into(),
+        newer_sha256: SWITCH_NEW.into(),
+    };
+
+    // Open the editor, switch, and Share before any re-read.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent_id, window, cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_act_on_model_notice(&agent_id, &notice, window, cx);
+            v.inspector_begin_promote(window, cx);
+            v.inspector_confirm_promote(window, cx);
+        });
+    })
+    .unwrap();
+
+    wait_until(cx, "both writes settled", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .any(|p| p.id == agent_id && p.source == "referenced")
+        })
+    });
+    let stored = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .unwrap()
+        .into_iter()
+        .find(|p| p.id == agent_id)
+        .unwrap();
+    assert_eq!(stored.source, "referenced", "the share landed");
+    assert_eq!(
+        stored.model_ref.as_deref(),
+        Some(new_pin.as_str()),
+        "the switch held"
+    );
+
+    drain_runtime(&core);
+}
+
 /// The headline fork: editing a **referenced global** ("You") writes either the
 /// shared config (edit everywhere) or a per-space override (override here). The
 /// view routes to the right store method per its mode.
