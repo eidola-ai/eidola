@@ -1018,9 +1018,11 @@ CREATE INDEX idx_request_credential
 -- value when the catalog's retention says the engine can no
 -- longer hold the lineage's cache — idle past `idle_ttl_secs`,
 -- older than `max_age_secs` — or when it would cross a boundary:
--- a different `model`, a different `trust_domain` (the digest of
--- the eidola endpoint and trust bundle it was minted under), or
--- a clock that ran backwards. So no key outlives the cache it
+-- a different `model` (the weights hash the turn resolved to,
+-- `sha256:<hex>`, or the selection where the catalog publishes
+-- none), a different `trust_domain` (the digest of the eidola
+-- endpoint and trust bundle it was minted under), or a clock
+-- that ran backwards. So no key outlives the cache it
 -- unlocks, and none reaches two trust domains.
 --
 -- A key is overwritten in place before it is replaced or

@@ -650,6 +650,11 @@ pub struct MockConfig {
     /// the default — publishes none, the shape of a gateway older than
     /// hash-keyed models.
     pub published_sha256: PublishedSha,
+    /// Weights `GET /v1/models` also lists, under no tag: the row a release
+    /// leaves behind when it moves [`MODEL`]'s tag to other weights while the
+    /// earlier ones are still served. Otherwise [`MODEL`]'s row. `None` — the
+    /// default — lists none.
+    pub untagged_sha256: PublishedSha,
     /// When set, the **next** chat request is answered with this non-2xx
     /// status (an error document) and the setting clears, whatever `chat`
     /// says — so a test can fail one turn between ordinary ones.
@@ -896,6 +901,7 @@ impl Default for MockConfig {
             declared_prompt_cache: None,
             declared_max_output: None,
             published_sha256: PublishedSha::default(),
+            untagged_sha256: PublishedSha::default(),
             fail_next_chat: FailNextChat::default(),
             close_switch: CloseSwitch::default(),
             list_flat_model: false,
@@ -3822,6 +3828,18 @@ fn models_body(config: &MockConfig) -> String {
         primary["sha256"] = serde_json::json!(sha256);
         primary["tags"] = serde_json::json!([MODEL]);
     }
+    let untagged = config
+        .untagged_sha256
+        .lock()
+        .expect("untagged hash lock poisoned")
+        .clone()
+        .map(|sha256| {
+            let mut row = primary.clone();
+            row["id"] = serde_json::json!(format!("sha256:{sha256}"));
+            row["sha256"] = serde_json::json!(sha256);
+            row["tags"] = serde_json::json!([]);
+            row
+        });
     let router = serde_json::json!({
         "id": ROUTER_REMOTE_MODEL,
         "context_length": 8192u64,
@@ -3850,6 +3868,7 @@ fn models_body(config: &MockConfig) -> String {
     let listed: Vec<serde_json::Value> = [primary, router]
         .into_iter()
         .chain(config.list_flat_model.then_some(flat))
+        .chain(untagged)
         .filter(|entry| {
             let id = entry["id"].as_str().unwrap_or_default();
             !omitted.iter().any(|o| o == id)

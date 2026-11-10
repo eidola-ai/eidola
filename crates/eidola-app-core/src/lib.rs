@@ -2787,6 +2787,7 @@ impl Inner {
             .db
             .get_or_try_init(|| async {
                 let database = db::open(&self.data_dir).await?;
+                self.forget_other_domains_cache_keys(&database).await;
                 self.sweep_pristine_spaces(&database).await;
                 Ok::<_, AppError>(database)
             })
@@ -2794,6 +2795,50 @@ impl Inner {
         // FK enforcement is per-connection (turso defaults it OFF), and the
         // scope-owned schema depends on it — enable it on every connection.
         db::connect(database).await
+    }
+
+    /// Forget every prefix-cache key minted under a trust domain other than
+    /// the one this process resolves, once per process — inside the
+    /// `OnceCell` initializer, before any turn can claim.
+    ///
+    /// **The trust domain can change with no write to the eidola row**: a
+    /// build with another compiled-in server URL or measurement resolves
+    /// another domain from the same NULL columns, so the configuration door's
+    /// cleanup (`backends::update_backend`) never runs for it. Each lineage
+    /// would still rotate at its next claim, and a lineage never used again
+    /// would keep its key on disk; this overwrites and deletes them all, and
+    /// empties the log, exactly as that door does.
+    ///
+    /// **A failed cleanup is never a failed open**: no key crosses domains
+    /// either way (the claim mints under a mismatch), so it is warned about,
+    /// naming no key, and left to the next open.
+    async fn forget_other_domains_cache_keys(&self, database: &turso::Database) {
+        let forgotten = async {
+            let conn = db::connect(database).await?;
+            let row = db::get_backend(&conn, backends::EIDOLA_BACKEND_ID).await?;
+            let domain = EidolaResolved::from_row(row.as_ref())?.cache_trust_domain();
+            db::begin_write(&conn).await?;
+            let forgotten = match db::forget_cache_keys_outside(&conn, &domain).await {
+                Ok(n) => {
+                    conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+                    n
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            };
+            if forgotten > 0 {
+                db::truncate_log_after_forgetting_keys(&conn).await;
+            }
+            Ok::<_, AppError>(())
+        }
+        .await;
+        if let Err(e) = forgotten {
+            eprintln!(
+                "warning: could not forget prefix-cache keys of other trust configurations: {e}"
+            );
+        }
     }
 
     /// The startup sweep, run exactly once per process — inside the `OnceCell`
@@ -8075,6 +8120,7 @@ impl Inner {
             weights_moved: false,
             model_participant_id,
             max_completion_tokens,
+            continues: continuation.is_some(),
             continuation,
             inf_item_id,
             inf_supersedes,
@@ -14130,6 +14176,7 @@ fn keyed_body(prep: &TurnPrep, body: &serde_json::Value) -> (reqwest::Body, usiz
     let space_id = prep.space_id.clone();
     let participant_id = prep.model_participant_id.clone();
     let model = prep.model.clone();
+    let weights = prep.resolved_sha256.clone();
     let scope = prep
         .cache_scope
         .clone()
@@ -14141,6 +14188,7 @@ fn keyed_body(prep: &TurnPrep, body: &serde_json::Value) -> (reqwest::Body, usiz
             &space_id,
             &participant_id,
             &model,
+            weights.as_deref(),
             &scope,
             clock.now_ms(),
         )
@@ -14250,6 +14298,10 @@ struct TurnPrep {
     /// first from new weights after an answer from other ones, and taken by
     /// [`Self::announce_moved_weights`] once the write has committed.
     weights_moved: bool,
+    /// Whether this is a [`ResponseMode::Continue`] turn, for all of its
+    /// rounds: its requests are pinned to the weights of the answer it
+    /// continues, and its actions say so ([`db::INTENT_CONTINUE`]).
+    continues: bool,
     /// The acting agent participant. Deliberately **no** scope alongside it:
     /// a turn spans HTTP round trips, and task 36's promotion can flip that
     /// scope mid-flight — so the pinned echo is derived from this id inside
@@ -15009,7 +15061,8 @@ impl TurnPrep {
     /// under this model: the one write that changes what the participant's
     /// model notices say (`model_catalog::notices`' `Updated` compares the
     /// latest recorded hash with what the tag names now). The first hash
-    /// ever recorded moves nothing a notice reads.
+    /// ever recorded moves nothing a notice reads, and neither does a
+    /// continuation's, which that read skips.
     async fn record_resolved_hash(
         &mut self,
         action_id: &str,
@@ -15027,11 +15080,17 @@ impl TurnPrep {
         .await?;
         db::set_action_model_sha256(&self.db_conn, action_id, Some(&sha256)).await?;
         // A failed generation records which weights erred, and moves no
-        // notice: it is not an answer (`db::last_model_sha256`).
-        if answered && previous.is_some_and(|p| p != sha256) {
+        // notice: it is not an answer (`db::last_model_sha256`). Nor does a
+        // continuation, pinned to the weights of the answer it continues.
+        if answered && !self.continues && previous.is_some_and(|p| p != sha256) {
             self.weights_moved = true;
         }
         Ok(())
+    }
+
+    /// The `action.intent` of the model-call actions this turn writes.
+    fn action_intent(&self) -> Option<String> {
+        self.continues.then(|| db::INTENT_CONTINUE.to_string())
     }
 
     /// After a commit: when that write moved the participant's recorded
@@ -15116,7 +15175,7 @@ impl TurnPrep {
                 supersedes_action_id: None,
                 action_type: "tool_call".to_string(),
                 status: "complete".to_string(),
-                intent: None,
+                intent: self.action_intent(),
                 model: Some(self.model.clone()),
                 input_tokens,
                 output_tokens,
@@ -15562,7 +15621,7 @@ impl TurnPrep {
                 supersedes_action_id: self.inf_supersedes.clone(),
                 action_type: "inference".to_string(),
                 status: action_status.to_string(),
-                intent: None,
+                intent: self.action_intent(),
                 model: Some(self.model.clone()),
                 input_tokens,
                 output_tokens,
@@ -20429,6 +20488,110 @@ mod tests {
         });
         assert_eq!(tmpl, config::DEFAULT_TEMPLATE_ID);
         assert_eq!(model, config::DEFAULT_MODEL);
+    }
+
+    /// **A profile opened under another trust domain keeps no key of the old
+    /// one.** A build with another compiled-in server URL or measurement
+    /// changes the domain with no write to the eidola row, so the open itself
+    /// forgets — overwritten, and gone from the database's files — every key
+    /// minted under another domain, and keeps the current domain's.
+    #[test]
+    fn opening_a_profile_forgets_the_keys_of_another_trust_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().to_path_buf();
+        let data_dir = dir.path().join("data");
+        let on_disk = |key: &[u8]| {
+            std::fs::read_dir(&data_dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.is_file())
+                .any(|p| {
+                    std::fs::read(p)
+                        .unwrap()
+                        .windows(key.len())
+                        .any(|w| w == key)
+                })
+        };
+
+        let core = AppCore::new(config_dir.clone(), data_dir.clone()).unwrap();
+        let spaces: Vec<String> = (0..2)
+            .map(|_| {
+                core.runtime
+                    .block_on(core.post_reply("How do tides work?".into(), None, None))
+                    .unwrap()
+                    .space_id
+            })
+            .collect();
+        let inner = core.inner.clone();
+        let (other, current) = core.runtime.block_on(async move {
+            let conn = inner.db_conn().await.unwrap();
+            let row = db::get_backend(&conn, backends::EIDOLA_BACKEND_ID)
+                .await
+                .unwrap();
+            let here = EidolaResolved::from_row(row.as_ref())
+                .unwrap()
+                .cache_trust_domain();
+            let mut keys = Vec::new();
+            // A lineage keyed by a build that resolved another domain, never
+            // used since; and one keyed under this build's.
+            for (space, domain) in spaces
+                .iter()
+                .zip(["another-build's-domain".to_string(), here])
+            {
+                let agent = db::list_space_owned_participants(&conn, space)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|p| p.kind == "agent")
+                    .unwrap();
+                let scope = prefix_cache::CacheScope {
+                    policy: prefix_cache::PromptCachePolicy {
+                        idle_ttl_ms: 900_000,
+                        max_age_ms: 7_200_000,
+                    },
+                    trust_domain: domain,
+                };
+                let model = canonical_model(agent.model_ref.as_deref().unwrap());
+                let claimed = db::claim_prefix_cache_key(
+                    &conn,
+                    space,
+                    &agent.id,
+                    &model,
+                    None,
+                    &scope,
+                    now_ms(),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(claimed, db::ClaimOutcome::Claimed(_)));
+                let mut rows = conn
+                    .query(
+                        "SELECT key_bytes FROM prefix_cache_key WHERE space_id = ?1",
+                        [turso::Value::Text(space.clone())],
+                    )
+                    .await
+                    .unwrap();
+                let row = rows.next().await.unwrap().unwrap();
+                keys.push(row.get::<Vec<u8>>(0).unwrap());
+            }
+            (keys.remove(0), keys.remove(0))
+        });
+        drop(core);
+        assert!(on_disk(&other), "the old key is stored (the premise)");
+
+        let core = AppCore::new(config_dir, data_dir.clone()).unwrap();
+        core.runtime.block_on(core.open_database()).unwrap();
+        assert!(
+            !on_disk(&other),
+            "a key of another trust domain is nowhere in the database's files"
+        );
+        assert!(on_disk(&current), "this domain's key is kept");
+        let inner = core.inner.clone();
+        let left = core.runtime.block_on(async move {
+            let conn = inner.db_conn().await.unwrap();
+            db::prefix_cache_lineages(&conn).await.unwrap()
+        });
+        assert_eq!(left.len(), 1);
     }
 
     #[test]

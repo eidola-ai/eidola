@@ -12018,6 +12018,7 @@ fn a_moved_tags_update_notice_is_shown_and_can_be_dismissed() {
             Err(AppError::ModelNoticeStale { .. }) => {}
             other => panic!("expected ModelNoticeStale, got {other:?}"),
         }
+        assert_eq!(drain(&mut rx), vec![], "a stale dismissal says nothing");
     });
 }
 
@@ -12085,11 +12086,13 @@ fn a_pin_whose_tag_moved_can_switch_to_the_newer_weights() {
             ]
         );
 
+        let mut rx = core.subscribe_changes();
         let selection = core
             .runtime()
             .block_on(core.switch_to_newer_weights(space.clone(), agent.id.clone()))
             .expect("switch");
         assert_eq!(selection, format!("{MODEL}@sha256:{HASH_2}@eidola"));
+        assert_eq!(drain(&mut rx), vec![Change::Participants]);
         let switched = core
             .runtime()
             .block_on(core.list_space_participants(space.clone()))
@@ -12104,6 +12107,7 @@ fn a_pin_whose_tag_moved_can_switch_to_the_newer_weights() {
                 .block_on(core.switch_to_newer_weights(space, agent.id)),
             Err(AppError::ModelNoticeStale { .. })
         ));
+        assert_eq!(drain(&mut rx), vec![], "a stale switch says nothing");
     });
 }
 
@@ -12202,6 +12206,124 @@ fn a_continuation_is_pinned_to_the_weights_that_wrote_the_partial_answer() {
             other => panic!("expected ModelUnavailable, got {other:?}"),
         }
         assert_eq!(mock.chat_bodies().len(), sent, "nothing was sent");
+    });
+}
+
+/// A cut-off answer from [`HASH_1`], then the release that moves [`MODEL`]'s
+/// tag to [`HASH_2`] with the earlier weights still served, then a second
+/// (cut-off) answer in the same space from the new weights: `(mock, core,
+/// dir, the first turn)`.
+fn an_answer_on_each_side_of_a_tag_move(
+    config: MockConfig,
+) -> (
+    MockServer,
+    AppCore,
+    tempfile::TempDir,
+    eidola_app_core::ChatResult,
+) {
+    let config = MockConfig {
+        chat: ChatBehavior::ContinueAfterLength {
+            cut: Cut::Answer,
+            again: false,
+        },
+        ..config
+    };
+    let published = config.published_sha256.clone();
+    let untagged = config.untagged_sha256.clone();
+    *published.lock().unwrap() = Some(HASH_1.to_string());
+    let (mock, core, dir) = setup(config);
+    with_account(&core);
+    core.test_set_model_catalog(MOVED_CATALOG);
+    let first = core
+        .runtime()
+        .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+        .expect("the answer from the earlier weights");
+    *published.lock().unwrap() = Some(HASH_2.to_string());
+    *untagged.lock().unwrap() = Some(HASH_1.to_string());
+    core.runtime()
+        .block_on(core.chat(
+            "And the moon?".into(),
+            MODEL.into(),
+            Some(first.space_id.clone()),
+        ))
+        .expect("the answer from the new weights");
+    (mock, core, dir, first)
+}
+
+/// **Continuing an answer from earlier weights does not raise "model
+/// updated" again.** The participant's later answer already came from the
+/// weights the tag names now; the continuation records the earlier weights
+/// on its own generation, and is not what the notice reads.
+#[test]
+fn continuing_an_earlier_weights_answer_raises_no_update_notice() {
+    run(|| {
+        let (mock, core, _dir, first) = an_answer_on_each_side_of_a_tag_move(MockConfig::default());
+        let space = first.space_id.clone();
+        assert_eq!(
+            answering(&core, &space).model_notices,
+            vec![],
+            "the answer from the new weights settled the notice (the premise)"
+        );
+
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.continue_answer(first.response_action_id.clone().unwrap()))
+            .expect("the continuation");
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.last().unwrap()["model"],
+            format!("{MODEL}@sha256:{HASH_1}"),
+            "asked of the weights that wrote the partial answer"
+        );
+        let continued = core
+            .runtime()
+            .block_on(core.test_space_actions(space.clone()))
+            .expect("actions")
+            .into_iter()
+            .rfind(|a| a.action_type == "inference")
+            .expect("the continued generation");
+        assert_eq!(continued.model_sha256.as_deref(), Some(HASH_1));
+        assert_eq!(answering(&core, &space).model_notices, vec![]);
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Change::Participants)),
+            "and it moved nothing the roster shows"
+        );
+    });
+}
+
+/// **A key is bound to the weights, not to the name that selected them.** A
+/// followed tag that moves rotates its lineage's key, and a continuation
+/// pinned to the earlier weights never carries the key a request to the
+/// current ones did: no key is seen with two weights hashes.
+#[test]
+fn no_key_reaches_two_weights_when_a_followed_tag_moves() {
+    run(|| {
+        let (mock, core, _dir, first) = an_answer_on_each_side_of_a_tag_move(MockConfig {
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            ..MockConfig::default()
+        });
+        core.runtime()
+            .block_on(core.continue_answer(first.response_action_id.clone().unwrap()))
+            .expect("the continuation");
+
+        let sent: Vec<(String, String)> = mock
+            .chat_bodies()
+            .iter()
+            .map(|b| (b["model"].as_str().unwrap().to_string(), sent_key(b)))
+            .collect();
+        let old = format!("{MODEL}@sha256:{HASH_1}");
+        let new = format!("{MODEL}@sha256:{HASH_2}");
+        assert_eq!(
+            sent.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>(),
+            [old.as_str(), new.as_str(), old.as_str()]
+        );
+        assert_ne!(sent[0].1, sent[1].1, "the tag's move rotated the key");
+        assert_ne!(
+            sent[1].1, sent[2].1,
+            "the continuation does not carry the current weights' key"
+        );
     });
 }
 
