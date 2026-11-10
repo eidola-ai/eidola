@@ -334,7 +334,8 @@ pub fn install(cx: &mut App) {
     // HTTP client today, so that one fails, but only by accident) or an
     // unbounded read of any local path. Only the app's own assets resolve;
     // everything else shows its markdown. Set here because every context —
-    // the app, the tests, the driver — runs `install`.
+    // the app, the tests, the driver — runs `install`. A host that renders
+    // files the reader opened (the notepad) sets `Any` after this call.
     cx.set_global(gpui_markdown_editor::image::ImageSources::EmbeddedOnly);
 
     if !cx.has_global::<ThemeState>() {
