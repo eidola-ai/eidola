@@ -166,9 +166,18 @@ struct StripeErrorBody {
 }
 
 /// The one field of a Stripe Charge the dispute handlers need.
+///
+/// Required but nullable, deliberately: a Charge always carries `customer`
+/// (`null` when the charge was made without one), so an omitted key is not
+/// a charge without a customer but a response this code does not
+/// understand. Defaulting it to `None` would have ended the dispute as
+/// `orphan_customer` — a 200 that stops Stripe's redelivery — on evidence
+/// that was never there; a parse error takes the retryable branch instead.
+/// (serde treats a bare `Option` field as missing-means-`None`; the
+/// `deserialize_with` is what makes the key itself required.)
 #[derive(Debug, Deserialize)]
 struct StripeChargeCustomer {
-    #[serde(default)]
+    #[serde(deserialize_with = "Option::deserialize")]
     customer: Option<String>,
 }
 
@@ -1116,5 +1125,49 @@ mod tests {
                 .is_none()
         );
         assert_eq!(stub.limits(), vec![Some("100".to_string())]);
+    }
+
+    // --- The charge lookup ----------------------------------------------
+
+    /// Serve one fixed JSON body at `/charges/{id}`.
+    async fn stub_charge(body: serde_json::Value) -> StripeClient {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/charges/{id}",
+            get(move || {
+                let body = body.clone();
+                async move { axum::Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let mut client = StripeClient::new("sk_test".to_string());
+        client.base_url = format!("http://{addr}");
+        client
+    }
+
+    /// `customer: null` is a charge made without a customer, and the dispute
+    /// handlers may end on it. A body with no `customer` key at all is not a
+    /// Charge as Stripe defines one, and must fail the parse — the handlers'
+    /// retryable branch — rather than read as the same orphan.
+    #[tokio::test]
+    async fn a_charge_without_the_customer_key_is_a_parse_error_not_an_orphan() {
+        let explicit_null = stub_charge(serde_json::json!({
+            "id": "ch_1", "object": "charge", "customer": null
+        }))
+        .await;
+        assert_eq!(
+            explicit_null.get_charge_customer("ch_1").await.unwrap(),
+            None
+        );
+
+        let omitted = stub_charge(serde_json::json!({ "id": "ch_1", "object": "charge" })).await;
+        let err = omitted.get_charge_customer("ch_1").await.unwrap_err();
+        assert!(
+            matches!(err, ServerError::Parse(_)),
+            "expected the omitted field to fail the parse, got {err:?}"
+        );
     }
 }
