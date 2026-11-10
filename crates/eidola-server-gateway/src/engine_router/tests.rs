@@ -21,8 +21,8 @@ use tinfoil_verifier::AllowedMeasurement;
 use super::*;
 use crate::engine_trust::{PinnedWeights, PromptCachePolicy};
 use crate::types::{
-    Capability, Model, ModelCapabilities, ModelPricing, OutputBudgetClass, PinnedWeightsCapability,
-    PromptCacheCapability, ScaledPrice,
+    CacheKey, Capability, Model, ModelCapabilities, ModelPricing, OutputBudgetClass,
+    PinnedWeightsCapability, PromptCacheCapability, ScaledPrice,
 };
 use eidola_common::engine_protocol::error_type as kind;
 
@@ -486,13 +486,36 @@ fn request(model: &str, key: Option<&str>, stream: bool) -> ValidatedRequest {
     ValidatedRequest::from_bytes(bytes::Bytes::from(request_text(model, key, stream, ""))).unwrap()
 }
 
-/// A well-formed cache key's text for `i`.
-fn key_text(i: u64) -> String {
-    use base64::Engine as _;
+/// A well-formed cache key's bytes for `i`.
+fn key_bytes(i: u64) -> [u8; 32] {
     let mut bytes = [0u8; 32];
     bytes[..8].copy_from_slice(&i.to_le_bytes());
     bytes[31] = 0x5a;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    bytes
+}
+
+/// A well-formed cache key's text for `i`.
+fn key_text(i: u64) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_bytes(i))
+}
+
+/// The first `i` whose key ranks the upstream at `first` ahead of every other
+/// upstream at `others`. Rendezvous weights hash each upstream's base URL,
+/// which carries a port the OS picked, so which engine a fixed key reaches
+/// differs from run to run; a test that needs a given engine tried first
+/// chooses its key this way.
+fn key_ranking_first(router: &EngineRouter, model: &str, first: &str, others: &[&str]) -> u64 {
+    let ups: Vec<Arc<Upstream>> = std::iter::once(first)
+        .chain(others.iter().copied())
+        .map(|url| upstream(router, model, url))
+        .collect();
+    (0..)
+        .find(|&i| {
+            let ranked = rendezvous::rank_by_key(&CacheKey::from_bytes(key_bytes(i)), ups.clone());
+            ranked[0].base_url == first
+        })
+        .unwrap()
 }
 
 /// Which engine served the last request: the one whose chat count grew.
@@ -824,7 +847,9 @@ async fn a_misregistered_engine_never_takes_traffic() {
         assert!(!upstream(&router, MODEL_A, &e.base_url).routable());
     }
     refuses.set_mode(Mode::WeightsMismatch);
-    for i in 0..8 {
+    // The first key tries the refusing engine first, so its refusal is seen.
+    let first = key_ranking_first(&router, MODEL_A, &refuses.base_url, &[&good.base_url]);
+    for i in first..first + 8 {
         router
             .send(&request(MODEL_A, Some(&key_text(i)), false))
             .await
@@ -833,7 +858,7 @@ async fn a_misregistered_engine_never_takes_traffic() {
     for e in bad {
         assert!(e.chats().is_empty());
     }
-    assert!(refuses.chats().len() <= 1, "opened on its first refusal");
+    assert_eq!(refuses.chats().len(), 1, "opened on its first refusal");
     assert!(!upstream(&router, MODEL_A, &refuses.base_url).routable());
     assert_eq!(good.chats().len(), 8);
 }
