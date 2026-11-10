@@ -6443,6 +6443,26 @@ pub async fn set_action_model_sha256(
     Ok(())
 }
 
+/// The weights hash `action_id` was answered with (`action.model_sha256`),
+/// if one was recorded.
+pub async fn action_model_sha256(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT model_sha256 FROM action WHERE id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<Option<String>>(0).map_err(AppError::db),
+        None => Ok(None),
+    }
+}
+
 /// The weights hash the last answer of `participant_id` in `space_id` under
 /// model selection `model` (canonical) came from, if any did: what a
 /// followed tag last resolved to, which the "model updated" notice compares

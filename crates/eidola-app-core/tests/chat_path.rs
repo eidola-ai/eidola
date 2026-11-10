@@ -11220,3 +11220,70 @@ fn an_answer_from_new_weights_announces_the_participants_change() {
         assert_eq!(participants_in(&mut rx), 0);
     });
 }
+
+/// **A continuation is asked of the weights that wrote what it continues.**
+/// With the tag where it was, the continuation names those weights and
+/// records them; once a release has moved the tag and those weights are no
+/// longer served, it is refused by name before anything is spent, rather
+/// than finished by other weights under the same tag.
+#[test]
+fn a_continuation_is_pinned_to_the_weights_that_wrote_the_partial_answer() {
+    run(|| {
+        let config = MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Answer,
+                again: false,
+            },
+            ..MockConfig::default()
+        };
+        let published = config.published_sha256.clone();
+        *published.lock().unwrap() = Some(HASH_1.to_string());
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+
+        // The tag where it was: continued on the same weights.
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        let res = core
+            .runtime()
+            .block_on(core.continue_answer(cut.response_action_id.clone().unwrap()))
+            .expect("the continuation");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies[1]["model"], format!("{MODEL}@sha256:{HASH_1}"));
+        let recorded: Vec<Option<String>> = core
+            .runtime()
+            .block_on(core.test_space_actions(cut.space_id.clone()))
+            .expect("actions")
+            .into_iter()
+            .filter(|a| a.action_type == "inference")
+            .map(|a| a.model_sha256)
+            .collect();
+        assert!(
+            recorded.iter().all(|h| h.as_deref() == Some(HASH_1)),
+            "{recorded:?}"
+        );
+        assert!(!res.truncated);
+
+        // Cut again, then the tag moves and the old weights are gone.
+        let cut = core
+            .runtime()
+            .block_on(core.chat(
+                "And the moon?".into(),
+                MODEL.into(),
+                Some(cut.space_id.clone()),
+            ))
+            .expect("the second cut-off turn");
+        *published.lock().unwrap() = Some(HASH_2.to_string());
+        let sent = mock.chat_bodies().len();
+        match core
+            .runtime()
+            .block_on(core.continue_answer(cut.response_action_id.clone().unwrap()))
+        {
+            Err(AppError::ModelUnavailable { model }) => assert_eq!(model, MODEL),
+            other => panic!("expected ModelUnavailable, got {other:?}"),
+        }
+        assert_eq!(mock.chat_bodies().len(), sent, "nothing was sent");
+    });
+}
