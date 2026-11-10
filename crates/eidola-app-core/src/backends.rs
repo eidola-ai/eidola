@@ -919,6 +919,31 @@ mod tests {
         );
     }
 
+    /// The gateway's pinned reference, `tag@sha256:<hex>`, survives the
+    /// split when qualified with its backend: backend ids hold no `:`, so the
+    /// last `@` is the backend's. Bare, the digest reads as a backend id,
+    /// which `validate_backend_id` refuses to create, so such a selection is
+    /// spelled qualified.
+    #[test]
+    fn a_pinned_gateway_reference_parses_when_qualified() {
+        let pinned = format!("mimo-v2.6-flash@sha256:{}", "a".repeat(64));
+        assert_eq!(
+            parse_model_ref(&format!("{pinned}@eidola")),
+            ModelRef {
+                backend_id: "eidola".into(),
+                model: pinned.clone()
+            }
+        );
+        let bare = parse_model_ref(&pinned);
+        assert_eq!(bare.model, "mimo-v2.6-flash");
+        assert!(validate_backend_id(&bare.backend_id).is_err());
+        // The id the gateway lists a model under holds no `@`.
+        assert_eq!(
+            parse_model_ref(&format!("sha256:{}", "a".repeat(64))).backend_id,
+            "eidola"
+        );
+    }
+
     #[test]
     fn parse_degenerate_at_forms_fall_through() {
         // A leading/trailing @ is not a qualification.

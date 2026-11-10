@@ -102,6 +102,8 @@ bytes = "1"
 
 [build-dependencies]
 serde_json = "1"
+# `src/models/file.rs`: the model catalog's source files under `models/`.
+toml = "1"
 # `src/engine_trust/file.rs`: the typed parse of engine-enclaves.json.
 serde = { version = "1", features = ["derive"] }
 # `src/engine_trust/manifest.rs`, compiled into the build script: hashing the
@@ -120,6 +122,8 @@ eidola-common = { path = "../eidola-common", features = ["deployment"] }
 tinfoil-verifier = { path = "../tinfoil-verifier", features = ["platform-endorsements"] }
 
 [dev-dependencies]
+# `src/models/file.rs`, compiled into the crate's tests.
+toml = "1"
 # The same module, compiled into the crate's tests.
 eidola-common = { path = "../eidola-common", features = ["deployment"] }
 tinfoil-verifier = { path = "../tinfoil-verifier", features = ["platform-endorsements"] }

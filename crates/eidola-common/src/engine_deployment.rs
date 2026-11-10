@@ -18,6 +18,8 @@
 //! already depend on `argon2` themselves (see the crate docs' dependency
 //! rule).
 
+pub use crate::architecture::{Architecture, Shape};
+
 /// The node's environment variables. Every one is required (an empty value
 /// counts as missing) except where noted.
 pub mod env {
@@ -164,9 +166,10 @@ pub mod caps {
     /// Speculative draft width: MiMo's MTP heads are a handful; the node also
     /// refuses more than the loaded model has.
     pub const DRAFT_TOKENS: u32 = 8;
-    /// Speculative draft width with the CUDA executor: MiMo-V2.6-Flash's MTP
-    /// layers (`num_nextn_predict_layers`), each serving one draft depth
-    /// (`eidola-engine-cuda` `support::MTP_LAYERS`).
+    /// Speculative draft width with the CUDA executor: the most MTP layers
+    /// (`num_nextn_predict_layers`, one per draft depth) an implemented
+    /// architecture ships (`crate::architecture::Shape::mtp_layers`;
+    /// MiMo-V2.6-Flash's three, `eidola-engine-cuda` `support::MTP_LAYERS`).
     pub const CUDA_DRAFT_TOKENS: u32 = 3;
     /// Admission slots: each may hold a request body of up to
     /// `engine_protocol::MAX_REQUEST_BODY_BYTES` and its parse, held to the
@@ -174,30 +177,10 @@ pub mod caps {
     pub const MAX_REQUESTS: u32 = 4096;
 }
 
-/// KV-cache bytes per position, every layer of MiMo-V2.6-Flash
-/// (`eidola-engine-cuda` `support`): 9 global layers of 4 KV heads and 39
-/// sliding layers of 8, each head 192 K + 128 V dims, in bf16.
-pub const KV_BYTES_PER_POSITION: u64 = (9 * 4 + 39 * 8) * (192 + 128) * 2;
-
-/// KV-cache bytes per position of MiMo-V2.6-Flash's global layers: 9 layers
-/// of 4 KV heads, 192 K + 128 V dims, bf16.
-pub const GLOBAL_KV_BYTES_PER_POSITION: u64 = 9 * 4 * (192 + 128) * 2;
-
-/// KV-cache bytes per position of MiMo-V2.6-Flash's sliding layers: 39
-/// layers of 8 KV heads, 192 K + 128 V dims, bf16.
-pub const SLIDING_KV_BYTES_PER_POSITION: u64 = 39 * 8 * (192 + 128) * 2;
-
-/// Positions a sliding layer sees (`eidola-engine-cuda` `support::WINDOW`).
-pub const SLIDING_WINDOW: u64 = 128;
-
-/// Drafter KV bytes per position for each draft depth: one MTP layer of
-/// MiMo-V2.6-Flash, 8 KV heads of 192 K + 128 V dims, bf16 (`eidola-engine-cuda`
-/// `kv::GroupGeometry`, planar layout).
-pub const DRAFTER_KV_BYTES_PER_POSITION_PER_DEPTH: u64 = 8 * (192 + 128) * 2;
-
-/// Drafter boundary-tap bytes per block for each draft depth: one chain
-/// level of the hidden size (4,096) in f32.
-pub const DRAFTER_TAP_BYTES_PER_DEPTH: u64 = 4096 * 4;
+// The numbers a model's shape fixes (KV bytes per position, the sliding
+// window, the drafter's layers, the executor's per-token scratch) are its
+// architecture's: `crate::architecture::Shape`, read through
+// `Architecture::shape`. What follows holds for every architecture.
 
 /// Retention points a keyed sequence may hold per sliding group with the
 /// prefix cache enabled (the node's `cuda::RETENTION_POINTS`).
@@ -218,24 +201,6 @@ pub const SUPPORTED_GPU_MEMORY_BYTES: u64 = 287_428_640_768;
 /// bytes (each fused QKV chunk padded to whole 128-row tiles, norm and bias
 /// vectors widened to f32): 4 GiB.
 pub const DEVICE_FIXED_RESERVE_BYTES: u64 = 4 << 30;
-
-/// Device scratch per token a step may hold (`MAX_BATCHED_TOKENS`), at
-/// Flash's shapes (`eidola-engine-cuda` `model::ScratchSizes`, whose logit
-/// rows are a step's tokens): the f32 logits row (152,576 × 4 bytes), the
-/// residual stream and its projections, the quantized activations, Q, K, V
-/// and attention output, the dense FFN, and eight expert rows of 22,580
-/// bytes each, about 1.03 MB in all, rounded up to 1.25 MiB.
-pub const STEP_TOKEN_DEVICE_BYTES: u64 = 5 << 18;
-
-/// The expert scratch held whatever the step, beside its eight rows a token:
-/// the expert layout's padding (up to 127 rows for each of the 256 experts,
-/// and a block's rounding), bounded by 65,536 rows of at most 24 KiB.
-pub const EXPERT_FLOOR_DEVICE_BYTES: u64 = 65_536 * (24 << 10);
-
-/// Device memory per sampler row (`eidola-engine-cuda`'s sampler scratch):
-/// the f64 distribution over at most the head's 152,576 ids (1,220,608
-/// bytes) and the row's buffers, rounded up to 1.25 MiB.
-pub const SAMPLER_ROW_DEVICE_BYTES: u64 = 5 << 18;
 
 /// Sampler rows per seat (`MAX_SEQS`): one without drafting; with `k`
 /// drafts, a step keeps `k` draft distributions, `k + 1` target
@@ -266,18 +231,13 @@ pub fn drafter_seat_rows(draft_tokens: u32) -> u64 {
 /// targets, work lists, the drafter's one-position page lists, sampler and
 /// acceptance rows; about 2,400 words a table for three depths), bounded by
 /// 32 KiB. An eager step's arrays per token beyond those (about 30 words for
-/// three depths) are inside [`STEP_TOKEN_DEVICE_BYTES`]'s rounding.
+/// three depths) are inside [`Shape::step_token_device_bytes`]' rounding.
 pub const DRAFT_TABLE_SEAT_BYTES: u64 = 32 << 10;
 
 /// Keys per chunk of the CUDA executor's split global attention
 /// (`eidola-engine-cuda` `attention::SPLIT_KEYS`): a global row's keys are
 /// reduced in chunks of this many positions, each a partial row, then merged.
 pub const SPLIT_ATTENTION_KEYS: u64 = 1024;
-
-/// Device bytes of one split-attention partial row at Flash's shapes: 64
-/// query heads, each a BF16 output of 128 and an f32 log-sum-exp
-/// (`eidola-engine-cuda` `attention::PARTIAL_BYTES_PER_HEAD`).
-pub const SPLIT_PARTIAL_ROW_BYTES: u64 = 64 * (128 * 2 + 4);
 
 /// Split attention's partial-row scratch (`eidola-engine-cuda`
 /// `executor::split_partial_rows`): the most tokens a captured step holds,
@@ -298,37 +258,36 @@ pub fn split_partial_rows(sizing: &Sizing) -> u64 {
 /// step's.
 pub const DRAFT_TABLE_SEAT_BYTES_PER_CHUNK: u64 = 2 * 2 * 3 * 4;
 
-/// RoPE table bytes per position (`MAX_MODEL_LEN`): 64 f32 for each distinct
-/// θ, at most three.
-pub const ROPE_DEVICE_BYTES_PER_POSITION: u64 = 3 * 64 * 4;
-
 /// Device memory the CUDA executor takes beside its weights and KV pools,
-/// bounded from above: [`DEVICE_FIXED_RESERVE_BYTES`], plus
-/// [`STEP_TOKEN_DEVICE_BYTES`] per `MAX_BATCHED_TOKENS`,
-/// [`EXPERT_FLOOR_DEVICE_BYTES`], per `MAX_SEQS` [`sampler_rows`] of
-/// [`SAMPLER_ROW_DEVICE_BYTES`], the device block tables (`MAX_SEQS` ×
+/// bounded from above, for a model of shape `shape`:
+/// [`DEVICE_FIXED_RESERVE_BYTES`], plus
+/// [`Shape::step_token_device_bytes`] per `MAX_BATCHED_TOKENS`,
+/// [`Shape::expert_floor_device_bytes`], per `MAX_SEQS` [`sampler_rows`] of
+/// [`Shape::sampler_row_device_bytes`], the device block tables (`MAX_SEQS` ×
 /// ⌈`MAX_MODEL_LEN` / `KV_BLOCK_SIZE`⌉ `i32` entries per KV group,
 /// [`kv_groups`]) and the RoPE tables
-/// ([`ROPE_DEVICE_BYTES_PER_POSITION`] per `MAX_MODEL_LEN`), and split
-/// attention's [`split_partial_rows`] of [`SPLIT_PARTIAL_ROW_BYTES`]. With
+/// ([`Shape::rope_device_bytes_per_position`] per `MAX_MODEL_LEN`), and split
+/// attention's [`split_partial_rows`] of [`Shape::split_partial_row_bytes`]. With
 /// `DRAFT_TOKENS` `k` > 0, per `MAX_SEQS` also [`drafter_seat_rows`] rows of
-/// 16 KiB, [`DRAFT_TABLE_SEAT_BYTES`], the global page lists of a drafted
+/// [`Shape::hidden_row_bytes`], [`DRAFT_TABLE_SEAT_BYTES`], the global page lists of a drafted
 /// step's table four times over (a graph's and an eager step's, each a row's
 /// pages twice when its verify run is cut at a 64-key boundary, one `i32` per
 /// block of `MAX_MODEL_LEN`), and [`DRAFT_TABLE_SEAT_BYTES_PER_CHUNK`] per
 /// chunk of `MAX_MODEL_LEN`. The MTP layers' own scratch (their
 /// copy lists, 36 bytes a token) and the drafted step's copy of the target's
-/// states (one 16 KiB row a token) are inside [`STEP_TOKEN_DEVICE_BYTES`]'s
+/// states (one hidden row a token) are inside [`Shape::step_token_device_bytes`]'
 /// rounding, and their weights inside the pack. Saturates.
-pub fn cuda_device_reserve_bytes(sizing: &Sizing) -> u64 {
+pub fn cuda_device_reserve_bytes(shape: &Shape, sizing: &Sizing) -> u64 {
     let blocks_per_seq =
         u64::from(sizing.max_model_len).div_ceil(u64::from(sizing.kv_block_size.max(1)));
     let seats = u64::from(sizing.max_seqs);
     let drafting = sizing.draft_tokens > 0;
     let groups = kv_groups(sizing.draft_tokens);
     let per_seat = sampler_rows(sizing.draft_tokens)
-        .saturating_mul(SAMPLER_ROW_DEVICE_BYTES)
-        .saturating_add(drafter_seat_rows(sizing.draft_tokens).saturating_mul(16 << 10))
+        .saturating_mul(shape.sampler_row_device_bytes)
+        .saturating_add(
+            drafter_seat_rows(sizing.draft_tokens).saturating_mul(shape.hidden_row_bytes),
+        )
         .saturating_add(if drafting {
             let chunks = u64::from(sizing.max_model_len).div_ceil(SPLIT_ATTENTION_KEYS);
             DRAFT_TABLE_SEAT_BYTES
@@ -339,18 +298,18 @@ pub fn cuda_device_reserve_bytes(sizing: &Sizing) -> u64 {
         });
     DEVICE_FIXED_RESERVE_BYTES
         .saturating_add(
-            u64::from(sizing.max_batched_tokens).saturating_mul(STEP_TOKEN_DEVICE_BYTES),
+            u64::from(sizing.max_batched_tokens).saturating_mul(shape.step_token_device_bytes),
         )
-        .saturating_add(EXPERT_FLOOR_DEVICE_BYTES)
+        .saturating_add(shape.expert_floor_device_bytes)
         .saturating_add(seats.saturating_mul(per_seat))
         .saturating_add(
             seats
                 .saturating_mul(blocks_per_seq)
                 .saturating_mul(groups * 4),
         )
-        .saturating_add(split_partial_rows(sizing).saturating_mul(SPLIT_PARTIAL_ROW_BYTES))
+        .saturating_add(split_partial_rows(sizing).saturating_mul(shape.split_partial_row_bytes))
         .saturating_add(
-            u64::from(sizing.max_model_len).saturating_mul(ROPE_DEVICE_BYTES_PER_POSITION),
+            u64::from(sizing.max_model_len).saturating_mul(shape.rope_device_bytes_per_position),
         )
 }
 
@@ -450,8 +409,8 @@ pub fn host_memory_bytes(sizing: &Sizing) -> u64 {
 
 /// The fewest bytes of device memory the CUDA executor's KV pools need: the
 /// node's own derivation (`cuda::derive_kv_blocks` in `eidola-server-engine`)
-/// at its smallest. With `B` = `KV_BLOCK_SIZE`,
-/// `R` = ⌈([`SLIDING_WINDOW`] − 1) / `B`⌉ + 1, and `P` =
+/// at its smallest, for a model of shape `shape`. With `B` = `KV_BLOCK_SIZE`,
+/// `R` = ⌈([`Shape::sliding_window`] − 1) / `B`⌉ + 1, and `P` =
 /// [`RETENTION_POINTS`] with the prefix cache (else 0):
 ///
 /// - the **sliding** pool: 1 + `MAX_SEQS` × ((1 + `P`) × `R` + 1) +
@@ -463,15 +422,15 @@ pub fn host_memory_bytes(sizing: &Sizing) -> u64 {
 ///   pool;
 ///
 /// each pool one pad block more (where a replayed decode graph's padding rows
-/// write), each block `B` positions of [`SLIDING_KV_BYTES_PER_POSITION`],
-/// [`GLOBAL_KV_BYTES_PER_POSITION`] or `k` ×
-/// [`DRAFTER_KV_BYTES_PER_POSITION_PER_DEPTH`], a drafter block also `k` ×
-/// [`DRAFTER_TAP_BYTES_PER_DEPTH`] of boundary tap. Saturates rather than
+/// write), each block `B` positions of [`Shape::sliding_kv_bytes_per_position`],
+/// [`Shape::global_kv_bytes_per_position`] or `k` ×
+/// [`Shape::drafter_kv_bytes_per_position_per_depth`], a drafter block also `k` ×
+/// [`Shape::drafter_tap_bytes_per_depth`] of boundary tap. Saturates rather than
 /// wraps.
-pub fn cuda_kv_min_bytes(sizing: &Sizing, cache: &CacheConfig) -> u64 {
+pub fn cuda_kv_min_bytes(shape: &Shape, sizing: &Sizing, cache: &CacheConfig) -> u64 {
     let b = u64::from(sizing.kv_block_size.max(1));
     let points = if cache.enabled { RETENTION_POINTS } else { 0 };
-    let window_blocks = (SLIDING_WINDOW - 1).div_ceil(b) + 1;
+    let window_blocks = (shape.sliding_window - 1).div_ceil(b) + 1;
     let sliding_blocks = u64::from(sizing.max_seqs)
         .saturating_mul((1 + points).saturating_mul(window_blocks).saturating_add(1))
         .saturating_add(1 + u64::from(sizing.max_batched_tokens).div_ceil(b));
@@ -487,12 +446,12 @@ pub fn cuda_kv_min_bytes(sizing: &Sizing, cache: &CacheConfig) -> u64 {
         0
     } else {
         sliding_blocks.saturating_add(1).saturating_mul(
-            b.saturating_mul(k * DRAFTER_KV_BYTES_PER_POSITION_PER_DEPTH)
-                .saturating_add(k * DRAFTER_TAP_BYTES_PER_DEPTH),
+            b.saturating_mul(k * shape.drafter_kv_bytes_per_position_per_depth)
+                .saturating_add(k * shape.drafter_tap_bytes_per_depth),
         )
     };
-    pool(sliding_blocks, SLIDING_KV_BYTES_PER_POSITION)
-        .saturating_add(pool(global_blocks, GLOBAL_KV_BYTES_PER_POSITION))
+    pool(sliding_blocks, shape.sliding_kv_bytes_per_position)
+        .saturating_add(pool(global_blocks, shape.global_kv_bytes_per_position))
         .saturating_add(drafter)
 }
 
@@ -501,7 +460,7 @@ pub fn cuda_kv_min_bytes(sizing: &Sizing, cache: &CacheConfig) -> u64 {
 /// MiB) holds [`host_memory_bytes`], the prefix cache's host tier
 /// (`kv_host_bytes`, `KV_HOST_BYTES`: page-locked, so it can never be paged
 /// out to make room), plus, for the `cpu` executor, its KV cache
-/// (`KV_BLOCKS` × `KV_BLOCK_SIZE` × [`KV_BYTES_PER_POSITION`]). For the
+/// (`KV_BLOCKS` × `KV_BLOCK_SIZE` × [`Shape::kv_bytes_per_position`]). For the
 /// `cuda` executor, which runs on one [`SUPPORTED_GPU`], the VM has a GPU,
 /// `KV_DEVICE_BYTES` holds at least [`cuda_kv_min_bytes`], and
 /// `KV_DEVICE_BYTES` + `weights_bytes` + [`cuda_device_reserve_bytes`] fit
@@ -510,6 +469,7 @@ pub fn cuda_kv_min_bytes(sizing: &Sizing, cache: &CacheConfig) -> u64 {
 /// every file of it, whether the node loads it or not.
 #[allow(clippy::too_many_arguments)]
 pub fn check_resources(
+    shape: &Shape,
     sizing: &Sizing,
     cache: &CacheConfig,
     executor: &ExecutorSettings,
@@ -521,7 +481,7 @@ pub fn check_resources(
     let host_kv = match executor {
         ExecutorSettings::Cpu { kv_blocks } => u64::from(*kv_blocks)
             .saturating_mul(u64::from(sizing.kv_block_size))
-            .saturating_mul(KV_BYTES_PER_POSITION),
+            .saturating_mul(shape.kv_bytes_per_position()),
         ExecutorSettings::Cuda { .. } => 0,
     };
     let host = host_memory_bytes(sizing)
@@ -542,7 +502,7 @@ pub fn check_resources(
         if gpus == 0 {
             return Err("the cuda executor needs a GPU, and the VM has none".into());
         }
-        let needed = cuda_kv_min_bytes(sizing, cache);
+        let needed = cuda_kv_min_bytes(shape, sizing, cache);
         if *kv_device_bytes < needed {
             return Err(format!(
                 "{} ({kv_device_bytes}) is less than the {needed} bytes the KV pools need at \
@@ -551,7 +511,7 @@ pub fn check_resources(
                 env::MAX_MODEL_LEN
             ));
         }
-        let reserve = cuda_device_reserve_bytes(sizing);
+        let reserve = cuda_device_reserve_bytes(shape, sizing);
         let device = kv_device_bytes
             .saturating_add(weights_bytes)
             .saturating_add(reserve);
@@ -978,8 +938,10 @@ pub fn parse_measured(
             env::DRAFT_TOKENS
         )));
     }
-    // The CUDA executor drafts with MiMo-V2.6-Flash's MTP layers, one per
-    // depth: no wider than the checkpoint it serves ships.
+    // The CUDA executor drafts with the model's MTP layers, one per depth:
+    // no wider than any implemented architecture ships (a deployment is held
+    // to its own architecture's layers by `deployment::check_deployment`,
+    // and the node to its checkpoint's when it loads).
     if kind == Executor::Cuda && sizing.draft_tokens > caps::CUDA_DRAFT_TOKENS {
         return Err(ConfigError(format!(
             "{} must be at most {} with the cuda executor (the model's MTP layers)",
@@ -1040,8 +1002,8 @@ pub fn parse_measured(
     })
 }
 
-/// A deployment path component (a model id, a variant):
-/// `[a-z0-9][a-z0-9._-]*`. `deploy/engine/<model>/<variant>/` directories
+/// A deployment path component (a deployment's name, a variant):
+/// `[a-z0-9][a-z0-9._-]*`. `deploy/engine/<name>/<variant>/` directories
 /// are named this way; the gateway's build refuses a pin naming any other,
 /// and `measure-enclave` refuses to measure one.
 pub fn is_safe_component(s: &str) -> bool {
@@ -1668,7 +1630,7 @@ mod tests {
             max_age_secs: 3600,
         };
         let kv = cuda(64 << 30);
-        assert!(check_resources(&sizing, &cache, &kv, 0, FIXTURE_PACK, 65_536, 8).is_ok());
+        assert!(check_resources(FLASH, &sizing, &cache, &kv, 0, FIXTURE_PACK, 65_536, 8).is_ok());
         // A request slot is 645,922,816 bytes at the caps: a 32 MiB body read
         // with both parses (3 × 32 MiB of text, 512 bytes for each of 2^18
         // values) and admitted with its tree (32 MiB of text, 160 bytes a
@@ -1701,13 +1663,15 @@ mod tests {
             ..sizing
         };
         // Six slots, the headroom and the tables fit 8 GiB; eight do not.
-        assert!(check_resources(&near(6), &cache, &kv, 0, FIXTURE_PACK, 8192, 8).is_ok());
-        assert!(check_resources(&near(8), &cache, &kv, 0, FIXTURE_PACK, 8192, 8).is_err());
+        assert!(check_resources(FLASH, &near(6), &cache, &kv, 0, FIXTURE_PACK, 8192, 8).is_ok());
+        assert!(check_resources(FLASH, &near(8), &cache, &kv, 0, FIXTURE_PACK, 8192, 8).is_err());
         // Near the limit: 99 slots fit 64 GiB; 100 do not.
-        assert!(check_resources(&near(99), &cache, &kv, 0, FIXTURE_PACK, 65_536, 8).is_ok());
-        assert!(check_resources(&near(100), &cache, &kv, 0, FIXTURE_PACK, 65_536, 8).is_err());
+        assert!(check_resources(FLASH, &near(99), &cache, &kv, 0, FIXTURE_PACK, 65_536, 8).is_ok());
+        assert!(
+            check_resources(FLASH, &near(100), &cache, &kv, 0, FIXTURE_PACK, 65_536, 8).is_err()
+        );
         // The cuda executor needs a GPU.
-        assert!(check_resources(&sizing, &cache, &kv, 0, FIXTURE_PACK, 65_536, 0).is_err());
+        assert!(check_resources(FLASH, &sizing, &cache, &kv, 0, FIXTURE_PACK, 65_536, 0).is_err());
         // Block size 1 at the longest model length: 2^20 entries per slot.
         let tables = Sizing {
             kv_block_size: 1,
@@ -1715,13 +1679,35 @@ mod tests {
             max_seqs: caps::MAX_SEQS,
             ..sizing
         };
-        assert!(check_resources(&tables, &cache, &kv, 0, FIXTURE_PACK, 16_384, 8).is_err());
+        assert!(check_resources(FLASH, &tables, &cache, &kv, 0, FIXTURE_PACK, 16_384, 8).is_err());
         // The cpu executor's KV is host memory: 2^20 blocks of 16 positions
         // are 3.4 TiB.
         let cpu = |kv_blocks| ExecutorSettings::Cpu { kv_blocks };
-        assert!(check_resources(&sizing, &cache, &cpu(1024), 0, FIXTURE_PACK, 65_536, 0).is_ok());
         assert!(
-            check_resources(&sizing, &cache, &cpu(1 << 20), 0, FIXTURE_PACK, 65_536, 0).is_err()
+            check_resources(
+                FLASH,
+                &sizing,
+                &cache,
+                &cpu(1024),
+                0,
+                FIXTURE_PACK,
+                65_536,
+                0
+            )
+            .is_ok()
+        );
+        assert!(
+            check_resources(
+                FLASH,
+                &sizing,
+                &cache,
+                &cpu(1 << 20),
+                0,
+                FIXTURE_PACK,
+                65_536,
+                0
+            )
+            .is_err()
         );
     }
 
@@ -1744,9 +1730,15 @@ mod tests {
         // Sliding: R = ⌈127/16⌉ + 1 = 9; 1 + 64 × (4 × 9 + 1) + 512 = 2,881
         // blocks, one pad more, × 16 × 199,680. Global: 8,192 + 1 blocks,
         // one pad more, × 16 × 23,040.
-        assert_eq!(cuda_kv_min_bytes(&sizing, &cache(true)), 12_228_280_320);
+        assert_eq!(
+            cuda_kv_min_bytes(FLASH, &sizing, &cache(true)),
+            12_228_280_320
+        );
         // Without the cache, no retained windows: 1 + 64 × 10 + 512 = 1,153.
-        assert_eq!(cuda_kv_min_bytes(&sizing, &cache(false)), 6_707_527_680);
+        assert_eq!(
+            cuda_kv_min_bytes(FLASH, &sizing, &cache(false)),
+            6_707_527_680
+        );
         // Drafting k tokens adds a drafter pool of the sliding pool's
         // blocks, each 16 positions × k × 5,120 bytes and a tap of k × 16 KiB.
         for k in 1..=3u64 {
@@ -1755,13 +1747,14 @@ mod tests {
                 ..sizing
             };
             assert_eq!(
-                cuda_kv_min_bytes(&drafting, &cache(true)),
+                cuda_kv_min_bytes(FLASH, &drafting, &cache(true)),
                 12_228_280_320 + 2_882 * (16 * k * 5_120 + k * 16_384)
             );
         }
-        let min = cuda_kv_min_bytes(&sizing, &cache(true));
+        let min = cuda_kv_min_bytes(FLASH, &sizing, &cache(true));
         let fits = |bytes| {
             check_resources(
+                FLASH,
                 &sizing,
                 &cache(true),
                 &cuda(bytes),
@@ -1774,6 +1767,9 @@ mod tests {
         assert!(fits(min).is_ok());
         assert!(fits(min - 1).is_err());
     }
+
+    /// The shape every check below is held to.
+    const FLASH: &Shape = &crate::architecture::MIMO_V26_FLASH;
 
     /// The weights pack in the gateway's fixture: 17,419,419,648 bytes.
     const FIXTURE_PACK: u64 = 17_419_419_648;
@@ -1802,9 +1798,9 @@ mod tests {
         // entries × 2 groups × 4 bytes; split attention's 64 tokens × 128
         // chunks of partial rows of 16,640 bytes; 131,072 positions × 768
         // bytes of RoPE tables.
-        let reserve = cuda_device_reserve_bytes(&sizing);
+        let reserve = cuda_device_reserve_bytes(FLASH, &sizing);
         assert_eq!(split_partial_rows(&sizing), 64 * 128);
-        assert_eq!(SPLIT_PARTIAL_ROW_BYTES, 16_640);
+        assert_eq!(FLASH.split_partial_row_bytes, 16_640);
         assert_eq!(
             reserve,
             (4 << 30)
@@ -1817,7 +1813,7 @@ mod tests {
         );
         assert_eq!(reserve, 16_968_056_832);
         // A sampler row holds an f64 distribution over every id of the head.
-        const { assert!(SAMPLER_ROW_DEVICE_BYTES >= 152_576 * 8) };
+        const { assert!(crate::architecture::MIMO_V26_FLASH.sampler_row_device_bytes >= 152_576 * 8) };
         // Drafting three tokens: per seat 8 sampler rows, 39 rows of 16 KiB
         // (12 of drafter state, 3 + 24 level rows), 32 KiB of step tables,
         // four global page lists of 8,192 entries and 48 bytes of work items
@@ -1831,7 +1827,7 @@ mod tests {
         assert_eq!(drafter_seat_rows(3), 39);
         assert_eq!(split_partial_rows(&drafting), 256 * 128);
         assert_eq!(
-            cuda_device_reserve_bytes(&drafting),
+            cuda_device_reserve_bytes(FLASH, &drafting),
             (4 << 30)
                 + 8192 * (5 << 18)
                 + 65_536 * (24 << 10)
@@ -1842,25 +1838,38 @@ mod tests {
         );
         for k in 1..=3 {
             assert!(
-                cuda_device_reserve_bytes(&Sizing {
-                    draft_tokens: k,
-                    ..sizing
-                }) > reserve
+                cuda_device_reserve_bytes(
+                    FLASH,
+                    &Sizing {
+                        draft_tokens: k,
+                        ..sizing
+                    }
+                ) > reserve
             );
         }
         // Pinned deployments draft three tokens: with the drafter pool in the
         // KV budget and the larger reserve, 64 GiB of KV still fits beside
         // Flash's checkpoint, and the device is still the bound.
-        let drafting_reserve = cuda_device_reserve_bytes(&drafting);
-        assert!(cuda_kv_min_bytes(&drafting, &cache) < 64 << 30);
-        let fits_drafting =
-            |kv: u64| check_resources(&drafting, &cache, &cuda(kv), 0, FLASH_PACK, 65_536, 8);
+        let drafting_reserve = cuda_device_reserve_bytes(FLASH, &drafting);
+        assert!(cuda_kv_min_bytes(FLASH, &drafting, &cache) < 64 << 30);
+        let fits_drafting = |kv: u64| {
+            check_resources(
+                FLASH,
+                &drafting,
+                &cache,
+                &cuda(kv),
+                0,
+                FLASH_PACK,
+                65_536,
+                8,
+            )
+        };
         assert!(fits_drafting(64 << 30).is_ok());
         let room = SUPPORTED_GPU_MEMORY_BYTES - FLASH_PACK - drafting_reserve;
         assert!(fits_drafting(room).is_ok());
         assert!(fits_drafting(room + 1).is_err());
         let fits = |kv: u64, weights: u64, gpus: u64| {
-            check_resources(&sizing, &cache, &cuda(kv), 0, weights, 65_536, gpus)
+            check_resources(FLASH, &sizing, &cache, &cuda(kv), 0, weights, 65_536, gpus)
         };
         // A realistic Flash deployment: 64 GiB of KV beside the checkpoint.
         assert!(fits(64 << 30, FLASH_PACK, 1).is_ok());
@@ -2263,6 +2272,7 @@ mod tests {
         let mib = |bytes: u64| bytes.div_ceil(1 << 20);
         let fits = |host: u64, memory: u64| {
             check_resources(
+                FLASH,
                 &m.sizing,
                 &m.cache,
                 &m.executor,

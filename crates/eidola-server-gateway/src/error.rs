@@ -45,6 +45,11 @@ pub enum ServerError {
     /// Service unavailable (503).
     ServiceUnavailable(String),
 
+    /// The request's `model` does not resolve: malformed (400), unknown
+    /// (404), naming a tag and a hash it does not resolve to (409), or
+    /// retired (410). Fixed messages, never the reference itself.
+    ModelReference(crate::models::ModelRefError),
+
     /// Internal server error (500).
     Internal(String),
 }
@@ -65,6 +70,9 @@ impl ServerError {
             ServerError::Network(_) | ServerError::Parse(_) => StatusCode::BAD_GATEWAY,
             ServerError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ServerError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ServerError::ModelReference(e) => {
+                StatusCode::from_u16(e.status()).unwrap_or(StatusCode::BAD_REQUEST)
+            }
         }
     }
 
@@ -94,6 +102,7 @@ impl ServerError {
             ServerError::Parse(msg) => ErrorResponse::new(msg, "upstream_error"),
             ServerError::ServiceUnavailable(msg) => ErrorResponse::new(msg, "service_unavailable"),
             ServerError::Internal(msg) => ErrorResponse::new(msg, "internal_error"),
+            ServerError::ModelReference(e) => ErrorResponse::new(e.message(), e.error_type()),
         }
     }
 }
@@ -145,6 +154,7 @@ impl std::fmt::Display for ServerError {
             ServerError::Parse(msg) => write!(f, "parse error: {}", msg),
             ServerError::ServiceUnavailable(msg) => write!(f, "service unavailable: {}", msg),
             ServerError::Internal(msg) => write!(f, "internal error: {}", msg),
+            ServerError::ModelReference(e) => write!(f, "model reference: {}", e.error_type()),
         }
     }
 }

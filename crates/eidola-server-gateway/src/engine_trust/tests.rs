@@ -12,7 +12,11 @@ use super::manifest::{self, CheckedCachePolicy, CheckedModel, CheckedWeights};
 use super::*;
 use eidola_common::engine_deployment;
 
-const MODEL: &str = "fixture-model";
+/// The fixture model's weights hash, which it is listed under and its node
+/// is named by.
+const MODEL: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+/// The shape the fixture's resources are checked against.
+const FLASH: &engine_deployment::Shape = &eidola_common::architecture::MIMO_V26_FLASH;
 const CONFIG: &str = "deploy/engine/fixture-model/tdx-a/tinfoil-config.yml";
 const SIDECAR: &str = "deploy/engine/fixture-model/tdx-a/deployment.json";
 /// The platform endorsements the fixture sidecar names, as vendored.
@@ -227,6 +231,7 @@ fn the_fixture_deployment_is_accepted() {
         checked,
         vec![CheckedModel {
             id: MODEL.to_string(),
+            architecture: engine_deployment::Architecture::MimoV26Flash,
             weights: CheckedWeights {
                 sha256: "3".repeat(64),
                 repo: "example/fixture-model".to_string(),
@@ -324,11 +329,21 @@ fn the_file_shape_is_strict() {
 fn the_config_must_be_this_models_committed_file() {
     let mut tree = Tree::fixture();
     tree.deployment()["config"] = "deploy/engine/other-model/tdx-a/tinfoil-config.yml".into();
-    refused(&tree, "config must be deploy/engine/fixture-model/");
+    refused(
+        &tree,
+        "read deploy/engine/other-model/tdx-a/tinfoil-config.yml",
+    );
 
-    let mut tree = Tree::fixture();
-    tree.deployment()["config"] = "deploy/engine/fixture-model/../x/tinfoil-config.yml".into();
-    refused(&tree, "config must be deploy/engine/fixture-model/");
+    for bad in [
+        "deploy/engine/fixture-model/../x/tinfoil-config.yml",
+        "deploy/engine/tdx-a/tinfoil-config.yml",
+        "deploy/engine/a/b/c/tinfoil-config.yml",
+        "deploy/other/fixture-model/tdx-a/tinfoil-config.yml",
+    ] {
+        let mut tree = Tree::fixture();
+        tree.deployment()["config"] = bad.into();
+        refused(&tree, "config must be deploy/engine/<name>/<variant>/");
+    }
 
     let mut tree = Tree::fixture();
     tree.files.remove(CONFIG);
@@ -380,12 +395,44 @@ fn a_cuda_deployment_runs_on_the_gpu_image() {
 
 #[test]
 fn the_config_serves_this_model_and_these_weights() {
+    // A pinned node is named by its weights hash.
     let mut tree = Tree::fixture();
-    tree.edit_config("\"fixture-model\"", "\"another-model\"");
-    refused(&tree, "EIDOLA_ENGINE_MODEL_ID is \"another-model\"");
+    tree.edit_config(
+        &format!("EIDOLA_ENGINE_MODEL_ID: \"{MODEL}\""),
+        "EIDOLA_ENGINE_MODEL_ID: \"fixture-model\"",
+    );
+    refused(&tree, "a pinned node is named by its weights hash");
+
+    // The file lists the model under that hash.
+    let mut tree = Tree::fixture();
+    let deployments = tree.json["models"]
+        .as_object_mut()
+        .unwrap()
+        .remove(MODEL)
+        .unwrap();
+    tree.json["models"]["fixture-model"] = deployments;
+    refused(&tree, "listed under its weights hash");
 
     let mut tree = Tree::fixture();
-    tree.edit_config(&"3".repeat(64), &"8".repeat(64));
+    let deployments = tree.json["models"]
+        .as_object_mut()
+        .unwrap()
+        .remove(MODEL)
+        .unwrap();
+    tree.json["models"][&"8".repeat(64)] = deployments;
+    refused(&tree, "not 8888");
+
+    // The sidecar names an implemented architecture.
+    let mut tree = Tree::fixture();
+    let mut sidecar = tree.sidecar();
+    sidecar["architecture"] = "MimoV26Pro".into();
+    tree.set_sidecar(sidecar);
+    refused(&tree, "is not implemented");
+
+    // Other weights, with the node named by them: not the pin's.
+    let mut tree = Tree::fixture();
+    let text = tree.config_text().replace(&"3".repeat(64), &"8".repeat(64));
+    tree.set_config(text);
     refused(&tree, "EIDOLA_ENGINE_WEIGHTS_SHA256 is");
 
     let mut tree = Tree::fixture();
@@ -1112,7 +1159,7 @@ fn allocations_are_capped_and_fit_the_deployment() {
     // measured sizing).
     let measured = fixture_measured(&Tree::fixture());
     assert_eq!(measured.sizing.draft_tokens, 3);
-    let kv_min = engine_deployment::cuda_kv_min_bytes(&measured.sizing, &measured.cache);
+    let kv_min = engine_deployment::cuda_kv_min_bytes(FLASH, &measured.sizing, &measured.cache);
     let mut tree = Tree::fixture();
     tree.edit_config(
         "KV_DEVICE_BYTES: \"68719476736\"",
@@ -1133,7 +1180,7 @@ fn allocations_are_capped_and_fit_the_deployment() {
         draft_tokens: 0,
         ..measured.sizing
     };
-    let undrafted_min = engine_deployment::cuda_kv_min_bytes(&undrafted, &measured.cache);
+    let undrafted_min = engine_deployment::cuda_kv_min_bytes(FLASH, &undrafted, &measured.cache);
     assert!(undrafted_min < kv_min);
     let mut tree = Tree::fixture();
     tree.edit_config(
@@ -1150,7 +1197,7 @@ fn allocations_are_capped_and_fit_the_deployment() {
     // for this sizing, the drafter's seat rows, step tables, third group of
     // block tables and wider partial rows included) within the B300's
     // `SUPPORTED_GPU_MEMORY_BYTES`.
-    let reserve = engine_deployment::cuda_device_reserve_bytes(&measured.sizing);
+    let reserve = engine_deployment::cuda_device_reserve_bytes(FLASH, &measured.sizing);
     let room = engine_deployment::SUPPORTED_GPU_MEMORY_BYTES - FIXTURE_PACK_BYTES - reserve;
     let mut tree = Tree::fixture();
     tree.edit_config(
@@ -1552,7 +1599,7 @@ fn a_deployment_path_uses_safe_components() {
         let mut tree = Tree::fixture();
         tree.deployment()["config"] =
             format!("deploy/engine/fixture-model/{variant}/tinfoil-config.yml").into();
-        refused(&tree, "config must be deploy/engine/fixture-model/");
+        refused(&tree, "config must be deploy/engine/<name>/<variant>/");
     }
 }
 

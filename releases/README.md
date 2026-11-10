@@ -140,9 +140,11 @@ An engine pin's TDX machine policy and the machines it accepts come from a vendo
 
 `trust/engine-enclaves.json` is same-sha: a gateway build accepts exactly the engine deployments committed in its tree, with no notion of a previous version. A change to an engine deployment therefore rolls out in order — **new engines → new gateways → client → shift → retire**:
 
-1. Commit the new deployment (its `deploy/engine/<model-id>/<variant>/` directory) beside the old one, measure it (`measure-engine-enclaves`, release-time), and deploy it. A gateway built from this tree accepts both.
+1. Commit the new deployment (its `deploy/engine/<name>/<variant>/` directory) beside the old one, measure it (`measure-engine-enclaves`, release-time), and deploy it. A gateway built from this tree accepts both.
 2. Ship that gateway, then the client release pinning it.
 3. Shift traffic to the new deployment.
 4. Remove the old deployment's directory and re-measure; the next gateway build no longer accepts it.
+
+New weights are a new model: a new weights hash, its own file under `models/` and its own deployments. Moving a tag onto them follows the same order: the new file and deployments land in step 1 with the tag still on the old file; the gateway release of step 2 moves the tag (and marks the old file `deprecated`, with `retire_after`); step 4 marks the old file `retired` as its deployments are removed. A client that named the old weights by hash keeps them until that release, and is then refused as retired.
 
 An in-place config change moves its pin with it, so the new engine must be running before a gateway carrying that pin ships. Doctrine: `crates/eidola-server-gateway/AGENTS.md` → Eidola-hosted engines. Recording engine deployments in `artifact-manifest.json` is a proposed manifest schema rotation (accept side one release before emit side), written up in `crates/measure-enclave/AGENTS.md` → Engine deployments; the manifest schema is unchanged today.

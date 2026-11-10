@@ -231,6 +231,7 @@ fn wide_drafts_and_a_small_kv_budget_are_refused_before_the_device() {
     let mut map = cuda_env(dir, hash);
     let sizing = config_from(&map).unwrap().sizing;
     let without = eidola_common::engine_deployment::cuda_kv_min_bytes(
+        &eidola_common::architecture::MIMO_V26_FLASH,
         &sizing,
         &config_from(&map).unwrap().cache,
     );

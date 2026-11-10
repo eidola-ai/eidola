@@ -592,6 +592,7 @@ mod tests {
     /// block sizes, seats, step sizes, the cache switch and the draft width.
     #[test]
     fn the_shared_minimum_is_the_derivations() {
+        use eidola_common::architecture::MIMO_V26_FLASH;
         use eidola_common::engine_deployment::cuda_kv_min_bytes;
         for block in [1, 16, 64, 1024] {
             for (seats, step) in [(1, 4), (8, 512), (64, 8192)] {
@@ -606,7 +607,7 @@ mod tests {
                     };
                     let mut spec = flash_drafting(draft);
                     spec.block_size = block;
-                    let min = cuda_kv_min_bytes(&sizing, &cache(enabled));
+                    let min = cuda_kv_min_bytes(&MIMO_V26_FLASH, &sizing, &cache(enabled));
                     let at = (block, seats, step, enabled, draft);
                     derive_kv_blocks(&spec, 4096, min, &sizing, &cache(enabled))
                         .unwrap_or_else(|e| panic!("{at:?}: {e}"));

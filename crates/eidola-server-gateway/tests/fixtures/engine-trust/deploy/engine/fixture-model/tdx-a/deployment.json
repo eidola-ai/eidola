@@ -1,4 +1,5 @@
 {
+  "architecture": "MimoV26Flash",
   "weights": {
     "repo": "example/fixture-model",
     "revision": "4444444444444444444444444444444444444444"

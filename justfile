@@ -170,6 +170,7 @@ check:
     ./scripts/check-manifest-determinism.sh
     ./scripts/artifact-manifest.sh check-complete
     ./scripts/test-release-assets.sh
+    ./scripts/test-weights-hash.sh
 
 # Apply auto-fixable markdown formatting via rumdl
 format:
@@ -275,6 +276,7 @@ test-shipping-zip:
 # otherwise runs only on a real `v*` tag; this runs it on every PR.
 test-release-assets:
     ./scripts/test-release-assets.sh
+    ./scripts/test-weights-hash.sh
 
 # Compute enclave measurements from tinfoil-config.yml and CVM artifacts
 measure:
