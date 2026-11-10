@@ -3224,10 +3224,21 @@ impl Inner {
     async fn account_balances(&self) -> Result<BalancesResult, AppError> {
         let cfg = self.load_config();
         let eidola = self.eidola_resolved().await?;
-        let base_url = eidola.base_url.as_str();
-        let (id, secret) = self.require_credentials(&cfg)?;
-
         let client = self.build_client(&eidola, None).await?;
+        self.account_balances_via(&cfg, &client, eidola.base_url.as_str())
+            .await
+    }
+
+    /// `account_balances` against an already-resolved backend: what a turn
+    /// calls, so its provisioning stays on the snapshot the turn itself will
+    /// send through (see `ensure_spendable_credential`).
+    async fn account_balances_via(
+        &self,
+        cfg: &Config,
+        client: &reqwest::Client,
+        base_url: &str,
+    ) -> Result<BalancesResult, AppError> {
+        let (id, secret) = self.require_credentials(cfg)?;
         let resp = client
             .get(format!("{base_url}/v1/account/balances"))
             .basic_auth(id, Some(secret))
@@ -3353,19 +3364,32 @@ impl Inner {
     }
 
     async fn account_allocate(&self, credits: i64) -> Result<AllocateResult, AppError> {
+        let cfg = self.load_config();
+        let eidola = self.eidola_resolved().await?;
+        let client = self.build_client(&eidola, None).await?;
+        self.account_allocate_via(&cfg, &client, eidola.base_url.as_str(), credits)
+            .await
+    }
+
+    /// `account_allocate` against an already-resolved backend. Keys, balance
+    /// and issuance all go to this one snapshot; a turn passes the backend it
+    /// will send the completion through, so a settings edit mid-turn cannot
+    /// debit one server for a credential another then rejects.
+    async fn account_allocate_via(
+        &self,
+        cfg: &Config,
+        client: &reqwest::Client,
+        base_url: &str,
+        credits: i64,
+    ) -> Result<AllocateResult, AppError> {
         if credits <= 0 {
             return Err(AppError::Credential {
                 message: "credits must be greater than 0".into(),
             });
         }
+        let (account_id, secret) = self.require_credentials(cfg)?;
 
-        let cfg = self.load_config();
-        let eidola = self.eidola_resolved().await?;
-        let base_url = eidola.base_url.as_str();
-        let (account_id, secret) = self.require_credentials(&cfg)?;
-        let client = self.build_client(&eidola, None).await?;
-
-        let keys = self.refresh_issuer_keys(&cfg, &client, base_url).await?;
+        let keys = self.refresh_issuer_keys(cfg, client, base_url).await?;
 
         let expected_ds = cfg.domain_separator();
         let now = now_ms();
@@ -6145,6 +6169,8 @@ impl Inner {
         &self,
         cfg: &Config,
         db_conn: &turso::Connection,
+        client: &reqwest::Client,
+        base_url: &str,
         charge_credits: i64,
     ) -> Result<db::SpendableCredential, AppError> {
         let deadline = tokio::time::Instant::now() + PROVISION_WAIT_TIMEOUT;
@@ -6164,15 +6190,16 @@ impl Inner {
             // holding a spendable credential, and a sufficient balance buys an
             // allocation the wallet did not need. Best-effort: if the server
             // cannot be reached, the reads below say so.
+            // Everything here goes to the turn's own backend snapshot
+            // (`client`, `base_url`): refresh, balance and allocation. Resolved
+            // again, a settings edit mid-turn would have the wallet debit one
+            // server for a credential the turn then presents to another.
             if !keys_refreshed {
                 keys_refreshed = true;
-                let refreshed = async {
-                    let eidola = self.eidola_resolved().await?;
-                    let client = self.build_client(&eidola, None).await?;
-                    self.refresh_issuer_keys(cfg, &client, eidola.base_url.as_str())
-                        .await
-                };
-                if refreshed.await.is_ok()
+                if self
+                    .refresh_issuer_keys(cfg, client, base_url)
+                    .await
+                    .is_ok()
                     && let Some(cred) =
                         db::find_spendable_credential(db_conn, charge_credits).await?
                 {
@@ -6184,11 +6211,12 @@ impl Inner {
                 return Err(AppError::NoAccount);
             }
 
-            let balances = self.account_balances().await?;
+            let balances = self.account_balances_via(cfg, client, base_url).await?;
             if balances.available >= charge_credits {
                 // Enough to allocate at least the charge — grow the pool.
                 let amount = auto_allocation_amount(balances.available, charge_credits)?;
-                self.account_allocate(amount).await?;
+                self.account_allocate_via(cfg, client, base_url, amount)
+                    .await?;
                 continue;
             }
 
@@ -7227,7 +7255,7 @@ impl Inner {
                 // later rounds re-check it against their own (grown) estimate.
                 check_turn_budget(charge_credits, budget)?;
                 let (spend, auth_value) = self
-                    .acquire_spend(&cfg, &db_conn, charge_credits, now)
+                    .acquire_spend(&cfg, &db_conn, &client, &base_url, charge_credits, now)
                     .await?;
                 (charge_credits, Some(spend), Some(auth_value))
             }
@@ -7357,6 +7385,8 @@ impl Inner {
         &self,
         cfg: &Config,
         db_conn: &turso::Connection,
+        client: &reqwest::Client,
+        base_url: &str,
         charge_credits: u128,
         now: i64,
     ) -> Result<(SpendPrep, String), AppError> {
@@ -7367,7 +7397,7 @@ impl Inner {
         // credential becomes `spending`); the HTTP request runs outside it.
         let _spend_guard = self.spend_gate.lock().await;
         let cred = self
-            .ensure_spendable_credential(cfg, db_conn, charge_credits as i64)
+            .ensure_spendable_credential(cfg, db_conn, client, base_url, charge_credits as i64)
             .await?;
 
         let credit_token =
@@ -7495,7 +7525,14 @@ impl Inner {
         }
         check_turn_budget(charge_credits, prep.budget)?;
         let (spend, auth_value) = self
-            .acquire_spend(&cfg, &prep.db_conn, charge_credits, prep.now)
+            .acquire_spend(
+                &cfg,
+                &prep.db_conn,
+                &prep.client,
+                &prep.base_url,
+                charge_credits,
+                prep.now,
+            )
             .await?;
         prep.charge_credits = charge_credits;
         prep.total_credits += charge_credits;

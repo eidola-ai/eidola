@@ -1222,7 +1222,9 @@ impl Inner {
                         message: "computed charge is zero — model pricing may be missing".into(),
                     });
                 }
-                let (prep, auth) = self.acquire_spend(&cfg, &db_conn, charge, now).await?;
+                let (prep, auth) = self
+                    .acquire_spend(&cfg, &db_conn, &route.client, &route.base_url, charge, now)
+                    .await?;
                 spend = Some(prep);
                 Some(auth)
             }
