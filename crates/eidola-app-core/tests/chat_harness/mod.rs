@@ -587,6 +587,10 @@ pub enum RefundMode {
 /// [`MockConfig::published_sha256`]).
 pub type PublishedSha = Arc<std::sync::Mutex<Option<String>>>;
 
+/// A one-shot non-2xx for the next chat request (see
+/// [`MockConfig::fail_next_chat`]).
+pub type FailNextChat = Arc<std::sync::Mutex<Option<u16>>>;
+
 /// Mock upstream configuration.
 #[derive(Clone)]
 pub struct MockConfig {
@@ -642,6 +646,10 @@ pub struct MockConfig {
     /// the default — publishes none, the shape of a gateway older than
     /// hash-keyed models.
     pub published_sha256: PublishedSha,
+    /// When set, the **next** chat request is answered with this non-2xx
+    /// status (an error document) and the setting clears, whatever `chat`
+    /// says — so a test can fail one turn between ordinary ones.
+    pub fail_next_chat: FailNextChat,
     /// Armed by a test to make the mock **stop listening** once it has served
     /// the next `GET /v1/models` — so the turn that fetched the catalog then
     /// meets a refused connection for its completion, the one failure that
@@ -866,6 +874,7 @@ impl Default for MockConfig {
             declared_prompt_cache: None,
             declared_max_output: None,
             published_sha256: PublishedSha::default(),
+            fail_next_chat: FailNextChat::default(),
             close_switch: CloseSwitch::default(),
             list_flat_model: false,
             chat_delay_ms: 0,
@@ -2121,6 +2130,14 @@ async fn handle_chat(
 ) -> std::io::Result<()> {
     if config.chat_delay_ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(config.chat_delay_ms)).await;
+    }
+    let fail = config
+        .fail_next_chat
+        .lock()
+        .expect("fail-next lock poisoned")
+        .take();
+    if let Some(status) = fail {
+        return write_json(stream, status, &error_body("upstream model error")).await;
     }
     // Compute an inline refund object once (shared by the blocking happy path).
     let inline_refund = if matches!(config.refund, RefundMode::Succeed | RefundMode::NotStored) {

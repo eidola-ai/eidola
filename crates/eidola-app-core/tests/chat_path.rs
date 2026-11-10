@@ -11495,3 +11495,59 @@ fn a_continuation_is_pinned_to_the_weights_that_wrote_the_partial_answer() {
         assert_eq!(mock.chat_bodies().len(), sent, "nothing was sent");
     });
 }
+
+/// **A failed generation is not an answer from new weights.** After the tag
+/// moves, a turn that errors upstream records which weights erred, but the
+/// participant's last answer is still the one from the earlier weights: the
+/// roster is not announced, and the next successful answer is the one that
+/// moves it.
+#[test]
+fn a_failed_generation_does_not_move_the_last_answers_weights() {
+    run(|| {
+        let config = MockConfig::default();
+        let published = config.published_sha256.clone();
+        let fail = config.fail_next_chat.clone();
+        *published.lock().unwrap() = Some(HASH_1.to_string());
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        let first = core
+            .runtime()
+            .block_on(core.chat("first".into(), MODEL.into(), None))
+            .expect("turn 1");
+        let space = first.space_id.clone();
+
+        *published.lock().unwrap() = Some(HASH_2.to_string());
+        *fail.lock().unwrap() = Some(503);
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.chat("fails".into(), MODEL.into(), Some(space.clone())))
+            .expect_err("the upstream refused");
+        let errored = core
+            .runtime()
+            .block_on(core.test_space_actions(space.clone()))
+            .expect("actions")
+            .into_iter()
+            .rfind(|a| a.action_type == "inference")
+            .expect("the error generation");
+        assert_eq!(errored.status, "error");
+        assert_eq!(errored.model_sha256.as_deref(), Some(HASH_2));
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Change::Participants)),
+            "a failed generation moves no notice"
+        );
+
+        core.runtime()
+            .block_on(core.chat("succeeds".into(), MODEL.into(), Some(space)))
+            .expect("turn 3");
+        assert_eq!(
+            drain(&mut rx)
+                .iter()
+                .filter(|c| matches!(c, Change::Participants))
+                .count(),
+            1,
+            "the first successful answer from the new weights announces the roster"
+        );
+    });
+}

@@ -14428,7 +14428,11 @@ impl TurnPrep {
     /// model notices say (`model_catalog::notices`' `Updated` compares the
     /// latest recorded hash with what the tag names now). The first hash
     /// ever recorded moves nothing a notice reads.
-    async fn record_resolved_hash(&mut self, action_id: &str) -> Result<(), AppError> {
+    async fn record_resolved_hash(
+        &mut self,
+        action_id: &str,
+        answered: bool,
+    ) -> Result<(), AppError> {
         let Some(sha256) = self.resolved_sha256.clone() else {
             return Ok(());
         };
@@ -14440,7 +14444,9 @@ impl TurnPrep {
         )
         .await?;
         db::set_action_model_sha256(&self.db_conn, action_id, Some(&sha256)).await?;
-        if previous.is_some_and(|p| p != sha256) {
+        // A failed generation records which weights erred, and moves no
+        // notice: it is not an answer (`db::last_model_sha256`).
+        if answered && previous.is_some_and(|p| p != sha256) {
             self.weights_moved = true;
         }
         Ok(())
@@ -14541,7 +14547,7 @@ impl TurnPrep {
             },
         )
         .await?;
-        self.record_resolved_hash(&action_id).await?;
+        self.record_resolved_hash(&action_id, true).await?;
         if let Some(ref ante) = self.trace_reply_to {
             db::insert_action_antecedent(&self.db_conn, &action_id, ante, 0, "reply").await?;
         }
@@ -14986,7 +14992,8 @@ impl TurnPrep {
             },
         )
         .await?;
-        self.record_resolved_hash(&inference_action_id).await?;
+        self.record_resolved_hash(&inference_action_id, action_status != "error")
+            .await?;
         if let Some(ref ante) = self.inf_reply_to {
             db::insert_action_antecedent(&self.db_conn, &inference_action_id, ante, 0, "reply")
                 .await?;
