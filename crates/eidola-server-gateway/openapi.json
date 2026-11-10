@@ -237,7 +237,7 @@
           "Linked"
         ],
         "summary": "`POST /v1/account/credentials` — issue anonymous credentials (authenticated).",
-        "description": "Idempotent per `(account, idempotency_key)`: the first request debits and\nstores the signed response in one transaction, and a retry with the same\nkey and request is answered from what was stored, so a response lost on the\nway back costs nothing. A stored issuance is answered before the terms gate\nand the current-key check, because it was already paid for.",
+        "description": "Idempotent per `(account, idempotency_key)`: the first request debits and\nstores the signed response in one transaction, and a retry with the same\nkey and request is answered from what was stored, so a response lost on the\nway back costs nothing. A stored issuance is answered before the terms gate\nand the current-key check, because it was already paid for. A key that is\nnot current is refused with `409` only once the database, under the account\nlock, has it no longer issuing, so no attempt under the idempotency key can\ndebit afterwards; otherwise `503`.",
         "operationId": "issue_credentials",
         "requestBody": {
           "content": {
@@ -291,7 +291,7 @@
             }
           },
           "409": {
-            "description": "The idempotency key was used for a different request, or the named issuer key is not the current one; nothing was debited",
+            "description": "The idempotency key was used for a different request, or the named issuer key has stopped issuing; nothing was or will be debited under the idempotency key",
             "content": {
               "application/json": {
                 "schema": {
@@ -311,7 +311,7 @@
             }
           },
           "503": {
-            "description": "Credential issuance not configured",
+            "description": "Credential issuance not configured, or the named issuer key is not yet this gateway's current issuing key; try again",
             "content": {
               "application/json": {
                 "schema": {
@@ -523,7 +523,7 @@
           "Unlinked"
         ],
         "summary": "Create a chat completion.",
-        "description": "Paid with one or two ACT (Anonymous Credit Token) spends in the body's\n`credentials` member. Every spend proof is verified, every nullifier is\nrecorded, all or none, each with a provisional refund of nothing, and when\nthe request ends each is replaced by its input's final refund: the charge\nis consumed in input order, and each input's unspent credits return under\nits own issuer key.",
+        "description": "Paid with one or two ACT (Anonymous Credit Token) spends in the body's\n`credentials` member. Every spend proof is verified, every nullifier is\nrecorded, all or none, each with a provisional refund of nothing, and when\nthe request ends each is replaced by its input's final refund: the charge\nis consumed in input order, and each input's unspent credits return under\nits own issuer key.\n\n`model` is `tag`, `tag@sha256:<hex>` or `sha256:<hex>` (a full SHA-256 in\nlowercase hex), resolved to the model's weights hash before anything else.\nA digest, when present, decides alone; a bare tag resolves through this\nbuild's catalog. The response's `model` is `tag@sha256:<hex>` (or\n`sha256:<hex>` for a hash named alone).",
         "operationId": "chat_completions",
         "requestBody": {
           "content": {
@@ -547,7 +547,7 @@
             }
           },
           "400": {
-            "description": "Invalid request; a malformed refund recovery key, more than two credentials, one credential presented twice, a share of zero, or a credential in a header (refused before any credential is spent); or a hold above the worst-case cost (refunded in full)",
+            "description": "Invalid request; a malformed model reference (`invalid_model_reference`: not `tag`, `tag@sha256:<hex>` or `sha256:<hex>`), a malformed refund recovery key, more than two credentials, one credential presented twice, a share of zero, or a credential in a header (refused before any credential is spent); or a hold above the worst-case cost (refunded in full)",
             "content": {
               "application/json": {
                 "schema": {
@@ -576,8 +576,28 @@
               }
             }
           },
+          "404": {
+            "description": "The model reference names no model (`model_not_found`); refunded in full",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "A credential already spent; none of the request's credentials is recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "The model reference names a retired model (`model_retired`); refunded in full",
             "content": {
               "application/json": {
                 "schema": {
@@ -708,6 +728,7 @@
           "Public"
         ],
         "summary": "List available models.",
+        "description": "One entry per weights hash, with its tags, source, per-file manifest,\nlifecycle and the engine deployments that serve it (`docs/model-identity.md`).",
         "operationId": "list_models",
         "responses": {
           "200": {
@@ -1570,6 +1591,24 @@
           }
         }
       },
+      "EngineDeploymentPin": {
+        "type": "object",
+        "description": "One engine deployment that serves a model.",
+        "required": [
+          "config_sha256",
+          "measurement"
+        ],
+        "properties": {
+          "config_sha256": {
+            "type": "string",
+            "description": "SHA-256 of the deployment's committed `tinfoil-config.yml`, lowercase\nhex (on Intel TDX, its MRCONFIGID)."
+          },
+          "measurement": {
+            "type": "object",
+            "description": "The attestation measurement every connection to the deployment is\nheld to, in `tinfoil-verifier`'s pin shape."
+          }
+        }
+      },
       "ErrorDetail": {
         "type": "object",
         "required": [
@@ -1815,6 +1854,14 @@
           }
         }
       },
+      "LifecycleStatus": {
+        "type": "string",
+        "description": "A listed model's lifecycle status.",
+        "enum": [
+          "current",
+          "deprecated"
+        ]
+      },
       "ListKeysResponse": {
         "type": "object",
         "description": "Response for `GET /v1/keys`.",
@@ -1926,6 +1973,12 @@
         "description": "A model descriptor.",
         "required": [
           "id",
+          "sha256",
+          "tags",
+          "architecture",
+          "weights",
+          "lifecycle",
+          "deployments",
           "name",
           "description",
           "context_length",
@@ -1934,6 +1987,10 @@
           "pricing"
         ],
         "properties": {
+          "architecture": {
+            "type": "string",
+            "description": "The model architecture (`MimoV26Flash`, …)."
+          },
           "capabilities": {
             "$ref": "#/components/schemas/ModelCapabilities",
             "description": "What this model can do."
@@ -1944,13 +2001,24 @@
             "description": "Maximum context window size in tokens.",
             "minimum": 0
           },
+          "deployments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EngineDeploymentPin"
+            },
+            "description": "The engine deployments that serve these weights: each config's hash\nand the attestation measurement this gateway holds it to."
+          },
           "description": {
             "type": "string",
             "description": "Short description of the model's capabilities."
           },
           "id": {
             "type": "string",
-            "description": "The model identifier (e.g. \"openai/gpt-4o\")."
+            "description": "The id to request the model by: its first tag, which follows the tag\n(`tag`), or `sha256:<hex>` when it has none. A request may also name\n`tag@sha256:<hex>` (the tag, asserted to resolve to this hash) or\n`sha256:<hex>` (these weights, under any tag)."
+          },
+          "lifecycle": {
+            "$ref": "#/components/schemas/ModelLifecycle",
+            "description": "Whether the model is current or deprecated, and when it retires."
           },
           "max_output_tokens": {
             "type": [
@@ -1972,6 +2040,21 @@
           "pricing": {
             "$ref": "#/components/schemas/ModelPricing",
             "description": "Pricing in integer credits per 1k tokens."
+          },
+          "sha256": {
+            "type": "string",
+            "description": "The model's identity: its weights hash, lowercase hex\n(`docs/model-identity.md`)."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Every tag that resolves to this hash. Each tag names exactly one hash."
+          },
+          "weights": {
+            "$ref": "#/components/schemas/WeightsProvenance",
+            "description": "Where the weights come from, and every file the hash covers."
           }
         }
       },
@@ -2016,6 +2099,26 @@
           "tool_calling": {
             "$ref": "#/components/schemas/Capability",
             "description": "Whether the model accepts a `tools` request field.\n\nNamed after the wire rather than after an adjective: the question a\nclient actually has is \"will this request be accepted\", and a field\nname answers it where \"supports tool use\" does not."
+          }
+        }
+      },
+      "ModelLifecycle": {
+        "type": "object",
+        "description": "A model's place in its lifecycle.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "retire_after": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For a deprecated model, the announced retirement date, `YYYY-MM-DD`."
+          },
+          "status": {
+            "$ref": "#/components/schemas/LifecycleStatus",
+            "description": "`current` or `deprecated` (a retired model is not listed)."
           }
         }
       },
@@ -2545,6 +2648,57 @@
                 "type": "null"
               }
             ]
+          }
+        }
+      },
+      "WeightsFileEntry": {
+        "type": "object",
+        "description": "One file the weights hash covers.",
+        "required": [
+          "path",
+          "size",
+          "sha256"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The file's name, in the weights directory and in the repository."
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Its SHA-256, lowercase hex."
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Its size in bytes.",
+            "minimum": 0
+          }
+        }
+      },
+      "WeightsProvenance": {
+        "type": "object",
+        "description": "Where a model's weights come from, and every file its hash covers.",
+        "required": [
+          "repo",
+          "revision",
+          "files"
+        ],
+        "properties": {
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WeightsFileEntry"
+            },
+            "description": "Every file the weights hash covers, sorted by path. The hash is the\nSHA-256 of `<sha256>␠␠<path>\\n` over these, in this order."
+          },
+          "repo": {
+            "type": "string",
+            "description": "The source repository, `<owner>/<name>` (on Hugging Face)."
+          },
+          "revision": {
+            "type": "string",
+            "description": "The source repository's revision (a 40-hex-digit commit)."
           }
         }
       }

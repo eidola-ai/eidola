@@ -220,10 +220,14 @@
               relPath == "/deploy"
               || relPath == "/deploy/engine"
               || pkgs.lib.hasPrefix "/deploy/engine/" relPath;
+            # ... and compiles in the model catalog, one file per set of
+            # weights under `models/`, bound to those pins by weights hash.
+            isModelCatalogPath = relPath == "/models" || pkgs.lib.hasPrefix "/models/" relPath;
           in
           (crateInSet "eidola-app-core" && isTrustRootPath && !isPlatformEndorsementsPath)
           || (crateInSet "eidola-server-gateway" && isTrustRootPath)
           || (crateInSet "eidola-server-gateway" && isEngineDeployPath)
+          || (crateInSet "eidola-server-gateway" && isModelCatalogPath)
           # Test fixtures and data of a crate being built: a package build
           # runs that crate's tests (`doCheck`), and the workspace checks run
           # every crate's; fixtures are rarely Rust source (the gateway's

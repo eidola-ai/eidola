@@ -754,8 +754,26 @@ pub enum IssuanceRecord {
     /// An earlier attempt under this idempotency key was debited; this is
     /// what it stored. Nothing was debited now.
     Stored(StoredIssuance),
+    /// The named key's issue window has closed by the database clock, read
+    /// under the account lock; nothing debited or stored.
+    Retired,
     /// The balance could not cover the amount; nothing debited or stored.
     Insufficient,
+}
+
+/// What [`resolve_issuance_off_current_key`] found, for an issuance naming a
+/// key that is not the gateway's current issuing key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OffCurrentKey {
+    /// An earlier attempt under this idempotency key was debited.
+    Stored(StoredIssuance),
+    /// Nothing is stored and the named key has stopped issuing (or is
+    /// unknown) by the database clock under the account lock, so nothing can
+    /// ever be debited under this idempotency key.
+    Retired,
+    /// Nothing is stored, but the database still has the named key issuing:
+    /// an attempt under this idempotency key may yet debit.
+    Issuing,
 }
 
 /// A stored issuance response (a `credential_issuance` row).
@@ -812,7 +830,10 @@ pub async fn find_credential_issuance(
 ///
 /// One transaction, serialized per account by the account row lock: an
 /// issuance already stored under the key is returned and nothing is debited;
-/// otherwise the debit (pool-aware, FIFO by expiry, through `debit_account`)
+/// a key whose issue window has closed by the database clock, read under the
+/// lock, is refused ([`IssuanceRecord::Retired`]) however long ago this
+/// attempt passed the gateway's current-key check; otherwise the debit
+/// (pool-aware, FIFO by expiry, through `debit_account`)
 /// and the stored response commit together, so a row exists exactly when the
 /// account paid for it.
 #[tracing::instrument(skip_all, name = "db.record_credential_issuance", err)]
@@ -857,10 +878,52 @@ pub async fn record_credential_issuance(
             ledger_entry_id: row.get("ledger_entry_id"),
         },
         "stored" => IssuanceRecord::Stored(map_stored_issuance(&row)),
+        "retired" => IssuanceRecord::Retired,
         "insufficient" => IssuanceRecord::Insufficient,
         other => {
             return Err(ServerError::Internal(format!(
                 "unexpected issuance outcome {other:?}"
+            )));
+        }
+    })
+}
+
+/// Decide an issuance that names a key other than the current issuing key,
+/// under the account lock [`record_credential_issuance`] takes and on the
+/// same database clock, so a refusal is ordered against every attempt under
+/// the idempotency key still in flight.
+#[tracing::instrument(skip_all, name = "db.resolve_issuance_off_current_key", err)]
+pub async fn resolve_issuance_off_current_key(
+    pool: &Pool,
+    account_id: Uuid,
+    idempotency_key: &[u8],
+    issuer_key_id: &str,
+) -> Result<OffCurrentKey, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    let row = client
+        .query_one(
+            "SELECT outcome, request_digest, issuer_key_id, credits, issuance_response, \
+             ledger_entry_id FROM resolve_issuance_off_current_key($1, $2, $3)",
+            &[&account_id, &idempotency_key, &issuer_key_id],
+        )
+        .await
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "credential issuance key check failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
+    let outcome: String = row.get("outcome");
+    Ok(match outcome.as_str() {
+        "stored" => OffCurrentKey::Stored(map_stored_issuance(&row)),
+        "retired" => OffCurrentKey::Retired,
+        "issuing" => OffCurrentKey::Issuing,
+        other => {
+            return Err(ServerError::Internal(format!(
+                "unexpected issuance key outcome {other:?}"
             )));
         }
     })

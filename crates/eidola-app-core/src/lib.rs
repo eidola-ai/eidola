@@ -18646,35 +18646,48 @@ enum IssuanceAttempt {
     /// debited, and abandoning it strands nothing.
     First,
     /// A retry after an answer that never arrived. The first attempt may have
-    /// been debited and its response stored, so only a refusal the gateway
-    /// gives *after* looking for that stored response, or one decided by the
-    /// request bytes alone, proves the issuance is dead
+    /// been debited and its response stored, or may still be in flight at the
+    /// gateway and debit later, so only a refusal decided by the request bytes
+    /// alone, or one the gateway decides under the account lock in a way no
+    /// later attempt can change, proves the issuance is dead
     /// ([`retry_refusal_is_final`]).
     Retry,
 }
 
 /// Whether a retry's `status` proves that nothing was, or will be, debited
-/// under its idempotency key. Every 4xx the gateway's issuance path returns,
-/// classified explicitly:
+/// under its idempotency key. A retry's refusal answers only the retry: the
+/// original attempt may have passed every check before it and still be on
+/// its way to the debit, so a refusal that turns on state that can change
+/// (the balance, the terms in force) proves nothing about it. Every 4xx the
+/// gateway's issuance path returns, classified explicitly:
 ///
 /// * `400`: the request is malformed (credits, idempotency key, base64, CBOR,
 ///   amount, or a commitment the key cannot sign). Decided by the bytes alone,
 ///   which are the first attempt's bytes, so that attempt was refused the
 ///   same way. Final.
 /// * `422`: the body did not deserialize. The same argument. Final.
-/// * `402`: the balance check inside `record_credential_issuance`, under the
-///   account lock, after its stored lookup found nothing. Final.
-/// * `409`: the idempotency key answers a different request, or the named
-///   key is no longer the current issuing key, both after the stored lookup.
-///   Final.
-/// * `428`: the terms gate, after the stored lookup found nothing. Final.
+/// * `409`: the idempotency key answers a different request (a stored row,
+///   so nothing else can debit under the key), or the named key has stopped
+///   issuing. The gateway decides the second under the account lock on the
+///   database clock, and refuses any later debit under a key it has seen
+///   stop issuing on that same clock, so an original still in flight can
+///   never land after it. Final.
+/// * `402`: the balance at the retry's own debit. An original that stalled
+///   before its debit may still land, if the balance has grown by then. Kept.
+/// * `428`: the terms gate, which the original may have passed before the
+///   terms changed. Kept.
 /// * `401` / `403`: authentication, decided **before** the stored lookup. A
 ///   relinked account with a mistyped secret is refused here although its
 ///   paid issuance is stored and answers once the secret is right. Kept.
 /// * `429`, `404`, `408`, `413` and any other: not the issuance handler's own
 ///   verdict on this key. Kept.
+///
+/// A kept issuance still ends: once its key stops issuing, the next retry is
+/// answered with the stored response or the final `409`, and the stored
+/// response outlives the key's spend window, after which the issuance is no
+/// longer asked for (`db::list_pending_issuances`).
 fn retry_refusal_is_final(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 400 | 402 | 409 | 422 | 428)
+    matches!(status.as_u16(), 400 | 409 | 422)
 }
 
 /// Send one issuance request.
@@ -20223,15 +20236,15 @@ mod tests {
     }
 
     #[test]
-    fn only_a_retry_refusal_the_gateway_gives_after_its_stored_lookup_is_final() {
+    fn only_a_retry_refusal_no_attempt_in_flight_can_overturn_is_final() {
         let status = |code: u16| reqwest::StatusCode::from_u16(code).unwrap();
-        for code in [400, 402, 409, 422, 428] {
+        for code in [400, 409, 422] {
             assert!(
                 retry_refusal_is_final(status(code)),
                 "{code} should be final"
             );
         }
-        for code in [401, 403, 404, 408, 413, 429, 500, 502, 503] {
+        for code in [401, 402, 403, 404, 408, 413, 428, 429, 500, 502, 503] {
             assert!(
                 !retry_refusal_is_final(status(code)),
                 "{code} must stay pending"

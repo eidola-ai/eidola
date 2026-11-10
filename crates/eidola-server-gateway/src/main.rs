@@ -360,9 +360,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         _ => None,
     };
 
+    // The catalog, priced. `PRICING_OVERRIDES` is keyed by weights hash, and
+    // an override that names no served model, or does not fit its pricing,
+    // refuses the boot rather than being ignored.
+    let pricing_overrides = std::env::var("PRICING_OVERRIDES").ok();
+    let catalog =
+        Catalog::new(config.pricing_markup, pricing_overrides.as_deref()).map_err(|e| {
+            error!("{e}");
+            e
+        })?;
+
     // Create shared state
     let state = AppState::new(
-        Catalog::new(config.pricing_markup),
+        catalog,
         engines,
         db_pool,
         stripe,

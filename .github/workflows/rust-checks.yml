@@ -151,6 +151,15 @@ jobs:
         # Bash + python3, no toolchain.
         run: ./scripts/test-release-assets.sh
 
+      - name: Test the weights-hash recompute script
+        # Deliberately ungated: scripts/weights-hash.py is what a user runs
+        # to check a model's weights hash without our code, and a change to
+        # it is a scripts change the scope step calls irrelevant. It must
+        # reach the hash the gateway's tests hold the catalog fixture's
+        # weights directory to, and refuse each way a directory can be
+        # wrong. python3 (3.11+) stdlib, no toolchain.
+        run: ./scripts/test-weights-hash.sh
+
       - name: Check legal document versioning
         # The published legal documents (www/pages/terms.md, privacy.md)
         # are accepted by the SHA-256 of their exact bytes, ordered by a

@@ -17,7 +17,6 @@
 //! Release-time work, like `just update-manifest`: nothing here downloads.
 //! With no deployments committed it writes the empty pin set.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -45,12 +44,13 @@ fn main() -> Result<()> {
     let root = cli.workspace.join("deploy/engine");
     let workspace_file = |relative: &str| read(&cli.workspace.join(relative));
 
-    let mut entries: BTreeMap<String, Vec<engine_enclaves::Entry>> = BTreeMap::new();
-    for model in sorted_dirs(&root)? {
-        let model_id = name(&model)?;
-        for variant in sorted_dirs(&model)? {
+    let mut entries = Vec::new();
+    for group in sorted_dirs(&root)? {
+        let group_name = name(&group)?;
+        for variant in sorted_dirs(&group)? {
             let variant_name = name(&variant)?;
-            let config_path = format!("deploy/engine/{model_id}/{variant_name}/tinfoil-config.yml");
+            let config_path =
+                format!("deploy/engine/{group_name}/{variant_name}/tinfoil-config.yml");
             let config = read(&variant.join("tinfoil-config.yml"))?;
             let sidecar = read(&variant.join("deployment.json"))?;
             let (version, _) =
@@ -60,19 +60,16 @@ fn main() -> Result<()> {
                     .join(format!("tinfoil-inference-v{version}-manifest.json")),
             )?;
             let igvm = read(&cli.release_dir.join(format!("tinfoil-tdx-v{version}.igvm")))?;
-            let entry = engine_enclaves::deployment_entry(
-                &model_id,
-                &DeploymentInputs {
-                    config_path: &config_path,
-                    config: &config,
-                    sidecar: &sidecar,
-                    release_manifest: &release_manifest,
-                    igvm: &igvm,
-                    read: &workspace_file,
-                },
-            )
+            let entry = engine_enclaves::deployment_entry(&DeploymentInputs {
+                config_path: &config_path,
+                config: &config,
+                sidecar: &sidecar,
+                release_manifest: &release_manifest,
+                igvm: &igvm,
+                read: &workspace_file,
+            })
             .with_context(|| config_path.clone())?;
-            entries.entry(model_id.clone()).or_default().push(entry);
+            entries.push(entry);
         }
     }
 
