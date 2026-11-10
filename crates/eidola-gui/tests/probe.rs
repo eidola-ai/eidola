@@ -4911,18 +4911,32 @@ fn the_model_picker_offers_a_pin_and_shows_the_weights(cx: &mut TestAppContext) 
         s.participants = Some((space, roster));
         s.space_settings = Some(("demo".into(), eidola_app_core::SpaceSettings::default()));
         s.model_catalog = PICKER_CATALOG;
-        s.models = vec![ModelInfo {
-            id: "gemma4-31b".into(),
-            sha256: Some(PICKER_HASH.into()),
-            tags: vec!["gemma4-31b".into()],
-            context_length: 131_072,
-            max_output_tokens: None,
-            output_budget_class: None,
-            capabilities: ModelCapabilities::default(),
-            prompt_credits_per_token: 0.53,
-            completion_credits_per_token: 1.5,
-            request_credits: None,
-        }];
+        s.models = vec![
+            ModelInfo {
+                id: format!("sha256:{}", "3".repeat(64)),
+                sha256: Some("3".repeat(64)),
+                tags: Vec::new(),
+                context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
+                prompt_credits_per_token: 0.53,
+                completion_credits_per_token: 1.5,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "gemma4-31b".into(),
+                sha256: Some(PICKER_HASH.into()),
+                tags: vec!["gemma4-31b".into()],
+                context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
+                prompt_credits_per_token: 0.53,
+                completion_credits_per_token: 1.5,
+                request_credits: None,
+            },
+        ];
     });
     let (window, view) = open_participants_inspector_with(cx, stores);
 
@@ -4932,13 +4946,13 @@ fn the_model_picker_offers_a_pin_and_shows_the_weights(cx: &mut TestAppContext) 
         &entries,
         "space/inspector/participants/agent-1/notice/0/switch",
         gpui::Role::Button,
-        "Switch to the newer weights",
+        "Switch Assistant to the newer weights",
     );
     assert_probe(
         &entries,
         "space/inspector/participants/agent-1/notice/1/dismiss",
         gpui::Role::Button,
-        "Dismiss",
+        "Dismiss the model update for Assistant",
     );
 
     // The add form's picker: follow, or pin to these weights.
@@ -4964,6 +4978,19 @@ fn the_model_picker_offers_a_pin_and_shows_the_weights(cx: &mut TestAppContext) 
             .iter()
             .any(|l| l.starts_with("gemma4-31b, pinned to 222222222222… · ")),
         "pinning those weights is offered: {options:?}"
+    );
+    // A model listed by its hash alone is offered as itself, never as a
+    // second, unparseable pin of the hash.
+    assert!(
+        !options
+            .iter()
+            .any(|l| l.starts_with("sha256:") && l.contains("pinned")),
+        "no pin of a hash-only listing: {options:?}"
+    );
+    assert_eq!(
+        options.len(),
+        3,
+        "the hash-only model, the tag, and the tag's pin: {options:?}"
     );
     assert_probe(
         &entries,

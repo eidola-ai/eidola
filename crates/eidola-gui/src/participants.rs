@@ -186,7 +186,12 @@ pub(crate) fn model_groups(
                 // Beside following an Eidola tag, the choice to **pin** these
                 // exact weights: stored qualified (`tag@sha256:<hex>@eidola`),
                 // shown with the hash it holds to.
-                if eidola && let Some(sha256) = &m.sha256 {
+                // Only a model listed under a tag gets one: a model listed by
+                // its hash alone (`sha256:<hex>`) is already pinned.
+                if eidola
+                    && eidola_app_core::model_reference::is_tag(&m.id)
+                    && let Some(sha256) = &m.sha256
+                {
                     let pin = eidola_app_core::qualified_model_id(
                         &eidola_app_core::model_reference::pinned(Some(&m.id), sha256),
                         eidola_app_core::EIDOLA_BACKEND_ID,

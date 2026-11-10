@@ -1552,12 +1552,9 @@ impl SpaceView {
                     // updated tag, a newer model for a pin, a retirement — on
                     // the row itself, open or closed: a notice found only by
                     // opening the editor is not given.
-                    .children(
-                        p.model_notices
-                            .iter()
-                            .enumerate()
-                            .map(|(i, notice)| self.render_model_notice(&pid, i, notice, cx)),
-                    ),
+                    .children(p.model_notices.iter().enumerate().map(|(i, notice)| {
+                        self.render_model_notice(&pid, &display_name, i, notice, cx)
+                    })),
             )
             // The chevron says the row opens; its state is on the row's own node
             // (`aria_expanded`), so this is decoration.
@@ -1586,10 +1583,13 @@ impl SpaceView {
     /// where it has one — **switch** a pin to the newer weights its tag names
     /// now (in this conversation), or **dismiss** a followed tag's "model
     /// updated" notice until the tag moves again. The action's click does not
-    /// reach the row behind it, which would open the editor.
+    /// reach the row behind it, which would open the editor. Its accessible
+    /// name carries the participant (`name`): the same verb repeats on every
+    /// row that has the notice.
     fn render_model_notice(
         &self,
         pid: &str,
+        name: &str,
         i: usize,
         notice: &eidola_app_core::model_catalog::ModelNotice,
         cx: &mut Context<Self>,
@@ -1613,35 +1613,44 @@ impl SpaceView {
             ModelNotice::NewerAvailable { .. } => Some((
                 "switch",
                 crate::i18n::msg::participants_model_switch_newer(cx),
+                crate::i18n::msg::participants_model_switch_newer_for(cx, name.to_string()),
             )),
             ModelNotice::Updated { .. } => Some((
                 "dismiss",
                 crate::i18n::msg::participants_model_dismiss_update(cx),
+                crate::i18n::msg::participants_model_dismiss_update_for(cx, name.to_string()),
             )),
             _ => None,
         };
-        let Some((verb, label)) = action else {
+        let Some((verb, label, aria)) = action else {
             return line.into_any_element();
         };
         let space_id = self.space_id(cx);
-        let participants = self.stores.participants.clone();
         let target = pid.to_string();
-        let button = crate::participants::ghost_button(
+        let button = crate::participants::ghost_button_labeled(
             SharedString::from(format!("space-inspector-p-{pid}-notice-{i}-{verb}")),
             SharedString::from(format!(
                 "space/inspector/participants/{pid}/notice/{i}/{verb}"
             )),
             label,
+            aria,
             false,
             cx,
-            move |_, _, cx| {
+            cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
                 cx.stop_propagation();
                 let (space_id, target) = (space_id.clone(), target.clone());
-                participants.update(cx, |store, cx| match verb {
+                this.stores.participants.update(cx, |store, cx| match verb {
                     "switch" => store.switch_to_newer_weights(space_id, target, cx),
                     _ => store.dismiss_model_update(space_id, target, cx),
                 });
-            },
+                // The notice, and this control with it, goes when the roster
+                // re-reads: hand the keyboard to the view root now, unless a
+                // field of the panel holds it, so it is never left on an
+                // element that no longer exists.
+                if !this.inspector_field_focused(window, cx) {
+                    window.focus(&this.focus_handle, cx);
+                }
+            }),
         );
         h_flex()
             .gap_2()

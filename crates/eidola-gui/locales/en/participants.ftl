@@ -56,3 +56,11 @@ participants-model-pinned = { $model }, pinned to { $hash }
 participants-model-switch-newer = Switch to the newer weights
 # Dismiss a "model updated" notice. It comes back if the tag moves again.
 participants-model-dismiss-update = Dismiss
+# The accessible names of the two notice actions, naming the participant they
+# act on: the same verb repeats on every row with the notice.
+participants-model-switch-newer-for = Switch { $name } to the newer weights
+participants-model-dismiss-update-for = Dismiss the model update for { $name }
+# The accessible names of the two notice actions, naming the participant they
+# act on: the same verb repeats on every row with the notice.
+participants-model-switch-newer-for = Switch { $name } to the newer weights
+participants-model-dismiss-update-for = Dismiss the model update for { $name }
