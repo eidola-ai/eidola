@@ -246,8 +246,8 @@ Inputs and shares are chosen so that the amounts reveal nothing that a single sp
 
 1. **Order the wallet.** Take the credentials available for a spend now (not in flight, and before their spend deadline), sorted by key `accept_until` ascending, then balance ascending, then nullifier bytes. All credentials under one key share an `accept_until`, so this is: oldest key first, smallest first within a key.
 2. **One input.** If the first credential covers `W`, spend it alone with share `W`.
-3. **Two inputs.** Otherwise the first credential, with balance `a < W`, is drained: present it first with share `a`, then the first later credential in the order that covers `W − a`, with share `W − a`.
-4. **A new credential.** If no later credential covers `W − a` (or the wallet is empty), allocate a new credential by the client's ordinary allocation rule and use it as that later credential (or alone, for an empty wallet).
+3. **Two inputs.** Otherwise take the first credential in the order, with balance `a < W`, for which some later credential covers `W − a`. Drain it: present it first with share `a`, then the first such later credential, with share `W − a`. This is normally the first credential in the order; a later one is drained only when the first has no fill but another pair in the wallet covers `W`, so that a wallet able to pay is never sent to allocation.
+4. **A new credential.** If no pair covers `W` (or the wallet is empty), drain the first credential and allocate a new credential by the client's ordinary allocation rule as its fill (or use the new credential alone, for an empty wallet).
 
 The client MUST NOT present an input whose spend deadline (`accept_until` minus the client's margin) has passed. The request's own deadline is the earliest of its inputs'.
 
