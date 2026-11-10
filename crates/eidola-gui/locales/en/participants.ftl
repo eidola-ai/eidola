@@ -60,7 +60,3 @@ participants-model-dismiss-update = Dismiss
 # act on: the same verb repeats on every row with the notice.
 participants-model-switch-newer-for = Switch { $name } to the newer weights
 participants-model-dismiss-update-for = Dismiss the model update for { $name }
-# The accessible names of the two notice actions, naming the participant they
-# act on: the same verb repeats on every row with the notice.
-participants-model-switch-newer-for = Switch { $name } to the newer weights
-participants-model-dismiss-update-for = Dismiss the model update for { $name }
