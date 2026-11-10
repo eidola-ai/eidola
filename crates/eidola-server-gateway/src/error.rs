@@ -46,8 +46,7 @@ pub enum ServerError {
     ServiceUnavailable(String),
 
     /// The request's `model` does not resolve: malformed (400), unknown
-    /// (404), naming a tag and a hash it does not resolve to (409), or
-    /// retired (410). Fixed messages, never the reference itself.
+    /// (404) or retired (410). Fixed messages, never the reference itself.
     ModelReference(crate::models::ModelRefError),
 
     /// Internal server error (500).

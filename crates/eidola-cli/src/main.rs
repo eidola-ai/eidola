@@ -1098,20 +1098,13 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                     Ok(())
                 }
                 CredentialsCommand::Recover => {
-                    let spending = session.wallet_spending_credentials().await?;
-                    if spending.is_empty() {
-                        println!("no in-flight credentials");
-                        return Ok(());
-                    }
-                    println!("attempting to recover {} credential(s)...", spending.len());
-                    let recovered = session.recover_spending_credentials().await?;
-                    if recovered.is_empty() {
-                        println!("no credentials could be recovered");
-                    } else {
-                        println!("recovered {} credential(s):", recovered.len());
-                        for nonce in &recovered {
-                            println!("  {nonce}");
-                        }
+                    // Both doors, always: a conversion whose answer was lost
+                    // leaves nothing in flight to announce it.
+                    let spends = session.recover_spending_credentials().await?;
+                    let still_spending = session.wallet_spending_credentials().await?.len();
+                    let issuances = session.recover_pending_issuances().await?;
+                    for line in recovery_report(&spends, still_spending, issuances.as_ref()) {
+                        println!("{line}");
                     }
                     Ok(())
                 }
@@ -1723,6 +1716,64 @@ fn in_flight_line(c: &eidola_app_core::CredentialLifecycleInfo) -> String {
     }
 }
 
+/// What `eidola wallet credentials recover` prints: the holds it settled and
+/// those still in flight, then the conversions whose lost answer arrived and
+/// those still unanswered. `issuances` is `None` when another process answers
+/// for the profile and asks for those itself.
+fn recovery_report(
+    spends: &[String],
+    still_spending: usize,
+    issuances: Option<&eidola_app_core::IssuanceRecovery>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if spends.is_empty() && still_spending == 0 {
+        lines.push("no in-flight credentials".to_string());
+    }
+    if !spends.is_empty() {
+        lines.push(format!(
+            "recovered {} in-flight credential(s):",
+            spends.len()
+        ));
+        lines.extend(spends.iter().map(|nonce| format!("  {nonce}")));
+    }
+    if still_spending > 0 {
+        lines.push(format!(
+            "{still_spending} credential(s) still in flight: the request may still be running, \
+             or the server could not be reached; try again later"
+        ));
+    }
+    match issuances {
+        None => lines.push(
+            "conversions awaiting an answer are asked for again by the running Eidola".to_string(),
+        ),
+        Some(issuances) => {
+            if !issuances.recovered.is_empty() {
+                lines.push(format!(
+                    "recovered {} converted credential(s) whose answer had been lost:",
+                    issuances.recovered.len()
+                ));
+                lines.extend(issuances.recovered.iter().map(|nonce| format!("  {nonce}")));
+            }
+            if issuances.waiting > 0 {
+                lines.push(format!(
+                    "{} conversion(s) too recent to ask for again; try again in ten minutes",
+                    issuances.waiting
+                ));
+            }
+            if issuances.unresolved > 0 {
+                lines.push(format!(
+                    "{} conversion(s) still unanswered; try again later",
+                    issuances.unresolved
+                ));
+            }
+            if issuances.recovered.is_empty() && issuances.waiting + issuances.unresolved == 0 {
+                lines.push("no conversions awaiting an answer".to_string());
+            }
+        }
+    }
+    lines
+}
+
 /// Human-readable relative expiry for balance pools (`expires_at` is epoch
 /// milliseconds). Mirrors the GUI's humanized expiry rather than printing a
 /// raw timestamp.
@@ -2292,6 +2343,49 @@ mod tests {
         );
         let other = not_downloaded_hint("mine@local");
         assert!(other.contains("`eidola model download <url>`"), "{other}");
+    }
+
+    /// A conversion whose answer was lost leaves nothing in flight, so the
+    /// report must reach it with no in-flight credential to announce it, and
+    /// say plainly what is still unanswered.
+    #[test]
+    fn the_recovery_report_covers_lost_conversions_with_nothing_in_flight() {
+        let issuances = eidola_app_core::IssuanceRecovery {
+            recovered: vec!["abc".into()],
+            waiting: 1,
+            unresolved: 2,
+        };
+        let lines = recovery_report(&[], 0, Some(&issuances));
+        assert_eq!(lines[0], "no in-flight credentials");
+        assert!(lines.iter().any(|l| l.contains("recovered 1 converted")));
+        assert!(lines.contains(&"  abc".to_string()));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("1 conversion(s) too recent"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("2 conversion(s) still unanswered"))
+        );
+
+        let nothing = recovery_report(&[], 0, Some(&Default::default()));
+        assert_eq!(
+            nothing,
+            [
+                "no in-flight credentials",
+                "no conversions awaiting an answer"
+            ]
+        );
+
+        let held = recovery_report(&["n1".into()], 1, None);
+        assert!(held[0].starts_with("recovered 1 in-flight"));
+        assert!(
+            held.iter()
+                .any(|l| l.starts_with("1 credential(s) still in flight"))
+        );
+        assert!(held.last().unwrap().contains("the running Eidola"));
     }
 
     mod model_show {
