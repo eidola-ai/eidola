@@ -507,6 +507,12 @@ async fn set_user_version(conn: &Connection, version: i64) -> Result<(), AppErro
 // Layer 0 — Wallet: Issuer key operations
 // ---------------------------------------------------------------------------
 
+/// Store an issuer key as the server advertises it. A key already on file
+/// keeps its identity (the id is the hash of the key material) but takes the
+/// advertised `expires_at`: that is the key's `accept_until`, the row may
+/// have been written when it recorded `issue_until` instead, and a stale
+/// value expires every credential under the key while the server still
+/// takes them.
 pub async fn upsert_issuer_key(
     conn: &Connection,
     id: &str,
@@ -517,8 +523,9 @@ pub async fn upsert_issuer_key(
     created_at: i64,
 ) -> Result<(), AppError> {
     conn.execute(
-        "INSERT OR IGNORE INTO issuer_key (id, params_hash, public_key_data, params_data, expires_at, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO issuer_key (id, params_hash, public_key_data, params_data, expires_at, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(id) DO UPDATE SET expires_at = excluded.expires_at",
         (
             Value::Text(id.to_string()),
             Value::Text(params_hash.to_string()),
@@ -10844,6 +10851,43 @@ mod tests {
         let lc = list_credential_lifecycle(&conn).await.unwrap();
         let exp = lc.iter().find(|r| r.nonce == "nonce-exp").unwrap();
         assert_eq!(exp.state, "expired");
+    }
+
+    /// A key row written with its issuing window as the expiry (what every
+    /// profile from before `accept_until` was stored holds, and what a key
+    /// rotated out of issuance since looks like) must take the advertised
+    /// expiry on the next upsert, or its credentials read `expired` while the
+    /// server still accepts them and the wallet buys another allocation.
+    #[tokio::test]
+    async fn upserting_a_known_issuer_key_adopts_the_advertised_expiry() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+        upsert_issuer_key(&conn, "ik-old", "ph", b"pub", b"params", 1, 1_000)
+            .await
+            .unwrap();
+        insert_pre_credential_issuance(&conn, "pc-old", "ik-old", b"pre", 5, 1_000)
+            .await
+            .unwrap();
+        insert_credential(&conn, "nonce-old", "pc-old", "ik-old", b"c", 5, 0, 1_100)
+            .await
+            .unwrap();
+        let lc = list_credential_lifecycle(&conn).await.unwrap();
+        assert_eq!(lc[0].state, "expired", "stale expiry on file");
+
+        // The server still advertises the key, with its real acceptance window.
+        upsert_issuer_key(
+            &conn,
+            "ik-old",
+            "ph",
+            b"pub",
+            b"params",
+            99_999_999_999_999,
+            2_000,
+        )
+        .await
+        .unwrap();
+        let lc = list_credential_lifecycle(&conn).await.unwrap();
+        assert_eq!(lc[0].state, "active", "the advertised expiry replaces it");
     }
 
     #[tokio::test]

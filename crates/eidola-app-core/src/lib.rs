@@ -3341,25 +3341,39 @@ impl Inner {
 
         let params = params_from_domain_separator(expected_ds)?;
 
-        // 2. Open DB and store issuer key
+        // 2. Open DB and store the issuer keys. Every still-accepted key the
+        // server advertises is stored, not only the one issuing now: a
+        // credential lives as long as the server accepts its key — the grace
+        // window past `issue_until`, not just the issuing window — and a key
+        // already on file from before that was so, or rotated out of issuance
+        // since, keeps a stale expiry unless the advertised one overwrites it.
         let db_conn = self.db_conn().await?;
-        let params_hash = blake3::hash(key.domain_separator.as_bytes())
-            .to_hex()
-            .to_string();
-        // A credential lives as long as the server accepts its key — the
-        // grace window past `issue_until`, not just the issuing window.
-        let expires_at = iso_to_ms(&key.accept_until)?;
-
-        db::upsert_issuer_key(
-            &db_conn,
-            &key.id,
-            &params_hash,
-            &public_key_cbor,
-            key.domain_separator.as_bytes(),
-            expires_at,
-            now,
-        )
-        .await?;
+        for advertised in keys
+            .data
+            .iter()
+            .filter(|k| k.domain_separator == expected_ds)
+        {
+            let advertised_public_key =
+                URL_SAFE_NO_PAD
+                    .decode(&advertised.public_key)
+                    .map_err(|e| AppError::Credential {
+                        message: format!("invalid base64 public key: {e}"),
+                    })?;
+            let params_hash = blake3::hash(advertised.domain_separator.as_bytes())
+                .to_hex()
+                .to_string();
+            let expires_at = iso_to_ms(&advertised.accept_until)?;
+            db::upsert_issuer_key(
+                &db_conn,
+                &advertised.id,
+                &params_hash,
+                &advertised_public_key,
+                advertised.domain_separator.as_bytes(),
+                expires_at,
+                now,
+            )
+            .await?;
+        }
 
         // 3. Create PreIssuance checkpoint
         let pre_issuance = PreIssuance::random(OsRng);
