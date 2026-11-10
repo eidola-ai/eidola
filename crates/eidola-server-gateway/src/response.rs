@@ -49,7 +49,7 @@ impl EidolaResponse {
         response: crate::types::ChatCompletionResponse,
         privacy: PrivacyMetadata,
         verification: VerificationMetadata,
-        refund: Option<RefundInfo>,
+        refunds: Vec<RefundInfo>,
     ) -> Self {
         Self {
             id: response.id,
@@ -60,7 +60,7 @@ impl EidolaResponse {
             usage: response.usage,
             privacy,
             verification,
-            refunds: refund.into_iter().collect(),
+            refunds,
         }
     }
 }
@@ -216,14 +216,14 @@ impl EidolaStreamMetadata {
         id: String,
         privacy: PrivacyMetadata,
         verification: VerificationMetadata,
-        refund: Option<RefundInfo>,
+        refunds: Vec<RefundInfo>,
     ) -> Self {
         Self {
             object: "eidola.chat.completion.metadata".to_string(),
             id,
             privacy,
             verification,
-            refunds: refund.into_iter().collect(),
+            refunds,
         }
     }
 }
@@ -348,7 +348,7 @@ mod tests {
                 proxy: None,
                 backend: None,
             },
-            None,
+            Vec::new(),
         );
 
         let json = serde_json::to_string(&meta).unwrap();

@@ -54,7 +54,7 @@ use crate::recorded::{RecordedBody, recorded_answer, recorded_cut_answer, record
 use crate::{
     ChargePricing, EidolaResolved, Inner, ModelInfo, backends, db, estimate_charge_credits,
     fetch_models, find_event_boundary, flush_attestations, is_event_stream, local_models, now_ms,
-    parse_server_error_message, process_refund, recover_refund,
+    parse_server_error_message,
 };
 
 /// How long one backend has to answer `/v1/models` before it is treated as
@@ -1376,10 +1376,10 @@ impl Inner {
             mut route,
             body,
             db_conn,
-            spend,
+            mut spend,
             auth_value,
         } = self.preflighted(&request, false).await?;
-        let nonce = spend.as_ref().map(|s| s.cred.nonce.clone());
+        let nonce = spend.as_ref().map(|s| s.first_nonce().to_string());
         // Materialised **once** for this attempt: the wire and the Record row
         // then carry the same `traceparent`, which is the whole point of the
         // set being a value rather than a recipe.
@@ -1398,7 +1398,7 @@ impl Inner {
         let outbound = match build_upstream_request(&route, &body, spend.as_ref(), &headers) {
             Ok(outbound) => outbound,
             Err(error) => {
-                self.settle_proxy_refund(&db_conn, &spend, &route, None)
+                self.settle_proxy_refund(&db_conn, &mut spend, &route, None)
                     .await;
                 self.record_proxy_request(
                     &route,
@@ -1434,7 +1434,7 @@ impl Inner {
                 if route.flush_new_attestations(&db_conn).await {
                     self.bus.emit(Change::Record);
                 }
-                self.settle_proxy_refund(&db_conn, &spend, &route, None)
+                self.settle_proxy_refund(&db_conn, &mut spend, &route, None)
                     .await;
                 self.record_proxy_request(
                     &route,
@@ -1461,7 +1461,7 @@ impl Inner {
             Ok(answer) => answer,
             Err(failure) => {
                 let error = failure.error;
-                self.settle_proxy_refund(&db_conn, &spend, &route, None)
+                self.settle_proxy_refund(&db_conn, &mut spend, &route, None)
                     .await;
                 self.record_proxy_request(
                     &route,
@@ -1536,7 +1536,7 @@ impl Inner {
         };
         self.settle_proxy_refund(
             &db_conn,
-            &spend,
+            &mut spend,
             &route,
             parsed.as_ref().and_then(crate::inline_refund),
         )
@@ -1610,10 +1610,10 @@ impl Inner {
             mut route,
             body,
             db_conn,
-            spend,
+            mut spend,
             auth_value,
         } = self.preflighted(&request, true).await?;
-        let nonce = spend.as_ref().map(|s| s.cred.nonce.clone());
+        let nonce = spend.as_ref().map(|s| s.first_nonce().to_string());
         // Materialised **once** for this attempt: the wire and the Record row
         // then carry the same `traceparent`, which is the whole point of the
         // set being a value rather than a recipe.
@@ -1630,7 +1630,7 @@ impl Inner {
         let outbound = match build_upstream_request(&route, &body, spend.as_ref(), &headers) {
             Ok(outbound) => outbound,
             Err(error) => {
-                self.settle_proxy_refund(&db_conn, &spend, &route, None)
+                self.settle_proxy_refund(&db_conn, &mut spend, &route, None)
                     .await;
                 self.record_proxy_request(
                     &route,
@@ -1666,7 +1666,7 @@ impl Inner {
                 if route.flush_new_attestations(&db_conn).await {
                     self.bus.emit(Change::Record);
                 }
-                self.settle_proxy_refund(&db_conn, &spend, &route, None)
+                self.settle_proxy_refund(&db_conn, &mut spend, &route, None)
                     .await;
                 self.record_proxy_request(
                     &route,
@@ -1704,7 +1704,7 @@ impl Inner {
                 Ok(answer) => answer,
                 Err(failure) => {
                     let error = failure.error;
-                    self.settle_proxy_refund(&db_conn, &spend, &route, None)
+                    self.settle_proxy_refund(&db_conn, &mut spend, &route, None)
                         .await;
                     self.record_proxy_request(
                         &route,
@@ -1744,7 +1744,7 @@ impl Inner {
             let refusal = answer
                 .over_ceiling
                 .then(|| crate::peer_read::answer_past_ceiling(&route.backend_id));
-            self.settle_proxy_refund(&db_conn, &spend, &route, inline.as_ref())
+            self.settle_proxy_refund(&db_conn, &mut spend, &route, inline.as_ref())
                 .await;
             self.record_proxy_request(
                 &route,
@@ -1796,7 +1796,7 @@ impl Inner {
                 Ok(answer) => answer,
                 Err(failure) => {
                     let error = failure.error;
-                    self.settle_proxy_refund(&db_conn, &spend, &route, None)
+                    self.settle_proxy_refund(&db_conn, &mut spend, &route, None)
                         .await;
                     self.record_proxy_request(
                         &route,
@@ -1827,7 +1827,7 @@ impl Inner {
             } else {
                 malformed_stream_answer(&route.backend_id, status.as_u16())
             };
-            self.settle_proxy_refund(&db_conn, &spend, &route, inline.as_ref())
+            self.settle_proxy_refund(&db_conn, &mut spend, &route, inline.as_ref())
                 .await;
             self.record_proxy_request(
                 &route,
@@ -1982,7 +1982,7 @@ impl Inner {
         // refund, and sends it even when its own persistence of that token
         // failed — the one case where recovery can never answer. See
         // [`forward_sse_event`].
-        self.settle_proxy_refund(&db_conn, &spend, &route, inline_refund.as_ref())
+        self.settle_proxy_refund(&db_conn, &mut spend, &route, inline_refund.as_ref())
             .await;
         self.record_proxy_request(
             &route,
@@ -2007,43 +2007,30 @@ impl Inner {
         }
     }
 
-    /// Settle a proxied call's credential: the inline refund when the response
-    /// carried one, otherwise the recovery endpoint. A no-op for the
-    /// zero-spend backends, and best-effort throughout — a wallet hiccup must
-    /// not turn a delivered answer into a failure.
+    /// Settle a proxied call's inputs: the inline refunds when the response
+    /// carried them, otherwise the recovery endpoint, input by input. A no-op
+    /// for the zero-spend backends, and best-effort throughout — a wallet
+    /// hiccup must not turn a delivered answer into a failure.
     async fn settle_proxy_refund(
         &self,
         db_conn: &turso::Connection,
-        spend: &Option<crate::SpendPrep>,
+        spend: &mut Option<crate::SpendPrep>,
         route: &ProxyRoute,
         inline: Option<&Value>,
     ) {
         let Some(spend) = spend else { return };
-        let refund_obj = match inline {
-            Some(object) => Some(object.clone()),
-            None => recover_refund(&route.client, &route.base_url, &spend.presented, None)
-                .await
-                .ok(),
-        };
-        let Some(refund_obj) = refund_obj else {
-            eprintln!("warning: a proxied call's credential refund could not be recovered");
-            return;
-        };
-        let applied = process_refund(
-            &refund_obj,
-            &spend.params,
-            &spend.spend_proof,
-            &spend.pre_refund,
-            &spend.public_key,
-            db_conn,
-            &spend.pre_cred_id,
-            spend.cred.generation + 1,
-            now_ms(),
-        )
-        .await;
-        match applied {
-            Ok(()) => self.bus.emit(Change::Wallet),
-            Err(e) => eprintln!("warning: a proxied call's refund failed to apply: {e}"),
+        let (_, error) = spend
+            .settle(
+                &route.client,
+                &route.base_url,
+                db_conn,
+                &self.bus,
+                inline,
+                now_ms(),
+            )
+            .await;
+        if let Some(e) = error {
+            eprintln!("warning: a proxied call's credential refund was not applied: {e}");
         }
     }
 }
@@ -2109,7 +2096,7 @@ fn build_upstream_request(
     spend: Option<&crate::SpendPrep>,
     headers: &SentHeaders,
 ) -> Result<reqwest::Request, AppError> {
-    let sent = crate::body_with_spend(body, spend.map(|s| &s.presented));
+    let sent = crate::body_with_spend(body, spend);
     let mut request = route
         .client
         .post(format!("{}/v1/chat/completions", route.base_url))
@@ -2698,7 +2685,7 @@ mod tests {
         let text = String::from_utf8(out).expect("utf-8");
         assert!(!text.contains("material"), "{text}");
         assert!(text.contains(r#""model":"m@acme""#), "{text}");
-        assert_eq!(refund.expect("the refund")["refund"], "material");
+        assert_eq!(refund.expect("the refunds")[0]["refund"], "material");
     }
 
     #[test]
@@ -2717,9 +2704,9 @@ mod tests {
         // **And the token is handed back rather than dropped** — the server
         // sends it even when its own persistence failed, which is the one case
         // where recovery can never answer.
-        let refund = refund.expect("the refund the event carried");
-        assert_eq!(refund["refund"], "credential-material");
-        assert_eq!(refund["issuer_key_id"], "ab");
+        let refunds = refund.expect("the refunds the event carried");
+        assert_eq!(refunds[0]["refund"], "credential-material");
+        assert_eq!(refunds[0]["issuer_key_id"], "ab");
     }
 
     /// **The cap bounds what is held, not only what is written.** Sealing

@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 18;
+const LATEST_VERSION: i64 = 19;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -769,6 +769,59 @@ pub async fn abandon_pre_credential_issuance(
     Ok(())
 }
 
+/// The issuer key this client recorded for `epoch` under `scope` (the
+/// server's base URL), if it has seen one: what the server listed first for
+/// that epoch.
+pub async fn issuer_key_for_epoch(
+    conn: &Connection,
+    scope: &str,
+    epoch: u64,
+) -> Result<Option<String>, AppError> {
+    let Ok(epoch) = i64::try_from(epoch) else {
+        return Ok(None);
+    };
+    let mut stmt = conn
+        .prepare("SELECT issuer_key_id FROM issuer_key_epoch WHERE scope = ?1 AND epoch = ?2")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(scope.to_string()), Value::Integer(epoch)))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+        None => Ok(None),
+    }
+}
+
+/// How many issuances `account_id` has made under `issuer_key_id` and not
+/// abandoned: those that landed and those whose response is still pending.
+pub async fn issuances_under_key(
+    conn: &Connection,
+    account_id: &str,
+    issuer_key_id: &str,
+) -> Result<i64, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT COUNT(*) FROM pre_credential \
+             WHERE type = 'issuance' AND abandoned_at IS NULL \
+               AND account_id = ?1 AND issuer_key_id = ?2",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((
+            Value::Text(account_id.to_string()),
+            Value::Text(issuer_key_id.to_string()),
+        ))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<i64>(0).map_err(AppError::db),
+        None => Ok(0),
+    }
+}
+
 /// The credits the wallet can still spend at `now` from credentials whose key
 /// lets a spend begin until at least `horizon_until`: every active
 /// credential's balance, plus what an in-flight spend's successor is worth at
@@ -818,6 +871,61 @@ pub async fn last_spend_at(conn: &Connection) -> Result<Option<i64>, AppError> {
     }
 }
 
+/// One input of a request about to be sent: the spend's pending-refund row.
+pub struct SpendInputRecord<'a> {
+    /// The pre-credential id (UUIDv7) its successor will name.
+    pub id: &'a str,
+    pub credential_nonce: &'a str,
+    pub issuer_key_id: &'a str,
+    /// The encoded `PreRefund`.
+    pub data: &'a [u8],
+    /// The input's share.
+    pub spend_amount: i64,
+    pub spend_proof_data: &'a [u8],
+}
+
+/// Mark every input of one request `spending`, **together**: one write
+/// transaction inserting each input's pending-refund row under one
+/// `spend_group`, so a crash cannot leave one input marked and another not,
+/// and the request's inputs are taken at one instant. A credential already
+/// spending (`idx_one_spend_per_credential`) refuses the whole write.
+pub async fn insert_spend_inputs(
+    conn: &Connection,
+    spend_group: &str,
+    inputs: &[SpendInputRecord<'_>],
+    created_at: i64,
+) -> Result<(), AppError> {
+    begin_write(conn).await?;
+    for input in inputs {
+        let inserted = conn
+            .execute(
+                "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, \
+                     credits, spend_amount, spend_proof_data, spend_group, created_at) \
+                 VALUES (?1, 'refund', ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8)",
+                (
+                    Value::Text(input.id.to_string()),
+                    Value::Text(input.credential_nonce.to_string()),
+                    Value::Text(input.issuer_key_id.to_string()),
+                    Value::Blob(input.data.to_vec()),
+                    Value::Integer(input.spend_amount),
+                    Value::Blob(input.spend_proof_data.to_vec()),
+                    Value::Text(spend_group.to_string()),
+                    Value::Integer(created_at),
+                ),
+            )
+            .await;
+        if let Err(e) = inserted {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(AppError::Database {
+                message: format!("failed to insert refund pre_credential: {e}"),
+            });
+        }
+    }
+    conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+    Ok(())
+}
+
+/// One spend of one credential, its own request's only input.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_pre_credential_refund(
     conn: &Connection,
@@ -829,24 +937,20 @@ pub async fn insert_pre_credential_refund(
     spend_proof_data: &[u8],
     created_at: i64,
 ) -> Result<(), AppError> {
-    conn.execute(
-        "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, spend_amount, spend_proof_data, created_at) \
-         VALUES (?1, 'refund', ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
-        (
-            Value::Text(id.to_string()),
-            Value::Text(credential_nonce.to_string()),
-            Value::Text(issuer_key_id.to_string()),
-            Value::Blob(data.to_vec()),
-            Value::Integer(spend_amount),
-            Value::Blob(spend_proof_data.to_vec()),
-            Value::Integer(created_at),
-        ),
+    insert_spend_inputs(
+        conn,
+        id,
+        &[SpendInputRecord {
+            id,
+            credential_nonce,
+            issuer_key_id,
+            data,
+            spend_amount,
+            spend_proof_data,
+        }],
+        created_at,
     )
     .await
-    .map_err(|e| AppError::Database {
-        message: format!("failed to insert refund pre_credential: {e}"),
-    })?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -893,34 +997,39 @@ pub struct SpendableCredential {
     pub public_key_data: Vec<u8>,
 }
 
-pub async fn find_spendable_credential(
+/// Every credential a spend may begin from now, with anything in it, in the
+/// order inputs are chosen from (`docs/specs/act-multi-spend.md` §7.2): its
+/// key's `accept_until` ascending (the soonest-lapsing value first), then
+/// balance ascending, then nonce (the nullifier's bytes, as hex, so text
+/// order is byte order). Every element of the order is public or random, so
+/// the order discloses nothing a request does not already show.
+pub async fn spendable_credentials(
     conn: &Connection,
-    min_credits: i64,
-) -> Result<Option<SpendableCredential>, AppError> {
+) -> Result<Vec<SpendableCredential>, AppError> {
     let mut stmt = conn
         .prepare(
             "SELECT c.nonce, c.issuer_key_id, c.data, c.credits, c.generation, ik.public_key_data \
              FROM credential_lifecycle cl \
              JOIN credential c ON c.nonce = cl.nonce \
              JOIN issuer_key ik ON ik.id = c.issuer_key_id \
-             WHERE cl.state = 'active' AND c.credits >= ?1 \
-             ORDER BY c.credits ASC \
-             LIMIT 1",
+             WHERE cl.state = 'active' AND c.credits > 0 \
+             ORDER BY ik.accept_until ASC, c.credits ASC, c.nonce ASC",
         )
         .await
         .map_err(AppError::db)?;
-    let mut rows = stmt.query([min_credits]).await.map_err(AppError::db)?;
-    match rows.next().await.map_err(AppError::db)? {
-        None => Ok(None),
-        Some(row) => Ok(Some(SpendableCredential {
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        results.push(SpendableCredential {
             nonce: row.get::<String>(0).map_err(AppError::db)?,
             issuer_key_id: row.get::<String>(1).map_err(AppError::db)?,
             data: row.get::<Vec<u8>>(2).map_err(AppError::db)?,
             credits: row.get::<i64>(3).map_err(AppError::db)?,
             generation: row.get::<i64>(4).map_err(AppError::db)?,
             public_key_data: row.get::<Vec<u8>>(5).map_err(AppError::db)?,
-        })),
+        });
     }
+    Ok(results)
 }
 
 pub struct CredentialRow {
@@ -12046,6 +12155,130 @@ mod tests {
         );
     }
 
+    /// **A request's inputs are taken together or not at all.** Two inputs
+    /// are marked `spending` in one transaction under one spend group; an
+    /// input whose credential is already spending refuses the whole write, so
+    /// the other input is not left marked. The wallet's spend order is the
+    /// key's `accept_until`, then balance, then nonce, and leaves out empty
+    /// credentials.
+    #[tokio::test]
+    async fn a_requests_inputs_are_taken_together_or_not_at_all() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+        let now = crate::now_ms();
+        let hour = 3_600_000;
+        for (id, accept_until) in [("ik-old", now + 2 * hour), ("ik-new", now + 4 * hour)] {
+            let deadlines = IssuerKeyDeadlines {
+                spend_until: accept_until - hour,
+                accept_until,
+            };
+            upsert_issuer_key(&conn, id, "ph", b"pub", b"params", deadlines, 1_000)
+                .await
+                .unwrap();
+        }
+        // Each credential's nonce is random, as a real nullifier is; which of
+        // the two equal old-key balances sorts first is decided by them.
+        let nonce = || uuid::Uuid::new_v4().simple().to_string();
+        let (new_small, old_large, old_small_1, old_small_2, old_empty) =
+            (nonce(), nonce(), nonce(), nonce(), nonce());
+        for (key, nonce, credits) in [
+            ("ik-new", &new_small, 10),
+            ("ik-old", &old_large, 900),
+            ("ik-old", &old_small_1, 20),
+            ("ik-old", &old_small_2, 20),
+            ("ik-old", &old_empty, 0),
+        ] {
+            let pc = format!("pc-{nonce}");
+            insert_pre_credential_issuance(
+                &conn,
+                &PreIssuanceRecord {
+                    id: &pc,
+                    issuer_key_id: key,
+                    data: b"pre",
+                    credits,
+                    idempotency_key: &[0u8; 32],
+                    issuance_request: b"request",
+                    account_id: "account",
+                    created_at: 1_000,
+                },
+            )
+            .await
+            .unwrap();
+            insert_credential(&conn, nonce, &pc, key, b"cred", credits, 0, 1_000)
+                .await
+                .unwrap();
+        }
+        let order: Vec<String> = spendable_credentials(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.nonce)
+            .collect();
+        let (first_small, second_small) = if old_small_1 < old_small_2 {
+            (&old_small_1, &old_small_2)
+        } else {
+            (&old_small_2, &old_small_1)
+        };
+        assert_eq!(
+            order,
+            [first_small, second_small, &old_large, &new_small].map(String::clone),
+            "soonest-lapsing key first, then smallest, then nonce; nothing empty"
+        );
+
+        fn input<'a>(id: &'a str, nonce: &'a str, key: &'a str) -> SpendInputRecord<'a> {
+            SpendInputRecord {
+                id,
+                credential_nonce: nonce,
+                issuer_key_id: key,
+                data: b"pre-refund",
+                spend_amount: 5,
+                spend_proof_data: b"proof",
+            }
+        }
+        // One input of a request is already spending: neither is taken.
+        insert_pre_credential_refund(&conn, "pc-busy", &old_large, "ik-old", b"r", 5, b"p", 2_000)
+            .await
+            .unwrap();
+        insert_spend_inputs(
+            &conn,
+            "group-refused",
+            &[
+                input("pc-in-1", first_small, "ik-old"),
+                input("pc-in-2", &old_large, "ik-old"),
+            ],
+            3_000,
+        )
+        .await
+        .expect_err("a credential already spending refuses the request");
+        let states = |lc: Vec<CredentialLifecycleRow>, nonce: &str| {
+            lc.into_iter().find(|r| r.nonce == nonce).unwrap().state
+        };
+        assert_eq!(
+            states(list_credential_lifecycle(&conn).await.unwrap(), first_small),
+            "active",
+            "the other input is not left marked"
+        );
+
+        // Two free inputs, under two keys, are taken together.
+        insert_spend_inputs(
+            &conn,
+            "group-taken",
+            &[
+                input("pc-in-3", first_small, "ik-old"),
+                input("pc-in-4", &new_small, "ik-new"),
+            ],
+            3_000,
+        )
+        .await
+        .unwrap();
+        for nonce in [first_small, &new_small] {
+            assert_eq!(
+                states(list_credential_lifecycle(&conn).await.unwrap(), nonce),
+                "spending"
+            );
+        }
+    }
+
     /// A key's two deadlines split the lifecycle: past `spend_until` an unspent
     /// credential is `expired` (no new spend may start, so the provisioning
     /// queue cannot pick it), but one whose spend is already in flight stays
@@ -12146,9 +12379,14 @@ mod tests {
         assert_eq!(state("gone-flying"), "expired");
 
         // The provisioning queue reads the same view: the smaller credential
-        // past its spend deadline is never the best fit, the live one is.
-        let picked = find_spendable_credential(&conn, 1).await.unwrap().unwrap();
-        assert_eq!(picked.nonce, "live");
+        // past its spend deadline is never offered, the live one is.
+        let offered: Vec<String> = spendable_credentials(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.nonce)
+            .collect();
+        assert_eq!(offered, vec!["live".to_string()]);
         // Recovery still sees the in-flight spend inside the acceptance window.
         let flying: Vec<String> = list_spending_credentials(&conn)
             .await

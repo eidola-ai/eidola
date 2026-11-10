@@ -5,7 +5,7 @@
 //!   `tests/bus.rs` was asserted-by-inspection only. Each typed-failure test
 //!   here asserts BOTH the returned error AND the emitted `Change`s, turning a
 //!   table row into an executed test.
-//! * **Wave-1 auto-provisioning** — `ensure_spendable_credential` had only a
+//! * **Auto-provisioning** — `ensure_spend_inputs` had only a
 //!   pure-decision unit test; `auto_provisioning_*` here drives the empty-wallet
 //!   + funded-account path all the way through a successful chat.
 //!
@@ -548,6 +548,419 @@ fn a_provisional_refund_is_settled_on_only_when_the_gateway_calls_it_final() {
             creds.iter().any(|c| c.credits == before - hold),
             "the successor holds the untouched remainder c - s: {creds:?}"
         );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Two-input requests: a drain and a fill
+// ---------------------------------------------------------------------------
+
+/// The active credentials' balances, smallest first.
+fn active_balances(core: &AppCore) -> Vec<i64> {
+    let mut balances: Vec<i64> = active_credentials(core)
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect();
+    balances.sort();
+    balances
+}
+
+/// The credentials still `spending`, as `(balance, share)`.
+fn spending_credentials(core: &AppCore) -> Vec<(i64, i64)> {
+    core.runtime()
+        .block_on(core.wallet_lifecycle())
+        .expect("lifecycle")
+        .into_iter()
+        .filter(|c| c.state == "spending")
+        .map(|c| (c.credits, c.spend_amount.expect("a share")))
+        .collect()
+}
+
+/// **A credential that cannot cover the hold is drained, and the rest
+/// filled** (`docs/specs/act-multi-spend.md` §7.2). The wallet's first
+/// credential in spend order (smallest, under the one key) holds 1,000
+/// credits, below the hold `W`: it is presented first with its whole balance
+/// as its share, and the 1,000,000-credit credential second with `W − 1,000`.
+/// The shares sum to exactly `W`. Settled at a charge of 1,500, the charge is
+/// consumed from the drain first: the drain's successor is empty, and the
+/// fill's returns all but 500. With the drain exhausted, the next request is
+/// paid by the fill's successor alone.
+#[test]
+fn a_credential_short_of_the_hold_is_drained_and_the_rest_filled() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            settled_charge: Some(1_500),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        for amount in [1_000_000, 1_000] {
+            core.runtime()
+                .block_on(core.account_allocate(amount))
+                .expect("an allocation");
+        }
+
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("a drain-and-fill turn");
+        let worst = mock.chat_charges()[0].expect("a hold") as i64;
+        assert!(worst > 1_000, "the drain cannot cover the hold alone");
+        assert_eq!(
+            mock.chat_shares()[0],
+            vec![1_000, (worst - 1_000) as u128],
+            "the drain first, its whole balance; the fill the rest"
+        );
+        let keys = &mock.chat_input_keys()[0];
+        assert_eq!(keys[0], keys[1], "one key: no key mixed without need");
+        assert_eq!(mock.hold_mismatches(), 0, "the shares sum to exactly W");
+        assert!(
+            spending_credentials(&core).is_empty(),
+            "both inputs settled"
+        );
+        assert_eq!(
+            active_balances(&core),
+            vec![0, 1_000_000 - 500],
+            "the charge consumed the drain first; the fill paid the rest"
+        );
+        // The Record's spend trail shows the request under both inputs.
+        let trail = core
+            .runtime()
+            .block_on(core.spend_trail(10, 0))
+            .expect("spend trail");
+        assert_eq!(trail.len(), 2, "{trail:?}");
+        assert_eq!(trail[0].request_id, trail[1].request_id);
+        assert_ne!(trail[0].credential_nonce, trail[1].credential_nonce);
+
+        core.runtime()
+            .block_on(core.chat("again".into(), MODEL.into(), None))
+            .expect("the next turn");
+        assert_eq!(
+            mock.chat_shares()[1],
+            vec![worst as u128],
+            "an exhausted drain is never presented; the fill pays alone"
+        );
+    });
+}
+
+/// **A drain whose change comes back is drained again**, as a run: charged
+/// less than its balance, the drained credential returns as a smaller
+/// successor, first in spend order and still short of the hold, so the next
+/// request drains it once more, with the fill's successor filling. The change
+/// lands on the drain and the fill comes back whole, until a charge exhausts
+/// the drain and the fill pays the rest.
+#[test]
+fn a_drain_with_change_is_drained_again_on_the_next_request() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            settled_charge: Some(400),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        for amount in [1_000_000, 1_000] {
+            core.runtime()
+                .block_on(core.account_allocate(amount))
+                .expect("an allocation");
+        }
+        // Each turn charged 400: the drain pays first, the fill only once the
+        // drain is exhausted (the third turn's 200 leaves 200 to the fill).
+        for (turn, drained, after) in [
+            (0usize, 1_000i64, [600i64, 1_000_000]),
+            (1, 600, [200, 1_000_000]),
+            (2, 200, [0, 1_000_000 - 200]),
+        ] {
+            core.runtime()
+                .block_on(core.chat(format!("turn {turn}"), MODEL.into(), None))
+                .expect("a turn");
+            let worst = mock.chat_charges()[turn].expect("a hold") as i64;
+            assert_eq!(
+                mock.chat_shares()[turn],
+                vec![drained as u128, (worst - drained) as u128],
+                "turn {turn}"
+            );
+            assert_eq!(active_balances(&core), after.to_vec(), "turn {turn}");
+        }
+    });
+}
+
+/// **Nothing that covers the rest: a new credential is the fill.** With only
+/// a 1,000-credit credential, the request still drains it, and the
+/// just-in-time allocation converts a standard credential to fill the rest,
+/// rather than converting one to pay the whole hold and stranding the
+/// residual.
+#[test]
+fn a_new_credential_fills_what_the_wallet_cannot() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("a small allocation");
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("the turn");
+        let worst = mock.chat_charges()[0].expect("a hold");
+        assert_eq!(mock.chat_shares()[0], vec![1_000, worst - 1_000]);
+        assert_eq!(mock.issuance_debits(), 2, "one just-in-time conversion");
+        assert!(spending_credentials(&core).is_empty());
+    });
+}
+
+/// **Every exit of a two-input round settles every input**: a completed
+/// answer and a stream ending in its metadata event (one refund per input, in
+/// band), a refusal after recording (full refunds in its error body), and a
+/// connection dropped before any answer (each input recovered by its own
+/// nullifier). Charged nothing here, each input comes back whole, and no
+/// credential is left `spending`.
+#[test]
+fn every_exit_of_a_two_input_round_settles_every_input() {
+    for (chat, streaming) in [
+        (ChatBehavior::OkBlocking, false),
+        (ChatBehavior::StreamingWithMetadataRefund, true),
+        (ChatBehavior::Non2xxWithRefund(502), false),
+        (ChatBehavior::DropBeforeResponse, false),
+    ] {
+        run(move || {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat,
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            for amount in [1_000_000, 1_000] {
+                core.runtime()
+                    .block_on(core.account_allocate(amount))
+                    .expect("an allocation");
+            }
+            if streaming {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let _ = core.runtime().block_on(async {
+                    let collector = async { while rx.recv().await.is_some() {} };
+                    let chat = core.chat_stream("hello".into(), MODEL.into(), None, tx);
+                    tokio::join!(chat, collector).0
+                });
+            } else {
+                let _ = core
+                    .runtime()
+                    .block_on(core.chat("hello".into(), MODEL.into(), None));
+            }
+            assert_eq!(
+                mock.chat_inputs()[0].len(),
+                2,
+                "{chat:?}: a drain and a fill"
+            );
+            assert!(spending_credentials(&core).is_empty(), "{chat:?}");
+            assert_eq!(active_balances(&core), vec![1_000, 1_000_000], "{chat:?}");
+        });
+    }
+}
+
+/// **A wallet able to pay is never sent to allocation.** The first
+/// credential (1,000) has no fill, since no later credential covers the rest
+/// of the hold, but the two 3,000-credit credentials together do: the first
+/// of them is drained and the second fills, with nothing converted (the
+/// account has no balance to convert), and the 1,000 is left for a later
+/// request.
+#[test]
+fn a_later_pair_pays_when_the_first_credential_has_no_fill() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            balance: 0,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        for amount in [1_000, 3_000, 3_000] {
+            core.runtime()
+                .block_on(core.account_allocate(amount))
+                .expect("an allocation");
+        }
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("the wallet pays without converting anything");
+        let worst = mock.chat_charges()[0].expect("a hold");
+        assert!(
+            worst > 4_000 && worst <= 6_000,
+            "the pair, and only the pair, covers {worst}"
+        );
+        assert_eq!(mock.chat_shares()[0], vec![3_000, worst - 3_000]);
+        assert_eq!(mock.issuance_debits(), 3, "no conversion");
+        assert!(spending_credentials(&core).is_empty());
+        assert_eq!(active_balances(&core), vec![1_000, 3_000, 3_000]);
+    });
+}
+
+/// **Mixed keys, to drain an older key's residual.** A 1,000-credit residual
+/// under the epoch just ended is drained into a request whose fill is under
+/// the new epoch's key: the older key sorts first (its value lapses first),
+/// ahead of a smaller credential under the newer key, and no credential under
+/// it covers the rest. Each input's refund is signed
+/// under that input's own key (the mock signs with the key the input names,
+/// and the client verifies each against its own credential's key), so the
+/// drain's change stays under the old key and the fill's under the new.
+#[test]
+fn an_older_keys_residual_is_drained_into_a_newer_keys_fill() {
+    run(|| {
+        let now = now_unix_secs();
+        let boundary = now + 6;
+        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
+        let config = MockConfig {
+            issuer_calendar: Some(calendar),
+            settled_charge: Some(1_500),
+            ..MockConfig::default()
+        };
+        let key_swap = config.key_swap.clone();
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+        let old = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the residual, under the epoch's key");
+
+        key_swap.swap();
+        sleep_past_unix_secs(boundary);
+        let new = core
+            .runtime()
+            .block_on(core.account_allocate(1_000_000))
+            .expect("the next epoch's key issues");
+        assert_ne!(old.issuer_key_id, new.issuer_key_id);
+        // Smaller than the residual, but under the key that lapses later: by
+        // balance alone it would be drained first.
+        core.runtime()
+            .block_on(core.account_allocate(500))
+            .expect("a small credential under the new key");
+
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("a turn draining the old key's residual");
+        assert_eq!(
+            mock.chat_input_keys()[0],
+            vec![old.issuer_key_id.clone(), new.issuer_key_id.clone()],
+            "the older key's residual first, the newer key's fill second"
+        );
+        assert_eq!(mock.chat_shares()[0][0], 1_000);
+        assert!(spending_credentials(&core).is_empty(), "each input settled");
+        assert_eq!(active_balances(&core), vec![0, 500, 1_000_000 - 500]);
+    });
+}
+
+/// **Each input is recovered on its own, and stays pending until its own
+/// refund is final.** The answer carries no refunds, so each input is
+/// recovered by its own nullifier: the gateway calls the first input's
+/// refund provisional and the second's final. The second settles; the first
+/// stays `spending` (the request is not settled as a whole), and the sweep
+/// settles it once the gateway calls it final.
+#[test]
+fn one_inputs_recovery_waits_while_the_others_is_final() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            refund: RefundMode::ProvisionalFirst(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        for amount in [1_000_000, 1_000] {
+            core.runtime()
+                .block_on(core.account_allocate(amount))
+                .expect("an allocation");
+        }
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("the answer arrives; only its settlement waits");
+        assert_eq!(mock.refund_hits(), 2, "each input recovered on its own");
+        assert_eq!(
+            spending_credentials(&core),
+            vec![(1_000, 1_000)],
+            "the drain waits on its provisional refund; the fill is settled"
+        );
+
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_spending_credentials())
+            .expect("sweep");
+        assert_eq!(recovered.len(), 1);
+        assert!(spending_credentials(&core).is_empty());
+    });
+}
+
+/// **Each input's settlement is announced at its own write.** The answer
+/// carries no refunds; the first input's recovery succeeds and the second's
+/// never answers. The first input's successor is durable, and `Wallet` says
+/// so while the turn is still waiting on the second, rather than only once
+/// the whole settlement returns, which here it never does.
+#[test]
+fn a_settled_input_is_announced_while_the_other_still_waits() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            refund: RefundMode::StallAfter(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        for amount in [1_000_000, 1_000] {
+            core.runtime()
+                .block_on(core.account_allocate(amount))
+                .expect("an allocation");
+        }
+        let mut rx = core.subscribe_changes();
+        let outcome = core.runtime().block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                core.chat("hello".into(), MODEL.into(), None),
+            )
+            .await
+        });
+        assert!(outcome.is_err(), "the second recovery never answers");
+        assert_eq!(mock.refund_hits(), 2);
+        assert_eq!(spending_credentials(&core).len(), 1, "one input settled");
+        let wallet = drain(&mut rx)
+            .into_iter()
+            .filter(|c| *c == Change::Wallet)
+            .count();
+        assert_eq!(
+            wallet, 2,
+            "one at the spend's start, one at the settled input's write"
+        );
+    });
+}
+
+/// **Two turns at once never take one credential.** Both inputs of a request
+/// are marked `spending` together, under the wallet's spend gate: the first
+/// turn takes the drain and the fill, and the second, finding neither, is
+/// paid by a new credential. No nullifier is presented twice.
+#[test]
+fn concurrent_turns_never_share_an_input() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat_delay_ms: 300,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        for amount in [1_000_000, 1_000] {
+            core.runtime()
+                .block_on(core.account_allocate(amount))
+                .expect("an allocation");
+        }
+        let (first, second) = core.runtime().block_on(async {
+            tokio::join!(
+                core.chat("one".into(), MODEL.into(), None),
+                core.chat("two".into(), MODEL.into(), None),
+            )
+        });
+        first.expect("the first turn");
+        second.expect("the second turn");
+        let nullifiers: Vec<String> = mock.chat_nullifiers().into_iter().flatten().collect();
+        let distinct: std::collections::HashSet<&String> = nullifiers.iter().collect();
+        assert_eq!(distinct.len(), nullifiers.len(), "no input presented twice");
+        let mut counts: Vec<usize> = mock.chat_inputs().iter().map(Vec::len).collect();
+        counts.sort();
+        assert_eq!(
+            counts,
+            vec![1, 2],
+            "one turn drained and filled; the other paid alone"
+        );
+        assert_eq!(
+            mock.issuance_debits(),
+            3,
+            "the second turn's credential was new"
+        );
+        assert!(spending_credentials(&core).is_empty());
     });
 }
 
@@ -10484,8 +10897,9 @@ fn provision(core: &AppCore) -> ProvisionOutcome {
 }
 
 /// Below the threshold, with recent spending and a funded account, one pass
-/// issues one credential of the standard size; the next pass finds the buffer
-/// covered and issues nothing.
+/// issues credentials of the standard size: one here, since the account's
+/// just-in-time issuance already makes it one of two under the key; the next
+/// pass finds the buffer covered and issues nothing.
 #[test]
 fn the_provisioner_tops_up_a_wallet_running_low() {
     run(|| {
@@ -10507,6 +10921,88 @@ fn the_provisioner_tops_up_a_wallet_running_low() {
 
         assert_eq!(provision(&core), ProvisionOutcome::Covered);
         assert_eq!(mock.issuance_debits(), 2, "a covered wallet issues nothing");
+    });
+}
+
+/// **Two credentials under each key the provisioner issues under**, so a
+/// request draining one and filling from another under that key is placed
+/// among every account that provisioned, not the heavy users. The account
+/// was issued one credential under the epoch just ended; under the new
+/// epoch's key it has none, so the provisioner issues two, both the standard
+/// size. Where the account already holds an issuance under the key (a
+/// just-in-time one), it issues one more ([`the_provisioner_tops_up_a_wallet_running_low`]).
+#[test]
+fn the_provisioner_issues_two_credentials_under_a_key_it_has_not_issued_under() {
+    run(|| {
+        let now = now_unix_secs();
+        let boundary = now + 6;
+        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
+        let config = MockConfig {
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        };
+        let key_swap = config.key_swap.clone();
+        let (mock, core, _dir) = setup(config);
+        spend_from_a_small_credential(&core, 100_000);
+        assert_eq!(mock.issuance_debits(), 1);
+
+        key_swap.swap();
+        sleep_past_unix_secs(boundary);
+        let outcome = provision(&core);
+        let ProvisionOutcome::Issued { nonces } = outcome else {
+            panic!("got {outcome:?}");
+        };
+        assert_eq!(nonces.len(), 2, "two under the new key");
+        assert_eq!(mock.issuance_debits(), 3);
+        assert_eq!(
+            mock.issuance_debited_credits(),
+            100_000 + 2 * DEFAULT_ALLOCATION_CREDITS,
+            "both the one public denomination"
+        );
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+    });
+}
+
+/// **A pair interrupted by a lost response is finished on a later pass.**
+/// The first of the two issuances under a fresh key loses its response, so
+/// the pass ends there. The next pass recovers it, which covers the buffer,
+/// and still issues the second: the account ends up with two issuances under
+/// the key, as every provisioning account does. Then the buffer is covered.
+#[test]
+fn a_pair_interrupted_by_a_lost_response_is_finished_later() {
+    run(|| {
+        let now = now_unix_secs();
+        let boundary = now + 6;
+        let (_, calendar) = KeyWindow::epoch_ending_at(boundary, WEEK_SECS as u64);
+        let config = MockConfig {
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        };
+        let key_swap = config.key_swap.clone();
+        let (mock, core, _dir) = setup(config);
+        spend_from_a_small_credential(&core, 100_000);
+
+        key_swap.swap();
+        sleep_past_unix_secs(boundary);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.test_provision_once())
+            .expect_err("the first issuance's response was lost");
+        assert_eq!(mock.issuance_debits(), 2);
+
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        let outcome = provision(&core);
+        let ProvisionOutcome::Issued { nonces } = outcome else {
+            panic!("got {outcome:?}");
+        };
+        assert_eq!(
+            nonces.len(),
+            1,
+            "the pair's second, after the first was recovered"
+        );
+        assert_eq!(mock.issuance_debits(), 3);
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+        assert_eq!(mock.issuance_debits(), 3);
     });
 }
 
@@ -10810,11 +11306,12 @@ fn a_pending_issuance_is_never_retried_for_another_account() {
 /// recovery failed would convert another allocation. The mock refunds every
 /// charge in full, so everything it ever debited is still held.
 #[test]
-fn what_is_held_stays_within_the_threshold_plus_one_allocation() {
+fn what_is_held_stays_within_the_threshold_plus_two_allocations() {
     run(|| {
         let (mock, core, _dir) = setup(MockConfig::default());
         spend_from_a_small_credential(&core, 100_000);
-        let bound = eidola_app_core::PROVISION_THRESHOLD_CREDITS + DEFAULT_ALLOCATION_CREDITS;
+        let bound = eidola_app_core::PROVISION_THRESHOLD_CREDITS
+            + eidola_app_core::PROVISION_CREDENTIALS_PER_KEY * DEFAULT_ALLOCATION_CREDITS;
 
         mock.issuance_knobs().lose_next(1);
         core.runtime()
