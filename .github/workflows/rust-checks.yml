@@ -51,6 +51,11 @@ jobs:
     # too-tight timeout there would leave every subsequent PR cold, timing out
     # in a spiral.
     timeout-minutes: 90
+    env:
+      # Nothing here is debugged interactively, and full debuginfo for every
+      # gpui-linked test binary overflows the runner's disk at link time.
+      # Line tables keep file:line in backtraces.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     permissions:
       contents: read
 
@@ -204,7 +209,12 @@ jobs:
             /opt/ghc \
             /usr/local/.ghcup \
             /opt/hostedtoolcache/CodeQL \
-            /usr/share/swift
+            /usr/share/swift \
+            /usr/local/share/powershell \
+            /usr/share/miniconda \
+            /usr/lib/jvm \
+            /opt/microsoft \
+            /opt/az
           echo "Root disk avail: $before -> $(df --output=avail -BG / | tail -1)"
 
       - name: Install Linux GUI build dependencies
