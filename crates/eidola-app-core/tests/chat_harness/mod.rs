@@ -1602,7 +1602,7 @@ fn refunds_value(
             }))
         })
         .collect::<Option<Vec<_>>>()?;
-    (!refunds.is_empty()).then(|| serde_json::Value::Array(refunds))
+    (!refunds.is_empty()).then_some(serde_json::Value::Array(refunds))
 }
 
 /// Start the mock upstream on an ephemeral loopback port.
