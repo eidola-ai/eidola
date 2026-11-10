@@ -424,7 +424,24 @@ impl Config {
         fs::rename(&tmp, path).map_err(|e| {
             let _ = fs::remove_file(&tmp);
             write_err(e)
-        })
+        })?;
+        // `sync_all` above made the temporary's *contents* durable; the
+        // rename is an entry in the parent directory, which is its own
+        // metadata and on most filesystems is not durable until the directory
+        // is synced too. Without this, a crash right after the first account
+        // save returns could lose the file — the only copy of the secret —
+        // despite the successful result.
+        #[cfg(unix)]
+        {
+            let parent = match path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(write_err)?;
+        }
+        Ok(())
     }
 }
 
