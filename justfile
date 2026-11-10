@@ -34,7 +34,7 @@ db-reset:
 
 # --- Build (local toolchain, fast iteration) ---
 
-# Build a system: gateway, cli, gui, www, or engine-server
+# Build a system: gateway, cli, gui, notepad, www, or engine-server
 build system:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -55,6 +55,14 @@ build system:
           ./scripts/package-gui-app.sh debug
         fi
         ;;
+      notepad)
+        # A personal markdown editor on Eidola's writing surface; bundled
+        # on macOS for the same reasons as the GUI, plus its document types.
+        cargo build -p eidola-notepad
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+          ./scripts/package-notepad-app.sh debug
+        fi
+        ;;
       www)
         # Build the website to target/www (drafts excluded, as deployed).
         cargo run -q -p eidola-www -- build
@@ -63,7 +71,7 @@ build system:
         cargo build -p eidola-server-engine
         ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: gateway, cli, gui, www, engine-server)" >&2
+        echo "error: unknown system '{{ system }}' (expected: gateway, cli, gui, notepad, www, engine-server)" >&2
         exit 1
         ;;
     esac
@@ -93,7 +101,7 @@ engine-platform-endorsements tag:
 engine:
     nix build .#llama-server -o crates/eidola-gui/build/llama-server
 
-# Build and run a system: gateway, cli, gui, www, or engine-server
+# Build and run a system: gateway, cli, gui, notepad, www, or engine-server
 run system *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -116,6 +124,14 @@ run system *args:
           open -W "crates/eidola-gui/build/Eidola.app" --args {{ args }}
         else
           cargo run -p eidola-gui -- {{ args }}
+        fi
+        ;;
+      notepad)
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+          just build notepad
+          open -W "crates/eidola-notepad/build/Eidola Notepad.app" --args {{ args }}
+        else
+          cargo run -p eidola-notepad -- {{ args }}
         fi
         ;;
       www)
@@ -154,7 +170,7 @@ run system *args:
           cargo run -p eidola-server-engine -- {{ args }}
         ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: gateway, cli, gui, www, engine-server)" >&2
+        echo "error: unknown system '{{ system }}' (expected: gateway, cli, gui, notepad, www, engine-server)" >&2
         exit 1
         ;;
     esac

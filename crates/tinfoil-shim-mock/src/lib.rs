@@ -10,6 +10,9 @@
 //!   `REPORT_DATA` binds their hashes plus the nonce. The response carries its
 //!   VCEK chain and ARK-signed CRL, matching Tinfoil's self-contained v3
 //!   envelope.
+//! - **VCEK binding:** the VCEK carries the AMD KDS SPL and hwID extensions
+//!   for the TCB and chip every report claims ([`MOCK_TCB`], [`MOCK_CHIP_ID`]),
+//!   because the verifier refuses a report its VCEK was not endorsed for.
 //!
 //! This exercises the complete verification path in `tinfoil-verifier` with
 //! no escape hatches — the `sev` crate's `Verifiable` trait verifies every
@@ -126,6 +129,30 @@ const OFF_COMMITTED_TCB: usize = 0x1E0; // 8 bytes
 const OFF_LAUNCH_TCB: usize = 0x1F0; // 8 bytes
 const OFF_SIGNATURE: usize = 0x2A0; // 512 bytes (72 R + 72 S + 368 reserved)
 const REPORT_SIZE: usize = 0x4A0; // 1184 bytes
+
+/// The TCB `(bl, tee, snp, ucode)` every TCB field of a mock report claims,
+/// and the one the mock VCEK is endorsed for. Must pass the verifier's
+/// minimum policy (bl=0x07, snp=0x0E, ucode=0x48).
+const MOCK_TCB: (u8, u8, u8, u8) = (0x07, 0x00, 0x0E, 0x48);
+
+/// The mock chip identity: `CHIP_ID` in every report and `hwID` in the VCEK.
+/// A stable non-zero value (V3 generation detection runs off the CPUID
+/// fields, not the chip_id shape).
+const MOCK_CHIP_ID: [u8; 64] = {
+    let mut id = [0u8; 64];
+    id[0] = 0xDE;
+    id[1] = 0xAD;
+    id[8] = 0x01;
+    id
+};
+
+/// AMD KDS VCEK extension OIDs: the four SPL fields of the endorsed TCB and
+/// the 64-byte hardware ID (AMD GHCB/KDS spec §4, OID arc 1.3.6.1.4.1.3704).
+const OID_BL_SPL: &str = "1.3.6.1.4.1.3704.1.3.1";
+const OID_TEE_SPL: &str = "1.3.6.1.4.1.3704.1.3.2";
+const OID_SNP_SPL: &str = "1.3.6.1.4.1.3704.1.3.3";
+const OID_UCODE_SPL: &str = "1.3.6.1.4.1.3704.1.3.8";
+const OID_HWID: &str = "1.3.6.1.4.1.3704.1.4";
 
 fn tls_config() -> rustls::ClientConfig {
     let mut root_store = rustls::RootCertStore::empty();
@@ -468,6 +495,30 @@ fn authority_key_id_ext(
     })
 }
 
+/// Build the AMD KDS extensions that bind a VCEK to one TCB and one chip,
+/// encoded as the KDS encodes them: each SPL a DER INTEGER, the hwID 64
+/// untagged bytes. The verifier compares a report's `reported_tcb` and
+/// `CHIP_ID` against these, so they carry exactly what `build_report`
+/// writes.
+fn vcek_binding_extensions()
+-> Result<Vec<x509_cert::ext::Extension>, Box<dyn std::error::Error + Send + Sync>> {
+    let kds = |oid: &str, value: Vec<u8>| {
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(x509_cert::ext::Extension {
+            extn_id: ObjectIdentifier::new_unwrap(oid),
+            critical: false,
+            extn_value: der::asn1::OctetString::new(value)?,
+        })
+    };
+    let (bl, tee, snp, ucode) = MOCK_TCB;
+    Ok(vec![
+        kds(OID_BL_SPL, bl.to_der()?)?,
+        kds(OID_TEE_SPL, tee.to_der()?)?,
+        kds(OID_SNP_SPL, snp.to_der()?)?,
+        kds(OID_UCODE_SPL, ucode.to_der()?)?,
+        kds(OID_HWID, MOCK_CHIP_ID.to_vec())?,
+    ])
+}
+
 /// Build the non-critical CRL number extension required for a complete v2
 /// CRL. The mock has one freshly generated CRL per process, so its sequence
 /// starts at one each time.
@@ -596,9 +647,9 @@ fn tls_leaf_extensions(
 // ── Report construction ─────────────────────────────────────────────────
 
 /// Write a TcbVersion in legacy Genoa format: [bl, tee, 0, 0, 0, 0, snp, ucode]
-fn write_tcb(report: &mut [u8], offset: usize, bl: u8, snp: u8, ucode: u8) {
+fn write_tcb(report: &mut [u8], offset: usize, (bl, tee, snp, ucode): (u8, u8, u8, u8)) {
     report[offset] = bl;
-    report[offset + 1] = 0; // tee
+    report[offset + 1] = tee;
     report[offset + 6] = snp;
     report[offset + 7] = ucode;
 }
@@ -630,12 +681,11 @@ fn build_report(measurement: &[u8], report_data_prefix: &[u8; 32]) -> [u8; REPOR
     report[OFF_CPUID_FAM + 1] = 0x11;
     report[OFF_CPUID_FAM + 2] = 0x01;
 
-    // TCB values (must pass minimum policy: bl=0x07, snp=0x0E, ucode=0x48)
-    let (bl, snp, ucode) = (0x07, 0x0E, 0x48);
-    write_tcb(&mut report, OFF_CURRENT_TCB, bl, snp, ucode);
-    write_tcb(&mut report, OFF_REPORTED_TCB, bl, snp, ucode);
-    write_tcb(&mut report, OFF_COMMITTED_TCB, bl, snp, ucode);
-    write_tcb(&mut report, OFF_LAUNCH_TCB, bl, snp, ucode);
+    // TCB values: the TCB the VCEK is endorsed for (`vcek_binding_extensions`).
+    write_tcb(&mut report, OFF_CURRENT_TCB, MOCK_TCB);
+    write_tcb(&mut report, OFF_REPORTED_TCB, MOCK_TCB);
+    write_tcb(&mut report, OFF_COMMITTED_TCB, MOCK_TCB);
+    write_tcb(&mut report, OFF_LAUNCH_TCB, MOCK_TCB);
 
     // report_data[0..32] = the v1 envelope digest; the rest stays zero.
     report[OFF_REPORT_DATA..OFF_REPORT_DATA + 32].copy_from_slice(report_data_prefix);
@@ -644,11 +694,8 @@ fn build_report(measurement: &[u8], report_data_prefix: &[u8; 32]) -> [u8; REPOR
     let len = measurement.len().min(48);
     report[OFF_MEASUREMENT..OFF_MEASUREMENT + len].copy_from_slice(&measurement[..len]);
 
-    // chip_id — a stable non-zero mock identity. (V3 generation detection
-    // runs off the CPUID fields above, not the chip_id shape.)
-    report[OFF_CHIP_ID] = 0xDE;
-    report[OFF_CHIP_ID + 1] = 0xAD;
-    report[OFF_CHIP_ID + 8] = 0x01;
+    // chip_id — the hwID the VCEK is endorsed for.
+    report[OFF_CHIP_ID..OFF_CHIP_ID + 64].copy_from_slice(&MOCK_CHIP_ID);
 
     report
 }
@@ -1123,9 +1170,11 @@ pub async fn start(config: ShimConfig) -> Result<RunningShim, BoxError> {
     // VCEK is ephemeral and only used in the SEV chain (the `sev` crate
     // doesn't enforce strict validity policy), so a generous 5-year window
     // from boot is fine. We give it an AKI referencing ASK so chain
-    // builders that follow SKI/AKI links work end-to-end.
+    // builders that follow SKI/AKI links work end-to-end, and the KDS
+    // SPL/hwID extensions the verifier binds every report to.
     let vcek_validity = validity_from_now(Duration::from_secs(5 * 365 * 24 * 60 * 60))?;
-    let vcek_extensions = vec![authority_key_id_ext(&ask.key_id)?];
+    let mut vcek_extensions = vec![authority_key_id_ext(&ask.key_id)?];
+    vcek_extensions.extend(vcek_binding_extensions()?);
     let vcek_der = build_rsa_pss_cert(
         3,
         &ask.subject,

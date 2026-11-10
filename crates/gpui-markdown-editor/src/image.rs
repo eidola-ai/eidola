@@ -36,7 +36,7 @@
 //! * [`block_size`] for `BlockKind::Image` — width capped to the
 //!   available content width, height scaled to preserve aspect.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
@@ -80,11 +80,23 @@ impl LoadedImage {
 /// * `http://…` / `https://…` — fetched via the asset HTTP client.
 /// * `file://…` and absolute filesystem paths — read via the
 ///   filesystem loader.
+/// * A relative path, when the editor has a `base_dir` (a document
+///   opened from disk — see `MarkdownEditorState::set_image_base_dir`)
+///   — joined onto it and read via the filesystem loader, so
+///   `![](assets/fig.png)` beside a note finds the file the way every
+///   other markdown viewer does. Percent-escapes are decoded first
+///   (`my%20figure.png`), since a link destination cannot carry a raw
+///   space.
 /// * Anything else — treated as an embedded asset path. Hosting
 ///   applications can ship their own embedded asset source via
 ///   `gpui::AssetSource` to resolve these.
-pub fn load(dest_url: &str, window: &mut Window, cx: &mut App) -> LoadedImage {
-    let resource = make_resource(dest_url);
+pub fn load(
+    dest_url: &str,
+    base_dir: Option<&Path>,
+    window: &mut Window,
+    cx: &mut App,
+) -> LoadedImage {
+    let resource = make_resource(dest_url, base_dir);
     match window.use_asset::<ImgResourceLoader>(&resource, cx) {
         Some(Ok(data)) => LoadedImage::Loaded(data),
         Some(Err(_)) => LoadedImage::Failed,
@@ -92,19 +104,60 @@ pub fn load(dest_url: &str, window: &mut Window, cx: &mut App) -> LoadedImage {
     }
 }
 
-fn make_resource(dest_url: &str) -> Resource {
+fn make_resource(dest_url: &str, base_dir: Option<&Path>) -> Resource {
     if dest_url.starts_with("http://") || dest_url.starts_with("https://") {
         Resource::Uri(SharedUri::from(dest_url.to_string()))
     } else if let Some(path) = dest_url.strip_prefix("file://") {
         Resource::Path(PathBuf::from(path).into())
     } else if dest_url.starts_with('/') {
         Resource::Path(PathBuf::from(dest_url).into())
+    } else if let Some(base) = base_dir.filter(|_| !has_scheme(dest_url)) {
+        Resource::Path(base.join(percent_decode(dest_url)).into())
     } else {
         // Treat as an embedded asset path; hosting apps can register
         // their own `AssetSource` to resolve these. Falls back to a
         // failed load if the host hasn't registered one.
         Resource::Embedded(SharedString::from(dest_url.to_string()))
     }
+}
+
+/// Whether `url` opens with a URI scheme (`data:`, `mailto:`, …) rather than
+/// a path. Such a destination is never a file beside the document.
+fn has_scheme(url: &str) -> bool {
+    match url.split_once(':') {
+        Some((scheme, _)) => {
+            scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        }
+        None => false,
+    }
+}
+
+/// Decode `%XX` escapes. A malformed escape is kept literally, and a
+/// decoding that is not UTF-8 falls back to the input unchanged.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
+            out.push((h << 4) | l);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+fn hex(b: u8) -> Option<u8> {
+    (b as char).to_digit(16).map(|d| d as u8)
 }
 
 /// Pixel size for an inline image overlay at the given line height.
@@ -199,6 +252,56 @@ pub fn fit_contain(natural: Size<Pixels>, bounds: Bounds<Pixels>) -> Bounds<Pixe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn path_of(resource: Resource) -> Option<PathBuf> {
+        match resource {
+            Resource::Path(p) => Some(p.to_path_buf()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_relative_image_resolves_against_the_documents_directory() {
+        let base = Path::new("/notes/today");
+        assert_eq!(
+            path_of(make_resource("assets/fig.png", Some(base))),
+            Some(PathBuf::from("/notes/today/assets/fig.png"))
+        );
+        assert_eq!(
+            path_of(make_resource("../my%20figure.png", Some(base))),
+            Some(PathBuf::from("/notes/today/../my figure.png"))
+        );
+        // Absolute paths and URLs ignore the base.
+        assert_eq!(
+            path_of(make_resource("/abs/fig.png", Some(base))),
+            Some(PathBuf::from("/abs/fig.png"))
+        );
+        assert!(matches!(
+            make_resource("https://example.com/a.png", Some(base)),
+            Resource::Uri(_)
+        ));
+        // A scheme is never a file beside the document.
+        assert!(matches!(
+            make_resource("data:image/png;base64,AAAA", Some(base)),
+            Resource::Embedded(_)
+        ));
+    }
+
+    #[test]
+    fn without_a_base_a_relative_image_stays_an_embedded_asset() {
+        assert!(matches!(
+            make_resource("assets/fig.png", None),
+            Resource::Embedded(_)
+        ));
+    }
+
+    #[test]
+    fn percent_decoding_keeps_what_it_cannot_decode() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%E2%9C%93"), "\u{2713}");
+    }
 
     #[test]
     fn inline_size_respects_height_cap_and_scales_width() {

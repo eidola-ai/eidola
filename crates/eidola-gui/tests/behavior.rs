@@ -25327,3 +25327,46 @@ fn a_proxy_verb_that_unmounts_itself_hands_the_keyboard_back(cx: &mut TestAppCon
         "the subtree that disappeared was not the one holding the keyboard"
     );
 }
+
+/// The traffic lights and window border are drawn from the app's native
+/// appearance, so a palette that departs from the OS's light/dark has to
+/// force it — and `system` has to let go, or the OS appearance it reads
+/// would be its own override reflected back.
+#[gpui::test]
+fn the_window_chrome_follows_the_palette_not_the_system(cx: &mut TestAppContext) {
+    use eidola_app_core::config::{AppearanceSetting, LightCharacter, TimeOfDayTint};
+    use eidola_gui::theme::{self, ThemeSettings};
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::install(cx);
+    });
+    let set = |appearance, cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            theme::set_settings(
+                ThemeSettings {
+                    appearance,
+                    tint: TimeOfDayTint::Off,
+                    character: LightCharacter::Neutral,
+                    font_scale: 1.0,
+                },
+                cx,
+            );
+            theme::chrome_override_for_test(cx)
+        })
+    };
+
+    assert_eq!(cx.update(|cx| theme::chrome_override_for_test(cx)), None);
+    assert_eq!(
+        set(AppearanceSetting::Night, cx),
+        Some(gpui::WindowAppearance::Dark)
+    );
+    assert_eq!(
+        set(AppearanceSetting::Day, cx),
+        Some(gpui::WindowAppearance::Light)
+    );
+    assert_eq!(
+        set(AppearanceSetting::System, cx),
+        None,
+        "system follows the OS again"
+    );
+}

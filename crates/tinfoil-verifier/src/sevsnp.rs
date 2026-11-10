@@ -23,7 +23,11 @@
 //! - `reported_tcb`: the TCB version associated with the VCEK that signed
 //!   the report. The hypervisor can change this via the firmware's
 //!   `SET_TCB_VERSION` command, but only downward (it can't lie upward,
-//!   because there is no VCEK that would sign for a higher TCB).
+//!   because there is no VCEK that would sign for a higher TCB — a fact
+//!   [`verify_report`] enforces by comparing `reported_tcb` and `CHIP_ID`
+//!   with the SPL and hwID extensions of the VCEK that signed the report;
+//!   the VCEK arrives as untrusted collateral, so the signature alone binds
+//!   the report to *some* genuine VCEK, not to this TCB).
 //! - `committed_tcb`: a one-way commit by the firmware. Once the firmware
 //!   commits to a TCB level, it will not honor any `SET_TCB_VERSION`
 //!   request that would drop reported_tcb below it.
@@ -171,6 +175,104 @@ pub fn verify_report(
     (verified_vek, report)
         .verify()
         .map_err(|e| Error::Signature(format!("report signature verification failed: {e}")))?;
+
+    check_vcek_binding(vcek_der, report)?;
+
+    Ok(())
+}
+
+/// AMD KDS VCEK extension OIDs (VCEK/VLEK certificate spec, AMD 57230;
+/// the same set `go-sev-guest`'s `kds` package reads).
+const OID_BL_SPL: der::asn1::ObjectIdentifier =
+    der::asn1::ObjectIdentifier::new_unwrap("1.3.6.1.4.1.3704.1.3.1");
+const OID_TEE_SPL: der::asn1::ObjectIdentifier =
+    der::asn1::ObjectIdentifier::new_unwrap("1.3.6.1.4.1.3704.1.3.2");
+const OID_SNP_SPL: der::asn1::ObjectIdentifier =
+    der::asn1::ObjectIdentifier::new_unwrap("1.3.6.1.4.1.3704.1.3.3");
+const OID_UCODE_SPL: der::asn1::ObjectIdentifier =
+    der::asn1::ObjectIdentifier::new_unwrap("1.3.6.1.4.1.3704.1.3.8");
+const OID_HWID: der::asn1::ObjectIdentifier =
+    der::asn1::ObjectIdentifier::new_unwrap("1.3.6.1.4.1.3704.1.4");
+
+/// Bind the report to the VCEK that signed it.
+///
+/// A VCEK is derived per chip *and per TCB*: its certificate's SPL
+/// extensions name the TCB it was endorsed for, and its HWID names the
+/// chip. The signature alone proves only that *some* genuine VCEK signed
+/// the report, and the VCEK arrives as untrusted collateral the document's
+/// author chooses — so without this check, a VCEK whose key leaked from a
+/// vulnerable TCB could sign a report claiming any `reported_tcb`, and
+/// every floor in [`SevSnpTcbPolicy`] would be enforced against a number
+/// the attacker wrote. This is what makes the module doc's "there is no
+/// VCEK that would sign for a higher TCB" true. Mirrors `go-sev-guest`'s
+/// `validateTcb` (`reported == cert`) and its CHIP_ID/HWID check, including
+/// its tolerance for the KDS encoding the HWID as untagged raw bytes.
+fn check_vcek_binding(vcek_der: &[u8], report: &AttestationReport) -> Result<(), Error> {
+    let cert = x509_cert::Certificate::from_der(vcek_der)
+        .map_err(|e| Error::CertParse(format!("failed to parse VCEK DER: {e}")))?;
+    let extensions = cert.tbs_certificate.extensions.as_deref().unwrap_or(&[]);
+    let find = |oid: der::asn1::ObjectIdentifier, name: &str| -> Result<&[u8], Error> {
+        let mut found = extensions.iter().filter(|ext| ext.extn_id == oid);
+        let ext = found.next().ok_or_else(|| {
+            Error::CertChain(format!("VCEK certificate carries no {name} extension"))
+        })?;
+        if found.next().is_some() {
+            return Err(Error::CertChain(format!(
+                "VCEK certificate carries duplicate {name} extensions"
+            )));
+        }
+        Ok(ext.extn_value.as_bytes())
+    };
+    let spl = |oid, name| -> Result<u8, Error> {
+        u8::from_der(find(oid, name)?).map_err(|e| {
+            Error::CertChain(format!(
+                "VCEK {name} extension is not a DER INTEGER 0-255: {e}"
+            ))
+        })
+    };
+
+    let cert_tcb = SevSnpTcbSvns {
+        bootloader: spl(OID_BL_SPL, "blSPL")?,
+        tee: spl(OID_TEE_SPL, "teeSPL")?,
+        snp: spl(OID_SNP_SPL, "snpSPL")?,
+        microcode: spl(OID_UCODE_SPL, "ucodeSPL")?,
+        fmc: None,
+    };
+    let reported = SevSnpTcbSvns::from(report.reported_tcb);
+    if (
+        cert_tcb.bootloader,
+        cert_tcb.tee,
+        cert_tcb.snp,
+        cert_tcb.microcode,
+    ) != (
+        reported.bootloader,
+        reported.tee,
+        reported.snp,
+        reported.microcode,
+    ) {
+        return Err(Error::CertChain(format!(
+            "report reported_tcb ({reported}) is not the TCB its VCEK was endorsed for \
+             ({cert_tcb})"
+        )));
+    }
+
+    let hwid_ext = find(OID_HWID, "hwID")?;
+    let hwid = match hwid_ext.len() {
+        64 => hwid_ext,
+        _ => der::asn1::OctetStringRef::from_der(hwid_ext)
+            .map(|octets| octets.as_bytes())
+            .ok()
+            .filter(|bytes| bytes.len() == 64)
+            .ok_or_else(|| Error::CertChain("VCEK hwID extension is not 64 bytes".to_string()))?,
+    };
+    // An all-zero CHIP_ID is a masked chip identity (MASK_CHIP_ID); there is
+    // nothing to compare, as in go-sev-guest. The TCB binding above still
+    // holds.
+    if report.chip_id != [0u8; 64] && report.chip_id[..] != hwid[..] {
+        return Err(Error::CertChain(
+            "report CHIP_ID is not the hwID of the VCEK that signed it".to_string(),
+        ));
+    }
 
     Ok(())
 }
@@ -672,5 +774,139 @@ mod tests {
         let (obs, result) = policy.evaluate(&report_with_tcb(reported, reported));
         assert!(result.is_err());
         assert_eq!(obs.as_metric_label(), "below_floor");
+    }
+
+    // --- VCEK binding -----------------------------------------------------
+    //
+    // The binding reads only the VCEK's extensions, so a synthetic VCEK is
+    // the built-in Genoa ASK with its extensions replaced. Nothing here is
+    // signed; `verify_report` checks the signature before the binding.
+
+    const HWID: [u8; 64] = [0xA5; 64];
+
+    fn kds_extension(
+        oid: der::asn1::ObjectIdentifier,
+        value: Vec<u8>,
+    ) -> x509_cert::ext::Extension {
+        x509_cert::ext::Extension {
+            extn_id: oid,
+            critical: false,
+            extn_value: der::asn1::OctetString::new(value).unwrap(),
+        }
+    }
+
+    fn spl_extension(oid: der::asn1::ObjectIdentifier, spl: u8) -> x509_cert::ext::Extension {
+        kds_extension(oid, spl.to_der().unwrap())
+    }
+
+    /// A VCEK endorsed for `tcb` on chip `HWID`, with the hwID encoded the
+    /// way AMD's KDS writes it: 64 raw bytes, no OCTET STRING tag.
+    fn kds_extensions(tcb: SevSnpTcbSvns) -> Vec<x509_cert::ext::Extension> {
+        vec![
+            spl_extension(OID_BL_SPL, tcb.bootloader),
+            spl_extension(OID_TEE_SPL, tcb.tee),
+            spl_extension(OID_SNP_SPL, tcb.snp),
+            spl_extension(OID_UCODE_SPL, tcb.microcode),
+            kds_extension(OID_HWID, HWID.to_vec()),
+        ]
+    }
+
+    fn vcek_with(extensions: Vec<x509_cert::ext::Extension>) -> Vec<u8> {
+        let der = genoa::ask().unwrap().to_der().unwrap();
+        let mut cert = x509_cert::Certificate::from_der(&der).unwrap();
+        cert.tbs_certificate.extensions = Some(extensions);
+        cert.to_der().unwrap()
+    }
+
+    fn report_signed_for(tcb: SevSnpTcbSvns, chip_id: [u8; 64]) -> AttestationReport {
+        AttestationReport {
+            chip_id,
+            ..report_with_tcb(tcb, tcb)
+        }
+    }
+
+    #[test]
+    fn vcek_binding_accepts_the_tcb_and_chip_the_vcek_was_endorsed_for() {
+        let tcb = svns(0x07, 0x00, 0x0E, 0x48);
+        let report = report_signed_for(tcb, HWID);
+        check_vcek_binding(&vcek_with(kds_extensions(tcb)), &report).expect("raw hwID");
+
+        // go-sev-guest also tolerates a tagged OCTET STRING hwID.
+        let mut tagged = kds_extensions(tcb);
+        tagged[4] = kds_extension(
+            OID_HWID,
+            der::asn1::OctetString::new(HWID.to_vec())
+                .unwrap()
+                .to_der()
+                .unwrap(),
+        );
+        check_vcek_binding(&vcek_with(tagged), &report).expect("tagged hwID");
+    }
+
+    #[test]
+    fn vcek_binding_refuses_a_report_claiming_a_tcb_its_vcek_was_not_endorsed_for() {
+        // The leaked key's VCEK is for an old microcode; the report claims the
+        // patched one, which every floor would otherwise accept.
+        let endorsed = svns(0x07, 0x00, 0x0E, 0x0A);
+        let claimed = svns(0x07, 0x00, 0x0E, 0x54);
+        let vcek = vcek_with(kds_extensions(endorsed));
+        let err = check_vcek_binding(&vcek, &report_signed_for(claimed, HWID)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not the TCB its VCEK was endorsed for"),
+            "{err}"
+        );
+        // Each component is compared.
+        let bl = svns(0x05, 0x00, 0x0E, 0x0A);
+        assert!(check_vcek_binding(&vcek, &report_signed_for(bl, HWID)).is_err());
+    }
+
+    #[test]
+    fn vcek_binding_refuses_another_chips_vcek() {
+        let tcb = svns(0x07, 0x00, 0x0E, 0x48);
+        let vcek = vcek_with(kds_extensions(tcb));
+        let err = check_vcek_binding(&vcek, &report_signed_for(tcb, [0x5A; 64])).unwrap_err();
+        assert!(err.to_string().contains("CHIP_ID"), "{err}");
+    }
+
+    #[test]
+    fn vcek_binding_tolerates_a_masked_chip_id() {
+        // MASK_CHIP_ID zeroes CHIP_ID; there is nothing to compare, as in
+        // go-sev-guest. The TCB binding still holds.
+        let tcb = svns(0x07, 0x00, 0x0E, 0x48);
+        let vcek = vcek_with(kds_extensions(tcb));
+        check_vcek_binding(&vcek, &report_signed_for(tcb, [0; 64])).expect("masked chip id");
+        let claimed = svns(0x07, 0x00, 0x0E, 0x54);
+        assert!(check_vcek_binding(&vcek, &report_signed_for(claimed, [0; 64])).is_err());
+    }
+
+    #[test]
+    fn vcek_binding_refuses_missing_duplicate_or_malformed_extensions() {
+        let tcb = svns(0x07, 0x00, 0x0E, 0x48);
+        let report = report_signed_for(tcb, HWID);
+
+        let mut no_hwid = kds_extensions(tcb);
+        no_hwid.pop();
+        let err = check_vcek_binding(&vcek_with(no_hwid), &report).unwrap_err();
+        assert!(err.to_string().contains("no hwID extension"), "{err}");
+
+        let mut twice = kds_extensions(tcb);
+        twice.push(spl_extension(OID_UCODE_SPL, tcb.microcode));
+        let err = check_vcek_binding(&vcek_with(twice), &report).unwrap_err();
+        assert!(err.to_string().contains("duplicate ucodeSPL"), "{err}");
+
+        let mut wide = kds_extensions(tcb);
+        wide[0] = kds_extension(OID_BL_SPL, 0x0107u16.to_der().unwrap());
+        let err = check_vcek_binding(&vcek_with(wide), &report).unwrap_err();
+        assert!(err.to_string().contains("not a DER INTEGER 0-255"), "{err}");
+
+        let mut short_hwid = kds_extensions(tcb);
+        short_hwid[4] = kds_extension(OID_HWID, vec![0xA5; 32]);
+        let err = check_vcek_binding(&vcek_with(short_hwid), &report).unwrap_err();
+        assert!(err.to_string().contains("not 64 bytes"), "{err}");
+
+        // The ASK itself carries no KDS extensions at all.
+        let ask = genoa::ask().unwrap().to_der().unwrap();
+        assert!(check_vcek_binding(&ask, &report).is_err());
     }
 }

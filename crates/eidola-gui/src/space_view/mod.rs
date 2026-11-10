@@ -79,28 +79,28 @@ pub use crate::actions::{PostOnly, Send};
 
 /// Height reserved at the top of the window for the (transparent) titlebar —
 /// the macOS traffic-light band / the Linux CSD controls + drag strip.
-pub(crate) const TITLE_BAR_RESERVE: Pixels = crate::titlebar::DRAG_BAND_HEIGHT;
+pub const TITLE_BAR_RESERVE: Pixels = crate::titlebar::DRAG_BAND_HEIGHT;
 
 /// Prose typography for narrative content — Newsreader at a book size/leading,
 /// distinct from the system UI font the theme uses for chrome. Matches the
 /// chat composer's typography so a post shapes pixel-for-pixel like what the
 /// user types.
-pub(crate) const PROSE_FONT_SIZE: Pixels = px(17.);
-pub(crate) const PROSE_LINE_HEIGHT: f32 = 1.65;
+pub const PROSE_FONT_SIZE: Pixels = px(17.);
+pub const PROSE_LINE_HEIGHT: f32 = 1.65;
 /// Inter-block spacing as a multiple of the font size (the editor splits it
 /// half above / half below each block). Kept here as the single source of truth
 /// for both [`prose_style`] and the height estimate, so they can't drift.
-pub(crate) const PROSE_PARAGRAPH_GAP: f32 = 1.5;
+pub const PROSE_PARAGRAPH_GAP: f32 = 1.5;
 
 /// The byline gutter (right-aligned author + time) and the centered reading
 /// column it sits beside.
-pub(crate) const GUTTER_WIDTH: Pixels = px(120.);
-pub(crate) const GUTTER_GAP: Pixels = px(28.);
-pub(crate) const BODY_MAX_WIDTH: Pixels = px(600.);
+pub const GUTTER_WIDTH: Pixels = px(120.);
+pub const GUTTER_GAP: Pixels = px(28.);
+pub const BODY_MAX_WIDTH: Pixels = px(600.);
 
 /// Vertical breathing room around each post, plus the faint full-bleed band
 /// that separates one depth level of the tree from the next.
-pub(crate) const POST_PAD_Y: Pixels = px(40.);
+pub const POST_PAD_Y: Pixels = px(40.);
 pub(crate) const BAND_HEIGHT: Pixels = px(48.);
 
 /// The **default** floating-composer fraction of the window height — every
@@ -220,7 +220,7 @@ pub(crate) const SELECTION_AUTOSCROLL_MAX_SPEED: f32 = 32.0;
 /// large). Mirrors the website's prose ramp (`www/static/site.css`).
 /// `from_theme` seeds the system font + theme colors, so we override the
 /// family back to Newsreader for narrative content.
-pub(crate) fn prose_style(cx: &gpui::App) -> MarkdownStyle {
+pub fn prose_style(cx: &gpui::App) -> MarkdownStyle {
     // The prose ramp is the one place the type ramp is spelled in absolute
     // pixels rather than `rems()`, so it doesn't ride the scaled `rem_size`
     // automatically — multiply the base size by the type-scale factor here. The

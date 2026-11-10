@@ -71,7 +71,7 @@ use gpui_component::InteractiveElementExt;
 ///   idiom), right-click → `show_window_menu` (the *compositor's* window menu:
 ///   move / resize / workspace / always-on-top — the idiomatic window-scoped
 ///   menu, maintained by the compositor, one call).
-pub(crate) fn make_draggable(
+pub fn make_draggable(
     el: Stateful<Div>,
     key: &'static str,
     window: &mut Window,
