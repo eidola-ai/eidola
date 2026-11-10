@@ -927,7 +927,7 @@
       },
       "BackendAttestation": {
         "type": "object",
-        "description": "Backend attestation from the inference provider.",
+        "description": "A per-response attestation from the inference backend. No response\ncarries one: Eidola's engines are attested at the connection.",
         "required": [
           "provider",
           "signing_address",
@@ -938,7 +938,7 @@
         "properties": {
           "provider": {
             "type": "string",
-            "description": "The provider that issued the attestation (e.g., \"redpill\")."
+            "description": "The provider that issued the attestation."
           },
           "signature": {
             "type": "string",
@@ -950,7 +950,7 @@
           },
           "signing_address": {
             "type": "string",
-            "description": "The signing address (e.g., Ethereum address for Phala/RedPill)."
+            "description": "The signing address."
           },
           "signing_algorithm": {
             "type": "string",
@@ -2140,7 +2140,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/ScaledPrice",
-                "description": "Per-request pricing (for models like Whisper or TTS that charge per request\nrather than per token). When present, `per_prompt_token` and\n`per_completion_token` are zero."
+                "description": "Per-request pricing, for a model that charges per request rather than\nper token. When present, `per_prompt_token` and `per_completion_token`\nare zero."
               },
               {
                 "type": "null"
@@ -2339,7 +2339,7 @@
       },
       "ProxyAttestation": {
         "type": "object",
-        "description": "Proxy attestation (placeholder for future TEE deployment).",
+        "description": "Proxy attestation. No response carries one.",
         "required": [
           "status"
         ],
@@ -2631,7 +2631,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/BackendAttestation",
-                "description": "Backend attestation (only for TEE-backed models like phala/*)."
+                "description": "Backend attestation. Always absent: the gateway attests each engine\non its own connection to it and relays no per-response evidence."
               },
               {
                 "type": "null"
@@ -2642,7 +2642,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/ProxyAttestation",
-                "description": "Proxy attestation (None until the proxy runs in a TEE)."
+                "description": "Proxy attestation. Always absent: the gateway's enclave is attested\nto the client on every TLS handshake, not in the response."
               },
               {
                 "type": "null"

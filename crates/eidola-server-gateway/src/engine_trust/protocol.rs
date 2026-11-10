@@ -540,6 +540,43 @@ mod tests {
         serde_json::from_slice::<ChatCompletionRequest>(&body).unwrap();
     }
 
+    /// The forwarded body outgrows the client's by no more than the shared
+    /// bound the gateway's body limit leaves below the node's: numbers are
+    /// what grow when re-spelled, each to at most `RESPELLED_NUMBER_BYTES`,
+    /// and a body at the value cap made of the numbers that grow most stays
+    /// within `FORWARDED_BODY_GROWTH_BYTES`.
+    #[test]
+    fn forwarding_grows_a_body_within_the_shared_bound() {
+        use eidola_common::engine_protocol::{
+            FORWARDED_BODY_GROWTH_BYTES, MAX_REQUEST_JSON_VALUES, RESPELLED_NUMBER_BYTES,
+        };
+        for number in [
+            "1e15",
+            "-1e15",
+            "1E2",
+            "0",
+            "-1.2345678901234567e-300",
+            "1e-5",
+        ] {
+            let respelled =
+                serde_json::to_string(&serde_json::from_str::<serde_json::Value>(number).unwrap())
+                    .unwrap();
+            assert!(respelled.len() <= RESPELLED_NUMBER_BYTES, "{respelled}");
+        }
+        let numbers = "1e15,".repeat(MAX_REQUEST_JSON_VALUES - 32);
+        let raw = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"stream":true,"tools":[{{"type":"function","function":{{"name":"f","parameters":{{"enum":[{numbers}0]}}}}}}]}}"#
+        );
+        eidola_common::engine_protocol::check_request_json(raw.as_bytes()).unwrap();
+        let mut request = ValidatedRequest::from_bytes(bytes::Bytes::from(raw.clone())).unwrap();
+        request.resolve_model(&"a".repeat(64));
+        request.default_completion_ceiling(Some(u64::from(u32::MAX)));
+        let body = engine_request_body(&request);
+        let growth = body.len() - raw.len();
+        assert!(growth > 3 * 1024 * 1024, "the numbers grew: {growth}");
+        assert!(growth <= FORWARDED_BODY_GROWTH_BYTES, "{growth}");
+    }
+
     /// The member-merging rule written the obvious way (scan the members
     /// collected so far), as the reference the indexed implementation must
     /// reproduce byte for byte.

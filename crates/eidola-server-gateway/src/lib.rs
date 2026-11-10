@@ -40,6 +40,36 @@ pub fn tls_config() -> rustls::ClientConfig {
         .with_no_client_auth()
 }
 
+/// Largest request body a JSON route reads, in bytes; a longer one is
+/// refused with 413. Shared with the node's limit
+/// (`eidola_common::engine_protocol`), so a body accepted here is never one a
+/// node refuses for its size.
+pub const MAX_REQUEST_BODY_BYTES: usize =
+    eidola_common::engine_protocol::GATEWAY_MAX_REQUEST_BODY_BYTES;
+
+/// Largest request body read without a large-body permit, in bytes, and the
+/// largest read at all from a request that does not declare its length or on
+/// a route that is not JSON (the router's `DefaultBodyLimit`).
+pub const UNGATED_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Memory the gateway lets large request bodies (those past
+/// [`UNGATED_REQUEST_BODY_BYTES`]) take while they are read and parsed, before
+/// any credential is verified.
+pub const LARGE_BODY_MEMORY_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// How many large request bodies are read and parsed at once: the budget over
+/// the most one takes (`eidola_common::engine_deployment::read_slot_bytes` at
+/// the largest body and the JSON value cap: the body, its text copied into
+/// the parse, and the parse's nodes; measured for the node, which holds one
+/// tree more than the gateway does).
+pub fn large_body_permits() -> usize {
+    let each = eidola_common::engine_deployment::read_slot_bytes(
+        MAX_REQUEST_BODY_BYTES as u64,
+        eidola_common::engine_protocol::MAX_REQUEST_JSON_VALUES as u64,
+    );
+    (LARGE_BODY_MEMORY_BUDGET_BYTES / each) as usize
+}
+
 /// Shared application state (Clone via inner Arc).
 #[derive(Clone)]
 pub struct AppState {
@@ -113,4 +143,7 @@ pub fn build_router() -> OpenApiRouter<AppState> {
         .routes(routes!(credentials::issue_credentials))
         .routes(routes!(credentials::recover_refund))
         .routes(routes!(webhook::stripe_webhook))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            UNGATED_REQUEST_BODY_BYTES,
+        ))
 }

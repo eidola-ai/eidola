@@ -539,7 +539,10 @@ async fn streaming_shapes_text_and_usage() {
         let delta = &c["choices"][0]["delta"];
         assert!(delta.get("role").is_none());
         let keys: Vec<&String> = delta.as_object().unwrap().keys().collect();
-        assert!(!keys.is_empty(), "no empty deltas");
+        assert!(
+            !keys.is_empty() || c.get("usage").is_some(),
+            "an empty delta carries the running count"
+        );
         assert!(
             keys.iter()
                 .all(|k| ["reasoning_content", "content", "tool_calls"].contains(&k.as_str()))
@@ -631,6 +634,64 @@ async fn stop_sequences_truncate_the_output_and_end_the_request() {
         .wait_for(Duration::from_secs(5), |s| s.in_engine == 0)
         .await;
     assert_eq!(s.cancelled, 2, "{s:?}");
+}
+
+/// A step that gives out no text still reports the running count: while the stop
+/// matcher holds back the beginning of a stop sequence the output then departs from,
+/// chunks with an empty delta carry the count, so a stream cut there is billed for the
+/// tokens generated; and without `include_usage` no such chunk is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn held_back_steps_report_the_running_count() {
+    let node = TestNode::start(&[]).await;
+    let max = 32;
+    let mut body = request(LONG_TEXT, max);
+    let (_, plain) = node.chat_json(&body).await;
+    let message = &plain["choices"][0]["message"];
+    let full_text = text_of(message, "reasoning_content") + &text_of(message, "content");
+    // The end of the text, then a character the model never says: held back step
+    // after step, and never matched.
+    let chars: Vec<char> = full_text.chars().collect();
+    assert!(chars.len() >= 40, "{full_text:?}");
+    let held: String = chars[chars.len() - 40..].iter().collect();
+    body["stop"] = json!([held + "\u{1}"]);
+    body["stream"] = true.into();
+    body["stream_options"] = json!({"include_usage": true});
+    let (chunks, done) = parse_chunks(&node.chat_stream(&body).await);
+    assert!(done);
+
+    let mut text = String::new();
+    let mut counts_alone = 0;
+    let mut last = 0;
+    for c in &chunks[1..chunks.len() - 2] {
+        let choice = &c["choices"][0];
+        assert!(choice["finish_reason"].is_null());
+        let running = c["usage"]["completion_tokens"]
+            .as_u64()
+            .expect("every chunk before the finish carries the running count");
+        if choice["delta"] == json!({}) {
+            assert!(running > last, "a count alone is sent only when it moved");
+            counts_alone += 1;
+        }
+        assert!(running >= last);
+        last = running;
+        text.push_str(choice["delta"]["reasoning_content"].as_str().unwrap_or(""));
+        text.push_str(choice["delta"]["content"].as_str().unwrap_or(""));
+    }
+    assert!(
+        counts_alone > 1,
+        "{counts_alone} steps reported a count alone"
+    );
+    assert_eq!(text, full_text, "held-back text is released whole");
+    assert_eq!(chunks.last().unwrap()["usage"], plain["usage"]);
+
+    body["stream_options"] = Value::Null;
+    let (chunks, _) = parse_chunks(&node.chat_stream(&body).await);
+    assert!(
+        chunks[1..chunks.len() - 1]
+            .iter()
+            .all(|c| c["choices"][0]["delta"] != json!({})),
+        "no empty delta without include_usage"
+    );
 }
 
 /// A long stop sequence that the output never begins does not delay the stream: text is

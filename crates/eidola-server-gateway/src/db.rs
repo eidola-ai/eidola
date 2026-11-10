@@ -473,9 +473,16 @@ pub struct EnginePlacementRow {
     pub enabled: bool,
 }
 
-/// Every `engine_placement` row. Only the named columns are read, so a column
-/// a later gateway adds does not disturb this one: the table is shared by
-/// every gateway version running against the database, and grows additively.
+/// Most `engine_placement` rows one read takes. The database is outside the
+/// enclave, and every admissible row becomes an upstream with a client and a
+/// probe of its own, so the table cannot make the gateway build without
+/// bound; far above any real fleet.
+pub const MAX_ENGINE_PLACEMENT_ROWS: i64 = 256;
+
+/// The `engine_placement` rows, at most [`MAX_ENGINE_PLACEMENT_ROWS`] of
+/// them. Only the named columns are read, so a column a later gateway adds
+/// does not disturb this one: the table is shared by every gateway version
+/// running against the database, and grows additively.
 pub async fn get_engine_placement(pool: &Pool) -> Result<Vec<EnginePlacementRow>, ServerError> {
     let client = pool
         .get()
@@ -485,8 +492,8 @@ pub async fn get_engine_placement(pool: &Pool) -> Result<Vec<EnginePlacementRow>
     let rows = client
         .query(
             "SELECT model_id, deployment, base_url, enabled \
-             FROM engine_placement ORDER BY model_id, base_url",
-            &[],
+             FROM engine_placement ORDER BY model_id, base_url LIMIT $1",
+            &[&MAX_ENGINE_PLACEMENT_ROWS],
         )
         .await
         .map_err(|e| {
@@ -496,6 +503,11 @@ pub async fn get_engine_placement(pool: &Pool) -> Result<Vec<EnginePlacementRow>
             ))
         })?;
 
+    if rows.len() as i64 == MAX_ENGINE_PLACEMENT_ROWS {
+        tracing::warn!(
+            "engine_placement holds at least {MAX_ENGINE_PLACEMENT_ROWS} rows; the rest are not read"
+        );
+    }
     Ok(rows
         .iter()
         .map(|r| EnginePlacementRow {

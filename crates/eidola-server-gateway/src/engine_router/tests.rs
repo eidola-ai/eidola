@@ -129,6 +129,8 @@ enum Mode {
     UnknownEvent,
     /// Stream a role chunk, then wait for `release`.
     Hold,
+    /// Answer nothing, headers included, until `release`; then serve.
+    Stall,
 }
 
 /// One chat request as an engine received it.
@@ -337,6 +339,9 @@ async fn chat(
         body: body.to_vec(),
     });
     let mode = *state.mode.lock().unwrap();
+    if mode == Mode::Stall {
+        state.release.notified().await;
+    }
     match mode {
         Mode::Overloaded => return error(StatusCode::SERVICE_UNAVAILABLE, kind::OVERLOADED),
         Mode::Fail500 => return error(StatusCode::INTERNAL_SERVER_ERROR, kind::INTERNAL_ERROR),
@@ -705,6 +710,111 @@ async fn a_dropped_receiver_closes_the_engine_connection_without_waiting_for_out
         assert!(
             std::time::Instant::now() < deadline,
             "the engine's stream was never released"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A streaming request whose handler is dropped while the engine has not yet
+/// answered (the client went away mid-dispatch) is still settled with its
+/// final refund, and its spend leaves the live set: the dispatch and the
+/// settlement run in the request's own task.
+#[test]
+fn a_stream_whose_handler_is_dropped_before_it_opens_is_settled() {
+    // Signing a refund needs more stack than a test thread has.
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(a_stream_dropped_before_it_opens_is_settled())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn a_stream_dropped_before_it_opens_is_settled() {
+    use crate::credentials::tests::{Cache, DAY, add_key, spend};
+    use crate::credentials::verification_count;
+
+    let a = engine(Identity::of(MODEL_A)).await;
+    let router = router_for(&[&a], models());
+    router
+        .apply_placement(&[a.row(MODEL_A, DEPLOYMENT_A)])
+        .await;
+    router.probe_due().await;
+    a.set_mode(Mode::Stall);
+
+    let validated = request(MODEL_A, None, true);
+    let model = catalog_model();
+    let hold = crate::handlers::worst_case_cost(validated.request(), &model);
+    let mut keys = Cache::new();
+    let hash = add_key(&mut keys, std::time::SystemTime::now() + DAY);
+    let (act, _) = spend(&keys[&hash], 1_000_000, hold);
+    let proof = act.spend_proof.clone();
+    let state = crate::AppState::new(
+        crate::backend::Catalog::new(None, None).unwrap(),
+        Some(router),
+        crate::db::create_pool(
+            "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
+            None,
+            None,
+        )
+        .unwrap(),
+        None,
+        None,
+        [0u8; 32],
+        Arc::new(tokio::sync::RwLock::new(keys)),
+    );
+    crate::handlers::check_presented_spends(&state, std::slice::from_ref(&act))
+        .await
+        .unwrap();
+    assert_eq!(verification_count::of(&proof), 1);
+
+    let live = Arc::new(state.live_spends.serve(&act));
+    let recording = async move {
+        Ok(crate::handlers::tests::paid_inputs(
+            vec![crate::auth::ActSpend {
+                live: Some(live),
+                ..act
+            }],
+            vec![hold],
+        ))
+    };
+    let mut handler = Box::pin(crate::handlers::run_paid_request(
+        state.clone(),
+        validated,
+        Ok(crate::backend::ResolvedModel {
+            model,
+            echo: MODEL_A.to_string(),
+        }),
+        recording,
+    ));
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while a.chats().is_empty() {
+        assert!(
+            std::time::Instant::now() < until,
+            "the engine was never asked"
+        );
+        tokio::select! {
+            _ = &mut handler => panic!("answered before the engine did"),
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    // The client goes away while the engine has answered nothing.
+    drop(handler);
+    assert_eq!(verification_count::of(&proof), 1);
+    a.state.release.notify_one();
+
+    let key_id = hex::encode(hash);
+    let nullifier = proof.nullifier().as_bytes().to_vec();
+    while verification_count::of(&proof) < 2 || state.live_spends.is_live(&key_id, &nullifier) {
+        assert!(
+            std::time::Instant::now() < until,
+            "the request was never settled"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
