@@ -1,11 +1,13 @@
 //! The model catalog's source files (`models/<family>/<label>.toml` at the
-//! workspace root), parsed and checked.
+//! workspace root), parsed and checked: the one reader both the gateway's
+//! build (which compiles the catalog in and binds it to its engine pins) and
+//! the client's build (which compiles the same catalog in, to tell a user
+//! what their model choice resolves to) run, so the two cannot read a file
+//! differently.
 //!
-//! This file is compiled twice: by `build.rs` (through `#[path]`), which
-//! checks every committed catalog file and renders the catalog as Rust, and
-//! by the crate's tests, which run the same functions over fixtures. It
-//! therefore uses nothing from the crate and only dependencies that are both
-//! build- and dev-dependencies (`serde`, `toml`, `sha2`, `eidola-common`).
+//! Behind this crate's `catalog` feature, which adds `toml`, `sha2` and
+//! `serde` only to the consumers that enable it (the gateway's and the
+//! client's build scripts and tests), each of which already depends on them.
 //!
 //! # What is checked
 //!
@@ -14,12 +16,13 @@
 //! - its shape, strictly (unknown members refused at every level; TOML
 //!   itself refuses a repeated key);
 //! - `sha256` is 64 lowercase hex digits, and **equals the SHA-256 of the
-//!   canonical manifest of `files`** (`eidola_common::weights_manifest`):
-//!   every file the engine's weights hash covers is listed with its size and
+//!   canonical manifest of `files`** ([`crate::weights_manifest`]): every
+//!   file the engine's weights hash covers is listed with its size and
 //!   SHA-256, and nothing else;
 //! - `architecture` names an [`Architecture`] that is **implemented**;
-//! - every tag matches `[A-Za-z0-9._-]+` (at most 64 bytes, so never `@` or
-//!   `:`, the reference syntax's separators), and none is listed twice;
+//! - every tag is a tag ([`crate::model_reference::is_tag`]: `[A-Za-z0-9._-]+`,
+//!   at most 64 bytes, so never `@` or `:`, the reference syntax's
+//!   separators), and none is listed twice;
 //! - the source is `<owner>/<name>` at a 40-hex-digit revision;
 //! - display and capabilities are complete (a context window, a ceiling
 //!   inside it, text in and text out, no repeated modality);
@@ -30,23 +33,19 @@
 //! Across files ([`check_catalog`]): no weights hash is listed twice, and
 //! **each tag names exactly one hash**.
 //!
-//! Against the engine pins ([`check_binding`]): every row that is not
-//! retired has a pin for its hash, with the same architecture and source,
-//! every pin has such a row, and no retired row is pinned.
+//! Against the engine pins ([`check_binding`], the gateway's): every row
+//! that is not retired has a pin for its hash, with the same architecture
+//! and source, every pin has such a row, and no retired row is pinned.
 
-// Each reader uses only some items.
-#![allow(dead_code)]
-
-use eidola_common::architecture::Architecture;
-use eidola_common::weights_manifest;
+use crate::architecture::Architecture;
+use crate::weights_manifest;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 /// Where the catalog files live, relative to the workspace root.
 pub const MODELS_ROOT: &str = "models";
 
-/// The longest tag accepted.
-pub const MAX_TAG_LEN: usize = 64;
+pub use crate::model_reference::{MAX_TAG_LEN, is_tag};
 
 /// One checked catalog file.
 #[derive(Debug, Clone, PartialEq)]
@@ -162,15 +161,6 @@ struct RawLifecycle {
 
 const MODALITIES: [&str; 3] = ["text", "image", "audio"];
 const BUDGET_CLASSES: [&str; 2] = ["standard", "reasoning"];
-
-/// Whether `tag` is a tag: `[A-Za-z0-9._-]+`, at most [`MAX_TAG_LEN`] bytes.
-pub fn is_tag(tag: &str) -> bool {
-    !tag.is_empty()
-        && tag.len() <= MAX_TAG_LEN
-        && tag
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
 
 /// Whether `path` is a catalog file's path: `models/<family>/<label>.toml`,
 /// each component `[a-z0-9][a-z0-9._-]*`.

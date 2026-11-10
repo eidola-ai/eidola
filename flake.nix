@@ -228,6 +228,9 @@
           || (crateInSet "eidola-server-gateway" && isTrustRootPath)
           || (crateInSet "eidola-server-gateway" && isEngineDeployPath)
           || (crateInSet "eidola-server-gateway" && isModelCatalogPath)
+          # app-core compiles the same catalog in, to tell a user what a model
+          # choice resolves to, when a tag has moved and when weights retire.
+          || (crateInSet "eidola-app-core" && isModelCatalogPath)
           # Test fixtures and data of a crate being built: a package build
           # runs that crate's tests (`doCheck`), and the workspace checks run
           # every crate's; fixtures are rarely Rust source (the gateway's

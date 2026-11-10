@@ -1480,6 +1480,7 @@ mod driver {
             // The **wire** label (task 64); every surface shows "You".
             label: "User".into(),
             model_ref: None,
+            model_notices: Vec::new(),
             system_prompt: None,
             notify_policy: "explicit".into(),
             role: "member".into(),
@@ -1501,6 +1502,7 @@ mod driver {
             kind: "agent".into(),
             label: "Assistant".into(),
             model_ref: Some("gemma4-31b".into()),
+            model_notices: Vec::new(),
             system_prompt: Some("Be concise and cite sources.".into()),
             notify_policy: "human".into(),
             role: "member".into(),
@@ -1513,6 +1515,7 @@ mod driver {
             kind: "agent".into(),
             label: "Critic".into(),
             model_ref: Some("qwen3-8b@my-vllm".into()),
+            model_notices: Vec::new(),
             system_prompt: Some("Challenge assumptions and find weak points.".into()),
             notify_policy: "all".into(),
             role: "member".into(),

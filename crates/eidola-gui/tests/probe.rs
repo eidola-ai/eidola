@@ -3942,6 +3942,7 @@ fn probe_participants() -> (String, Vec<ParticipantInfo>) {
         // must map it back to "You" through the shared presentation rule.
         label: "User".into(),
         model_ref: None,
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "explicit".into(),
         role: "member".into(),
@@ -3963,6 +3964,7 @@ fn probe_participants() -> (String, Vec<ParticipantInfo>) {
         kind: "agent".into(),
         label: "Assistant".into(),
         model_ref: Some("gemma4-31b".into()),
+        model_notices: Vec::new(),
         system_prompt: Some("Be concise.".into()),
         notify_policy: "human".into(),
         role: "member".into(),
@@ -3978,6 +3980,68 @@ fn open_participants_inspector(
 ) -> (AnyWindowHandle, Entity<eidola_gui::space_view::SpaceView>) {
     let stores = participants_inspector_stores(cx);
     open_participants_inspector_with(cx, stores)
+}
+
+/// **A model choice's notices sit on the participant's row**, closed or
+/// open, each as a labelled line: a followed tag that moved, a pin with newer
+/// weights, a retirement announced or passed, retired weights. A notice found
+/// only by opening an editor is not given.
+#[gpui::test]
+fn space_inspector_a_participants_model_notices_are_on_its_row(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    let _guard = probes_on();
+    let (space, mut roster) = probe_participants();
+    roster[1].model_notices = vec![
+        ModelNotice::Updated {
+            tag: "gemma4-31b".into(),
+            previous_sha256: "1".repeat(64),
+            current_sha256: "2".repeat(64),
+        },
+        ModelNotice::NewerAvailable {
+            tag: "gemma4-31b".into(),
+            newer_sha256: "3".repeat(64),
+        },
+        ModelNotice::Retiring {
+            retire_after: "2027-06-01".into(),
+            past: false,
+        },
+        ModelNotice::Retiring {
+            retire_after: "2026-01-01".into(),
+            past: true,
+        },
+        ModelNotice::Retired,
+    ];
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some((space, roster));
+    });
+    let (window, _view) = open_participants_inspector_with(cx, stores);
+    let entries = fresh_entries(cx, window);
+    for (i, label) in [
+        "Model updated: gemma4-31b now names newer weights.",
+        "Newer weights are available as gemma4-31b. This agent stays on the ones it is pinned to.",
+        "These weights retire after 2027-06-01.",
+        "These weights were due to retire on 2026-01-01. Choose another model.",
+        "These weights are retired. Choose another model.",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_probe(
+            &entries,
+            &format!("space/inspector/participants/agent-1/notice/{i}"),
+            gpui::Role::Label,
+            label,
+        );
+    }
+    // A participant with nothing to be told gets no line.
+    assert!(
+        !entries.iter().any(|(n, _)| n.starts_with(&format!(
+            "space/inspector/participants/{}/notice/",
+            eidola_app_core::HUMAN_PARTICIPANT_ID
+        ))),
+        "the human has no model and no notice"
+    );
 }
 
 /// **A notebook's owner carries no Remove** (task 36; Codex review, PR #279).
@@ -7759,6 +7823,7 @@ fn a_room_the_reader_only_watches_offers_no_regenerate(cx: &mut TestAppContext) 
         kind: "agent".into(),
         label: "Surveyor".into(),
         model_ref: Some("gemma4-31b".into()),
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "all".into(),
         role: "member".into(),
@@ -7841,6 +7906,7 @@ fn a_room_the_reader_belongs_to_keeps_its_verbs(cx: &mut TestAppContext) {
             kind: "human".into(),
             label: "User".into(),
             model_ref: None,
+            model_notices: Vec::new(),
             system_prompt: None,
             notify_policy: "explicit".into(),
             role: "owner".into(),
@@ -7853,6 +7919,7 @@ fn a_room_the_reader_belongs_to_keeps_its_verbs(cx: &mut TestAppContext) {
             kind: "agent".into(),
             label: "Surveyor".into(),
             model_ref: Some("gemma4-31b".into()),
+            model_notices: Vec::new(),
             system_prompt: None,
             notify_policy: "all".into(),
             role: "member".into(),
@@ -7969,6 +8036,7 @@ fn the_acting_gate_converges_and_its_interim_withholds(cx: &mut TestAppContext) 
                     kind: "agent".into(),
                     label: "Surveyor".into(),
                     model_ref: Some("gemma4-31b".into()),
+                    model_notices: Vec::new(),
                     system_prompt: None,
                     notify_policy: "all".into(),
                     role: "member".into(),
@@ -8181,6 +8249,7 @@ fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
         kind: "agent".into(),
         label: "Surveyor".into(),
         model_ref: Some("gemma4-31b".into()),
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "all".into(),
         role: "member".into(),
@@ -8256,6 +8325,7 @@ fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
                 kind: "human".into(),
                 label: "User".into(),
                 model_ref: None,
+                model_notices: Vec::new(),
                 system_prompt: None,
                 notify_policy: "explicit".into(),
                 role: "owner".into(),

@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 17;
+const LATEST_VERSION: i64 = 18;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -6417,6 +6417,65 @@ async fn edit_post_tx_body(conn: &Connection, plan: &EditPostPlan<'_>) -> Result
     Ok(())
 }
 
+/// Record the weights hash the Eidola gateway answered `action_id` with
+/// (`action.model_sha256`): the hash the turn's model reference resolved to.
+/// Written in the same transaction as the action itself; `None` writes
+/// nothing, so a backend without weights hashes leaves the column NULL.
+pub async fn set_action_model_sha256(
+    conn: &Connection,
+    action_id: &str,
+    sha256: Option<&str>,
+) -> Result<(), AppError> {
+    let Some(sha256) = sha256 else {
+        return Ok(());
+    };
+    conn.execute(
+        "UPDATE action SET model_sha256 = ?1 WHERE id = ?2",
+        (
+            Value::Text(sha256.to_string()),
+            Value::Text(action_id.to_string()),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to record the action's weights hash: {e}"),
+    })?;
+    Ok(())
+}
+
+/// The weights hash the last answer of `participant_id` in `space_id` under
+/// model selection `model` (canonical) came from, if any did: what a
+/// followed tag last resolved to, which the "model updated" notice compares
+/// with what it resolves to now.
+pub async fn last_model_sha256(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    model: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT model_sha256 FROM action \
+             WHERE space_id = ?1 AND participant_id = ?2 AND model = ?3 \
+               AND model_sha256 IS NOT NULL \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+            Value::Text(model.to_string()),
+        ))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<Option<String>>(0).map_err(AppError::db),
+        None => Ok(None),
+    }
+}
+
 pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO action (id, space_id, participant_id, participant_scope, item_id, \
@@ -7420,6 +7479,8 @@ pub struct RawActionRow {
     pub participant_scope: String,
     pub status: String,
     pub model: Option<String>,
+    /// The weights hash the action's Eidola model reference resolved to.
+    pub model_sha256: Option<String>,
     pub credits_consumed: Option<i64>,
     pub reply_to: Option<String>,
     pub blocks: Vec<RawBlockRow>,
@@ -7445,7 +7506,7 @@ pub async fn raw_space_actions(
             "SELECT a.id, a.action_type, a.status, a.model, a.credits_consumed, \
                     (SELECT aa.antecedent_action_id FROM action_antecedent aa \
                       WHERE aa.action_id = a.id AND aa.relation = 'reply'), \
-                    a.participant_id, a.participant_scope \
+                    a.participant_id, a.participant_scope, a.model_sha256 \
              FROM action a WHERE a.space_id = ?1 ORDER BY a.created_at ASC, a.id ASC",
         )
         .await
@@ -7465,6 +7526,7 @@ pub async fn raw_space_actions(
             reply_to: row.get::<Option<String>>(5).map_err(AppError::db)?,
             participant_id: row.get::<String>(6).map_err(AppError::db)?,
             participant_scope: row.get::<String>(7).map_err(AppError::db)?,
+            model_sha256: row.get::<Option<String>>(8).map_err(AppError::db)?,
             blocks: Vec::new(),
         });
     }

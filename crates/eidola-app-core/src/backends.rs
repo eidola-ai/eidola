@@ -39,7 +39,11 @@
 //! means `gemma4-31b@eidola`, and [`qualified_model_id`] keeps the bare
 //! form canonical so the common case reads clean everywhere (config,
 //! action rows, the CLI). Every other backend — the local singleton
-//! included — always spells its models qualified (`<slug>@local`).
+//! included — always spells its models qualified (`<slug>@local`). An Eidola
+//! model reference may carry a digest (`tag@sha256:<hex>`, a pin; see
+//! `model_catalog`), which holds an `@` of its own: [`parse_model_ref`] never
+//! reads a digest as a backend id, and [`qualified_model_id`] always spells a
+//! pin qualified, `tag@sha256:<hex>@eidola`.
 //!
 //! ## Forensics
 //!
@@ -155,11 +159,20 @@ pub struct ModelRef {
 /// `@`; a bare selection routes to `eidola` (the default backend's sugar).
 /// Pure and infallible — whether the backend *exists* is the router's
 /// question, not the parser's.
+///
+/// **A digest is never a backend.** An Eidola pin, `tag@sha256:<hex>`, holds
+/// an `@` of its own; what follows the last `@` there starts with the digest
+/// prefix, which no backend id can (backend ids are `[a-z0-9-]`), so a
+/// selection whose tail is a digest is an Eidola model whole. Qualified,
+/// `tag@sha256:<hex>@eidola`, the last `@` is the backend's as usual.
 pub fn parse_model_ref(selection: &str) -> ModelRef {
     if let Some(at) = selection.rfind('@') {
         let (model, backend) = selection.split_at(at);
         let backend = &backend[1..];
-        if !model.is_empty() && !backend.is_empty() {
+        if !model.is_empty()
+            && !backend.is_empty()
+            && !backend.starts_with(eidola_common::model_reference::DIGEST_PREFIX)
+        {
             return ModelRef {
                 backend_id: backend.to_string(),
                 model: model.to_string(),
@@ -174,9 +187,12 @@ pub fn parse_model_ref(selection: &str) -> ModelRef {
 
 /// The canonical selection string for a (model, backend) pair — the inverse
 /// of [`parse_model_ref`]. Eidola models stay bare (the default backend's
-/// sugar); every other backend's models are spelled qualified.
+/// sugar) unless they carry an `@` of their own: a pin, `tag@sha256:<hex>`,
+/// is always spelled qualified, `tag@sha256:<hex>@eidola`, so no reader of the
+/// selection has to know the digest rule to split it. Every other backend's
+/// models are spelled qualified.
 pub fn qualified_model_id(model: &str, backend_id: &str) -> String {
-    if backend_id == EIDOLA_BACKEND_ID {
+    if backend_id == EIDOLA_BACKEND_ID && !model.contains('@') {
         model.to_string()
     } else {
         format!("{model}@{backend_id}")
@@ -919,29 +935,44 @@ mod tests {
         );
     }
 
-    /// The gateway's pinned reference, `tag@sha256:<hex>`, survives the
-    /// split when qualified with its backend: backend ids hold no `:`, so the
-    /// last `@` is the backend's. Bare, the digest reads as a backend id,
-    /// which `validate_backend_id` refuses to create, so such a selection is
-    /// spelled qualified.
+    /// Every spelling of an Eidola digest reference parses to the eidola
+    /// backend and the whole reference, and a pin's canonical spelling is
+    /// qualified: a digest is never read as a backend id.
     #[test]
-    fn a_pinned_gateway_reference_parses_when_qualified() {
-        let pinned = format!("mimo-v2.6-flash@sha256:{}", "a".repeat(64));
+    fn a_digest_reference_is_never_split_as_a_backend() {
+        let hash = "a".repeat(64);
+        let pinned = format!("mimo-v2.6-flash@sha256:{hash}");
+        let unlabelled = format!("sha256:{hash}");
+        for (selection, model) in [
+            (format!("{pinned}@eidola"), pinned.clone()),
+            (pinned.clone(), pinned.clone()),
+            (unlabelled.clone(), unlabelled.clone()),
+            (format!("{unlabelled}@eidola"), unlabelled.clone()),
+        ] {
+            assert_eq!(
+                parse_model_ref(&selection),
+                ModelRef {
+                    backend_id: "eidola".into(),
+                    model
+                },
+                "{selection}"
+            );
+        }
         assert_eq!(
-            parse_model_ref(&format!("{pinned}@eidola")),
-            ModelRef {
-                backend_id: "eidola".into(),
-                model: pinned.clone()
-            }
+            qualified_model_id(&pinned, "eidola"),
+            format!("{pinned}@eidola")
         );
-        let bare = parse_model_ref(&pinned);
-        assert_eq!(bare.model, "mimo-v2.6-flash");
-        assert!(validate_backend_id(&bare.backend_id).is_err());
-        // The id the gateway lists a model under holds no `@`.
+        assert_eq!(qualified_model_id(&unlabelled, "eidola"), unlabelled);
         assert_eq!(
-            parse_model_ref(&format!("sha256:{}", "a".repeat(64))).backend_id,
-            "eidola"
+            qualified_model_id("mimo-v2.6-flash", "eidola"),
+            "mimo-v2.6-flash"
         );
+        for model in [pinned, unlabelled, "mimo-v2.6-flash".to_string()] {
+            let q = qualified_model_id(&model, "eidola");
+            assert_eq!(parse_model_ref(&q).model, model, "{q}");
+        }
+        // No backend id can begin with the digest prefix.
+        assert!(validate_backend_id("sha256:x").is_err());
     }
 
     #[test]

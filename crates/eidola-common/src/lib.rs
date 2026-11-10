@@ -129,6 +129,9 @@ pub mod embed;
 pub mod engine_deployment;
 pub mod engine_protocol;
 pub mod issuer_calendar;
+#[cfg(feature = "catalog")]
+pub mod model_catalog;
+pub mod model_reference;
 #[cfg(feature = "private-token")]
 pub mod private_token;
 pub mod refund_key;

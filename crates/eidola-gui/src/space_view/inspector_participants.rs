@@ -1547,7 +1547,28 @@ impl SpaceView {
                     )
                     .when_some(detail, |el, detail| {
                         el.child(div().text_xs().text_color(muted).truncate().child(detail))
-                    }),
+                    })
+                    // What the user should know about the model choice — an
+                    // updated tag, a newer model for a pin, a retirement — on
+                    // the row itself, open or closed: a notice found only by
+                    // opening the editor is not given.
+                    .children(p.model_notices.iter().enumerate().map(|(i, notice)| {
+                        let text = crate::participants::model_notice_text(notice, cx);
+                        div()
+                            .id(SharedString::from(format!(
+                                "space-inspector-p-{pid}-notice-{i}"
+                            )))
+                            .probe(
+                                SharedString::from(format!(
+                                    "space/inspector/participants/{pid}/notice/{i}"
+                                )),
+                                gpui::Role::Label,
+                                text.clone(),
+                            )
+                            .text_xs()
+                            .text_color(theme.warning)
+                            .child(text)
+                    })),
             )
             // The chevron says the row opens; its state is on the row's own node
             // (`aria_expanded`), so this is decoration.

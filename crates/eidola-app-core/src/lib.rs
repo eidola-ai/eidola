@@ -8,6 +8,7 @@ pub mod error;
 pub mod ipc;
 pub mod local_models;
 pub mod memory;
+pub mod model_catalog;
 mod peer_read;
 mod prefix_cache;
 pub mod proxy;
@@ -170,6 +171,10 @@ pub struct ParticipantInfo {
     pub kind: String,
     pub label: String,
     pub model_ref: Option<String>,
+    /// What the user should be told about `model_ref` in this space
+    /// (`model_catalog::notices`): filled by `list_space_participants` for an
+    /// Eidola model, empty everywhere else.
+    pub model_notices: Vec<model_catalog::ModelNotice>,
     pub system_prompt: Option<String>,
     pub notify_policy: String,
     /// `owner`/`member`/`observer`.
@@ -211,6 +216,7 @@ impl ParticipantInfo {
             kind: r.kind,
             label: r.label,
             model_ref: r.model_ref,
+            model_notices: Vec::new(),
             system_prompt: r.system_prompt,
             notify_policy: r.notify_policy,
             role: r.role,
@@ -226,6 +232,7 @@ impl ParticipantInfo {
             kind: r.kind,
             label: r.label,
             model_ref: r.model_ref,
+            model_notices: Vec::new(),
             system_prompt: r.system_prompt,
             notify_policy: r.notify_policy,
             role: r.role,
@@ -4985,6 +4992,14 @@ impl Inner {
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let mut info = ParticipantInfo::from_effective(r);
+            info.model_notices = model_notices_for(
+                &conn,
+                space_id,
+                &info.id,
+                info.model_ref.as_deref(),
+                model_catalog::CATALOG,
+            )
+            .await?;
             if info.source == "referenced"
                 && let Some(base) = db::get_participant(&conn, &info.id).await?
             {
@@ -6855,10 +6870,17 @@ impl Inner {
         // the two coincide there (as they do for eidola, where canonical is
         // the bare model); openai backends get the bare model.
         let canonical_model = backends::qualified_model_id(&mref.model, &backend.id);
-        let wire_model = match backend_kind {
-            BackendKind::OpenAi => mref.model.clone(),
+        // An Eidola model reference goes on the wire bare, without its
+        // `@eidola` qualifier: a pin's canonical spelling is qualified
+        // (`qualified_model_id`), and the gateway resolves the reference
+        // alone.
+        let mut wire_model = match backend_kind {
+            BackendKind::OpenAi | BackendKind::Eidola => mref.model.clone(),
             _ => canonical_model.clone(),
         };
+        // The weights hash an Eidola turn resolved to, recorded on the
+        // actions it writes (`action.model_sha256`).
+        let mut resolved_sha256: Option<String> = None;
         let model = canonical_model.as_str();
 
         // **A continuation is asked of the model that wrote what it continues,
@@ -7011,13 +7033,24 @@ impl Inner {
                 // the only thing worse than this failure is quietly answering
                 // with a different model. See [`AppError::ModelUnavailable`].
                 let model_entry =
-                    models
-                        .data
-                        .iter()
-                        .find(|m| m.id == wire_model)
-                        .ok_or_else(|| AppError::ModelUnavailable {
+                    find_catalog_entry(&models.data, &wire_model).ok_or_else(|| {
+                        AppError::ModelUnavailable {
                             model: model.to_string(),
-                        })?;
+                        }
+                    })?;
+                // **Every request of the turn names the weights the turn
+                // resolved to.** A followed tag is pinned here to the hash the
+                // catalog gives it now, so a tool round or continuation later
+                // in the turn cannot land on other weights if a release moves
+                // the tag mid-turn; a pin stays the pin it was.
+                if let Some(sha256) = model_entry.sha256.as_deref()
+                    && eidola_common::model_reference::is_digest_hex(sha256)
+                    && let Ok(reference) =
+                        eidola_common::model_reference::ModelReference::parse(&wire_model)
+                {
+                    wire_model = eidola_common::model_reference::pinned(reference.tag(), sha256);
+                    resolved_sha256 = Some(sha256.to_string());
+                }
                 let pricing = ChargePricing::from_catalog(&model_entry.pricing);
                 // Whose catalog is this? Declarations are acted on only when
                 // the client is talking to the trust root it was built with:
@@ -7814,6 +7847,7 @@ impl Inner {
             space_id,
             model: model.to_string(),
             wire_model,
+            resolved_sha256,
             model_participant_id,
             max_completion_tokens,
             continuation,
@@ -13584,6 +13618,27 @@ struct ModelsResponseInfo {
     data: Vec<ModelListEntry>,
 }
 
+/// The catalog row a model reference names, as the Eidola gateway resolves
+/// it (`eidola_common::model_reference`): a reference carrying a digest
+/// names the row with that weights hash, whatever its tag says; a bare tag
+/// names the row listing it (or listed under it). A string that is no
+/// reference matches a row's id exactly, as every other catalog is read.
+pub(crate) fn find_catalog_entry<'a>(
+    models: &'a [ModelListEntry],
+    reference: &str,
+) -> Option<&'a ModelListEntry> {
+    use eidola_common::model_reference::ModelReference;
+    match ModelReference::parse(reference) {
+        Ok(parsed) => match parsed.digest() {
+            Some(sha256) => models.iter().find(|m| m.sha256.as_deref() == Some(sha256)),
+            None => models
+                .iter()
+                .find(|m| m.id == reference || m.tags.iter().any(|t| t == reference)),
+        },
+        Err(_) => models.iter().find(|m| m.id == reference),
+    }
+}
+
 /// One row of `GET /v1/models`, parsed **leniently on purpose**.
 ///
 /// Every field beyond the three the client cannot work without carries
@@ -13593,8 +13648,15 @@ struct ModelsResponseInfo {
 /// a leaf, or ships a capability object this build has never heard of must
 /// degrade to "undeclared" rather than take every conversation down with it.
 #[derive(Deserialize)]
-struct ModelListEntry {
-    id: String,
+pub(crate) struct ModelListEntry {
+    pub(crate) id: String,
+    /// The model's weights hash (`docs/model-identity.md`), when the catalog
+    /// publishes one.
+    #[serde(default)]
+    sha256: Option<String>,
+    /// Every tag that resolves to `sha256`.
+    #[serde(default)]
+    tags: Vec<String>,
     context_length: u64,
     #[serde(default)]
     max_output_tokens: Option<u64>,
@@ -13855,8 +13917,14 @@ struct TurnPrep {
     /// actions, shown in UIs, returned in `ChatResult`.
     model: String,
     /// The model id the backend's HTTP API expects in the request body.
-    /// Equals `model` except for openai backends (bare wire model).
+    /// Equals `model` except for openai backends (bare wire model) and
+    /// Eidola references, which go bare and, once the catalog has resolved
+    /// them, pinned to the weights hash (`tag@sha256:<hex>`), so every round
+    /// of the turn names the same weights.
     wire_model: String,
+    /// The weights hash an Eidola turn resolved to; `None` for every other
+    /// backend, and for a catalog that does not publish hashes.
+    resolved_sha256: Option<String>,
     /// The acting agent participant. Deliberately **no** scope alongside it:
     /// a turn spans HTTP round trips, and task 36's promotion can flip that
     /// scope mid-flight — so the pinned echo is derived from this id inside
@@ -14426,6 +14494,8 @@ impl TurnPrep {
             },
         )
         .await?;
+        db::set_action_model_sha256(&self.db_conn, &action_id, self.resolved_sha256.as_deref())
+            .await?;
         if let Some(ref ante) = self.trace_reply_to {
             db::insert_action_antecedent(&self.db_conn, &action_id, ante, 0, "reply").await?;
         }
@@ -14867,6 +14937,12 @@ impl TurnPrep {
                 resumable: truncated && resumable,
                 created_at: now_ms(),
             },
+        )
+        .await?;
+        db::set_action_model_sha256(
+            &self.db_conn,
+            &inference_action_id,
+            self.resolved_sha256.as_deref(),
         )
         .await?;
         if let Some(ref ante) = self.inf_reply_to {
@@ -16355,6 +16431,59 @@ pub fn post_stamp(created_at_ms: i64) -> String {
         (sod / 60) % 60,
         sod % 60
     )
+}
+
+/// What the user should be told about `selection`, the model choice of
+/// `participant_id` in `space_id` (`model_catalog::notices`), from `catalog`:
+/// a followed tag that now names other weights than the participant's last
+/// answer there came from (`action.model_sha256`), a pin whose tag has moved
+/// on, weights that are deprecated or retired. Empty for a choice on any
+/// other backend, and for no choice. Reads only the local database.
+async fn model_notices_for(
+    conn: &turso::Connection,
+    space_id: &str,
+    participant_id: &str,
+    selection: Option<&str>,
+    catalog: &[model_catalog::CatalogRow],
+) -> Result<Vec<model_catalog::ModelNotice>, AppError> {
+    let Some(selection) = selection.filter(|m| !m.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let mref = backends::parse_model_ref(selection);
+    if mref.backend_id != backends::EIDOLA_BACKEND_ID {
+        return Ok(Vec::new());
+    }
+    let canonical = backends::qualified_model_id(&mref.model, &mref.backend_id);
+    let last = db::last_model_sha256(conn, space_id, participant_id, &canonical).await?;
+    let today = &post_stamp(now_ms())[..10];
+    Ok(model_catalog::notices(
+        catalog,
+        &mref.model,
+        last.as_deref(),
+        today,
+    ))
+}
+
+/// The identity of the Eidola model a selection names
+/// (`model_catalog::identity`): its weights hash, tags, source repository and
+/// revision, per-file manifest and lifecycle, with the page that says how to
+/// check them independently. `None` for a selection on another backend, or
+/// one this build's catalog does not know. A pure function of the catalog
+/// compiled into this build.
+pub fn model_identity(selection: &str) -> Option<model_catalog::ModelIdentity> {
+    model_identity_in(model_catalog::CATALOG, selection)
+}
+
+/// The identity of the Eidola model `selection` names in `catalog`.
+fn model_identity_in(
+    catalog: &[model_catalog::CatalogRow],
+    selection: &str,
+) -> Option<model_catalog::ModelIdentity> {
+    let mref = backends::parse_model_ref(selection);
+    if mref.backend_id != backends::EIDOLA_BACKEND_ID {
+        return None;
+    }
+    model_catalog::identity(catalog, &mref.model)
 }
 
 /// Days since the Unix epoch → `(year, month, day)` in the proleptic Gregorian
