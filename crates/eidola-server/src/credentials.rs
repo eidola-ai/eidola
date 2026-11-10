@@ -753,20 +753,10 @@ pub async fn recover_refund(
         })
     };
 
-    // What a recorded spend's row answers with. A settled token is final. A
-    // provisional one is the chat path's zero refund from before dispatch:
-    // final only once nothing can still settle the spend — while this
-    // process has a handler or stream task for it (`state.settling`), the
-    // settled token is still coming, and a client recovering now would spend
-    // its one successor on the full hold. A row without a token predates
-    // provisional refunds and can never be served.
-    //
-    // The mark is checked **before** the row is read, every time. Settlement
-    // stores the settled token and only then releases the mark, so a mark
-    // seen absent means any settlement has already landed and the read that
-    // follows sees it. Read first, the row could be the provisional one
-    // while the settled UPDATE commits and the mark drops before the check —
-    // and the zero refund already in hand would be served.
+    // A recorded spend's row answers through `recorded_refund`, which reads
+    // the row, checks the settling mark and re-reads: see its doc for why
+    // each step is where it is. A row without a token predates provisional
+    // refunds and can never be served.
     let still_in_flight = || {
         Err(ServerError::NotFound {
             message: "nullifier recorded but refund token not yet available — \
@@ -774,22 +764,12 @@ pub async fn recover_refund(
                 .to_string(),
         })
     };
-    let serve_recorded = |stored: db::StoredRefund, key_id: String| match stored {
-        db::StoredRefund {
-            refund_token: Some(refund_cbor),
-            standing: db::RefundStanding::Settled | db::RefundStanding::Provisional,
-        } => Ok(answer(&refund_cbor, key_id)),
-        db::StoredRefund {
-            refund_token: None, ..
-        } => still_in_flight(),
-    };
 
     // Check if the nullifier was already recorded (original request arrived).
-    if state.settling.is_settling(&key_id, &nullifier_bytes) {
-        return still_in_flight();
-    }
-    if let Some(stored) = db::get_refund_token(&state.db_pool, &key_id, &nullifier_bytes).await? {
-        return serve_recorded(stored, key_id);
+    match recorded_refund(&state, &key_id, &nullifier_bytes).await? {
+        Recorded::Token(refund_cbor) => return Ok(answer(&refund_cbor, key_id)),
+        Recorded::InFlight => return still_in_flight(),
+        Recorded::Absent => {}
     }
 
     // The nullifier doesn't exist: the original request never arrived.
@@ -826,14 +806,77 @@ pub async fn recover_refund(
     }
 
     // Recorded by someone else meanwhile: a concurrent recovery (settled) or
-    // the chat path (provisional, and in flight in this process). Mark
-    // first, then the row, as above.
-    if state.settling.is_settling(&key_id, &nullifier_bytes) {
-        return still_in_flight();
+    // the chat path (provisional, and in flight in this process).
+    match recorded_refund(&state, &key_id, &nullifier_bytes).await? {
+        Recorded::Token(refund_cbor) => Ok(answer(&refund_cbor, key_id)),
+        Recorded::InFlight | Recorded::Absent => still_in_flight(),
     }
-    match db::get_refund_token(&state.db_pool, &key_id, &nullifier_bytes).await? {
-        Some(stored) => serve_recorded(stored, key_id),
-        None => still_in_flight(),
+}
+
+/// What a recorded spend answers recovery with.
+enum Recorded {
+    /// No row: the original request never arrived.
+    Absent,
+    /// This process can still settle the spend (or the row predates
+    /// provisional refunds): "retry shortly".
+    InFlight,
+    /// A token that is final — the settlement, or a provisional refund
+    /// nothing can still replace.
+    Token(Vec<u8>),
+}
+
+/// Read the spend's row, and decide whether its token may be served.
+///
+/// A settled token is final. A provisional one is the chat path's zero
+/// refund from before dispatch, final only once nothing can still settle
+/// the spend — while this process holds the settling mark for it, the
+/// settled token is still coming, and a client handed the provisional one
+/// would spend its one successor on the full hold. The three steps, in this
+/// order, cover both sides of the mark's lifetime:
+///
+/// 1. **Read the row.** A row that exists was written by a chat that took
+///    its mark *before* the INSERT, so the check that follows observes that
+///    mark. (Checking before the read would miss a chat that began and
+///    inserted in between.)
+/// 2. **Check the mark.** Held: in flight. Absent: nothing in this process
+///    can still settle the spend — but a settlement may have stored its token
+///    and released between the read and this check, so:
+/// 3. **Re-read the row.** Settlement stores the token before it releases the
+///    mark, so a mark seen absent means this read sees the settled token if
+///    there is one; otherwise the provisional token stands.
+async fn recorded_refund(
+    state: &AppState,
+    key_id: &str,
+    nullifier: &[u8],
+) -> Result<Recorded, ServerError> {
+    let Some(stored) = db::get_refund_token(&state.db_pool, key_id, nullifier).await? else {
+        return Ok(Recorded::Absent);
+    };
+    match stored {
+        db::StoredRefund {
+            refund_token: Some(refund_cbor),
+            standing: db::RefundStanding::Settled,
+        } => Ok(Recorded::Token(refund_cbor)),
+        db::StoredRefund {
+            refund_token: Some(provisional),
+            standing: db::RefundStanding::Provisional,
+        } => {
+            if state.settling.is_settling(key_id, nullifier) {
+                return Ok(Recorded::InFlight);
+            }
+            Ok(
+                match db::get_refund_token(&state.db_pool, key_id, nullifier).await? {
+                    Some(db::StoredRefund {
+                        refund_token: Some(latest),
+                        ..
+                    }) => Recorded::Token(latest),
+                    _ => Recorded::Token(provisional),
+                },
+            )
+        }
+        db::StoredRefund {
+            refund_token: None, ..
+        } => Ok(Recorded::InFlight),
     }
 }
 
