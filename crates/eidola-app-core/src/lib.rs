@@ -13316,7 +13316,8 @@ impl AppCore {
     /// when it is a shared agent (the switch is a decision about this
     /// conversation, never every space the agent is in). Refused with
     /// [`AppError::ModelNoticeStale`] when the participant has no such notice
-    /// any more. Emits [`Change::Participants`]. Returns the new selection.
+    /// any more, or its model changed after the notice was read. Emits
+    /// [`Change::Participants`]. Returns the new selection.
     pub async fn switch_to_newer_weights(
         &self,
         space_id: String,
