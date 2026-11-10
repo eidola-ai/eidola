@@ -45,6 +45,32 @@ pub const CACHE_KEY_TEXT_LEN: usize = (CACHE_KEY_BYTES * 8).div_ceil(6);
 /// deployment's host-memory check counts it.
 pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
+/// The most a gateway's forwarded body can exceed the client's body it was
+/// made from, in bytes. The gateway re-emits the body compactly with every
+/// scalar re-spelled as `serde_json` writes it: a string never grows (an
+/// escape `serde_json` writes is one the input had to spell at least as
+/// long), and a number grows to at most [`RESPELLED_NUMBER_BYTES`], so the
+/// growth is bounded by the value count; the members the gateway writes
+/// itself (the model's hash, the completion ceiling, `stream_options`) fit in
+/// the slack.
+pub const FORWARDED_BODY_GROWTH_BYTES: usize = 8 * 1024 * 1024;
+
+/// The longest text `serde_json` writes for a number: an `f64` in its
+/// shortest round-trip form (`-1.2345678901234567e-300`).
+pub const RESPELLED_NUMBER_BYTES: usize = 24;
+
+const _: () = assert!(
+    MAX_REQUEST_JSON_VALUES * RESPELLED_NUMBER_BYTES + 64 * 1024 <= FORWARDED_BODY_GROWTH_BYTES
+);
+
+/// Largest request body the gateway reads from a client, in bytes: the node's
+/// [`MAX_REQUEST_BODY_BYTES`] less [`FORWARDED_BODY_GROWTH_BYTES`], so a body
+/// the gateway accepts is never one a node refuses for its size. At 24 MiB it
+/// holds a prompt that fills the largest context an architecture declares
+/// (2^20 positions) at 24 bytes of JSON a token.
+pub const GATEWAY_MAX_REQUEST_BODY_BYTES: usize =
+    MAX_REQUEST_BODY_BYTES - FORWARDED_BODY_GROWTH_BYTES;
+
 /// The request header carrying the weights hash a gateway expects a node to
 /// serve: the node's weights hash, 64 hex digits. Header names are
 /// case-insensitive; this is the lowercase spelling both sides use.
@@ -109,7 +135,9 @@ impl core::fmt::Display for JsonShapeError {
 /// Validate `body` as one JSON text and count its values and depth, refusing
 /// as soon as either limit is passed. It allocates nothing and does not
 /// recurse, so a hostile body costs only the scan: every parse that follows
-/// (and allocates per value) sees a body within both limits.
+/// (and allocates per value) sees a body within both limits. That holds for a
+/// body refused as [`JsonShapeError::Malformed`] too: the scan counts as it
+/// goes, so what precedes the fault is within both limits.
 ///
 /// Strict RFC 8259, as `serde_json` is: no comments, no trailing commas, no
 /// leading zeros, whitespace only between tokens. A `\uXXXX` escape is
@@ -117,9 +145,6 @@ impl core::fmt::Display for JsonShapeError {
 /// for the parsers that follow to refuse.
 pub fn check_request_json(body: &[u8]) -> Result<JsonShape, JsonShapeError> {
     use JsonShapeError::{Malformed, TooDeep, TooManyValues};
-    if core::str::from_utf8(body).is_err() {
-        return Err(Malformed);
-    }
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Need {
         Value,
@@ -149,7 +174,10 @@ pub fn check_request_json(body: &[u8]) -> Result<JsonShape, JsonShapeError> {
             i += 1;
         }
         let Some(&b) = body.get(i) else {
-            return if need == Need::AfterValue && depth == 0 {
+            // UTF-8 is checked last: the scan reads bytes, so a body past a
+            // limit is refused for it whatever its strings hold, and a body
+            // that is not UTF-8 goes on to the parsers within both limits.
+            return if need == Need::AfterValue && depth == 0 && core::str::from_utf8(body).is_ok() {
                 Ok(JsonShape {
                     values,
                     depth: deepest,
@@ -945,6 +973,17 @@ mod tests {
             check_request_json(over.as_bytes()),
             Err(JsonShapeError::TooManyValues)
         );
+        // The limits come before the encoding: a body past the cap is refused
+        // for it even when a string in it is not UTF-8, so no parser that
+        // allocates per value ever reads it.
+        let mut hostile = over.clone().into_bytes();
+        let end = hostile.len() - 1;
+        hostile.splice(end..end, *b",\"\xff\"");
+        assert_eq!(
+            check_request_json(&hostile),
+            Err(JsonShapeError::TooManyValues)
+        );
+
         // Keys count: an object of n members is 2n + 1 values.
         let n = MAX_REQUEST_JSON_VALUES / 2;
         let keys = format!("{{{}}}", vec!["\"\":0"; n].join(","));

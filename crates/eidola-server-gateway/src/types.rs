@@ -870,9 +870,9 @@ pub struct ModelCapabilities {
 pub struct ModelPricing {
     pub per_prompt_token: ScaledPrice,
     pub per_completion_token: ScaledPrice,
-    /// Per-request pricing (for models like Whisper or TTS that charge per request
-    /// rather than per token). When present, `per_prompt_token` and
-    /// `per_completion_token` are zero.
+    /// Per-request pricing, for a model that charges per request rather than
+    /// per token. When present, `per_prompt_token` and `per_completion_token`
+    /// are zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_request: Option<ScaledPrice>,
 }

@@ -413,10 +413,13 @@ fn chunk(r: &ResponseMeta, choices: Value, usage: Option<Value>) -> Event {
 ///
 /// With `include_usage`, the role chunk and every delta chunk also carry the running
 /// `usage` (the prompt, and the completion tokens decoded so far, held-back text
-/// included): the gateway, which bills, keeps the last count it received, so a
-/// request it cuts short (its client went away, or it reached its deadline) is
-/// charged for what was generated rather than for nothing or for everything. The
-/// gateway forwards only the final usage chunk to its client.
+/// included), and a step that moved the count while giving out no delta (a tool call
+/// still being read, a held stop prefix or partial tag, a skipped special token) sends
+/// a chunk with an empty delta carrying the count alone: the gateway, which bills,
+/// keeps the last count it received, so a request it cuts short (its client went
+/// away, or it reached its deadline) is charged for what was generated rather than
+/// for nothing or for everything. The gateway forwards only the final usage chunk to
+/// its client, and never a chunk that carries the count alone.
 fn stream_response(run: Run, decoder: Decoder, include_usage: bool) -> Response {
     struct S {
         run: Run,
@@ -424,11 +427,14 @@ fn stream_response(run: Run, decoder: Decoder, include_usage: bool) -> Response 
         started: bool,
         finished: bool,
         include_usage: bool,
+        /// The completion count the last chunk sent carried.
+        reported: u32,
     }
     impl S {
         /// The running `usage`, when the request asked for usage.
-        fn running_usage(&self) -> Option<Value> {
+        fn running_usage(&mut self) -> Option<Value> {
             self.include_usage.then(|| {
+                self.reported = self.decoder.completion_tokens();
                 usage(
                     self.run.response.prompt_tokens,
                     self.decoder.completion_tokens(),
@@ -443,6 +449,7 @@ fn stream_response(run: Run, decoder: Decoder, include_usage: bool) -> Response 
         started: false,
         finished: false,
         include_usage,
+        reported: 0,
     };
     let events = stream::unfold(state, |mut s| async move {
         if s.finished {
@@ -467,6 +474,17 @@ fn stream_response(run: Run, decoder: Decoder, include_usage: bool) -> Response 
                     out.push(chunk(
                         &s.run.response,
                         json!([{"index": 0, "delta": step.delta.to_openai_delta(), "finish_reason": null}]),
+                        running,
+                    ));
+                } else if step.finish.is_none()
+                    && s.include_usage
+                    && s.decoder.completion_tokens() != s.reported
+                {
+                    // The count moved and nothing was given out: the count alone.
+                    let running = s.running_usage();
+                    out.push(chunk(
+                        &s.run.response,
+                        json!([{"index": 0, "delta": {}, "finish_reason": null}]),
                         running,
                     ));
                 }

@@ -126,16 +126,18 @@ pub struct TransportInfo {
 /// Verification metadata with cryptographic attestations for the proxy and backend.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct VerificationMetadata {
-    /// Proxy attestation (None until the proxy runs in a TEE).
+    /// Proxy attestation. Always absent: the gateway's enclave is attested
+    /// to the client on every TLS handshake, not in the response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyAttestation>,
 
-    /// Backend attestation (only for TEE-backed models like phala/*).
+    /// Backend attestation. Always absent: the gateway attests each engine
+    /// on its own connection to it and relays no per-response evidence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend: Option<BackendAttestation>,
 }
 
-/// Proxy attestation (placeholder for future TEE deployment).
+/// Proxy attestation. No response carries one.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ProxyAttestation {
     /// Current attestation status.
@@ -146,19 +148,20 @@ pub struct ProxyAttestation {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AttestationStatus {
-    /// Attestation is not yet available (proxy not in TEE).
+    /// No attestation is carried.
     Unavailable,
     /// Attestation is present and verified.
     Verified,
 }
 
-/// Backend attestation from the inference provider.
+/// A per-response attestation from the inference backend. No response
+/// carries one: Eidola's engines are attested at the connection.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BackendAttestation {
-    /// The provider that issued the attestation (e.g., "redpill").
+    /// The provider that issued the attestation.
     pub provider: String,
 
-    /// The signing address (e.g., Ethereum address for Phala/RedPill).
+    /// The signing address.
     pub signing_address: String,
 
     /// The ECDSA signature over the signed content.
@@ -287,7 +290,10 @@ pub fn build_verification_metadata(
     backend_attestation: Option<BackendAttestation>,
 ) -> VerificationMetadata {
     VerificationMetadata {
-        proxy: None, // Placeholder until proxy runs in TEE
+        // Neither is carried in a response: clients verify the gateway's
+        // enclave on every TLS handshake, and the gateway verifies each
+        // engine's on its own.
+        proxy: None,
         backend: backend_attestation,
     }
 }
