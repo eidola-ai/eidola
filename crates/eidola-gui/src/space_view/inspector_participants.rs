@@ -1688,10 +1688,19 @@ impl SpaceView {
                 // pin there would publish it to every space on the next Save.
                 if let Some(edit) = self.inspector_participant_edit.as_mut()
                     && edit.participant_id == participant_id
-                    && !(edit.is_referenced && edit.mode == EditMode::Everywhere)
-                    && edit.model_ref == current
                 {
-                    edit.model_ref = Some(newer);
+                    if !(edit.is_referenced && edit.mode == EditMode::Everywhere)
+                        && edit.model_ref == current
+                    {
+                        edit.model_ref = Some(newer.clone());
+                    }
+                    // The cached per-space source the mode fork re-seeds from
+                    // carries the switch too (it is this space's override), so
+                    // toggling Everyone → This space shows the newer pin; the
+                    // global source stays as it is.
+                    if let Some(reference) = edit.reference.as_mut() {
+                        reference.override_model_ref = Some(newer);
+                    }
                 }
                 self.stores.participants.update(cx, |store, cx| {
                     store.switch_to_newer_weights(space_id, target, cx)
@@ -1704,14 +1713,20 @@ impl SpaceView {
             }
             _ => return,
         }
-        // The notice, and its control with it, goes when the roster re-reads:
-        // hand the keyboard to its home now — the open draft or inline edit
-        // when there is one, else the view — unless a field of the panel holds
-        // it, so it is never left on an element that no longer exists, nor on
-        // a root that yields every key to a composing session.
+        // The notice, and its control with it, goes when the roster re-reads,
+        // so the keyboard moves now, unless a field of the panel holds it. An
+        // inspector covering the pane keeps it (`inspector_focus`): nothing
+        // behind its scrim may take keys. Otherwise it goes home — the open
+        // draft or inline edit when there is one, else the view — so it is
+        // never left on an element that no longer exists, nor on a root that
+        // yields every key to a composing session.
         if !self.inspector_field_focused(window, cx) {
-            let home = self.keyboard_home(cx);
-            window.focus(&home, cx);
+            if self.inspector_covers_pane(window) {
+                window.focus(&self.inspector_focus, cx);
+            } else {
+                let home = self.keyboard_home(cx);
+                window.focus(&home, cx);
+            }
         }
         cx.notify();
     }

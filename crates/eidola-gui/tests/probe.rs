@@ -5051,7 +5051,8 @@ fn an_open_editor_follows_a_switch_to_newer_weights(cx: &mut TestAppContext) {
 /// **A shared agent's "Everyone" draft does not follow a per-space switch.**
 /// The switch writes this space's override; the Everyone draft is the agent's
 /// global config, and adopting the pin there would publish it to every space
-/// on the next Save. The "This space" draft follows, as an owned one does.
+/// on the next Save. Toggling to "This space" afterwards shows the newer pin,
+/// because the per-space source the fork re-seeds from carries the switch.
 #[gpui::test]
 fn an_everyone_draft_keeps_its_model_through_a_per_space_switch(cx: &mut TestAppContext) {
     use eidola_app_core::model_catalog::ModelNotice;
@@ -5098,11 +5099,11 @@ fn an_everyone_draft_keeps_its_model_through_a_per_space_switch(cx: &mut TestApp
         "gemma4-31b · Eidola",
     );
 
-    // The same switch with the "This space" draft open: it follows.
+    // Toggling to "This space" re-seeds from the per-space source, which
+    // carries the switch: the newer pin, not the old one.
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
             v.inspector_set_edit_mode(EditMode::OverrideHere, window, cx);
-            v.inspector_act_on_model_notice("agent-1", &notice, window, cx);
         });
     })
     .unwrap();
