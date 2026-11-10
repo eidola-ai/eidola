@@ -5019,7 +5019,8 @@ fn switched_pin() -> String {
 /// nothing in the editor until the roster shows the participant on the newer
 /// pin; then the editor's selection moves to it. A switch the roster never
 /// shows (refused, or overtaken by another window's write) leaves the editor
-/// as it was.
+/// as it was, and another participant's switch sent meanwhile never discards
+/// this one's.
 #[gpui::test]
 fn an_open_editor_follows_a_switch_to_newer_weights(cx: &mut TestAppContext) {
     use eidola_app_core::model_catalog::ModelNotice;
@@ -5030,6 +5031,10 @@ fn an_open_editor_follows_a_switch_to_newer_weights(cx: &mut TestAppContext) {
         newer_sha256: PICKER_HASH.into(),
     };
     roster[1].model_notices = vec![notice.clone()];
+    let mut second = roster[1].clone();
+    second.id = "agent-2".into();
+    second.label = "Second".into();
+    roster.push(second);
     let seeded = roster.clone();
     let stores = stub_stores(cx, |s| {
         s.config_state = Some(probe_config_state());
@@ -5046,14 +5051,15 @@ fn an_open_editor_follows_a_switch_to_newer_weights(cx: &mut TestAppContext) {
             .and_then(|(_, e)| e.value.clone())
             .map(|v| v.to_string())
     };
-    let switch = |cx: &mut TestAppContext| {
+    let switch_for = |cx: &mut TestAppContext, participant_id: &str| {
         cx.update_window(window, |_, window, cx| {
             view.update(cx, |v, cx| {
-                v.inspector_act_on_model_notice("agent-1", &notice, window, cx);
+                v.inspector_act_on_model_notice(participant_id, &notice, window, cx);
             });
         })
         .unwrap();
     };
+    let switch = |cx: &mut TestAppContext| switch_for(cx, "agent-1");
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
             v.inspector_toggle_participant("agent-1", window, cx)
@@ -5078,9 +5084,11 @@ fn an_open_editor_follows_a_switch_to_newer_weights(cx: &mut TestAppContext) {
     participants.update(cx, |p, _| p.seed_for_test(&space, landed.clone()));
     assert_eq!(editor_value(cx).as_deref(), Some("gemma4-31b · Eidola"));
 
-    // A switch that lands: the editor follows.
+    // A switch that lands, with another row's switch sent behind it: the
+    // editor follows its own.
     participants.update(cx, |p, _| p.seed_for_test(&space, seeded.clone()));
     switch(cx);
+    switch_for(cx, "agent-2");
     participants.update(cx, |p, _| p.seed_for_test(&space, landed));
     assert_eq!(
         editor_value(cx).as_deref(),

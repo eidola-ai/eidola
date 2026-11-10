@@ -29,6 +29,8 @@
 //! private copy. Only the transient editing bits (which row is open, its input
 //! buffers, which picker is open) are view fields.
 
+use std::collections::HashMap;
+
 use eidola_app_core::{
     NewParticipant, ParticipantInfo, ParticipantOverride, ParticipantReference, ParticipantUpdate,
 };
@@ -192,10 +194,9 @@ pub(crate) struct TemplateForm {
 }
 
 /// A switch to newer weights sent from a notice, waiting to be seen in the
-/// roster (`SpaceView::inspector_pending_switch`).
+/// roster (`SpaceView::inspector_pending_switches`, keyed by participant).
 #[derive(Clone, Debug)]
 pub(crate) struct PendingSwitch {
-    participant_id: String,
     /// The participant's model the switch replaces.
     previous: Option<String>,
     /// The pin it writes, `tag@sha256:<hex>@eidola`.
@@ -659,9 +660,9 @@ impl SpaceView {
         let writes_this_space = !(edit.is_referenced && edit.mode == EditMode::Everywhere);
         let defer_model = writes_this_space
             && self
-                .inspector_pending_switch
-                .as_ref()
-                .is_some_and(|p| p.participant_id == pid && edit.model_ref == p.previous);
+                .inspector_pending_switches
+                .get(&pid)
+                .is_some_and(|p| edit.model_ref == p.previous);
 
         if edit.is_referenced && edit.mode == EditMode::OverrideHere {
             // Per-membership overrides. An empty model/prompt on a referenced
@@ -1265,42 +1266,53 @@ impl SpaceView {
     /// shared agent's "Everyone" draft is its global config, which the switch
     /// does not touch. Anything else — the row gone, or on a third model
     /// (another window's write) — drops the pending switch and leaves the
-    /// editor alone.
+    /// editor alone. Each participant's switch settles on its own, so one
+    /// row's switch never discards another's.
     fn apply_landed_switch(&mut self, cx: &mut Context<Self>) {
-        let Some(pending) = self.inspector_pending_switch.as_ref() else {
+        if self.inspector_pending_switches.is_empty() {
             return;
-        };
+        }
         let space_id = self.space_id(cx);
-        let row_model = {
+        let row_models: HashMap<String, Option<String>> = {
             let store = self.stores.participants.read(cx);
             match store.participants(&space_id).value() {
                 Some(list) => list
                     .iter()
-                    .find(|p| p.id == pending.participant_id)
-                    .map(|p| p.model_ref.clone()),
+                    .filter(|p| self.inspector_pending_switches.contains_key(&p.id))
+                    .map(|p| (p.id.clone(), p.model_ref.clone()))
+                    .collect(),
                 None => return,
             }
         };
-        match row_model {
-            Some(model) if model == pending.previous => {}
-            Some(model) if model.as_deref() == Some(pending.newer.as_str()) => {
-                let Some(pending) = self.inspector_pending_switch.take() else {
-                    return;
-                };
-                if let Some(edit) = self.inspector_participant_edit.as_mut()
-                    && edit.participant_id == pending.participant_id
-                {
-                    if !(edit.is_referenced && edit.mode == EditMode::Everywhere)
-                        && edit.model_ref == pending.previous
+        let ids: Vec<String> = self.inspector_pending_switches.keys().cloned().collect();
+        for participant_id in ids {
+            let Some(pending) = self.inspector_pending_switches.get(&participant_id) else {
+                continue;
+            };
+            match row_models.get(&participant_id) {
+                Some(model) if *model == pending.previous => {}
+                Some(model) if model.as_deref() == Some(pending.newer.as_str()) => {
+                    let Some(pending) = self.inspector_pending_switches.remove(&participant_id)
+                    else {
+                        continue;
+                    };
+                    if let Some(edit) = self.inspector_participant_edit.as_mut()
+                        && edit.participant_id == participant_id
                     {
-                        edit.model_ref = Some(pending.newer.clone());
-                    }
-                    if let Some(reference) = edit.reference.as_mut() {
-                        reference.override_model_ref = Some(pending.newer);
+                        if !(edit.is_referenced && edit.mode == EditMode::Everywhere)
+                            && edit.model_ref == pending.previous
+                        {
+                            edit.model_ref = Some(pending.newer.clone());
+                        }
+                        if let Some(reference) = edit.reference.as_mut() {
+                            reference.override_model_ref = Some(pending.newer);
+                        }
                     }
                 }
+                _ => {
+                    self.inspector_pending_switches.remove(&participant_id);
+                }
             }
-            _ => self.inspector_pending_switch = None,
         }
     }
 
@@ -1767,11 +1779,13 @@ impl SpaceView {
                 );
                 // The editor follows once the roster shows the switch landed,
                 // never here: a switch the core refuses leaves it as it was.
-                self.inspector_pending_switch = Some(PendingSwitch {
-                    participant_id: participant_id.to_string(),
-                    previous: current,
-                    newer,
-                });
+                self.inspector_pending_switches.insert(
+                    participant_id.to_string(),
+                    PendingSwitch {
+                        previous: current,
+                        newer,
+                    },
+                );
                 self.stores.participants.update(cx, |store, cx| {
                     store.switch_to_newer_weights(space_id, target, cx)
                 });
