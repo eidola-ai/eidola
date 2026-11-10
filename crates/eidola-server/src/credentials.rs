@@ -760,6 +760,13 @@ pub async fn recover_refund(
     // settled token is still coming, and a client recovering now would spend
     // its one successor on the full hold. A row without a token predates
     // provisional refunds and can never be served.
+    //
+    // The mark is checked **before** the row is read, every time. Settlement
+    // stores the settled token and only then releases the mark, so a mark
+    // seen absent means any settlement has already landed and the read that
+    // follows sees it. Read first, the row could be the provisional one
+    // while the settled UPDATE commits and the mark drops before the check —
+    // and the zero refund already in hand would be served.
     let still_in_flight = || {
         Err(ServerError::NotFound {
             message: "nullifier recorded but refund token not yet available — \
@@ -770,24 +777,17 @@ pub async fn recover_refund(
     let serve_recorded = |stored: db::StoredRefund, key_id: String| match stored {
         db::StoredRefund {
             refund_token: Some(refund_cbor),
-            standing: db::RefundStanding::Settled,
+            standing: db::RefundStanding::Settled | db::RefundStanding::Provisional,
         } => Ok(answer(&refund_cbor, key_id)),
-        db::StoredRefund {
-            refund_token: Some(refund_cbor),
-            standing: db::RefundStanding::Provisional,
-        } => {
-            if state.settling.is_settling(&key_id, &nullifier_bytes) {
-                still_in_flight()
-            } else {
-                Ok(answer(&refund_cbor, key_id))
-            }
-        }
         db::StoredRefund {
             refund_token: None, ..
         } => still_in_flight(),
     };
 
     // Check if the nullifier was already recorded (original request arrived).
+    if state.settling.is_settling(&key_id, &nullifier_bytes) {
+        return still_in_flight();
+    }
     if let Some(stored) = db::get_refund_token(&state.db_pool, &key_id, &nullifier_bytes).await? {
         return serve_recorded(stored, key_id);
     }
@@ -801,24 +801,13 @@ pub async fn recover_refund(
         }
     })?;
 
-    let t = credit_to_scalar::<128>(charge_credits)
-        .map_err(|e| ServerError::Internal(format!("invalid refund amount: {e:?}")))?;
-
-    let refund_cbor = {
-        let cache = state.credential_key_cache.read().await;
-        let key = cache.get(&act.issuer_key_hash).ok_or_else(|| {
-            ServerError::Internal("issuer key not in cache for refund".to_string())
-        })?;
-
-        let refund = key
-            .secret_key
-            .refund(&key.params, &act.spend_proof, t, OsRng)
-            .map_err(|e| ServerError::Internal(format!("refund issuance failed: {e:?}")))?;
-
-        refund
-            .to_cbor()
-            .map_err(|e| ServerError::Internal(format!("refund CBOR encoding failed: {e:?}")))?
-    };
+    let refund_cbor = crate::handlers::mint_refund(
+        &state,
+        &act.spend_proof,
+        &act.issuer_key_hash,
+        charge_credits,
+    )
+    .await?;
 
     // Record the nullifier and the refund in one statement: the nullifier is
     // durable before the refund is released (the forking-attack rule), and
@@ -837,7 +826,11 @@ pub async fn recover_refund(
     }
 
     // Recorded by someone else meanwhile: a concurrent recovery (settled) or
-    // the chat path (provisional, and in flight in this process).
+    // the chat path (provisional, and in flight in this process). Mark
+    // first, then the row, as above.
+    if state.settling.is_settling(&key_id, &nullifier_bytes) {
+        return still_in_flight();
+    }
     match db::get_refund_token(&state.db_pool, &key_id, &nullifier_bytes).await? {
         Some(stored) => serve_recorded(stored, key_id),
         None => still_in_flight(),
@@ -993,7 +986,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     async fn recovery_state() -> (AppState, [u8; 32]) {
-        recovery_state_under(crate::helpers::EpochConfig::default()).await
+        recovery_state_under(test_epoch()).await
+    }
+
+    /// The epoch the DB-backed tests mint their keys under: long enough for
+    /// any test, short enough to leave the shared development database alone.
+    /// A key minted under the default epoch would be advertised, selected as
+    /// the newest issuing key and fail `cache_key` (it is sealed under this
+    /// module's test master key) for a server pointed at the same database,
+    /// for the whole default issuing window and grace period.
+    fn test_epoch() -> crate::helpers::EpochConfig {
+        crate::helpers::EpochConfig {
+            epoch_duration: Duration::from_secs(60),
+            grace_period: Duration::from_secs(120),
+        }
     }
 
     async fn recovery_state_under(epoch: crate::helpers::EpochConfig) -> (AppState, [u8; 32]) {
@@ -1261,9 +1267,15 @@ mod tests {
             .await
             .expect("first spend verifies");
         assert!(
-            db::record_nullifier(&state.db_pool, &key_id, &nullifier)
-                .await
-                .unwrap()
+            db::record_nullifier_with_refund(
+                &state.db_pool,
+                &key_id,
+                &nullifier,
+                &[],
+                db::RefundStanding::Settled,
+            )
+            .await
+            .unwrap()
         );
 
         retire().await;
@@ -1325,8 +1337,7 @@ mod tests {
     #[ignore]
     async fn a_spend_whose_request_never_finishes_is_still_recoverable() {
         let upstream = upstream_that_never_answers().await;
-        let (state, key_hash) =
-            recovery_state_at(crate::helpers::EpochConfig::default(), Some(upstream)).await;
+        let (state, key_hash) = recovery_state_at(test_epoch(), Some(upstream)).await;
         let (act, pre_refund) = spend_under(&state, key_hash, None, 1_000_000, 100_000).await;
 
         let (router, _) = crate::build_router()
@@ -1394,8 +1405,7 @@ mod tests {
     #[ignore]
     async fn recovery_waits_for_a_spend_that_is_still_settling() {
         let upstream = upstream_that_never_answers().await;
-        let (state, key_hash) =
-            recovery_state_at(crate::helpers::EpochConfig::default(), Some(upstream)).await;
+        let (state, key_hash) = recovery_state_at(test_epoch(), Some(upstream)).await;
         let (act, pre_refund) = spend_under(&state, key_hash, None, 1_000_000, 100_000).await;
         let key_id = hex::encode(act.issuer_key_hash);
         let nullifier = act.spend_proof.nullifier().as_bytes().to_vec();
@@ -1518,8 +1528,7 @@ mod tests {
     #[ignore]
     async fn a_departed_client_releases_a_stream_the_upstream_left_idle() {
         let upstream = upstream_that_opens_a_stream_and_stalls().await;
-        let (state, key_hash) =
-            recovery_state_at(crate::helpers::EpochConfig::default(), Some(upstream)).await;
+        let (state, key_hash) = recovery_state_at(test_epoch(), Some(upstream)).await;
         let (act, _) = spend_under(&state, key_hash, None, 1_000_000, 100_000).await;
         let key_id = hex::encode(act.issuer_key_hash);
         let nullifier = act.spend_proof.nullifier().as_bytes().to_vec();

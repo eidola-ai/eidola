@@ -407,7 +407,6 @@ pub mod metrics {
         "db.get_refund_token",
         "db.get_valid_issuer_keys",
         "db.insert_credit_ledger",
-        "db.record_nullifier",
         "db.record_nullifier_with_refund",
         "db.store_refund_token",
         "upstream.chat",
@@ -736,12 +735,8 @@ mod tests {
     /// of its own — that is what bounds the cardinality of `SPAN_DURATION`.
     #[test]
     fn unknown_span_names_collapse_to_one_bucket() {
-        assert_eq!(
-            metrics::span_operation("db.record_nullifier"),
-            Some("db.record_nullifier")
-        );
-        // The span every chat and recovery insert now emits: left off the
-        // list, nullifier latency folds into `other` and the series goes dark.
+        // The span every chat and recovery insert emits: left off the list,
+        // nullifier latency folds into `other` and the series goes dark.
         assert_eq!(
             metrics::span_operation("db.record_nullifier_with_refund"),
             Some("db.record_nullifier_with_refund")

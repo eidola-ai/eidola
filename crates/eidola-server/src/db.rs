@@ -945,33 +945,6 @@ pub async fn get_issuer_key_by_hash(
     Ok(row.as_ref().map(map_issuer_key_row))
 }
 
-/// Atomically record a nullifier. Returns `true` if successfully recorded,
-/// `false` if the nullifier was already present (double-spend attempt).
-#[tracing::instrument(skip_all, name = "db.record_nullifier", err)]
-pub async fn record_nullifier(
-    pool: &Pool,
-    issuer_key_id: &str,
-    value: &[u8],
-) -> Result<bool, ServerError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
-
-    let rows_affected = client
-        .execute(
-            "INSERT INTO nullifier (issuer_key_id, value) \
-             VALUES ($1, $2) ON CONFLICT DO NOTHING",
-            &[&issuer_key_id, &value],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!("record_nullifier failed: {}", db_error_summary(&e)))
-        })?;
-
-    Ok(rows_affected > 0)
-}
-
 /// Whether a refund token stored on a nullifier row is the spend's final word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefundStanding {

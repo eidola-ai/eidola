@@ -206,8 +206,9 @@ async fn issue_refund_async(
     })
 }
 
-/// Settle a blocking request's spend where the client's departure cannot
-/// interrupt it.
+/// Settle a spend from a handler where the client's departure cannot
+/// interrupt it: every exit of the blocking path, and the stream path's exits
+/// before its task has taken the mark.
 ///
 /// hyper drops the handler when the client goes, and with it any settlement
 /// the handler was awaiting — but a `store_refund_token` UPDATE that was
@@ -320,7 +321,7 @@ impl Drop for SettlingSpend {
 /// (it is fixed by the spend proof), so a client holding two of them can
 /// spend only one: issuing a provisional refund ahead of the settled one
 /// never mints extra value.
-async fn mint_refund(
+pub(crate) async fn mint_refund(
     state: &AppState,
     spend_proof: &SpendProof<128>,
     issuer_key_hash: &[u8; 32],
@@ -893,8 +894,9 @@ async fn handle_streaming_request(
         Err(e) => {
             // Known error — upstream didn't process any tokens. Full refund.
             warn!("Stream start error, issuing full refund: {}", e);
-            let refund = issue_refund_async(
+            let refund = settle_detached(
                 &state,
+                settling,
                 &act.spend_proof,
                 &act.issuer_key_hash,
                 charge_credits,
@@ -914,8 +916,9 @@ async fn handle_streaming_request(
         Err(e) => {
             // Can't serialize spend proof for the spawned task — issue full refund now.
             error!("spend proof re-encode failed: {e:?}");
-            let refund = issue_refund_async(
+            let refund = settle_detached(
                 &state,
+                settling,
                 &act.spend_proof,
                 &act.issuer_key_hash,
                 charge_credits,
@@ -1005,6 +1008,10 @@ async fn handle_streaming_request(
             // forever. Watching the receiver's side settles such a spend as
             // soon as the client is gone.
             let event_result = tokio::select! {
+                // Biased: a ready upstream event always wins over the client's
+                // departure, so a client that leaves just as `Done` arrives
+                // still gets the real refund stored, not the zero one.
+                biased;
                 event = upstream_rx.recv() => match event {
                     Some(event) => event,
                     None => break,

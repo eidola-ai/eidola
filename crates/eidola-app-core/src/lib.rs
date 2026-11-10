@@ -3270,11 +3270,19 @@ impl Inner {
     /// overwrites it — so the refresh has to run before the lifecycle and
     /// balance decision, not only inside the allocation that decision reaches
     /// for when the balance allows one.
-    async fn refresh_issuer_keys(&self, cfg: &Config) -> Result<ListKeysResponse, AppError> {
-        let eidola = self.eidola_resolved().await?;
-        let base_url = eidola.base_url.as_str();
-        let client = self.build_client(&eidola, None).await?;
-
+    ///
+    /// Takes the caller's resolved backend (`client`, `base_url`) rather than
+    /// resolving its own: issuance verifies the server's response against the
+    /// key fetched here, so both must come from one snapshot of the backend
+    /// row — resolved twice, a settings edit in between could fetch keys from
+    /// one server and issue against another, debiting the account for a
+    /// credential the wallet then refuses to store.
+    async fn refresh_issuer_keys(
+        &self,
+        cfg: &Config,
+        client: &reqwest::Client,
+        base_url: &str,
+    ) -> Result<ListKeysResponse, AppError> {
         let resp = client
             .get(format!("{base_url}/v1/keys"))
             .send()
@@ -3340,7 +3348,7 @@ impl Inner {
         let (account_id, secret) = self.require_credentials(&cfg)?;
         let client = self.build_client(&eidola, None).await?;
 
-        let keys = self.refresh_issuer_keys(&cfg).await?;
+        let keys = self.refresh_issuer_keys(&cfg, &client, base_url).await?;
 
         let expected_ds = cfg.domain_separator();
         let now = now_ms();
@@ -6123,26 +6131,34 @@ impl Inner {
                 return Ok(cred);
             }
 
-            if cfg.account_id.is_none() || cfg.account_secret.is_none() {
-                return Err(AppError::NoAccount);
-            }
-
             // Nothing spendable on file — but "expired" here is the *local*
             // expiry, and a stale one hides a credential the server still
             // accepts (see `refresh_issuer_keys`). Refresh the advertised keys
-            // once before concluding anything about balance, and look again:
-            // otherwise a short balance ends in `InsufficientBalance` with a
-            // spendable credential in the wallet, and a sufficient one buys an
+            // once before concluding anything — account presence included,
+            // since a held credential spends without an account and `/v1/keys`
+            // needs none — and look again. Otherwise a reset account ends in
+            // `NoAccount` and a short balance in `InsufficientBalance`, each
+            // holding a spendable credential, and a sufficient balance buys an
             // allocation the wallet did not need. Best-effort: if the server
-            // cannot be reached, the balance read just below says so.
+            // cannot be reached, the reads below say so.
             if !keys_refreshed {
                 keys_refreshed = true;
-                if self.refresh_issuer_keys(cfg).await.is_ok()
+                let refreshed = async {
+                    let eidola = self.eidola_resolved().await?;
+                    let client = self.build_client(&eidola, None).await?;
+                    self.refresh_issuer_keys(cfg, &client, eidola.base_url.as_str())
+                        .await
+                };
+                if refreshed.await.is_ok()
                     && let Some(cred) =
                         db::find_spendable_credential(db_conn, charge_credits).await?
                 {
                     return Ok(cred);
                 }
+            }
+
+            if cfg.account_id.is_none() || cfg.account_secret.is_none() {
+                return Err(AppError::NoAccount);
             }
 
             let balances = self.account_balances().await?;
