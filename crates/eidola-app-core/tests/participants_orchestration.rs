@@ -854,11 +854,10 @@ fn post_reply_rejects_reply_to_from_another_space() {
     });
 }
 
-/// The default label the seeded agent gets from `DEFAULT_MODEL` (mirrors
-/// `db::default_agent_label`). MODEL == DEFAULT_MODEL in the harness.
+/// The label of the harness profile's default agent, which `core_for` seats
+/// on the mock's `MODEL` (`chat_harness::DEFAULT_AGENT_LABEL`).
 fn default_agent_label() -> String {
-    // `gemma4-31b` → `Gemma4 31b` (see db::default_agent_label).
-    "Gemma4 31b".to_string()
+    chat_harness::DEFAULT_AGENT_LABEL.to_string()
 }
 
 // ===========================================================================

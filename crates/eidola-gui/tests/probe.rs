@@ -4992,6 +4992,14 @@ fn the_model_picker_offers_a_pin_and_shows_the_weights(cx: &mut TestAppContext) 
         3,
         "the hash-only model, the tag, and the tag's pin: {options:?}"
     );
+    // Following the tag shows the weights it resolves to.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_select_participant_model("gemma4-31b", cx)
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
     assert_probe(
         &entries,
         "space/inspector/participants/add/model/weights",

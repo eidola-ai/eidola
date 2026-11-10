@@ -620,7 +620,25 @@ fn app_hint(e: &AppError) {
                  command) and run this again"
             );
         }
+        AppError::LocalModelNotDownloaded { model } => {
+            eprintln!("{}", not_downloaded_hint(model));
+        }
         _ => {}
+    }
+}
+
+/// How to get an on-device model a turn named but this machine lacks: the
+/// download command for a curated one, else where to find the command.
+fn not_downloaded_hint(model: &str) -> String {
+    match eidola_app_core::catalog_entry_for_model_ref(model) {
+        Some(entry) => format!(
+            "hint: run `eidola model download {}` ({}), or pick another model with `--model`",
+            entry.id,
+            fmt_size(entry.size_bytes)
+        ),
+        None => "hint: download it with `eidola model download <url>`, or pick another \
+                 model with `--model`"
+            .to_string(),
     }
 }
 
@@ -2313,6 +2331,19 @@ impl CreateConsent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default model on a fresh profile is not downloaded; the hint
+    /// names the command that downloads it.
+    #[test]
+    fn a_curated_model_that_is_not_downloaded_hints_its_download_command() {
+        let hint = not_downloaded_hint(eidola_app_core::config::DEFAULT_MODEL);
+        assert!(
+            hint.contains("`eidola model download gemma-4-e4b`"),
+            "{hint}"
+        );
+        let other = not_downloaded_hint("mine@local");
+        assert!(other.contains("`eidola model download <url>`"), "{other}");
+    }
 
     /// A conversion whose answer was lost leaves nothing in flight, so the
     /// report must reach it with no in-flight credential to announce it, and

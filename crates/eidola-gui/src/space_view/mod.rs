@@ -2438,6 +2438,11 @@ impl SpaceView {
             .chain(local.external().iter().flat_map(|b| b.models.iter()))
             .find(|m| m.id == selection)
             .map(|m| m.display_name.clone())
+            // A curated model not yet downloaded still has its catalog name.
+            .or_else(|| {
+                eidola_app_core::catalog_entry_for_model_ref(selection)
+                    .map(|entry| entry.display_name.to_string())
+            })
             .unwrap_or_else(|| mref.model.clone());
         (model_name.into(), backend_name.into())
     }
@@ -2931,6 +2936,15 @@ fn error_copy(e: &AppError, cx: &gpui::App) -> String {
         // that is the promise the refusal exists to keep.
         AppError::ModelUnavailable { model } => {
             crate::i18n::msg::space_error_model_unavailable(cx, model.clone()).to_string()
+        }
+        // An on-device model with no file yet — a fresh profile's default.
+        // Named by the curated catalog's display name where it has one, since
+        // that is the name Settings lists it under.
+        AppError::LocalModelNotDownloaded { model } => {
+            let name = eidola_app_core::catalog_entry_for_model_ref(model)
+                .map(|entry| entry.display_name.to_string())
+                .unwrap_or_else(|| model.clone());
+            crate::i18n::msg::space_error_local_model_not_downloaded(cx, name).to_string()
         }
         // The server's issuer key failed a check this client makes for
         // itself. Worded as what the reader needs: they were protected,
