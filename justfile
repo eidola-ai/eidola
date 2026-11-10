@@ -10,13 +10,13 @@ default:
 dev:
     ./scripts/dev.sh --container
 
-# Run backing services for host-mode dev — gateway runs on host with cargo; writes .env.local with BIND_ADDR + STRIPE_WEBHOOK_SECRET to source.
+# Run backing services for host-mode dev; writes .env.local with BIND_ADDR.
 services:
     ./scripts/dev.sh --host
 
 # Stop everything started by `just dev` or `just services`.
 down:
-    docker compose --profile gateway --profile stripe down --remove-orphans
+    docker compose --profile gateway --profile stripe --profile billing down --remove-orphans
 
 # Point this machine's client (GUI + CLI) at the local dev stack
 client-local:
@@ -34,13 +34,16 @@ db-reset:
 
 # --- Build (local toolchain, fast iteration) ---
 
-# Build a system: gateway, cli, gui, notepad, www, or engine-server
+# Build a system: gateway, billing, cli, gui, notepad, www, or engine-server
 build system:
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{ system }}" in
       gateway)
         cargo build -p eidola-server-gateway
+        ;;
+      billing)
+        cargo build -p eidola-billing-cli
         ;;
       cli)
         cargo build -p eidola-cli
@@ -71,7 +74,7 @@ build system:
         cargo build -p eidola-server-engine
         ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: gateway, cli, gui, notepad, www, engine-server)" >&2
+        echo "error: unknown system '{{ system }}' (expected: gateway, billing, cli, gui, notepad, www, engine-server)" >&2
         exit 1
         ;;
     esac
@@ -101,13 +104,16 @@ engine-platform-endorsements tag:
 engine:
     nix build .#llama-server -o crates/eidola-gui/build/llama-server
 
-# Build and run a system: gateway, cli, gui, notepad, www, or engine-server
+# Build and run a system: gateway, billing, cli, gui, notepad, www, or engine-server
 run system *args:
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{ system }}" in
       gateway)
         cargo run -p eidola-server-gateway -- {{ args }}
+        ;;
+      billing)
+        cargo run -p eidola-billing-cli -- {{ args }}
         ;;
       cli)
         cargo run -p eidola-cli -- {{ args }}
@@ -170,7 +176,7 @@ run system *args:
           cargo run -p eidola-server-engine -- {{ args }}
         ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: gateway, cli, gui, notepad, www, engine-server)" >&2
+        echo "error: unknown system '{{ system }}' (expected: gateway, billing, cli, gui, notepad, www, engine-server)" >&2
         exit 1
         ;;
     esac
@@ -222,6 +228,7 @@ test-integration:
 test-billing:
     : "${BILLING_TEST_DATABASE_URL:?set BILLING_TEST_DATABASE_URL to a disposable Postgres database}"
     cargo test -p eidola-billing -- --ignored --test-threads=1
+    cargo test -p eidola-billing-cli -- --ignored --test-threads=1
     cargo test -p eidola-server-gateway --test billing_support -- --ignored --test-threads=1
 
 # Run E2E webhook smoke tests (requires STRIPE_API_KEY)

@@ -300,6 +300,7 @@ jobs:
           docker exec -i eidola-billing-tests psql -U billing_test -d billing_test -v ON_ERROR_STOP=1 \
             < crates/eidola-server-gateway/schema/schema.sql
           cargo test -p eidola-billing -- --ignored --test-threads=1
+          cargo test -p eidola-billing-cli -- --ignored --test-threads=1
           cargo test -p eidola-server-gateway -- --ignored --test-threads=1
 
       - name: Check OCI stub-source resolution

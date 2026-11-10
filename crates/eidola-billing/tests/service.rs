@@ -31,6 +31,9 @@ struct Provider {
     refund_pending: bool,
     response_gate: Option<Arc<tokio::sync::Notify>>,
     post_started: Arc<tokio::sync::Notify>,
+    snapshot_reads: usize,
+    snapshot_gate: Option<Arc<tokio::sync::Notify>>,
+    snapshot_started: Arc<tokio::sync::Notify>,
 }
 
 fn list(data: Vec<Value>) -> Value {
@@ -59,11 +62,16 @@ async fn serve(State(state): State<Arc<Mutex<Provider>>>, request: Request) -> R
         let mut provider = state.lock().unwrap();
         let mut response_gate = None;
         let result = match (method.as_str(), path.as_str()) {
-        ("GET", "/charges") => list((1..=provider.purchases).map(|n| json!({
+        ("GET", "/charges") => {
+            provider.snapshot_reads += 1;
+            provider.snapshot_started.notify_one();
+            response_gate = provider.snapshot_gate.clone();
+            list((1..=provider.purchases).map(|n| json!({
             "id":format!("ch_{n}"),"customer":"cus_1","payment_intent":format!("pi_{n}"),
             "amount":1000,"amount_refunded":0,"currency":"usd","paid":true,"captured":true,
             "status":"succeeded","created":provider.created
-        })).collect()),
+        })).collect())
+        },
         ("GET", "/checkout/sessions") => list((1..=provider.purchases).map(|n| json!({
             "id":format!("cs_{n}"),"customer":"cus_1","mode":"payment","status":"complete","payment_status":"paid",
             "amount_total":1000,"currency":"usd","payment_intent":format!("pi_{n}"),"created":provider.created,
@@ -118,6 +126,7 @@ struct Fixture {
     admin: tokio_postgres::Client,
     pool: Pool,
     service: Arc<BillingService>,
+    stripe: StripeClient,
     provider: Arc<Mutex<Provider>>,
     http: tokio::task::JoinHandle<()>,
 }
@@ -173,7 +182,7 @@ impl Fixture {
         });
         let _ = rustls_rustcrypto::provider().install_default();
         let stripe = StripeClient::new("test".into()).with_base_url(format!("http://{addr}"));
-        let service = Arc::new(BillingService::new(pool.clone(), stripe));
+        let service = Arc::new(BillingService::new(pool.clone(), stripe.clone()));
         service.reconcile_account(account).await.unwrap();
         Self {
             account,
@@ -181,6 +190,7 @@ impl Fixture {
             admin,
             pool,
             service,
+            stripe,
             provider,
             http,
         }
@@ -454,5 +464,207 @@ async fn losing_the_database_lock_prevents_an_old_provider_response_from_overwri
         "failed"
     );
     assert_eq!(f.balance().await, 1_000_000);
+    f.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated BILLING_TEST_DATABASE_URL"]
+async fn separate_workers_do_not_duplicate_a_claim_and_a_later_repair_is_not_lost() {
+    let f = Fixture::new().await;
+    let second = BillingService::new(f.pool.clone(), f.stripe.clone());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(tokio::sync::Notify::new());
+    let before = {
+        let mut provider = f.provider.lock().unwrap();
+        provider.snapshot_gate = Some(gate.clone());
+        provider.snapshot_started = started.clone();
+        provider.snapshot_reads
+    };
+    f.service
+        .store()
+        .request_reconciliation(f.account)
+        .await
+        .unwrap();
+    let worker = f.service.clone();
+    let first = tokio::spawn(async move { worker.drain_events(32).await });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    assert_eq!(second.drain_events(32).await.unwrap().processed, 0);
+    assert_eq!(f.provider.lock().unwrap().snapshot_reads, before + 1);
+    // A private operator still uses the account lock, independently of queue
+    // ownership. It cannot race a refund through this active provider snapshot.
+    assert!(matches!(
+        second.submit_refund(&f.request()).await,
+        Err(BillingError::Conflict(_))
+    ));
+    assert!(f.provider.lock().unwrap().posts.is_empty());
+    let pending = f
+        .service
+        .store()
+        .request_reconciliation(f.account)
+        .await
+        .unwrap();
+    assert_eq!(
+        (pending.requested_generation, pending.completed_generation),
+        (2, 0)
+    );
+    f.provider.lock().unwrap().snapshot_gate = None;
+    gate.notify_one();
+    assert_eq!(first.await.unwrap().unwrap().completed, 1);
+    let pending = f
+        .service
+        .store()
+        .reconciliation_status(f.account)
+        .await
+        .unwrap();
+    assert_eq!(
+        (pending.requested_generation, pending.completed_generation),
+        (2, 1)
+    );
+    assert_eq!(second.drain_events(32).await.unwrap().completed, 1);
+    let complete = f
+        .service
+        .store()
+        .reconciliation_status(f.account)
+        .await
+        .unwrap();
+    assert_eq!(
+        (complete.requested_generation, complete.completed_generation),
+        (2, 2)
+    );
+    assert_eq!(complete.report.unwrap().purchases, 1);
+    assert_eq!(f.provider.lock().unwrap().snapshot_reads, before + 2);
+    f.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated BILLING_TEST_DATABASE_URL"]
+async fn unsupported_work_remains_pending_and_visible_without_provider_calls() {
+    let f = Fixture::new().await;
+    let before = f.provider.lock().unwrap().snapshot_reads;
+    f.service
+        .store()
+        .enqueue_event("future_work", "billing.future.action", "future_object")
+        .await
+        .unwrap();
+    f.service
+        .store()
+        .request_reconciliation(f.account)
+        .await
+        .unwrap();
+    let id = format!("billing.reconcile:{}", f.account);
+    f.pool
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE billing_event SET protocol_version=2 WHERE id=$1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    // An incompatible record is not an idle account and must not be overwritten.
+    assert!(
+        f.service
+            .store()
+            .reconciliation_status(f.account)
+            .await
+            .is_err()
+    );
+    assert!(
+        f.service
+            .store()
+            .request_reconciliation(f.account)
+            .await
+            .is_err()
+    );
+    let result = f.service.drain_events(32).await.unwrap();
+    assert_eq!((result.completed, result.failed, result.review), (0, 2, 2));
+    let rows = f.pool.get().await.unwrap().query(
+        "SELECT last_error,completed_at IS NULL,completed_generation FROM billing_event ORDER BY last_error", &[],
+    ).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>(0), "unsupported_kind");
+    assert_eq!(rows[1].get::<_, String>(0), "unsupported_protocol");
+    for row in rows {
+        assert!(row.get::<_, bool>(1));
+        assert_eq!(row.get::<_, i64>(2), 0);
+    }
+    assert_eq!(f.provider.lock().unwrap().snapshot_reads, before);
+    f.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated BILLING_TEST_DATABASE_URL"]
+async fn incompatible_executors_refuse_before_provider_calls_while_v1_producers_continue() {
+    let f = Fixture::new().await;
+    let before = f.provider.lock().unwrap().snapshot_reads;
+    f.pool
+        .get()
+        .await
+        .unwrap()
+        .execute("UPDATE billing_protocol SET execution_version=2", &[])
+        .await
+        .unwrap();
+    f.service.store().check_ingress_protocol().await.unwrap();
+    f.service
+        .store()
+        .request_reconciliation(f.account)
+        .await
+        .unwrap();
+    f.service
+        .store()
+        .enqueue_event("evt_future_executor", "refund.updated", "re_1")
+        .await
+        .unwrap();
+    f.service
+        .store()
+        .lock_checkout(f.account)
+        .await
+        .unwrap()
+        .release()
+        .await
+        .unwrap();
+    assert!(f.service.store().check_protocol().await.is_err());
+    assert!(f.service.drain_events(32).await.is_err());
+    assert!(f.service.reconcile_account(f.account).await.is_err());
+    assert!(f.service.submit_refund(&f.request()).await.is_err());
+    assert!(f.service.cancel_subscriptions(f.account).await.is_err());
+    assert!(
+        f.service
+            .close_account(f.account, "operator request")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.service.store().account_state(f.account).await.unwrap(),
+        "open"
+    );
+    assert_eq!(f.provider.lock().unwrap().snapshot_reads, before);
+    assert!(f.provider.lock().unwrap().posts.is_empty());
+    assert_eq!(f.balance().await, 2_000_000);
+    f.pool
+        .get()
+        .await
+        .unwrap()
+        .execute("UPDATE billing_protocol SET ingress_version=2", &[])
+        .await
+        .unwrap();
+    assert!(
+        f.service
+            .store()
+            .request_reconciliation(f.account)
+            .await
+            .is_err()
+    );
+    assert!(
+        f.service
+            .store()
+            .enqueue_event("evt_new", "refund.updated", "re_2")
+            .await
+            .is_err()
+    );
+    assert!(f.service.store().lock_checkout(f.account).await.is_err());
     f.close().await;
 }

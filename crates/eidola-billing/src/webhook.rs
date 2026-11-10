@@ -1,13 +1,6 @@
-//! Stripe webhooks durably enqueue observations. Billing effects belong to
-//! eidola-billing, shared with account repair and the private support CLI.
+//! Stripe ingress authenticates raw bytes and retains only event identities.
+//! Provider payloads are observations, never ledger mutation instructions.
 
-use crate::{AppState, error::ServerError};
-use axum::{
-    extract::State,
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
-};
-use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -104,7 +97,7 @@ struct EventObject {
     id: String,
 }
 
-use eidola_billing::service::BILLING_EVENT_TYPES;
+use crate::service::BILLING_EVENT_TYPES;
 
 fn event_type_label(kind: &str) -> &'static str {
     BILLING_EVENT_TYPES
@@ -114,121 +107,33 @@ fn event_type_label(kind: &str) -> &'static str {
         .unwrap_or("other")
 }
 
-fn record_webhook_outcome(kind: &str, reason: &'static str) {
-    crate::telemetry::metrics::WEBHOOK_OUTCOME.add(
-        1,
-        &[
-            opentelemetry::KeyValue::new("event_type", event_type_label(kind)),
-            opentelemetry::KeyValue::new("reason", reason),
-        ],
-    );
+/// The only fields persisted from a verified Stripe event.
+#[derive(Debug, PartialEq, Eq)]
+pub struct WebhookEvent {
+    pub id: String,
+    pub kind: String,
+    pub object_id: String,
 }
 
-/// An acknowledgment means the event is durable, not that Stripe has already
-/// been fetched. A gateway crash after this response cannot lose the work.
-#[utoipa::path(
-    post,
-    path = "/v1/webhooks/stripe",
-    tag = "Linked",
-    responses(
-        (status = 200, description = "Event durably received or type ignored"),
-        (status = 400, description = "Invalid signature or event", body = crate::types::ErrorResponse),
-        (status = 500, description = "Event was not persisted; retry delivery", body = crate::types::ErrorResponse),
-        (status = 503, description = "Webhook secret not configured", body = crate::types::ErrorResponse)
-    )
-)]
-#[tracing::instrument(skip_all, name = "webhook.process")]
-pub async fn stripe_webhook(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> axum::response::Response {
-    let Some(secret) = state.stripe_webhook_secret.as_deref() else {
-        record_webhook_outcome("", "not_configured");
-        return ServerError::ServiceUnavailable("webhook secret is not configured".into())
-            .into_response();
-    };
-    let Some(signature) = headers
-        .get("stripe-signature")
-        .and_then(|v| v.to_str().ok())
-    else {
-        record_webhook_outcome("", "missing_signature");
-        return bad_request("missing stripe-signature header");
-    };
-    if verify_signature(signature, &body, secret).is_err() {
-        record_webhook_outcome("", "bad_signature");
-        return bad_request("invalid webhook signature");
-    }
-    let Ok(event) = serde_json::from_slice::<StripeEvent>(&body) else {
-        record_webhook_outcome("", "malformed_event");
-        return bad_request("invalid webhook event");
-    };
+/// Parse a previously authenticated payload. Unsupported types are ignored.
+/// The caller must verify the signature against these exact bytes first.
+pub fn parse_event(body: &[u8]) -> Result<Option<WebhookEvent>, &'static str> {
+    let event: StripeEvent = serde_json::from_slice(body).map_err(|_| "invalid webhook event")?;
     if event_type_label(&event.kind) == "other" {
-        record_webhook_outcome("", "ignored");
-        return StatusCode::OK.into_response();
+        return Ok(None);
     }
     if !valid_object_id(&event.id) || !valid_object_id(&event.data.object.id) {
-        record_webhook_outcome(&event.kind, "malformed_event");
-        return bad_request("invalid webhook object identifier");
+        return Err("invalid webhook object identifier");
     }
-    let store = eidola_billing::store::Store::new(state.db_pool.clone());
-    match store
-        .enqueue_event(&event.id, &event.kind, &event.data.object.id)
-        .await
-    {
-        Ok(_) => {
-            record_webhook_outcome(&event.kind, "queued");
-            state.billing_wakeup.notify_one();
-            StatusCode::OK.into_response()
-        }
-        Err(_) => {
-            record_webhook_outcome(&event.kind, "database_error");
-            ServerError::Internal("could not persist billing event".into()).into_response()
-        }
-    }
+    Ok(Some(WebhookEvent {
+        id: event.id,
+        kind: event.kind,
+        object_id: event.data.object.id,
+    }))
 }
 
 fn valid_object_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 255 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-}
-
-fn bad_request(message: &str) -> axum::response::Response {
-    ServerError::BadRequest {
-        message: message.into(),
-    }
-    .into_response()
-}
-
-/// Retry durable inbox work, including work accepted by a previous gateway.
-/// The timer reads only our queue; it never periodically polls Stripe accounts.
-pub fn spawn_billing_worker(state: AppState) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let Some(stripe) = state.stripe.clone() else {
-            return;
-        };
-        let service = eidola_billing::service::BillingService::new(state.db_pool.clone(), stripe);
-        loop {
-            match service.drain_events(32).await {
-                Ok(report) => {
-                    if report.failed > 0 {
-                        tracing::warn!("billing reconciliation remains pending");
-                    }
-                    if report.review > 0 {
-                        tracing::warn!("billing reconciliation requires support review");
-                    }
-                    if report.processed == 32 && report.failed == 0 {
-                        tokio::task::yield_now().await;
-                        continue;
-                    }
-                }
-                Err(_) => tracing::warn!("billing inbox unavailable; will retry"),
-            }
-            tokio::select! {
-                _ = state.billing_wakeup.notified() => {},
-                _ = tokio::time::sleep(Duration::from_secs(5)) => {},
-            }
-        }
-    })
 }
 
 #[cfg(test)]

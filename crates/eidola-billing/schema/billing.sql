@@ -1,5 +1,15 @@
 -- Billing operations. This block is embedded verbatim in the gateway baseline.
 -- All state here belongs to the linked account surface, never to ACT spends.
+-- Producers can remain on their stable ingress contract while billing executors
+-- change. An incompatible executor rollout must quiesce the previous executors
+-- before changing execution_version; these are admission checks, not migrations.
+CREATE TABLE billing_protocol (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    ingress_version INTEGER NOT NULL CHECK (ingress_version > 0),
+    execution_version INTEGER NOT NULL CHECK (execution_version > 0)
+);
+INSERT INTO billing_protocol(singleton,ingress_version,execution_version) VALUES(TRUE,1,1);
+
 ALTER TABLE account ADD COLUMN billing_state TEXT NOT NULL DEFAULT 'open'
     CHECK (billing_state IN ('open', 'closing', 'closed'));
 ALTER TABLE account ADD COLUMN billing_closed_at TIMESTAMPTZ;
@@ -117,13 +127,18 @@ CREATE TABLE billing_event (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
     object_id TEXT NOT NULL,
+    protocol_version INTEGER NOT NULL DEFAULT 1 CHECK (protocol_version > 0),
+    generation BIGINT NOT NULL DEFAULT 1 CHECK (generation > 0),
+    completed_generation BIGINT NOT NULL DEFAULT 0 CHECK (
+        completed_generation >= 0 AND completed_generation <= generation),
+    report JSONB,
     attempts INTEGER NOT NULL DEFAULT 0,
     completed_at TIMESTAMPTZ,
     last_error TEXT,
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     received_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
-CREATE INDEX idx_billing_event_pending ON billing_event(received_at) WHERE completed_at IS NULL;
+CREATE INDEX idx_billing_event_pending ON billing_event(next_attempt_at,received_at,id) WHERE completed_at IS NULL;
 
 -- Purchase-level allocation replaces pools which accidentally merged prices.
 -- This signature is also called by record_credential_issuance.

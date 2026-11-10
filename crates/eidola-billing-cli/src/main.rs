@@ -6,6 +6,8 @@ use eidola_billing::service::BillingService;
 use eidola_billing::store::{RefundOperation, RefundRequest, Store};
 use eidola_billing::stripe::StripeClient;
 use serde_json::{Value, json};
+use std::net::SocketAddr;
+use std::time::Duration;
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -17,6 +19,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run only the stable webhook receiver; needs no Stripe API key.
+    ServeWebhooks {
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        bind: SocketAddr,
+    },
+    /// Run only the durable billing work loop; opens no HTTP listener.
+    Work {
+        #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(i64).range(1..=100))]
+        batch_size: i64,
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        retry_interval_secs: u64,
+    },
     /// Inspect local billing records; no provider calls or mutations.
     Inspect(Account),
     /// Fetch current Stripe facts and reconcile this account.
@@ -126,6 +140,15 @@ impl Refund {
 async fn main() {
     let cli = Cli::parse();
     let _ = rustls_rustcrypto::provider().install_default();
+    if matches!(
+        cli.command,
+        Command::ServeWebhooks { .. } | Command::Work { .. }
+    ) {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(std::io::stderr)
+            .init();
+    }
     match run(cli).await {
         Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap()),
         Err(error) => {
@@ -151,6 +174,15 @@ async fn run(cli: Cli) -> Result<Value, BillingError> {
     .map_err(BillingError::Database)?;
     let store = Store::new(pool.clone());
     match &cli.command {
+        Command::ServeWebhooks { bind } => {
+            let secret = required_env("STRIPE_WEBHOOK_SECRET")?;
+            let shutdown = eidola_billing_cli::runtime::shutdown_signal()?;
+            let listener = tokio::net::TcpListener::bind(bind)
+                .await
+                .map_err(|_| BillingError::Network("could not bind webhook listener".into()))?;
+            eidola_billing_cli::runtime::serve_webhooks(listener, store, secret, shutdown).await?;
+            return Ok(json!({"stopped": "webhooks"}));
+        }
         Command::Inspect(args) => return inspect(&store, args.account).await,
         Command::Close {
             account,
@@ -165,6 +197,20 @@ async fn run(cli: Cli) -> Result<Value, BillingError> {
     }
     let service = BillingService::new(pool, StripeClient::new(required_env("STRIPE_API_KEY")?));
     match cli.command {
+        Command::Work {
+            batch_size,
+            retry_interval_secs,
+        } => {
+            let shutdown = eidola_billing_cli::runtime::shutdown_signal()?;
+            eidola_billing_cli::runtime::work(
+                service,
+                batch_size,
+                Duration::from_secs(retry_interval_secs),
+                shutdown,
+            )
+            .await?;
+            Ok(json!({"stopped": "worker"}))
+        }
         Command::Reconcile(args) => {
             serde_json::to_value(service.reconcile_account(args.account).await?)
                 .map_err(|_| BillingError::Parse("report serialization failed".into()))
@@ -202,7 +248,7 @@ async fn run(cli: Cli) -> Result<Value, BillingError> {
             account, reason, ..
         } => serde_json::to_value(service.close_account(account, &reason).await?)
             .map_err(|_| BillingError::Parse("report serialization failed".into())),
-        Command::Inspect(_) | Command::NewOperation => {
+        Command::Inspect(_) | Command::NewOperation | Command::ServeWebhooks { .. } => {
             unreachable!("handled before provider access")
         }
     }
@@ -317,5 +363,35 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn runtime_roles_are_explicit_and_worker_options_are_bounded() {
+        assert!(Cli::try_parse_from(["eidola-billing"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from([
+                "eidola-billing",
+                "serve-webhooks",
+                "--bind",
+                "127.0.0.1:8080"
+            ])
+            .unwrap()
+            .command,
+            Command::ServeWebhooks { .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["eidola-billing", "work"])
+                .unwrap()
+                .command,
+            Command::Work { .. }
+        ));
+        for (option, value) in [
+            ("--batch-size", "0"),
+            ("--batch-size", "101"),
+            ("--retry-interval-secs", "0"),
+            ("--retry-interval-secs", "3601"),
+        ] {
+            assert!(Cli::try_parse_from(["eidola-billing", "work", option, value]).is_err());
+        }
     }
 }

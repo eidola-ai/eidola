@@ -38,7 +38,7 @@ The server requires environment variables to work correctly. See .env.example. F
 
 There are two supported development workflows:
 
-**1. Full container stack** — postgres, server, shim, and stripe-cli all run inside docker (detached). Use this when you want a one-shot reproducible environment and don't mind rebuilding the server image:
+**1. Full container stack** — postgres, server, shim, and the optional billing receiver, worker and stripe-cli run inside docker (detached). Use this when you want a one-shot reproducible environment and don't mind rebuilding the server image:
 
 ```bash
 just dev
@@ -46,16 +46,15 @@ docker compose logs -f       # follow logs
 just down                    # stop everything
 ```
 
-**2. Host-mode server** — postgres, the tinfoil shim mock, and stripe-cli run in containers; the server runs on the host with cargo. The shim is configured to forward to `host.docker.internal:8080`, so requests from the shim and Stripe webhooks all flow into the cargo-built server. This is the recommended inner loop while iterating on `eidola-server-gateway`:
+**2. Host-mode server** — postgres, the tinfoil shim mock, and optional billing processes run in containers; the server runs on the host with cargo. The shim forwards client requests to `host.docker.internal:8080`; Stripe webhooks go directly to the separate billing receiver. This is the recommended inner loop while iterating on `eidola-server-gateway`:
 
 ```bash
-# Bring up postgres + shim + stripe-cli; captures the Stripe webhook secret
-# and writes .env.local. Stripe forwarding is enabled iff STRIPE_API_KEY is
-# set in your environment or .env.
+# Bring up postgres + shim and write .env.local. If STRIPE_API_KEY is set,
+# also start the billing receiver, worker and Stripe forwarding.
 just services
 
-# Load env vars (the .env.local override sets BIND_ADDR=0.0.0.0:8080 and
-# STRIPE_WEBHOOK_SECRET so the host server is reachable from the shim).
+# Load env vars (.env.local sets BIND_ADDR=0.0.0.0:8080 so the host server
+# is reachable from the shim; webhook credentials stay with the receiver).
 set -a; source .env; source .env.local; set +a
 
 # Run the server on the host machine with cargo
@@ -71,6 +70,8 @@ just down
 ```
 
 Both modes expose the same endpoints externally: postgres on `localhost:5432`, the shim on `https://localhost:8443`, and (in container mode) the server on `http://localhost:8080`. CLI configuration is identical across the two modes.
+
+When billing is enabled, its receiver also listens on `http://localhost:8081`; its worker has no HTTP listener. Both roles use `eidola-billing:dev` (`docker buildx bake billing`) with separate commands and credentials. They can also run through `just run billing serve-webhooks` and `just run billing work`. The [billing playbook](crates/eidola-billing-cli/README.md) describes these processes and private support commands. This repository supplies the image and development wiring; production placement, TLS and credential provisioning are operator configuration.
 
 ### CLI
 

@@ -302,7 +302,7 @@ pub struct DisputeSnapshot {
     pub status: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewItem {
     pub object_id: String,
     /// A fixed reason, never Stripe's free text or payment details.

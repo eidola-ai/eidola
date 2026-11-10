@@ -6,13 +6,13 @@
 use std::time::{Duration, SystemTime};
 
 use deadpool_postgres::Pool;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::BillingError;
 use crate::store::{
-    DisputeObservation, Purchase, ReconciliationGuard, RefundObservation, RefundOperation,
-    RefundRequest, Store,
+    DisputeObservation, INGRESS_PROTOCOL_VERSION, PendingEvent, Purchase, ReconciliationGuard,
+    RefundObservation, RefundOperation, RefundRequest, Store,
 };
 use crate::stripe::{RefundSnapshot, ReviewItem, StripeClient};
 
@@ -40,7 +40,7 @@ pub const BILLING_EVENT_TYPES: &[&str] = &[
     "charge.dispute.funds_reinstated",
 ];
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ReconcileReport {
     pub purchases: usize,
     pub refunds: usize,
@@ -279,6 +279,7 @@ impl BillingService {
             .checked_sub(age)
             .filter(|d| !d.is_zero())
             .ok_or_else(|| BillingError::RequiresReview("refund retry window elapsed".into()))?;
+        guard.ensure_compatible().await?;
         let response = tokio::time::timeout_at(
             anchor + remaining.min(Duration::from_secs(30)),
             self.stripe.create_refund(
@@ -369,11 +370,15 @@ impl BillingService {
 
     pub async fn cancel_subscriptions(&self, account_id: Uuid) -> Result<usize, BillingError> {
         let guard = self.store.lock_reconciliation(account_id).await?;
-        let result = self.cancel_subscriptions_locked(account_id).await;
+        let result = self.cancel_subscriptions_locked(account_id, &guard).await;
         finish_locked(result, guard.release().await)
     }
 
-    async fn cancel_subscriptions_locked(&self, account_id: Uuid) -> Result<usize, BillingError> {
+    async fn cancel_subscriptions_locked(
+        &self,
+        account_id: Uuid,
+        guard: &ReconciliationGuard,
+    ) -> Result<usize, BillingError> {
         let Some(customer) = self.store.customer_id(account_id).await? else {
             return Ok(0);
         };
@@ -384,6 +389,7 @@ impl BillingService {
                 subscription.status.as_str(),
                 "canceled" | "incomplete_expired"
             ) {
+                guard.ensure_compatible().await?;
                 self.stripe.cancel_subscription(&subscription.id).await?;
                 canceled += 1;
             }
@@ -406,7 +412,7 @@ impl BillingService {
             self.store
                 .begin_close_with_reason(account_id, reason)
                 .await?;
-            self.cancel_subscriptions_locked(account_id).await?;
+            self.cancel_subscriptions_locked(account_id, &guard).await?;
             let mut report = self.reconcile_locked(account_id, &mut guard, true).await?;
             // Accounts with no payment relationship still close durably.
             if self.store.customer_id(account_id).await?.is_none() {
@@ -427,7 +433,7 @@ impl BillingService {
     ) -> Result<(), BillingError> {
         // Resuming through a webhook or account repair must finish cancellation
         // too: the original closer may have stopped immediately after freezing.
-        self.cancel_subscriptions_locked(account_id).await?;
+        self.cancel_subscriptions_locked(account_id, guard).await?;
         let mut awaiting = false;
         for operation in self.store.list_refunds(account_id).await? {
             if matches!(
@@ -468,27 +474,75 @@ impl BillingService {
         Ok(())
     }
 
-    /// Retry durable webhook work only. There is no periodic Stripe scan.
+    /// Retry durable observations and commands. The database queue is scanned;
+    /// Stripe accounts are read only in response to recorded work.
     pub async fn drain_events(&self, limit: i64) -> Result<DrainReport, BillingError> {
         if !(1..=100).contains(&limit) {
             return Err(BillingError::Invalid("event limit must be 1..=100".into()));
         }
-        let events = self.store.pending_events(limit).await?;
+        self.store.check_protocol().await?;
+        // Scan past rows owned by another process instead of letting the first
+        // busy account prevent useful work for the rest of this bounded batch.
+        let events = self.store.pending_events(100).await?;
         let mut report = DrainReport::default();
-        for event in events {
+        for candidate in events {
+            if report.processed >= limit as usize {
+                break;
+            }
+            let Some(job) = self.store.claim_event(&candidate.id).await? else {
+                continue;
+            };
+            let event = job.event().clone();
             report.processed += 1;
-            if matches!(
+            if event.protocol_version != INGRESS_PROTOCOL_VERSION {
+                job.fail("unsupported_protocol").await?;
+                report.failed += 1;
+                report.review += 1;
+                continue;
+            }
+            if !matches!(
                 event.kind.as_str(),
-                "billing.refund.resume" | "billing.close.resume"
-            ) {
-                let result = async {
-                    let id = Uuid::parse_str(&event.object_id).map_err(|_| {
-                        BillingError::RequiresReview("invalid internal billing job".into())
-                    })?;
-                    if event.kind == "billing.refund.resume" {
+                "billing.refund.resume" | "billing.close.resume" | "billing.account.reconcile"
+            ) && event_object_kind(&event.kind).is_none()
+            {
+                // Older executors may encounter a newer producer's kind. It
+                // must remain visible and pending until a capable executor runs.
+                job.fail("unsupported_kind").await?;
+                report.failed += 1;
+                report.review += 1;
+                continue;
+            }
+            match self.process_event(&event).await {
+                Ok(result) => {
+                    report.review += result.review.len();
+                    job.complete((event.kind == "billing.account.reconcile").then_some(&result))
+                        .await?;
+                    report.completed += 1;
+                }
+                Err(error) => {
+                    job.fail(failure_class(&error)).await?;
+                    report.failed += 1;
+                    if matches!(error, BillingError::RequiresReview(_)) {
+                        report.review += 1;
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    async fn process_event(&self, event: &PendingEvent) -> Result<ReconcileReport, BillingError> {
+        match event.kind.as_str() {
+            "billing.refund.resume" | "billing.close.resume" | "billing.account.reconcile" => {
+                let id = Uuid::parse_str(&event.object_id).map_err(|_| {
+                    BillingError::RequiresReview("invalid internal billing job".into())
+                })?;
+                match event.kind.as_str() {
+                    "billing.refund.resume" => {
                         self.resume_refund(id).await?;
-                        Ok(0)
-                    } else {
+                        Ok(ReconcileReport::default())
+                    }
+                    "billing.close.resume" => {
                         if !matches!(
                             self.store.account_state(id).await?.as_str(),
                             "closing" | "closed"
@@ -497,35 +551,16 @@ impl BillingService {
                                 "closure was not requested".into(),
                             ));
                         }
-                        Ok(self
-                            .close_account(id, "resume recorded account closure")
-                            .await?
-                            .review
-                            .len())
+                        self.close_account(id, "resume recorded account closure")
+                            .await
                     }
+                    _ => self.reconcile_account(id).await,
                 }
-                .await;
-                match result {
-                    Ok(review) => {
-                        self.store.complete_event(&event.id).await?;
-                        report.completed += 1;
-                        report.review += review;
-                    }
-                    Err(error) => {
-                        self.store
-                            .fail_event(&event.id, failure_class(&error))
-                            .await?;
-                        report.failed += 1;
-                    }
-                }
-                continue;
             }
-            let Some(kind) = event_object_kind(&event.kind) else {
-                self.store.complete_event(&event.id).await?;
-                report.completed += 1;
-                continue;
-            };
-            let result = async {
+            _ => {
+                let kind = event_object_kind(&event.kind).ok_or_else(|| {
+                    BillingError::RequiresReview("unsupported billing event kind".into())
+                })?;
                 let customer = self
                     .stripe
                     .event_customer(kind, &event.object_id)
@@ -538,22 +573,7 @@ impl BillingService {
                     .ok_or_else(|| BillingError::RequiresReview("customer is not linked".into()))?;
                 self.reconcile_account(account_id).await
             }
-            .await;
-            match result {
-                Ok(result) => {
-                    report.review += result.review.len();
-                    self.store.complete_event(&event.id).await?;
-                    report.completed += 1;
-                }
-                Err(error) => {
-                    self.store
-                        .fail_event(&event.id, failure_class(&error))
-                        .await?;
-                    report.failed += 1;
-                }
-            }
         }
-        Ok(report)
     }
 }
 

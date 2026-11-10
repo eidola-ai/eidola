@@ -422,15 +422,15 @@
       }
     },
     "/v1/account/reconcile": {
-      "post": {
+      "get": {
         "tags": [
           "Linked"
         ],
-        "summary": "Reconcile this account's billing against current Stripe state. No supplied\naccount, provider object, amount or credit effect can expand its authority.\nThis remains available while reviewing terms and after account closure.",
-        "operationId": "reconcile_billing",
+        "summary": "Read this account's durable repair status without initiating provider work.",
+        "operationId": "get_reconciliation",
         "responses": {
           "200": {
-            "description": "Current billing reconciled; inspect review for unresolved items",
+            "description": "Repair status; report covers completed_generation",
             "content": {
               "application/json": {
                 "schema": {
@@ -449,8 +449,52 @@
               }
             }
           },
-          "409": {
-            "description": "Billing requires review",
+          "503": {
+            "description": "Billing unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Linked"
+        ],
+        "summary": "Durably request billing reconciliation for the authenticated account.\nAn independent billing worker performs the provider calls. This remains\navailable without Stripe credentials, while reviewing terms and after\naccount closure. Poll GET on this path for completion and review items.",
+        "operationId": "reconcile_billing",
+        "responses": {
+          "202": {
+            "description": "Repair request recorded; poll GET for its completed generation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReconcileResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Repair does not accept a request body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
             "content": {
               "application/json": {
                 "schema": {
@@ -852,50 +896,6 @@
           }
         }
       }
-    },
-    "/v1/webhooks/stripe": {
-      "post": {
-        "tags": [
-          "Linked"
-        ],
-        "summary": "An acknowledgment means the event is durable, not that Stripe has already\nbeen fetched. A gateway crash after this response cannot lose the work.",
-        "operationId": "stripe_webhook",
-        "responses": {
-          "200": {
-            "description": "Event durably received or type ignored"
-          },
-          "400": {
-            "description": "Invalid signature or event",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Event was not persisted; retry delivery",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Webhook secret not configured",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
     }
   },
   "components": {
@@ -1077,6 +1077,36 @@
               "$ref": "#/components/schemas/BalancePool"
             },
             "description": "Per-pool breakdown, earliest expiry first."
+          }
+        }
+      },
+      "BillingReconcileReport": {
+        "type": "object",
+        "required": [
+          "purchases",
+          "refunds",
+          "disputes",
+          "review"
+        ],
+        "properties": {
+          "disputes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "purchases": {
+            "type": "integer",
+            "description": "Counts of current provider objects examined, not newly granted credits.",
+            "minimum": 0
+          },
+          "refunds": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "review": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BillingReview"
+            }
           }
         }
       },
@@ -2463,32 +2493,50 @@
       "ReconcileResponse": {
         "type": "object",
         "required": [
-          "purchases",
-          "refunds",
-          "disputes",
-          "review"
+          "state",
+          "requested_generation",
+          "completed_generation"
         ],
         "properties": {
-          "disputes": {
+          "completed_generation": {
             "type": "integer",
-            "minimum": 0
+            "format": "int64",
+            "description": "Generation covered by `report`. While pending, this report describes\nthe last completed run, not the latest request."
           },
-          "purchases": {
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Fixed failure category from the last unsuccessful attempt, if any.\nThe durable request remains pending and may be retried by the worker."
+          },
+          "report": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BillingReconcileReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "requested_generation": {
             "type": "integer",
-            "description": "Counts of current provider objects examined, not newly granted credits.",
-            "minimum": 0
+            "format": "int64",
+            "description": "Latest durable repair request. A request arriving during a run remains\npending until a subsequent run covers its generation."
           },
-          "refunds": {
-            "type": "integer",
-            "minimum": 0
-          },
-          "review": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/BillingReview"
-            }
+          "state": {
+            "$ref": "#/components/schemas/ReconcileState"
           }
         }
+      },
+      "ReconcileState": {
+        "type": "string",
+        "enum": [
+          "idle",
+          "pending",
+          "complete"
+        ]
       },
       "RecurringResponse": {
         "type": "object",

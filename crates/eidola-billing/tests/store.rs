@@ -595,7 +595,11 @@ async fn durable_local_intents_and_provider_retries_survive_process_loss() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].object_id, op.id.to_string());
     f.store
-        .fail_event(&pending[0].id, "provider_unavailable")
+        .claim_event(&pending[0].id)
+        .await
+        .unwrap()
+        .unwrap()
+        .fail("provider_unavailable")
         .await
         .unwrap();
     assert!(f.store.pending_events(100).await.unwrap().is_empty());
@@ -610,6 +614,175 @@ async fn durable_local_intents_and_provider_retries_survive_process_loss() {
         f.store.pending_events(100).await.unwrap()[0].kind,
         "billing.close.resume"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn inbox_claims_exclude_other_connections_and_recheck_stale_candidates() {
+    let f = fixture().await;
+    let other = Store::new(f.pool.clone());
+    f.store
+        .enqueue_event("evt_claim", "refund.updated", "re_claim")
+        .await
+        .unwrap();
+    let selected = other.pending_events(32).await.unwrap();
+    let claim = f.store.claim_event("evt_claim").await.unwrap().unwrap();
+    assert!(other.claim_event("evt_claim").await.unwrap().is_none());
+    claim.complete(None).await.unwrap();
+    assert!(other.claim_event(&selected[0].id).await.unwrap().is_none());
+    assert!(other.pending_events(32).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn a_lost_inbox_connection_cannot_complete_work_claimed_by_its_replacement() {
+    let f = fixture().await;
+    let status = f.store.request_reconciliation(f.account).await.unwrap();
+    assert_eq!(status.requested_generation, 1);
+    let id = format!("billing.reconcile:{}", f.account);
+    let old = f.store.claim_event(&id).await.unwrap().unwrap();
+    let c = f.pool.get().await.unwrap();
+    let killed: bool = c.query_one(
+        "SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype='advisory' AND granted \
+         AND classid=hashtext('eidola-billing-event')::OID AND objid=hashtext($1)::OID AND objsubid=2",
+        &[&id],
+    ).await.unwrap().get(0);
+    assert!(killed);
+    f.store.request_reconciliation(f.account).await.unwrap();
+    let replacement = f.store.claim_event(&id).await.unwrap().unwrap();
+    assert!(old.complete(None).await.is_err());
+    assert_eq!(
+        f.store
+            .reconciliation_status(f.account)
+            .await
+            .unwrap()
+            .completed_generation,
+        0
+    );
+    // Cancellation drops the session; there is no lease timeout before recovery.
+    drop(replacement);
+    let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(claim) = f.store.claim_event(&id).await.unwrap() {
+                break claim;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(recovered.event().generation, 2);
+    recovered
+        .complete(Some(&eidola_billing::service::ReconcileReport::default()))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .reconciliation_status(f.account)
+            .await
+            .unwrap()
+            .completed_generation,
+        2
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn a_repair_requested_during_processing_survives_completion_of_the_older_generation() {
+    let f = fixture().await;
+    let idle = f.store.reconciliation_status(f.account).await.unwrap();
+    assert_eq!(
+        (idle.requested_generation, idle.completed_generation),
+        (0, 0)
+    );
+    f.store.request_reconciliation(f.account).await.unwrap();
+    let id = format!("billing.reconcile:{}", f.account);
+    let first = f.store.claim_event(&id).await.unwrap().unwrap();
+    f.store.request_reconciliation(f.account).await.unwrap();
+    let mut report = eidola_billing::service::ReconcileReport {
+        purchases: 1,
+        ..Default::default()
+    };
+    first.complete(Some(&report)).await.unwrap();
+    let pending = f.store.reconciliation_status(f.account).await.unwrap();
+    assert_eq!(
+        (pending.requested_generation, pending.completed_generation),
+        (2, 1)
+    );
+    assert_eq!(pending.report.unwrap().purchases, 1);
+    let second = f.store.claim_event(&id).await.unwrap().unwrap();
+    report.purchases = 2;
+    second.complete(Some(&report)).await.unwrap();
+    let complete = f.store.reconciliation_status(f.account).await.unwrap();
+    assert_eq!(
+        (complete.requested_generation, complete.completed_generation),
+        (2, 2)
+    );
+    assert_eq!(complete.report.unwrap().purchases, 2);
+    assert!(f.store.pending_events(32).await.unwrap().is_empty());
+    assert_eq!(
+        f.store
+            .reconciliation_status(Uuid::new_v4())
+            .await
+            .unwrap()
+            .requested_generation,
+        0
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn repeated_repair_requests_do_not_bypass_backoff_or_grow_the_queue() {
+    let f = fixture().await;
+    f.store.request_reconciliation(f.account).await.unwrap();
+    let id = format!("billing.reconcile:{}", f.account);
+    f.store
+        .claim_event(&id)
+        .await
+        .unwrap()
+        .unwrap()
+        .fail("provider_unavailable")
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        f.store.request_reconciliation(f.account).await.unwrap();
+    }
+    assert!(f.store.pending_events(32).await.unwrap().is_empty());
+    let row = f
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT count(*),max(attempts) FROM billing_event", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>(0), 1);
+    assert_eq!(row.get::<_, i32>(1), 1);
+    let status = f.store.reconciliation_status(f.account).await.unwrap();
+    assert_eq!(status.requested_generation, 11);
+    assert_eq!(status.last_error.as_deref(), Some("provider_unavailable"));
+}
+
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn a_hot_repair_returns_to_the_back_of_due_work_after_each_generation() {
+    let f = fixture().await;
+    f.store.request_reconciliation(f.account).await.unwrap();
+    let id = format!("billing.reconcile:{}", f.account);
+    let first = f.store.claim_event(&id).await.unwrap().unwrap();
+    f.store
+        .enqueue_event("evt_waiting", "refund.updated", "re_waiting")
+        .await
+        .unwrap();
+    f.store.request_reconciliation(f.account).await.unwrap();
+    first
+        .complete(Some(&eidola_billing::service::ReconcileReport::default()))
+        .await
+        .unwrap();
+    let due = f.store.pending_events(32).await.unwrap();
+    assert_eq!(due.len(), 2);
+    assert_eq!(due[0].id, "evt_waiting");
+    assert_eq!(due[1].id, id);
 }
 
 #[tokio::test]

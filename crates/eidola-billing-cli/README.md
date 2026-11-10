@@ -1,6 +1,6 @@
 # Billing support playbook
 
-`eidola-billing` is a private operator tool. It connects directly to PostgreSQL and Stripe using the credentials of the human or workload running it. The gateway has no administrative refund or adjustment endpoint. Its account-holder repair endpoint invokes the same reconciliation code, scoped to the authenticated account and its stored Stripe customer.
+`eidola-billing` provides private operator commands and separately runnable webhook receiver and worker roles. It connects directly to PostgreSQL and Stripe using the credentials of the human or workload running it. The gateway has no administrative refund or adjustment endpoint. Its account-holder repair endpoint records a durable request scoped to the authenticated account; workers reconcile that account and its stored Stripe customer.
 
 The [terms of service](../../www/pages/terms.md) govern eligibility. This playbook describes how to carry out that policy; it does not narrow legal remedies or replace case-specific judgment.
 
@@ -12,6 +12,36 @@ The database records its authenticated `current_user` for billing operations. Us
 
 Commands return JSON. Account and payment references in that output are private support data. Keep case references concise; do not copy customer messages or payment details into reasons. No command inspects, identifies, redeems, or revokes ACTs.
 
+## Receiver and worker processes
+
+Run the two roles independently, with as many replicas of each as needed:
+
+```sh
+eidola-billing serve-webhooks --bind 0.0.0.0:8080
+eidola-billing work --batch-size 32 --retry-interval-secs 5
+```
+
+The receiver needs the database settings above and `STRIPE_WEBHOOK_SECRET`. It does **not** need `STRIPE_API_KEY`, and does not execute reconciliation or start workers. Direct Stripe webhooks to `POST /v1/webhooks/stripe` on this stable deployment. It serves plain HTTP behind the deployment's HTTPS termination, including a Tinfoil shim if desired. `GET /healthz` checks database connectivity and the ingress protocol. The receiver limits request bodies to 2 MiB, authenticates the exact raw bytes, and stores only the supported event's ID, type, and object ID. It acknowledges a supported event only after the database commits it; a failed write returns a non-success response for Stripe to retry. Unsupported event types are acknowledged without storing them.
+
+The worker needs the database settings and `STRIPE_API_KEY`, but no webhook secret. It opens no HTTP listener. Its timer retries pending database work, including webhook observations, account repair requests, and interrupted refunds/closures; it never periodically scans Stripe accounts. Each process handles one batch at a time. Scale worker containers for parallel accounts. Database locks coordinate duplicate deliveries, multiple workers, and direct support commands; durable operation identities and Stripe idempotency remain necessary when a process loses a provider response.
+
+Both roles handle SIGTERM and SIGINT. Receivers stop accepting connections and allow active requests up to 30 seconds to finish. Workers stop taking new batches and allow an active batch up to 30 seconds to finish. After that, incomplete work remains durable and its database locks are released when the process exits. Set the container termination grace longer than 30 seconds. Runtime logs report fixed failure categories/counts to stderr without event bodies, account references, or credentials.
+
+The image recipe is [oci/eidola-billing/Containerfile](../../oci/eidola-billing/Containerfile). Build from the repository root:
+
+```sh
+docker buildx build --platform linux/amd64 --load \
+  -f oci/eidola-billing/Containerfile -t eidola-billing .
+docker run --rm --env-file /path/to/receiver.env -p 8080:8080 \
+  eidola-billing serve-webhooks --bind 0.0.0.0:8080
+docker run --rm --env-file /path/to/worker.env \
+  eidola-billing work --batch-size 32 --retry-interval-secs 5
+```
+
+The same non-root, static image runs either role or an operator command; no role starts implicitly. Keep secret files outside the repository. Production hostname, TLS, credentials, replication, monitoring, and deployment manifests belong to the operator's deployment configuration, which may live in a private repository. Monitor pending-work age and repeated failures in `billing_event`; a healthy receiver confirms durable delivery, not that the worker has completed the financial effect.
+
+Ingress and financial execution have separate database protocol versions. A receiver or gateway may continue recording v1 requests while compatible workers evolve. Workers and direct operator commands refuse incompatible execution versions before performing financial work. An incompatible change requires stopping and draining old workers/operator processes before changing the execution version/schema and starting the new build; do not change that version underneath an admitted operation. Unsupported job kinds or versions remain pending for review rather than being silently marked complete.
+
 ## Inspect and repair
 
 ```sh
@@ -22,7 +52,9 @@ eidola-billing drain-events --limit 32
 
 `inspect` reads local records. `reconcile` fetches current Stripe state, verifies purchase provenance, and atomically applies that account's purchases, refunds, and disputes. It also resumes already-approved refund operations and account closures. It cannot choose a new discretionary credit effect.
 
-The gateway durably records verified webhook identities before acknowledging them. Its worker drains this same database work queue, including interrupted internal operations. Provider facts are fetched through the same reconciliation path; there is no independent periodic Stripe scan. Events can arrive twice or out of order without creating a second business operation.
+The stable receiver durably records verified webhook identities before acknowledging them. Separately deployed workers drain this database work queue, including interrupted internal operations. Provider facts are fetched through the same reconciliation path. Events can arrive twice or out of order without creating a second business operation.
+
+Account holders request repair through authenticated `POST /v1/account/reconcile` and read its status through `GET /v1/account/reconcile`; neither requires accepting new terms or a configured gateway Stripe client. The response tracks requested and completed generations so a request arriving during a running repair remains pending. A completed report records observations and unresolved review items; it is not a promise that a pending Stripe refund has settled. Direct `eidola-billing reconcile` remains available to an operator under the same account lock.
 
 Read `review` items in the result. Unknown grant terms, unsupported payment funding, or an ambiguous old refund attempt require investigation. Do not guess cash value from credit face value. An unexplained external refund is recorded without canceling credits; decide any remedy explicitly.
 

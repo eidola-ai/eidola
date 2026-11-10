@@ -193,6 +193,29 @@ pub struct CashDebt {
 
 #[derive(Serialize, ToSchema)]
 pub struct ReconcileResponse {
+    pub state: ReconcileState,
+    /// Latest durable repair request. A request arriving during a run remains
+    /// pending until a subsequent run covers its generation.
+    pub requested_generation: i64,
+    /// Generation covered by `report`. While pending, this report describes
+    /// the last completed run, not the latest request.
+    pub completed_generation: i64,
+    pub report: Option<BillingReconcileReport>,
+    /// Fixed failure category from the last unsuccessful attempt, if any.
+    /// The durable request remains pending and may be retried by the worker.
+    pub last_error: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileState {
+    Idle,
+    Pending,
+    Complete,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct BillingReconcileReport {
     /// Counts of current provider objects examined, not newly granted credits.
     pub purchases: usize,
     pub refunds: usize,
@@ -204,6 +227,37 @@ pub struct ReconcileResponse {
 pub struct BillingReview {
     pub object_id: String,
     pub reason: String,
+}
+
+impl From<eidola_billing::store::RepairStatus> for ReconcileResponse {
+    fn from(status: eidola_billing::store::RepairStatus) -> Self {
+        let state = if status.requested_generation == 0 {
+            ReconcileState::Idle
+        } else if status.requested_generation > status.completed_generation {
+            ReconcileState::Pending
+        } else {
+            ReconcileState::Complete
+        };
+        Self {
+            state,
+            requested_generation: status.requested_generation,
+            completed_generation: status.completed_generation,
+            report: status.report.map(|report| BillingReconcileReport {
+                purchases: report.purchases,
+                refunds: report.refunds,
+                disputes: report.disputes,
+                review: report
+                    .review
+                    .into_iter()
+                    .map(|item| BillingReview {
+                        object_id: item.object_id,
+                        reason: item.reason,
+                    })
+                    .collect(),
+            }),
+            last_error: status.last_error,
+        }
+    }
 }
 
 /// One balance pool: credits sharing an origin and expiration.
@@ -678,7 +732,7 @@ pub async fn create_checkout(
     // The external session can outlive this call; a later payment on a closed
     // account is reconciled into its closure refund workflow.
     let store = eidola_billing::store::Store::new(state.db_pool.clone());
-    let _guard = store.lock_reconciliation(account_id).await?;
+    let _guard = store.lock_checkout(account_id).await?;
     if db::get_account_by_id(&state.db_pool, account_id)
         .await?
         .billing_state
@@ -786,18 +840,19 @@ pub async fn create_checkout(
     Ok(Json(CheckoutUrlResponse { checkout_url }))
 }
 
-/// Reconcile this account's billing against current Stripe state. No supplied
-/// account, provider object, amount or credit effect can expand its authority.
-/// This remains available while reviewing terms and after account closure.
+/// Durably request billing reconciliation for the authenticated account.
+/// An independent billing worker performs the provider calls. This remains
+/// available without Stripe credentials, while reviewing terms and after
+/// account closure. Poll GET on this path for completion and review items.
 #[utoipa::path(
     post,
     path = "/v1/account/reconcile",
     tag = "Linked",
     security(("basic" = [])),
     responses(
-        (status = 200, description = "Current billing reconciled; inspect review for unresolved items", body = ReconcileResponse),
+        (status = 202, description = "Repair request recorded; poll GET for its completed generation", body = ReconcileResponse),
+        (status = 400, description = "Repair does not accept a request body", body = crate::types::ErrorResponse),
         (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
-        (status = 409, description = "Billing requires review", body = crate::types::ErrorResponse),
         (status = 503, description = "Billing unavailable", body = crate::types::ErrorResponse)
     )
 )]
@@ -805,24 +860,40 @@ pub async fn create_checkout(
 pub async fn reconcile_billing(
     BasicAuth(account_id): BasicAuth,
     State(state): State<AppState>,
+    body: bytes::Bytes,
+) -> Result<(StatusCode, Json<ReconcileResponse>), ServerError> {
+    if !body.is_empty() {
+        return Err(ServerError::BadRequest {
+            message: "billing repair does not accept a request body".into(),
+        });
+    }
+    let status = eidola_billing::store::Store::new(state.db_pool.clone())
+        .request_reconciliation(account_id)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(status.into())))
+}
+
+/// Read this account's durable repair status without initiating provider work.
+#[utoipa::path(
+    get,
+    path = "/v1/account/reconcile",
+    tag = "Linked",
+    security(("basic" = [])),
+    responses(
+        (status = 200, description = "Repair status; report covers completed_generation", body = ReconcileResponse),
+        (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
+        (status = 503, description = "Billing unavailable", body = crate::types::ErrorResponse)
+    )
+)]
+#[tracing::instrument(skip_all, name = "account.reconcile_status", err)]
+pub async fn get_reconciliation(
+    BasicAuth(account_id): BasicAuth,
+    State(state): State<AppState>,
 ) -> Result<Json<ReconcileResponse>, ServerError> {
-    let stripe = require_stripe(&state.stripe)?;
-    let service =
-        eidola_billing::service::BillingService::new(state.db_pool.clone(), stripe.clone());
-    let report = service.reconcile_account(account_id).await?;
-    Ok(Json(ReconcileResponse {
-        purchases: report.purchases,
-        refunds: report.refunds,
-        disputes: report.disputes,
-        review: report
-            .review
-            .into_iter()
-            .map(|item| BillingReview {
-                object_id: item.object_id,
-                reason: item.reason,
-            })
-            .collect(),
-    }))
+    let status = eidola_billing::store::Store::new(state.db_pool.clone())
+        .reconciliation_status(account_id)
+        .await?;
+    Ok(Json(status.into()))
 }
 
 /// Ensure the account has a Stripe customer ID, creating one if needed.

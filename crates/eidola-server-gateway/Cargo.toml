@@ -72,11 +72,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.23"
 hex = "0.4"
 
-# Webhook signature verification; hashing the engine route key, whose hasher
-# state is scrubbed on drop (`zeroize`).
-hmac = "0.13"
+# Hashing the engine route key; its hasher state is scrubbed on drop (`zeroize`).
 sha2 = { version = "0.11", features = ["zeroize"] }
-subtle = "2"
 
 # Shared client/server contract logic (pricing formula; `spend-credentials`: the
 # one spelling of a request's `credentials` member, and the ACT parameter `L`)

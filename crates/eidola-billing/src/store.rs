@@ -11,6 +11,12 @@ use tokio_postgres::Row;
 use uuid::Uuid;
 
 use crate::BillingError;
+use crate::service::ReconcileReport;
+
+/// Stable command envelope understood by gateway and webhook producers.
+pub const INGRESS_PROTOCOL_VERSION: i32 = 1;
+/// Billing semantics admitted by this worker / private CLI implementation.
+pub const EXECUTION_PROTOCOL_VERSION: i32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Purchase {
@@ -93,6 +99,17 @@ pub struct PendingEvent {
     pub kind: String,
     pub object_id: String,
     pub attempts: i32,
+    pub protocol_version: i32,
+    pub generation: i64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct RepairStatus {
+    pub requested_generation: i64,
+    pub completed_generation: i64,
+    /// The report for completed_generation; it may predate a pending request.
+    pub report: Option<ReconcileReport>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -107,6 +124,59 @@ fn db(e: tokio_postgres::Error) -> BillingError {
             .map_or("database connection failed", |v| v.code())
             .into(),
     )
+}
+
+async fn check_protocol(c: &tokio_postgres::Client, ingress: bool) -> Result<(), BillingError> {
+    let row = c
+        .query_opt(
+            "SELECT ingress_version,execution_version FROM billing_protocol WHERE singleton",
+            &[],
+        )
+        .await
+        .map_err(db)?
+        .ok_or_else(|| {
+            BillingError::ServiceUnavailable("billing protocol is not configured".into())
+        })?;
+    let supported = if ingress {
+        INGRESS_PROTOCOL_VERSION
+    } else {
+        EXECUTION_PROTOCOL_VERSION
+    };
+    let actual: i32 = row.get(if ingress {
+        "ingress_version"
+    } else {
+        "execution_version"
+    });
+    if actual != supported {
+        return Err(BillingError::ServiceUnavailable(
+            "billing protocol is incompatible".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn row_pending_event(r: Row) -> PendingEvent {
+    PendingEvent {
+        id: r.get("id"),
+        kind: r.get("kind"),
+        object_id: r.get("object_id"),
+        attempts: r.get("attempts"),
+        protocol_version: r.get("protocol_version"),
+        generation: r.get("generation"),
+    }
+}
+
+fn row_repair_status(r: Row) -> Result<RepairStatus, BillingError> {
+    let report: Option<serde_json::Value> = r.get("report");
+    Ok(RepairStatus {
+        requested_generation: r.get("generation"),
+        completed_generation: r.get("completed_generation"),
+        report: report
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| BillingError::Parse("stored repair report is incompatible".into()))?,
+        last_error: r.get("last_error"),
+    })
 }
 
 fn row_purchase(r: Row) -> Purchase {
@@ -387,7 +457,7 @@ async fn observe_refund(
                     .await?;
                 }
                 c.execute(
-                    "UPDATE billing_event SET completed_at=clock_timestamp() WHERE id=$1",
+                    "UPDATE billing_event SET completed_at=clock_timestamp(),completed_generation=generation WHERE id=$1",
                     &[&format!("local:refund:{id}")],
                 )
                 .await
@@ -573,6 +643,17 @@ impl Store {
     pub fn pool(&self) -> &Pool {
         &self.pool
     }
+    /// Check executable billing semantics before starting a worker or operator
+    /// command. Account execution checks again after acquiring its lock.
+    pub async fn check_protocol(&self) -> Result<(), BillingError> {
+        let client = self.client().await?;
+        check_protocol(&client, false).await
+    }
+    /// Receiver / gateway producers only depend on the stable command envelope.
+    pub async fn check_ingress_protocol(&self) -> Result<(), BillingError> {
+        let client = self.client().await?;
+        check_protocol(&client, true).await
+    }
     /// Retry windows use the database clock that stamped submission, never a
     /// support operator's potentially skewed laptop clock.
     pub(crate) async fn current_time(&self) -> Result<SystemTime, BillingError> {
@@ -748,7 +829,7 @@ impl Store {
             return Err(BillingError::Conflict("refund rejection does not match submission".into()));
         }
         tx.execute(
-            "UPDATE billing_event SET completed_at=clock_timestamp() WHERE id=$1",
+            "UPDATE billing_event SET completed_at=clock_timestamp(),completed_generation=generation WHERE id=$1",
             &[&format!("local:refund:{id}")],
         )
         .await
@@ -794,7 +875,7 @@ impl Store {
         .await
         .map_err(db)?;
         tx.execute(
-            "UPDATE billing_event SET completed_at=clock_timestamp() WHERE id=$1",
+            "UPDATE billing_event SET completed_at=clock_timestamp(),completed_generation=generation WHERE id=$1",
             &[&format!("local:refund:{id}")],
         )
         .await
@@ -924,7 +1005,7 @@ impl Store {
         .await
         .map_err(db)?;
         tx.execute(
-            "UPDATE billing_event SET completed_at=clock_timestamp() WHERE id=$1",
+            "UPDATE billing_event SET completed_at=clock_timestamp(),completed_generation=generation WHERE id=$1",
             &[&format!("local:refund:{id}")],
         )
         .await
@@ -1051,11 +1132,12 @@ impl Store {
         object_id: &str,
     ) -> Result<bool, BillingError> {
         let c = self.client().await?;
+        check_protocol(&c, true).await?;
         let inserted=c.execute("INSERT INTO billing_event(id,kind,object_id) VALUES($1,$2,$3) ON CONFLICT(id) DO NOTHING", &[&id,&kind,&object_id]).await.map_err(db)?;
         if inserted == 0 {
             let old = c
                 .query_one(
-                    "SELECT kind,object_id FROM billing_event WHERE id=$1",
+                    "SELECT kind,object_id,protocol_version FROM billing_event WHERE id=$1",
                     &[&id],
                 )
                 .await
@@ -1063,55 +1145,136 @@ impl Store {
             if old.get::<_, String>(0) != kind || old.get::<_, String>(1) != object_id {
                 return Err(BillingError::Conflict("event id payload changed".into()));
             }
+            if old.get::<_, i32>(2) != INGRESS_PROTOCOL_VERSION {
+                return Err(BillingError::Conflict("event protocol changed".into()));
+            }
         }
         Ok(inserted > 0)
     }
+
+    /// One row per account bounds storage for repeated repair requests. Each
+    /// request advances a generation, so a request arriving during an active
+    /// provider read cannot disappear when that earlier read completes.
+    pub async fn request_reconciliation(
+        &self,
+        account: Uuid,
+    ) -> Result<RepairStatus, BillingError> {
+        let c = self.client().await?;
+        check_protocol(&c, true).await?;
+        let id = format!("billing.reconcile:{account}");
+        let row = c.query_opt(
+            "INSERT INTO billing_event(id,kind,object_id) \
+             SELECT $1,'billing.account.reconcile',$2 FROM account WHERE id=$3 \
+             ON CONFLICT(id) DO UPDATE SET generation=billing_event.generation+1,completed_at=NULL, \
+             next_attempt_at=CASE WHEN billing_event.completed_at IS NOT NULL THEN clock_timestamp() ELSE billing_event.next_attempt_at END, \
+             attempts=CASE WHEN billing_event.completed_at IS NOT NULL THEN 0 ELSE billing_event.attempts END, \
+             last_error=CASE WHEN billing_event.completed_at IS NOT NULL THEN NULL ELSE billing_event.last_error END \
+             WHERE billing_event.kind='billing.account.reconcile' AND billing_event.object_id=$2 \
+             AND billing_event.protocol_version=1 \
+             RETURNING generation,completed_generation,report,last_error",
+            &[&id, &account.to_string(), &account],
+        ).await.map_err(db)?.ok_or_else(|| BillingError::Conflict("account repair cannot be requested".into()))?;
+        row_repair_status(row)
+    }
+
+    pub async fn reconciliation_status(&self, account: Uuid) -> Result<RepairStatus, BillingError> {
+        let c = self.client().await?;
+        check_protocol(&c, true).await?;
+        let Some(row) = c.query_opt(
+            "SELECT kind,object_id,protocol_version,generation,completed_generation,report,last_error \
+             FROM billing_event WHERE id=$1", &[&format!("billing.reconcile:{account}")],
+        ).await.map_err(db)? else { return Ok(RepairStatus::default()); };
+        if row.get::<_, String>("kind") != "billing.account.reconcile"
+            || row.get::<_, String>("object_id") != account.to_string()
+            || row.get::<_, i32>("protocol_version") != INGRESS_PROTOCOL_VERSION
+        {
+            return Err(BillingError::ServiceUnavailable(
+                "account repair protocol is incompatible".into(),
+            ));
+        }
+        row_repair_status(row)
+    }
+
     pub async fn pending_events(&self, limit: i64) -> Result<Vec<PendingEvent>, BillingError> {
         let limit = limit.clamp(1, 100);
         Ok(self
             .client()
             .await?
             .query(
-                "SELECT id,kind,object_id,attempts FROM billing_event WHERE completed_at IS NULL \
-            AND next_attempt_at<=clock_timestamp() ORDER BY received_at,id LIMIT $1",
+                "SELECT id,kind,object_id,attempts,protocol_version,generation FROM billing_event WHERE completed_at IS NULL \
+            AND next_attempt_at<=clock_timestamp() ORDER BY next_attempt_at,received_at,id LIMIT $1",
                 &[&limit],
             )
             .await
             .map_err(db)?
             .into_iter()
-            .map(|r| PendingEvent {
-                id: r.get(0),
-                kind: r.get(1),
-                object_id: r.get(2),
-                attempts: r.get(3),
-            })
+            .map(row_pending_event)
             .collect())
+    }
+
+    /// Claim a candidate on a detached session, then re-read its eligibility.
+    /// The selection above is only a hint: another process can complete the
+    /// item before this process gets here. No SQL transaction spans Stripe I/O.
+    pub async fn claim_event(&self, id: &str) -> Result<Option<EventGuard>, BillingError> {
+        static LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+        let permit = LIMIT
+            .get_or_init(|| Arc::new(Semaphore::new(4)))
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| BillingError::ServiceUnavailable("billing workers are busy".into()))?;
+        let client = Client::take(self.client().await?);
+        let acquired: bool = client
+            .query_one(
+                "SELECT pg_try_advisory_lock(hashtext('eidola-billing-event'),hashtext($1))",
+                &[&id],
+            )
+            .await
+            .map_err(db)?
+            .get(0);
+        if !acquired {
+            return Ok(None);
+        }
+        check_protocol(&client, false).await?;
+        let Some(row) = client
+            .query_opt(
+                "SELECT id,kind,object_id,attempts,protocol_version,generation FROM billing_event \
+             WHERE id=$1 AND completed_at IS NULL AND next_attempt_at<=clock_timestamp()",
+                &[&id],
+            )
+            .await
+            .map_err(db)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(EventGuard {
+            client: Some(client),
+            event: row_pending_event(row),
+            _permit: permit,
+        }))
     }
     pub async fn review_issues(&self, account: Uuid) -> Result<Vec<ReviewIssue>, BillingError> {
         Ok(self.client().await?.query("SELECT kind,id,reason FROM billing_unmatched_observation WHERE account_id=$1 ORDER BY kind,id", &[&account]).await.map_err(db)?
             .into_iter().map(|r|ReviewIssue{kind:r.get(0),id:r.get(1),reason:r.get(2)}).collect())
     }
-    pub async fn complete_event(&self, id: &str) -> Result<(), BillingError> {
-        self.client().await?.execute("UPDATE billing_event SET completed_at=COALESCE(completed_at,clock_timestamp()),last_error=NULL WHERE id=$1", &[&id]).await.map_err(db)?;
-        Ok(())
-    }
-    pub async fn fail_event(&self, id: &str, reason: &str) -> Result<(), BillingError> {
-        // Fixed categories only; no Stripe-provided text or personal information.
-        let reason = match reason {
-            "requires_review" | "provider_unavailable" | "database_unavailable" | "conflict" => {
-                reason
-            }
-            _ => "reconciliation_failed",
-        };
-        self.client().await?.execute("UPDATE billing_event SET attempts=LEAST(attempts+1,30),last_error=$2, \
-            next_attempt_at=clock_timestamp()+make_interval(secs=>LEAST(3600,5*power(2,LEAST(attempts,10)))::DOUBLE PRECISION) \
-            WHERE id=$1 AND completed_at IS NULL", &[&id,&reason]).await.map_err(db)?;
-        Ok(())
-    }
-
     pub async fn lock_reconciliation(
         &self,
         account: Uuid,
+    ) -> Result<ReconciliationGuard, BillingError> {
+        self.lock_account_work(account, false).await
+    }
+
+    /// Checkout publishes v1 purchase metadata and coordinates with account
+    /// reconciliation, but never executes the worker's evolving billing rules.
+    pub async fn lock_checkout(&self, account: Uuid) -> Result<CheckoutGuard, BillingError> {
+        Ok(CheckoutGuard {
+            inner: self.lock_account_work(account, true).await?,
+        })
+    }
+
+    async fn lock_account_work(
+        &self,
+        account: Uuid,
+        ingress: bool,
     ) -> Result<ReconciliationGuard, BillingError> {
         static LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
         let permit = LIMIT
@@ -1131,11 +1294,72 @@ impl Store {
                 "account reconciliation is already running".into(),
             ));
         }
+        check_protocol(&client, ingress).await?;
         Ok(ReconciliationGuard {
             client: Some(client),
             account,
             _permit: permit,
         })
+    }
+}
+
+pub struct CheckoutGuard {
+    inner: ReconciliationGuard,
+}
+
+impl CheckoutGuard {
+    pub async fn release(self) -> Result<(), BillingError> {
+        self.inner.release().await
+    }
+}
+
+/// A work item belongs to this database session until completion or drop.
+/// If the process/connection disappears, another worker can claim the still
+/// pending row. An old guard can never finish through a replacement connection.
+pub struct EventGuard {
+    client: Option<ClientWrapper>,
+    event: PendingEvent,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl EventGuard {
+    pub fn event(&self) -> &PendingEvent {
+        &self.event
+    }
+
+    pub async fn complete(self, report: Option<&ReconcileReport>) -> Result<(), BillingError> {
+        let report = report
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| BillingError::Parse("repair report serialization failed".into()))?;
+        self.client.as_ref().expect("guard not released").execute(
+            "UPDATE billing_event SET completed_generation=GREATEST(completed_generation,$2), \
+             completed_at=CASE WHEN generation=$2 THEN COALESCE(completed_at,clock_timestamp()) ELSE NULL END, \
+             report=COALESCE($3::JSONB,report),last_error=NULL,attempts=0,next_attempt_at=clock_timestamp() \
+             WHERE id=$1 AND completed_generation<=$2 AND generation>=$2",
+            &[&self.event.id, &self.event.generation, &report],
+        ).await.map_err(db)?;
+        Ok(())
+    }
+
+    pub async fn fail(self, reason: &str) -> Result<(), BillingError> {
+        // Only fixed categories enter this column; never a provider response.
+        let reason = match reason {
+            "requires_review"
+            | "provider_unavailable"
+            | "database_unavailable"
+            | "conflict"
+            | "unsupported_kind"
+            | "unsupported_protocol" => reason,
+            _ => "reconciliation_failed",
+        };
+        self.client.as_ref().expect("guard not released").execute(
+            "UPDATE billing_event SET attempts=LEAST(attempts+1,30),last_error=$2, \
+             next_attempt_at=clock_timestamp()+make_interval(secs=>LEAST(3600,5*power(2,LEAST(attempts,10)))::DOUBLE PRECISION) \
+             WHERE id=$1 AND completed_at IS NULL",
+            &[&self.event.id,&reason],
+        ).await.map_err(db)?;
+        Ok(())
     }
 }
 
@@ -1146,6 +1370,12 @@ pub struct ReconciliationGuard {
 }
 
 impl ReconciliationGuard {
+    /// Recheck the actual lock connection immediately before provider writes.
+    /// An uncertain provider outcome still uses the durable operation identity.
+    pub async fn ensure_compatible(&self) -> Result<(), BillingError> {
+        check_protocol(self.client.as_ref().expect("guard not released"), false).await
+    }
+
     pub async fn mark_refund_rejected(&mut self, id: Uuid) -> Result<(), BillingError> {
         let tx = self
             .client
@@ -1165,7 +1395,7 @@ impl ReconciliationGuard {
             return Err(BillingError::Conflict("refund rejection does not match submission".into()));
         }
         tx.execute(
-            "UPDATE billing_event SET completed_at=clock_timestamp() WHERE id=$1",
+            "UPDATE billing_event SET completed_at=clock_timestamp(),completed_generation=generation WHERE id=$1",
             &[&format!("local:refund:{id}")],
         )
         .await

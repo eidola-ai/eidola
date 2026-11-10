@@ -2924,12 +2924,16 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "deadpool-postgres",
+ "hex",
+ "hmac 0.13.0",
  "reqwest",
  "rustls",
  "rustls-pki-types",
  "rustls-rustcrypto",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "subtle",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
@@ -2942,11 +2946,20 @@ dependencies = [
 name = "eidola-billing-cli"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "clap",
+ "deadpool-postgres",
  "eidola-billing",
+ "hex",
+ "hmac 0.13.0",
+ "reqwest",
  "rustls-rustcrypto",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
+ "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -3155,7 +3168,6 @@ dependencies = [
  "futures-util",
  "hex",
  "hkdf 0.13.0",
- "hmac 0.13.0",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
@@ -3169,7 +3181,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "subtle",
  "tinfoil-shim-mock",
  "tinfoil-verifier",
  "tokio",

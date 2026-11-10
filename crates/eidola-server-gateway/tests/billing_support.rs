@@ -17,14 +17,11 @@ use deadpool_postgres::{Manager, Pool};
 use eidola_server_gateway::{
     AppState, backend::Catalog, credentials::KeyCache, stripe::StripeClient,
 };
-use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
-use sha2::Sha256;
 use tokio_postgres::NoTls;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-const WEBHOOK_SECRET: &str = "whsec_billing_boundary_test";
 const ACCOUNT_SECRET: &str = "billing-boundary-secret";
 
 struct TestDb {
@@ -74,7 +71,6 @@ impl TestDb {
             None,
             self.pool.clone(),
             stripe,
-            Some(WEBHOOK_SECRET.into()),
             [0; 32],
             KeyCache::default(),
         )
@@ -114,114 +110,6 @@ fn auth(account: Uuid) -> String {
         "Basic {}",
         base64::engine::general_purpose::STANDARD.encode(format!("{account}:{ACCOUNT_SECRET}"))
     )
-}
-
-fn signature(body: &[u8]) -> String {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut mac = Hmac::<Sha256>::new_from_slice(WEBHOOK_SECRET.as_bytes()).unwrap();
-    mac.update(timestamp.to_string().as_bytes());
-    mac.update(b".");
-    mac.update(body);
-    format!(
-        "t={timestamp},v1={}",
-        hex::encode(mac.finalize().into_bytes())
-    )
-}
-
-fn webhook_request(body: &[u8], valid: bool) -> Request<Body> {
-    Request::builder()
-        .method("POST")
-        .uri("/v1/webhooks/stripe")
-        .header("content-type", "application/json")
-        .header(
-            "stripe-signature",
-            if valid {
-                signature(body)
-            } else {
-                "t=0,v1=00".into()
-            },
-        )
-        .body(Body::from(body.to_vec()))
-        .unwrap()
-}
-
-#[tokio::test]
-#[ignore = "requires BILLING_TEST_DATABASE_URL"]
-async fn webhook_acknowledges_only_a_durable_inbox_entry_and_duplicates_do_not_fork_it() {
-    let db = TestDb::new().await;
-    let app = router(db.state(None)); // Stripe can be down or unconfigured.
-    let body = serde_json::to_vec(&json!({"id":"evt_durable", "type":"refund.created",
-        "data":{"object":{"id":"re_durable", "amount":500, "customer_email":"never persist this"}}})).unwrap();
-    for _ in 0..2 {
-        let response = app
-            .clone()
-            .oneshot(webhook_request(&body, true))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        // Read from another connection after each acknowledgment. No worker is
-        // running, so a non-durable spawn cannot satisfy this assertion.
-        let rows = db
-            .pool
-            .get()
-            .await
-            .unwrap()
-            .query(
-                "SELECT id,kind,object_id,completed_at IS NULL FROM billing_event",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get::<_, String>(0), "evt_durable");
-        assert_eq!(rows[0].get::<_, String>(1), "refund.created");
-        assert_eq!(rows[0].get::<_, String>(2), "re_durable");
-        assert!(rows[0].get::<_, bool>(3));
-    }
-    db.pool
-        .get()
-        .await
-        .unwrap()
-        .batch_execute(
-            "ALTER TABLE billing_event ADD CONSTRAINT reject_test_write CHECK (false) NOT VALID",
-        )
-        .await
-        .unwrap();
-    let response = app.oneshot(webhook_request(&body, true)).await.unwrap();
-    assert_eq!(
-        response.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "a failed durable write must ask Stripe to retry"
-    );
-    db.finish().await;
-}
-
-#[tokio::test]
-#[ignore = "requires BILLING_TEST_DATABASE_URL"]
-async fn invalid_webhook_signature_cannot_enqueue_an_observation() {
-    let db = TestDb::new().await;
-    let body = serde_json::to_vec(&json!({"id":"evt_forged", "type":"charge.dispute.created",
-        "data":{"object":{"id":"dp_forged"}}}))
-    .unwrap();
-    let response = router(db.state(None))
-        .oneshot(webhook_request(&body, false))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let count: i64 = db
-        .pool
-        .get()
-        .await
-        .unwrap()
-        .query_one("SELECT count(*) FROM billing_event", &[])
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(count, 0);
-    db.finish().await;
 }
 
 #[derive(Debug, Clone)]
@@ -290,19 +178,42 @@ fn empty_provider() -> HashMap<String, Value> {
     .collect()
 }
 
+fn repair_request(method: &str, account: Uuid) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri("/v1/account/reconcile")
+        .header("authorization", auth(account))
+        .body(Body::empty())
+        .unwrap()
+}
+
+async fn response_json(response: axum::response::Response, status: StatusCode) -> Value {
+    let actual = response.status();
+    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+    assert_eq!(actual, status, "{}", String::from_utf8_lossy(&bytes));
+    serde_json::from_slice(&bytes).unwrap()
+}
+
 #[tokio::test]
 #[ignore = "requires BILLING_TEST_DATABASE_URL"]
-async fn repair_uses_only_the_authenticated_account_and_survives_terms_and_closure() {
+async fn repair_is_durable_without_stripe_and_survives_terms_closure_and_gateway_restart() {
     let db = TestDb::new().await;
+    // A newer executor can retain the same stable ingress protocol. This old
+    // gateway must still enqueue/read repairs without executing billing code.
+    db.pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute("UPDATE billing_protocol SET execution_version=2")
+        .await
+        .unwrap();
     let own = db.account("cus_own", "open").await;
     let other = db.account("cus_other", "open").await;
     db.pool.get().await.unwrap().execute(
         "INSERT INTO required_document(document,version,sha256,url) VALUES ('terms_of_service',2,$1,'https://example.test/terms')",
         &[&"ab".repeat(32)],
     ).await.unwrap();
-    let (stripe, provider) = stripe(empty_provider()).await;
-    let app = router(db.state(Some(stripe)));
-    for state in ["open", "closed"] {
+    for (index, state) in ["open", "closed"].into_iter().enumerate() {
         db.pool
             .get()
             .await
@@ -313,64 +224,122 @@ async fn repair_uses_only_the_authenticated_account_and_survives_terms_and_closu
             )
             .await
             .unwrap();
-        let response = app.clone().oneshot(Request::builder().method("POST")
-            .uri(format!("/v1/account/reconcile?account_id={other}&customer=cus_other"))
-            .header("authorization", auth(own)).header("content-type", "application/json")
-            .body(Body::from(json!({"account_id":other,"customer":"cus_other","credits":999999,"charge_id":"ch_other"}).to_string())).unwrap())
-            .await.unwrap();
-        let status = response.status();
-        let body = to_bytes(response.into_body(), 65536).await.unwrap();
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "repair in {state}: {}",
-            String::from_utf8_lossy(&body)
-        );
-        let report: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(report["purchases"], 0);
-        assert_eq!(report["refunds"], 0);
-        assert_eq!(report["disputes"], 0);
+        // This gateway has no Stripe client. Neither enqueue nor status reads
+        // may perform provider work or require accepted terms/an open account.
+        let mut request = repair_request("POST", own);
+        *request.uri_mut() = format!("/v1/account/reconcile?account_id={other}&customer=cus_other")
+            .parse()
+            .unwrap();
+        let response = router(db.state(None)).oneshot(request).await.unwrap();
+        let status = response_json(response, StatusCode::ACCEPTED).await;
+        assert_eq!(status["state"], "pending");
+        assert_eq!(status["requested_generation"], index + 1);
+        assert_eq!(status["completed_generation"], 0);
+        assert!(status["report"].is_null());
+        // A fresh application state proves the request is durable, not a
+        // process-local notification. Foreign query parameters cannot scope it.
+        let response = router(db.state(None))
+            .oneshot(repair_request("GET", own))
+            .await
+            .unwrap();
+        assert_eq!(response_json(response, StatusCode::OK).await, status);
     }
-    let requests = provider.requests.lock().unwrap().clone();
-    assert!(!requests.is_empty());
-    assert!(
-        requests
-            .iter()
-            .all(|request| request.uri.contains("customer=cus_own")),
-        "{requests:?}"
-    );
-    assert!(requests.iter().all(|request| request.method == Method::GET));
-    drop(requests);
-    let other_state: String = db
+    let response = router(db.state(None))
+        .oneshot(repair_request("GET", other))
+        .await
+        .unwrap();
+    let status = response_json(response, StatusCode::OK).await;
+    assert_eq!(status["state"], "idle");
+    assert_eq!(status["requested_generation"], 0);
+    assert!(status["report"].is_null());
+    let rows = db
         .pool
         .get()
         .await
         .unwrap()
-        .query_one("SELECT billing_state FROM account WHERE id=$1", &[&other])
+        .query("SELECT kind, object_id FROM billing_event", &[])
         .await
-        .unwrap()
-        .get(0);
-    assert_eq!(other_state, "open");
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "billing.account.reconcile");
+    assert_eq!(rows[0].get::<_, String>(1), own.to_string());
     db.finish().await;
 }
 
 #[tokio::test]
 #[ignore = "requires BILLING_TEST_DATABASE_URL"]
-async fn repair_without_account_authentication_is_refused_before_provider_access() {
+async fn repair_rejects_caller_chosen_effects_without_enqueuing_work() {
     let db = TestDb::new().await;
-    let (stripe, provider) = stripe(empty_provider()).await;
-    let response = router(db.state(Some(stripe)))
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/account/reconcile")
-                .body(Body::empty())
-                .unwrap(),
+    let own = db.account("cus_own", "open").await;
+    let other = db.account("cus_other", "open").await;
+    let response = router(db.state(None)).oneshot(Request::builder().method("POST")
+        .uri("/v1/account/reconcile")
+        .header("authorization", auth(own)).header("content-type", "application/json")
+        .body(Body::from(json!({"account_id":other,"customer":"cus_other","credits":999999,"charge_id":"ch_other"}).to_string())).unwrap())
+        .await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let count: i64 = db
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT count(*) FROM billing_event", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0);
+    db.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn repair_and_status_require_account_authentication() {
+    let db = TestDb::new().await;
+    for method in ["POST", "GET"] {
+        let response = router(db.state(None))
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/v1/account/reconcile")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let count: i64 = db
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT count(*) FROM billing_event", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0);
+    db.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn failed_durable_repair_write_is_not_accepted() {
+    let db = TestDb::new().await;
+    let own = db.account("cus_own", "open").await;
+    db.pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(
+            "ALTER TABLE billing_event ADD CONSTRAINT reject_test_write CHECK (false) NOT VALID",
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert!(provider.requests.lock().unwrap().is_empty());
+    let response = router(db.state(None))
+        .oneshot(repair_request("POST", own))
+        .await
+        .unwrap();
+    assert!(response.status().is_server_error());
     db.finish().await;
 }
 
@@ -378,6 +347,13 @@ async fn repair_without_account_authentication_is_refused_before_provider_access
 #[ignore = "requires BILLING_TEST_DATABASE_URL"]
 async fn checkout_snapshots_the_selected_grant_and_closure_refuses_new_checkout() {
     let db = TestDb::new().await;
+    db.pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute("UPDATE billing_protocol SET execution_version=2")
+        .await
+        .unwrap();
     let own = db.account("cus_own", "open").await;
     let mut responses = empty_provider();
     responses.insert("/prices/price_1".into(), json!({"id":"price_1","active":true,"currency":"usd",
@@ -407,7 +383,7 @@ async fn checkout_snapshots_the_selected_grant_and_closure_refuses_new_checkout(
     let requests = provider.requests.lock().unwrap().clone();
     let create = requests
         .iter()
-        .find(|request| request.method == Method::POST)
+        .find(|request| request.method == Method::POST && request.uri == "/checkout/sessions")
         .unwrap();
     assert!(
         create
@@ -482,27 +458,29 @@ async fn late_invoice_payment_records_cash_and_original_expiry_without_spendable
             "pricing":{"type":"price_details","price_details":{"price":"price_late"}},
             "parent":{"type":"subscription_item_details","subscription_item_details":{"proration":false}}}]},
         "status_transitions":{"paid_at":now-60}}]}));
-    let (stripe, _) = stripe(responses).await;
-    let response = router(db.state(Some(stripe)))
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/account/reconcile")
-                .header("authorization", auth(own))
-                .body(Body::empty())
-                .unwrap(),
-        )
+    let (stripe, provider) = stripe(responses).await;
+    let response = router(db.state(None))
+        .oneshot(repair_request("POST", own))
         .await
         .unwrap();
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&bytes)
-    );
-    let report: Value = serde_json::from_slice(&bytes).unwrap();
+    let pending = response_json(response, StatusCode::ACCEPTED).await;
+    assert_eq!(pending["state"], "pending");
+    assert!(provider.requests.lock().unwrap().is_empty());
+    // The independently deployed worker executes the financial workflow.
+    let result = eidola_billing::service::BillingService::new(db.pool.clone(), stripe)
+        .drain_events(32)
+        .await
+        .unwrap();
+    assert_eq!(result.completed, 1);
+    let response = router(db.state(None))
+        .oneshot(repair_request("GET", own))
+        .await
+        .unwrap();
+    let status = response_json(response, StatusCode::OK).await;
+    assert_eq!(status["state"], "complete");
+    assert_eq!(status["requested_generation"], 1);
+    assert_eq!(status["completed_generation"], 1);
+    let report = &status["report"];
     assert_eq!(report["purchases"], 1);
     assert!(
         report["review"]
@@ -516,5 +494,14 @@ async fn late_invoice_payment_records_cash_and_original_expiry_without_spendable
     assert_eq!(row.get::<_, i64>(0), 1500);
     assert!(row.get::<_, bool>(1));
     assert_eq!(row.get::<_, i64>(2), 0);
+    let response = router(db.state(None))
+        .oneshot(repair_request("POST", own))
+        .await
+        .unwrap();
+    let again = response_json(response, StatusCode::ACCEPTED).await;
+    assert_eq!(again["state"], "pending");
+    assert_eq!(again["requested_generation"], 2);
+    assert_eq!(again["completed_generation"], 1);
+    assert_eq!(again["report"], status["report"]);
     db.finish().await;
 }

@@ -8,6 +8,7 @@ pub mod error;
 pub mod service;
 pub mod store;
 pub mod stripe;
+pub mod webhook;
 pub use error::BillingError;
 
 pub fn tls_config() -> rustls::ClientConfig {
