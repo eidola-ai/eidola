@@ -17,9 +17,10 @@
 //!   the engine's idle TTL, older than its maximum age, or a clock that
 //!   disagrees with itself. Rotation mints a fresh random key, so a lineage's
 //!   requests are linkable only within one key's window.
-//! - **Never carried across a boundary**: a key is bound to the model and to
-//!   the [`trust_domain`] — the eidola endpoint and trust bundle — it was minted
-//!   under, and a change of either mints a new one.
+//! - **Never carried across a boundary**: a key is bound to the model
+//!   ([`key_model`]: its weights) and to the [`trust_domain`] — the eidola
+//!   endpoint and trust bundle — it was minted under, and a change of either
+//!   mints a new one.
 //! - **Forgotten when it can no longer be sent**
 //!   ([`crate::db::forget_unsendable_cache_keys`]), overwritten before it goes.
 //!
@@ -119,10 +120,22 @@ pub(crate) struct CacheScope {
     pub trust_domain: String,
 }
 
+/// The model a key is bound to: **the weights hash the turn resolved to**,
+/// spelled `sha256:<hex>`, so a followed tag that moves to other weights is
+/// another model to its lineage's key, and a request pinned to earlier
+/// weights never shares a key with one sent to the current ones. Where the
+/// catalog publishes no hash, the canonical selection.
+pub(crate) fn key_model(selection: &str, sha256: Option<&str>) -> String {
+    match sha256 {
+        Some(hex) => format!("{}{hex}", eidola_common::model_reference::DIGEST_PREFIX),
+        None => selection.to_string(),
+    }
+}
+
 /// A lineage's stored key, minus the key: what [`decide`] judges it by.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredKeyAge {
-    /// The model the key was minted for.
+    /// The [`key_model`] the key was minted for.
     pub model: String,
     /// The [`trust_domain`] the key was minted under.
     pub trust_domain: String,
@@ -310,6 +323,20 @@ mod tests {
         assert_eq!(decide(None, "m", "d", &POLICY, 5_000), Claim::Mint);
         let s = stored("other", 1_000, 2_000);
         assert_eq!(decide(Some(&s), "m", "d", &POLICY, 2_000), Claim::Mint);
+    }
+
+    #[test]
+    fn a_key_is_bound_to_the_weights_where_they_are_known() {
+        let h1 = "1".repeat(64);
+        let h2 = "2".repeat(64);
+        assert_eq!(key_model("tag", None), "tag");
+        assert_eq!(key_model("tag", Some(&h1)), format!("sha256:{h1}"));
+        assert_ne!(key_model("tag", Some(&h1)), key_model("tag", Some(&h2)));
+        let s = stored(&key_model("tag", Some(&h1)), 1_000, 2_000);
+        let claim =
+            |hash: &str| decide(Some(&s), &key_model("tag", Some(hash)), "d", &POLICY, 2_000);
+        assert_eq!(claim(&h1), Claim::Reuse);
+        assert_eq!(claim(&h2), Claim::Mint, "a tag that moved rotates the key");
     }
 
     #[test]
