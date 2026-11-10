@@ -16,8 +16,11 @@ pub const DEFAULT_DOMAIN_SEPARATOR: &str = "ACT-v1:eidola:inference:production:2
 /// Embedded fallback for the inference model. The `default_model` config key
 /// is gone (Participants v1); this is the model the seeded "Default" space
 /// template's agent participant carries, and the last-resort fallback when a
-/// space or template has no resolvable agent model.
-pub const DEFAULT_MODEL: &str = "gemma4-31b";
+/// space or template has no resolvable agent model. It is the curated Gemma 4
+/// E4B in the managed local store (`gemma-4-e4b` in
+/// `local_models::LOCAL_MODEL_CATALOG`), spelled as the `<file-stem>@local`
+/// reference that model is selected by once downloaded.
+pub const DEFAULT_MODEL: &str = "gemma-4-E4B_q4_0-it@local";
 
 /// Well-known id of the seeded "Default" space template — the compiled-in
 /// value [`Config::default_template`] resolves to when the user has set no

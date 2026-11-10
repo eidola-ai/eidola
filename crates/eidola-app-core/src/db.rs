@@ -49,10 +49,14 @@ const DEFAULT_TEMPLATE_AGENT_ID: &str = "00000000-0000-7000-8000-000000000011";
 const DEFAULT_AGENT_SYSTEM_PROMPT: &str =
     "You are a helpful assistant. Answer clearly and concisely.";
 
-/// A readable default label derived from a model reference (e.g.
-/// `gemma4-31b` → `Gemma4 31b`). Only a *default* — the user edits it — so
-/// title-casing hyphen tokens is enough; it never needs to be canonical.
+/// A readable default label derived from a model reference: a curated local
+/// model's display name (`Gemma 4 E4B`), else the model title-cased by
+/// hyphen tokens (`my-model@ext` → `My Model`). Only a *default* — the user
+/// edits it — so it never needs to be canonical.
 pub fn default_agent_label(model_ref: &str) -> String {
+    if let Some(entry) = crate::local_models::catalog_entry_for_model_ref(model_ref) {
+        return entry.display_name.to_string();
+    }
     // Drop any `@backend` suffix, then title-case hyphen/underscore tokens.
     let model = model_ref
         .rsplit_once('@')

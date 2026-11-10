@@ -56,7 +56,8 @@ pub use eidola_common::model_reference;
 use error::{AppError, IssuerKeyRefusal};
 pub use local_models::{
     ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
-    LocalModelStatus, LocalModelsState, ModelDownloadTarget, RunningEngine, resolve_model_download,
+    LocalModelStatus, LocalModelsState, ModelDownloadTarget, RunningEngine,
+    catalog_entry_for_model_ref, resolve_model_download,
 };
 pub use subspace_driver::{
     ANCHOR_WAIT_GRACE, DelegationEnd, DelegationFailure, MAX_ATTEMPTS_PER_TAIL,
@@ -1838,11 +1839,11 @@ pub struct SpendTrailEntry {
 ///
 /// Why 1,000,000: credits are micro-USD-denominated (the server's
 /// `PRICING_SCALE_FACTOR` is 1e6 — `usd_per_M_tokens × markup` becomes
-/// credits-per-token directly, e.g. gemma4-31b output $1.00/M × 1.5 markup
+/// credits-per-token directly, e.g. output at $1.00/M × 1.5 markup
 /// = 1.5 credits/token). A single chat turn's worst-case hold is
 /// `chargeable_prompt_tokens(bytes, msgs) × prompt_rate + 4096 ×
 /// completion_rate` (the shared `eidola-common` contract): ≈6,200 credits
-/// for the default gemma4-31b, ≈32,000 for the most expensive catalog
+/// at that rate, ≈32,000 for the most expensive catalog
 /// models (output 7.875 credits/token) — mostly refunded after the actual
 /// usage settles. 1,000,000 credits ($1.00 of balance) therefore covers
 /// ~30 worst-case holds or 100+ typical turns: small enough that only a

@@ -1124,6 +1124,9 @@ impl WireError {
             AppError::Config { message } => ("Config", json!({ "message": message })),
             AppError::Internal { message } => ("Internal", json!({ "message": message })),
             AppError::LocalModel { message } => ("LocalModel", json!({ "message": message })),
+            AppError::LocalModelNotDownloaded { model } => {
+                ("LocalModelNotDownloaded", json!({ "model": model }))
+            }
             AppError::Update { message } => ("Update", json!({ "message": message })),
             AppError::ToolLoop { message } => ("ToolLoop", json!({ "message": message })),
             AppError::RegenerationInFlight { item_id } => {
@@ -1221,6 +1224,7 @@ impl WireError {
             "Config" => AppError::Config { message: msg() },
             "Internal" => AppError::Internal { message: msg() },
             "LocalModel" => AppError::LocalModel { message: msg() },
+            "LocalModelNotDownloaded" => AppError::LocalModelNotDownloaded { model: s("model")? },
             "Update" => AppError::Update { message: msg() },
             "ToolLoop" => AppError::ToolLoop { message: msg() },
             "RegenerationInFlight" => AppError::RegenerationInFlight {
@@ -1967,6 +1971,9 @@ mod tests {
             },
             AppError::ModelUnavailable {
                 model: "gemma4-31b".into(),
+            },
+            AppError::LocalModelNotDownloaded {
+                model: "tiny@local".into(),
             },
             AppError::ModelNoticeStale {
                 participant_id: "agent".into(),

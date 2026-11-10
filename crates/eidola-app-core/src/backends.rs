@@ -35,8 +35,8 @@
 //! `<model>@<backend-id>`, parsed at the **last** `@` (backend ids are
 //! validated to `[a-z0-9-]`, so the split is unambiguous even for
 //! Ollama-style `name:tag` or HF-style `org/model` ids). The single sugar:
-//! `eidola`, being the default backend, may be written bare — `gemma4-31b`
-//! means `gemma4-31b@eidola`, and [`qualified_model_id`] keeps the bare
+//! `eidola`, being the default backend, may be written bare — `<tag>`
+//! means `<tag>@eidola`, and [`qualified_model_id`] keeps the bare
 //! form canonical so the common case reads clean everywhere (config,
 //! action rows, the CLI). Every other backend — the local singleton
 //! included — always spells its models qualified (`<slug>@local`). An Eidola

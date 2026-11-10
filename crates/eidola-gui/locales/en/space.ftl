@@ -62,6 +62,15 @@ space-regenerating = Regenerating…
 # TRANSLATORS: $model is the selection exactly as it was saved, an id rather
 # than a display name. Leave it verbatim; it is what the reader looks for.
 space-error-model-unavailable = { $model } is no longer offered by its backend, and nothing will answer in its place. Nothing was sent and nothing was charged — pick a different model, then try again.
+# Shown in the conversation's recovery notice when the model this turn would
+# have used runs on this computer but has not been downloaded — what a new
+# profile meets first, since its default agent uses an on-device model. Says
+# that nothing was sent, and the two ways on: download that model, or choose
+# another one. Retry stays offered, for after the download.
+# TRANSLATORS: $model is the model's display name (e.g. "Gemma 4 E4B") or, for
+# a model with none, its id. Leave it verbatim. "Settings ▸ Backends ▸ Local"
+# names the app's own menus; use the translated names those menus show.
+space-error-local-model-not-downloaded = { $model } runs on this computer but isn't downloaded yet, so nothing was sent. Download it in Settings ▸ Backends ▸ Local, or pick a different model, then try again.
 # A quiet marker beneath a response a regeneration was asked for while one was
 # already running against it somewhere this window cannot see. Not a failure:
 # the first one is still going, and its result will arrive here.

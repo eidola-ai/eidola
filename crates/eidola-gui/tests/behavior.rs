@@ -1646,6 +1646,12 @@ fn space_model_display_splits_name_and_backend(cx: &mut TestAppContext) {
             v.model_display("gone@local", cx),
             ("gone".into(), "Local".into())
         );
+        // A curated model with no file yet — a fresh profile's default — is
+        // still called by its catalog name.
+        assert_eq!(
+            v.model_display(eidola_app_core::config::DEFAULT_MODEL, cx),
+            ("Gemma 4 E4B".into(), "Local".into())
+        );
     });
 }
 
@@ -17795,6 +17801,67 @@ async fn a_stale_model_selection_says_which_model_and_substitutes_none(
         "the model id survives translation verbatim: {french}"
     );
     cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+}
+
+/// **A fresh profile's first post names the model to download.**
+///
+/// The default agent uses an on-device model, and a new profile has not
+/// downloaded it, so the first turn meets `AppError::LocalModelNotDownloaded`.
+/// The notice says which model by the name Settings lists it under, says
+/// nothing was sent, and points at the download — never the log-shaped
+/// `Display`, which names neither and is English in every locale. Retry
+/// stands, for after the download.
+#[gpui::test]
+async fn a_model_that_is_not_downloaded_says_which_and_where_to_get_it(
+    cx: &mut gpui::TestAppContext,
+) {
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the only post")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::LocalModelNotDownloaded {
+                    model: eidola_app_core::config::DEFAULT_MODEL.into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let notice = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+    assert!(
+        notice.contains("Gemma 4 E4B"),
+        "the notice names the model by its catalog name: {notice}"
+    );
+    assert!(
+        notice.contains("Settings ▸ Backends ▸ Local"),
+        "and says where to download it: {notice}"
+    );
+    assert!(
+        notice.contains("nothing was sent"),
+        "and that nothing was sent: {notice}"
+    );
+    assert!(
+        !notice.contains("is not downloaded"),
+        "the raw Display must not be what a reader sees: {notice}"
+    );
+    space.read_with(cx, |s, _| {
+        assert!(s.can_retry(), "Retry stands for after the download")
+    });
 }
 
 /// **An affordance that cannot succeed is worse than none.**
