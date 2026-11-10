@@ -234,6 +234,13 @@ pub fn drafter_seat_rows(draft_tokens: u32) -> u64 {
 /// three depths) are inside [`Shape::step_token_device_bytes`]' rounding.
 pub const DRAFT_TABLE_SEAT_BYTES: u64 = 32 << 10;
 
+/// Query slots a step of decode rows takes when every seat has one:
+/// `MAX_SEQS × (1 + DRAFT_TOKENS)`, a row's token and its drafts. The
+/// grammar holds `MAX_BATCHED_TOKENS` to at least this ([`parse_measured`]).
+pub fn decode_step_tokens(sizing: &Sizing) -> u64 {
+    u64::from(sizing.max_seqs) * (u64::from(sizing.draft_tokens) + 1)
+}
+
 /// Keys per chunk of the CUDA executor's split global attention
 /// (`eidola-engine-cuda` `attention::SPLIT_KEYS`): a global row's keys are
 /// reduced in chunks of this many positions, each a partial row, then merged.
@@ -429,30 +436,84 @@ pub fn host_memory_bytes(sizing: &Sizing) -> u64 {
 /// wraps.
 pub fn cuda_kv_min_bytes(shape: &Shape, sizing: &Sizing, cache: &CacheConfig) -> u64 {
     let b = u64::from(sizing.kv_block_size.max(1));
+    let global_blocks = u64::from(sizing.max_model_len).div_ceil(b) + 1;
+    global_blocks
+        .saturating_add(1)
+        .saturating_mul(global_block_bytes(shape, sizing))
+        .saturating_add(cuda_windowed_pools_bytes(shape, sizing, cache))
+}
+
+/// Blocks of the CUDA executor's sliding pool, and of its drafter pool when
+/// drafting (the pad block not among them): [`cuda_kv_min_bytes`]' count.
+fn sliding_pool_blocks(shape: &Shape, sizing: &Sizing, cache: &CacheConfig) -> u64 {
+    let b = u64::from(sizing.kv_block_size.max(1));
     let points = if cache.enabled { RETENTION_POINTS } else { 0 };
     let window_blocks = (shape.sliding_window - 1).div_ceil(b) + 1;
-    let sliding_blocks = u64::from(sizing.max_seqs)
+    u64::from(sizing.max_seqs)
         .saturating_mul((1 + points).saturating_mul(window_blocks).saturating_add(1))
-        .saturating_add(1 + u64::from(sizing.max_batched_tokens).div_ceil(b));
-    let global_blocks = u64::from(sizing.max_model_len).div_ceil(b) + 1;
-    let pool = |blocks: u64, per_position: u64| {
-        blocks
-            .saturating_add(1)
-            .saturating_mul(b)
-            .saturating_mul(per_position)
-    };
+        .saturating_add(1 + u64::from(sizing.max_batched_tokens).div_ceil(b))
+}
+
+/// Bytes of one block of the global pool.
+fn global_block_bytes(shape: &Shape, sizing: &Sizing) -> u64 {
+    u64::from(sizing.kv_block_size.max(1)).saturating_mul(shape.global_kv_bytes_per_position)
+}
+
+/// Bytes of one block of the sliding pool.
+fn sliding_block_bytes(shape: &Shape, sizing: &Sizing) -> u64 {
+    u64::from(sizing.kv_block_size.max(1)).saturating_mul(shape.sliding_kv_bytes_per_position)
+}
+
+/// Bytes of one block of the drafter pool (its boundary tap included); 0
+/// without drafting, when there is no such pool.
+fn drafter_block_bytes(shape: &Shape, sizing: &Sizing) -> u64 {
     let k = u64::from(sizing.draft_tokens);
-    let drafter = if k == 0 {
-        0
-    } else {
-        sliding_blocks.saturating_add(1).saturating_mul(
-            b.saturating_mul(k * shape.drafter_kv_bytes_per_position_per_depth)
-                .saturating_add(k * shape.drafter_tap_bytes_per_depth),
+    u64::from(sizing.kv_block_size.max(1))
+        .saturating_mul(k * shape.drafter_kv_bytes_per_position_per_depth)
+        .saturating_add(k * shape.drafter_tap_bytes_per_depth)
+}
+
+/// Device bytes of the sliding pool and, when drafting, the drafter pool,
+/// each with its pad block: what the global pool does not get.
+fn cuda_windowed_pools_bytes(shape: &Shape, sizing: &Sizing, cache: &CacheConfig) -> u64 {
+    sliding_pool_blocks(shape, sizing, cache)
+        .saturating_add(1)
+        .saturating_mul(
+            sliding_block_bytes(shape, sizing).saturating_add(drafter_block_bytes(shape, sizing)),
         )
-    };
-    pool(sliding_blocks, shape.sliding_kv_bytes_per_position)
-        .saturating_add(pool(global_blocks, shape.global_kv_bytes_per_position))
-        .saturating_add(drafter)
+}
+
+/// The fewest bytes of host memory a non-zero host tier needs with the CUDA
+/// executor: the node's own derivation (`cuda::derive_host_blocks` in
+/// `eidola-server-engine`) at its smallest, for the device pools
+/// `kv_device_bytes` gives (at least [`cuda_kv_min_bytes`]).
+///
+/// The node scales the device pools' mix to the tier's budget `H`: a pool of
+/// `n` device blocks gets ⌊`n` × `H` / `D`⌋ host blocks, `D` the device
+/// pools' bytes (pad blocks not among them), and every pool needs two (the
+/// null block and one to hold an entry). The device pools are the sliding
+/// pool and, when drafting, the drafter pool at [`cuda_kv_min_bytes`]'
+/// count, and a global pool of what is left of `kv_device_bytes` after them,
+/// less its pad block, at most `i32::MAX` blocks. So the least `H` is
+/// ⌈2 × `D` / the smallest pool's blocks⌉. Saturates rather than wraps.
+pub fn cuda_kv_host_min_bytes(
+    shape: &Shape,
+    sizing: &Sizing,
+    cache: &CacheConfig,
+    kv_device_bytes: u64,
+) -> u64 {
+    let windowed = sliding_pool_blocks(shape, sizing, cache);
+    let global_bytes = global_block_bytes(shape, sizing).max(1);
+    let global = (kv_device_bytes.saturating_sub(cuda_windowed_pools_bytes(shape, sizing, cache))
+        / global_bytes)
+        .saturating_sub(1)
+        .min(i32::MAX as u64);
+    let device = u128::from(global) * u128::from(global_bytes)
+        + u128::from(windowed)
+            * (u128::from(sliding_block_bytes(shape, sizing))
+                + u128::from(drafter_block_bytes(shape, sizing)));
+    let smallest = u128::from(global.min(windowed).max(1));
+    u64::try_from((2 * device).div_ceil(smallest)).unwrap_or(u64::MAX)
 }
 
 /// Whether the deployment's VM and GPUs hold what its configuration
@@ -462,7 +523,8 @@ pub fn cuda_kv_min_bytes(shape: &Shape, sizing: &Sizing, cache: &CacheConfig) ->
 /// out to make room), plus, for the `cpu` executor, its KV cache
 /// (`KV_BLOCKS` × `KV_BLOCK_SIZE` × [`Shape::kv_bytes_per_position`]). For the
 /// `cuda` executor, which runs on one [`SUPPORTED_GPU`], the VM has a GPU,
-/// `KV_DEVICE_BYTES` holds at least [`cuda_kv_min_bytes`], and
+/// `KV_DEVICE_BYTES` holds at least [`cuda_kv_min_bytes`], a non-zero
+/// `KV_HOST_BYTES` at least [`cuda_kv_host_min_bytes`], and
 /// `KV_DEVICE_BYTES` + `weights_bytes` + [`cuda_device_reserve_bytes`] fit
 /// [`SUPPORTED_GPU_MEMORY_BYTES`]. `weights_bytes` bounds the weights' device
 /// footprint from above: the pack's data size ([`artifact_data_bytes`]),
@@ -509,6 +571,14 @@ pub fn check_resources(
                  their smallest (one {} sequence, every seat's sliding window, pad blocks)",
                 env::KV_DEVICE_BYTES,
                 env::MAX_MODEL_LEN
+            ));
+        }
+        let host_needed = cuda_kv_host_min_bytes(shape, sizing, cache, *kv_device_bytes);
+        if kv_host_bytes > 0 && kv_host_bytes < host_needed {
+            return Err(format!(
+                "{} ({kv_host_bytes}) is less than the {host_needed} bytes that give every KV \
+                 pool two host blocks; 0 is no host tier",
+                env::KV_HOST_BYTES
             ));
         }
         let reserve = cuda_device_reserve_bytes(shape, sizing);
@@ -891,12 +961,10 @@ pub fn parse_measured(
         draft_tokens: non_negative(env::DRAFT_TOKENS)?,
         max_requests: positive(env::MAX_REQUESTS)?,
     };
-    // The scheduler's own boot refusal (`Engine::new`): a decode row costs
-    // `1 + draft_tokens` query slots, so a step must hold more than
-    // `draft_tokens` of them. The engine's other boot refusals that depend
-    // only on these values (a zero seat, prefill chunk or block count) are the
-    // positivity rules above; the rest need the model (its position limit and
-    // MTP depth) or the node build (its executor).
+    // The engine's boot refusals that depend only on these values (a zero
+    // seat, prefill chunk or block count) are the positivity rules above; the
+    // rest need the model (its position limit and MTP depth) or the node
+    // build (its executor).
     // Every allocation-driving value is capped, so a configuration cannot ask
     // the node for an allocation it cannot make (a table of `MAX_SEQS` slots,
     // a scratch of `MAX_BATCHED_TOKENS` rows): refused here, before any
@@ -930,10 +998,18 @@ pub fn parse_measured(
             return Err(ConfigError(format!("{name} must be at most {cap}")));
         }
     }
-    if sizing.max_batched_tokens <= sizing.draft_tokens {
+    // A decode row costs `1 + draft_tokens` query slots, and the scheduler
+    // leaves a row a step cannot afford out of that step: with fewer slots
+    // than every seat's decode row needs, the newest seated sequences would
+    // hold their seats and KV without advancing while older ones decode. It
+    // also covers the scheduler's own boot refusal (`Engine::new`: a step
+    // holds one decode row).
+    if u64::from(sizing.max_batched_tokens) < decode_step_tokens(&sizing) {
         return Err(ConfigError(format!(
-            "{} must exceed {}: a decode row needs 1 + {} query slots",
+            "{} must be at least {} x (1 + {}): a step holds every seat's decode row, \
+             1 + {} query slots each",
             env::MAX_BATCHED_TOKENS,
+            env::MAX_SEQS,
             env::DRAFT_TOKENS,
             env::DRAFT_TOKENS
         )));
@@ -2286,6 +2362,26 @@ mod tests {
         assert!(fits(room - rest, mib(room)).is_ok());
         let err = fits(room - rest + 1, mib(room)).unwrap_err();
         assert!(err.contains(env::KV_HOST_BYTES), "{err}");
+
+        // A tier is none (0) or holds two blocks of every pool: the node
+        // refuses to boot with less.
+        let ExecutorSettings::Cuda {
+            kv_device_bytes, ..
+        } = m.executor
+        else {
+            panic!("the cuda executor");
+        };
+        let least = cuda_kv_host_min_bytes(FLASH, &m.sizing, &m.cache, kv_device_bytes);
+        assert!(least > 1 && least < 32 << 30, "{least}");
+        assert!(fits(0, mib(room)).is_ok());
+        assert!(fits(least, mib(room)).is_ok());
+        for short in [1, least - 1] {
+            let err = fits(short, mib(room)).unwrap_err();
+            assert!(
+                err.contains(env::KV_HOST_BYTES) && err.contains("two host blocks"),
+                "{err}"
+            );
+        }
     }
     /// The settings only the cuda executor takes.
     #[cfg(feature = "argon2")]
@@ -2372,27 +2468,48 @@ mod tests {
         }
     }
 
-    /// A step that cannot hold one decode row is refused, as the node's
-    /// scheduler would refuse it at boot.
+    /// A step that cannot hold every seat's decode row is refused: the
+    /// scheduler would leave the rows it cannot afford out of each step.
     #[cfg(feature = "argon2")]
     #[test]
-    fn a_step_holds_a_decode_row() {
+    fn a_step_holds_every_seats_decode_row() {
         let mut cpu = cuda_env();
         cpu.insert(env::EXECUTOR, "cpu".into());
         for name in CUDA_SETTINGS {
             cpu.remove(name);
         }
         cpu.insert(env::KV_BLOCKS, "256".into());
-        cpu.insert(env::DRAFT_TOKENS, "2".into());
-        cpu.insert(env::MAX_BATCHED_TOKENS, "2".into());
         cpu.insert(env::MAX_PREFILL_CHUNK, "2".into());
-        let err = parse_map(&cpu).unwrap_err();
+        // (seats, drafts): the fewest slots are seats × (1 + drafts).
+        for (seats, drafts, least) in [(1u32, 2u32, 3u32), (1, 0, 1), (64, 0, 64), (64, 2, 192)] {
+            cpu.insert(env::MAX_SEQS, seats.to_string());
+            cpu.insert(env::DRAFT_TOKENS, drafts.to_string());
+            cpu.insert(env::MAX_BATCHED_TOKENS, least.to_string());
+            let m = parse_map(&cpu).unwrap_or_else(|e| panic!("{seats} x (1 + {drafts}): {e}"));
+            assert_eq!(decode_step_tokens(&m.sizing), u64::from(least));
+            if least > 1 {
+                cpu.insert(env::MAX_BATCHED_TOKENS, (least - 1).to_string());
+                let err = parse_map(&cpu).unwrap_err();
+                assert!(
+                    err.contains(
+                        "EIDOLA_ENGINE_MAX_BATCHED_TOKENS must be at least \
+                         EIDOLA_ENGINE_MAX_SEQS x (1 + EIDOLA_ENGINE_DRAFT_TOKENS)"
+                    ),
+                    "{err}"
+                );
+            }
+        }
+        // The pinned shape, and the cuda executor's widest draft.
+        let mut cuda = cuda_env();
+        parse_map(&cuda).expect("64 seats x 4 slots fit 8192");
+        cuda.insert(env::MAX_BATCHED_TOKENS, "255".into());
         assert!(
-            err.contains("EIDOLA_ENGINE_MAX_BATCHED_TOKENS must exceed EIDOLA_ENGINE_DRAFT_TOKENS"),
-            "{err}"
+            parse_map(&cuda)
+                .unwrap_err()
+                .contains(env::MAX_BATCHED_TOKENS)
         );
-        cpu.insert(env::MAX_BATCHED_TOKENS, "3".into());
-        parse_map(&cpu).expect("three slots hold a decode row with two drafts");
+        cuda.insert(env::MAX_BATCHED_TOKENS, "256".into());
+        parse_map(&cuda).expect("64 seats x 4 slots are 256");
     }
 
     #[cfg(feature = "argon2")]

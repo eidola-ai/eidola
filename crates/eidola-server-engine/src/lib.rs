@@ -80,25 +80,63 @@ impl std::fmt::Debug for Node {
     }
 }
 
+/// How long a graceful shutdown waits for open requests to finish on their own before
+/// the rest are cancelled. With [`TEARDOWN_LIMIT`] and [`ENGINE_SETTLE_LIMIT`] it bounds
+/// the time from the signal to the exit, so a long generation or a stalled reader cannot
+/// hold the process until it is killed with KV still unzeroed.
+pub const DRAIN_LIMIT: Duration = Duration::from_secs(5);
+
 /// How long the runtime may take to wind down remaining tasks (open connections, a
 /// preparation still running on the blocking pool) once serving has ended.
 pub const TEARDOWN_LIMIT: Duration = Duration::from_secs(2);
 
-/// Serves `router` on `listener` until `shutdown` resolves (`Ok`, after draining open
-/// requests gracefully) or the engine thread stops for any reason (`Err`, at once):
-/// `engine_stopped` resolving, by its signal or by its sender going away, is fatal, and
-/// nothing waits for open connections, however stalled. Those connection tasks are left
-/// to the runtime's bounded teardown ([`run`]).
+/// How long a graceful shutdown waits, after the runtime is down, for the engine thread
+/// to release what the cancelled requests held (their KV zeroed or left encrypted, their
+/// keys dropped) and stop.
+pub const ENGINE_SETTLE_LIMIT: Duration = Duration::from_secs(2);
+
+/// Serves `router` on `listener` until `shutdown` resolves (`Ok`, after open requests
+/// have drained or [`DRAIN_LIMIT`] has passed, whichever is first) or the engine thread
+/// stops for any reason (`Err`, at once): `engine_stopped` resolving, by its signal or by
+/// its sender going away, is fatal, and nothing waits for open connections, however
+/// stalled. Connection tasks still open either way are left to the runtime's bounded
+/// teardown ([`run`]), which drops them: each request's guard then cancels it in the
+/// engine.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     router: axum::Router,
-    engine_stopped: oneshot::Receiver<()>,
+    mut engine_stopped: oneshot::Receiver<()>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), BootError> {
-    let server = axum::serve(listener, router).with_graceful_shutdown(shutdown);
+    serve_until(listener, router, &mut engine_stopped, shutdown).await
+}
+
+/// [`serve`], leaving `engine_stopped` with the caller when serving ends without it.
+async fn serve_until(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    engine_stopped: &mut oneshot::Receiver<()>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), BootError> {
+    let (draining_tx, draining_rx) = oneshot::channel::<()>();
+    let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+        shutdown.await;
+        let _ = draining_tx.send(());
+    });
+    let drain_limit = async move {
+        match draining_rx.await {
+            Ok(()) => tokio::time::sleep(DRAIN_LIMIT).await,
+            // The server ended without a shutdown; its own arm reports that.
+            Err(_) => std::future::pending().await,
+        }
+    };
     tokio::select! {
         served = std::future::IntoFuture::into_future(server) => {
             served.map_err(|e| BootError(format!("serving failed: {}", e.kind())))
+        }
+        _ = drain_limit => {
+            tracing::info!("open requests outlasted the drain limit; cancelling them");
+            Ok(())
         }
         _ = engine_stopped => {
             tracing::error!("the engine thread stopped");
@@ -111,10 +149,17 @@ pub async fn serve(
 /// bound address to `on_listening`, serves (see [`serve`]), and then tears the runtime
 /// down within [`TEARDOWN_LIMIT`], so a fatal engine stop ends the process promptly even
 /// with requests stalled mid-upload. `main` maps `Err` to a non-zero exit.
+///
+/// After a graceful shutdown the teardown drops every request still open, whose guards
+/// cancel them in the engine, and with the router gone the engine thread stops once it
+/// has run the maintenance they left. This waits for that, up to
+/// [`ENGINE_SETTLE_LIMIT`], so the process does not exit under the engine while it zeroes
+/// freed KV. The caller must hold no [`EngineHandle`] of its own by then: the engine
+/// thread runs for as long as one exists.
 pub fn run(
     bind: std::net::SocketAddr,
     router: axum::Router,
-    engine_stopped: oneshot::Receiver<()>,
+    mut engine_stopped: oneshot::Receiver<()>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     on_listening: impl FnOnce(std::net::SocketAddr),
 ) -> Result<(), BootError> {
@@ -127,7 +172,7 @@ pub fn run(
         .enable_all()
         .build()
         .map_err(|e| BootError(format!("cannot start the runtime: {}", e.kind())))?;
-    let result = runtime.block_on(async move {
+    let result = runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(bind)
             .await
             .map_err(|e| BootError(format!("cannot bind: {}", e.kind())))?;
@@ -136,9 +181,20 @@ pub fn run(
                 .local_addr()
                 .map_err(|e| BootError(format!("cannot bind: {}", e.kind())))?,
         );
-        serve(listener, router, engine_stopped, shutdown).await
+        serve_until(listener, router, &mut engine_stopped, shutdown).await
     });
     runtime.shutdown_timeout(TEARDOWN_LIMIT);
+    if result.is_ok() {
+        let settle = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .map_err(|e| BootError(format!("cannot start the runtime: {}", e.kind())))?;
+        let settled = settle
+            .block_on(async { tokio::time::timeout(ENGINE_SETTLE_LIMIT, engine_stopped).await });
+        if settled.is_err() {
+            tracing::warn!("the engine did not stop within its limit");
+        }
+    }
     result
 }
 

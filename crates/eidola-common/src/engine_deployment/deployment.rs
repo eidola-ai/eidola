@@ -511,7 +511,8 @@ impl EngineConfig {
         }
         super::yaml_events::refuse_divergent_constructs(bytes, path)?;
         // One document, every struct strict (decode.go: `KnownFields(true)`,
-        // a trailing document refused), duplicate keys refused.
+        // a trailing document refused); the events above refused duplicate
+        // keys and unquoted env values.
         let config: TinfoilConfig =
             serde_yaml::from_slice(bytes).map_err(|e| format!("{path}: {e}"))?;
 
@@ -805,4 +806,48 @@ fn is_repo(s: &str) -> bool {
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
     };
     matches!(s.split_once('/'), Some((owner, name)) if part(owner) && part(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONFIG: &str = "\
+cvm-version: 0.15.3-rc.1+gpu@sha256:1111111111111111111111111111111111111111111111111111111111111111
+cpus: 16
+memory: 65536
+containers:
+  - name: \"eidola-server-engine\"
+    image: \"ghcr.io/eidola-ai/eidola-server-engine@sha256:2222222222222222222222222222222222222222222222222222222222222222\"
+    env:
+      - EIDOLA_ENGINE_KV_BLOCK_SIZE: \"16\"
+      - EIDOLA_ENGINE_EXECUTOR: \"cuda\"
+shim:
+  upstream-port: 8080
+";
+
+    fn env_of(config: &str) -> Result<BTreeMap<String, String>, String> {
+        EngineConfig::parse(config.as_bytes(), "config").map(|c| c.env)
+    }
+
+    /// An env value reaches the node as the text between its quotes; a
+    /// scalar another YAML reader could resolve to a different text, and an
+    /// entry naming a variable twice, never parse.
+    #[test]
+    fn env_text_is_the_same_to_every_reader() {
+        let env = env_of(CONFIG).unwrap();
+        assert_eq!(env["EIDOLA_ENGINE_KV_BLOCK_SIZE"], "16");
+        let env = env_of(&CONFIG.replace("\"16\"", "\"0100\"")).unwrap();
+        assert_eq!(env["EIDOLA_ENGINE_KV_BLOCK_SIZE"], "0100");
+        for plain in ["0100", "1_000", "cuda8"] {
+            let err = env_of(&CONFIG.replace("\"16\"", plain)).unwrap_err();
+            assert!(err.contains("with a quoted string value"), "{plain}: {err}");
+        }
+        let twice = CONFIG.replace(
+            "      - EIDOLA_ENGINE_EXECUTOR: \"cuda\"\n",
+            "      - EIDOLA_ENGINE_EXECUTOR: \"cuda\"\n        EIDOLA_ENGINE_EXECUTOR: \"cpu\"\n",
+        );
+        let err = env_of(&twice).unwrap_err();
+        assert!(err.contains("duplicate mapping key"), "{err}");
+    }
 }
