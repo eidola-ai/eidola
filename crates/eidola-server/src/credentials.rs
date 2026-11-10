@@ -429,15 +429,24 @@ pub async fn load_key_for_spending(
     pool: &deadpool_postgres::Pool,
     key_hash: &[u8; 32],
 ) -> Result<(), ServerError> {
-    // Fast path: already in cache, and not yet retired. A retired key is
-    // refused here, not reloaded: the database would refuse it too.
+    // Fast path: already in cache, and clearly not retired — or clearly
+    // retired, which is refused here rather than reloaded, since the
+    // database would refuse it too. Retirement is decided on the database's
+    // clock (`accept_until > now()` in `get_issuer_key_by_hash`), and this
+    // host's may differ from it by up to `MAX_CLOCK_SKEW`; inside that
+    // margin of the boundary the cache does not decide, and the spend takes
+    // the slow path so that a cached and an uncached key get the same
+    // answer in the last seconds of the acceptance window.
     if let Some(key) = key_cache.read().await.get(key_hash) {
-        if key.accept_until > SystemTime::now() {
+        let now = SystemTime::now();
+        if key.accept_until > now + db::MAX_CLOCK_SKEW {
             return Ok(());
         }
-        return Err(ServerError::Unauthorized {
-            message: "unknown or expired issuer key".to_string(),
-        });
+        if key.accept_until + db::MAX_CLOCK_SKEW <= now {
+            return Err(ServerError::Unauthorized {
+                message: "unknown or expired issuer key".to_string(),
+            });
+        }
     }
 
     // Slow path: load from DB by key hash
