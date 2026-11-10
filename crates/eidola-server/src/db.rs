@@ -1210,6 +1210,13 @@ mod tests {
 
     /// A throwaway issuer key row: `credit_ledger.credential_key_id` is a
     /// foreign key, and `issuer_key.id` must be the hash of its public key.
+    ///
+    /// Its windows are all in the past. The row's `private_key_enc` is one
+    /// byte, which `credentials::cache_key` rejects, and `get_valid_issuer_keys`
+    /// selects every unexpired key regardless of domain — so a fixture that
+    /// was still accepted would stop a server started against this database
+    /// from issuing until it expired or someone deleted it. Expired, it is
+    /// only ever a foreign-key target.
     async fn insert_dummy_issuer_key(pool: &Pool) -> String {
         let public_key = Uuid::new_v4().as_bytes().to_vec();
         let client = pool.get().await.unwrap();
@@ -1219,8 +1226,8 @@ mod tests {
                      (id, private_key_enc, public_key, domain_separator, \
                       issue_from, issue_until, accept_until) \
                  VALUES (encode(sha256($1), 'hex'), '\\x00', $1, 'test', \
-                         now() - interval '1 day', now() + interval '6 days', \
-                         now() + interval '13 days') \
+                         now() - interval '20 days', now() - interval '13 days', \
+                         now() - interval '6 days') \
                  RETURNING id",
                 &[&public_key],
             )
