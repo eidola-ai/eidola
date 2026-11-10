@@ -574,7 +574,18 @@ async fn handle_charge_refunded(event: &StripeEvent, pool: &Pool) -> WebhookOutc
     // so goodwill refunds of expired credits net to zero) and voids the
     // credits it granted pro rata to the charge `amount` refunded.
     let payment_intent = obj["payment_intent"].as_str();
-    let charge_amount = obj["amount"].as_i64();
+    // Required, like `amount_refunded`: a Charge always carries `amount`, and
+    // defaulting its absence to "unknown" selected a financial meaning (the
+    // at-par target) for a payload this code does not understand — a full
+    // refund of a $20 purchase that granted 16,000,000 credits would have
+    // written -20,000,000.
+    let charge_amount = match obj["amount"].as_i64() {
+        Some(a) => a,
+        None => {
+            error!("webhook: charge.refunded missing amount");
+            return WebhookOutcome::Done("malformed_event");
+        }
+    };
 
     match db::refund_charge(
         pool,
@@ -662,6 +673,13 @@ async fn handle_dispute_created(
         Err(outcome) => return outcome,
     };
 
+    // The dispute id is what its `closed` event will reverse by: the
+    // clawback row carries it as `memo`.
+    let Some(dispute_id) = obj["id"].as_str() else {
+        error!("webhook: charge.dispute.created missing dispute id");
+        return WebhookOutcome::Done("malformed_event");
+    };
+
     let amount = match obj["amount"].as_i64() {
         Some(a) => a,
         None => {
@@ -684,6 +702,7 @@ async fn handle_dispute_created(
         microdollars,
         "dispute_clawback",
         &event.id,
+        Some(dispute_id),
     )
     .await
     {
@@ -720,43 +739,32 @@ async fn handle_dispute_closed(
         Err(outcome) => return outcome,
     };
 
-    let amount = match obj["amount"].as_i64() {
-        Some(a) => a,
-        None => {
-            error!("webhook: charge.dispute.closed missing amount");
-            return WebhookOutcome::Done("malformed_event");
-        }
+    let Some(dispute_id) = obj["id"].as_str() else {
+        error!("webhook: charge.dispute.closed missing dispute id");
+        return WebhookOutcome::Done("malformed_event");
     };
 
-    let delta = match cents_to_microdollars(amount) {
-        Some(d) => d,
-        None => {
-            error!("webhook: amount overflow in charge.dispute.closed");
-            return WebhookOutcome::Done("amount_overflow");
-        }
-    };
-
-    match db::insert_credit_ledger(
-        pool,
-        account.id,
-        delta,
-        "dispute_reversal",
-        &event.id,
-        None,
-        None,
-    )
-    .await
-    {
-        Ok(true) => {
+    // What comes back is what the dispute's clawback took, read off the
+    // ledger — not the payload's `amount`. A dispute this server never
+    // debited (its `created` event arrived before the handler could resolve
+    // the account, or was exhausted) has nothing to reverse; crediting the
+    // payload's amount would mint balance the account never lost, and
+    // balance converts to unlinkable credentials.
+    match db::reverse_dispute_clawback(pool, account.id, dispute_id, &event.id).await {
+        Ok(db::DisputeReversal::Credited(_)) => {
             info!("webhook: ledger credited (dispute_reversal)");
             WebhookOutcome::Done("handled")
         }
-        Ok(false) => {
+        Ok(db::DisputeReversal::Duplicate) => {
             info!("webhook: duplicate event, skipping");
             WebhookOutcome::Done("duplicate")
         }
+        Ok(db::DisputeReversal::NothingToReverse) => {
+            warn!("webhook: dispute won with no clawback on the ledger, nothing to reverse");
+            WebhookOutcome::Done("no_clawback_recorded")
+        }
         Err(e) => {
-            error!("webhook: failed to insert ledger entry: {}", e);
+            error!("webhook: failed to reverse dispute clawback: {}", e);
             WebhookOutcome::Retryable("db_error")
         }
     }
@@ -1007,6 +1015,7 @@ mod tests {
             "charge.refunded",
             serde_json::json!({
                 "customer": cust,
+                "amount": 1000,
                 "amount_refunded": 1000
             }),
         );
@@ -1256,6 +1265,7 @@ mod tests {
             serde_json::json!({
                 "customer": cust,
                 "payment_intent": pi,
+                "amount": 5000,
                 "amount_refunded": 5000
             }),
         );
@@ -1310,6 +1320,7 @@ mod tests {
             "charge.refunded",
             serde_json::json!({
                 "customer": cust,
+                "amount": 5000,
                 "amount_refunded": 5000
             }),
         );
@@ -1358,6 +1369,7 @@ mod tests {
             &format!("evt_{}", uuid::Uuid::new_v4()),
             "charge.dispute.created",
             serde_json::json!({
+                "id": "dp_plain_123",
                 "customer": cust,
                 "amount": 500,
                 "charge": "ch_test_123"
@@ -1467,9 +1479,64 @@ mod tests {
         assert_eq!(get_balance(&pool, account_id).await, 45_000_000);
     }
 
+    /// A won dispute gives back what its clawback took — read off the ledger
+    /// by dispute id, through the real `created` → `closed` sequence.
     #[tokio::test]
     #[ignore]
     async fn dispute_closed_won_reverses_a_stripe_shaped_dispute() {
+        let pool = test_pool();
+        let cust = format!("cus_test_{}", uuid::Uuid::new_v4());
+        let account_id = create_test_account(&pool, &cust).await;
+        db::insert_credit_ledger(
+            &pool,
+            account_id,
+            50_000_000,
+            "subscription_renewal",
+            &format!("evt_seed_{}", uuid::Uuid::new_v4()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let stripe = stub_charge_customer(Some(cust.clone())).await;
+
+        let created = make_event(
+            &format!("evt_{}", uuid::Uuid::new_v4()),
+            "charge.dispute.created",
+            stripe_shaped_dispute("needs_response"),
+        );
+        assert!(
+            !handle_dispute_created(&created, &pool, &stripe)
+                .await
+                .is_retryable()
+        );
+        assert_eq!(get_balance(&pool, account_id).await, 45_000_000);
+
+        let won = make_event(
+            &format!("evt_{}", uuid::Uuid::new_v4()),
+            "charge.dispute.closed",
+            stripe_shaped_dispute("won"),
+        );
+        let outcome = handle_dispute_closed(&won, &pool, &stripe).await;
+        assert!(!outcome.is_retryable());
+        assert_eq!(get_balance(&pool, account_id).await, 50_000_000);
+
+        // Redelivered, it gives nothing back twice.
+        assert!(
+            !handle_dispute_closed(&won, &pool, &stripe)
+                .await
+                .is_retryable()
+        );
+        assert_eq!(get_balance(&pool, account_id).await, 50_000_000);
+    }
+
+    /// A dispute this server never debited — its `created` event arrived
+    /// before the handler could resolve the account, or was exhausted — has
+    /// nothing to reverse. Crediting the payload's amount would mint balance
+    /// the account never lost, and balance converts to unlinkable credentials.
+    #[tokio::test]
+    #[ignore]
+    async fn a_won_dispute_with_no_recorded_clawback_credits_nothing() {
         let pool = test_pool();
         let cust = format!("cus_test_{}", uuid::Uuid::new_v4());
         let account_id = create_test_account(&pool, &cust).await;
@@ -1482,34 +1549,9 @@ mod tests {
         let stripe = stub_charge_customer(Some(cust.clone())).await;
         let outcome = handle_dispute_closed(&event, &pool, &stripe).await;
 
-        assert!(!outcome.is_retryable());
-        assert_eq!(get_balance(&pool, account_id).await, 5_000_000);
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn dispute_closed_won_reverses() {
-        let pool = test_pool();
-        let cust = format!("cus_test_{}", uuid::Uuid::new_v4());
-        let account_id = create_test_account(&pool, &cust).await;
-
-        let event = make_event(
-            &format!("evt_{}", uuid::Uuid::new_v4()),
-            "charge.dispute.closed",
-            serde_json::json!({
-                "customer": cust,
-                "charge": "ch_test_123",
-                "status": "won",
-                "amount": 500
-            }),
-        );
-
-        let stripe = stub_charge_customer(Some(cust.clone())).await;
-        let outcome = handle_dispute_closed(&event, &pool, &stripe).await;
-
-        assert!(!outcome.is_retryable());
-        assert_eq!(get_balance(&pool, account_id).await, 5_000_000);
-        assert_eq!(count_ledger_entries(&pool, account_id).await, 1);
+        assert!(!outcome.is_retryable(), "redelivery would not help");
+        assert_eq!(get_balance(&pool, account_id).await, 0);
+        assert_eq!(count_ledger_entries(&pool, account_id).await, 0);
     }
 
     #[tokio::test]

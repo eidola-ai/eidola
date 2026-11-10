@@ -398,7 +398,8 @@ CREATE FUNCTION debit_account(
     p_stripe_event_id  TEXT    DEFAULT NULL,
     p_credential_key_id TEXT   DEFAULT NULL,
     p_require_balance  BOOLEAN DEFAULT TRUE,
-    p_payment_intent   TEXT    DEFAULT NULL
+    p_payment_intent   TEXT    DEFAULT NULL,
+    p_memo             TEXT    DEFAULT NULL
 ) RETURNS UUID[]
 LANGUAGE plpgsql
 AS $$
@@ -459,12 +460,13 @@ BEGIN
 
         INSERT INTO credit_ledger (
             id, account_id, delta, reason, stripe_event_id, expires_at,
-            credential_key_id, credential_credits, stripe_payment_intent, created_at
+            credential_key_id, credential_credits, stripe_payment_intent, memo,
+            created_at
         ) VALUES (
             gen_random_uuid(), p_account_id, -v_take, p_reason, v_event_id,
             v_pool.expires_at, p_credential_key_id,
             CASE WHEN p_credential_key_id IS NOT NULL THEN v_take ELSE NULL END,
-            p_payment_intent,
+            p_payment_intent, p_memo,
             now()
         )
         RETURNING id INTO v_entry_id;
@@ -567,7 +569,9 @@ COMMENT ON FUNCTION debit_account IS
     'remainder beyond live pools is next netted against expired positive '
     'pools (most recently expired first, inheriting their past expires_at); '
     'only what exceeds those too is placed in the permanent (NULL expiry) '
-    'pool.  Clawbacks skip the expired-pool pass and go permanent directly.';
+    'pool.  Clawbacks skip the expired-pool pass and go permanent directly. '
+    'p_memo is carried onto every row the debit writes; a dispute clawback '
+    'records the Stripe dispute id there so its reversal can find it.';
 
 CREATE FUNCTION prune_expired_nullifiers()
 RETURNS BIGINT

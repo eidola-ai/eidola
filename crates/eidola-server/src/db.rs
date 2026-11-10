@@ -742,6 +742,7 @@ pub async fn debit_stripe_event(
     amount: i64,
     reason: &str,
     stripe_event_id: &str,
+    memo: Option<&str>,
 ) -> Result<bool, ServerError> {
     let client = pool
         .get()
@@ -750,8 +751,8 @@ pub async fn debit_stripe_event(
 
     let row = client
         .query_one(
-            "SELECT debit_account($1, $2, $3, $4, NULL, FALSE) AS ids",
-            &[&account_id, &amount, &reason, &stripe_event_id],
+            "SELECT debit_account($1, $2, $3, $4, NULL, FALSE, NULL, $5) AS ids",
+            &[&account_id, &amount, &reason, &stripe_event_id, &memo],
         )
         .await
         .map_err(|e| {
@@ -767,6 +768,100 @@ pub async fn debit_stripe_event(
         Some(v) if v.is_empty() => Ok(false), // duplicate event
         Some(_) => Ok(true),
     }
+}
+
+/// What reversing a dispute's clawback did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DisputeReversal {
+    /// The clawbacks recorded for the dispute, net of earlier reversals, were
+    /// credited back: this many micro-dollars.
+    Credited(i64),
+    /// This event was already handled.
+    Duplicate,
+    /// No clawback is on the ledger for this dispute (or it was reversed
+    /// already), so there is nothing to give back.
+    NothingToReverse,
+}
+
+/// Reverse the clawback recorded for `dispute_id`, crediting back exactly
+/// what it debited (net of any earlier reversal) — never the amount the
+/// `charge.dispute.closed` payload names. A dispute whose `created` event
+/// this server never debited (delivered before the handler could resolve
+/// its account, or exhausted) has nothing to reverse, and crediting the
+/// payload's amount would mint balance the account never lost. One
+/// transaction with the account row locked, like `refund_charge`.
+pub async fn reverse_dispute_clawback(
+    pool: &Pool,
+    account_id: Uuid,
+    dispute_id: &str,
+    stripe_event_id: &str,
+) -> Result<DisputeReversal, ServerError> {
+    let db_err = |what: &'static str| {
+        move |e: tokio_postgres::Error| {
+            ServerError::Internal(format!("{what} failed: {}", db_error_summary(&e)))
+        }
+    };
+    let mut client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    let tx = client
+        .transaction()
+        .await
+        .map_err(db_err("begin dispute reversal transaction"))?;
+
+    tx.execute(
+        "SELECT 1 FROM account WHERE id = $1 FOR UPDATE",
+        &[&account_id],
+    )
+    .await
+    .map_err(db_err("dispute reversal account lock"))?;
+
+    let duplicate: bool = tx
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM credit_ledger WHERE stripe_event_id = $1)",
+            &[&stripe_event_id],
+        )
+        .await
+        .map_err(db_err("dispute reversal duplicate check"))?
+        .get(0);
+    if duplicate {
+        tx.rollback()
+            .await
+            .map_err(db_err("dispute reversal rollback"))?;
+        return Ok(DisputeReversal::Duplicate);
+    }
+
+    // Clawback rows are negative and reversal rows positive, so the negated
+    // sum over both is what the dispute still holds back from the account.
+    let outstanding: i64 = tx
+        .query_one(
+            "SELECT COALESCE(SUM(-delta), 0)::bigint FROM credit_ledger \
+             WHERE account_id = $1 AND memo = $2 \
+               AND reason IN ('dispute_clawback', 'dispute_reversal')",
+            &[&account_id, &dispute_id],
+        )
+        .await
+        .map_err(db_err("dispute clawback lookup"))?
+        .get(0);
+    if outstanding <= 0 {
+        tx.rollback()
+            .await
+            .map_err(db_err("dispute reversal rollback"))?;
+        return Ok(DisputeReversal::NothingToReverse);
+    }
+
+    tx.execute(
+        "INSERT INTO credit_ledger (account_id, delta, reason, stripe_event_id, memo) \
+         VALUES ($1, $2, 'dispute_reversal', $3, $4)",
+        &[&account_id, &outstanding, &stripe_event_id, &dispute_id],
+    )
+    .await
+    .map_err(db_err("dispute reversal insert"))?;
+    tx.commit()
+        .await
+        .map_err(db_err("dispute reversal commit"))?;
+    Ok(DisputeReversal::Credited(outstanding))
 }
 
 /// What [`refund_charge`] did with one `charge.refunded` event.
@@ -808,7 +903,7 @@ pub async fn refund_charge(
     account_id: Uuid,
     stripe_event_id: &str,
     payment_intent: Option<&str>,
-    charge_amount_cents: Option<i64>,
+    charge_amount_cents: i64,
     amount_refunded_cents: i64,
 ) -> Result<RefundOutcome, ServerError> {
     let db_err = |what: &'static str| {
@@ -862,7 +957,7 @@ pub async fn refund_charge(
         ServerError::Internal("refund amount overflows micro-dollars".to_string())
     })?;
     let target = match (&original, charge_amount_cents) {
-        (Some(row), Some(charge)) if charge > 0 => {
+        (Some(row), charge) if charge > 0 => {
             let granted: i64 = row.get("delta");
             let share = i128::from(granted) * i128::from(amount_refunded_cents.min(charge))
                 / i128::from(charge);
