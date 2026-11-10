@@ -39,7 +39,11 @@
 //! means `gemma4-31b@eidola`, and [`qualified_model_id`] keeps the bare
 //! form canonical so the common case reads clean everywhere (config,
 //! action rows, the CLI). Every other backend — the local singleton
-//! included — always spells its models qualified (`<slug>@local`).
+//! included — always spells its models qualified (`<slug>@local`). An Eidola
+//! model reference may carry a digest (`tag@sha256:<hex>`, a pin; see
+//! `model_catalog`), which holds an `@` of its own: [`parse_model_ref`] never
+//! reads a digest as a backend id, and [`qualified_model_id`] always spells a
+//! pin qualified, `tag@sha256:<hex>@eidola`.
 //!
 //! ## Forensics
 //!
@@ -155,11 +159,20 @@ pub struct ModelRef {
 /// `@`; a bare selection routes to `eidola` (the default backend's sugar).
 /// Pure and infallible — whether the backend *exists* is the router's
 /// question, not the parser's.
+///
+/// **A digest is never a backend.** An Eidola pin, `tag@sha256:<hex>`, holds
+/// an `@` of its own; what follows the last `@` there starts with the digest
+/// prefix, which no backend id can (backend ids are `[a-z0-9-]`), so a
+/// selection whose tail is a digest is an Eidola model whole. Qualified,
+/// `tag@sha256:<hex>@eidola`, the last `@` is the backend's as usual.
 pub fn parse_model_ref(selection: &str) -> ModelRef {
     if let Some(at) = selection.rfind('@') {
         let (model, backend) = selection.split_at(at);
         let backend = &backend[1..];
-        if !model.is_empty() && !backend.is_empty() {
+        if !model.is_empty()
+            && !backend.is_empty()
+            && !backend.starts_with(eidola_common::model_reference::DIGEST_PREFIX)
+        {
             return ModelRef {
                 backend_id: backend.to_string(),
                 model: model.to_string(),
@@ -174,9 +187,12 @@ pub fn parse_model_ref(selection: &str) -> ModelRef {
 
 /// The canonical selection string for a (model, backend) pair — the inverse
 /// of [`parse_model_ref`]. Eidola models stay bare (the default backend's
-/// sugar); every other backend's models are spelled qualified.
+/// sugar) unless they carry an `@` of their own: a pin, `tag@sha256:<hex>`,
+/// is always spelled qualified, `tag@sha256:<hex>@eidola`, so no reader of the
+/// selection has to know the digest rule to split it. Every other backend's
+/// models are spelled qualified.
 pub fn qualified_model_id(model: &str, backend_id: &str) -> String {
-    if backend_id == EIDOLA_BACKEND_ID {
+    if backend_id == EIDOLA_BACKEND_ID && !model.contains('@') {
         model.to_string()
     } else {
         format!("{model}@{backend_id}")
@@ -553,38 +569,80 @@ impl Inner {
         let overrides_json = update
             .model_overrides
             .map(|o| overrides_to_json(o.as_deref()));
-        let updated = db::update_backend_config(
-            &conn,
-            id,
-            update.display_name.as_deref(),
-            update
-                .base_url
-                .as_ref()
-                .map(|o| o.as_deref().map(|u| u.trim().trim_end_matches('/'))),
-            update.api_key.as_ref().map(|o| o.as_deref()),
-            update.models_dir.as_ref().map(|o| o.as_deref()),
-            overrides_json.as_ref().map(|o| o.as_deref()),
-            update
-                .engine_path
-                .as_ref()
-                .map(|o| o.as_deref().map(|p| p.trim()).filter(|p| !p.is_empty())),
-            update.auto_start,
-            update
-                .trusted_measurements
-                .as_ref()
-                .map(|o| o.as_deref().filter(|m| !m.is_empty())),
-            update.hardware_root_ca.as_ref().map(|o| o.as_deref()),
-            update
-                .hardware_intermediate_ca
-                .as_ref()
-                .map(|o| o.as_deref()),
-            now_ms(),
-        )
-        .await?;
+        // **One transaction: the configuration and the keys it invalidates.**
+        // A prefix-cache key never outlives the trust domain it was minted
+        // under — every key is bound to the digest of the eidola endpoint and
+        // trust bundle, and a mismatch rotates it at the next claim — and this
+        // is the belt to that brace: a write that changes the domain forgets
+        // every key from another one in the same transaction, read back from
+        // the row as written. So the configuration never commits without its
+        // cleanup, and a failure in either leaves both as they were and is
+        // reported with nothing to announce. A write that changed nothing
+        // keeps every key.
+        db::begin_write(&conn).await?;
+        let written = async {
+            let updated = db::update_backend_config(
+                &conn,
+                id,
+                update.display_name.as_deref(),
+                update
+                    .base_url
+                    .as_ref()
+                    .map(|o| o.as_deref().map(|u| u.trim().trim_end_matches('/'))),
+                update.api_key.as_ref().map(|o| o.as_deref()),
+                update.models_dir.as_ref().map(|o| o.as_deref()),
+                overrides_json.as_ref().map(|o| o.as_deref()),
+                update
+                    .engine_path
+                    .as_ref()
+                    .map(|o| o.as_deref().map(|p| p.trim()).filter(|p| !p.is_empty())),
+                update.auto_start,
+                update
+                    .trusted_measurements
+                    .as_ref()
+                    .map(|o| o.as_deref().filter(|m| !m.is_empty())),
+                update.hardware_root_ca.as_ref().map(|o| o.as_deref()),
+                update
+                    .hardware_intermediate_ca
+                    .as_ref()
+                    .map(|o| o.as_deref()),
+                now_ms(),
+            )
+            .await?;
+            if !updated || kind != BackendKind::Eidola {
+                return Ok((updated, 0));
+            }
+            #[cfg(feature = "test-support")]
+            if self
+                .fail_cache_key_cleanup
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(AppError::Database {
+                    message: "injected failure forgetting prefix-cache keys".into(),
+                });
+            }
+            let current = db::get_backend(&conn, id).await?;
+            let domain = crate::EidolaResolved::from_row(current.as_ref())?.cache_trust_domain();
+            Ok((true, db::forget_cache_keys_outside(&conn, &domain).await?))
+        }
+        .await;
+        let (updated, forgotten) = match written {
+            Ok(done) => {
+                conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+                done
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
         if !updated {
             return Err(AppError::NotConfigured {
                 message: format!("no backend named `{id}` is configured"),
             });
+        }
+        if forgotten > 0 {
+            db::truncate_log_after_forgetting_keys(&conn).await;
         }
         if repointed {
             self.retire_engines_for(id).await;
@@ -771,6 +829,8 @@ impl Inner {
                             context_tokens, ..
                         } => Some(ModelInfo {
                             id: m.id,
+                            sha256: None,
+                            tags: Vec::new(),
                             context_length: context_tokens as u64,
                             // A local model is a file someone supplied. What
                             // it can do is a property of the chat template
@@ -787,6 +847,8 @@ impl Inner {
                         crate::local_models::LocalModelStatus::Available
                         | crate::local_models::LocalModelStatus::Loading => Some(ModelInfo {
                             id: m.id,
+                            sha256: None,
+                            tags: Vec::new(),
                             context_length: 0,
                             max_output_tokens: None,
                             output_budget_class: None,
@@ -809,6 +871,8 @@ impl Inner {
 fn plain_model_info(id: String) -> ModelInfo {
     ModelInfo {
         id,
+        sha256: None,
+        tags: Vec::new(),
         context_length: 0,
         max_output_tokens: None,
         output_budget_class: None,
@@ -875,6 +939,46 @@ mod tests {
                 model: "org/model".into()
             }
         );
+    }
+
+    /// Every spelling of an Eidola digest reference parses to the eidola
+    /// backend and the whole reference, and a pin's canonical spelling is
+    /// qualified: a digest is never read as a backend id.
+    #[test]
+    fn a_digest_reference_is_never_split_as_a_backend() {
+        let hash = "a".repeat(64);
+        let pinned = format!("mimo-v2.6-flash@sha256:{hash}");
+        let unlabelled = format!("sha256:{hash}");
+        for (selection, model) in [
+            (format!("{pinned}@eidola"), pinned.clone()),
+            (pinned.clone(), pinned.clone()),
+            (unlabelled.clone(), unlabelled.clone()),
+            (format!("{unlabelled}@eidola"), unlabelled.clone()),
+        ] {
+            assert_eq!(
+                parse_model_ref(&selection),
+                ModelRef {
+                    backend_id: "eidola".into(),
+                    model
+                },
+                "{selection}"
+            );
+        }
+        assert_eq!(
+            qualified_model_id(&pinned, "eidola"),
+            format!("{pinned}@eidola")
+        );
+        assert_eq!(qualified_model_id(&unlabelled, "eidola"), unlabelled);
+        assert_eq!(
+            qualified_model_id("mimo-v2.6-flash", "eidola"),
+            "mimo-v2.6-flash"
+        );
+        for model in [pinned, unlabelled, "mimo-v2.6-flash".to_string()] {
+            let q = qualified_model_id(&model, "eidola");
+            assert_eq!(parse_model_ref(&q).model, model, "{q}");
+        }
+        // No backend id can begin with the digest prefix.
+        assert!(validate_backend_id("sha256:x").is_err());
     }
 
     #[test]

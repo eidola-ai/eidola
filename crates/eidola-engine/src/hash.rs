@@ -10,9 +10,13 @@
 
 use sha2::{Digest, Sha256};
 
+use crate::kv_cipher::KvNonce;
 use crate::secret::EngineSalt;
 
 const DOMAIN: &[u8] = b"eidola/kv-block/v1";
+
+/// Domain label of the nonce an idle block is encrypted under.
+const NONCE_DOMAIN: &[u8] = b"eidola/kv-nonce/v1";
 
 /// A block hash. It is an opaque but stable linkage tag for a (salt, prefix) pair: two
 /// equal hashes mean "same salt and same tokens up to here", and nothing about the tokens
@@ -44,6 +48,21 @@ impl BlockHash {
     /// Hash of the block following `parent`.
     pub fn child(parent: &BlockHash, tokens: &[u32]) -> Self {
         Self::digest(1, &parent.0, tokens)
+    }
+
+    /// The nonce group `group`'s block at this hash is encrypted under while idle:
+    /// `SHA-256("eidola/kv-nonce/v1" ‖ hash ‖ group:u32le)`, its first 12 bytes. One per
+    /// sealed block of a lineage, so the same plaintext always meets the same nonce
+    /// (`crate::kv_cipher` gives the argument).
+    pub fn kv_nonce(&self, group: u32) -> KvNonce {
+        let mut h = Sha256::new();
+        h.update(NONCE_DOMAIN);
+        h.update(self.0);
+        h.update(group.to_le_bytes());
+        let d = h.finalize();
+        let mut n = [0u8; 12];
+        n.copy_from_slice(&d[..12]);
+        KvNonce::from_bytes(n)
     }
 
     fn digest(tag: u8, prev: &[u8; 32], tokens: &[u32]) -> Self {
@@ -114,6 +133,21 @@ mod tests {
         extend_chain(&s, &toks2, 16, &mut other);
         assert_eq!(whole[..2], other[..2]);
         assert_ne!(whole[2], other[2]);
+    }
+
+    #[test]
+    fn nonces_differ_by_block_and_group_and_are_stable() {
+        let s = EngineSalt::from_bytes([5; 32]);
+        let toks: Vec<u32> = (0..64).collect();
+        let mut chain = Vec::new();
+        extend_chain(&s, &toks, 16, &mut chain);
+        let mut seen = std::collections::HashSet::new();
+        for h in &chain {
+            for g in 0..3 {
+                assert!(seen.insert(h.kv_nonce(g)));
+                assert_eq!(h.kv_nonce(g), h.kv_nonce(g));
+            }
+        }
     }
 
     #[test]

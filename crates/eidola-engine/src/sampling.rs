@@ -12,27 +12,45 @@
 //!    applied by construction rather than by each caller remembering to mask.
 //! 1. **Greedy** (`temperature == 0`): the distribution is one-hot at `argmax l`, ties to
 //!    the lowest token id. No random draw is consumed.
-//! 2. Otherwise `z = l / temperature`, `p = softmax(z)` (max-subtracted).
+//! 2. Otherwise `z = l / temperature`, `p = softmax(z)` (max-subtracted, exponentials
+//!    from [`det_exp`]).
 //! 3. **Top-k** (`top_k > 0`): order tokens by `(p descending, id ascending)`; keep the
 //!    first `top_k`.
 //! 4. **Top-p** (`top_p < 1`): renormalize the kept set; in the same order keep the
-//!    shortest prefix whose cumulative mass is `>= top_p` (always at least one token).
+//!    shortest prefix whose mass is `>= top_p` (always at least one token).
 //! 5. **Min-p** (`min_p > 0`): keep tokens with `p >= min_p * max(p)`.
 //! 6. Renormalize the kept set; everything else has probability exactly 0.
 //! 7. **Draw**: `u = uniform(seed, position, stream)`; the token is the smallest id `i`
-//!    (in vocabulary order) with `Σ_{j<=i} p_j > u`. If rounding leaves no such id, the
-//!    largest id with `p > 0` is chosen.
+//!    (in vocabulary order) with `Σ_{j<=i} p_j > u · Σ_j p_j`. If rounding leaves no such
+//!    id, the largest id with `p > 0` is chosen.
 //!
 //! `position` is the absolute sequence position of the token being chosen, so a draw
 //! depends only on `(seed, position, stream)` — never on batch composition, step
 //! boundaries, preemption, or chunking. That is what makes recompute-based preemption and
 //! chunked prefill reproduce an uninterrupted run exactly.
 //!
-//! # Precision
+//! # Precision: pinned arithmetic
 //!
-//! This reference accumulates in `f64` in vocabulary order. A device sampler reducing in
-//! `f32` in parallel produces the same token except when `u` lies within rounding distance
-//! of a CDF boundary; that is the only permitted divergence.
+//! The arithmetic is `f64` and fixed down to the last bit, so that a parallel device
+//! sampler reproduces every probability, and therefore every token, exactly:
+//!
+//! * **Exponentials** come from [`det_exp`], built from correctly rounded `+ - * /` only
+//!   (no FMA contraction), never from the platform's `exp`, whose last bit differs between
+//!   C libraries (macOS and glibc disagree on about 0.2 % of softmax-range arguments).
+//! * **Every sum of a set of probabilities** is [`pinned_sum`] in vocabulary order: each
+//!   chunk of [`SUM_CHUNK`] consecutive ids summed left to right, then the chunk sums left
+//!   to right. A mass "in rank order" (top-p's prefixes) is the pinned sum of that set in
+//!   vocabulary order. Because adding a non-negative term never lowers a rounded partial
+//!   sum, these masses grow with the set, so "the shortest prefix whose mass is `>= x`" is
+//!   well defined.
+//! * **Cumulative sums** for the draw follow the same chunking: the prefix through id `i`
+//!   in chunk `c` is `(sum of the chunk sums before c) + (left-to-right sum of chunk c
+//!   through i)`, and its last value is exactly the pinned total.
+//!
+//! Max, comparisons, `f32 → f64` conversion and the divisions are exact or correctly
+//! rounded on every IEEE platform. A device sampler that performs these same operations in
+//! this same grouping returns the same token as this reference, bit for bit, given equal
+//! logits.
 //!
 //! # Speculative acceptance
 //!
@@ -174,6 +192,94 @@ pub enum Stream {
     Draft = 3,
 }
 
+/// Ids per chunk of a [`pinned_sum`].
+pub const SUM_CHUNK: usize = 1024;
+
+/// The sum of `x` in the pinned order: each [`SUM_CHUNK`] of consecutive entries summed
+/// left to right from 0, then the chunk sums left to right from 0.
+pub fn pinned_sum(x: &[f64]) -> f64 {
+    let mut total = 0.0;
+    for chunk in x.chunks(SUM_CHUNK) {
+        let mut s = 0.0;
+        for &v in chunk {
+            s += v;
+        }
+        total += s;
+    }
+    total
+}
+
+/// [`pinned_sum`] of the entries `keep` selects (the others count as 0).
+fn pinned_sum_where(x: &[f64], keep: impl Fn(usize) -> bool) -> f64 {
+    let mut total = 0.0;
+    for (c, chunk) in x.chunks(SUM_CHUNK).enumerate() {
+        let mut s = 0.0;
+        for (j, &v) in chunk.iter().enumerate() {
+            if keep(c * SUM_CHUNK + j) {
+                s += v;
+            }
+        }
+        total += s;
+    }
+    total
+}
+
+/// Coefficients `1 / k!` (correctly rounded) of the degree-13 Taylor polynomial of `e^r`.
+const EXP_COEFFS: [u64; 14] = [
+    0x3ff0000000000000,
+    0x3ff0000000000000,
+    0x3fe0000000000000,
+    0x3fc5555555555555,
+    0x3fa5555555555555,
+    0x3f81111111111111,
+    0x3f56c16c16c16c17,
+    0x3f2a01a01a01a01a,
+    0x3efa01a01a01a01a,
+    0x3ec71de3a556c734,
+    0x3e927e4fb7789f5c,
+    0x3e5ae64567f544e4,
+    0x3e21eed8eff8d898,
+    0x3de6124613a86d09,
+];
+
+/// `e^x` from correctly rounded `+ - * /` alone, so every IEEE platform (and a device
+/// kernel that avoids FMA contraction) computes the same bits. Accurate to a few ulp:
+///
+/// 1. `n = round(x / ln 2)` (half away from zero), `r = (x - n·ln2_hi) - n·ln2_lo`
+///    (Cody–Waite; `ln2_hi` has 32 significant bits, so `n·ln2_hi` is exact);
+/// 2. `e^r` by Horner over [`EXP_COEFFS`] (`|r| <= 0.35`, truncation below 1e-17);
+/// 3. scaled by `2^n` with power-of-two multiplications (two of them below `2^-1022`,
+///    where the second rounds once into the subnormals).
+pub fn det_exp(x: f64) -> f64 {
+    const INV_LN2: f64 = f64::from_bits(0x3ff71547652b82fe);
+    const LN2_HI: f64 = f64::from_bits(0x3fe62e42fee00000);
+    const LN2_LO: f64 = f64::from_bits(0x3dea39ef35793c76);
+    if x.is_nan() {
+        return x;
+    }
+    if x > 709.782712893384 {
+        return f64::INFINITY;
+    }
+    if x < -745.2 {
+        return 0.0;
+    }
+    let n = (x * INV_LN2).round();
+    let r = (x - n * LN2_HI) - n * LN2_LO;
+    let mut p = f64::from_bits(EXP_COEFFS[13]);
+    for k in (0..13).rev() {
+        p = p * r + f64::from_bits(EXP_COEFFS[k]);
+    }
+    let n = n as i64;
+    let pow2 = |e: i64| f64::from_bits(((e + 1023) as u64) << 52);
+    if n > 1023 {
+        p * pow2(1023) * pow2(n - 1023)
+    } else if n < -1022 {
+        p * pow2(-600) * pow2(n + 600)
+    } else {
+        p * pow2(n)
+    }
+}
+
 /// SplitMix64 finalizer.
 pub fn mix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -260,11 +366,10 @@ pub fn processed_probs(logits: Logits<'_>, params: &SamplingParams) -> Vec<f64> 
     let max = logits
         .iter()
         .fold(f64::NEG_INFINITY, |m, &v| m.max(v as f64 / t));
-    let mut sum = 0.0;
     for (pi, &l) in p.iter_mut().zip(logits) {
-        *pi = ((l as f64 / t) - max).exp();
-        sum += *pi;
+        *pi = det_exp((l as f64 / t) - max);
     }
+    let sum = pinned_sum(&p);
     for pi in &mut p {
         *pi /= sum;
     }
@@ -278,19 +383,26 @@ pub fn processed_probs(logits: Logits<'_>, params: &SamplingParams) -> Vec<f64> 
     if params.top_k > 0 {
         keep = keep.min(params.top_k as usize);
     }
+    // rank[i]: position of id i in `order`.
+    let mut rank = vec![0usize; n];
+    for (r, &i) in order.iter().enumerate() {
+        rank[i] = r;
+    }
     if params.top_p < 1.0 {
-        let mass: f64 = order[..keep].iter().map(|&i| p[i]).sum();
+        let mass = pinned_sum_where(&p, |i| rank[i] < keep);
         let target = params.top_p as f64 * mass;
-        let mut cum = 0.0;
-        let mut cut = keep;
-        for (rank, &i) in order[..keep].iter().enumerate() {
-            cum += p[i];
-            if cum >= target {
-                cut = rank + 1;
-                break;
+        // The mass of the first `r` ranks grows with `r`: binary search for the
+        // shortest prefix reaching the target (the whole kept set always does).
+        let (mut lo, mut hi) = (1usize, keep);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if pinned_sum_where(&p, |i| rank[i] < mid) >= target {
+                hi = mid;
+            } else {
+                lo = mid + 1;
             }
         }
-        keep = cut.max(1);
+        keep = lo.max(1);
     }
     if params.min_p > 0.0 {
         let floor = params.min_p as f64 * p[order[0]];
@@ -298,27 +410,36 @@ pub fn processed_probs(logits: Logits<'_>, params: &SamplingParams) -> Vec<f64> 
         keep = cut.max(1);
     }
     let mut out = vec![0.0f64; n];
-    let mass: f64 = order[..keep].iter().map(|&i| p[i]).sum();
+    let mass = pinned_sum_where(&p, |i| rank[i] < keep);
     for &i in &order[..keep] {
         out[i] = p[i] / mass;
     }
     out
 }
 
-/// Inverse-CDF draw in vocabulary order (step 7).
+/// Inverse-CDF draw in vocabulary order (step 7), with the pinned chunked prefix sums.
 pub fn sample_from(probs: &[f64], u: f64) -> u32 {
-    let total: f64 = probs.iter().sum();
-    let target = u * total;
-    let mut cum = 0.0;
+    let target = u * pinned_sum(probs);
+    let mut base = 0.0;
     let mut last_nonzero = 0usize;
-    for (i, &p) in probs.iter().enumerate() {
-        if p > 0.0 {
-            last_nonzero = i;
-            cum += p;
-            if cum > target {
-                return i as u32;
+    for (c, chunk) in probs.chunks(SUM_CHUNK).enumerate() {
+        let mut chunk_sum = 0.0;
+        for &p in chunk {
+            chunk_sum += p;
+        }
+        if let Some(j) = chunk.iter().rposition(|&p| p > 0.0) {
+            last_nonzero = c * SUM_CHUNK + j;
+        }
+        if base + chunk_sum > target {
+            let mut cum = 0.0;
+            for (j, &p) in chunk.iter().enumerate() {
+                cum += p;
+                if p > 0.0 && base + cum > target {
+                    return (c * SUM_CHUNK + j) as u32;
+                }
             }
         }
+        base += chunk_sum;
     }
     last_nonzero as u32
 }
@@ -380,7 +501,7 @@ pub fn chain_accept(
             argmax_f64(p)
         } else {
             let residual: Vec<f64> = p.iter().zip(q).map(|(a, b)| (a - b).max(0.0)).collect();
-            let row = if residual.iter().sum::<f64>() > 0.0 {
+            let row = if pinned_sum(&residual) > 0.0 {
                 &residual
             } else {
                 p
@@ -486,6 +607,67 @@ mod tests {
                 .is_greedy()
         );
         assert!(SamplingParams::new(0.7, 8, 0.9, 1.0, 3).is_ok());
+    }
+
+    /// `det_exp` stays within a few ulp of the platform `exp` across the range softmax
+    /// uses (and beyond, through the subnormals), and its bits are pinned: the goldens
+    /// below were computed once and must hold on every platform.
+    #[test]
+    fn det_exp_is_accurate_and_pinned() {
+        let ulps = |a: f64, b: f64| (a.to_bits() as i64 - b.to_bits() as i64).unsigned_abs();
+        let mut s = 1u64;
+        let mut worst = 0;
+        for _ in 0..200_000 {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let x = -((s >> 11) as f64 / (1u64 << 53) as f64) * 745.0 + 5.0;
+            let (a, b) = (det_exp(x), x.exp());
+            if b > f64::MIN_POSITIVE {
+                worst = worst.max(ulps(a, b));
+            } else {
+                assert!((a - b).abs() <= f64::from_bits(2), "{x}: {a:e} vs {b:e}");
+            }
+        }
+        assert!(worst <= 2, "worst {worst} ulp");
+        assert_eq!(det_exp(0.0), 1.0);
+        assert_eq!(det_exp(f64::NEG_INFINITY), 0.0);
+        assert_eq!(det_exp(-746.0), 0.0);
+        assert_eq!(det_exp(710.0), f64::INFINITY);
+        assert!(det_exp(f64::NAN).is_nan());
+        for (x, bits) in DET_EXP_GOLDEN {
+            assert_eq!(det_exp(x).to_bits(), bits, "det_exp({x})");
+        }
+    }
+
+    /// Computed independently (Python's IEEE doubles, same operations).
+    const DET_EXP_GOLDEN: [(f64, u64); 6] = [
+        (-1.0, 0x3fd78b56362cef38),
+        (-0.5, 0x3fe368b2fc6f960a),
+        (-13.37, 0x3eba31ad57ba12f4),
+        (-700.25, 0x00caf5fe9a485c8e),
+        (-740.0, 0x0000000000000055),
+        (3.0, 0x403415e5bf6fb106),
+    ];
+
+    #[test]
+    fn pinned_sum_chunks() {
+        let x: Vec<f64> = (0..3000).map(|i| 1.0 / (i as f64 + 1.0)).collect();
+        let mut want = 0.0;
+        for c in x.chunks(SUM_CHUNK) {
+            want += c.iter().fold(0.0, |a, &b| a + b);
+        }
+        assert_eq!(pinned_sum(&x).to_bits(), want.to_bits());
+        assert_eq!(pinned_sum_where(&x, |_| true).to_bits(), want.to_bits());
+        // A draw lands on the id whose pinned prefix first exceeds the target.
+        let mut p = vec![0.0; 2 * SUM_CHUNK + 5];
+        p[3] = 0.25;
+        p[SUM_CHUNK + 7] = 0.5;
+        p[2 * SUM_CHUNK + 1] = 0.25;
+        assert_eq!(sample_from(&p, 0.0), 3);
+        assert_eq!(sample_from(&p, 0.25), SUM_CHUNK as u32 + 7);
+        assert_eq!(sample_from(&p, 0.75), 2 * SUM_CHUNK as u32 + 1);
+        assert_eq!(sample_from(&p, 0.999), 2 * SUM_CHUNK as u32 + 1);
     }
 
     #[test]

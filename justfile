@@ -6,17 +6,17 @@ default:
 
 # --- Development ---
 
-# Run the full server stack with the server in a container (detached).
+# Run the full dev stack with the gateway in a container (detached).
 dev:
     ./scripts/dev.sh --container
 
-# Run backing services for host-mode dev — server runs on host with cargo; writes .env.local with BIND_ADDR + STRIPE_WEBHOOK_SECRET to source.
+# Run backing services for host-mode dev — gateway runs on host with cargo; writes .env.local with BIND_ADDR + STRIPE_WEBHOOK_SECRET to source.
 services:
     ./scripts/dev.sh --host
 
 # Stop everything started by `just dev` or `just services`.
 down:
-    docker compose --profile server --profile stripe down --remove-orphans
+    docker compose --profile gateway --profile stripe down --remove-orphans
 
 # Point this machine's client (GUI + CLI) at the local dev stack
 client-local:
@@ -34,13 +34,13 @@ db-reset:
 
 # --- Build (local toolchain, fast iteration) ---
 
-# Build a system: server, cli, gui, or www
+# Build a system: gateway, cli, gui, notepad, www, or engine-server
 build system:
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{ system }}" in
-      server)
-        cargo build -p eidola-server
+      gateway)
+        cargo build -p eidola-server-gateway
         ;;
       cli)
         cargo build -p eidola-cli
@@ -55,12 +55,23 @@ build system:
           ./scripts/package-gui-app.sh debug
         fi
         ;;
+      notepad)
+        # A personal markdown editor on Eidola's writing surface; bundled
+        # on macOS for the same reasons as the GUI, plus its document types.
+        cargo build -p eidola-notepad
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+          ./scripts/package-notepad-app.sh debug
+        fi
+        ;;
       www)
         # Build the website to target/www (drafts excluded, as deployed).
         cargo run -q -p eidola-www -- build
         ;;
+      engine-server)
+        cargo build -p eidola-server-engine
+        ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, www)" >&2
+        echo "error: unknown system '{{ system }}' (expected: gateway, cli, gui, notepad, www, engine-server)" >&2
         exit 1
         ;;
     esac
@@ -72,6 +83,15 @@ build system:
 engine-kernels *args:
     crates/eidola-engine-kernels/scripts/build-in-docker.sh {{args}}
 
+# Vendor a release of the platform provider's signed platform endorsements
+# (`platform-vX.Y.Z` of tinfoilsh/cvmimage) into
+# releases/trust/platform-endorsements/<tag>/: downloads the release file and
+# its attestation bundle, verifies them offline exactly as the gateway's build
+# does, and writes only what verified, for review. The one network fetch of
+# the endorsements; no build reads the network. See deploy/engine/README.md.
+engine-platform-endorsements tag:
+    ./scripts/engine-platform-endorsements.sh {{tag}}
+
 # Build the bundled on-device inference engine sidecar (static llama.cpp
 # `llama-server`) via Nix and materialize it at
 # crates/eidola-gui/build/llama-server. `just build gui` / `just run gui`
@@ -81,13 +101,13 @@ engine-kernels *args:
 engine:
     nix build .#llama-server -o crates/eidola-gui/build/llama-server
 
-# Build and run a system: server, cli, gui, or www
+# Build and run a system: gateway, cli, gui, notepad, www, or engine-server
 run system *args:
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{ system }}" in
-      server)
-        cargo run -p eidola-server -- {{ args }}
+      gateway)
+        cargo run -p eidola-server-gateway -- {{ args }}
         ;;
       cli)
         cargo run -p eidola-cli -- {{ args }}
@@ -106,13 +126,51 @@ run system *args:
           cargo run -p eidola-gui -- {{ args }}
         fi
         ;;
+      notepad)
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+          just build notepad
+          open -W "crates/eidola-notepad/build/Eidola Notepad.app" --args {{ args }}
+        else
+          cargo run -p eidola-notepad -- {{ args }}
+        fi
+        ;;
       www)
         # Dev server at http://127.0.0.1:8000 — drafts included, rebuilds
         # on change. Pass --addr <host:port> to override.
         cargo run -q -p eidola-www -- serve {{ args }}
         ;;
+      engine-server)
+        # An inference node on 127.0.0.1:8090 serving the synthetic dev model (random
+        # weights, gibberish output) through the CPU executor. Gateway token:
+        # `dev-gateway-token`; the weights hash is printed below and served by
+        # GET /v1/engine/info. See crates/eidola-server-engine/AGENTS.md.
+        dir=target/engine-dev-model
+        hash=$(cargo run -q -p eidola-server-engine --example dev_model -- "$dir")
+        echo "weights hash: $hash"
+        EIDOLA_ENGINE_MODEL_ID=mimo-dev \
+        EIDOLA_ENGINE_WEIGHTS_DIR="$dir" \
+        EIDOLA_ENGINE_WEIGHTS_SHA256="$hash" \
+        EIDOLA_ENGINE_WEIGHTS_STORAGE=dev-writable \
+        GATEWAY_TOKEN=dev-gateway-token \
+        GATEWAY_TOKEN_HASH="$(cargo run -q -p hash-secret -- dev-gateway-token)" \
+        EIDOLA_ENGINE_EXECUTOR=cpu \
+        EIDOLA_ENGINE_BIND_ADDR=127.0.0.1:8090 \
+        EIDOLA_ENGINE_KV_BLOCK_SIZE=16 \
+        EIDOLA_ENGINE_KV_BLOCKS=1024 \
+        EIDOLA_ENGINE_MAX_MODEL_LEN=4096 \
+        EIDOLA_ENGINE_MAX_SEQS=8 \
+        EIDOLA_ENGINE_MAX_BATCHED_TOKENS=512 \
+        EIDOLA_ENGINE_MAX_PREFILL_CHUNK=512 \
+        EIDOLA_ENGINE_DRAFT_TOKENS=2 \
+        EIDOLA_ENGINE_MAX_REQUESTS=32 \
+        EIDOLA_ENGINE_PREFIX_CACHE=true \
+        EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS=900 \
+        EIDOLA_ENGINE_CACHE_MAX_AGE_SECS=7200 \
+        EIDOLA_ENGINE_KV_HOST_BYTES=0 \
+          cargo run -p eidola-server-engine -- {{ args }}
+        ;;
       *)
-        echo "error: unknown system '{{ system }}' (expected: server, cli, gui, www)" >&2
+        echo "error: unknown system '{{ system }}' (expected: gateway, cli, gui, notepad, www, engine-server)" >&2
         exit 1
         ;;
     esac
@@ -128,6 +186,7 @@ check:
     ./scripts/check-manifest-determinism.sh
     ./scripts/artifact-manifest.sh check-complete
     ./scripts/test-release-assets.sh
+    ./scripts/test-weights-hash.sh
 
 # Apply auto-fixable markdown formatting via rumdl
 format:
@@ -157,7 +216,7 @@ test:
 
 # Run integration tests (requires: just services && just db-reset)
 test-integration:
-    DATABASE_URL="${DATABASE_URL:-postgres://eidola@localhost/eidola}" CREDENTIAL_MASTER_KEY="${CREDENTIAL_MASTER_KEY:-0000000000000000000000000000000000000000000000000000000000000000}" cargo test -p eidola-server -- --ignored
+    DATABASE_URL="${DATABASE_URL:-postgres://eidola@localhost/eidola}" CREDENTIAL_MASTER_KEY="${CREDENTIAL_MASTER_KEY:-0000000000000000000000000000000000000000000000000000000000000000}" cargo test -p eidola-server-gateway -- --ignored
 
 # Run E2E webhook smoke tests (requires STRIPE_API_KEY)
 test-webhook-smoke:
@@ -167,7 +226,7 @@ test-webhook-smoke:
 
 # Regenerate OpenAPI spec
 update-openapi:
-    ./scripts/update-server-openapi.sh
+    ./scripts/update-gateway-openapi.sh
 
 # Regenerate every identity asset from the brand geometry (macOS only —
 # the .icns needs iconutil; Assets.car needs actool + ictool). See
@@ -233,6 +292,7 @@ test-shipping-zip:
 # otherwise runs only on a real `v*` tag; this runs it on every PR.
 test-release-assets:
     ./scripts/test-release-assets.sh
+    ./scripts/test-weights-hash.sh
 
 # Compute enclave measurements from tinfoil-config.yml and CVM artifacts
 measure:

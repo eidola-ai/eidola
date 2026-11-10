@@ -1650,8 +1650,7 @@ fn register_record(s: &mut Snapshots) {
                 method: "POST".into(),
                 path: "/v1/chat/completions".into(),
                 request_headers: Some(
-                    "content-type: application/json\nauthorization: PrivateToken token=\"…\""
-                        .into(),
+                    "content-type: application/json\naccept: text/event-stream".into(),
                 ),
                 request_body: Some(
                     br#"{"model":"gemma4-31b","stream":true,"messages":[{"role":"user","content":"Why is the sky blue?"}]}"#
@@ -1732,6 +1731,7 @@ fn agent_participant(id: &str, label: &str) -> eidola_app_core::ParticipantInfo 
         kind: "agent".into(),
         label: label.into(),
         model_ref: Some("kimi-k2-6".into()),
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "human".into(),
         role: "member".into(),
@@ -1750,6 +1750,7 @@ fn inspector_participants() -> (String, Vec<eidola_app_core::ParticipantInfo>) {
         // The **wire** label (task 64); the row shows "You".
         label: "User".into(),
         model_ref: None,
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "explicit".into(),
         role: "member".into(),
@@ -1787,6 +1788,8 @@ fn model_stores(cx: &mut App) -> Stores {
         s.models = vec![
             ModelInfo {
                 id: "gemma4-31b".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: Some(16_384),
                 output_budget_class: Some(OutputBudgetClass::Reasoning),
@@ -1802,6 +1805,8 @@ fn model_stores(cx: &mut App) -> Stores {
             },
             ModelInfo {
                 id: "kimi-k2-6".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 262_144,
                 max_output_tokens: Some(32_768),
                 output_budget_class: Some(OutputBudgetClass::Reasoning),
@@ -1820,6 +1825,8 @@ fn model_stores(cx: &mut App) -> Stores {
             // picker has to render one.
             ModelInfo {
                 id: "qwen3-coder-watt".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1834,6 +1841,8 @@ fn model_stores(cx: &mut App) -> Stores {
             // imply we sell one.
             ModelInfo {
                 id: "per-request-example".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 0,
                 max_output_tokens: None,
                 output_budget_class: None,

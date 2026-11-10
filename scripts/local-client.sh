@@ -78,7 +78,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # what both compose and just do.
 #
 # Deliberately not `source .env`: that executes arbitrary shell, and this
-# file holds real secrets (TINFOIL_API_KEY, STRIPE_API_KEY) that would then
+# file holds real secrets (STRIPE_API_KEY, CREDENTIAL_MASTER_KEY) that would then
 # be exported into every process this script spawns.
 #
 # The supported subset of compose's `.env` grammar, verified against

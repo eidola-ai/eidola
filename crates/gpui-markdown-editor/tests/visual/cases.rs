@@ -318,6 +318,40 @@ pub fn register(s: &mut Snapshots) {
         })
     });
 
+    // Frontmatter — a code block at byte 0, so the cursor has no "just
+    // before" side; the rest of the required positions follow.
+    const FRONTMATTER: &str = "---\ntitle: Morning pages\ntags: [notes, journal]\n---\n\nBody prose sits under the metadata.\n\nA second paragraph.";
+    let closer_end = FRONTMATTER.find("---\n\n").unwrap() + 3;
+    let body = FRONTMATTER.find("Body").unwrap();
+    let second = FRONTMATTER.find("A second").unwrap();
+    for (name, selection) in [
+        ("frontmatter_cursor_inside", Selection::Cursor(10)),
+        (
+            "frontmatter_cursor_at_closer",
+            Selection::Cursor(closer_end),
+        ),
+        ("frontmatter_cursor_just_after", Selection::Cursor(body)),
+        (
+            "frontmatter_cursor_separate_line",
+            Selection::Cursor(second + 3),
+        ),
+        (
+            "frontmatter_selection_overlapping",
+            Selection::range(10, body + 4),
+        ),
+    ] {
+        s.add(name, win, move |window, cx| {
+            cx.new(|cx| {
+                let state = EditorState {
+                    markdown: FRONTMATTER.into(),
+                    selection: selection.clone(),
+                    ..Default::default()
+                };
+                EditorHarness::with_state(state, window, cx)
+            })
+        });
+    }
+
     // Fenced code block — long line that overflows the visible width
     // and triggers the horizontal scrollbar.
     s.add("code_block_overflow_scrollbar", win, |window, cx| {

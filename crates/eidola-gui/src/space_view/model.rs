@@ -76,6 +76,8 @@ pub struct PostData {
     /// completion ceiling. The durable half of the cut-off mark: it survives a
     /// window close, which `SpaceView::truncated_posts` cannot.
     pub truncated: bool,
+    /// The cut-off mark offers **Continue** (`ChatMessageView::continuable`).
+    pub continuable: bool,
 }
 
 /// What a [`TreeNode`] renders from.
@@ -288,6 +290,7 @@ mod tests {
             blocks: Vec::new(),
             regenerable: kind == "agent",
             truncated: false,
+            continuable: false,
         }
     }
 
@@ -309,6 +312,7 @@ mod tests {
             blocks: Vec::new(),
             regenerable: false,
             truncated: false,
+            continuable: false,
         }
     }
 

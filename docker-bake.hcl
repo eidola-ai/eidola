@@ -64,15 +64,27 @@ target "_cache_postgres" {
   cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:postgres,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
 }
 
-# ── Local dev targets (compose.yaml overlay) ──────────────────────────────────
-# context and dockerfile come from compose.yaml; not repeated here.
+# ── Local dev targets ─────────────────────────────────────────────────────────
+# Every target declares its own context and dockerfile. Bake also reads
+# compose.yaml and merges a compose service into the target of the same name,
+# but that coupling is by name only: a target leaning on it silently falls
+# back to `./Dockerfile` the moment the service is renamed. compose.yaml's
+# build sections stay for `docker compose build`; they are not this file's
+# source of truth.
 # For reproducible builds, use a docker-container builder with OCI output and
 # --set '*.output=type=image,push=false,rewrite-timestamp=true,force-compression=true,oci-mediatypes=true'
 # (the default docker driver does not support these options).
 
+# The `server` and `ci-server` targets build the gateway image
+# (eidola-server-gateway). The target name is not cosmetic:
+# scripts/artifact-manifest.sh records each target's digest under the
+# manifest key `eidola-<target>`, and installed clients compare that key set,
+# so renaming a target is a manifest artifact-set rotation (releases/README.md).
 target "server" {
-  inherits = ["_common", "_cache_server"]
-  tags     = ["eidola-server:dev"]
+  inherits   = ["_common", "_cache_server"]
+  context    = "."
+  dockerfile = "oci/eidola-server-gateway/Containerfile"
+  tags       = ["eidola-server-gateway:dev"]
 }
 
 target "cli" {
@@ -83,13 +95,17 @@ target "cli" {
 }
 
 target "postgres" {
-  inherits = ["_common", "_cache_postgres"]
-  tags     = ["eidola-postgres:dev"]
+  inherits   = ["_common", "_cache_postgres"]
+  context    = "."
+  dockerfile = "oci/postgresql/Containerfile"
+  tags       = ["eidola-postgres:dev"]
 }
 
 target "shim" {
-  inherits = ["_common"]
-  tags     = ["tinfoil-shim-mock:dev"]
+  inherits   = ["_common"]
+  context    = "."
+  dockerfile = "oci/tinfoil-shim-mock/Containerfile"
+  tags       = ["tinfoil-shim-mock:dev"]
 }
 
 # Stripe CLI — pins the upstream image by digest so dependabot can propose
@@ -119,8 +135,8 @@ target "_ci" {
 target "ci-server" {
   inherits   = ["_ci", "_cache_server"]
   context    = "."
-  dockerfile = "oci/eidola-server/Containerfile"
-  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-server:${t}"]
+  dockerfile = "oci/eidola-server-gateway/Containerfile"
+  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-server-gateway:${t}"]
 }
 
 target "ci-cli" {

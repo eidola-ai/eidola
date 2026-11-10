@@ -17,7 +17,12 @@ space-footnote-delegation-failed = se detuvo: { $reason ->
     }
 
 space-regenerating = Regenerando…
-space-error-response-truncated = El modelo agotó todo su margen de longitud razonando y nunca empezó una respuesta. No se añadió ni reemplazó ninguna respuesta: inténtalo de nuevo o haz una pregunta más breve.
 space-error-model-unavailable = { $model } ya no está disponible en su backend, y ningún otro modelo responderá en su lugar. No se envió nada ni se cobró nada: elige otro modelo e inténtalo de nuevo.
 space-regenerating-elsewhere = Esta respuesta ya se está regenerando.
-space-answer-cut-off = Esta respuesta alcanzó su límite de longitud y se corta a mitad de idea.
+space-answer-cut-off = Esta respuesta se detuvo en su límite de longitud.
+space-continue-answer = Continuar
+space-continue-answer-label = Continuar esta respuesta desde donde se detuvo
+space-continuing = Continuando…
+space-error-issuer-key-off-calendar = El servidor de Eidola ofreció una clave de pago que no sigue el calendario público de claves, así que esta aplicación no la usó. No se envió nada ni se cobró nada, y los créditos que ya tienes siguen funcionando.
+space-error-issuer-key-second-for-epoch = El servidor de Eidola ofreció esta semana una clave de pago distinta de la que esta aplicación ya tiene. Un servidor honesto usa una sola clave por semana, así que esta aplicación no aceptará créditos nuevos con ella hasta la clave de la próxima semana. No se envió nada ni se cobró nada, y los créditos que ya tienes siguen funcionando.
+space-error-issuer-key-reused = El servidor de Eidola ofreció la misma clave de pago para dos semanas distintas, algo que un servidor honesto nunca hace, así que esta aplicación no la usó. No se envió nada ni se cobró nada, y los créditos que ya tienes siguen funcionando.

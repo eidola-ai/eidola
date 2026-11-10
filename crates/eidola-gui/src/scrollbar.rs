@@ -77,7 +77,7 @@ where
 ///
 /// Drop the returned element as a sibling of the scroll container; see the
 /// module docs for placement and corner-duty notes.
-pub(crate) fn vertical<H>(id: &'static str, handle: &H, window: &Window) -> Stateful<Div>
+pub fn vertical<H>(id: &'static str, handle: &H, window: &Window) -> Stateful<Div>
 where
     H: ScrollbarHandle + Clone,
 {

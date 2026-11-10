@@ -1480,6 +1480,7 @@ mod driver {
             // The **wire** label (task 64); every surface shows "You".
             label: "User".into(),
             model_ref: None,
+            model_notices: Vec::new(),
             system_prompt: None,
             notify_policy: "explicit".into(),
             role: "member".into(),
@@ -1501,6 +1502,7 @@ mod driver {
             kind: "agent".into(),
             label: "Assistant".into(),
             model_ref: Some("gemma4-31b".into()),
+            model_notices: Vec::new(),
             system_prompt: Some("Be concise and cite sources.".into()),
             notify_policy: "human".into(),
             role: "member".into(),
@@ -1513,6 +1515,7 @@ mod driver {
             kind: "agent".into(),
             label: "Critic".into(),
             model_ref: Some("qwen3-8b@my-vllm".into()),
+            model_notices: Vec::new(),
             system_prompt: Some("Challenge assumptions and find weak points.".into()),
             notify_policy: "all".into(),
             role: "member".into(),
@@ -1741,6 +1744,8 @@ mod driver {
         vec![
             ModelInfo {
                 id: "gemma4-31b".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1751,6 +1756,8 @@ mod driver {
             },
             ModelInfo {
                 id: "kimi-k2-6".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 262_144,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1761,6 +1768,8 @@ mod driver {
             },
             ModelInfo {
                 id: "qwen3-coder-watt".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1774,6 +1783,8 @@ mod driver {
             // fixture for the picker's own scroll indicator.
             ModelInfo {
                 id: "llama4-scout".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1784,6 +1795,8 @@ mod driver {
             },
             ModelInfo {
                 id: "deepseek-v3".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1794,6 +1807,8 @@ mod driver {
             },
             ModelInfo {
                 id: "mistral-large-3".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1804,6 +1819,8 @@ mod driver {
             },
             ModelInfo {
                 id: "gpt-oss-120b".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1814,6 +1831,8 @@ mod driver {
             },
             ModelInfo {
                 id: "phi5-moe".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1824,6 +1843,8 @@ mod driver {
             },
             ModelInfo {
                 id: "command-r-plus-2".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1834,6 +1855,8 @@ mod driver {
             },
             ModelInfo {
                 id: "yi-large-2".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1844,6 +1867,8 @@ mod driver {
             },
             ModelInfo {
                 id: "glm-5-air".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,

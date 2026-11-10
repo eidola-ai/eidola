@@ -1,0 +1,914 @@
+-- Eidola Billing Schema
+-- Targeting PostgreSQL 16+
+--
+-- This schema covers the "identified" side of the system: accounts, payments,
+-- credit balances, and credential provisioning records. It also includes issuer
+-- key management and nullifier storage, which serve both the identified and
+-- anonymous contexts but require durable persistence.
+
+BEGIN;
+
+-- ---------------------------------------------------------------------------
+-- Extensions
+-- ---------------------------------------------------------------------------
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";  -- for gen_random_uuid()
+
+-- ---------------------------------------------------------------------------
+-- Account
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE account (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    secret_hash         TEXT NOT NULL,
+    stripe_customer_id  TEXT UNIQUE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE account IS
+    'A lightweight account record. No PII is stored here; identity is a '
+    'bearer credential (id + secret). The Stripe Customer ID is the only '
+    'link to payment identity. No subscription state is stored here: Stripe '
+    'is the source of truth and is read on demand. What webhooks durably '
+    'record is their effect on credits (see credit_ledger), not the '
+    'subscription itself.';
+
+COMMENT ON COLUMN account.id IS
+    'Public account identifier, exposed in the API as account_id. '
+    'Safe to include in logs.';
+
+COMMENT ON COLUMN account.secret_hash IS
+    'Argon2id hash of the account secret. The plaintext is returned '
+    'exactly once at account creation and never stored.';
+
+COMMENT ON COLUMN account.stripe_customer_id IS
+    'Set when the account first interacts with Stripe (subscription or top-up). '
+    'NULL for accounts that have never made a payment. UNIQUE because one Stripe '
+    'customer should map to exactly one account.';
+
+CREATE INDEX idx_account_stripe_customer ON account (stripe_customer_id)
+    WHERE stripe_customer_id IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- Account Acceptance
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE account_acceptance (
+    account_id  UUID NOT NULL REFERENCES account(id),
+    document    TEXT NOT NULL
+        CHECK (document IN ('terms_of_service', 'privacy_policy')),
+    version     BIGINT NOT NULL CHECK (version >= 1),
+    sha256      TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (account_id, document, sha256)
+);
+
+COMMENT ON TABLE account_acceptance IS
+    'Append-only record of terms-of-service / privacy-policy acceptance. '
+    'Each row binds an account to the SHA-256 of the exact document text it '
+    'accepted (the same accept-by-hash mechanism the repository''s CLA uses), '
+    'so a dispute can be resolved against the precise version in git history. '
+    'Rows are never updated or deleted; re-accepting an already-accepted '
+    'version is a no-op that preserves the original timestamp. The currently '
+    'REQUIRED versions live in required_document (advanced by the terms-feed '
+    'poller and/or seeded from server configuration).';
+
+COMMENT ON COLUMN account_acceptance.version IS
+    'The document''s front-matter version number at acceptance time, '
+    'stamped from the requiring server''s view. The acceptance gate is '
+    'MAX(version) >= required version, so accepting a newer version '
+    'satisfies an instance whose required view briefly lags.';
+
+COMMENT ON COLUMN account_acceptance.sha256 IS
+    'Hex-encoded SHA-256 of the exact published document text the account '
+    'accepted.';
+
+-- ---------------------------------------------------------------------------
+-- Required Document
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE required_document (
+    document    TEXT NOT NULL
+        CHECK (document IN ('terms_of_service', 'privacy_policy')),
+    version     BIGINT NOT NULL CHECK (version >= 1),
+    sha256      TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    url         TEXT NOT NULL,
+    first_required_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (document, version)
+);
+
+COMMENT ON TABLE required_document IS
+    'Append-only record of every legal-document version this cluster has '
+    'ever required. One row per (document, version); rows are never '
+    'updated or deleted. The CURRENT requirement is the highest version '
+    'per document, so monotonicity is structural — a stale poll or a '
+    'website briefly serving old content inserts nothing new and can '
+    'never regress the requirement — and the full history answers "which '
+    'version was being enforced on date X" forever (the acceptance-record '
+    'counterpart in account_acceptance answers "what did this account '
+    'agree to, and when"). Fed by the terms-feed poller and/or the '
+    'startup env seed, both through the same insert-if-absent. Empty '
+    'table = acceptance gate disabled. CI enforces that a published '
+    'document''s bytes never change without a version increment, which is '
+    'what makes the integer ordering trustworthy; a same-version row with '
+    'a different hash is a contract violation the poller detects and '
+    'refuses to record.';
+
+COMMENT ON COLUMN required_document.first_required_at IS
+    'When this version was first observed and became enforced '
+    'cluster-wide. Never overwritten — later observations of the same '
+    'version are no-ops.';
+
+-- ---------------------------------------------------------------------------
+-- Issuer Key
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE issuer_key (
+    id              TEXT PRIMARY KEY,
+    private_key_enc BYTEA NOT NULL,
+    public_key      BYTEA NOT NULL,
+    domain_separator TEXT NOT NULL,
+    issue_from      TIMESTAMPTZ NOT NULL,
+    issue_until     TIMESTAMPTZ NOT NULL,
+    accept_until    TIMESTAMPTZ NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT id_is_key_hash CHECK (id = encode(sha256(public_key), 'hex')),
+    CONSTRAINT issue_window CHECK (issue_from < issue_until),
+    CONSTRAINT grace_window CHECK (issue_until <= accept_until),
+    -- One key per epoch: an honest gateway never mints a second.
+    CONSTRAINT one_key_per_epoch UNIQUE (issue_from)
+);
+
+COMMENT ON TABLE issuer_key IS
+    'Credential issuer key pairs, one per epoch of the public issuer calendar '
+    '(eidola_common::issuer_calendar: 7-day epochs from the Unix epoch; a key '
+    'issues for its epoch and is accepted for one more). The private key is '
+    'encrypted at rest under a TEE-held master key, with the id, public key, '
+    'domain separator and all three windows bound into the encryption as '
+    'associated data: a row whose plain columns were edited does not decrypt, '
+    'and the gateway refuses it. The public key and domain separator are '
+    'served publicly via GET /v1/keys. Race-safe provisioning is handled by '
+    'serializable transactions in the application layer.';
+
+COMMENT ON COLUMN issuer_key.id IS
+    'Hex-encoded SHA-256 hash of the serialized public key (64 hex chars). '
+    'This is the issuer_key_id per the ACT Privacy Pass spec '
+    '(draft-schlesinger-privacypass-act-01, Section 6). Clients use this '
+    'to identify keys in Token structures and credential requests.';
+
+COMMENT ON COLUMN issuer_key.private_key_enc IS
+    'AES-256-GCM encrypted credential private key (Ristretto255 scalar), as '
+    'nonce || ciphertext+tag. Decrypted only inside the TEE at runtime. The '
+    'encryption key is derived from CREDENTIAL_MASTER_KEY and the key id; the '
+    'associated data binds the id, public key, domain separator, issue_from, '
+    'issue_until and accept_until.';
+
+COMMENT ON COLUMN issuer_key.public_key IS
+    'Credential public key (compressed Ristretto255 point, 32 bytes). Served '
+    'to clients for credential verification.';
+
+COMMENT ON COLUMN issuer_key.domain_separator IS
+    'Full domain separator string, e.g., '
+    '''ACT-v1:eidola:inference:production:2026-03''. Included in all '
+    'cryptographic operations for domain separation.';
+
+COMMENT ON COLUMN issuer_key.issue_from IS
+    'Start of the period during which new credentials may be issued with this key.';
+
+COMMENT ON COLUMN issuer_key.issue_until IS
+    'End of the issuance window. After this, no new credentials are issued with '
+    'this key, but existing credentials remain spendable until accept_until.';
+
+COMMENT ON COLUMN issuer_key.accept_until IS
+    'Grace period end. Credentials signed by this key are accepted for spending '
+    'until this timestamp: one epoch after issue_until. '
+    'Nullifiers for this key are pruned only once the gateway''s retention '
+    'margin past this timestamp has also passed (prune_expired_nullifiers).';
+
+-- ---------------------------------------------------------------------------
+-- Credit Ledger
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE credit_ledger (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id      UUID NOT NULL REFERENCES account(id),
+    delta           BIGINT NOT NULL,
+    reason          TEXT NOT NULL
+        CHECK (reason IN (
+            'subscription_renewal',
+            'purchase',
+            'refund',
+            'credential_issuance',
+            'dispute_clawback',
+            'dispute_reversal',
+            'manual_adjustment'
+        )),
+    stripe_event_id TEXT UNIQUE,
+    stripe_payment_intent TEXT,
+    memo            TEXT,
+    expires_at      TIMESTAMPTZ,
+    credential_key_id    TEXT REFERENCES issuer_key(id),
+    credential_credits   BIGINT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Stripe-originated entries must carry their event ID for idempotency.
+    CONSTRAINT require_stripe_event_id CHECK (
+        reason NOT IN (
+            'subscription_renewal', 'purchase', 'refund',
+            'dispute_clawback', 'dispute_reversal'
+        )
+        OR stripe_event_id IS NOT NULL
+    ),
+
+    -- Credits from payments must be positive; debits must be negative;
+    -- manual adjustments can go either way. delta = 0 is never valid.
+    CONSTRAINT delta_nonzero CHECK (delta != 0),
+    CONSTRAINT delta_sign CHECK (
+        reason = 'manual_adjustment'
+        OR (reason IN ('subscription_renewal', 'purchase', 'dispute_reversal') AND delta > 0)
+        OR (reason IN ('credential_issuance', 'refund', 'dispute_clawback') AND delta < 0)
+    ),
+
+    -- credential_key_id and credential_credits are only set for credential issuance entries.
+    CONSTRAINT credential_issuance_metadata CHECK (
+        (reason = 'credential_issuance' AND credential_key_id IS NOT NULL AND credential_credits IS NOT NULL)
+        OR
+        (reason != 'credential_issuance' AND credential_key_id IS NULL AND credential_credits IS NULL)
+    ),
+
+    -- credential_credits must equal the absolute value of delta on issuance rows.
+    -- Redundant by construction, but guards against application bugs.
+    CONSTRAINT credential_issuance_credits_match CHECK (
+        reason != 'credential_issuance'
+        OR credential_credits = -delta
+    )
+);
+
+COMMENT ON TABLE credit_ledger IS
+    'Append-only, single-entry ledger of credit mutations. Every change to an '
+    'account''s balance — whether from payment, provisioning, dispute, or admin '
+    'action — is a row in this table. The current balance is always derived: '
+    'SUM(delta) WHERE expires_at IS NULL OR expires_at > now(). '
+    'Rows are never updated or deleted.';
+
+COMMENT ON COLUMN credit_ledger.delta IS
+    'Credit amount in micro-dollars (1 credit = $0.000001). Positive for '
+    'credits added (payments, adjustments), negative for credits consumed '
+    '(credential issuance, refunds, clawbacks). A $20 subscription renewal is +20000000.';
+
+COMMENT ON COLUMN credit_ledger.reason IS
+    'Informational tag for filtering and auditing. Does not drive business '
+    'logic — only delta and expires_at have operational meaning. Reasons: '
+    'subscription_renewal = recurring Stripe subscription payment; '
+    'purchase = one-time Stripe purchase (premium pricing, 1-year expiry); '
+    'refund = Stripe refund (full or partial), cooperative; '
+    'credential_issuance = credits converted into anonymous credentials (the privacy boundary); '
+    'dispute_clawback = Stripe dispute/chargeback, adversarial; '
+    'dispute_reversal = dispute resolved in our favor; '
+    'manual_adjustment = admin correction (positive or negative).';
+
+COMMENT ON COLUMN credit_ledger.stripe_event_id IS
+    'Stripe event ID (e.g., evt_xxx) for entries originating from webhooks. '
+    'UNIQUE constraint provides idempotent webhook handling — duplicate '
+    'delivery simply fails the insert. NULL for non-Stripe entries.';
+
+COMMENT ON COLUMN credit_ledger.stripe_payment_intent IS
+    'Stripe PaymentIntent ID (pi_xxx) for entries originating from a payment '
+    '(purchase, subscription_renewal) and for every refund debit of a charge '
+    'that carries one. Lets a later charge.refunded event locate the original '
+    'credit entry and issue the refund debit against the same balance pool — '
+    'inheriting its expires_at even when that pool has already expired, so the '
+    'refund nets against the credits it reverses — and lets it debit only what '
+    'the charge''s earlier refunds have not (charge.refunded carries the '
+    'refunded total, once per partial refund). NULL for non-payment entries '
+    'and for events where Stripe did not include a payment intent.';
+
+COMMENT ON COLUMN credit_ledger.memo IS
+    'Optional free-text note. Primarily useful for manual_adjustment entries '
+    '("reversed accidental double-credit per support ticket #123"). '
+    'Not exposed to end users.';
+
+COMMENT ON COLUMN credit_ledger.expires_at IS
+    'NULL means credits never expire (e.g., manual adjustments). '
+    'For subscription renewals, set to the billing period end date; '
+    'for one-time purchases, set to one year after the purchase. '
+    'Expired credits are excluded from balance calculations by the query, '
+    'not by a cron job. '
+    'For debit entries (credential_issuance, refund, dispute_clawback), '
+    'debit_account() sets this to match the balance pool being consumed. '
+    'E.g., if consuming subscription credits expiring Mar 1, the debit '
+    'also carries expires_at = Mar 1.  This ensures that when the pool '
+    'expires, its debits expire with it, preventing phantom negative '
+    'balances from outliving the credits they reversed.';
+
+COMMENT ON COLUMN credit_ledger.created_at IS
+    'When this ledger entry was created in our system. NOT the upstream event '
+    'timestamp — for that, look up the stripe_event_id via Stripe''s API.';
+
+COMMENT ON COLUMN credit_ledger.credential_key_id IS
+    'Only set for credential_issuance entries. The issuer key ID '
+    'used to sign the credential. Allows querying "how many credits were provisioned '
+    'per key" without joining to issuer_key.';
+
+COMMENT ON COLUMN credit_ledger.credential_credits IS
+    'Only set for credential_issuance entries. The credit amount loaded into the '
+    'issued credential. Always equals -delta by constraint. Stored explicitly for '
+    'query convenience ("show me the distribution of credential sizes").';
+
+-- Primary query path: "what is this account's available balance?"
+CREATE INDEX idx_ledger_account_balance ON credit_ledger (account_id, expires_at)
+    INCLUDE (delta);
+
+-- Audit/admin: "show me all entries for a given reason this month"
+CREATE INDEX idx_ledger_reason_created ON credit_ledger (reason, created_at);
+
+-- Refund matching: locate the original credit entry for a payment intent.
+CREATE INDEX idx_ledger_payment_intent ON credit_ledger (stripe_payment_intent)
+    WHERE stripe_payment_intent IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- Credential Issuance
+-- ---------------------------------------------------------------------------
+--
+-- One row per idempotent issuance: the signed response, kept so a client whose
+-- response was lost can ask again under the same idempotency key and receive
+-- the same response instead of being debited a second time. Account-surface
+-- data only, beside the ledger row it was debited by (which already records
+-- the account, amount, key and time). No timestamp of its own: the ledger
+-- row has one, and nothing here needs a second.
+
+CREATE TABLE credential_issuance (
+    account_id        UUID   NOT NULL REFERENCES account(id),
+    idempotency_key   BYTEA  NOT NULL CHECK (octet_length(idempotency_key) = 32),
+    request_digest    BYTEA  NOT NULL CHECK (octet_length(request_digest) = 32),
+    issuer_key_id     TEXT   NOT NULL REFERENCES issuer_key(id),
+    credits           BIGINT NOT NULL CHECK (credits > 0),
+    issuance_response BYTEA  NOT NULL,
+    ledger_entry_id   UUID   NOT NULL UNIQUE REFERENCES credit_ledger(id),
+    PRIMARY KEY (account_id, idempotency_key)
+);
+
+-- Pruning walks a key's rows at once.
+CREATE INDEX idx_credential_issuance_key ON credential_issuance (issuer_key_id);
+
+COMMENT ON TABLE credential_issuance IS
+    'Stored responses of idempotent credential issuances, keyed by the account '
+    'and the client-chosen idempotency key. A retry with the same key and the '
+    'same request is answered from here without a second debit; one with the '
+    'same key and a different request is refused. Written in the same '
+    'transaction as the debit (record_credential_issuance), so a row exists '
+    'exactly when the account was debited for it. Pruned with the key''s '
+    'nullifiers (prune_expired_issuances), once the key can be used for nothing.';
+
+COMMENT ON COLUMN credential_issuance.idempotency_key IS
+    '32 random bytes the client generated and persisted before it first sent '
+    'the request. Used on this surface only; it is never sent with a spend.';
+
+COMMENT ON COLUMN credential_issuance.request_digest IS
+    'SHA-256 over the request the response answers (the CBOR issuance request '
+    'and the credit amount), so a retry naming this idempotency key with any '
+    'other request is refused rather than answered with a response to a '
+    'different commitment.';
+
+COMMENT ON COLUMN credential_issuance.issuance_response IS
+    'The CBOR IssuanceResponse as returned. The issuer computed it and could '
+    'always have kept it: issuance is blind, so it carries nothing that '
+    'recognises the credential when it is later spent.';
+
+-- ---------------------------------------------------------------------------
+-- Nullifier
+-- ---------------------------------------------------------------------------
+
+-- Deliberately timestamp-free: a per-spend timestamp on the unlinked
+-- surface would sit in the same database as per-account issuance
+-- timestamps in credit_ledger, giving the operator statistical
+-- issuance-to-redemption correlation material under low traffic
+-- (privacy-guarantees.md §2.5). Rows carry only what double-spend
+-- prevention and refund recovery require.
+CREATE TABLE nullifier (
+    issuer_key_id TEXT NOT NULL REFERENCES issuer_key(id),
+    value         BYTEA NOT NULL,
+    refund_token  BYTEA,
+    PRIMARY KEY (issuer_key_id, value)
+);
+
+COMMENT ON TABLE nullifier IS
+    'Spent credential nullifiers. A nullifier must be durably recorded BEFORE '
+    'a refund credential is issued to prevent the forking attack (re-spending a '
+    'credential with a different amount to create divergent credential chains). '
+    'The compound primary key (issuer_key_id, value) partitions nullifiers by key, '
+    'enabling efficient bulk pruning once a key''s accept_until has '
+    'passed. This table lives in the same database as the billing schema for '
+    'durability guarantees. In a production split-environment deployment, '
+    'it would move to the service environment''s own durable store.';
+
+COMMENT ON COLUMN nullifier.issuer_key_id IS
+    'The issuer key under which this credential was issued and spent. '
+    'Partitions the nullifier space for lifecycle management.';
+
+COMMENT ON COLUMN nullifier.value IS
+    'The raw nullifier scalar (32 bytes for Ristretto255). Revealed in the '
+    'clear during the spend proof. Uniqueness within a key is enforced by '
+    'the primary key — a duplicate insert fails, indicating a double-spend.';
+
+COMMENT ON COLUMN nullifier.refund_token IS
+    'The refund token for this spend, sealed: a version byte (0x03), a '
+    '12-byte random nonce, then a stage byte (0x00 provisional, 0x01 final) '
+    'and the CBOR RefundMsg, under AES-256-GCM with its tag. Written with the '
+    'nullifier in one statement, as the provisional refund (t = 0), and '
+    'overwritten with the final refund when the request ends, or by recovery '
+    'declaring the provisional one final, each a compare-and-swap; the stage '
+    'is inside the seal, so the database sees only the second write. The key is HKDF-SHA256 (salt = issuer_key_id, info = '
+    'eidola-refund-token-v1) over the refund recovery key the client sent with '
+    'the spend, and nothing else, derived in enclave memory and kept nowhere: '
+    'the client key is never stored or logged, so no one without the client '
+    '(the operator included) can open the value; the client presents its key '
+    'again to recover the token. The associated '
+    'data is the version byte, the length-prefixed issuer_key_id and the '
+    'nullifier value, so a token opens only on its own row. Sealed because the '
+    'RefundMsg carries the refund amount t as a plain scalar (only its '
+    'signature parts are useful solely to the client holding the matching '
+    'PreRefund), and t is a function of the request''s content lengths. The '
+    'ciphertext is as long as the stage prefix and the fixed-size CBOR, so its '
+    'length says nothing, at either stage. '
+    'Stored so the client can recover the token via POST '
+    '/v1/credentials/refund if the original response was lost; a value that '
+    'does not open for the presented key is answered as no token stored.';
+
+-- A database holding refund tokens in an earlier format (bare CBOR, which
+-- begins 0xa5, or an earlier seal version) is cleared by hand, idempotently:
+--
+--   UPDATE nullifier SET refund_token = NULL
+--    WHERE substring(refund_token FROM 1 FOR 1) <> '\x03'::bytea;
+--
+-- That clears current values only: WAL, base backups and replicas keep the
+-- old ones until they age out.
+
+-- ---------------------------------------------------------------------------
+-- Engine Placement
+-- ---------------------------------------------------------------------------
+--
+-- Self-contained and idempotent (IF NOT EXISTS throughout), so it can be
+-- applied on its own to a database created before it existed. Shared by every
+-- gateway version running against the database, so it changes additively
+-- only: gateways read named columns, and a column one adds must not change
+-- what an older gateway's read means.
+
+CREATE TABLE IF NOT EXISTS engine_placement (
+    model_id    TEXT NOT NULL,
+    deployment  TEXT NOT NULL CHECK (deployment ~ '^[0-9a-f]{64}$'),
+    base_url    TEXT NOT NULL CHECK (base_url ~ '^https://'),
+    enabled     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (model_id, base_url)
+);
+
+COMMENT ON TABLE engine_placement IS
+    'Where Eidola-hosted inference engines can be reached, edited by an '
+    'operator. Availability only, never trust: a gateway uses a row only '
+    'when it is enabled and names a model and a deployment that gateway''s '
+    'own build pins, and attests every connection to the engine against '
+    'those compiled-in pins. Health is each gateway''s own and is never '
+    'written here.';
+
+COMMENT ON COLUMN engine_placement.model_id IS
+    'The model''s weights hash, lowercase hex: the key it is listed under in '
+    'releases/trust/engine-enclaves.json and the models/ catalog. Never a '
+    'tag: a gateway resolves a client''s tag to this hash before routing.';
+
+COMMENT ON COLUMN engine_placement.deployment IS
+    'The engine deployment''s config hash: config_sha256 in '
+    'releases/trust/engine-enclaves.json (on Intel TDX, the launch''s '
+    'MRCONFIGID). A gateway built from a tree that does not pin this '
+    'deployment ignores the row.';
+
+COMMENT ON COLUMN engine_placement.base_url IS
+    'The engine''s https origin (optionally with a path prefix); the gateway '
+    'calls /v1/chat/completions, /v1/engine/info and /healthz under it.';
+
+-- ---------------------------------------------------------------------------
+-- Helper Functions
+-- ---------------------------------------------------------------------------
+
+CREATE FUNCTION available_balance(p_account_id UUID)
+RETURNS BIGINT
+LANGUAGE SQL STABLE
+AS $$
+    SELECT COALESCE(SUM(delta), 0)
+    FROM credit_ledger
+    WHERE account_id = p_account_id
+      AND (expires_at IS NULL OR expires_at > now())
+$$;
+
+COMMENT ON FUNCTION available_balance IS
+    'Returns the total available credit balance for an account. Used as a '
+    'fast check before credential provisioning. For the full breakdown '
+    '(expiring vs permanent), query the account_balance view instead.';
+
+-- Pool-aware debit: allocates a negative delta across balance pools in FIFO
+-- order (earliest expiry first, permanent last).  Returns an array of inserted
+-- ledger entry IDs on success, NULL if p_require_balance is TRUE and the
+-- account has insufficient balance, or an empty array if the stripe_event_id
+-- has already been processed (idempotent duplicate).
+CREATE OR REPLACE FUNCTION debit_account(
+    p_account_id       UUID,
+    p_amount           BIGINT,
+    p_reason           TEXT,
+    p_stripe_event_id  TEXT    DEFAULT NULL,
+    p_credential_key_id TEXT   DEFAULT NULL,
+    p_require_balance  BOOLEAN DEFAULT TRUE,
+    p_payment_intent   TEXT    DEFAULT NULL,
+    p_memo             TEXT    DEFAULT NULL
+) RETURNS UUID[]
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_remaining BIGINT := p_amount;
+    v_pool      RECORD;
+    v_entry_id  UUID;
+    v_entry_ids UUID[] := '{}';
+    v_take      BIGINT;
+    v_pool_idx  INT := 0;
+    v_event_id  TEXT;
+BEGIN
+    -- One debit per account at a time. Without the lock, two concurrent
+    -- issuances each read the same balance, each pass the check below, and
+    -- both convert it into anonymous credentials: an overdraft no later step
+    -- can recover, because the credentials cannot be traced once issued.
+    -- Under READ COMMITTED each statement below takes a fresh snapshot, so a
+    -- debit that waited here sees the one it waited for.
+    PERFORM 1 FROM account WHERE id = p_account_id FOR UPDATE;
+
+    -- Balance check (credential issuance).
+    IF p_require_balance AND available_balance(p_account_id) < p_amount THEN
+        RETURN NULL;
+    END IF;
+
+    -- Idempotency for Stripe-originated events.
+    IF p_stripe_event_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM credit_ledger WHERE stripe_event_id = p_stripe_event_id
+    ) THEN
+        RETURN '{}';
+    END IF;
+
+    -- Allocate across pools (earliest expiry first, permanent last).
+    FOR v_pool IN
+        SELECT expires_at, SUM(delta)::bigint AS pool_amount
+        FROM credit_ledger
+        WHERE account_id = p_account_id
+          AND (expires_at IS NULL OR expires_at > now())
+        GROUP BY expires_at
+        HAVING SUM(delta) > 0
+        ORDER BY expires_at NULLS LAST
+    LOOP
+        EXIT WHEN v_remaining <= 0;
+
+        v_take := LEAST(v_remaining, v_pool.pool_amount);
+        v_pool_idx := v_pool_idx + 1;
+
+        IF p_stripe_event_id IS NOT NULL THEN
+            v_event_id := CASE WHEN v_pool_idx = 1
+                THEN p_stripe_event_id
+                ELSE p_stripe_event_id || ':' || v_pool_idx
+            END;
+        ELSE
+            v_event_id := NULL;
+        END IF;
+
+        INSERT INTO credit_ledger (
+            id, account_id, delta, reason, stripe_event_id, expires_at,
+            credential_key_id, credential_credits, stripe_payment_intent, memo,
+            created_at
+        ) VALUES (
+            gen_random_uuid(), p_account_id, -v_take, p_reason, v_event_id,
+            v_pool.expires_at, p_credential_key_id,
+            CASE WHEN p_credential_key_id IS NOT NULL THEN v_take ELSE NULL END,
+            p_payment_intent, p_memo,
+            now()
+        )
+        RETURNING id INTO v_entry_id;
+
+        v_entry_ids := v_entry_ids || v_entry_id;
+        v_remaining := v_remaining - v_take;
+    END LOOP;
+
+    -- Cooperative refunds that exceed all live pools are next allocated
+    -- against EXPIRED positive pools (most recently expired first), each
+    -- debit inheriting the expired pool's own (past) expires_at.  This nets
+    -- a refund of already-expired credits against the pool it reverses —
+    -- both sides invisible to the balance — instead of creating a permanent
+    -- negative entry that would claw back credits the account never had
+    -- (the "phantom negative balance" hazard documented on expires_at).
+    -- Adversarial debits (dispute_clawback) intentionally skip this pass:
+    -- a clawback should outlive the credits it reverses.
+    IF v_remaining > 0 AND NOT p_require_balance AND p_reason = 'refund' THEN
+        FOR v_pool IN
+            SELECT expires_at, SUM(delta)::bigint AS pool_amount
+            FROM credit_ledger
+            WHERE account_id = p_account_id
+              AND expires_at IS NOT NULL
+              AND expires_at <= now()
+            GROUP BY expires_at
+            HAVING SUM(delta) > 0
+            ORDER BY expires_at DESC
+        LOOP
+            EXIT WHEN v_remaining <= 0;
+
+            v_take := LEAST(v_remaining, v_pool.pool_amount);
+            v_pool_idx := v_pool_idx + 1;
+
+            IF p_stripe_event_id IS NOT NULL THEN
+                v_event_id := CASE WHEN v_pool_idx = 1
+                    THEN p_stripe_event_id
+                    ELSE p_stripe_event_id || ':' || v_pool_idx
+                END;
+            ELSE
+                v_event_id := NULL;
+            END IF;
+
+            INSERT INTO credit_ledger (
+                id, account_id, delta, reason, stripe_event_id, expires_at,
+                credential_key_id, credential_credits, stripe_payment_intent, memo,
+                created_at
+            ) VALUES (
+                gen_random_uuid(), p_account_id, -v_take, p_reason, v_event_id,
+                v_pool.expires_at, p_credential_key_id,
+                CASE WHEN p_credential_key_id IS NOT NULL THEN v_take ELSE NULL END,
+                p_payment_intent, p_memo,
+                now()
+            )
+            RETURNING id INTO v_entry_id;
+
+            v_entry_ids := v_entry_ids || v_entry_id;
+            v_remaining := v_remaining - v_take;
+        END LOOP;
+    END IF;
+
+    -- Remainder that exceeds all positive pools (refunds/clawbacks that
+    -- exceed the current balance).  Placed in the permanent (NULL) pool.
+    IF v_remaining > 0 AND NOT p_require_balance THEN
+        v_pool_idx := v_pool_idx + 1;
+
+        IF p_stripe_event_id IS NOT NULL THEN
+            v_event_id := CASE WHEN v_pool_idx = 1
+                THEN p_stripe_event_id
+                ELSE p_stripe_event_id || ':' || v_pool_idx
+            END;
+        ELSE
+            v_event_id := NULL;
+        END IF;
+
+        INSERT INTO credit_ledger (
+            id, account_id, delta, reason, stripe_event_id, expires_at,
+            credential_key_id, credential_credits, stripe_payment_intent, memo,
+            created_at
+        ) VALUES (
+            gen_random_uuid(), p_account_id, -v_remaining, p_reason, v_event_id,
+            NULL, p_credential_key_id,
+            CASE WHEN p_credential_key_id IS NOT NULL THEN v_remaining ELSE NULL END,
+            p_payment_intent, p_memo,
+            now()
+        )
+        RETURNING id INTO v_entry_id;
+
+        v_entry_ids := v_entry_ids || v_entry_id;
+    END IF;
+
+    RETURN v_entry_ids;
+END;
+$$;
+
+COMMENT ON FUNCTION debit_account IS
+    'Pool-aware debit function.  Holds the account row lock for the rest of '
+    'the calling transaction, so concurrent debits of one account serialize '
+    'and a balance check cannot pass twice on the same balance.  Allocates a negative delta across credit '
+    'pools in FIFO order (earliest expiry first, permanent last) so that '
+    'each debit row carries the expires_at of the pool it draws from. '
+    'Returns NULL when p_require_balance is TRUE and the balance is '
+    'insufficient.  Returns an empty array on duplicate stripe_event_id. '
+    'For refunds (reason = ''refund'', p_require_balance = FALSE), any '
+    'remainder beyond live pools is next netted against expired positive '
+    'pools (most recently expired first, inheriting their past expires_at); '
+    'only what exceeds those too is placed in the permanent (NULL expiry) '
+    'pool.  Clawbacks skip the expired-pool pass; what exceeds live pools '
+    'goes permanent. p_memo is carried onto every row the debit writes '
+    '(live, expired-pool and permanent): the Stripe object a debit answers '
+    'for — the dispute id on a clawback, so its reversal can mirror it row '
+    'for row; the charge id on a refund, so later partial refunds know what '
+    'is already debited.';
+
+-- Self-contained and re-runnable, so an operator can apply it to an existing
+-- database by hand. The zero-argument form pruned at accept_until itself,
+-- with no margin for spends accepted just before it; it is dropped.
+DROP FUNCTION IF EXISTS prune_expired_nullifiers();
+
+CREATE OR REPLACE FUNCTION prune_expired_nullifiers(p_retain_past_accept INTERVAL)
+RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    pruned BIGINT;
+BEGIN
+    IF p_retain_past_accept IS NULL OR p_retain_past_accept <= interval '0' THEN
+        RAISE EXCEPTION 'prune_expired_nullifiers: retention past accept_until must be positive';
+    END IF;
+    DELETE FROM nullifier
+    WHERE issuer_key_id IN (
+        SELECT id FROM issuer_key
+        WHERE accept_until + p_retain_past_accept < now()
+    );
+    GET DIAGNOSTICS pruned = ROW_COUNT;
+    RETURN pruned;
+END;
+$$;
+
+COMMENT ON FUNCTION prune_expired_nullifiers(INTERVAL) IS
+    'Removes nullifiers for keys retired at least p_retain_past_accept ago '
+    '(accept_until + p_retain_past_accept < now()). The gateway calls it '
+    'from its key-rotation task with RETENTION_PAST_ACCEPT, the same margin '
+    'during which it still signs refunds under a key, so no nullifier is '
+    'pruned while its key could accept a spend. Do not call it by hand with '
+    'a smaller interval. Returns the number of nullifiers pruned.';
+
+-- Record an issuance idempotently. Locks the account row (debit_account would
+-- take the same lock) before looking for an earlier issuance under the key, so
+-- a retry racing its own original waits for it and then finds its row rather
+-- than debiting a second time. Under that lock, and on the database's own
+-- clock read after it is taken (clock_timestamp(), not the statement's now()),
+-- the named key must still be issuing: an attempt that passed the gateway's
+-- current-key check and then stalled past the key's issue_until debits
+-- nothing, so a retry refused for that key (resolve_issuance_off_current_key)
+-- is never followed by a debit under it. Returns the stored row's columns:
+--   outcome 'issued'  — debited now, row written, response is p_response;
+--   outcome 'stored'  — an earlier attempt under this key was debited; its
+--                       stored response, digest, key and amount are returned
+--                       and nothing is debited (the caller compares digests);
+--   outcome 'retired' — the named key has stopped issuing (or is unknown);
+--                       nothing debited or written;
+--   outcome 'insufficient' — balance too low, nothing debited or written.
+CREATE OR REPLACE FUNCTION record_credential_issuance(
+    p_account_id      UUID,
+    p_idempotency_key BYTEA,
+    p_request_digest  BYTEA,
+    p_issuer_key_id   TEXT,
+    p_credits         BIGINT,
+    p_response        BYTEA
+)
+RETURNS TABLE (
+    outcome           TEXT,
+    request_digest    BYTEA,
+    issuer_key_id     TEXT,
+    credits           BIGINT,
+    issuance_response BYTEA,
+    ledger_entry_id   UUID
+)
+LANGUAGE plpgsql
+AS $$
+#variable_conflict use_column
+DECLARE
+    v_ids UUID[];
+BEGIN
+    PERFORM 1 FROM account WHERE id = p_account_id FOR UPDATE;
+
+    RETURN QUERY
+        SELECT 'stored'::TEXT, ci.request_digest, ci.issuer_key_id, ci.credits,
+               ci.issuance_response, ci.ledger_entry_id
+        FROM credential_issuance ci
+        WHERE ci.account_id = p_account_id
+          AND ci.idempotency_key = p_idempotency_key;
+    IF FOUND THEN
+        RETURN;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM issuer_key ik
+                   WHERE ik.id = p_issuer_key_id
+                     AND ik.issue_until > clock_timestamp()) THEN
+        RETURN QUERY SELECT 'retired'::TEXT, NULL::BYTEA, NULL::TEXT,
+                            NULL::BIGINT, NULL::BYTEA, NULL::UUID;
+        RETURN;
+    END IF;
+
+    v_ids := debit_account(p_account_id, p_credits, 'credential_issuance',
+                           NULL, p_issuer_key_id, TRUE);
+    IF v_ids IS NULL OR cardinality(v_ids) = 0 THEN
+        RETURN QUERY SELECT 'insufficient'::TEXT, NULL::BYTEA, NULL::TEXT,
+                            NULL::BIGINT, NULL::BYTEA, NULL::UUID;
+        RETURN;
+    END IF;
+
+    INSERT INTO credential_issuance (account_id, idempotency_key, request_digest,
+                                     issuer_key_id, credits, issuance_response,
+                                     ledger_entry_id)
+    VALUES (p_account_id, p_idempotency_key, p_request_digest, p_issuer_key_id,
+            p_credits, p_response, v_ids[1]);
+
+    RETURN QUERY SELECT 'issued'::TEXT, p_request_digest, p_issuer_key_id,
+                        p_credits, p_response, v_ids[1];
+END;
+$$;
+
+COMMENT ON FUNCTION record_credential_issuance IS
+    'Idempotent issuance debit. Serialized per account by the account row lock; '
+    'answers an idempotency key already used with the row stored for it and '
+    'debits nothing; refuses a key whose issue window has closed by the '
+    'database clock read under the lock; otherwise debits and stores in one '
+    'transaction.';
+
+-- Decide an issuance naming a key that is not the gateway's current issuing
+-- key, under the same account lock record_credential_issuance takes, so the
+-- verdict is ordered against every attempt under the idempotency key that may
+-- still be in flight. Returns the same columns:
+--   outcome 'stored'  — an earlier attempt under this key was debited; its
+--                       stored row is returned (the caller compares digests);
+--   outcome 'retired' — nothing is stored and the named key's issue window
+--                       has closed by the database clock read under the lock
+--                       (or the key is unknown). record_credential_issuance
+--                       refuses such a key on the same clock, so no attempt
+--                       under this idempotency key can ever debit: final;
+--   outcome 'issuing' — nothing is stored but the named key may still issue
+--                       (the gateway's clock or key cache disagrees with the
+--                       database). An attempt may yet debit under it: not
+--                       final, and the caller answers so.
+CREATE OR REPLACE FUNCTION resolve_issuance_off_current_key(
+    p_account_id      UUID,
+    p_idempotency_key BYTEA,
+    p_issuer_key_id   TEXT
+)
+RETURNS TABLE (
+    outcome           TEXT,
+    request_digest    BYTEA,
+    issuer_key_id     TEXT,
+    credits           BIGINT,
+    issuance_response BYTEA,
+    ledger_entry_id   UUID
+)
+LANGUAGE plpgsql
+AS $$
+#variable_conflict use_column
+BEGIN
+    PERFORM 1 FROM account WHERE id = p_account_id FOR UPDATE;
+
+    RETURN QUERY
+        SELECT 'stored'::TEXT, ci.request_digest, ci.issuer_key_id, ci.credits,
+               ci.issuance_response, ci.ledger_entry_id
+        FROM credential_issuance ci
+        WHERE ci.account_id = p_account_id
+          AND ci.idempotency_key = p_idempotency_key;
+    IF FOUND THEN
+        RETURN;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM issuer_key ik
+               WHERE ik.id = p_issuer_key_id
+                 AND ik.issue_until > clock_timestamp()) THEN
+        RETURN QUERY SELECT 'issuing'::TEXT, NULL::BYTEA, NULL::TEXT,
+                            NULL::BIGINT, NULL::BYTEA, NULL::UUID;
+    ELSE
+        RETURN QUERY SELECT 'retired'::TEXT, NULL::BYTEA, NULL::TEXT,
+                            NULL::BIGINT, NULL::BYTEA, NULL::UUID;
+    END IF;
+END;
+$$;
+
+COMMENT ON FUNCTION resolve_issuance_off_current_key IS
+    'Decides an issuance naming a key that is not the current issuing key, '
+    'serialized with record_credential_issuance by the account row lock: the '
+    'stored row if an earlier attempt was debited, otherwise whether the key '
+    'has stopped issuing by the database clock (final: nothing can debit under '
+    'it again) or may still issue (not final).';
+
+CREATE OR REPLACE FUNCTION prune_expired_issuances(p_retain_past_accept INTERVAL)
+RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    pruned BIGINT;
+BEGIN
+    IF p_retain_past_accept IS NULL OR p_retain_past_accept <= interval '0' THEN
+        RAISE EXCEPTION 'prune_expired_issuances: retention past accept_until must be positive';
+    END IF;
+    DELETE FROM credential_issuance
+    WHERE issuer_key_id IN (
+        SELECT id FROM issuer_key
+        WHERE accept_until + p_retain_past_accept < now()
+    );
+    GET DIAGNOSTICS pruned = ROW_COUNT;
+    RETURN pruned;
+END;
+$$;
+
+COMMENT ON FUNCTION prune_expired_issuances(INTERVAL) IS
+    'Removes stored issuance responses for keys retired at least '
+    'p_retain_past_accept ago, on the same deadline as their nullifiers. A '
+    'credential built from a pruned response could no longer be spent, and the '
+    'issuance endpoint refuses any key that is not the current one before it '
+    'debits, so a retry arriving after pruning is refused rather than debited '
+    'again. Returns the number of rows pruned.';
+
+COMMIT;

@@ -11,16 +11,42 @@ license = "MIT OR Apache-2.0"
 name = "measure-enclave"
 path = "src/main.rs"
 
+[[bin]]
+name = "measure-tdx-igvm"
+path = "src/bin/measure-tdx-igvm.rs"
+
+[[bin]]
+name = "measure-engine-enclaves"
+path = "src/bin/measure-engine-enclaves.rs"
+
+[[bin]]
+name = "vendor-platform-endorsements"
+path = "src/bin/vendor-platform-endorsements.rs"
+
 [dependencies]
 # SEV-SNP measurement
 sev = { version = "8", default-features = false, features = ["snp", "crypto_nossl"] }
 
 # TDX measurement
 tdx-measure = { git = "https://github.com/virtee/tdx-measure", tag = "v0.1.1" }
+# IGVM image parsing, for MRTD of IGVM-model releases
+igvm = "0.5"
+igvm_defs = "0.5"
 
-# Config parsing
+# The engine-deployment config grammar shared with the gateway and the node
+# (`cvm-version`, cache retention).
+eidola-common = { path = "../eidola-common", features = ["deployment"] }
+
+# The attesting client's pin types and its pin compiler: every pin emitted is
+# one the client (and the gateway's build) accepts. `platform-endorsements`
+# verifies the provider's signed platform endorsements offline and derives
+# the TDX machine policy from them.
+tinfoil-verifier = { path = "../tinfoil-verifier", features = ["platform-endorsements"] }
+
+# Config parsing; `raw_value` keeps a downloaded Sigstore bundle as the bytes
+# served.
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml = "0.9"
 
 # Hashing (SHA-256 for config hash)
@@ -34,3 +60,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Error handling
 anyhow = "1"
+
+[dev-dependencies]
+# Tampering with a vendored Sigstore bundle's base64 members.
+base64 = "0.23"

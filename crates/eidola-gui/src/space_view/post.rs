@@ -115,11 +115,22 @@ impl SpaceView {
                         article_label(&post.byline, post.byline_backend.as_deref(), &post.time),
                         None,
                     ));
+                    // A continuation's stream opens with the text it continues,
+                    // so until anything arrives the post's own body stays —
+                    // the reader is still reading it.
+                    let continuing = self
+                        .space
+                        .read(cx)
+                        .streams()
+                        .iter()
+                        .any(|t| t.seq == seq && t.continuing);
+                    let waiting =
+                        continuing.then(|| self.render_post_body(i, node, bw, editing_this, cx));
                     (
                         post.byline.clone(),
                         post.byline_backend.clone(),
                         post.time.clone(),
-                        self.render_revision_body(seq, bw, cx),
+                        self.render_revision_body(seq, bw, waiting, cx),
                     )
                 } else {
                     article = Some((
@@ -401,7 +412,7 @@ impl SpaceView {
             // reader sees — the probe name is the stable selector, the label is
             // never a second English copy of the sentence.
             let cut_off = crate::i18n::msg::space_answer_cut_off(cx);
-            col = col.child(
+            let mut mark = h_flex().gap_2().flex_wrap().child(
                 div()
                     .id(SharedString::from(format!("space-cut-off-{}", node.id)))
                     .probe(
@@ -413,6 +424,43 @@ impl SpaceView {
                     .text_color(theme.muted_foreground)
                     .child(cut_off),
             );
+            // **Continue**, where it would work: the row says it can be
+            // continued (the rule app-core's door applies), this reader may act
+            // here, and the space would accept the mutation. Read off the
+            // durable row, so the live half of the mark — the frames before the
+            // reload — carries no verb until the row it acts on is in hand.
+            if let Some(id) = post
+                .action_id
+                .clone()
+                .filter(|_| post.continuable)
+                .filter(|_| self.space.read(cx).accepts_mutation() && self.viewer_may_act(cx))
+            {
+                let label = crate::i18n::msg::space_continue_answer(cx);
+                let aria = crate::i18n::msg::space_continue_answer_label(cx);
+                let handle = self
+                    .continue_focus
+                    .borrow_mut()
+                    .entry(node.id.clone())
+                    .or_insert_with(|| cx.focus_handle())
+                    .clone();
+                let node_id = node.id.clone();
+                mark = mark.child(
+                    verb_button(
+                        SharedString::from(format!("space-continue-{}", node.id)),
+                        format!("space/post/{i}/continue"),
+                        label,
+                        aria,
+                        cx,
+                    )
+                    // The covering guard, honoured by the tracked handle itself
+                    // (see the action gutter's verbs).
+                    .track_focus(&handle.tab_stop(!crate::focus::tab_stops_suppressed()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.continue_answer(&node_id, &id, window, cx)
+                    })),
+                );
+            }
+            col = col.child(mark);
         }
         // A regeneration of this generation is already running somewhere this
         // window cannot see. Said in the same quiet register, on the post it is
@@ -912,6 +960,33 @@ impl SpaceView {
         cx.notify();
     }
 
+    /// **Continue** a cut-off answer (`Space::continue_post`): a new generation
+    /// of the post that picks up where it stopped. Like [`Self::regenerate`],
+    /// an accepted press takes the verb's own row away — the space stops
+    /// accepting mutations, so the mark draws no Continue — and hands the
+    /// keyboard back first, asked before it acts.
+    pub fn continue_answer(
+        &mut self,
+        node_id: &SharedString,
+        action_id: &SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let held = self
+            .continue_focus
+            .borrow()
+            .get(node_id)
+            .is_some_and(|h| h.contains_focused(window, cx));
+        let id = action_id.to_string();
+        let accepted = self.space.update(cx, |s, cx| s.continue_post(id, cx));
+        if !accepted {
+            // A refusal is observed rather than dropped: nothing started.
+            return;
+        }
+        self.hand_back_focus(held, window, cx);
+        cx.notify();
+    }
+
     /// An *inactive* draft rendered inline: a "Draft" byline beside its editable
     /// body, taking real vertical space in the tree. Clicking it focuses the
     /// editor, which re-activates the draft (floating composer). Off-screen it
@@ -1051,30 +1126,39 @@ impl SpaceView {
     /// the same question (what is this silence?) with the honest reason. It is
     /// a readout, not a control: no click, `Role::Label`.
     /// The **pending revision** rendered in a post's own place: an immediate
-    /// "Regenerating…" line until anything arrives, then the ordinary streaming
-    /// treatment (thinking disclosure, then the answer as it comes).
+    /// "Regenerating…" (or, for a continuation, "Continuing…") line, then the
+    /// ordinary streaming treatment (thinking disclosure, then the answer as it
+    /// comes). Until anything arrives a continuation draws `waiting` — the
+    /// post's own body — beneath the line, since its stream will open with that
+    /// same text and nothing should blink out in between.
     ///
     /// The label is not decoration. A reasoning model can spend its whole
     /// budget before the first content token, so for minutes at a stretch the
     /// only honest thing to draw is that the request is out.
-    fn render_revision_body(&self, seq: u64, bw: gpui::Pixels, cx: &Context<Self>) -> AnyElement {
+    fn render_revision_body(
+        &self,
+        seq: u64,
+        bw: gpui::Pixels,
+        waiting: Option<AnyElement>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
-        let started = self
-            .space
-            .read(cx)
-            .streams()
-            .iter()
-            .find(|t| t.seq == seq)
+        let turn = self.space.read(cx).streams().iter().find(|t| t.seq == seq);
+        let started = turn
             .is_some_and(|t| !t.response.reasoning.is_empty() || !t.response.content.is_empty());
-        let regenerating = crate::i18n::msg::space_regenerating(cx);
+        let (state, regenerating) = if turn.is_some_and(|t| t.continuing) {
+            ("continuing", crate::i18n::msg::space_continuing(cx))
+        } else {
+            ("regenerating", crate::i18n::msg::space_regenerating(cx))
+        };
         v_flex()
             .w(bw)
             .gap_2()
             .child(
                 div()
-                    .id(SharedString::from(format!("space-regenerating-{seq}")))
+                    .id(SharedString::from(format!("space-{state}-{seq}")))
                     .probe(
-                        format!("space/streaming/{seq}/regenerating"),
+                        format!("space/streaming/{seq}/{state}"),
                         gpui::Role::Label,
                         regenerating.clone(),
                     )
@@ -1085,6 +1169,7 @@ impl SpaceView {
             .when(started, |d| {
                 d.child(self.render_streaming_body(seq, bw, cx))
             })
+            .when(!started, |d| d.children(waiting))
             .into_any_element()
     }
 

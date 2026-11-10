@@ -1,6 +1,6 @@
 # The server
 
-The Eidola server is an OpenAI-compatible proxy that sits between the client and an upstream inference provider. It also runs the account and billing surface. Its design is dominated by one structural decision: the **linked** account surface and the **unlinked** inference surface are kept disjoint, in code and at runtime.
+The Eidola server is an OpenAI-compatible proxy that sits between the client and Eidola's inference engines. It also runs the account and billing surface. Its design is dominated by one structural decision: the **linked** account surface and the **unlinked** inference surface are kept disjoint, in code and at runtime.
 
 ## Linked vs. unlinked
 
@@ -24,8 +24,9 @@ The flow:
 
 1. **Issuance.** The authenticated client (Basic auth, linked surface) requests credentials. It generates blinding factors locally and sends blinded token requests. The server signs the blinded requests with its issuer private key and returns blinded signatures. The server learns *that* this account requested N credentials, never *which specific tokens* it received.
 2. **Redemption.** When the client makes an inference request, it unblinds a token and presents it on the unlinked surface. The server verifies the token signature against the issuer public key. The token contains no account identifier, and the blind-signature construction guarantees the server cannot correlate this token with any individual issuance request from step 1.
+3. **Refund.** Redeeming a token uses it up: the request holds a worst-case charge against it, and the server answers with a refund the client turns into a fresh token carrying the rest of its balance plus the part of the hold the request did not use. To stop a token being spent twice, its nullifier is recorded in Postgres before the request is served, with a provisional refund of nothing stored beside it in the same write, and the final refund replaces that when the request ends (a stream cut short, by its client leaving or by the gateway's deadline, is charged for what the engine had generated), so a client whose response was lost can fetch it again (`POST /v1/credentials/refund`), and a gateway crash mid-request costs the request's hold and never the rest of the token. Postgres is outside the enclave, and the refund carries the amount returned, which is the hold minus what the request actually cost: a function of how long the prompt and the answer were. So the refund is stored **sealed under a key only the client can supply**. With each spend the client sends a refund recovery key (beside the token, in the request body's `credentials` member, as every credential travels), derived from secret state it already keeps for that spend; the server derives the encryption key from it alone in enclave memory, encrypts the refund (AES-256-GCM, bound to its own nullifier row), and keeps the client's key nowhere. Recovery works only when the client presents the same key again. No one without the client (not the database, not the operator, not anyone holding the server's own secrets) can read a stored refund amount; a spend without a key is refused before it is taken. The stored refund is the same length whatever the amount. What the database holds for a spend is the issuer key it was made under, its nullifier, and a ciphertext. (The row is written twice, at the spend and when the refund is stored, so someone watching the database live, or reading its write-ahead log, can see when each happened; see [gaps.md](gaps.md#spend-timing-at-the-database).)
 
-The issuer key is stored encrypted at rest in Postgres using a `CREDENTIAL_MASTER_KEY` that is injected into the server enclave as a Tinfoil secret. If this key were compromised, new ACTs could be forged, but the unlinkability property remains.
+The issuer key is stored encrypted at rest in Postgres using a `CREDENTIAL_MASTER_KEY` that is injected into the server enclave as a Tinfoil secret, with the key's id, public key, domain separator and windows bound into the encryption as associated data, so a row whose plain columns were edited does not decrypt and is refused. If this key were compromised, new ACTs could be forged, but the unlinkability property remains.
 
 Domain separation is baked into the credential construction (`ACT-v1:eidola:inference:production:<date>`) to prevent cross-deployment correlation if the issuer key were ever reused.
 
@@ -35,10 +36,12 @@ The unlinkability invariants in [privacy-guarantees.md §2](privacy-guarantees.m
 
 **Anonymity set = users sharing the same issuer key + domain separator.** Every ACT token redeemed against a given issuer key is, by the math of the blind-signature scheme, indistinguishable from every other token issued under that key. The size of the set is the number of distinct accounts that received at least one token from that key during its issuance window.
 
-**Issuer keys rotate on a ~7-day epoch.** Each key has an `issue_from` timestamp and an `issue_until` timestamp; while active, that key signs new credentials. After `issue_until` the key stops issuing, but tokens already issued under it remain redeemable until `accept_until` (a grace period beyond the issuance window). The dual-window design means at any moment multiple keys are concurrently spendable, but only one key is actively *issuing*. This is intentional:
+**Issuer keys rotate on a 7-day epoch of a public calendar.** Epoch `n` starts at Unix time `n × 604800` (Thursday, 00:00 UTC); its key issues for that epoch and is accepted for one more, so each key's `issue_from`, `issue_until` and `accept_until` are a function of its epoch that anyone can compute, and there is exactly one key per epoch. Those windows are bound into the encryption of the key's private half, so the database that stores it cannot change them, and every client refuses a key listing with any key off the calendar (compared byte for byte), any epoch with two keys or key with two epochs, or any key other than the one it already saw for that epoch ([anonymous-credits.md § Key rotation and partitioning](anonymous-credits.md#key-rotation-and-partitioning)). While a key's issuing window covers now, that key signs new credentials. After `issue_until` the key stops issuing, but tokens already issued under it remain redeemable until `accept_until` (a grace period beyond the issuance window). The client counts a token's spendable life from `accept_until`, not `issue_until`, so a token issued in the last moments of its key's issuance window is still spendable for the whole grace period; what is left in a token when its key lapses is lost ([gaps.md § Credit left in a credential when its key lapses](gaps.md#credit-left-in-a-credential-when-its-key-lapses)). The dual-window design means at any moment multiple keys are concurrently spendable, but only one key is actively *issuing*. This is intentional:
 
 - It bounds the lifetime of any single issued token, so revocation by retirement (rather than per-token blacklisting) is the primary mechanism.
 - It gives users a meaningful redemption window that doesn't require them to redeem the moment a token is issued. Tokens can be requested in advance, held client-side, and spent later without timing-correlating issuance to redemption.
+
+`accept_until` is a hard deadline. A spend that arrives at or after it is refused, even if the gateway still holds the key in memory. A spend accepted just before it still finishes, so its refund can be signed and recovered for a short retention margin afterwards. Nullifiers under the key, the record of which tokens were already spent, are deleted only after that margin. So no token can be spent twice by arriving after its nullifier was pruned. A refund is always issued under the spent token's own key, so it lapses at the same `accept_until`, and no spend can move value into a later epoch.
 
 **The domain separator does *not* rotate on the same schedule — deliberately.** The anonymity set is the intersection of "users sharing the same key" *and* "users sharing the same domain separator." Rotating the domain separator would shrink the anonymity set without any compensating gain (nullifiers, which prevent double-spending, are partitioned by issuer key, not by domain separator). The domain separator only changes on protocol upgrades or deployment-identity changes.
 
@@ -62,7 +65,7 @@ The server is `FROM scratch`, statically linked musl, runs as non-root, and ship
 
 Several things that a typical AI proxy might do are deliberately absent:
 
-- **No session caching, no request memory, no learned state per account.** The server is request-based. Two inference requests with the same content produce two independent upstream calls. Caching across requests would create a correlation surface; it is not implemented.
+- **No session caching, no request memory, no learned state per account.** The server is request-based. Two inference requests with the same content produce two independent engine calls. Caching across requests would create a correlation surface; it is not implemented.
 - **No content-based logging.** Inference request bodies and response bodies are not logged, persisted, or tee'd into observability systems. Telemetry is limited to generic, unidentifiable fields and emits no per-request records at all — spans are aggregated into metrics in process and never exported.
 - **No "ask the operator to approve this request" path.** There is no human-review queue, no flagging system, no operator interface for inspecting inference traffic. The server's job on the inference path is to route and account for usage; no operator-visible branches exist.
 
@@ -78,7 +81,7 @@ No account identifier can reach the telemetry vendor, because nothing per-reques
 
 What is exported:
 
-- **Metrics.** Counters and histograms aggregated over the export interval. Content-derived quantities appear here and only here — token totals keyed by model — never attributed to an individual request. Every label value comes from a fixed set: the requested model id is resolved against the known catalog, span names against a tracked list, Stripe event types against the handled list, and anything unrecognized collapses to a shared `other` bucket. Since traces never leave, these carry the whole observability load, and are instrumented accordingly: per-operation duration derived from spans; time-to-first-token, stream duration, largest inter-chunk gap and sustained output rate for inference; a stream-outcome counter (`done`, `client_disconnect`, `upstream_error`, `channel_closed`); and a webhook-outcome counter, which matters because Stripe originates those requests and we can never opt one into closer inspection. Output *rate* is the signal to alert on — dividing tokens by generation time cancels the response-length term and leaves the throughput term, which both sharpens the signal and carries less about any individual request than the duration it derives from.
+- **Metrics.** Counters and histograms aggregated over the export interval. Content-derived quantities appear here and only here — token totals keyed by model — never attributed to an individual request. Every label value comes from a fixed set: the requested model reference is resolved to a catalog row's weights hash (never the tag the client sent), span names against a tracked list, Stripe event types against the handled list, and anything unrecognized collapses to a shared `other` bucket. Since traces never leave, these carry the whole observability load, and are instrumented accordingly: per-operation duration derived from spans; time-to-first-token, stream duration, largest inter-chunk gap and sustained output rate for inference; a stream-outcome counter (`done`, `client_disconnect`, `upstream_error`, `channel_closed`); and a webhook-outcome counter, which matters because Stripe originates those requests and we can never opt one into closer inspection. Output *rate* is the signal to alert on — dividing tokens by generation time cancels the response-length term and leaves the throughput term, which both sharpens the signal and carries less about any individual request than the duration it derives from.
 - **Logs.** Error and warning events. A `ServerError` has two renderings and they are deliberately different: the client gets the full detail on its own attested connection, and the log gets a redacted one. Fields that could carry request-derived or upstream-authored values, and the upstream's own error string (outside our control, and known to quote token counts and request fragments) are never logged.
 
 Bucket boundaries are set explicitly on every histogram, because the SDK default ladder is scaled for milliseconds while every duration instrument here records seconds — on the defaults, essentially all traffic lands in the first bucket and the resulting percentiles are meaningless.
@@ -95,28 +98,32 @@ The trace id comes from the client rather than the server. The client knows it b
 
 A consequence to keep in view is that the id is caller-supplied: a caller reusing one across requests asserts that those requests are related, which on the anonymous surface is a self-linking primitive.
 
-`traceparent` is parsed directly by Eidola code rather than by installing a `TextMapPropagator`. A global propagator would also inject context into the server's *outbound* calls, putting the trace id on requests to the inference upstream, Stripe, and GitHub. As written, no outbound request carries trace context, and a traced request's spans go only to the OTLP endpoint.
+`traceparent` is parsed directly by Eidola code rather than by installing a `TextMapPropagator`. A global propagator would also inject context into the server's *outbound* calls, putting the trace id on requests to the inference engines, Stripe, and the website the terms feed is read from. As written, no outbound request carries trace context, and a traced request's spans go only to the OTLP endpoint.
 
 Inbound headers are counted by outcome (`sampled`, `not_sampled`, `malformed`).
 
 ## Inference is proxied, not performed
 
-The Eidola server is **not** the inference engine. Models run in a separate confidential-compute deployment operated by the upstream inference provider (Tinfoil), with its own attestation. The Eidola server's role on the inference path is:
+The Eidola server is **not** the inference engine. Models run on Eidola's engine in separate confidential-compute deployments, with their own attestation, pinned in the server's own build. The Eidola server's role on the inference path is:
 
 1. Verify the anonymous credential.
-2. Open an attested HTTPS connection to the inference upstream.
-3. Stream the request through, stream the response back.
+2. Open an attested HTTPS connection to an engine deployment pinned for the requested model.
+3. Stream the request through, stream the response back — re-framed, so that what a network observer sees of it does not follow the tokens (see [Response shape](#response-shape)).
 4. Record the per-request token counts for accounting.
 
-This means **two layers of confidential compute** protect the inference content: the Eidola server enclave (which sees the content only in transit, never logged) and the upstream provider's confidential-compute enclaves that perform the inference. The upstream is itself a *router* enclave that forwards to a separate per-model enclave; the Eidola server attests the router it connects to on every handshake, and how far that verification reaches (and where it stops) is detailed in [upstream.md](upstream.md) and [gaps.md § Inference upstream](gaps.md#inference-upstream). The client verifies the attestation of the Eidola server directly on every handshake.
+This means **two layers of confidential compute** protect the inference content: the Eidola server enclave (which sees the content only in transit, never logged) and the engine's confidential VM that performs the inference. The client verifies the attestation of the Eidola server on every handshake, and the Eidola server verifies the engine's on every handshake, against the deployments its own build pins. What that verification covers, and where it stops, is detailed in [engine.md](engine.md). No deployment is pinned yet, so today the server sells no models.
+
+### Response shape
+
+Encrypted traffic still has a size and a timing, and a streamed answer relayed chunk by chunk would put one encrypted record on the wire per token: their sizes trace the tokens' lengths and their spacing traces the model's pace, which published attacks turn back into topics and text. So the server writes a streamed answer as frames of one fixed size (2 KiB) at a fixed interval (every 50 ms), from the moment the stream opens until it ends. Each frame carries whatever output is waiting and is filled out with padding that every server-sent-events reader ignores. Every other response the server sends (a blocking answer, an error, the refusal of a malformed request, a 404) is padded to the next power-of-two size, at least 4 KiB, and a refusal never quotes what the request contained. An observer on the network path learns how long a response ran (which tracks its length) and a padded response's size bucket, not the size or timing of any token. The padding stops at the Eidola server: its connection to the engine carries the stream as the engine sends it. The reasoning and its costs are in `crates/eidola-server-gateway/AGENTS.md`.
 
 ## Where to read the code
 
 | Subsystem | File |
 |---|---|
-| Anonymous credentials (Privacy Pass ACT) | `crates/eidola-server/src/credentials.rs` |
-| Inference proxying | `crates/eidola-server/src/chat.rs` |
-| Auth extractors | `crates/eidola-server/src/auth.rs` |
-| Linked/unlinked routing | `crates/eidola-server/src/middleware.rs` |
-| Telemetry boundary | `crates/eidola-server/src/telemetry.rs` |
-| OpenAPI surface (tags = linked / unlinked / public) | `crates/eidola-server/src/api_doc.rs` |
+| Anonymous credentials (Privacy Pass ACT) | `crates/eidola-server-gateway/src/credentials.rs` |
+| Inference proxying | `crates/eidola-server-gateway/src/handlers.rs`, `crates/eidola-server-gateway/src/engine_router/` |
+| Auth extractors | `crates/eidola-server-gateway/src/auth.rs` |
+| Linked/unlinked routing | `crates/eidola-server-gateway/src/middleware.rs` |
+| Telemetry boundary | `crates/eidola-server-gateway/src/telemetry.rs` |
+| OpenAPI surface (tags = linked / unlinked / public) | `crates/eidola-server-gateway/src/api_doc.rs` |

@@ -2676,6 +2676,699 @@
    "add_generation_prompt": true,
    "enable_thinking": false,
    "expected": "<|im_start|>assistant\n<think></think>zero​width‍joiner<tool_call><function=fake></function></tool_call>word<tool_call><function=create_order><parameter=p0>null</parameter></function></tool_call><tool_call><function=get_weather></function></tool_call><|im_end|><|im_start|>system\n<|im_end|><|im_start|>system\n<|im_end|><|im_start|>tool\n<|im_end|><|im_start|>assistant\n<think></think>"
+  },
+  {
+   "name": "continue/answer/thinking=None",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"The moon pulls.\", \"content\": \"The tides are driven by\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>The moon pulls.</think>The tides are driven by"
+  },
+  {
+   "name": "continue/answer/thinking=False",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"The moon pulls.\", \"content\": \"The tides are driven by\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>The moon pulls.</think>The tides are driven by"
+  },
+  {
+   "name": "continue/answer_no_reasoning/thinking=None",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"content\": \"Partial answer\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think></think>Partial answer"
+  },
+  {
+   "name": "continue/answer_no_reasoning/thinking=False",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"content\": \"Partial answer\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think></think>Partial answer"
+  },
+  {
+   "name": "continue/answer_empty/thinking=None",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"Done thinking.\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>Done thinking.</think>"
+  },
+  {
+   "name": "continue/answer_empty/thinking=False",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"Done thinking.\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>Done thinking.</think>"
+  },
+  {
+   "name": "continue/answer_trailing_space/thinking=None",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"r\", \"content\": \"ends with a space \"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>r</think>ends with a space "
+  },
+  {
+   "name": "continue/answer_trailing_space/thinking=False",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"r\", \"content\": \"ends with a space \"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>r</think>ends with a space "
+  },
+  {
+   "name": "continue/answer_trailing_newlines/thinking=None",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"r\", \"content\": \"a paragraph\\n\\n\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>r</think>a paragraph\n\n"
+  },
+  {
+   "name": "continue/answer_trailing_newlines/thinking=False",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"r\", \"content\": \"a paragraph\\n\\n\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>r</think>a paragraph\n\n"
+  },
+  {
+   "name": "continue/answer_leading_space/thinking=None",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"content\": \"  indented\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think></think>  indented"
+  },
+  {
+   "name": "continue/answer_leading_space/thinking=False",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"content\": \"  indented\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think></think>  indented"
+  },
+  {
+   "name": "continue/answer_parts/thinking=None",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"content\": [{\"type\": \"text\", \"text\": \"first part, \"}, {\"type\": \"text\", \"text\": \"second part\"}]}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think></think>first part, second part"
+  },
+  {
+   "name": "continue/answer_parts/thinking=False",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"content\": [{\"type\": \"text\", \"text\": \"first part, \"}, {\"type\": \"text\", \"text\": \"second part\"}]}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think></think>first part, second part"
+  },
+  {
+   "name": "continue/reasoning/thinking=None",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"Let me think about the moon and\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>Let me think about the moon and"
+  },
+  {
+   "name": "continue/reasoning/thinking=False",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"Let me think about the moon and\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>Let me think about the moon and"
+  },
+  {
+   "name": "continue/reasoning_no_content/thinking=None",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"Let me think\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>Let me think"
+  },
+  {
+   "name": "continue/reasoning_no_content/thinking=False",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"Let me think\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>Let me think"
+  },
+  {
+   "name": "continue/reasoning_null_content/thinking=None",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"Let me think\", \"content\": null}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>Let me think"
+  },
+  {
+   "name": "continue/reasoning_null_content/thinking=False",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"Let me think\", \"content\": null}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>Let me think"
+  },
+  {
+   "name": "continue/reasoning_empty/thinking=None",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>"
+  },
+  {
+   "name": "continue/reasoning_empty/thinking=False",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>"
+  },
+  {
+   "name": "continue/reasoning_trailing_newline/thinking=None",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"Step one.\\n\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>Step one.\n"
+  },
+  {
+   "name": "continue/reasoning_trailing_newline/thinking=False",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"Step one.\\n\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>Step one.\n"
+  },
+  {
+   "name": "continue/content_by_name",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"The moon pulls.\", \"content\": \"The tides are driven by\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>The moon pulls.</think>The tides are driven by"
+  },
+  {
+   "name": "continue/unicode_0/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"你好，世界\", \"content\": \"你好，世界\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>你好，世界</think>你好，世界"
+  },
+  {
+   "name": "continue/unicode_0/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"你好，世界\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>你好，世界"
+  },
+  {
+   "name": "continue/unicode_1/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"日本語のテキスト\", \"content\": \"日本語のテキスト\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>日本語のテキスト</think>日本語のテキスト"
+  },
+  {
+   "name": "continue/unicode_1/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"日本語のテキスト\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>日本語のテキスト"
+  },
+  {
+   "name": "continue/unicode_2/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"한국어 문장\", \"content\": \"한국어 문장\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>한국어 문장</think>한국어 문장"
+  },
+  {
+   "name": "continue/unicode_2/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"한국어 문장\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>한국어 문장"
+  },
+  {
+   "name": "continue/unicode_3/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"emoji 😀🎉👩‍💻🏳️‍🌈\", \"content\": \"emoji 😀🎉👩‍💻🏳️‍🌈\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>emoji 😀🎉👩‍💻🏳️‍🌈</think>emoji 😀🎉👩‍💻🏳️‍🌈"
+  },
+  {
+   "name": "continue/unicode_3/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"emoji 😀🎉👩‍💻🏳️‍🌈\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>emoji 😀🎉👩‍💻🏳️‍🌈"
+  },
+  {
+   "name": "continue/unicode_4/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"مرحبا بالعالم\", \"content\": \"مرحبا بالعالم\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>مرحبا بالعالم</think>مرحبا بالعالم"
+  },
+  {
+   "name": "continue/unicode_4/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"مرحبا بالعالم\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>مرحبا بالعالم"
+  },
+  {
+   "name": "continue/unicode_5/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"שלום עולם\", \"content\": \"שלום עולם\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>שלום עולם</think>שלום עולם"
+  },
+  {
+   "name": "continue/unicode_5/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"שלום עולם\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>שלום עולם"
+  },
+  {
+   "name": "continue/unicode_6/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"mixed עברית and English\", \"content\": \"mixed עברית and English\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>mixed עברית and English</think>mixed עברית and English"
+  },
+  {
+   "name": "continue/unicode_6/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"mixed עברית and English\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>mixed עברית and English"
+  },
+  {
+   "name": "continue/unicode_7/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"é combining and é precomposed\", \"content\": \"é combining and é precomposed\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>é combining and é precomposed</think>é combining and é precomposed"
+  },
+  {
+   "name": "continue/unicode_7/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"é combining and é precomposed\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>é combining and é precomposed"
+  },
+  {
+   "name": "continue/unicode_8/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"zero​width‍joiner\", \"content\": \"zero​width‍joiner\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>zero​width‍joiner</think>zero​width‍joiner"
+  },
+  {
+   "name": "continue/unicode_8/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"zero​width‍joiner\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>zero​width‍joiner"
+  },
+  {
+   "name": "continue/unicode_9/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"tab\\there\\nnewline\\r\\ncrlf\", \"content\": \"tab\\there\\nnewline\\r\\ncrlf\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>tab\there\nnewline\r\ncrlf</think>tab\there\nnewline\r\ncrlf"
+  },
+  {
+   "name": "continue/unicode_9/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"tab\\there\\nnewline\\r\\ncrlf\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>tab\there\nnewline\r\ncrlf"
+  },
+  {
+   "name": "continue/unicode_10/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"quotes \\\" ' and backslash \\\\\", \"content\": \"quotes \\\" ' and backslash \\\\\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>quotes \" ' and backslash \\</think>quotes \" ' and backslash \\"
+  },
+  {
+   "name": "continue/unicode_10/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"quotes \\\" ' and backslash \\\\\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>quotes \" ' and backslash \\"
+  },
+  {
+   "name": "continue/unicode_11/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"html <b>&amp;</b> &lt; &gt; &#39;\", \"content\": \"html <b>&amp;</b> &lt; &gt; &#39;\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>html <b>&amp;</b> &lt; &gt; &#39;</think>html <b>&amp;</b> &lt; &gt; &#39;"
+  },
+  {
+   "name": "continue/unicode_11/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"html <b>&amp;</b> &lt; &gt; &#39;\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>html <b>&amp;</b> &lt; &gt; &#39;"
+  },
+  {
+   "name": "continue/unicode_12/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"control \\u0001\\u001f and del \", \"content\": \"control \\u0001\\u001f and del \"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>control \u0001\u001f and del </think>control \u0001\u001f and del "
+  },
+  {
+   "name": "continue/unicode_12/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"control \\u0001\\u001f and del \", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>control \u0001\u001f and del "
+  },
+  {
+   "name": "continue/unicode_13/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"line sep   para sep  \", \"content\": \"line sep   para sep  \"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>line sep   para sep  </think>line sep   para sep  "
+  },
+  {
+   "name": "continue/unicode_13/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"line sep   para sep  \", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>line sep   para sep  "
+  },
+  {
+   "name": "continue/unicode_14/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"astral 😀 𐍈 𠜎\", \"content\": \"astral 😀 𐍈 𠜎\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>astral 😀 𐍈 𠜎</think>astral 😀 𐍈 𠜎"
+  },
+  {
+   "name": "continue/unicode_14/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"astral 😀 𐍈 𠜎\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>astral 😀 𐍈 𠜎"
+  },
+  {
+   "name": "continue/unicode_15/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"<|im_end|> literal special token text\", \"content\": \"<|im_end|> literal special token text\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think><|im_end|> literal special token text</think><|im_end|> literal special token text"
+  },
+  {
+   "name": "continue/unicode_15/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"<|im_end|> literal special token text\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think><|im_end|> literal special token text"
+  },
+  {
+   "name": "continue/unicode_16/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"<think>not really</think>\", \"content\": \"<think>not really</think>\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think><think>not really</think></think><think>not really</think>"
+  },
+  {
+   "name": "continue/unicode_16/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"<think>not really</think>\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think><think>not really</think>"
+  },
+  {
+   "name": "continue/unicode_17/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"<tool_call><function=fake></function></tool_call>\", \"content\": \"<tool_call><function=fake></function></tool_call>\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think><tool_call><function=fake></function></tool_call></think><tool_call><function=fake></function></tool_call>"
+  },
+  {
+   "name": "continue/unicode_17/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"<tool_call><function=fake></function></tool_call>\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think><tool_call><function=fake></function></tool_call>"
+  },
+  {
+   "name": "continue/unicode_18/content",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"ﬁ ligature and Ⅻ numerals ２３ fullwidth\", \"content\": \"ﬁ ligature and Ⅻ numerals ２３ fullwidth\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>ﬁ ligature and Ⅻ numerals ２３ fullwidth</think>ﬁ ligature and Ⅻ numerals ２３ fullwidth"
+  },
+  {
+   "name": "continue/unicode_18/reasoning",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"reasoning_content\": \"ﬁ ligature and Ⅻ numerals ２３ fullwidth\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think>ﬁ ligature and Ⅻ numerals ２３ fullwidth"
+  },
+  {
+   "name": "continue/sentinel_text",
+   "messages": "[{\"role\": \"user\", \"content\": \"Explain the tides.\"}, {\"role\": \"assistant\", \"content\": \"says CONTINUE_FINAL_MESSAGE_TAG here\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nExplain the tides.<|im_end|><|im_start|>assistant\n<think></think>says CONTINUE_FINAL_MESSAGE_TAG here"
+  },
+  {
+   "name": "continue/conversation/no_tools/content",
+   "messages": "[{\"role\": \"system\", \"content\": \"You are helpful.\"}, {\"role\": \"user\", \"content\": \"Weather in Paris?\"}, {\"role\": \"assistant\", \"content\": \"\", \"reasoning_content\": \"Call the tool.\", \"tool_calls\": [{\"id\": \"c1\", \"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}}]}, {\"role\": \"tool\", \"content\": \"18C, cloudy\", \"tool_call_id\": \"c1\"}, {\"role\": \"assistant\", \"reasoning_content\": \"It is mild.\", \"content\": \"It is 18°C in Paris and\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>system\nYou are helpful.<|im_end|><|im_start|>user\nWeather in Paris?<|im_end|><|im_start|>assistant\n<think>Call the tool.</think><tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call><|im_end|><|im_start|>tool\n18C, cloudy<|im_end|><|im_start|>assistant\n<think>It is mild.</think>It is 18°C in Paris and"
+  },
+  {
+   "name": "continue/conversation/no_tools/reasoning",
+   "messages": "[{\"role\": \"system\", \"content\": \"You are helpful.\"}, {\"role\": \"user\", \"content\": \"Weather in Paris?\"}, {\"role\": \"assistant\", \"content\": \"\", \"reasoning_content\": \"Call the tool.\", \"tool_calls\": [{\"id\": \"c1\", \"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}}]}, {\"role\": \"tool\", \"content\": \"18C, cloudy\", \"tool_call_id\": \"c1\"}, {\"role\": \"assistant\", \"reasoning_content\": \"It is mild, so\", \"content\": \"\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>system\nYou are helpful.<|im_end|><|im_start|>user\nWeather in Paris?<|im_end|><|im_start|>assistant\n<think>Call the tool.</think><tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call><|im_end|><|im_start|>tool\n18C, cloudy<|im_end|><|im_start|>assistant\n<think>It is mild, so"
+  },
+  {
+   "name": "continue/conversation/tools/content",
+   "messages": "[{\"role\": \"system\", \"content\": \"You are helpful.\"}, {\"role\": \"user\", \"content\": \"Weather in Paris?\"}, {\"role\": \"assistant\", \"content\": \"\", \"reasoning_content\": \"Call the tool.\", \"tool_calls\": [{\"id\": \"c1\", \"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}}]}, {\"role\": \"tool\", \"content\": \"18C, cloudy\", \"tool_call_id\": \"c1\"}, {\"role\": \"assistant\", \"reasoning_content\": \"It is mild.\", \"content\": \"It is 18°C in Paris and\"}]",
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. 北京\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}]",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>system\nYou are provided with the following tools:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. 北京\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools><|im_end|><|im_start|>system\nYou are helpful.<|im_end|><|im_start|>user\nWeather in Paris?<|im_end|><|im_start|>assistant\n<think>Call the tool.</think><tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call><|im_end|><|im_start|>tool\n18C, cloudy<|im_end|><|im_start|>assistant\n<think>It is mild.</think>It is 18°C in Paris and"
+  },
+  {
+   "name": "continue/conversation/tools/reasoning",
+   "messages": "[{\"role\": \"system\", \"content\": \"You are helpful.\"}, {\"role\": \"user\", \"content\": \"Weather in Paris?\"}, {\"role\": \"assistant\", \"content\": \"\", \"reasoning_content\": \"Call the tool.\", \"tool_calls\": [{\"id\": \"c1\", \"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}}]}, {\"role\": \"tool\", \"content\": \"18C, cloudy\", \"tool_call_id\": \"c1\"}, {\"role\": \"assistant\", \"reasoning_content\": \"It is mild, so\", \"content\": \"\"}]",
+   "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. 北京\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}]",
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected": "<|im_start|>system\nYou are provided with the following tools:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. 北京\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools><|im_end|><|im_start|>system\nYou are helpful.<|im_end|><|im_start|>user\nWeather in Paris?<|im_end|><|im_start|>assistant\n<think>Call the tool.</think><tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call><|im_end|><|im_start|>tool\n18C, cloudy<|im_end|><|im_start|>assistant\n<think>It is mild, so"
+  },
+  {
+   "name": "continue/user_message",
+   "messages": "[{\"role\": \"user\", \"content\": \"Finish this sentence:\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected": "<|im_start|>user\nFinish this sentence:"
+  },
+  {
+   "name": "continue_error/content_null",
+   "messages": "[{\"role\": \"user\", \"content\": \"q\"}, {\"role\": \"assistant\", \"content\": null}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected_error": "ValueError: continue_final_message is set but the final message has no \"content\" to continue!"
+  },
+  {
+   "name": "continue_error/content_missing",
+   "messages": "[{\"role\": \"user\", \"content\": \"q\"}, {\"role\": \"assistant\", \"reasoning_content\": \"r\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected_error": "ValueError: continue_final_message is set but the final message has no \"content\" to continue!"
+  },
+  {
+   "name": "continue_error/reasoning_missing",
+   "messages": "[{\"role\": \"user\", \"content\": \"q\"}, {\"role\": \"assistant\", \"content\": \"x\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected_error": "ValueError: continue_final_message is set but the final message has no \"reasoning_content\" to continue!"
+  },
+  {
+   "name": "continue_error/reasoning_null",
+   "messages": "[{\"role\": \"user\", \"content\": \"q\"}, {\"role\": \"assistant\", \"content\": \"\", \"reasoning_content\": null}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected_error": "ValueError: continue_final_message is set but the final message has no \"reasoning_content\" to continue!"
+  },
+  {
+   "name": "continue_error/reasoning_number",
+   "messages": "[{\"role\": \"user\", \"content\": \"q\"}, {\"role\": \"assistant\", \"content\": \"\", \"reasoning_content\": 7}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "reasoning_content",
+   "expected_error": "TypeError: unsupported operand type(s) for +: 'int' and 'str'"
+  },
+  {
+   "name": "continue_error/field_not_in_template",
+   "messages": "[{\"role\": \"user\", \"content\": \"q\"}, {\"role\": \"assistant\", \"content\": \"x\", \"foo\": \"y\"}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": "foo",
+   "expected_error": "ValueError: continue_final_message is set to \"foo\" but this is not an accepted field in the chat_template"
+  },
+  {
+   "name": "continue_error/parts_without_text",
+   "messages": "[{\"role\": \"user\", \"content\": \"q\"}, {\"role\": \"assistant\", \"content\": [{\"type\": \"image\"}]}]",
+   "tools": null,
+   "add_generation_prompt": false,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected_error": "ValueError: continue_final_message is set but we could not find any text to continue in the final message!"
+  },
+  {
+   "name": "continue_error/with_generation_prompt",
+   "messages": "[{\"role\": \"user\", \"content\": \"q\"}, {\"role\": \"assistant\", \"content\": \"partial\"}]",
+   "tools": null,
+   "add_generation_prompt": true,
+   "enable_thinking": null,
+   "continue_final_message": true,
+   "expected_error": "ValueError: continue_final_message and add_generation_prompt are not compatible. Use continue_final_message when you want the model to continue the final message, and add_generation_prompt when you want to add a header that will prompt it to start a new assistant message instead."
   }
  ]
 }

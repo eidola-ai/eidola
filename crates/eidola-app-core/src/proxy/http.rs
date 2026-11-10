@@ -573,6 +573,7 @@ pub(crate) fn app_error_response(error: &AppError) -> Response<ProxyBody> {
         AppError::NoAccount
         | AppError::InsufficientBalance { .. }
         | AppError::Credential { .. }
+        | AppError::IssuerKeyRefused { .. }
         | AppError::ProvisioningTimeout { .. } => (
             StatusCode::PAYMENT_REQUIRED,
             "insufficient_quota",
@@ -647,7 +648,7 @@ pub(crate) fn app_error_response(error: &AppError) -> Response<ProxyBody> {
 /// What a downstream tool is told about a failure.
 ///
 /// **The audience decides, and here it is the opposite audience from the
-/// server's.** `eidola-server` hands its client every detail and redacts its
+/// server's.** `eidola-server-gateway` hands its client every detail and redacts its
 /// own logs, because there the detail *is* the client's own data and the log is
 /// the surface a stranger might read. This proxy is the mirror image: the
 /// detail is about **this machine** — a models directory on someone's disk, a
@@ -741,6 +742,8 @@ mod tests {
     fn a_models_entry_names_the_backend_it_is_reached_through() {
         let entry = model_entry(&crate::ModelInfo {
             id: "gemma@local".into(),
+            sha256: None,
+            tags: Vec::new(),
             context_length: 0,
             max_output_tokens: None,
             output_budget_class: None,
