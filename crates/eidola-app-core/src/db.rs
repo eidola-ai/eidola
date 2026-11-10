@@ -965,6 +965,9 @@ pub struct SpendingCredentialRow {
     pub spend_proof_data: Vec<u8>,
     pub issuer_key_id: String,
     pub public_key_data: Vec<u8>,
+    /// The spent key's `spend_until` (ms): past it, nothing waits for a
+    /// final refund.
+    pub spend_until: i64,
 }
 
 pub async fn list_spending_credentials(
@@ -974,7 +977,7 @@ pub async fn list_spending_credentials(
         .prepare(
             "SELECT c.nonce, c.credits, c.generation, c.created_at, \
                     pc.spend_amount, pc.id, pc.data, pc.spend_proof_data, \
-                    pc.issuer_key_id, ik.public_key_data \
+                    pc.issuer_key_id, ik.public_key_data, ik.spend_until \
              FROM credential_lifecycle cl \
              JOIN credential c ON c.nonce = cl.nonce \
              JOIN pre_credential pc ON pc.credential_nonce = c.nonce AND pc.type = 'refund' \
@@ -998,6 +1001,7 @@ pub async fn list_spending_credentials(
             spend_proof_data: row.get::<Vec<u8>>(7).map_err(AppError::db)?,
             issuer_key_id: row.get::<String>(8).map_err(AppError::db)?,
             public_key_data: row.get::<Vec<u8>>(9).map_err(AppError::db)?,
+            spend_until: row.get::<i64>(10).map_err(AppError::db)?,
         });
     }
     Ok(results)

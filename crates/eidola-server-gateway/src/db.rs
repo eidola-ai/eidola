@@ -1209,13 +1209,16 @@ pub async fn prune_expired_nullifiers(
     Ok(row.get("pruned"))
 }
 
-/// Atomically record a nullifier. Returns `true` if successfully recorded,
-/// `false` if the nullifier was already present (double-spend attempt).
+/// Atomically record a nullifier with its sealed refund token, in one
+/// statement, so no recorded nullifier is ever without a refund. Returns
+/// `true` if successfully recorded, `false` if the nullifier was already
+/// present (double-spend attempt), in which case nothing is written.
 #[tracing::instrument(skip_all, name = "db.record_nullifier", err)]
 pub async fn record_nullifier(
     pool: &Pool,
     issuer_key_id: &str,
     value: &[u8],
+    refund_token: &SealedRefundToken,
 ) -> Result<bool, ServerError> {
     let client = pool
         .get()
@@ -1224,9 +1227,9 @@ pub async fn record_nullifier(
 
     let rows_affected = client
         .execute(
-            "INSERT INTO nullifier (issuer_key_id, value) \
-             VALUES ($1, $2) ON CONFLICT DO NOTHING",
-            &[&issuer_key_id, &value],
+            "INSERT INTO nullifier (issuer_key_id, value, refund_token) \
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            &[&issuer_key_id, &value, &refund_token.as_bytes()],
         )
         .await
         .map_err(|e| {
@@ -1266,6 +1269,46 @@ pub async fn store_refund_token(
         })?;
 
     Ok(())
+}
+
+/// Replace the sealed refund token on a nullifier row with `new`, **only if**
+/// it is still exactly `expected`: `true` if it was replaced. A
+/// compare-and-swap, so of two writers racing over one row (settlement
+/// storing the final refund over the provisional one, and recovery declaring
+/// the provisional one final) exactly one wins, and the other sees it lost:
+/// under Postgres's row lock the loser re-checks its condition against the
+/// winner's row and matches nothing.
+#[tracing::instrument(skip_all, name = "db.replace_refund_token", err)]
+pub async fn replace_refund_token(
+    pool: &Pool,
+    issuer_key_id: &str,
+    nullifier_value: &[u8],
+    expected: &SealedRefundToken,
+    new: &SealedRefundToken,
+) -> Result<bool, ServerError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    let replaced = client
+        .execute(
+            "UPDATE nullifier SET refund_token = $4 \
+             WHERE issuer_key_id = $1 AND value = $2 AND refund_token = $3",
+            &[
+                &issuer_key_id,
+                &nullifier_value,
+                &expected.as_bytes(),
+                &new.as_bytes(),
+            ],
+        )
+        .await
+        .map_err(|e| {
+            ServerError::Internal(format!(
+                "replace_refund_token failed: {}",
+                db_error_summary(&e)
+            ))
+        })?;
+    Ok(replaced > 0)
 }
 
 /// Retrieve the sealed refund token stored for a nullifier. Returns `None` if

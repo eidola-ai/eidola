@@ -55,6 +55,8 @@ pub struct AppStateInner {
     pub stripe_webhook_secret: Option<String>,
     pub credential_master_key: [u8; 32],
     pub credential_key_cache: credentials::KeyCache,
+    /// The spends this process is serving right now (`credentials::LiveSpends`).
+    pub live_spends: Arc<credentials::LiveSpends>,
 }
 
 impl AppState {
@@ -77,6 +79,7 @@ impl AppState {
                 stripe_webhook_secret,
                 credential_master_key,
                 credential_key_cache,
+                live_spends: Arc::default(),
             }),
         }
     }

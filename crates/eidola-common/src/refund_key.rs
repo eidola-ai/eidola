@@ -12,15 +12,10 @@
 //!
 //! The wire form is fixed so the client and the gateway cannot disagree about
 //! it: [`REFUND_KEY_BYTES`] bytes as exactly [`REFUND_KEY_TEXT_LEN`] lowercase
-//! hex digits in the [`REFUND_KEY_HEADER`] request header. How the client
-//! chooses the bytes is the client's business; the gateway only needs them to
-//! be the same at spend and at recovery.
-
-/// The request header carrying the refund recovery key, on a spend
-/// (`POST /v1/chat/completions`) and on recovery (`POST /v1/credentials/refund`).
-/// Header names are case-insensitive; this is the lowercase spelling both
-/// sides use.
-pub const REFUND_KEY_HEADER: &str = "x-eidola-refund-key";
+//! hex digits, the `refund_key` beside its Token in the request body's
+//! `credentials` member (`spend_credentials`), on a spend and on recovery
+//! alike. How the client chooses the bytes is the client's business; the
+//! gateway only needs them to be the same at spend and at recovery.
 
 /// Length of a refund recovery key, in bytes.
 pub const REFUND_KEY_BYTES: usize = 32;

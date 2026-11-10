@@ -149,6 +149,8 @@ struct EngineState {
     chats: Mutex<Vec<Received>>,
     health_checks: AtomicUsize,
     release: tokio::sync::Notify,
+    /// Held streams whose connection went away before they were released.
+    abandoned: AtomicUsize,
 }
 
 /// A fake engine behind its shim.
@@ -217,6 +219,7 @@ async fn engine(identity: Identity) -> Engine {
         chats: Mutex::new(Vec::new()),
         health_checks: AtomicUsize::new(0),
         release: tokio::sync::Notify::new(),
+        abandoned: AtomicUsize::new(0),
     });
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -426,10 +429,23 @@ fn async_stream(
     state: Arc<EngineState>,
     rest: Vec<Event>,
 ) -> impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>> {
+    /// Counts a held stream dropped (its connection gone) before release.
+    struct Abandon(Option<Arc<EngineState>>);
+    impl Drop for Abandon {
+        fn drop(&mut self) {
+            if let Some(state) = self.0.take() {
+                state
+                    .abandoned
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
     let head = futures_util::stream::once(async move { Ok(role) });
     let tail = futures_util::stream::once(async move {
         if hold {
+            let mut abandon = Abandon(Some(state.clone()));
             state.release.notified().await;
+            abandon.0 = None;
         }
         futures_util::stream::iter(rest.into_iter().map(Ok))
     })
@@ -663,6 +679,35 @@ async fn without_a_key_the_least_loaded_engine_is_chosen() {
         seen.insert(served_by(&refs, &before));
     }
     assert_eq!(seen.len(), 2);
+}
+
+/// **A dropped receiver releases the engine at once**, even while the engine
+/// is sending nothing (a long prefill): the relay watches for its handler
+/// going away, closes the connection, and the engine sees its request go
+/// (which the node turns into a cancel in its scheduler).
+#[tokio::test]
+async fn a_dropped_receiver_closes_the_engine_connection_without_waiting_for_output() {
+    let a = engine(Identity::of(MODEL_A)).await;
+    let router = router_for(&[&a], models());
+    router
+        .apply_placement(&[a.row(MODEL_A, DEPLOYMENT_A)])
+        .await;
+    router.probe_due().await;
+    a.set_mode(Mode::Hold);
+    let mut held = router
+        .send_stream(&request(MODEL_A, None, true))
+        .await
+        .unwrap();
+    held.recv().await.unwrap().unwrap();
+    drop(held);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while a.state.abandoned.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the engine's stream was never released"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// Only enabled rows naming a pinned model and one of its pinned deployments,

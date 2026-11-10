@@ -307,6 +307,18 @@ impl EventSender {
             space.await;
         }
     }
+
+    /// Resolves once the client has gone (its stream was dropped): how the
+    /// producer notices a disconnect while it has nothing to send.
+    pub async fn closed(&self) {
+        loop {
+            let space = self.shared.space.notified();
+            if !self.shared.lock().stream_alive {
+                return;
+            }
+            space.await;
+        }
+    }
 }
 
 impl Drop for EventSender {

@@ -43,7 +43,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use eidola_common::refund_key::REFUND_KEY_HEADER;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -266,14 +265,11 @@ fn mint_traceparent() -> String {
 ///   the app's own streaming turns send), `application/json` otherwise. Stated
 ///   on both because reqwest inserts an `Accept: */*` of its own where the
 ///   request carries none: an unstated header is not an absent one.
-/// - **`Authorization`** — the ACT this app spends, or an external backend's
-///   own key. **Never the downstream's.** A downstream `Authorization`
+/// - **`Authorization`** — an external backend's own key. **Never the
+///   downstream's**, and never an Eidola spend, which travels in the body's
+///   `credentials` member ([`build_upstream_request`]). A downstream `Authorization`
 ///   authenticates the tool *to the proxy* and is consumed there; the two
 ///   credentials share a header name and nothing else.
-/// - **`x-eidola-refund-key`** — with the ACT only: the spend's refund
-///   recovery key (`eidola_common::refund_key`), which the server seals the
-///   refund it stores under. A secret like the credential, and redacted from
-///   the Record the same way.
 /// - **`traceparent`** — only when [`TraceUpstream::On`], and then freshly
 ///   minted here. See [`TraceUpstream`].
 ///
@@ -289,37 +285,10 @@ fn mint_traceparent() -> String {
 /// (`Host`, `Content-Length`): the protocol, not a fact about this app.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpstreamHeaders {
-    /// `Some` iff the route carries a credential.
+    /// `Some` iff the route carries an external backend's key.
     pub authorization: Option<String>,
-    /// `Some` iff the credential is an ACT spend: its refund recovery key, as
-    /// the header's wire form.
-    pub refund_key: Option<RefundKeyText>,
     pub streaming: bool,
     pub trace: TraceUpstream,
-}
-
-/// A refund recovery key's header value, held apart from `String` so that
-/// `Debug` on the header description never prints it.
-#[derive(Clone, PartialEq, Eq)]
-pub struct RefundKeyText(String);
-
-impl RefundKeyText {
-    pub fn new(key: &[u8; 32]) -> Self {
-        let text = eidola_common::refund_key::encode_refund_key(key);
-        Self(String::from_utf8(text.to_vec()).expect("lowercase hex is UTF-8"))
-    }
-}
-
-impl std::fmt::Debug for RefundKeyText {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("RefundKeyText(<redacted>)")
-    }
-}
-
-impl Drop for RefundKeyText {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.0);
-    }
 }
 
 /// The header set actually put on **one attempt's** wire.
@@ -333,19 +302,18 @@ impl Drop for RefundKeyText {
 /// and the row read that one value; `for_record` lives here rather than on the
 /// description because redacting *a set* is what the Record actually needs.
 ///
-/// **Its secrets stay secret past materialization.** Two values here are
-/// secrets ([`is_secret_header`]): the credential, and an ACT spend's refund
-/// recovery key. One predicate decides both what the Record redacts, what
-/// `Debug` prints, and which header values the request marks sensitive (so
-/// the built request's own `Debug` hides them too), and the secret values are
-/// zeroed when the set is dropped.
+/// **Its secret stays secret past materialization.** One value here is a
+/// secret ([`is_secret_header`]): an external backend's key. One predicate
+/// decides what the Record redacts, what `Debug` prints, and which header
+/// values the request marks sensitive (so the built request's own `Debug`
+/// hides it too), and the secret value is zeroed when the set is dropped.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SentHeaders(Vec<(&'static str, String)>);
 
-/// Whether a header this app sends upstream carries a secret: the credential
-/// (`Authorization`: a spend proof or an API key) or the refund recovery key.
+/// Whether a header this app sends upstream carries a secret: the
+/// credential (`Authorization`: an external backend's API key).
 fn is_secret_header(name: &str) -> bool {
-    name.eq_ignore_ascii_case("Authorization") || name.eq_ignore_ascii_case(REFUND_KEY_HEADER)
+    name.eq_ignore_ascii_case("Authorization")
 }
 
 impl std::fmt::Debug for SentHeaders {
@@ -379,14 +347,13 @@ impl SentHeaders {
     }
 
     /// What the Record shows about this request's headers: every name, and
-    /// every value **except** the secrets: the credential, which is replaced
-    /// by its scheme, and the refund recovery key, replaced outright.
+    /// every value **except** the secret: the credential, which is replaced
+    /// by its scheme.
     ///
     /// The names are the evidence that the allowlist did its job — a reader
     /// can see for themselves that nothing of their tool's travelled. The
-    /// value of `Authorization` is a spend proof or an API key, and the refund
-    /// key opens the stored copy of the spend's refund; neither may land in a
-    /// durable local log.
+    /// value of `Authorization` is an API key, which may not land in a durable
+    /// local log.
     pub fn for_record(&self) -> String {
         let redacted: Vec<Value> = self
             .0
@@ -437,9 +404,6 @@ impl UpstreamHeaders {
         ));
         if let Some(auth) = &self.authorization {
             pairs.push(("Authorization", auth.clone()));
-        }
-        if let Some(key) = &self.refund_key {
-            pairs.push((REFUND_KEY_HEADER, key.0.clone()));
         }
         if self.trace == TraceUpstream::On {
             pairs.push(("traceparent", mint_traceparent()));
@@ -1314,9 +1278,8 @@ impl Inner {
                         message: "computed charge is zero — model pricing may be missing".into(),
                     });
                 }
-                let (prep, auth) = self.acquire_spend(&cfg, &db_conn, charge, now).await?;
-                spend = Some(prep);
-                Some(auth)
+                spend = Some(self.acquire_spend(&cfg, &db_conn, charge, now).await?);
+                None
             }
         };
         Ok(ProxyPreflight {
@@ -1421,7 +1384,6 @@ impl Inner {
         // set being a value rather than a recipe.
         let headers = UpstreamHeaders {
             authorization: auth_value.clone(),
-            refund_key: spend.as_ref().map(|s| RefundKeyText::new(&s.refund_key)),
             streaming: false,
             trace: self.upstream_tracing(),
         }
@@ -1432,10 +1394,10 @@ impl Inner {
         // one.** The build can refuse — an external backend's key is user-typed
         // and may not be a header value — and a `?` would have returned with a
         // credential left `spending` and nothing in the Record to say why.
-        let outbound = match build_upstream_request(&route, &body, &headers) {
+        let outbound = match build_upstream_request(&route, &body, spend.as_ref(), &headers) {
             Ok(outbound) => outbound,
             Err(error) => {
-                self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                self.settle_proxy_refund(&db_conn, &spend, &route, None)
                     .await;
                 self.record_proxy_request(
                     &route,
@@ -1471,7 +1433,7 @@ impl Inner {
                 if route.flush_new_attestations(&db_conn).await {
                     self.bus.emit(Change::Record);
                 }
-                self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                self.settle_proxy_refund(&db_conn, &spend, &route, None)
                     .await;
                 self.record_proxy_request(
                     &route,
@@ -1498,7 +1460,7 @@ impl Inner {
             Ok(answer) => answer,
             Err(failure) => {
                 let error = failure.error;
-                self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                self.settle_proxy_refund(&db_conn, &spend, &route, None)
                     .await;
                 self.record_proxy_request(
                     &route,
@@ -1574,9 +1536,8 @@ impl Inner {
         self.settle_proxy_refund(
             &db_conn,
             &spend,
-            &auth_value,
             &route,
-            parsed.as_ref().and_then(|body| body.get("refund")),
+            parsed.as_ref().and_then(crate::inline_refund),
         )
         .await;
         self.record_proxy_request(
@@ -1624,7 +1585,7 @@ impl Inner {
             // credential's successor; it is wallet material, not part of any
             // OpenAI response, and a tool that saw it could do nothing with it
             // but keep a copy.
-            object.remove("refund");
+            object.remove(eidola_common::spend_credentials::REFUNDS_MEMBER);
             // The caller asked for a model by the name this app gave it; the
             // answer names it back. (Only an external OpenAI backend's wire id
             // differs from the canonical one — an engine's alias *is* the
@@ -1657,7 +1618,6 @@ impl Inner {
         // set being a value rather than a recipe.
         let headers = UpstreamHeaders {
             authorization: auth_value.clone(),
-            refund_key: spend.as_ref().map(|s| RefundKeyText::new(&s.refund_key)),
             streaming: true,
             trace: self.upstream_tracing(),
         }
@@ -1666,10 +1626,10 @@ impl Inner {
         let request_at = now_ms();
         // Past the hold, so a refusal settles it — the blocking transport's
         // arm, for the same reason.
-        let outbound = match build_upstream_request(&route, &body, &headers) {
+        let outbound = match build_upstream_request(&route, &body, spend.as_ref(), &headers) {
             Ok(outbound) => outbound,
             Err(error) => {
-                self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                self.settle_proxy_refund(&db_conn, &spend, &route, None)
                     .await;
                 self.record_proxy_request(
                     &route,
@@ -1705,7 +1665,7 @@ impl Inner {
                 if route.flush_new_attestations(&db_conn).await {
                     self.bus.emit(Change::Record);
                 }
-                self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                self.settle_proxy_refund(&db_conn, &spend, &route, None)
                     .await;
                 self.record_proxy_request(
                     &route,
@@ -1743,7 +1703,7 @@ impl Inner {
                 Ok(answer) => answer,
                 Err(failure) => {
                     let error = failure.error;
-                    self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                    self.settle_proxy_refund(&db_conn, &spend, &route, None)
                         .await;
                     self.record_proxy_request(
                         &route,
@@ -1779,11 +1739,11 @@ impl Inner {
             let inline = (!answer.over_ceiling)
                 .then(|| serde_json::from_str::<Value>(&text).ok())
                 .flatten()
-                .and_then(|body| body.get("refund").cloned());
+                .and_then(|body| crate::inline_refund(&body).cloned());
             let refusal = answer
                 .over_ceiling
                 .then(|| crate::peer_read::answer_past_ceiling(&route.backend_id));
-            self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, inline.as_ref())
+            self.settle_proxy_refund(&db_conn, &spend, &route, inline.as_ref())
                 .await;
             self.record_proxy_request(
                 &route,
@@ -1835,7 +1795,7 @@ impl Inner {
                 Ok(answer) => answer,
                 Err(failure) => {
                     let error = failure.error;
-                    self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                    self.settle_proxy_refund(&db_conn, &spend, &route, None)
                         .await;
                     self.record_proxy_request(
                         &route,
@@ -1856,7 +1816,7 @@ impl Inner {
             let inline = (!answer.over_ceiling)
                 .then(|| serde_json::from_str::<Value>(&text).ok())
                 .flatten()
-                .and_then(|body| body.get("refund").cloned());
+                .and_then(|body| crate::inline_refund(&body).cloned());
             // The refusal is this app's, so the row carries it: the upstream
             // said `200` and nothing was forwarded, which a row holding only
             // that status would present as an answered request. The ceiling,
@@ -1866,7 +1826,7 @@ impl Inner {
             } else {
                 malformed_stream_answer(&route.backend_id, status.as_u16())
             };
-            self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, inline.as_ref())
+            self.settle_proxy_refund(&db_conn, &spend, &route, inline.as_ref())
                 .await;
             self.record_proxy_request(
                 &route,
@@ -2021,14 +1981,8 @@ impl Inner {
         // refund, and sends it even when its own persistence of that token
         // failed — the one case where recovery can never answer. See
         // [`forward_sse_event`].
-        self.settle_proxy_refund(
-            &db_conn,
-            &spend,
-            &auth_value,
-            &route,
-            inline_refund.as_ref(),
-        )
-        .await;
+        self.settle_proxy_refund(&db_conn, &spend, &route, inline_refund.as_ref())
+            .await;
         self.record_proxy_request(
             &route,
             &headers,
@@ -2060,21 +2014,15 @@ impl Inner {
         &self,
         db_conn: &turso::Connection,
         spend: &Option<crate::SpendPrep>,
-        auth_value: &Option<String>,
         route: &ProxyRoute,
         inline: Option<&Value>,
     ) {
         let Some(spend) = spend else { return };
         let refund_obj = match inline {
             Some(object) => Some(object.clone()),
-            None => match auth_value {
-                Some(auth) => {
-                    recover_refund(&route.client, &route.base_url, auth, &spend.refund_key)
-                        .await
-                        .ok()
-                }
-                None => None,
-            },
+            None => recover_refund(&route.client, &route.base_url, &spend.presented, None)
+                .await
+                .ok(),
         };
         let Some(refund_obj) = refund_obj else {
             eprintln!("warning: a proxied call's credential refund could not be recovered");
@@ -2150,15 +2098,21 @@ fn offers_running_engines_only(exposure: LocalExposure, starts_on_demand: bool) 
 /// framing (`Host`, `Content-Length`) — the protocol, not a claim about this
 /// app — and the body is serialized here rather than by `json()` for the same
 /// reason: a helper that sets a header is a second author of the set.
+///
+/// An Eidola spend goes into the body here, in its `credentials` member
+/// ([`crate::body_with_spend`]), onto a copy: `body` is what the Record keeps,
+/// and it never holds a credential.
 fn build_upstream_request(
     route: &ProxyRoute,
     body: &Value,
+    spend: Option<&crate::SpendPrep>,
     headers: &SentHeaders,
 ) -> Result<reqwest::Request, AppError> {
+    let sent = crate::body_with_spend(body, spend.map(|s| &s.presented));
     let mut request = route
         .client
         .post(format!("{}/v1/chat/completions", route.base_url))
-        .body(body.to_string())
+        .body(sent.to_string())
         .build()
         .map_err(|e| AppError::Network {
             message: format!(
@@ -2374,16 +2328,19 @@ fn forward_sse_event(event: &[u8], canonical: &str) -> (Vec<u8>, Option<Value>) 
     else {
         return (event.to_vec(), None);
     };
-    let refund = value.get("refund").cloned();
+    let refund = crate::inline_refund(&value).cloned();
+    let carries_refunds = value
+        .get(eidola_common::spend_credentials::REFUNDS_MEMBER)
+        .is_some();
     let misnames = value
         .get("model")
         .and_then(Value::as_str)
         .is_some_and(|model| model != canonical);
-    if refund.is_none() && !misnames {
+    if !carries_refunds && !misnames {
         return (event.to_vec(), None);
     }
     if let Some(object) = value.as_object_mut() {
-        object.remove("refund");
+        object.remove(eidola_common::spend_credentials::REFUNDS_MEMBER);
         if object.contains_key("model") {
             object.insert("model".to_string(), Value::String(canonical.to_string()));
         }
@@ -2419,7 +2376,6 @@ mod tests {
     fn headers(auth: Option<&str>, streaming: bool, trace: TraceUpstream) -> UpstreamHeaders {
         UpstreamHeaders {
             authorization: auth.map(str::to_string),
-            refund_key: None,
             streaming,
             trace,
         }
@@ -2513,42 +2469,14 @@ mod tests {
     }
 
     #[test]
-    fn an_act_spend_carries_its_refund_key_and_the_record_never_shows_it() {
-        let key = [0x3cu8; 32];
-        let spend = UpstreamHeaders {
-            refund_key: Some(RefundKeyText::new(&key)),
-            ..headers(Some("PrivateToken token=\"x\""), false, TraceUpstream::Off)
-        };
-        let sent = spend.materialize();
-        let text =
-            String::from_utf8(eidola_common::refund_key::encode_refund_key(&key).to_vec()).unwrap();
-        assert_eq!(
-            sent.pairs()
-                .iter()
-                .map(|(name, _)| *name)
-                .collect::<Vec<_>>(),
-            vec!["Content-Type", "Accept", "Authorization", REFUND_KEY_HEADER],
-        );
-        assert!(sent.pairs().iter().any(|(_, value)| *value == text));
+    fn an_external_key_is_sensitive_and_the_record_never_shows_it() {
+        let sent = headers(Some("Bearer sk-secret"), false, TraceUpstream::Off).materialize();
         let recorded = sent.for_record();
-        assert!(recorded.contains(REFUND_KEY_HEADER), "{recorded}");
-        assert!(!recorded.contains(&text), "{recorded}");
-        assert!(!format!("{spend:?}").contains(&text));
-        // Materialized, the set still prints no secret...
-        let shown = format!("{sent:?}");
-        assert!(shown.contains(REFUND_KEY_HEADER), "{shown}");
-        assert!(!shown.contains(&text), "{shown}");
-        assert!(!shown.contains("token="), "{shown}");
-        // ...and neither does the request built from it, whose secret values
-        // are marked sensitive while still travelling as sent.
+        assert!(!recorded.contains("sk-secret"), "{recorded}");
+        assert!(!format!("{sent:?}").contains("sk-secret"));
         let route = route_with_pending_attestation("eidola", "http://127.0.0.1:9");
-        let request = build_upstream_request(&route, &serde_json::json!({}), &sent).unwrap();
-        let built = format!("{request:?}");
-        assert!(!built.contains(&text), "{built}");
-        assert!(!built.contains("token="), "{built}");
-        let key_value = request.headers().get(REFUND_KEY_HEADER).unwrap();
-        assert!(key_value.is_sensitive());
-        assert_eq!(key_value.as_bytes(), text.as_bytes());
+        let request = build_upstream_request(&route, &serde_json::json!({}), None, &sent).unwrap();
+        assert!(!format!("{request:?}").contains("sk-secret"));
         assert!(
             request
                 .headers()
@@ -2763,7 +2691,7 @@ mod tests {
         // carries a refund, and a chunk carrying both loses one and gains the
         // other.
         let (out, refund) = forward_sse_event(
-            br#"data: {"model":"m","refund":{"refund":"material","issuer_key_id":"ab"}}"#,
+            br#"data: {"model":"m","refunds":[{"refund":"material","issuer_key_id":"ab"}]}"#,
             "m@acme",
         );
         let text = String::from_utf8(out).expect("utf-8");
@@ -2777,7 +2705,7 @@ mod tests {
         // The server's real terminal event: Eidola's own metadata, with the
         // refund nested as `RefundInfo` — the shape `process_refund` reads.
         let (out, refund) = forward_sse_event(
-            br#"data: {"object":"eidola.chat.completion.metadata","id":"x","refund":{"refund":"credential-material","issuer_key_id":"ab"}}"#,
+            br#"data: {"object":"eidola.chat.completion.metadata","id":"x","refunds":[{"refund":"credential-material","issuer_key_id":"ab"}]}"#,
             "m@eidola",
         );
         let text = String::from_utf8(out).expect("utf-8");
