@@ -122,7 +122,7 @@ Encrypted traffic still has a size and a timing, and a streamed answer relayed c
 | Subsystem | File |
 |---|---|
 | Anonymous credentials (Privacy Pass ACT) | `crates/eidola-server-gateway/src/credentials.rs` |
-| Inference proxying | `crates/eidola-server-gateway/src/chat.rs` |
+| Inference proxying | `crates/eidola-server-gateway/src/handlers.rs`, `crates/eidola-server-gateway/src/engine_router/` |
 | Auth extractors | `crates/eidola-server-gateway/src/auth.rs` |
 | Linked/unlinked routing | `crates/eidola-server-gateway/src/middleware.rs` |
 | Telemetry boundary | `crates/eidola-server-gateway/src/telemetry.rs` |
