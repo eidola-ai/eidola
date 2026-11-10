@@ -523,7 +523,7 @@
           "Unlinked"
         ],
         "summary": "Create a chat completion.",
-        "description": "Paid with an ACT (Anonymous Credit Token) spend in the body's\n`credentials` member. The spend proof is verified, the nullifier is\nrecorded with a provisional refund of nothing, and when the request ends\nthat is replaced by the final refund, returning the unspent credits.\n\n`model` is `tag`, `tag@sha256:<hex>` or `sha256:<hex>` (a full SHA-256 in\nlowercase hex), resolved to the model's weights hash before anything else.\nA digest, when present, decides alone; a bare tag resolves through this\nbuild's catalog. The response's `model` is `tag@sha256:<hex>` (or\n`sha256:<hex>` for a hash named alone).",
+        "description": "Paid with one or two ACT (Anonymous Credit Token) spends in the body's\n`credentials` member. Every spend proof is verified, every nullifier is\nrecorded, all or none, each with a provisional refund of nothing, and when\nthe request ends each is replaced by its input's final refund: the charge\nis consumed in input order, and each input's unspent credits return under\nits own issuer key.\n\n`model` is `tag`, `tag@sha256:<hex>` or `sha256:<hex>` (a full SHA-256 in\nlowercase hex), resolved to the model's weights hash before anything else.\nA digest, when present, decides alone; a bare tag resolves through this\nbuild's catalog. The response's `model` is `tag@sha256:<hex>` (or\n`sha256:<hex>` for a hash named alone).",
         "operationId": "chat_completions",
         "requestBody": {
           "content": {
@@ -547,7 +547,7 @@
             }
           },
           "400": {
-            "description": "Invalid request; a malformed model reference (`invalid_model_reference`: not `tag`, `tag@sha256:<hex>` or `sha256:<hex>`), a malformed refund recovery key, more than one credential, or a credential in a header (refused before the credential is spent); or a hold above the worst-case cost (refunded in full)",
+            "description": "Invalid request; a malformed model reference (`invalid_model_reference`: not `tag`, `tag@sha256:<hex>` or `sha256:<hex>`), a malformed refund recovery key, more than two credentials, one credential presented twice, a share of zero, or a credential in a header (refused before any credential is spent); or a hold above the worst-case cost (refunded in full)",
             "content": {
               "application/json": {
                 "schema": {
@@ -587,7 +587,7 @@
             }
           },
           "409": {
-            "description": "Credential already spent",
+            "description": "A credential already spent; none of the request's credentials is recorded",
             "content": {
               "application/json": {
                 "schema": {
@@ -1109,8 +1109,8 @@
             "items": {
               "$ref": "#/components/schemas/SpendCredential"
             },
-            "description": "The anonymous credits paying for this request: one element per spend,\neach an ACT Token and its refund recovery key\n(`eidola_common::spend_credentials`). Required; a request without it is\nrefused before anything is recorded, as is one that carries a\ncredential in a header instead.\n\n**Secret, and never serialized**, like `cache_key`: it prints\nredacted, `Serialize` skips it, and the body forwarded to an engine\nleaves it out (`engine_trust::protocol::engine_request_body`).",
-            "maxItems": 1,
+            "description": "The anonymous credits paying for this request: one element per spend\n(one, or two: a drain and a fill), each an ACT Token and its refund\nrecovery key (`eidola_common::spend_credentials`), in the order the\ncharge is consumed from them. Required; a request without it is\nrefused before anything is recorded, as is one that carries a\ncredential in a header instead.\n\n**Secret, and never serialized**, like `cache_key`: it prints\nredacted, `Serialize` skips it, and the body forwarded to an engine\nleaves it out (`engine_trust::protocol::engine_request_body`).",
+            "maxItems": 2,
             "minItems": 1
           },
           "max_completion_tokens": {

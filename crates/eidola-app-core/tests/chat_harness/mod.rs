@@ -574,6 +574,10 @@ pub enum RefundMode {
     /// serving the spend any more and the provisional refund is its last
     /// word. Inline refunds are omitted, as for `Fail`.
     ProvisionalFirst(u64),
+    /// The first `n` calls to `/v1/credentials/refund` succeed and every
+    /// later one never answers: a recovery that stalls part-way through a
+    /// request's inputs. Inline refunds are omitted.
+    StallAfter(u64),
     /// **The gateway settled a stream it cut short on what was generated.**
     /// `/v1/credentials/refund` answers a final refund returning the hold less
     /// `n` credits (the prompt and the output generated before the cut), as
@@ -671,6 +675,12 @@ pub struct MockConfig {
     /// When set, every refund (in band and recovered) names this issuer key id
     /// instead of the key that actually signed it. `None` names the real key.
     pub refund_key_id: Option<String>,
+    /// The charge a completed request is settled at, consumed from its inputs
+    /// in input order as the gateway consumes it (clamped to the hold).
+    /// `None` — the default — charges nothing: every input's share returns
+    /// whole. Applies to the in-band refunds of a completed request; a
+    /// refusal or a recovery returns every share whole as before.
+    pub settled_charge: Option<u128>,
     /// When set, issuance signs under this request context instead of the one
     /// every credential under the key shares. `None` uses the shared one.
     pub issuance_context: Option<Scalar>,
@@ -723,6 +733,18 @@ impl KeySwap {
 
     fn second(&self) -> &Issuer {
         self.0.second.get_or_init(Issuer::new)
+    }
+
+    /// The issuer whose key has id `key_id`: the first, or the second if it
+    /// was ever made. A refund is signed under the key its input names.
+    fn issuer_for<'a>(&'a self, first: &'a Issuer, key_id: &str) -> Option<&'a Issuer> {
+        if first.key_id_hex == key_id {
+            return Some(first);
+        }
+        self.0
+            .second
+            .get()
+            .filter(|second| second.key_id_hex == key_id)
     }
 
     /// The issuer that lists and issues: the second one once swapped.
@@ -880,6 +902,7 @@ impl Default for MockConfig {
             chat_delay_ms: 0,
             issued_key_id: None,
             refund_key_id: None,
+            settled_charge: None,
             issuance_context: None,
             issuance_extra_credits: 0,
             key_window: None,
@@ -962,10 +985,10 @@ pub struct MockServer {
     /// in arrival order — an external backend's `Bearer` key; a spend never
     /// travels in a header.
     chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>>,
-    /// The `token` of each `POST /v1/chat/completions` body's one
-    /// `credentials` element, in arrival order — `None` for a request that
-    /// spent nothing (a local or external turn).
-    chat_spends: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    /// The `token` of each `POST /v1/chat/completions` body's `credentials`
+    /// elements, in input order, per request in arrival order — empty for a
+    /// request that spent nothing (a local or external turn).
+    chat_spends: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
     /// Number of `POST /v1/credentials/refund` requests received.
     refund_hits: Arc<AtomicU64>,
     /// The mock issuer, for what it remembers about spends.
@@ -1054,21 +1077,67 @@ impl MockServer {
     pub fn chat_auth_values(&self) -> Vec<Option<String>> {
         self.chat_auth_values.lock().unwrap().clone()
     }
-    /// Per-chat-request spend tokens (see `chat_spends`).
+    /// Per-chat-request first-input spend tokens (see `chat_spends`).
     pub fn chat_spends(&self) -> Vec<Option<String>> {
+        self.chat_inputs()
+            .into_iter()
+            .map(|tokens| tokens.into_iter().next())
+            .collect()
+    }
+    /// Per-chat-request spend tokens, every input in input order (see
+    /// `chat_spends`).
+    pub fn chat_inputs(&self) -> Vec<Vec<String>> {
         self.chat_spends.lock().unwrap().clone()
     }
-    /// The charge each `POST /v1/chat/completions` spend proof carried, in
-    /// arrival order — `None` for a request that spent nothing. This is the
-    /// hold the client sized, read off the wire the way the server reads it.
-    pub fn chat_charges(&self) -> Vec<Option<u128>> {
-        self.chat_spends()
+    /// Per-chat-request shares, every input in input order: what each spend
+    /// proof revealed, read off the wire the way the server reads it.
+    pub fn chat_shares(&self) -> Vec<Vec<u128>> {
+        self.chat_inputs()
             .iter()
-            .map(|auth| {
-                auth.as_deref()
-                    .and_then(Issuer::spend_proof_from_auth)
-                    .and_then(|proof| scalar_to_credit::<ACT_L>(&proof.charge()).ok())
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .filter_map(|token| Presented::from_token(token))
+                    .filter_map(|input| scalar_to_credit::<ACT_L>(&input.proof.charge()).ok())
+                    .collect()
             })
+            .collect()
+    }
+    /// Per-chat-request nullifiers (hex), every input in input order: what
+    /// the gateway records, so no two inputs anywhere may share one.
+    pub fn chat_nullifiers(&self) -> Vec<Vec<String>> {
+        self.chat_inputs()
+            .iter()
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .filter_map(|token| Presented::from_token(token))
+                    .map(|input| hex::encode(input.proof.nullifier().as_bytes()))
+                    .collect()
+            })
+            .collect()
+    }
+    /// Per-chat-request issuer key ids, every input in input order.
+    pub fn chat_input_keys(&self) -> Vec<Vec<String>> {
+        self.chat_inputs()
+            .iter()
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .filter_map(|token| Presented::from_token(token))
+                    .map(|input| input.key_id)
+                    .collect()
+            })
+            .collect()
+    }
+    /// The hold each `POST /v1/chat/completions` presented (the sum of its
+    /// inputs' shares), in arrival order — `None` for a request that spent
+    /// nothing. This is the hold the client sized, read off the wire the way
+    /// the server reads it.
+    pub fn chat_charges(&self) -> Vec<Option<u128>> {
+        self.chat_shares()
+            .into_iter()
+            .map(|shares| (!shares.is_empty()).then(|| shares.iter().sum()))
             .collect()
     }
     /// The loopback port the mock listens on — used by local-model tests to
@@ -1478,13 +1547,6 @@ impl Issuer {
         Some(URL_SAFE_NO_PAD.encode(resp.to_cbor().ok()?))
     }
 
-    /// Produce a refund for a parsed spend proof, refunding the full charge
-    /// (no work performed). Returns the base64url CBOR `Refund`.
-    fn refund_for(&self, spend_proof: &SpendProof<ACT_L>) -> Option<String> {
-        let charge = scalar_to_credit::<ACT_L>(&spend_proof.charge()).ok()?;
-        self.refund_of(spend_proof, charge)
-    }
-
     /// Produce a refund returning `t` credits of a parsed spend proof's
     /// charge. Returns the base64url CBOR `Refund`.
     fn refund_of(&self, spend_proof: &SpendProof<ACT_L>, t: u128) -> Option<String> {
@@ -1498,15 +1560,23 @@ impl Issuer {
             .ok()?;
         Some(URL_SAFE_NO_PAD.encode(refund.to_cbor().ok()?))
     }
+}
 
-    /// Parse a `credentials` element's `token` into its embedded spend proof
-    /// (mirrors the server's `auth::presented_spend`). Like the server, it
-    /// reads only the one spelling, padded base64url, decoded here with the
-    /// `base64` crate's canonical padded engine and a re-encoding check rather
-    /// than the shared `eidola_common::spend_credentials` rule the client
-    /// writes with, so the client's spelling is checked against an
-    /// independent reading.
-    fn spend_proof_from_auth(token: &str) -> Option<SpendProof<ACT_L>> {
+/// One input a request presented: its spend proof and the issuer key id its
+/// Token names.
+struct Presented {
+    proof: SpendProof<ACT_L>,
+    key_id: String,
+}
+
+impl Presented {
+    /// Parse a `credentials` element's `token` (mirrors the server's
+    /// `auth::presented_spends`). Like the server, it reads only the one
+    /// spelling, padded base64url, decoded here with the `base64` crate's
+    /// canonical padded engine and a re-encoding check rather than the shared
+    /// `eidola_common::spend_credentials` rule the client writes with, so the
+    /// client's spelling is checked against an independent reading.
+    fn from_token(token: &str) -> Option<Self> {
         let bytes = base64::engine::general_purpose::URL_SAFE
             .decode(token)
             .ok()
@@ -1515,8 +1585,44 @@ impl Issuer {
             return None;
         }
         // [token_type(2)][challenge_digest(32)][issuer_key_id(32)][spend_proof(..)]
-        SpendProof::<ACT_L>::from_cbor(&bytes[66..]).ok()
+        Some(Self {
+            proof: SpendProof::<ACT_L>::from_cbor(&bytes[66..]).ok()?,
+            key_id: hex::encode(&bytes[34..66]),
+        })
     }
+
+    fn share(&self) -> Option<u128> {
+        scalar_to_credit::<ACT_L>(&self.proof.charge()).ok()
+    }
+}
+
+/// One refund per input, in input order, each signed under the key its input
+/// names and returning that input's partial return when the request is
+/// charged `charge`, consumed in input order as the gateway consumes it
+/// (clamped to the hold). A charge of nothing returns every share whole.
+/// `None` if any input's refund could not be signed.
+fn refunds_value(
+    issuer: &Issuer,
+    config: &MockConfig,
+    inputs: &[Presented],
+    charge: u128,
+) -> Option<serde_json::Value> {
+    let shares: Vec<u128> = inputs.iter().map(Presented::share).collect::<Option<_>>()?;
+    let hold = eidola_common::spend_credentials::hold(&shares)?;
+    let returns = eidola_common::spend_credentials::partial_returns(&shares, charge.min(hold))?;
+    let refunds = inputs
+        .iter()
+        .zip(returns)
+        .map(|(input, t)| {
+            let signer = config.key_swap.issuer_for(issuer, &input.key_id)?;
+            let refund = signer.refund_of(&input.proof, t)?;
+            Some(serde_json::json!({
+                "refund": refund,
+                "issuer_key_id": refund_key_id(signer, config),
+            }))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!refunds.is_empty()).then_some(serde_json::Value::Array(refunds))
 }
 
 /// Start the mock upstream on an ephemeral loopback port.
@@ -1538,7 +1644,7 @@ pub async fn start(config: MockConfig) -> MockServer {
     let chat_auths: Arc<std::sync::Mutex<Vec<bool>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
-    let chat_spends: Arc<std::sync::Mutex<Vec<Option<String>>>> =
+    let chat_spends: Arc<std::sync::Mutex<Vec<Vec<String>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let refund_hits = Arc::new(AtomicU64::new(0));
     let models_hits = Arc::new(AtomicU64::new(0));
@@ -1622,43 +1728,50 @@ struct Req {
     auth: Option<String>,
     /// Whether the request carried the refund-key header the gateway refuses.
     refund_key_header: bool,
-    /// The body's spend: the one `credentials` element's `token` text, when
-    /// the member is an array of exactly one `{token, refund_key}` element.
-    spend_token: Option<String>,
-    /// That element's refund recovery key, decoded (`None` when absent or not
-    /// exactly the wire form — the real server refuses both alike).
-    refund_key: Option<[u8; 32]>,
+    /// The body's inputs, in input order: each `credentials` element's
+    /// `token` text and its refund recovery key, decoded (`None` when absent
+    /// or not exactly the wire form — the real server refuses both alike).
+    /// Empty when the member is not an array of one or two
+    /// `{token, refund_key}` elements.
+    spends: Vec<WireSpend>,
     /// Whether the body carried a `credentials` member at all.
     has_credentials: bool,
     body: Vec<u8>,
 }
 
-/// The body's one spend, read independently of the client's writer: the
-/// `credentials` member must be an array of exactly one object with exactly
-/// the members `token` and `refund_key`, as the gateway reads it.
-fn body_spend(body: &[u8]) -> (bool, Option<String>, Option<[u8; 32]>) {
+/// The body's inputs, read independently of the client's writer: the
+/// `credentials` member must be an array of one or two objects, each with
+/// exactly the members `token` and `refund_key`, as the gateway reads it.
+/// One `credentials` element as read: its `token` text and its refund
+/// recovery key, decoded (`None` when absent or not exactly the wire form).
+type WireSpend = (String, Option<[u8; 32]>);
+
+fn body_spend(body: &[u8]) -> (bool, Vec<WireSpend>) {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return (false, None, None);
+        return (false, Vec::new());
     };
     let Some(member) = value.get("credentials") else {
-        return (false, None, None);
+        return (false, Vec::new());
     };
-    let element = match member.as_array().map(Vec::as_slice) {
-        Some([element]) => element,
-        _ => return (true, None, None),
+    let elements = match member.as_array() {
+        Some(elements) if (1..=2).contains(&elements.len()) => elements,
+        _ => return (true, Vec::new()),
     };
-    let Some(object) = element.as_object().filter(|o| o.len() == 2) else {
-        return (true, None, None);
-    };
-    let token = object
-        .get("token")
-        .and_then(|t| t.as_str())
-        .map(str::to_owned);
-    let key = object
-        .get("refund_key")
-        .and_then(|k| k.as_str())
-        .and_then(|k| eidola_common::refund_key::decode_refund_key(k.as_bytes()));
-    (true, token, key)
+    let mut spends = Vec::new();
+    for element in elements {
+        let Some(object) = element.as_object().filter(|o| o.len() == 2) else {
+            return (true, Vec::new());
+        };
+        let Some(token) = object.get("token").and_then(|t| t.as_str()) else {
+            return (true, Vec::new());
+        };
+        let key = object
+            .get("refund_key")
+            .and_then(|k| k.as_str())
+            .and_then(|k| eidola_common::refund_key::decode_refund_key(k.as_bytes()));
+        spends.push((token.to_owned(), key));
+    }
+    (true, spends)
 }
 
 /// `raw` without its `credentials` member: what a test asserting bytes
@@ -1736,14 +1849,13 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
         body.extend_from_slice(&tmp[..n]);
     }
 
-    let (has_credentials, spend_token, refund_key) = body_spend(&body);
+    let (has_credentials, spends) = body_spend(&body);
     Some(Req {
         method,
         path,
         auth,
         refund_key_header,
-        spend_token,
-        refund_key,
+        spends,
         has_credentials,
         body,
     })
@@ -1759,7 +1871,7 @@ async fn handle_conn(
     chat_raw_bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     chat_auths: Arc<std::sync::Mutex<Vec<bool>>>,
     chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>>,
-    chat_spends: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    chat_spends: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
     refund_hits: Arc<AtomicU64>,
     models_hits: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
@@ -1809,28 +1921,22 @@ async fn handle_conn(
             if req.auth.is_some() || req.refund_key_header {
                 return write_json(&mut stream, 400, &error_body("credential in a header")).await;
             }
-            let proof = req
-                .spend_token
-                .as_deref()
-                .and_then(Issuer::spend_proof_from_auth);
-            match (proof, req.refund_key) {
+            // Exactly one input: each is recovered by its own nullifier.
+            let [(token, key)] = req.spends.as_slice() else {
+                return write_json(&mut stream, 400, &error_body("exactly one credential")).await;
+            };
+            let input = Presented::from_token(token);
+            match (&input, key) {
                 (_, None) => {
                     return write_json(&mut stream, 400, &error_body("refund key required")).await;
                 }
-                (Some(proof), Some(key)) if !issuer.spend_key_matches(&proof, key) => {
+                (Some(input), Some(key)) if !issuer.spend_key_matches(&input.proof, *key) => {
                     return write_json(&mut stream, 404, &error_body("refund token not found"))
                         .await;
                 }
                 _ => {}
             }
-            handle_refund(
-                &mut stream,
-                &issuer,
-                &config,
-                req.spend_token.as_deref(),
-                attempt,
-            )
-            .await?;
+            handle_refund(&mut stream, &issuer, &config, input, attempt).await?;
         }
         ("POST", "/v1/chat/completions") => {
             // 1-based index of this chat request — the tool-calling
@@ -1854,53 +1960,73 @@ async fn handle_conn(
                 .push(without_credentials(&req.body));
             chat_auths.lock().unwrap().push(req.auth.is_some());
             chat_auth_values.lock().unwrap().push(req.auth.clone());
-            chat_spends.lock().unwrap().push(req.spend_token.clone());
+            chat_spends
+                .lock()
+                .unwrap()
+                .push(req.spends.iter().map(|(token, _)| token.clone()).collect());
             // A spend travels in the body and nowhere else: one in a header,
-            // or a `credentials` member that is not one well-formed spend, is
-            // refused before anything is taken, as the gateway refuses it.
+            // or a `credentials` member that is not one or two well-formed
+            // spends, is refused before anything is taken, as the gateway
+            // refuses it.
             if req.has_credentials && (req.auth.is_some() || req.refund_key_header) {
                 return write_json(&mut stream, 400, &error_body("credential in a header")).await;
             }
-            if req.has_credentials && req.spend_token.is_none() {
+            let inputs: Option<Vec<Presented>> = req
+                .spends
+                .iter()
+                .map(|(token, _)| Presented::from_token(token))
+                .collect();
+            let inputs = inputs.unwrap_or_default();
+            if req.has_credentials && (inputs.is_empty() || inputs.len() != req.spends.len()) {
                 return write_json(&mut stream, 401, &error_body("malformed credentials")).await;
             }
-            // A spend without its refund recovery key is refused before it is
-            // taken, as the real server refuses it.
-            if let Some(proof) = req
-                .spend_token
-                .as_deref()
-                .and_then(Issuer::spend_proof_from_auth)
-            {
-                match req.refund_key {
+            // A spend without its refund recovery key, a share of zero, and
+            // one credential presented twice are refused before anything is
+            // taken, as the real server refuses them.
+            for (input, (_, key)) in inputs.iter().zip(&req.spends) {
+                match key {
                     Some(key) => {
-                        issuer.spend_key_matches(&proof, key);
+                        issuer.spend_key_matches(&input.proof, *key);
                     }
                     None => {
                         return write_json(&mut stream, 400, &error_body("refund key required"))
                             .await;
                     }
                 }
+                if input.share().is_none_or(|share| share == 0) {
+                    return write_json(&mut stream, 400, &error_body("a share of zero")).await;
+                }
+            }
+            if inputs.len() == 2
+                && inputs[0].key_id == inputs[1].key_id
+                && inputs[0].proof.nullifier().as_bytes() == inputs[1].proof.nullifier().as_bytes()
+            {
+                return write_json(&mut stream, 400, &error_body("one credential twice")).await;
             }
             let parsed: serde_json::Value =
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
             // **The hold is exactly the worst case**, as the gateway requires:
             // computed here from the body as it arrived and the catalog row it
-            // names, through the shared contract. A spend holding anything
-            // else is refused after it is taken, with a full refund, as the
-            // gateway refuses it (and counted, so a test can say none was).
-            if let Some(proof) = req
-                .spend_token
-                .as_deref()
-                .and_then(Issuer::spend_proof_from_auth)
+            // names, through the shared contract, against the sum of the
+            // inputs' shares. A spend holding anything else is refused after
+            // it is taken, with full refunds, as the gateway refuses it (and
+            // counted, so a test can say none was).
+            let hold = eidola_common::spend_credentials::hold(
+                &inputs
+                    .iter()
+                    .filter_map(Presented::share)
+                    .collect::<Vec<_>>(),
+            );
+            if !inputs.is_empty()
                 && let Some(worst) = worst_case_cost(&config, &parsed)
-                && scalar_to_credit::<ACT_L>(&proof.charge()).ok() != Some(worst)
+                && hold != Some(worst)
             {
                 issuer.hold_mismatches.fetch_add(1, Ordering::SeqCst);
                 let mut body: serde_json::Value =
                     serde_json::from_str(&error_body("the hold must equal the worst-case cost"))
                         .expect("error body");
-                if let Some(refund_b64) = issuer.refund_for(&proof) {
-                    body["refunds"] = serde_json::json!([{ "refund": refund_b64, "issuer_key_id": refund_key_id(&issuer, &config) }]);
+                if let Some(refunds) = refunds_value(&issuer, &config, &inputs, 0) {
+                    body["refunds"] = refunds;
                 }
                 return write_json(&mut stream, 400, &body.to_string()).await;
             }
@@ -1965,15 +2091,7 @@ async fn handle_conn(
                     stream.flush().await?;
                 }
                 _ => {
-                    handle_chat(
-                        &mut stream,
-                        &issuer,
-                        &config,
-                        req.spend_token.as_deref(),
-                        hit,
-                        &parsed,
-                    )
-                    .await?;
+                    handle_chat(&mut stream, &issuer, &config, &inputs, hit, &parsed).await?;
                 }
             }
         }
@@ -2079,7 +2197,7 @@ async fn handle_refund(
     stream: &mut TcpStream,
     issuer: &Issuer,
     config: &MockConfig,
-    auth: Option<&str>,
+    input: Option<Presented>,
     // 1-based index of this recovery call.
     attempt: u64,
 ) -> std::io::Result<()> {
@@ -2089,6 +2207,11 @@ async fn handle_refund(
         RefundMode::Succeed | RefundMode::ProvisionalFirst(_) | RefundMode::ChargedEarly(_) => {
             false
         }
+        RefundMode::StallAfter(n) if attempt > n => {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+        RefundMode::StallAfter(_) => false,
         RefundMode::NotStored => {
             return write_json(stream, 404, &error_body("refund token not found")).await;
         }
@@ -2098,20 +2221,23 @@ async fn handle_refund(
     }
     let stored_provisional = matches!(config.refund, RefundMode::ProvisionalFirst(_));
     let provisional = matches!(config.refund, RefundMode::ProvisionalFirst(n) if attempt <= n);
-    let refund = auth.and_then(Issuer::spend_proof_from_auth).and_then(|sp| {
-        if stored_provisional {
-            issuer.refund_of(&sp, 0)
+    // The stored provisional refund returns nothing; a stream cut short is
+    // charged what it generated; any other returns the share whole. Signed
+    // under the key the input names.
+    let refunds = input.and_then(|input| {
+        let charge = if stored_provisional {
+            input.share()?
         } else if let RefundMode::ChargedEarly(charged) = config.refund {
-            let hold = scalar_to_credit::<ACT_L>(&sp.charge()).ok()?;
-            issuer.refund_of(&sp, hold.checked_sub(charged)?)
+            charged
         } else {
-            issuer.refund_for(&sp)
-        }
+            0
+        };
+        refunds_value(issuer, config, std::slice::from_ref(&input), charge)
     });
-    match refund {
-        Some(refund_b64) => {
+    match refunds {
+        Some(refunds) => {
             let body = serde_json::json!({
-                "refunds": [{ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) }],
+                "refunds": refunds,
                 "provisional": provisional,
             });
             write_json(stream, 200, &body.to_string()).await
@@ -2124,7 +2250,7 @@ async fn handle_chat(
     stream: &mut TcpStream,
     issuer: &Issuer,
     config: &MockConfig,
-    auth: Option<&str>,
+    inputs: &[Presented],
     hit: u64,
     request: &serde_json::Value,
 ) -> std::io::Result<()> {
@@ -2139,16 +2265,19 @@ async fn handle_chat(
     if let Some(status) = fail {
         return write_json(stream, status, &error_body("upstream model error")).await;
     }
-    // Compute an inline refund object once (shared by the blocking happy path).
+    // The inline refunds of a completed request, computed once (shared by
+    // the blocking happy path): one per input, settled at the configured
+    // charge.
     let inline_refund = if matches!(config.refund, RefundMode::Succeed | RefundMode::NotStored) {
-        auth.and_then(Issuer::spend_proof_from_auth)
-            .and_then(|sp| issuer.refund_for(&sp))
-            .map(|refund_b64| {
-                serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) })
-            })
+        refunds_value(issuer, config, inputs, config.settled_charge.unwrap_or(0))
     } else {
         None
     };
+    // Every share whole: what a refusal carries.
+    let full_refunds = || refunds_value(issuer, config, inputs, 0);
+    // What a completed stream's metadata carries, whatever the refund mode.
+    let completed_refunds =
+        || refunds_value(issuer, config, inputs, config.settled_charge.unwrap_or(0));
 
     match config.chat {
         ChatBehavior::OkBlocking | ChatBehavior::OkBlockingNoInlineRefund => {
@@ -2167,7 +2296,7 @@ async fn handle_chat(
             if matches!(config.chat, ChatBehavior::OkBlocking)
                 && let Some(refund) = inline_refund
             {
-                body["refunds"] = serde_json::json!([refund]);
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2196,11 +2325,8 @@ async fn handle_chat(
         ChatBehavior::OkBlockingNotACompletion => {
             let mut body: serde_json::Value =
                 serde_json::from_str(&error_body("upstream model error")).expect("error body");
-            if let Some(refund_b64) = auth
-                .and_then(Issuer::spend_proof_from_auth)
-                .and_then(|sp| issuer.refund_for(&sp))
-            {
-                body["refunds"] = serde_json::json!([{ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) }]);
+            if let Some(refunds) = full_refunds() {
+                body["refunds"] = refunds;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2210,11 +2336,8 @@ async fn handle_chat(
         ChatBehavior::Non2xxWithRefund(status) => {
             let mut body: serde_json::Value =
                 serde_json::from_str(&error_body("stream start failed")).expect("error body");
-            if let Some(refund_b64) = auth
-                .and_then(Issuer::spend_proof_from_auth)
-                .and_then(|sp| issuer.refund_for(&sp))
-            {
-                body["refunds"] = serde_json::json!([{ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) }]);
+            if let Some(refunds) = full_refunds() {
+                body["refunds"] = refunds;
             }
             write_json(stream, status, &body.to_string()).await
         }
@@ -2260,21 +2383,11 @@ async fn handle_chat(
             write_sse_stream_with_terminator(stream, &[STREAM_CONTENT], "\r").await
         }
         ChatBehavior::StreamingWithMetadataRefund => {
-            let refund = auth
-                .and_then(Issuer::spend_proof_from_auth)
-                .and_then(|sp| issuer.refund_for(&sp))
-                .map(|refund_b64| {
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) })
-                });
+            let refund = completed_refunds();
             write_sse_stream_with_metadata(stream, &[STREAM_CONTENT], refund).await
         }
         ChatBehavior::StreamingPadded | ChatBehavior::StreamingPaddedPastReadCeiling => {
-            let refund = auth
-                .and_then(Issuer::spend_proof_from_auth)
-                .and_then(|sp| issuer.refund_for(&sp))
-                .map(|refund_b64| {
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) })
-                });
+            let refund = completed_refunds();
             let idle_frames = if matches!(config.chat, ChatBehavior::StreamingPaddedPastReadCeiling)
             {
                 // Ten megabytes of padding frames across the deltas below.
@@ -2286,12 +2399,7 @@ async fn handle_chat(
         }
         ChatBehavior::StreamingPaddedNearReadCeiling => write_padded_near_ceiling(stream).await,
         ChatBehavior::StreamingSplitDataFields => {
-            let refund = auth
-                .and_then(Issuer::spend_proof_from_auth)
-                .and_then(|sp| issuer.refund_for(&sp))
-                .map(|refund_b64| {
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) })
-                });
+            let refund = completed_refunds();
             write_sse_stream_split_data(stream, &[STREAM_CONTENT], refund).await
         }
         ChatBehavior::OkStreamingWithHeader => {
@@ -2340,12 +2448,7 @@ async fn handle_chat(
             write_sse_unterminated_stream(stream, &[STREAM_CONTENT]).await
         }
         ChatBehavior::StreamingCutShortWithRefund => {
-            let refund = auth
-                .and_then(Issuer::spend_proof_from_auth)
-                .and_then(|sp| issuer.refund_for(&sp))
-                .map(|refund_b64| {
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": refund_key_id(issuer, config) })
-                });
+            let refund = full_refunds();
             write_sse_cut_short(stream, &[STREAM_CONTENT], refund).await
         }
         ChatBehavior::OkThenStreamEndsWithoutDone if hit == 1 => {
@@ -2360,7 +2463,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refunds"] = serde_json::json!([refund]);
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2371,7 +2474,7 @@ async fn handle_chat(
             if hit <= rounds {
                 let mut body = tool_call_body(&tool_call_object(hit, &tool_arguments(hit)));
                 if let Some(refund) = inline_refund {
-                    body["refunds"] = serde_json::json!([refund]);
+                    body["refunds"] = refund;
                 }
                 write_json(stream, 200, &body.to_string()).await
             } else {
@@ -2383,7 +2486,7 @@ async fn handle_chat(
                     "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
                 });
                 if let Some(refund) = inline_refund {
-                    body["refunds"] = serde_json::json!([refund]);
+                    body["refunds"] = refund;
                 }
                 write_json(stream, 200, &body.to_string()).await
             }
@@ -2396,7 +2499,7 @@ async fn handle_chat(
             });
             let mut body = tool_call_body(&call);
             if let Some(refund) = inline_refund {
-                body["refunds"] = serde_json::json!([refund]);
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2413,7 +2516,7 @@ async fn handle_chat(
                 })
             };
             if let Some(refund) = inline_refund {
-                body["refunds"] = serde_json::json!([refund]);
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2443,7 +2546,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refunds"] = serde_json::json!([refund]);
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2457,7 +2560,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refunds"] = serde_json::json!([refund]);
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2465,7 +2568,7 @@ async fn handle_chat(
         ChatBehavior::DeclineBlocking => {
             let mut body = tool_call_body(&decline_call_object());
             if let Some(refund) = inline_refund {
-                body["refunds"] = serde_json::json!([refund]);
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2507,7 +2610,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refunds"] = serde_json::json!([refund]);
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2523,7 +2626,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refunds"] = serde_json::json!([refund]);
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2544,7 +2647,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS },
             });
             if let Some(refund) = inline_refund {
-                body["refunds"] = serde_json::json!([refund]);
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2565,7 +2668,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS },
             });
             if let Some(refund) = inline_refund {
-                body["refunds"] = serde_json::json!([refund]);
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2612,7 +2715,7 @@ async fn handle_chat(
                 }
                 let mut body = tool_call_body(&tool_call_object(1, &tool_arguments(1)));
                 if let Some(refund) = inline_refund {
-                    body["refunds"] = serde_json::json!([refund]);
+                    body["refunds"] = refund;
                 }
                 return write_json(stream, 200, &body.to_string()).await;
             }
@@ -2652,7 +2755,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refunds"] = serde_json::json!([refund]);
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2676,7 +2779,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refunds"] = serde_json::json!([refund]);
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2699,7 +2802,7 @@ async fn handle_chat(
             }
             let mut body = tool_call_body(&tool_call_object(hit, &tool_arguments(hit)));
             if let Some(refund) = inline_refund {
-                body["refunds"] = serde_json::json!([refund]);
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2747,7 +2850,7 @@ async fn handle_chat(
                 })
             };
             if let Some(refund) = inline_refund {
-                body["refunds"] = serde_json::json!([refund]);
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -3080,7 +3183,7 @@ async fn write_ending(
             body["choices"][0]["continuable"] = serde_json::json!(exact);
         }
         if let Some(refund) = inline_refund {
-            body["refunds"] = serde_json::json!([refund]);
+            body["refunds"] = refund;
         }
         return write_json(stream, 200, &body.to_string()).await;
     }
@@ -3230,7 +3333,7 @@ async fn write_sse_stream_with_metadata(
         "id": "chatcmpl-mock",
     });
     if let Some(refund) = refund {
-        metadata["refunds"] = serde_json::json!([refund]);
+        metadata["refunds"] = refund;
     }
     stream.write_all(&send_event(metadata.to_string())).await?;
     stream.write_all(&send_event("[DONE]".to_string())).await?;
@@ -3267,7 +3370,7 @@ async fn write_sse_cut_short(
         "id": "",
     });
     if let Some(refund) = refund {
-        metadata["refunds"] = serde_json::json!([refund]);
+        metadata["refunds"] = refund;
     }
     stream.write_all(&send_event(metadata.to_string())).await?;
     stream.write_all(b"0\r\n\r\n").await?;
@@ -3343,7 +3446,7 @@ async fn write_padded_sse_stream(
         "privacy": { "note": "m".repeat(eidola_server_gateway::padding::FRAME_BYTES) },
     });
     if let Some(refund) = refund {
-        metadata["refunds"] = serde_json::json!([refund]);
+        metadata["refunds"] = refund;
     }
     framer.push(&StreamEvent::Json(metadata.to_string()));
     framer.push(&StreamEvent::Done);
@@ -3476,7 +3579,7 @@ async fn write_sse_stream_split_data(
         "id": "chatcmpl-mock",
     });
     if let Some(refund) = refund {
-        metadata["refunds"] = serde_json::json!([refund]);
+        metadata["refunds"] = refund;
     }
     stream.write_all(&send_event(&metadata)).await?;
     let done = "data: [DONE]\n\n";

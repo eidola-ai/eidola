@@ -99,9 +99,10 @@ pub struct ChatCompletionRequest {
     #[schema(value_type = Option<String>, min_length = 43, max_length = 43, pattern = "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$")]
     pub cache_key: Option<CacheKey>,
 
-    /// The anonymous credits paying for this request: one element per spend,
-    /// each an ACT Token and its refund recovery key
-    /// (`eidola_common::spend_credentials`). Required; a request without it is
+    /// The anonymous credits paying for this request: one element per spend
+    /// (one, or two: a drain and a fill), each an ACT Token and its refund
+    /// recovery key (`eidola_common::spend_credentials`), in the order the
+    /// charge is consumed from them. Required; a request without it is
     /// refused before anything is recorded, as is one that carries a
     /// credential in a header instead.
     ///
@@ -109,7 +110,7 @@ pub struct ChatCompletionRequest {
     /// redacted, `Serialize` skips it, and the body forwarded to an engine
     /// leaves it out (`engine_trust::protocol::engine_request_body`).
     #[serde(default, skip_serializing_if = "never_serialized")]
-    #[schema(value_type = Vec<SpendCredential>, min_items = 1, max_items = 1)]
+    #[schema(value_type = Vec<SpendCredential>, min_items = 1, max_items = 2)]
     pub credentials: Credentials,
 }
 

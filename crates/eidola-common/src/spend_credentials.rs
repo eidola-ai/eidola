@@ -11,8 +11,8 @@
 //! `draft-schlesinger-privacypass-act` defines it (`token_type`,
 //! `challenge_digest`, `issuer_key_id`, the encoded spend proof) and that
 //! spend's refund recovery key ([`crate::refund_key`]). The member is always an
-//! array, whatever the count, so every count has one encoding; today a request
-//! carries exactly [`MAX_CREDENTIALS_PER_REQUEST`] of them.
+//! array, whatever the count, so every count has one encoding: a request
+//! carries one input, or at most [`MAX_CREDENTIALS_PER_REQUEST`].
 //!
 //! A credential travels in the body and nowhere else. A Token at a practical
 //! `L` is larger than common header limits, and a body has no such limit along
@@ -33,6 +33,11 @@
 //! [`REFUNDS_MEMBER`] array of `{ "refund", "issuer_key_id" }` objects, in a
 //! blocking response, an error body, the streamed final metadata event, and a
 //! recovery answer alike.
+//!
+//! A request with several inputs is charged across them in input order
+//! ([`partial_returns`]): the charge is consumed from the first input before
+//! the second, and each input's change returns under its own issuer key, so
+//! no value moves from one input to another.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE;
@@ -45,9 +50,14 @@ pub const CREDENTIALS_MEMBER: &str = "credentials";
 /// The answer member carrying one refund per input.
 pub const REFUNDS_MEMBER: &str = "refunds";
 
-/// How many inputs one request carries. A request with any other count is
-/// refused before any spend proof is decoded.
-pub const MAX_CREDENTIALS_PER_REQUEST: usize = 1;
+/// The most inputs one request carries: one drain and one fill. A request
+/// with more is refused before any spend proof is decoded.
+///
+/// Every input beyond the first narrows the request's anonymity set to the
+/// accounts issued at least that many credentials under each presented key,
+/// which is why the client provisions two credentials per epoch and why this
+/// is the smallest number that lets a residual be drained.
+pub const MAX_CREDENTIALS_PER_REQUEST: usize = 2;
 
 /// The ACT parameter `L`: a credential's balance lies in `[0, 2^L)` credits.
 ///
@@ -168,7 +178,7 @@ pub enum CredentialsError {
 impl std::fmt::Display for CredentialsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Missing => "a `credentials` array with one spend is required",
+            Self::Missing => "a `credentials` array with at least one spend is required",
             Self::TooMany => "`credentials` carries more spends than a request may",
             Self::TokenEncoding => "a credential's `token` must be padded base64url",
             Self::RefundKeyEncoding => {
@@ -176,6 +186,48 @@ impl std::fmt::Display for CredentialsError {
             }
         })
     }
+}
+
+/// The hold of a request whose inputs present `shares`: their sum, or `None`
+/// if it overflows (a malformed request).
+pub fn hold(shares: &[u128]) -> Option<u128> {
+    shares
+        .iter()
+        .try_fold(0u128, |sum, share| sum.checked_add(*share))
+}
+
+/// Each input's partial return `t` when a request whose inputs present
+/// `shares`, in input order, is charged `charge`: the charge is consumed from
+/// the first input, then the next, and the change lands on the inputs after
+/// that.
+///
+/// ```text
+/// remaining = charge
+/// for each input i, in order:
+///     a_i = min(s_i, remaining); remaining -= a_i; t_i = s_i - a_i
+/// ```
+///
+/// So `Σ t = hold − charge`, `0 ≤ t_i ≤ s_i`, and for some index every input
+/// before it is fully consumed and every input after it fully returned. The
+/// result is a function of the shares, their order and the charge alone, so a
+/// client can predict and check it, and the issuer has no choice of `t` with
+/// which to mark a successor. `None` when the charge exceeds the hold or the
+/// hold overflows: the caller clamps the charge to the hold first.
+pub fn partial_returns(shares: &[u128], charge: u128) -> Option<Vec<u128>> {
+    if charge > hold(shares)? {
+        return None;
+    }
+    let mut remaining = charge;
+    Some(
+        shares
+            .iter()
+            .map(|share| {
+                let consumed = (*share).min(remaining);
+                remaining -= consumed;
+                share - consumed
+            })
+            .collect(),
+    )
 }
 
 /// The inputs of a `credentials` member as it was deserialized, in input
@@ -290,13 +342,89 @@ mod tests {
     fn the_count_is_checked_first() {
         assert_eq!(parse("{}").unwrap_err(), "Missing");
         assert_eq!(parse(r#"{"credentials":[]}"#).unwrap_err(), "Missing");
-        // Two elements, the second malformed: refused for the count, before
-        // either value is decoded.
+        // Three elements, the last malformed: refused for the count, before
+        // any value is decoded.
         let json = format!(
-            r#"{{"credentials":[{{"token":"-_-_5a0=","refund_key":"{k}"}},{{"token":"bad","refund_key":"{k}"}}]}}"#,
+            r#"{{"credentials":[{{"token":"-_-_5a0=","refund_key":"{k}"}},{{"token":"-_-_5a0=","refund_key":"{k}"}},{{"token":"bad","refund_key":"{k}"}}]}}"#,
             k = hex_key()
         );
         assert_eq!(parse(&json).unwrap_err(), "TooMany");
+    }
+
+    #[test]
+    fn two_inputs_are_read_in_input_order() {
+        let first = [1u8, 2, 3];
+        let second = [4u8, 5, 6, 7];
+        let other_key = [0xcd; REFUND_KEY_BYTES];
+        let member = credentials_member(&[(&first, &KEY), (&second, &other_key)]);
+        let json = serde_json::json!({ "credentials": member }).to_string();
+        let decoded = parse(&json).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].token, first);
+        assert_eq!(decoded[0].refund_key, KEY);
+        assert_eq!(decoded[1].token, second);
+        assert_eq!(decoded[1].refund_key, other_key);
+    }
+
+    /// The allocation vectors: one input, a charge of nothing, of
+    /// everything, at the prefix boundary and one either side of it, and the
+    /// worked example (a drain of 3,000 and a fill of 3,200).
+    #[test]
+    fn the_charge_is_consumed_in_input_order() {
+        let cases: &[(&[u128], u128, &[u128])] = &[
+            (&[6_200], 0, &[6_200]),
+            (&[6_200], 4_000, &[2_200]),
+            (&[6_200], 6_200, &[0]),
+            (&[3_000, 3_200], 0, &[3_000, 3_200]),
+            (&[3_000, 3_200], 500, &[2_500, 3_200]),
+            (&[3_000, 3_200], 2_999, &[1, 3_200]),
+            (&[3_000, 3_200], 3_000, &[0, 3_200]),
+            (&[3_000, 3_200], 3_001, &[0, 3_199]),
+            (&[3_000, 3_200], 4_000, &[0, 2_200]),
+            (&[3_000, 3_200], 6_199, &[0, 1]),
+            (&[3_000, 3_200], 6_200, &[0, 0]),
+        ];
+        for (shares, charge, expected) in cases {
+            assert_eq!(
+                partial_returns(shares, *charge).as_deref(),
+                Some(*expected),
+                "{shares:?} charged {charge}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_charge_beyond_the_hold_or_an_overflowing_hold_has_no_allocation() {
+        assert_eq!(partial_returns(&[3_000, 3_200], 6_201), None);
+        assert_eq!(hold(&[u128::MAX, 1]), None);
+        assert_eq!(partial_returns(&[u128::MAX, 1], 0), None);
+        assert_eq!(hold(&[1u128 << 63, 1u128 << 63]), Some(1u128 << 64));
+    }
+
+    /// The allocation's properties over every charge for a few share lists:
+    /// exact, within each share, and a prefix of consumed inputs.
+    #[test]
+    fn the_allocation_is_exact_bounded_and_a_prefix() {
+        for shares in [&[7u128][..], &[3, 5], &[1, 1], &[9, 2]] {
+            let hold = hold(shares).unwrap();
+            for charge in 0..=hold {
+                let returns = partial_returns(shares, charge).unwrap();
+                assert_eq!(returns.iter().sum::<u128>(), hold - charge);
+                assert!(returns.iter().zip(shares).all(|(t, s)| t <= s));
+                // Once an input is not fully consumed, every later one is
+                // fully returned.
+                let first_partial = returns.iter().position(|t| *t > 0);
+                if let Some(j) = first_partial {
+                    assert!(returns[..j].iter().all(|t| *t == 0));
+                    assert!(
+                        returns[j + 1..]
+                            .iter()
+                            .zip(&shares[j + 1..])
+                            .all(|(t, s)| t == s)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
