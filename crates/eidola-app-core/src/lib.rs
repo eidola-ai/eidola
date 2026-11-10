@@ -6972,10 +6972,13 @@ impl Inner {
         db_conn: &turso::Connection,
         charge_credits: i64,
     ) -> Result<Vec<(db::SpendableCredential, i64)>, AppError> {
-        let deadline = tokio::time::Instant::now() + self.provision_wait();
+        let wait = self.provision_wait();
+        let deadline = tokio::time::Instant::now() + wait;
         // A hold no turn in this process is flying with settles only when
         // somebody asks for it: once before anything is converted for this
-        // request, and once more before it is refused.
+        // request, and once more while it waits, with the last quarter of
+        // the wait kept for that ask's answer.
+        let last_ask_at = deadline - wait / 4;
         let mut stranded_asks = 2;
         loop {
             if let Ok(inputs) = chosen_inputs(db_conn, charge_credits).await? {
@@ -7051,6 +7054,12 @@ impl Inner {
                 .collect();
             let recoverable = settlement_could_cover(&in_flight, &held, charge_credits);
             if recoverable && tokio::time::Instant::now() < deadline {
+                if stranded_asks == 1 && tokio::time::Instant::now() >= last_ask_at {
+                    stranded_asks = 0;
+                    if self.recover_stranded_spends_by(deadline).await {
+                        continue;
+                    }
+                }
                 tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
                 continue;
             }
@@ -7090,12 +7099,6 @@ impl Inner {
                 Err(_) => {}
             }
             if recoverable {
-                if stranded_asks == 1 {
-                    stranded_asks = 0;
-                    if self.recover_stranded_spends_by(deadline).await {
-                        continue;
-                    }
-                }
                 return Err(AppError::ProvisioningTimeout {
                     message: format!(
                         "timed out waiting for an in-flight credential refund to free \

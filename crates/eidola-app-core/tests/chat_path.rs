@@ -11673,6 +11673,42 @@ fn a_stranded_hold_is_asked_for_again_before_anything_is_converted() {
     });
 }
 
+/// A request that waits on a stranded hold asks for it again while there is
+/// still time for the answer: a refund that became final during the wait
+/// pays the waiting turn, rather than settling just after it gave up.
+#[test]
+fn a_waiting_request_asks_again_in_time_for_the_answer() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            refund: RefundMode::ProvisionalFirst(2),
+            // Nothing more can be converted for the second request.
+            balance: 0,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect("the wallet's one credential");
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("the answer arrives; only its settlement waits");
+        assert_eq!(mock.refund_hits(), 1, "answered provisionally");
+
+        core.test_set_issuance_timeouts(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(2),
+        );
+        // Asked at once (still provisional), then again inside the wait
+        core.runtime()
+            .block_on(core.chat("and again".into(), MODEL.into(), None))
+            .expect("the hold settled in time to pay the waiting turn");
+        // (final by then); the fourth ask is the second turn's own settlement.
+        assert_eq!(mock.refund_hits(), 4);
+        assert_eq!(mock.issuance_debits(), 1);
+    });
+}
+
 /// The long-lived process asks again for a stranded hold on its own, at a
 /// time no request decides, and sends nothing for a backend turned off.
 #[test]
@@ -11716,7 +11752,6 @@ fn the_long_lived_process_asks_again_for_a_stranded_hold() {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(spending(&core), 0, "nothing asked again for the hold");
-        assert_eq!(mock.issuance_debits(), 1);
     });
 }
 

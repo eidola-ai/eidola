@@ -397,7 +397,7 @@ The client never asks for recovery of a spend it is still waiting on (`LiveSpend
 **Who asks again, and when.** A spend whose refund has not arrived, or was answered provisionally, stays `spending` until somebody asks for it. That is:
 
 - the turn itself, once, as it ends without its refund;
-- a later request that what the wallet holds cannot pay, before anything is converted for it and once more before it is refused, so a recoverable token is used before the account is asked for another;
+- a later request that what the wallet holds cannot pay, before anything is converted for it and once more while it waits, with the last quarter of the wait kept for the answer, so a recoverable token is used before the account is asked for another;
 - the long-lived app, once in each provisioner interval ([Issuance timing](#issuance-timing)), at a random point in the interval's middle half, and when it starts;
 - `eidola wallet credentials recover`.
 
