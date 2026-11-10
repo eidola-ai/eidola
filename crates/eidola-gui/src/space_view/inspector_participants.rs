@@ -1644,11 +1644,14 @@ impl SpaceView {
                     _ => store.dismiss_model_update(space_id, target, cx),
                 });
                 // The notice, and this control with it, goes when the roster
-                // re-reads: hand the keyboard to the view root now, unless a
-                // field of the panel holds it, so it is never left on an
-                // element that no longer exists.
+                // re-reads: hand the keyboard to its home now — the open
+                // draft or inline edit when there is one, else the view —
+                // unless a field of the panel holds it, so it is never left on
+                // an element that no longer exists, nor on a root that yields
+                // every key to a composing session.
                 if !this.inspector_field_focused(window, cx) {
-                    window.focus(&this.focus_handle, cx);
+                    let home = this.keyboard_home(cx);
+                    window.focus(&home, cx);
                 }
             }),
         );
