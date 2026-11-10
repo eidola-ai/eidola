@@ -206,6 +206,48 @@ async fn issue_refund_async(
     })
 }
 
+/// Settle a blocking request's spend where the client's departure cannot
+/// interrupt it.
+///
+/// hyper drops the handler when the client goes, and with it any settlement
+/// the handler was awaiting — but a `store_refund_token` UPDATE that was
+/// already submitted still lands, after the mark that covered it was dropped
+/// with the handler. In that window recovery reads a provisional row with no
+/// mark, hands out the zero refund, and the real refund then lands on a row
+/// the client has already spent its one successor against. So the settlement
+/// runs in its own task, which owns the mark and releases it only once the
+/// write has returned, whatever became of the handler. The task also carries
+/// the zero-refund fallback, so a failed mint cannot leave the spend
+/// unsettled either.
+async fn settle_detached(
+    state: &AppState,
+    settling: SettlingSpend,
+    spend_proof: &SpendProof<128>,
+    issuer_key_hash: &[u8; 32],
+    refund_credits: u128,
+) -> Result<RefundInfo, ServerError> {
+    let spend_proof_cbor = spend_proof
+        .to_cbor()
+        .map_err(|e| ServerError::Internal(format!("spend proof re-encode failed: {e:?}")))?;
+    let state = state.clone();
+    let issuer_key_hash = *issuer_key_hash;
+    tokio::spawn(async move {
+        let _settling = settling;
+        let proof = SpendProof::<128>::from_cbor(&spend_proof_cbor)
+            .map_err(|e| ServerError::Internal(format!("spend proof re-parse failed: {e:?}")))?;
+        match issue_refund_async(&state, &proof, &issuer_key_hash, refund_credits).await {
+            Ok(info) => Ok(info),
+            Err(e) => {
+                // No amount in the log (see `handle_streaming_request`).
+                error!("CRITICAL: failed to issue refund: {e}, retrying with zero");
+                issue_refund_async(&state, &proof, &issuer_key_hash, 0).await
+            }
+        }
+    })
+    .await
+    .map_err(|e| ServerError::Internal(format!("settlement task failed: {e}")))?
+}
+
 /// The spends this process is still settling: every nullifier whose handler
 /// (or stream task) is alive between recording it and storing its settled
 /// refund. Refund recovery consults it before handing out a provisional
@@ -543,8 +585,9 @@ async fn chat_completions_phases(
             // zero refund (returns blind remaining value c - s).
             let refund_credits = scalar_to_credit::<128>(&act.spend_proof.charge()).unwrap_or(0);
             warn!("Request validation failed after nullifier recorded, issuing full refund: {e}");
-            let refund = issue_refund_async(
+            let refund = settle_detached(
                 state,
+                settling,
                 &act.spend_proof,
                 &act.issuer_key_hash,
                 refund_credits,
@@ -577,10 +620,10 @@ async fn handle_non_streaming_request(
     act: &ActSpend,
     model: &Model,
     charge_credits: u128,
-    // Held until this function returns, i.e. until the settled refund is
-    // stored; a client that abandons the request drops the handler, and the
-    // mark with it.
-    _settling: SettlingSpend,
+    // Handed to `settle_detached` on every exit: a client that abandons the
+    // request drops this handler, and the mark must outlive it for exactly
+    // as long as a settlement write may still land.
+    settling: SettlingSpend,
 ) -> Result<axum::response::Response, ServerError> {
     let auth_context = AuthContext {
         method: AuthMethod::AnonymousCredential,
@@ -593,8 +636,9 @@ async fn handle_non_streaming_request(
         Err(e) => {
             // Known error — backend didn't charge. Full refund.
             warn!("Backend error, issuing full refund: {}", e);
-            let refund = issue_refund_async(
+            let refund = settle_detached(
                 state,
+                settling,
                 &act.spend_proof,
                 &act.issuer_key_hash,
                 charge_credits,
@@ -632,8 +676,9 @@ async fn handle_non_streaming_request(
         .unwrap_or(charge_credits); // No usage → charge worst case
 
     let refund_credits = charge_credits.saturating_sub(cost);
-    let refund_info = match issue_refund_async(
+    let refund_info = match settle_detached(
         state,
+        settling,
         &act.spend_proof,
         &act.issuer_key_hash,
         refund_credits,
@@ -642,15 +687,8 @@ async fn handle_non_streaming_request(
     {
         Ok(info) => Some(info),
         Err(e) => {
-            error!("CRITICAL: failed to issue refund: {}", e);
-            // We were charged, so fall back to refunding 0 (blind remaining value).
-            match issue_refund_async(state, &act.spend_proof, &act.issuer_key_hash, 0).await {
-                Ok(info) => Some(info),
-                Err(e2) => {
-                    error!("CRITICAL: failed to issue fallback zero refund: {}", e2);
-                    None
-                }
-            }
+            error!("CRITICAL: failed to issue fallback zero refund: {}", e);
+            None
         }
     };
 
