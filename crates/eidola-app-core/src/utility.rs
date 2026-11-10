@@ -233,12 +233,13 @@ impl Inner {
                 // with it is its own doctrine — the router degrades and lets
                 // the post through, unrefined, rather than routing through
                 // some other model.
-                let entry = models
-                    .data
-                    .iter()
-                    .find(|m| m.id == target.model)
-                    .ok_or_else(|| AppError::ModelUnavailable {
-                        model: target.canonical.clone(),
+                // Matched as the gateway resolves the reference: a digest
+                // by hash, a tag by the row it names.
+                let entry =
+                    crate::find_catalog_entry(&models.data, &target.model).ok_or_else(|| {
+                        AppError::ModelUnavailable {
+                            model: target.canonical.clone(),
+                        }
                     })?;
                 Ok(UtilityRoute {
                     client,

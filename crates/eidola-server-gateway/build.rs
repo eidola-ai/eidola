@@ -12,7 +12,7 @@
 //!
 //! The model catalog, at the workspace root, is `models/<family>/<label>.toml`:
 //! one file per set of weights, keyed by its weights hash. Each file is
-//! checked (`src/models/file.rs`), the files are checked together (no hash
+//! checked (`eidola_common::model_catalog`, the reader the client's build runs too), the files are checked together (no hash
 //! twice, each tag naming exactly one hash), and the rows are bound to the
 //! engine pins one to one by hash before they are rendered as Rust.
 
@@ -21,8 +21,7 @@ mod engine_manifest;
 // `engine_manifest`'s `super::file`: the typed parse the runtime reads with.
 #[path = "src/engine_trust/file.rs"]
 mod file;
-#[path = "src/models/file.rs"]
-mod models;
+use eidola_common::model_catalog as models;
 
 use std::env;
 use std::fmt::Write;
@@ -47,10 +46,6 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("src/engine_trust/file.rs").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest_dir.join("src/models/file.rs").display()
     );
     let (engine_enclaves, pinned) = engine_enclaves(&workspace_root);
     fs::write(out_dir.join("engine_enclaves.gen.rs"), engine_enclaves)

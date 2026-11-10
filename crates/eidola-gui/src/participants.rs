@@ -350,7 +350,83 @@ pub(crate) fn model_field<V: 'static>(
             crate::scrollbar::vertical_floating("model-picker-scrollbar", picker_scroll),
         ));
     }
+    // The chosen Eidola model's identity, always visible under the picker: its
+    // weights hash and where the weights come from, and where to learn how to
+    // check them without trusting this app. From the catalog compiled into
+    // this build, so it names exactly what the gateway this build pins serves.
+    if let Some((weights, verify)) = current.and_then(|sel| model_identity_lines(sel, cx)) {
+        col = col
+            .child(
+                div()
+                    .id(SharedString::from(format!("{probe_prefix}-weights")))
+                    .probe(
+                        format!("{probe_prefix}/weights"),
+                        gpui::Role::Label,
+                        weights.clone(),
+                    )
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(weights),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("{probe_prefix}-verify")))
+                    .probe(
+                        format!("{probe_prefix}/verify"),
+                        gpui::Role::Label,
+                        verify.clone(),
+                    )
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(verify),
+            );
+    }
     col.into_any_element()
+}
+
+/// The two lines that identify an Eidola model choice: its weights hash
+/// (shortened; the whole hash is in the catalog and on `/v1/models`) with its
+/// source, and where to learn how to check them. `None` for a choice on any
+/// other backend or one this build's catalog does not know.
+pub(crate) fn model_identity_lines(
+    selection: &str,
+    cx: &gpui::App,
+) -> Option<(SharedString, SharedString)> {
+    let identity = eidola_app_core::model_identity(selection)?;
+    let short = format!("{}…", &identity.sha256[..12]);
+    let source = format!(
+        "{}@{}",
+        identity.repo,
+        &identity.revision[..identity.revision.len().min(7)]
+    );
+    Some((
+        crate::i18n::msg::participants_model_weights(cx, short, source),
+        crate::i18n::msg::participants_model_verify(cx, identity.doc_url),
+    ))
+}
+
+/// The sentence a model notice is shown as.
+pub(crate) fn model_notice_text(
+    notice: &eidola_app_core::model_catalog::ModelNotice,
+    cx: &gpui::App,
+) -> SharedString {
+    use eidola_app_core::model_catalog::ModelNotice;
+    match notice {
+        ModelNotice::Updated { tag, .. } => {
+            crate::i18n::msg::participants_model_updated(cx, tag.clone())
+        }
+        ModelNotice::NewerAvailable { tag, .. } => {
+            crate::i18n::msg::participants_model_newer(cx, tag.clone())
+        }
+        ModelNotice::Retiring { retire_after, past } => {
+            if *past {
+                crate::i18n::msg::participants_model_retiring_past(cx, retire_after.clone())
+            } else {
+                crate::i18n::msg::participants_model_retiring(cx, retire_after.clone())
+            }
+        }
+        ModelNotice::Retired => crate::i18n::msg::participants_model_retired(cx),
+    }
 }
 
 /// True when a model reference routes to the **remote** eidola backend — the

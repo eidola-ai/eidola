@@ -645,6 +645,13 @@ CREATE TABLE action (
 
     intent          TEXT,
     model           TEXT,
+    -- The weights hash an Eidola model reference resolved to for this
+    -- action (docs/model-identity.md): what the answer came from, whichever
+    -- way the model was named. NULL for every other backend, and for a
+    -- catalog that publishes no hashes. A followed tag's "model updated"
+    -- notice compares the latest one with what the tag names now.
+    model_sha256    TEXT CHECK (model_sha256 IS NULL OR (length(model_sha256) = 64
+                    AND model_sha256 NOT GLOB '*[^0-9a-f]*')),
 
     -- usage / cost
     input_tokens    INTEGER,

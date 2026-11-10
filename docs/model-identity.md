@@ -14,6 +14,15 @@ Only full digests are accepted. The server resolves the reference to a hash as t
 
 Every model's catalog entry is a file in the source tree, `models/<family>/<label>.toml`, compiled into the server, so the catalog a server publishes is part of what its enclave measurement covers. A model is **current** or **deprecated** (still served, with a retirement date announced) while it is listed, and **retired** when a release stops serving it; a retired model is refused by name, tag or hash.
 
+## In the Eidola app
+
+The app compiles in the same catalog files the server does, so it knows what each name resolves to in the server release it trusts, without asking anyone.
+
+- **Choosing a model** stores the choice as you made it: a tag, which follows the tag, or a pin, which keeps the weights it names.
+- **Each answer is sent under the exact weights its turn resolved to.** A turn that follows a tag names the tag's current hash on every request it makes, tool calls included, so one answer never mixes two sets of weights. The app records which weights each answer came from.
+- **The model's identity is shown wherever you choose it:** its weights hash, the repository and revision the weights come from, and a link to this page, so you can check them yourself.
+- **It tells you when something changed.** If a tag you follow now names newer weights than your last answer came from, it says the model was updated. If you pinned weights whose tag has moved on, it offers the newer ones. If your weights are deprecated, it shows the announced retirement date, and it tells you again once they are retired.
+
 ## What `/v1/models` publishes
 
 For each model the server sells, `/v1/models` publishes:
