@@ -12093,12 +12093,17 @@ mod tests {
                 .await
                 .unwrap();
         }
+        // Each credential's nonce is random, as a real nullifier is; which of
+        // the two equal old-key balances sorts first is decided by them.
+        let nonce = || uuid::Uuid::new_v4().simple().to_string();
+        let (new_small, old_large, old_small_1, old_small_2, old_empty) =
+            (nonce(), nonce(), nonce(), nonce(), nonce());
         for (key, nonce, credits) in [
-            ("ik-new", "a-new-small", 10),
-            ("ik-old", "b-old-large", 900),
-            ("ik-old", "c-old-small", 20),
-            ("ik-old", "a-old-small", 20),
-            ("ik-old", "d-old-empty", 0),
+            ("ik-new", &new_small, 10),
+            ("ik-old", &old_large, 900),
+            ("ik-old", &old_small_1, 20),
+            ("ik-old", &old_small_2, 20),
+            ("ik-old", &old_empty, 0),
         ] {
             let pc = format!("pc-{nonce}");
             insert_pre_credential_issuance(
@@ -12126,39 +12131,37 @@ mod tests {
             .into_iter()
             .map(|c| c.nonce)
             .collect();
+        let (first_small, second_small) = if old_small_1 < old_small_2 {
+            (&old_small_1, &old_small_2)
+        } else {
+            (&old_small_2, &old_small_1)
+        };
         assert_eq!(
             order,
-            ["a-old-small", "c-old-small", "b-old-large", "a-new-small"],
+            [first_small, second_small, &old_large, &new_small].map(String::clone),
             "soonest-lapsing key first, then smallest, then nonce; nothing empty"
         );
 
-        let input = |id: &'static str, nonce: &'static str, key: &'static str| SpendInputRecord {
-            id,
-            credential_nonce: nonce,
-            issuer_key_id: key,
-            data: b"pre-refund",
-            spend_amount: 5,
-            spend_proof_data: b"proof",
-        };
+        fn input<'a>(id: &'a str, nonce: &'a str, key: &'a str) -> SpendInputRecord<'a> {
+            SpendInputRecord {
+                id,
+                credential_nonce: nonce,
+                issuer_key_id: key,
+                data: b"pre-refund",
+                spend_amount: 5,
+                spend_proof_data: b"proof",
+            }
+        }
         // One input of a request is already spending: neither is taken.
-        insert_pre_credential_refund(
-            &conn,
-            "pc-busy",
-            "b-old-large",
-            "ik-old",
-            b"r",
-            5,
-            b"p",
-            2_000,
-        )
-        .await
-        .unwrap();
+        insert_pre_credential_refund(&conn, "pc-busy", &old_large, "ik-old", b"r", 5, b"p", 2_000)
+            .await
+            .unwrap();
         insert_spend_inputs(
             &conn,
             "group-refused",
             &[
-                input("pc-in-1", "a-old-small", "ik-old"),
-                input("pc-in-2", "b-old-large", "ik-old"),
+                input("pc-in-1", first_small, "ik-old"),
+                input("pc-in-2", &old_large, "ik-old"),
             ],
             3_000,
         )
@@ -12168,10 +12171,7 @@ mod tests {
             lc.into_iter().find(|r| r.nonce == nonce).unwrap().state
         };
         assert_eq!(
-            states(
-                list_credential_lifecycle(&conn).await.unwrap(),
-                "a-old-small"
-            ),
+            states(list_credential_lifecycle(&conn).await.unwrap(), first_small),
             "active",
             "the other input is not left marked"
         );
@@ -12181,14 +12181,14 @@ mod tests {
             &conn,
             "group-taken",
             &[
-                input("pc-in-3", "a-old-small", "ik-old"),
-                input("pc-in-4", "a-new-small", "ik-new"),
+                input("pc-in-3", first_small, "ik-old"),
+                input("pc-in-4", &new_small, "ik-new"),
             ],
             3_000,
         )
         .await
         .unwrap();
-        for nonce in ["a-old-small", "a-new-small"] {
+        for nonce in [first_small, &new_small] {
             assert_eq!(
                 states(list_credential_lifecycle(&conn).await.unwrap(), nonce),
                 "spending"
