@@ -730,44 +730,71 @@ pub async fn insert_credential_issuance(
     Ok(ids.and_then(|v| v.into_iter().next()))
 }
 
-/// Debit an account for a Stripe-originated event (refund or clawback).
-///
-/// Credits are drawn from balance pools in FIFO order (earliest expiry
-/// first, permanent last).  Any remainder beyond existing pools is placed
-/// in the permanent (NULL expiry) pool.  Returns `Ok(true)` if inserted,
-/// `Ok(false)` if the `stripe_event_id` was already processed (duplicate).
-pub async fn debit_stripe_event(
+/// What recording a dispute's clawback did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DisputeClawback {
+    Debited,
+    /// This event, or another event for the same dispute, already clawed it
+    /// back: Stripe can emit two Event objects for one transition.
+    Duplicate,
+}
+
+/// Claw back `amount` micro-dollars for `dispute_id`, once per dispute: the
+/// idempotency key is the dispute, not only the event, because Stripe can
+/// emit two Event objects with distinct ids for one `created` transition,
+/// and a second clawback would never be reversed (a lost dispute reverses
+/// nothing; a won one reverses by dispute id, once). One transaction with
+/// the account row locked, so two deliveries cannot both pass the check.
+pub async fn claw_back_dispute(
     pool: &Pool,
     account_id: Uuid,
     amount: i64,
-    reason: &str,
     stripe_event_id: &str,
-    memo: Option<&str>,
-) -> Result<bool, ServerError> {
-    let client = pool
+    dispute_id: &str,
+) -> Result<DisputeClawback, ServerError> {
+    let db_err = |what: &'static str| {
+        move |e: tokio_postgres::Error| {
+            ServerError::Internal(format!("{what} failed: {}", db_error_summary(&e)))
+        }
+    };
+    let mut client = pool
         .get()
         .await
         .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
+    let tx = client
+        .transaction()
+        .await
+        .map_err(db_err("begin clawback transaction"))?;
+    tx.execute(
+        "SELECT 1 FROM account WHERE id = $1 FOR UPDATE",
+        &[&account_id],
+    )
+    .await
+    .map_err(db_err("clawback account lock"))?;
 
-    let row = client
+    let already: bool = tx
         .query_one(
-            "SELECT debit_account($1, $2, $3, $4, NULL, FALSE, NULL, $5) AS ids",
-            &[&account_id, &amount, &reason, &stripe_event_id, &memo],
+            "SELECT EXISTS (SELECT 1 FROM credit_ledger \
+                            WHERE stripe_event_id = $1 \
+                               OR (account_id = $2 AND reason = 'dispute_clawback' AND memo = $3))",
+            &[&stripe_event_id, &account_id, &dispute_id],
         )
         .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "debit_stripe_event failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
-
-    let ids: Option<Vec<Uuid>> = row.get("ids");
-    match ids {
-        None => Ok(true), // p_require_balance is FALSE, so NULL is never returned
-        Some(v) if v.is_empty() => Ok(false), // duplicate event
-        Some(_) => Ok(true),
+        .map_err(db_err("clawback duplicate check"))?
+        .get(0);
+    if already {
+        tx.rollback().await.map_err(db_err("clawback rollback"))?;
+        return Ok(DisputeClawback::Duplicate);
     }
+
+    tx.query_one(
+        "SELECT debit_account($1, $2, 'dispute_clawback', $3, NULL, FALSE, NULL, $4)",
+        &[&account_id, &amount, &stripe_event_id, &dispute_id],
+    )
+    .await
+    .map_err(db_err("clawback debit"))?;
+    tx.commit().await.map_err(db_err("clawback commit"))?;
+    Ok(DisputeClawback::Debited)
 }
 
 /// What reversing a dispute's clawback did.
@@ -981,11 +1008,14 @@ pub async fn refund_charge(
 
     // Keyed on the charge, which every charge has, not on the PaymentIntent,
     // which a charge need not: the refund rows carry the charge id as `memo`.
+    // A refund row with no memo predates that and is counted by its
+    // PaymentIntent, which is all it carries.
     let already: i64 = tx
         .query_one(
             "SELECT COALESCE(SUM(-delta), 0)::bigint FROM credit_ledger \
-             WHERE account_id = $1 AND reason = 'refund' AND memo = $2",
-            &[&account_id, &charge_id],
+             WHERE account_id = $1 AND reason = 'refund' \
+               AND (memo = $2 OR (memo IS NULL AND stripe_payment_intent = $3))",
+            &[&account_id, &charge_id, &payment_intent],
         )
         .await
         .map_err(db_err("refund total lookup"))?

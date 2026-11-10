@@ -716,22 +716,13 @@ async fn handle_dispute_created(
         Err(outcome) => return outcome,
     };
 
-    match db::debit_stripe_event(
-        pool,
-        account.id,
-        microdollars,
-        "dispute_clawback",
-        &event.id,
-        Some(dispute_id),
-    )
-    .await
-    {
-        Ok(true) => {
+    match db::claw_back_dispute(pool, account.id, microdollars, &event.id, dispute_id).await {
+        Ok(db::DisputeClawback::Debited) => {
             info!("webhook: ledger debited (dispute_clawback)");
             WebhookOutcome::Done("handled")
         }
-        Ok(false) => {
-            info!("webhook: duplicate event, skipping");
+        Ok(db::DisputeClawback::Duplicate) => {
+            info!("webhook: dispute already clawed back, skipping");
             WebhookOutcome::Done("duplicate")
         }
         Err(e) => {
@@ -1741,6 +1732,43 @@ mod tests {
             500_000_000 - 20_000_000,
             "two $10 refunds debit $20 at par, not $30"
         );
+    }
+
+    /// Stripe can emit two Event objects, with distinct ids, for one
+    /// `charge.dispute.created` transition. Keyed on the event alone, the
+    /// second would claw the dispute back again — and nothing ever reverses
+    /// that second row. The dispute id is the idempotency key.
+    #[tokio::test]
+    #[ignore]
+    async fn a_dispute_is_clawed_back_once_whatever_the_event_ids() {
+        let pool = test_pool();
+        let cust = format!("cus_test_{}", uuid::Uuid::new_v4());
+        let account_id = create_test_account(&pool, &cust).await;
+        db::insert_credit_ledger(
+            &pool,
+            account_id,
+            50_000_000,
+            "subscription_renewal",
+            &format!("evt_seed_{}", uuid::Uuid::new_v4()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let stripe = stub_charge_customer(Some(cust.clone())).await;
+        for _ in 0..2 {
+            let event = make_event(
+                &format!("evt_{}", uuid::Uuid::new_v4()),
+                "charge.dispute.created",
+                stripe_shaped_dispute("needs_response"),
+            );
+            assert!(
+                !handle_dispute_created(&event, &pool, &stripe)
+                    .await
+                    .is_retryable()
+            );
+        }
+        assert_eq!(get_balance(&pool, account_id).await, 45_000_000);
     }
 
     #[tokio::test]
