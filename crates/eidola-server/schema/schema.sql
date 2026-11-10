@@ -511,12 +511,13 @@ BEGIN
 
             INSERT INTO credit_ledger (
                 id, account_id, delta, reason, stripe_event_id, expires_at,
-                credential_key_id, credential_credits, stripe_payment_intent, created_at
+                credential_key_id, credential_credits, stripe_payment_intent, memo,
+                created_at
             ) VALUES (
                 gen_random_uuid(), p_account_id, -v_take, p_reason, v_event_id,
                 v_pool.expires_at, p_credential_key_id,
                 CASE WHEN p_credential_key_id IS NOT NULL THEN v_take ELSE NULL END,
-                p_payment_intent,
+                p_payment_intent, p_memo,
                 now()
             )
             RETURNING id INTO v_entry_id;
@@ -542,12 +543,13 @@ BEGIN
 
         INSERT INTO credit_ledger (
             id, account_id, delta, reason, stripe_event_id, expires_at,
-            credential_key_id, credential_credits, stripe_payment_intent, created_at
+            credential_key_id, credential_credits, stripe_payment_intent, memo,
+            created_at
         ) VALUES (
             gen_random_uuid(), p_account_id, -v_remaining, p_reason, v_event_id,
             NULL, p_credential_key_id,
             CASE WHEN p_credential_key_id IS NOT NULL THEN v_remaining ELSE NULL END,
-            p_payment_intent,
+            p_payment_intent, p_memo,
             now()
         )
         RETURNING id INTO v_entry_id;
@@ -569,9 +571,12 @@ COMMENT ON FUNCTION debit_account IS
     'remainder beyond live pools is next netted against expired positive '
     'pools (most recently expired first, inheriting their past expires_at); '
     'only what exceeds those too is placed in the permanent (NULL expiry) '
-    'pool.  Clawbacks skip the expired-pool pass and go permanent directly. '
-    'p_memo is carried onto every row the debit writes; a dispute clawback '
-    'records the Stripe dispute id there so its reversal can find it.';
+    'pool.  Clawbacks skip the expired-pool pass; what exceeds live pools '
+    'goes permanent. p_memo is carried onto every row the debit writes '
+    '(live, expired-pool and permanent): the Stripe object a debit answers '
+    'for — the dispute id on a clawback, so its reversal can mirror it row '
+    'for row; the charge id on a refund, so later partial refunds know what '
+    'is already debited.';
 
 CREATE FUNCTION prune_expired_nullifiers()
 RETURNS BIGINT

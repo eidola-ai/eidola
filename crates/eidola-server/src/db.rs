@@ -784,11 +784,9 @@ pub enum DisputeReversal {
 }
 
 /// Reverse the clawback recorded for `dispute_id`, crediting back exactly
-/// what it debited (net of any earlier reversal) — never the amount the
-/// `charge.dispute.closed` payload names. A dispute whose `created` event
-/// this server never debited (delivered before the handler could resolve
-/// its account, or exhausted) has nothing to reverse, and crediting the
-/// payload's amount would mint balance the account never lost. One
+/// what it debited, row for row and expiry for expiry — never the amount the
+/// `charge.dispute.closed` payload names: crediting that for a dispute with
+/// no clawback on the ledger would mint balance the account never lost. One
 /// transaction with the account row locked, like `refund_charge`.
 pub async fn reverse_dispute_clawback(
     pool: &Pool,
@@ -851,10 +849,23 @@ pub async fn reverse_dispute_clawback(
         return Ok(DisputeReversal::NothingToReverse);
     }
 
+    // Row for row, each with the expiry of the clawback row it undoes: the
+    // clawback drew from live pools first and inherited their `expires_at`,
+    // so what came out of an expiring pool goes back expiring with it and
+    // only the permanent remainder comes back permanent. One reversal row
+    // with no expiry would turn subscription credits into permanent ones.
+    // Event ids follow `debit_account`: the first row carries the event id,
+    // the rest `id:N`.
     tx.execute(
-        "INSERT INTO credit_ledger (account_id, delta, reason, stripe_event_id, memo) \
-         VALUES ($1, $2, 'dispute_reversal', $3, $4)",
-        &[&account_id, &outstanding, &stripe_event_id, &dispute_id],
+        "INSERT INTO credit_ledger \
+             (account_id, delta, reason, stripe_event_id, memo, expires_at) \
+         SELECT account_id, -delta, 'dispute_reversal', \
+                CASE WHEN n = 1 THEN $3 ELSE $3 || ':' || (n - 1) END, memo, expires_at \
+         FROM (SELECT account_id, delta, memo, expires_at, \
+                      row_number() OVER (ORDER BY created_at, id) AS n \
+               FROM credit_ledger \
+               WHERE account_id = $1 AND memo = $2 AND reason = 'dispute_clawback') clawback",
+        &[&account_id, &dispute_id, &stripe_event_id],
     )
     .await
     .map_err(db_err("dispute reversal insert"))?;
@@ -902,6 +913,7 @@ pub async fn refund_charge(
     pool: &Pool,
     account_id: Uuid,
     stripe_event_id: &str,
+    charge_id: &str,
     payment_intent: Option<&str>,
     charge_amount_cents: i64,
     amount_refunded_cents: i64,
@@ -967,18 +979,17 @@ pub async fn refund_charge(
         _ => at_par,
     };
 
-    let already: i64 = match payment_intent {
-        Some(pi) => tx
-            .query_one(
-                "SELECT COALESCE(SUM(-delta), 0)::bigint FROM credit_ledger \
-                 WHERE account_id = $1 AND reason = 'refund' AND stripe_payment_intent = $2",
-                &[&account_id, &pi],
-            )
-            .await
-            .map_err(db_err("refund total lookup"))?
-            .get(0),
-        None => 0,
-    };
+    // Keyed on the charge, which every charge has, not on the PaymentIntent,
+    // which a charge need not: the refund rows carry the charge id as `memo`.
+    let already: i64 = tx
+        .query_one(
+            "SELECT COALESCE(SUM(-delta), 0)::bigint FROM credit_ledger \
+             WHERE account_id = $1 AND reason = 'refund' AND memo = $2",
+            &[&account_id, &charge_id],
+        )
+        .await
+        .map_err(db_err("refund total lookup"))?
+        .get(0);
     let increment = target - already;
     if increment <= 0 {
         tx.rollback().await.map_err(db_err("refund rollback"))?;
@@ -990,13 +1001,15 @@ pub async fn refund_charge(
             let expires_at: Option<SystemTime> = row.get("expires_at");
             tx.execute(
                 "INSERT INTO credit_ledger \
-                     (account_id, delta, reason, stripe_event_id, stripe_payment_intent, expires_at) \
-                 VALUES ($1, $2, 'refund', $3, $4, $5)",
+                     (account_id, delta, reason, stripe_event_id, stripe_payment_intent, memo, \
+                      expires_at) \
+                 VALUES ($1, $2, 'refund', $3, $4, $5, $6)",
                 &[
                     &account_id,
                     &-increment,
                     &stripe_event_id,
                     &payment_intent,
+                    &charge_id,
                     &expires_at,
                 ],
             )
@@ -1005,8 +1018,14 @@ pub async fn refund_charge(
         }
         None => {
             tx.query_one(
-                "SELECT debit_account($1, $2, 'refund', $3, NULL, FALSE, $4)",
-                &[&account_id, &increment, &stripe_event_id, &payment_intent],
+                "SELECT debit_account($1, $2, 'refund', $3, NULL, FALSE, $4, $5)",
+                &[
+                    &account_id,
+                    &increment,
+                    &stripe_event_id,
+                    &payment_intent,
+                    &charge_id,
+                ],
             )
             .await
             .map_err(db_err("refund debit"))?;
@@ -1333,9 +1352,10 @@ mod tests {
 
     /// Concurrent issuance must never debit more than the account holds.
     ///
-    /// `debit_account` checks `available_balance` and then inserts, under the
-    /// default READ COMMITTED isolation and with no lock, so requests that
-    /// overlap can each see the balance before the others' debits commit.
+    /// `debit_account` checks `available_balance` and then inserts as separate
+    /// statements; without its account row lock, under READ COMMITTED,
+    /// requests that overlap each see the balance before the others' debits
+    /// commit. This guards the lock.
     /// Each round funds a fresh account and fires `CONCURRENCY` issuances
     /// for the whole balance at once; at most one may succeed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
