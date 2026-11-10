@@ -98,11 +98,64 @@ pub struct ChatCompletionRequest {
     #[serde(default, skip_serializing_if = "never_serialized")]
     #[schema(value_type = Option<String>, min_length = 43, max_length = 43, pattern = "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$")]
     pub cache_key: Option<CacheKey>,
+
+    /// The anonymous credits paying for this request: one element per spend,
+    /// each an ACT Token and its refund recovery key
+    /// (`eidola_common::spend_credentials`). Required; a request without it is
+    /// refused before anything is recorded, as is one that carries a
+    /// credential in a header instead.
+    ///
+    /// **Secret, and never serialized**, like `cache_key`: it prints
+    /// redacted, `Serialize` skips it, and the body forwarded to an engine
+    /// leaves it out (`engine_trust::protocol::engine_request_body`).
+    #[serde(default, skip_serializing_if = "never_serialized")]
+    #[schema(value_type = Vec<SpendCredential>, min_items = 1, max_items = 1)]
+    pub credentials: Credentials,
 }
 
 /// The `skip_serializing_if` predicate of a member that is never serialized.
 fn never_serialized<T>(_: &T) -> bool {
     true
+}
+
+/// A request body's `credentials` member, as it arrived: each element held to
+/// its strict shape (`eidola_common::spend_credentials::CredentialWire`),
+/// its values decoded only by `auth::presented_spends`.
+#[derive(Clone, Default, Deserialize)]
+#[serde(transparent)]
+pub struct Credentials(pub Vec<eidola_common::spend_credentials::CredentialWire>);
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Credentials(<{} redacted>)", self.0.len())
+    }
+}
+
+/// Refuses, always: a request's `credentials` are skipped when the request
+/// serializes, and this impl exists only because that skip is spelled as a
+/// predicate. Nothing may serialize a credential by accident.
+impl Serialize for Credentials {
+    fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom(
+            "credentials are never serialized",
+        ))
+    }
+}
+
+/// One element of a request body's `credentials` member, as documented.
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub struct SpendCredential {
+    /// One ACT Token (`token_type`, `challenge_digest`, `issuer_key_id`, the
+    /// encoded spend proof) as base64url with padding: the one spelling, so a
+    /// value that does not re-encode to itself is refused.
+    #[schema(pattern = "^[A-Za-z0-9_-]*={0,2}$")]
+    pub token: String,
+    /// The spend's refund recovery key: exactly 64 lowercase hex digits. The
+    /// stored copy of the spend's refund is sealed under it, and recovery
+    /// must present it again.
+    #[schema(min_length = 64, max_length = 64, pattern = "^[0-9a-f]{64}$")]
+    pub refund_key: String,
 }
 
 /// What `continue_final_message` may carry: a flag, or the name of the final
@@ -837,10 +890,11 @@ pub struct ScaledPrice {
 pub struct ErrorResponse {
     pub error: ErrorDetail,
 
-    /// Refund token for unspent credits (present when an error occurs after
-    /// the ACT nullifier has been recorded).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refund: Option<serde_json::Value>,
+    /// One refund per spend, in the order the request presented them
+    /// (present when an error occurs after the spends' nullifiers were
+    /// recorded).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refunds: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -859,7 +913,7 @@ impl ErrorResponse {
                 error_type: error_type.into(),
                 code: None,
             },
-            refund: None,
+            refunds: Vec::new(),
         }
     }
 }

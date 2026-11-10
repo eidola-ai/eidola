@@ -62,7 +62,7 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 
 ### Spend timing at the database
 
-**Current behavior.** A spend writes its nullifier row twice: the nullifier when the request is accepted, and the sealed refund when the request completes ([server.md § Unlinkability](server.md#unlinkability)). The row carries no timestamp, but Postgres runs outside the enclave, so whoever can watch it live — or read its write-ahead log, a replica, or a backup, whose commit records are timed — can see when each write happened, and so how long each request took. Duration follows the length of the answer, so this is a coarse, per-request content-size signal in the operator's hands, and the same database holds per-account issuance timestamps in the credit ledger.
+**Current behavior.** A spend writes its nullifier row twice: the nullifier with a provisional sealed refund when the request is accepted, and the final sealed refund when the request ends ([server.md § Unlinkability](server.md#unlinkability)). The row carries no timestamp, but Postgres runs outside the enclave, so whoever can watch it live — or read its write-ahead log, a replica, or a backup, whose commit records are timed — can see when each write happened, and so how long each request took. Duration follows the length of the answer, so this is a coarse, per-request content-size signal in the operator's hands, and the same database holds per-account issuance timestamps in the credit ledger.
 
 **What constrains it today.** The refund amount itself is stored sealed under a key that needs the client's own secret, at a fixed length; nothing written names an account; and the timing is the signal a network observer of the server already has from each response's total duration ([Passive traffic analysis](#passive-traffic-analysis)). The database is treated as adversarial, so this is a real gap rather than a theoretical one.
 
@@ -96,13 +96,13 @@ A background issuance is timed too: it follows, by one random interval of 10 to 
 
 **Future.** A buffer for the CLI-only case, which needs a long-lived process the CLI does not have.
 
-### A crash mid-spend strands the token's remaining value
+### A crash mid-spend costs the request's hold
 
-**Current behavior.** A spend records its nullifier before the request is served and stores the refund when it completes. If the gateway stops between the two (a crash, a restart), the nullifier is recorded with no refund. Recovery then answers that the refund is not yet available, indefinitely, and the token's whole remaining balance is lost, not just the request's charge.
+**Current behavior.** A spend records its nullifier, with a provisional refund of nothing stored on the same row in the same statement, before the request is served, and replaces that with the final refund when the request ends ([anonymous-credits.md § Provisional refunds, the live set, and ending a request early](anonymous-credits.md#provisional-refunds-the-live-set-and-ending-a-request-early)). If the gateway stops in between (a crash, a restart), the provisional refund is the spend's last: as soon as the gateway is back, recovery finds no request serving the spend, calls the provisional refund final, and the client gets back the token's balance less the hold. The hold itself, which the request may or may not have used, is lost. The same is true, for the request's partial return only, when a client recovers a spend that is still running on a *different* live gateway instance: that instance's live set is not the one recovery asks.
 
-**What constrains it today.** The window is the duration of one request on one instance. The client keeps the spend's state and keeps retrying recovery until the key stops accepting.
+**What constrains it today.** The window is the duration of one request on one instance, and the client's wait is the gateway's restart time. Production runs one gateway instance, so the cross-instance case is at most a deploy overlap. The client keeps the spend's state and keeps retrying recovery until the key stops accepting.
 
-**Future.** Let recovery return the remaining balance of a spend whose refund never arrived: a refund of nothing returns the token's balance less the charge, so the server keeps everything it was paid. Telling an abandoned spend from one still in flight without a per-spend timestamp in the database is the design question.
+**Future.** Charging a crashed request what it actually used would need its usage to outlive the process, which the gateway deliberately keeps nowhere outside enclave memory. Running several instances side by side would need recovery to ask the instance that holds the spend, without the database learning which requests are in flight.
 
 ### A client's first sight of an epoch's key
 

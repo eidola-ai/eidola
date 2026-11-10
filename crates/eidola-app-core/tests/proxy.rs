@@ -654,10 +654,13 @@ fn no_downstream_header_reaches_the_upstream() {
         // nothing of the tool's.
         let auths = mock.chat_auth_values();
         assert_eq!(auths.len(), 1, "one upstream call");
-        let sent_auth = auths[0].clone().expect("the ACT this app spends");
-        assert!(
-            !sent_auth.contains(&key),
+        assert_eq!(
+            auths[0], None,
             "a downstream key authenticates the tool to the proxy and is never forwarded"
+        );
+        assert!(
+            mock.chat_spends()[0].is_some(),
+            "the ACT this app spends travels in the body"
         );
 
         // And the body is an allowlist too: the fields Eidola accepts travel,

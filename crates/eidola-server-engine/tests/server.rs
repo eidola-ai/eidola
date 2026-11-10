@@ -552,6 +552,25 @@ async fn streaming_shapes_text_and_usage() {
     assert_eq!(content, text_of(message, "content"));
     assert_eq!(usage_chunk["usage"], plain["usage"]);
 
+    // With include_usage the role chunk and every delta chunk carry the running
+    // count, which the gateway bills a stream it cuts short by: the prompt from the
+    // start, and completion tokens that only grow, up to the final count.
+    assert_eq!(
+        chunks[0]["usage"]["prompt_tokens"],
+        plain["usage"]["prompt_tokens"]
+    );
+    assert_eq!(chunks[0]["usage"]["completion_tokens"], 0);
+    let mut last = 0;
+    for c in &chunks[1..chunks.len() - 2] {
+        let running = c["usage"]["completion_tokens"]
+            .as_u64()
+            .expect("a delta chunk carries the running count");
+        assert!(running >= last && running > 0, "{running} after {last}");
+        assert_eq!(c["usage"]["prompt_tokens"], plain["usage"]["prompt_tokens"]);
+        last = running;
+    }
+    assert!(last <= plain["usage"]["completion_tokens"].as_u64().unwrap());
+
     // Without include_usage there is no usage chunk.
     body["stream_options"] = Value::Null;
     let (chunks, done) = parse_chunks(&node.chat_stream(&body).await);

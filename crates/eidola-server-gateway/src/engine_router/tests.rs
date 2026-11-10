@@ -21,8 +21,8 @@ use tinfoil_verifier::AllowedMeasurement;
 use super::*;
 use crate::engine_trust::{PinnedWeights, PromptCachePolicy};
 use crate::types::{
-    Capability, Model, ModelCapabilities, ModelPricing, OutputBudgetClass, PinnedWeightsCapability,
-    PromptCacheCapability, ScaledPrice,
+    CacheKey, Capability, Model, ModelCapabilities, ModelPricing, OutputBudgetClass,
+    PinnedWeightsCapability, PromptCacheCapability, ScaledPrice,
 };
 use eidola_common::engine_protocol::error_type as kind;
 
@@ -149,6 +149,8 @@ struct EngineState {
     chats: Mutex<Vec<Received>>,
     health_checks: AtomicUsize,
     release: tokio::sync::Notify,
+    /// Held streams whose connection went away before they were released.
+    abandoned: AtomicUsize,
 }
 
 /// A fake engine behind its shim.
@@ -217,6 +219,7 @@ async fn engine(identity: Identity) -> Engine {
         chats: Mutex::new(Vec::new()),
         health_checks: AtomicUsize::new(0),
         release: tokio::sync::Notify::new(),
+        abandoned: AtomicUsize::new(0),
     });
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -426,10 +429,23 @@ fn async_stream(
     state: Arc<EngineState>,
     rest: Vec<Event>,
 ) -> impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>> {
+    /// Counts a held stream dropped (its connection gone) before release.
+    struct Abandon(Option<Arc<EngineState>>);
+    impl Drop for Abandon {
+        fn drop(&mut self) {
+            if let Some(state) = self.0.take() {
+                state
+                    .abandoned
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
     let head = futures_util::stream::once(async move { Ok(role) });
     let tail = futures_util::stream::once(async move {
         if hold {
+            let mut abandon = Abandon(Some(state.clone()));
             state.release.notified().await;
+            abandon.0 = None;
         }
         futures_util::stream::iter(rest.into_iter().map(Ok))
     })
@@ -470,13 +486,36 @@ fn request(model: &str, key: Option<&str>, stream: bool) -> ValidatedRequest {
     ValidatedRequest::from_bytes(bytes::Bytes::from(request_text(model, key, stream, ""))).unwrap()
 }
 
-/// A well-formed cache key's text for `i`.
-fn key_text(i: u64) -> String {
-    use base64::Engine as _;
+/// A well-formed cache key's bytes for `i`.
+fn key_bytes(i: u64) -> [u8; 32] {
     let mut bytes = [0u8; 32];
     bytes[..8].copy_from_slice(&i.to_le_bytes());
     bytes[31] = 0x5a;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    bytes
+}
+
+/// A well-formed cache key's text for `i`.
+fn key_text(i: u64) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_bytes(i))
+}
+
+/// The first `i` whose key ranks the upstream at `first` ahead of every other
+/// upstream at `others`. Rendezvous weights hash each upstream's base URL,
+/// which carries a port the OS picked, so which engine a fixed key reaches
+/// differs from run to run; a test that needs a given engine tried first
+/// chooses its key this way.
+fn key_ranking_first(router: &EngineRouter, model: &str, first: &str, others: &[&str]) -> u64 {
+    let ups: Vec<Arc<Upstream>> = std::iter::once(first)
+        .chain(others.iter().copied())
+        .map(|url| upstream(router, model, url))
+        .collect();
+    (0..)
+        .find(|&i| {
+            let ranked = rendezvous::rank_by_key(&CacheKey::from_bytes(key_bytes(i)), ups.clone());
+            ranked[0].base_url == first
+        })
+        .unwrap()
 }
 
 /// Which engine served the last request: the one whose chat count grew.
@@ -642,6 +681,35 @@ async fn without_a_key_the_least_loaded_engine_is_chosen() {
     assert_eq!(seen.len(), 2);
 }
 
+/// **A dropped receiver releases the engine at once**, even while the engine
+/// is sending nothing (a long prefill): the relay watches for its handler
+/// going away, closes the connection, and the engine sees its request go
+/// (which the node turns into a cancel in its scheduler).
+#[tokio::test]
+async fn a_dropped_receiver_closes_the_engine_connection_without_waiting_for_output() {
+    let a = engine(Identity::of(MODEL_A)).await;
+    let router = router_for(&[&a], models());
+    router
+        .apply_placement(&[a.row(MODEL_A, DEPLOYMENT_A)])
+        .await;
+    router.probe_due().await;
+    a.set_mode(Mode::Hold);
+    let mut held = router
+        .send_stream(&request(MODEL_A, None, true))
+        .await
+        .unwrap();
+    held.recv().await.unwrap().unwrap();
+    drop(held);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while a.state.abandoned.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the engine's stream was never released"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Only enabled rows naming a pinned model and one of its pinned deployments,
 /// at an `https` URL, become upstreams; anything else is never contacted.
 #[tokio::test]
@@ -779,7 +847,9 @@ async fn a_misregistered_engine_never_takes_traffic() {
         assert!(!upstream(&router, MODEL_A, &e.base_url).routable());
     }
     refuses.set_mode(Mode::WeightsMismatch);
-    for i in 0..8 {
+    // The first key tries the refusing engine first, so its refusal is seen.
+    let first = key_ranking_first(&router, MODEL_A, &refuses.base_url, &[&good.base_url]);
+    for i in first..first + 8 {
         router
             .send(&request(MODEL_A, Some(&key_text(i)), false))
             .await
@@ -788,7 +858,7 @@ async fn a_misregistered_engine_never_takes_traffic() {
     for e in bad {
         assert!(e.chats().is_empty());
     }
-    assert!(refuses.chats().len() <= 1, "opened on its first refusal");
+    assert_eq!(refuses.chats().len(), 1, "opened on its first refusal");
     assert!(!upstream(&router, MODEL_A, &refuses.base_url).routable());
     assert_eq!(good.chats().len(), 8);
 }
