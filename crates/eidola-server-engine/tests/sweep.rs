@@ -114,7 +114,11 @@ fn commands_faster_than_the_sweep_interval_do_not_postpone_it() {
     .unwrap();
     let admission = Admission::new(64);
 
-    // A keyed request leaves whole prompt blocks in the prefix cache.
+    // A keyed request leaves whole prompt blocks in the prefix cache, stamped with the
+    // engine's clock at the step that finishes it. That stamp is not observable here, and
+    // the finish reaches this thread an unbounded scheduling delay after it, so expiry is
+    // measured from the submission, which precedes the stamp.
+    let submitted_at = Instant::now();
     let (guard, mut events) = handle
         .submit(
             request(&handle, (1..=17).collect(), CacheScope::Keyed(lineage(7))),
@@ -133,17 +137,14 @@ fn commands_faster_than_the_sweep_interval_do_not_postpone_it() {
         }
     }
     drop((guard, events));
-    let cached_at = Instant::now();
-    wait_for(&handle, |s| s.finished == 1 && s.in_engine == 0);
-    // Let the sweeps due before expiry run (nothing has expired yet), so the baseline
-    // includes any maintenance the finish queued.
-    std::thread::sleep(SWEEP * 3);
-    let baseline = handle.stats().engine_steps;
 
     // Commands every 10 ms, each refused (an empty prompt), so the engine stays idle,
-    // until well after the cached entry expired.
-    let mut evicted = None;
-    while cached_at.elapsed() < Duration::from_millis(IDLE_TTL_MS) + SWEEP * 10 {
+    // until a step beyond the request's own two (the one that prefilled and sampled, and
+    // the maintenance its release queued, as the test above pins) shows the sweep evicted
+    // the entry. Counting from that fixed number rather than a baseline read later keeps
+    // an eviction that lands before this thread looks from going unseen.
+    const REQUEST_STEPS: u64 = 2;
+    let s = loop {
         let (_guard, mut events) = handle
             .submit(
                 request(&handle, Vec::new(), CacheScope::Private),
@@ -152,15 +153,20 @@ fn commands_faster_than_the_sweep_interval_do_not_postpone_it() {
             .unwrap();
         assert!(matches!(events.blocking_recv(), Some(Output::Rejected(_))));
         let s = handle.stats();
-        if s.engine_steps > baseline {
-            evicted = Some(s);
-            break;
+        if s.engine_steps > REQUEST_STEPS {
+            break s;
         }
+        assert!(
+            submitted_at.elapsed() < Duration::from_millis(IDLE_TTL_MS) + SWEEP * 10,
+            "no sweep ran while commands kept arriving: {s:?}"
+        );
         std::thread::sleep(Duration::from_millis(10));
-    }
-    let s = evicted.expect("no sweep ran while commands kept arriving");
+    };
+    // The engine's clock counts whole milliseconds since it started, so an entry stamped
+    // at the end of one millisecond and swept at the start of another may have been idle
+    // up to a millisecond less than the TTL by this thread's clock.
     assert!(
-        cached_at.elapsed() >= Duration::from_millis(IDLE_TTL_MS),
+        submitted_at.elapsed() >= Duration::from_millis(IDLE_TTL_MS - 1),
         "swept before expiry: {s:?}"
     );
 }
