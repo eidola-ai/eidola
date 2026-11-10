@@ -408,6 +408,7 @@ pub mod metrics {
         "db.get_valid_issuer_keys",
         "db.insert_credit_ledger",
         "db.record_nullifier",
+        "db.record_nullifier_with_refund",
         "db.store_refund_token",
         "upstream.chat",
         "upstream.chat_stream",
@@ -738,6 +739,12 @@ mod tests {
         assert_eq!(
             metrics::span_operation("db.record_nullifier"),
             Some("db.record_nullifier")
+        );
+        // The span every chat and recovery insert now emits: left off the
+        // list, nullifier latency folds into `other` and the series goes dark.
+        assert_eq!(
+            metrics::span_operation("db.record_nullifier_with_refund"),
+            Some("db.record_nullifier_with_refund")
         );
         assert_eq!(metrics::span_operation("something.new"), Some("other"));
         assert_eq!(metrics::span_operation("id-42-suffixed"), Some("other"));
