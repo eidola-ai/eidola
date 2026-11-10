@@ -151,6 +151,9 @@ struct ThemeState {
     settings: ThemeSettings,
     applied: Option<(ThemeMode, LightCharacter)>,
     zone_cache: Option<(String, Option<(f64, f64)>)>,
+    /// The native window appearance last forced on the app ([`sync_chrome`]),
+    /// `None` while the windows follow the OS.
+    chrome: Option<gpui::WindowAppearance>,
 }
 
 impl Global for ThemeState {}
@@ -347,6 +350,7 @@ pub fn install(cx: &mut App) {
             },
             applied: None,
             zone_cache: None,
+            chrome: None,
         });
     }
     apply(None, cx);
@@ -357,6 +361,12 @@ pub fn install(cx: &mut App) {
 /// window. The one path through which the theme ever changes.
 pub fn apply(window: Option<&mut Window>, cx: &mut App) {
     let settings = cx.global::<ThemeState>().settings;
+    // Under `system` the OS appearance is an input, so any override has to be
+    // gone before it is read — a forced appearance is what `effectiveAppearance`
+    // would otherwise report back.
+    if settings.appearance == AppearanceSetting::System {
+        sync_chrome(None, cx);
+    }
     let system_is_dark = ThemeMode::from(
         window
             .as_ref()
@@ -373,6 +383,9 @@ pub fn apply(window: Option<&mut Window>, cx: &mut App) {
             DayPhases::Clock
         };
     let (mode, character) = resolve(settings, system_is_dark, now.minutes, phases);
+    if settings.appearance != AppearanceSetting::System {
+        sync_chrome(Some(mode), cx);
+    }
 
     {
         let theme = Theme::global_mut(cx);
@@ -391,6 +404,39 @@ pub fn apply(window: Option<&mut Window>, cx: &mut App) {
     for handle in cx.windows() {
         handle.update(cx, |_, window, _| window.refresh()).ok();
     }
+}
+
+/// Make the native window chrome — the traffic lights, the window border —
+/// match the palette on screen. AppKit draws them from the app's
+/// `NSAppearance`, so a Night palette under a light system (or Day under a
+/// dark one) left light-mode traffic lights on a dark page.
+///
+/// `None` clears the override and lets the windows follow the OS, which is
+/// what `system` wants and what keeps its live Light/Dark tracking working: a
+/// forced appearance stops windows reporting system changes, and is what the
+/// OS appearance would read back as. Every other setting ignores the OS, so it
+/// can force the resolved mode. Only a change is sent, so re-applying on the
+/// clock does not keep re-setting the app's appearance.
+fn sync_chrome(mode: Option<ThemeMode>, cx: &mut App) {
+    let wanted = mode.map(|m| {
+        if m.is_dark() {
+            gpui::WindowAppearance::Dark
+        } else {
+            gpui::WindowAppearance::Light
+        }
+    });
+    if cx.global::<ThemeState>().chrome != wanted {
+        cx.global_mut::<ThemeState>().chrome = wanted;
+        cx.set_window_appearance(wanted);
+    }
+}
+
+/// Test seam: the native window appearance currently forced on the app, or
+/// `None` while windows follow the OS. The platform half is a no-op under the
+/// test platform, so this is what can be asserted.
+#[doc(hidden)]
+pub fn chrome_override_for_test(cx: &App) -> Option<gpui::WindowAppearance> {
+    cx.global::<ThemeState>().chrome
 }
 
 /// Snapshot the focus ring's two colors out of the palette that was just
@@ -441,6 +487,9 @@ pub fn apply_fixed(mode: ThemeMode, character: LightCharacter, cx: &mut App) {
         theme.dark_theme = Rc::new(circadian_night(character, scale));
     }
     Theme::change(mode, None, cx);
+    if cx.has_global::<ThemeState>() {
+        sync_chrome(Some(mode), cx);
+    }
     snapshot_ring_colors(cx);
     for handle in cx.windows() {
         handle.update(cx, |_, window, _| window.refresh()).ok();
@@ -474,9 +523,15 @@ pub fn wire_config(config: &Entity<ConfigStore>, cx: &mut App) {
     })
     .detach();
 
-    // The clock: once a minute, re-resolve and re-apply if the (mode,
-    // character) pair moved to a new slot. App-lifetime task — the same
-    // sanctioned `.detach()` as above.
+    start_clock(cx);
+}
+
+/// Start the clock task that advances the palette across slot boundaries:
+/// once a minute, re-resolve and re-apply if the (mode, character) pair moved
+/// to a new slot. Called once per process — by [`wire_config`], or by a host
+/// that drives the theme through [`set_settings`] instead of a `ConfigStore`.
+/// App-lifetime task — the same sanctioned `.detach()` as the config observer.
+pub fn start_clock(cx: &mut App) {
     cx.spawn(async move |cx: &mut AsyncApp| {
         loop {
             cx.background_executor()
@@ -490,8 +545,15 @@ pub fn wire_config(config: &Entity<ConfigStore>, cx: &mut App) {
     .detach();
 }
 
-/// Install new settings and re-apply if they changed.
-fn set_settings(settings: ThemeSettings, cx: &mut App) {
+/// The settings the theme is currently resolved from.
+pub fn settings(cx: &App) -> ThemeSettings {
+    cx.global::<ThemeState>().settings
+}
+
+/// Install new settings and re-apply if they changed. The production app
+/// reaches this through [`wire_config`]; a host without a `ConfigStore` calls
+/// it directly (after [`install`]).
+pub fn set_settings(settings: ThemeSettings, cx: &mut App) {
     let state = cx.global_mut::<ThemeState>();
     if state.settings != settings {
         state.settings = settings;

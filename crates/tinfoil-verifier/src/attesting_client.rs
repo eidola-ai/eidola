@@ -617,7 +617,9 @@ where
                 break;
             }
 
-            if body.len() + size > MAX_BODY {
+            // Never `body.len() + size`: `size` is the peer's, and the
+            // release profile builds without overflow checks.
+            if size > MAX_BODY - body.len() {
                 return Err(Error::Connector("chunked body too large".to_string()));
             }
             while rest.len() < size + 2 {
@@ -664,5 +666,43 @@ where
         Err(Error::Connector(
             "attestation response missing Content-Length and not chunked".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run `read_http1_response` over an in-memory pipe whose far end has
+    /// already written `response` and hung up.
+    async fn read_response(response: &[u8]) -> Result<Vec<u8>, Error> {
+        let (near, mut far) = tokio::io::duplex(64 * 1024);
+        far.write_all(response).await.unwrap();
+        drop(far);
+        let mut io = TokioIo::new(TokioIo::new(near));
+        read_http1_response(&mut io).await
+    }
+
+    #[tokio::test]
+    async fn a_chunk_size_past_the_body_bound_is_refused_not_wrapped() {
+        // The peer is unauthenticated here: this response is read before
+        // the document it carries is verified. A one-byte chunk, then a
+        // chunk claiming `usize::MAX` bytes — `1 + usize::MAX` wraps to 0
+        // when overflow checks are off (the release profile), slipping
+        // under the bound and panicking on the slice that follows.
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                         1\r\nA\r\nffffffffffffffff\r\nB";
+        let err = read_response(response).await.unwrap_err();
+        assert!(
+            err.to_string().contains("chunked body too large"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_is_reassembled() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                         3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\n\r\n";
+        assert_eq!(read_response(response).await.unwrap(), b"abcde");
     }
 }

@@ -434,6 +434,12 @@ pub struct MarkdownEditorState {
     /// so a table broken by one event keeps its line structure across
     /// the following events while the user repairs it in place.
     table_guard: update::TableGuard,
+    /// The directory a relative image destination resolves against — the
+    /// folder of the file this buffer was opened from. `None` (the default)
+    /// keeps a relative destination an embedded-asset path. Host-supplied
+    /// render-time state, like the embed map: see
+    /// [`set_image_base_dir`](Self::set_image_base_dir).
+    pub(crate) image_base_dir: Option<std::path::PathBuf>,
     /// Focus/blur observers that translate gpui focus transitions into
     /// outward [`MarkdownEditorEvent::Focus`]/[`Blur`](MarkdownEditorEvent::Blur).
     /// Held so they live as long as the entity.
@@ -517,6 +523,7 @@ impl MarkdownEditorState {
             redo_stack: Vec::new(),
             coalesce_anchor: None,
             table_guard: update::TableGuard::default(),
+            image_base_dir: None,
             _focus_subscriptions,
         }
     }
@@ -680,6 +687,22 @@ impl MarkdownEditorState {
         self.coalesce_anchor = None;
         cx.emit(MarkdownEditorEvent::Change);
         cx.notify();
+    }
+
+    /// Set the directory a relative image destination (`![](fig.png)`)
+    /// resolves against — a host editing a file on disk passes the file's
+    /// parent so images beside the document load. Render-time state: the
+    /// buffer is untouched, so no [`MarkdownEditorEvent::Change`] is emitted.
+    pub fn set_image_base_dir(&mut self, dir: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
+        if self.image_base_dir != dir {
+            self.image_base_dir = dir;
+            cx.notify();
+        }
+    }
+
+    /// The directory relative image destinations resolve against, if any.
+    pub fn image_base_dir(&self) -> Option<&std::path::Path> {
+        self.image_base_dir.as_deref()
     }
 
     /// Clear the buffer. Convenience for `set_value("")`.
