@@ -4415,7 +4415,7 @@ impl Inner {
         Ok((waiting, unresolved))
     }
 
-    /// Before a conversion a request or the reader asked for: ask again for
+    /// Before a conversion the reader asked for: ask again for
     /// this account's pending issuances, and refuse to convert beside one
     /// that stays unresolved. A pending issuance may already have been paid
     /// for, and each is asked for again until it is answered, so converting
@@ -4434,19 +4434,6 @@ impl Inner {
             });
         }
         Ok(recovered)
-    }
-
-    /// [`Inner::resolve_pending_issuances_locked`] on a task of its own, for
-    /// the same reasons as [`Inner::allocate_on_its_own_task`].
-    async fn resolve_pending_issuances_on_its_own_task(&self) -> Result<Vec<String>, AppError> {
-        let Some(inner) = self.self_ref.upgrade() else {
-            return Err(AppError::Credential {
-                message: "the core is shutting down".into(),
-            });
-        };
-        tokio::spawn(async move { inner.resolve_pending_issuances_locked().await })
-            .await
-            .map_err(join_err)?
     }
 
     async fn available_models(&self) -> Result<Vec<ModelInfo>, AppError> {
@@ -6952,9 +6939,17 @@ impl Inner {
     /// 1. The wallet covers the hold, alone or as a drain and a fill → use it.
     /// 2. Otherwise `need` is what is missing: the whole hold, or the hold
     ///    less the first credential's balance when that one is to be drained.
-    ///    No account configured → [`AppError::NoAccount`] (the UI routes to
-    ///    account creation).
-    /// 3. Account exists and the available balance covers `need` → allocate
+    ///    A stranded hold is asked for first
+    ///    ([`Inner::recover_stranded_spends`], unlinked), and once more
+    ///    during any wait below. No account configured →
+    ///    [`AppError::NoAccount`] (the UI routes to account creation).
+    /// 3. An issuance of the account's is pending → nothing is converted, and
+    ///    nothing is sent to the account surface: the pending issuance is
+    ///    never asked for again from here (that is the provisioner's pass and
+    ///    the explicit doors'), and the request waits as in 4 with nothing
+    ///    convertible; when the wait cannot help,
+    ///    [`AppError::ProvisioningTimeout`]. Otherwise the available balance
+    ///    covers `need` → allocate
     ///    `min(available, max(DEFAULT_ALLOCATION_CREDITS, need))` (the pool)
     ///    and choose again: the new credential is the fill, or the whole.
     /// 4. Balance can't cover it but a mid-spend credential whose own
@@ -7000,7 +6995,7 @@ impl Inner {
             // never converts beside the ahead-of-need provisioner, and looks
             // again once it has it: a background issuance that landed while it
             // waited covers this turn without a second conversion.
-            let (balances, need) = {
+            let (convertible, need) = {
                 // Bounded by the queue's own deadline: this wait happens with
                 // `spend_gate` held, so an unbounded one would stall every
                 // paid turn behind it.
@@ -7010,25 +7005,28 @@ impl Inner {
                     Err(need) => need,
                 };
                 // An issuance still pending may already have been paid for,
-                // so it is asked for again before anything new is converted,
-                // and nothing is converted beside one left unresolved.
-                if !self
-                    .resolve_pending_issuances_on_its_own_task()
-                    .await?
-                    .is_empty()
-                {
-                    continue;
+                // so nothing is converted beside it. Nor is it asked for
+                // again from here: that request is account-authenticated,
+                // and this pass may just have asked for a stranded hold. The
+                // request can still be paid by what is in flight.
+                let (waiting, unresolved) = self.pending_issuance_counts().await?;
+                if waiting + unresolved > 0 {
+                    (None, need)
+                } else {
+                    let balances = self.account_balances_bounded().await?;
+                    if balances.available >= need {
+                        // Enough to allocate at least what is missing — grow
+                        // the pool, and choose again.
+                        let amount = auto_allocation_amount(balances.available, need)?;
+                        self.allocate_on_its_own_task(amount).await?;
+                        continue;
+                    }
+                    (Some(balances.available), need)
                 }
-                let balances = self.account_balances_bounded().await?;
-                if balances.available >= need {
-                    // Enough to allocate at least what is missing — grow the
-                    // pool, and choose again.
-                    let amount = auto_allocation_amount(balances.available, need)?;
-                    self.allocate_on_its_own_task(amount).await?;
-                    continue;
-                }
-                (balances, need)
             };
+            // What the account could still be converted into: nothing while
+            // an issuance is pending.
+            let available = convertible.unwrap_or(0);
 
             // Balance can't cover a fresh allocation. Waiting only helps if a
             // concurrent turn holds coverage this turn could actually use once
@@ -7050,7 +7048,7 @@ impl Inner {
                 .await?
                 .into_iter()
                 .map(|c| c.credits)
-                .chain(std::iter::once(balances.available))
+                .chain(std::iter::once(available))
                 .collect();
             let recoverable = settlement_could_cover(&in_flight, &held, charge_credits);
             if recoverable && tokio::time::Instant::now() < deadline {
@@ -7095,7 +7093,7 @@ impl Inner {
             // is taken again rather than refused on the stale amount.
             match chosen_inputs(db_conn, charge_credits).await? {
                 Ok(inputs) => return Ok(inputs),
-                Err(missing) if missing < need && balances.available >= missing => continue,
+                Err(missing) if missing < need && available >= missing => continue,
                 Err(_) => {}
             }
             if recoverable {
@@ -7106,8 +7104,16 @@ impl Inner {
                     ),
                 });
             }
+            let Some(available) = convertible else {
+                return Err(AppError::ProvisioningTimeout {
+                    message: "an earlier credit conversion has not been answered yet, and \
+                              nothing is converted beside it; it is asked for again \
+                              separately, so try again later"
+                        .into(),
+                });
+            };
             return Err(AppError::InsufficientBalance {
-                available: balances.available,
+                available,
                 required: need,
             });
         }

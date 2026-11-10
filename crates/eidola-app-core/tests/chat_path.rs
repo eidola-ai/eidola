@@ -11756,9 +11756,10 @@ fn the_long_lived_process_asks_again_for_a_stranded_hold() {
 }
 
 /// A turn retried after its conversion's answer was lost converts nothing
-/// new: the pending issuance may already have been paid for, so it is refused
-/// while that one is too young to ask for again, and once it can be asked
-/// for, the stored answer pays the turn. One debit, however many attempts.
+/// new and sends nothing to the account surface: the pending issuance may
+/// already have been paid for, so the turn is refused, however old the
+/// pending issuance is, until the issuance's own doors have asked for it
+/// again. One debit, however many attempts.
 #[test]
 fn a_turn_retried_after_a_lost_conversion_never_converts_again() {
     run(|| {
@@ -11770,6 +11771,7 @@ fn a_turn_retried_after_a_lost_conversion_never_converts_again() {
             .expect_err("the conversion's answer never arrived");
         assert_eq!(mock.issuance_debits(), 1);
 
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
         for _ in 0..3 {
             let err = core
                 .runtime()
@@ -11780,14 +11782,110 @@ fn a_turn_retried_after_a_lost_conversion_never_converts_again() {
                 "got {err:?}"
             );
         }
-        assert_eq!(mock.issuance_requests(), 1, "each retry converted again");
+        assert_eq!(
+            mock.issuance_requests(),
+            1,
+            "a retried turn converted again, or re-sent the pending issuance"
+        );
 
-        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        let recovery = core
+            .runtime()
+            .block_on(core.recover_pending_issuances())
+            .expect("recovery");
+        assert_eq!(recovery.recovered.len(), 1);
         core.runtime()
             .block_on(core.chat("hi".into(), MODEL.into(), None))
             .expect("the recovered credential pays the turn");
         assert_eq!(mock.issuance_requests(), 2);
         assert_eq!(mock.issuance_debits(), 1, "the account was debited once");
+    });
+}
+
+/// A request that has just asked for a stranded hold sends nothing
+/// account-authenticated after it: with the hold still provisional and an
+/// issuance pending and old enough to retry, the request is refused without
+/// the retry, which stays with the provisioner and the explicit doors.
+#[test]
+fn a_request_never_retries_an_issuance_beside_a_spend_recovery() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            refund: RefundMode::ProvisionalFirst(u64::MAX),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let allocate = |core: &AppCore| {
+            core.runtime()
+                .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+        };
+        allocate(&core).expect("the wallet's one credential");
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("the answer arrives; only its settlement waits");
+        mock.issuance_knobs().lose_next(1);
+        allocate(&core).expect_err("lost");
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        core.test_set_issuance_timeouts(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(600),
+        );
+
+        let (asked, requests) = (mock.refund_hits(), mock.issuance_requests());
+        let err = core
+            .runtime()
+            .block_on(core.chat("and again".into(), MODEL.into(), None))
+            .expect_err("the hold is provisional and nothing may be converted");
+        assert!(
+            matches!(err, AppError::ProvisioningTimeout { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            mock.refund_hits() > asked,
+            "the stranded hold was asked for"
+        );
+        assert_eq!(
+            mock.issuance_requests(),
+            requests,
+            "an issuance retry followed the recovery of a spend"
+        );
+    });
+}
+
+/// A pending issuance blocks conversion, not payment: a request made while
+/// another turn is flying with the wallet's only credential still waits for
+/// that turn's refund and is paid by it.
+#[test]
+fn a_pending_issuance_does_not_stop_a_request_waiting_for_a_refund() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat_delay_ms: 600,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let allocate = |core: &AppCore| {
+            core.runtime()
+                .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+        };
+        allocate(&core).expect("the wallet's one credential");
+        mock.issuance_knobs().lose_next(1);
+        allocate(&core).expect_err("lost");
+        let requests = mock.issuance_requests();
+
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                core.runtime()
+                    .block_on(core.chat("first".into(), MODEL.into(), None))
+            });
+            while mock.chat_hits() == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            core.runtime()
+                .block_on(core.chat("second".into(), MODEL.into(), None))
+                .expect("paid by the first turn's refund");
+            first.join().unwrap().expect("the first turn");
+        });
+        assert_eq!(mock.chat_hits(), 2);
+        assert_eq!(mock.issuance_requests(), requests, "nothing was converted");
     });
 }
 
