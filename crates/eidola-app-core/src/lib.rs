@@ -3316,43 +3316,63 @@ impl Inner {
         // already on file from before that was so, or rotated out of issuance
         // since, keeps a stale expiry unless the advertised one overwrites it.
         let db_conn = self.db_conn().await?;
-        let mut expiry_moved = false;
-        for advertised in keys
-            .data
-            .iter()
-            .filter(|k| k.domain_separator == expected_ds)
-        {
-            // A malformed entry is skipped, not fatal: this stores *every*
-            // accepted key, and one bad grace-window entry must not block
-            // issuance. The key issuance selects is parsed again, strictly, by
-            // the caller.
-            let (advertised_public_key, expires_at) = match (
-                URL_SAFE_NO_PAD.decode(&advertised.public_key),
-                iso_to_ms(&advertised.accept_until),
-            ) {
-                (Ok(public_key), Ok(expires_at)) => (public_key, expires_at),
-                _ => {
-                    eprintln!(
-                        "warning: skipping a malformed advertised issuer key {}",
-                        advertised.id
-                    );
-                    continue;
-                }
-            };
-            let params_hash = blake3::hash(advertised.domain_separator.as_bytes())
-                .to_hex()
-                .to_string();
-            expiry_moved |= db::upsert_issuer_key(
-                &db_conn,
-                &advertised.id,
-                &params_hash,
-                &advertised_public_key,
-                advertised.domain_separator.as_bytes(),
-                expires_at,
-                now,
-            )
-            .await?;
+        // One transaction for the whole batch: committed one key at a time, a
+        // write failure partway through would leave the refresh half applied
+        // while the caller treats it as wholly failed — with a revived
+        // credential on file that nobody announces or looks for.
+        db::begin_write(&db_conn).await?;
+        let stored = async {
+            let mut expiry_moved = false;
+            for advertised in keys
+                .data
+                .iter()
+                .filter(|k| k.domain_separator == expected_ds)
+            {
+                // A malformed entry is skipped, not fatal: this stores *every*
+                // accepted key, and one bad grace-window entry must not block
+                // issuance. The key issuance selects is parsed again, strictly, by
+                // the caller.
+                let (advertised_public_key, expires_at) = match (
+                    URL_SAFE_NO_PAD.decode(&advertised.public_key),
+                    iso_to_ms(&advertised.accept_until),
+                ) {
+                    (Ok(public_key), Ok(expires_at)) => (public_key, expires_at),
+                    _ => {
+                        eprintln!(
+                            "warning: skipping a malformed advertised issuer key {}",
+                            advertised.id
+                        );
+                        continue;
+                    }
+                };
+                let params_hash = blake3::hash(advertised.domain_separator.as_bytes())
+                    .to_hex()
+                    .to_string();
+                expiry_moved |= db::upsert_issuer_key(
+                    &db_conn,
+                    &advertised.id,
+                    &params_hash,
+                    &advertised_public_key,
+                    advertised.domain_separator.as_bytes(),
+                    expires_at,
+                    now,
+                )
+                .await?;
+            }
+            Ok::<bool, AppError>(expiry_moved)
         }
+        .await;
+        let expiry_moved = match stored {
+            Ok(moved) => {
+                db_conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+                moved
+            }
+            Err(e) => {
+                // Best-effort rollback; propagate the original error regardless.
+                let _ = db_conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
         // Rewriting an expiry flips credentials between `expired` and
         // `active`/`spending` in the lifecycle view: a durable wallet change,
         // and every durable commit broadcasts its invalidation.
