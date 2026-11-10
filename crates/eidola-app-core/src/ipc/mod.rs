@@ -1130,6 +1130,10 @@ impl WireError {
                 ("RegenerationInFlight", json!({ "item_id": item_id }))
             }
             AppError::ModelUnavailable { model } => ("ModelUnavailable", json!({ "model": model })),
+            AppError::ModelNoticeStale { participant_id } => (
+                "ModelNoticeStale",
+                json!({ "participant_id": participant_id }),
+            ),
         };
         Self::build(kind, e.to_string(), fields)
     }
@@ -1223,6 +1227,9 @@ impl WireError {
                 item_id: s("item_id")?,
             },
             "ModelUnavailable" => AppError::ModelUnavailable { model: s("model")? },
+            "ModelNoticeStale" => AppError::ModelNoticeStale {
+                participant_id: s("participant_id")?,
+            },
             _ => return None,
         })
     }
@@ -1960,6 +1967,9 @@ mod tests {
             },
             AppError::ModelUnavailable {
                 model: "gemma4-31b".into(),
+            },
+            AppError::ModelNoticeStale {
+                participant_id: "agent".into(),
             },
         ];
         for e in &cases {

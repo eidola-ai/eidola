@@ -68,6 +68,9 @@ pub use wallet::WalletStore;
 #[derive(Clone)]
 pub struct Stores {
     app_core: Option<Arc<AppCore>>,
+    /// A stub scene's Eidola model catalog (`StoresStub::model_catalog`);
+    /// with a core, the core's own is read instead.
+    stub_model_catalog: &'static [eidola_app_core::model_catalog::CatalogRow],
     pub config: Entity<ConfigStore>,
     pub backends: Entity<BackendsStore>,
     pub models: Entity<ModelsStore>,
@@ -193,6 +196,7 @@ impl Stores {
         let record = cx.new(|_| RecordStore::new());
         Self {
             app_core: None,
+            stub_model_catalog: fixture.model_catalog,
             config,
             backends,
             models,
@@ -235,6 +239,7 @@ impl Stores {
         let record = cx.new(|_| RecordStore::new());
         Self {
             app_core,
+            stub_model_catalog: &[],
             config,
             backends,
             models,
@@ -257,6 +262,29 @@ impl Stores {
     /// by views that need to gate "do I have a backend?" — `None` means stub.
     pub fn app_core(&self) -> Option<Arc<AppCore>> {
         self.app_core.clone()
+    }
+
+    /// The identity of the Eidola model a selection names
+    /// (`AppCore::model_identity`; in a stub scene, from its fixture catalog).
+    /// A pure read of the catalog compiled into the build.
+    pub fn model_identity(
+        &self,
+        selection: &str,
+    ) -> Option<eidola_app_core::model_catalog::ModelIdentity> {
+        match &self.app_core {
+            Some(core) => core.model_identity(selection),
+            None => {
+                let mref = eidola_app_core::parse_model_ref(selection);
+                (mref.backend_id == eidola_app_core::EIDOLA_BACKEND_ID)
+                    .then(|| {
+                        eidola_app_core::model_catalog::identity(
+                            self.stub_model_catalog,
+                            &mref.model,
+                        )
+                    })
+                    .flatten()
+            }
+        }
     }
 }
 
@@ -304,6 +332,9 @@ pub struct StoresStub {
     pub proxy_settings: Option<eidola_app_core::proxy::ProxySettings>,
     /// Fixture proxy keys. An empty list leaves the listing `NotLoaded`.
     pub proxy_keys: Vec<eidola_app_core::proxy::ProxyKeyInfo>,
+    /// The Eidola model catalog the scene reads identities and pins from
+    /// (empty, like the shipped one, by default).
+    pub model_catalog: &'static [eidola_app_core::model_catalog::CatalogRow],
 }
 
 /// Install the single app-lifetime bus bridge: a task on `AppCore`'s tokio

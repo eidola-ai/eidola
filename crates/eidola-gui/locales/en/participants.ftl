@@ -48,3 +48,15 @@ participants-model-retired = These weights are retired. Choose another model.
 participants-model-weights = Weights { $hash } from { $source }
 # Where to learn how to check the weights independently.
 participants-model-verify = Check these weights yourself: { $url }
+# A model choice pinned to exact weights, in the picker and on the row: the
+# tag the weights were chosen under, and the start of their hash.
+participants-model-pinned = { $model }, pinned to { $hash }
+# The one-click answer to "newer weights are available": re-pin this agent, in
+# this conversation, to the weights its tag names now.
+participants-model-switch-newer = Switch to the newer weights
+# Dismiss a "model updated" notice. It comes back if the tag moves again.
+participants-model-dismiss-update = Dismiss
+# The accessible names of the two notice actions, naming the participant they
+# act on: the same verb repeats on every row with the notice.
+participants-model-switch-newer-for = Switch { $name } to the newer weights
+participants-model-dismiss-update-for = Dismiss the model update for { $name }

@@ -112,11 +112,14 @@ pub enum ModelNotice {
 ///
 /// `reference` is the Eidola model reference (without `@eidola`);
 /// `last_sha256` is the hash the choice's last answer came from, if it has
-/// one; `today` is the current date, `YYYY-MM-DD`.
+/// one; `acknowledged_sha256` the weights the user last dismissed an
+/// `Updated` notice for, which keeps that notice dismissed while the tag
+/// names them; `today` is the current date, `YYYY-MM-DD`.
 pub fn notices(
     rows: &[CatalogRow],
     reference: &str,
     last_sha256: Option<&str>,
+    acknowledged_sha256: Option<&str>,
     today: &str,
 ) -> Vec<ModelNotice> {
     let Ok(parsed) = ModelReference::parse(reference) else {
@@ -130,6 +133,7 @@ pub fn notices(
         ModelReference::Follow { tag } => {
             if let Some(previous) = last_sha256
                 && previous != row.sha256
+                && acknowledged_sha256 != Some(row.sha256)
             {
                 out.push(ModelNotice::Updated {
                     tag: tag.to_string(),
@@ -161,6 +165,24 @@ pub fn notices(
         Lifecycle::Retired { .. } => out.push(ModelNotice::Retired),
     }
     out
+}
+
+/// The pin a `NewerAvailable` notice among `notices` offers to switch to:
+/// the tag's label with the newer weights, `tag@sha256:<hex>`.
+pub fn newer_pin(notices: &[ModelNotice]) -> Option<String> {
+    notices.iter().find_map(|n| match n {
+        ModelNotice::NewerAvailable { tag, newer_sha256 } => Some(pinned(Some(tag), newer_sha256)),
+        _ => None,
+    })
+}
+
+/// The weights an `Updated` notice among `notices` says the tag names now,
+/// which dismissing it records.
+pub fn updated_to(notices: &[ModelNotice]) -> Option<&str> {
+    notices.iter().find_map(|n| match n {
+        ModelNotice::Updated { current_sha256, .. } => Some(current_sha256.as_str()),
+        _ => None,
+    })
 }
 
 /// A model's identity, for a user to see and check independently
@@ -293,10 +315,10 @@ pub(crate) mod tests {
 
     #[test]
     fn a_followed_tag_that_moved_says_the_model_was_updated() {
-        assert_eq!(notices(ROWS, "flash", Some(FLASH_2), TODAY), vec![]);
-        assert_eq!(notices(ROWS, "flash", None, TODAY), vec![]);
+        assert_eq!(notices(ROWS, "flash", Some(FLASH_2), None, TODAY), vec![]);
+        assert_eq!(notices(ROWS, "flash", None, None, TODAY), vec![]);
         assert_eq!(
-            notices(ROWS, "flash", Some(FLASH_1), TODAY),
+            notices(ROWS, "flash", Some(FLASH_1), None, TODAY),
             vec![ModelNotice::Updated {
                 tag: "flash".into(),
                 previous_sha256: FLASH_1.into(),
@@ -306,12 +328,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_dismissed_update_stays_dismissed_until_the_tag_moves_again() {
+        assert_eq!(
+            notices(ROWS, "flash", Some(FLASH_1), Some(FLASH_2), TODAY),
+            vec![]
+        );
+        // Dismissed for other weights than the tag names now: shown again.
+        assert_eq!(
+            notices(ROWS, "flash", Some(FLASH_1), Some(OLD), TODAY).len(),
+            1
+        );
+    }
+
+    /// The pinned spelling of the newer weights a `NewerAvailable` notice
+    /// offers, which the one-click switch writes.
+    #[test]
+    fn a_newer_weights_notice_names_the_pin_to_switch_to() {
+        let pin = format!("flash@sha256:{FLASH_1}");
+        let n = notices(ROWS, &pin, None, None, TODAY);
+        assert_eq!(newer_pin(&n), Some(format!("flash@sha256:{FLASH_2}")));
+        assert_eq!(newer_pin(&notices(ROWS, "flash", None, None, TODAY)), None);
+    }
+
+    #[test]
     fn a_pin_whose_tag_moved_is_offered_the_newer_model_and_warned_of_retirement() {
         assert_eq!(
             notices(
                 ROWS,
                 &format!("flash@sha256:{FLASH_1}"),
                 Some(FLASH_1),
+                None,
                 TODAY
             ),
             vec![
@@ -326,23 +372,23 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(
-            notices(ROWS, &format!("flash@sha256:{FLASH_2}"), None, TODAY),
+            notices(ROWS, &format!("flash@sha256:{FLASH_2}"), None, None, TODAY),
             vec![]
         );
         assert_eq!(
-            notices(ROWS, &format!("sha256:{OLD}"), None, TODAY),
+            notices(ROWS, &format!("sha256:{OLD}"), None, None, TODAY),
             vec![ModelNotice::Retiring {
                 retire_after: "2026-01-01".into(),
                 past: true,
             }]
         );
         assert_eq!(
-            notices(ROWS, "gone", None, TODAY),
+            notices(ROWS, "gone", None, None, TODAY),
             vec![ModelNotice::Retired]
         );
-        assert_eq!(notices(ROWS, "nothing", None, TODAY), vec![]);
+        assert_eq!(notices(ROWS, "nothing", None, None, TODAY), vec![]);
         assert_eq!(
-            notices(ROWS, "not a reference", Some(FLASH_1), TODAY),
+            notices(ROWS, "not a reference", Some(FLASH_1), None, TODAY),
             vec![]
         );
     }

@@ -742,6 +742,8 @@ mod tests {
     fn a_models_entry_names_the_backend_it_is_reached_through() {
         let entry = model_entry(&crate::ModelInfo {
             id: "gemma@local".into(),
+            sha256: None,
+            tags: Vec::new(),
             context_length: 0,
             max_output_tokens: None,
             output_budget_class: None,

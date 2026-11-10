@@ -29,6 +29,8 @@
 //! private copy. Only the transient editing bits (which row is open, its input
 //! buffers, which picker is open) are view fields.
 
+use std::collections::HashMap;
+
 use eidola_app_core::{
     NewParticipant, ParticipantInfo, ParticipantOverride, ParticipantReference, ParticipantUpdate,
 };
@@ -189,6 +191,16 @@ pub(crate) struct InviteForm {
 pub(crate) struct TemplateForm {
     focus: gpui::FocusHandle,
     title: Entity<InputState>,
+}
+
+/// A switch to newer weights sent from a notice, waiting to be seen in the
+/// roster (`SpaceView::inspector_pending_switches`, keyed by participant).
+#[derive(Clone, Debug)]
+pub(crate) struct PendingSwitch {
+    /// The participant's model the switch replaces.
+    previous: Option<String>,
+    /// The pin it writes, `tag@sha256:<hex>@eidola`.
+    newer: String,
 }
 
 /// Which model picker is open. At most one at a time — they share one scroll
@@ -636,6 +648,7 @@ impl SpaceView {
         let system_prompt = edit.system_prompt.read(cx).value().trim().to_string();
         let is_agent = edit.kind == "agent";
         let pid = edit.participant_id.clone();
+        let defer_model = self.defers_model_to_switch(&edit);
 
         if edit.is_referenced && edit.mode == EditMode::OverrideHere {
             // Per-membership overrides. An empty model/prompt on a referenced
@@ -648,14 +661,19 @@ impl SpaceView {
                 ..Default::default()
             };
             if is_agent {
-                ov.model_ref = Some(edit.model_ref.clone().filter(|s| !s.is_empty()));
+                if !defer_model {
+                    ov.model_ref = Some(edit.model_ref.clone().filter(|s| !s.is_empty()));
+                }
                 ov.system_prompt = Some((!system_prompt.is_empty()).then_some(system_prompt));
             }
             self.stores
                 .participants
                 .update(cx, |s, cx| s.set_override(space_id, pid, ov, cx));
         } else {
-            let update = edit.as_everywhere_update(cx);
+            let mut update = edit.as_everywhere_update(cx);
+            if defer_model {
+                update.model_ref = None;
+            }
             // The premise the editor was seeded on: an owned row belongs to this
             // space, a referenced one is a shared identity. Either can move
             // under an open editor (promotion), and the write is where that is
@@ -741,13 +759,35 @@ impl SpaceView {
     /// carries the everywhere-vs-here fork this one was seeded without. Nothing
     /// else is view work — the roster's "shared" tag falls out of the same
     /// re-list.
+    /// **A write from the editor while a switch to newer weights is in flight
+    /// leaves the model to the switch.** The editor still shows the model the
+    /// switch replaces (it follows only once the roster shows the switch
+    /// landed), and the store runs a Save or Share after the switch: writing
+    /// that model would put the old pin back. So where both write the same
+    /// place — an owned agent's row (Save, or the persona Share carries), a
+    /// shared agent's "This space" override — an unchanged model is left out;
+    /// a model the reader picked is still written, and a shared agent's
+    /// "Everyone" save writes its global config, which the switch does not
+    /// touch.
+    fn defers_model_to_switch(&self, edit: &ParticipantEdit) -> bool {
+        let writes_this_space = !(edit.is_referenced && edit.mode == EditMode::Everywhere);
+        writes_this_space
+            && self
+                .inspector_pending_switches
+                .get(&edit.participant_id)
+                .is_some_and(|p| edit.model_ref == p.previous)
+    }
+
     pub fn inspector_confirm_promote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let space_id = self.space_id(cx);
         let held = self.inspector_field_focused(window, cx);
         let Some(edit) = self.inspector_participant_edit.take() else {
             return;
         };
-        let update = edit.as_everywhere_update(cx);
+        let mut update = edit.as_everywhere_update(cx);
+        if self.defers_model_to_switch(&edit) {
+            update.model_ref = None;
+        }
         if update.label.as_deref().is_some_and(str::is_empty) {
             self.inspector_participant_edit = Some(edit);
             return;
@@ -1192,6 +1232,7 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.apply_landed_switch(cx);
         let Some((pid, was_referenced)) = self
             .inspector_participant_edit
             .as_ref()
@@ -1219,6 +1260,68 @@ impl SpaceView {
         self.inspector_participant_edit = None;
         self.inspector_participant_picker = None;
         self.hand_back_inspector_focus(held, window, cx);
+    }
+
+    /// Apply a pending switch to newer weights to the open editor once the
+    /// roster shows it landed, and drop it once the roster shows it never
+    /// will. While the write is in flight (the row still on the model the
+    /// switch replaced) it waits.
+    ///
+    /// Landed: an editor writing to this space (an owned agent, or a shared
+    /// one's "This space" draft) whose selection is still the model the switch
+    /// replaced takes the newer pin, and a shared agent's cached per-space
+    /// source does too, so the mode fork re-seeds "This space" with it. A
+    /// shared agent's "Everyone" draft is its global config, which the switch
+    /// does not touch. Anything else — the row gone, or on a third model
+    /// (another window's write) — drops the pending switch and leaves the
+    /// editor alone. Each participant's switch settles on its own, so one
+    /// row's switch never discards another's.
+    fn apply_landed_switch(&mut self, cx: &mut Context<Self>) {
+        if self.inspector_pending_switches.is_empty() {
+            return;
+        }
+        let space_id = self.space_id(cx);
+        let row_models: HashMap<String, Option<String>> = {
+            let store = self.stores.participants.read(cx);
+            match store.participants(&space_id).value() {
+                Some(list) => list
+                    .iter()
+                    .filter(|p| self.inspector_pending_switches.contains_key(&p.id))
+                    .map(|p| (p.id.clone(), p.model_ref.clone()))
+                    .collect(),
+                None => return,
+            }
+        };
+        let ids: Vec<String> = self.inspector_pending_switches.keys().cloned().collect();
+        for participant_id in ids {
+            let Some(pending) = self.inspector_pending_switches.get(&participant_id) else {
+                continue;
+            };
+            match row_models.get(&participant_id) {
+                Some(model) if *model == pending.previous => {}
+                Some(model) if model.as_deref() == Some(pending.newer.as_str()) => {
+                    let Some(pending) = self.inspector_pending_switches.remove(&participant_id)
+                    else {
+                        continue;
+                    };
+                    if let Some(edit) = self.inspector_participant_edit.as_mut()
+                        && edit.participant_id == participant_id
+                    {
+                        if !(edit.is_referenced && edit.mode == EditMode::Everywhere)
+                            && edit.model_ref == pending.previous
+                        {
+                            edit.model_ref = Some(pending.newer.clone());
+                        }
+                        if let Some(reference) = edit.reference.as_mut() {
+                            reference.override_model_ref = Some(pending.newer);
+                        }
+                    }
+                }
+                _ => {
+                    self.inspector_pending_switches.remove(&participant_id);
+                }
+            }
+        }
     }
 
     pub(crate) fn inspector_toggle_participant_picker(
@@ -1553,21 +1656,7 @@ impl SpaceView {
                     // the row itself, open or closed: a notice found only by
                     // opening the editor is not given.
                     .children(p.model_notices.iter().enumerate().map(|(i, notice)| {
-                        let text = crate::participants::model_notice_text(notice, cx);
-                        div()
-                            .id(SharedString::from(format!(
-                                "space-inspector-p-{pid}-notice-{i}"
-                            )))
-                            .probe(
-                                SharedString::from(format!(
-                                    "space/inspector/participants/{pid}/notice/{i}"
-                                )),
-                                gpui::Role::Label,
-                                text.clone(),
-                            )
-                            .text_xs()
-                            .text_color(theme.warning)
-                            .child(text)
+                        self.render_model_notice(&pid, &display_name, i, notice, cx)
                     })),
             )
             // The chevron says the row opens; its state is on the row's own node
@@ -1591,6 +1680,147 @@ impl SpaceView {
             wrap = wrap.child(self.render_inspector_participant_editor(p, cx));
         }
         wrap.into_any_element()
+    }
+
+    /// One model notice on a participant's row: the sentence, and its action
+    /// where it has one — **switch** a pin to the newer weights its tag names
+    /// now (in this conversation), or **dismiss** a followed tag's "model
+    /// updated" notice until the tag moves again. The action's click does not
+    /// reach the row behind it, which would open the editor. Its accessible
+    /// name carries the participant (`name`): the same verb repeats on every
+    /// row that has the notice.
+    fn render_model_notice(
+        &self,
+        pid: &str,
+        name: &str,
+        i: usize,
+        notice: &eidola_app_core::model_catalog::ModelNotice,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use eidola_app_core::model_catalog::ModelNotice;
+        let warning = cx.theme().warning;
+        let text = crate::participants::model_notice_text(notice, cx);
+        let line = div()
+            .id(SharedString::from(format!(
+                "space-inspector-p-{pid}-notice-{i}"
+            )))
+            .probe(
+                SharedString::from(format!("space/inspector/participants/{pid}/notice/{i}")),
+                gpui::Role::Label,
+                text.clone(),
+            )
+            .text_xs()
+            .text_color(warning)
+            .child(text);
+        let action = match notice {
+            ModelNotice::NewerAvailable { .. } => Some((
+                "switch",
+                crate::i18n::msg::participants_model_switch_newer(cx),
+                crate::i18n::msg::participants_model_switch_newer_for(cx, name.to_string()),
+            )),
+            ModelNotice::Updated { .. } => Some((
+                "dismiss",
+                crate::i18n::msg::participants_model_dismiss_update(cx),
+                crate::i18n::msg::participants_model_dismiss_update_for(cx, name.to_string()),
+            )),
+            _ => None,
+        };
+        let Some((verb, label, aria)) = action else {
+            return line.into_any_element();
+        };
+        let target = pid.to_string();
+        let notice = notice.clone();
+        let button = crate::participants::ghost_button_labeled(
+            SharedString::from(format!("space-inspector-p-{pid}-notice-{i}-{verb}")),
+            SharedString::from(format!(
+                "space/inspector/participants/{pid}/notice/{i}/{verb}"
+            )),
+            label,
+            aria,
+            false,
+            cx,
+            cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
+                cx.stop_propagation();
+                this.inspector_act_on_model_notice(&target, &notice, window, cx);
+            }),
+        );
+        h_flex()
+            .gap_2()
+            .items_center()
+            .flex_wrap()
+            .child(line)
+            .child(button)
+            .into_any_element()
+    }
+
+    /// Act on a model notice of `participant_id` — the Switch and Dismiss
+    /// buttons' one handler, `pub` so tests drive exactly what a click does.
+    ///
+    /// **An open editor over that participant follows a switch, once it has
+    /// landed.** The editor holds its own working model selection, and the
+    /// roster re-read does not retire it (only a vanished row or a changed
+    /// `source` does), so a Save of any other field would write the old pin
+    /// back over the switch. The switch is recorded as pending and applied to
+    /// the editor by [`Self::sync_inspector_participant_edit`] when the roster
+    /// shows the participant on the newer pin; a refused switch never touches
+    /// it.
+    pub fn inspector_act_on_model_notice(
+        &mut self,
+        participant_id: &str,
+        notice: &eidola_app_core::model_catalog::ModelNotice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use eidola_app_core::model_catalog::ModelNotice;
+        let space_id = self.space_id(cx);
+        let target = participant_id.to_string();
+        match notice {
+            ModelNotice::NewerAvailable { tag, newer_sha256 } => {
+                let current = self
+                    .inspector_participants(cx)
+                    .into_iter()
+                    .find(|p| p.id == participant_id)
+                    .and_then(|p| p.model_ref);
+                let newer = eidola_app_core::qualified_model_id(
+                    &eidola_app_core::model_reference::pinned(Some(tag), newer_sha256),
+                    eidola_app_core::EIDOLA_BACKEND_ID,
+                );
+                // The editor follows once the roster shows the switch landed,
+                // never here: a switch the core refuses leaves it as it was.
+                self.inspector_pending_switches.insert(
+                    participant_id.to_string(),
+                    PendingSwitch {
+                        previous: current,
+                        newer,
+                    },
+                );
+                self.stores.participants.update(cx, |store, cx| {
+                    store.switch_to_newer_weights(space_id, target, cx)
+                });
+            }
+            ModelNotice::Updated { .. } => {
+                self.stores.participants.update(cx, |store, cx| {
+                    store.dismiss_model_update(space_id, target, cx)
+                });
+            }
+            _ => return,
+        }
+        // The notice, and its control with it, goes when the roster re-reads,
+        // so the keyboard moves now, unless a field of the panel holds it. An
+        // inspector covering the pane keeps it (`inspector_focus`): nothing
+        // behind its scrim may take keys. Otherwise it goes home — the open
+        // draft or inline edit when there is one, else the view — so it is
+        // never left on an element that no longer exists, nor on a root that
+        // yields every key to a composing session.
+        if !self.inspector_field_focused(window, cx) {
+            if self.inspector_covers_pane(window) {
+                window.focus(&self.inspector_focus, cx);
+            } else {
+                let home = self.keyboard_home(cx);
+                window.focus(&home, cx);
+            }
+        }
+        cx.notify();
     }
 
     /// The open disclosure's body — the fork (when referenced), name, model,

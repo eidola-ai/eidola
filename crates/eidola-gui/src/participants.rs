@@ -85,6 +85,12 @@ pub enum EditMode {
     OverrideHere,
 }
 
+/// A weights hash as the picker shows it: the first twelve hex digits. The
+/// whole hash is in the model's identity line and on `/v1/models`.
+pub(crate) fn short_hash(sha256: &str) -> String {
+    format!("{}…", &sha256[..sha256.len().min(12)])
+}
+
 /// The human display for a model selection id: `(model name, backend name)`.
 pub(crate) fn model_display(
     stores: &Stores,
@@ -102,6 +108,16 @@ pub(crate) fn model_display(
             eidola_app_core::LOCAL_BACKEND_ID => "Local".to_string(),
             other => other.to_string(),
         });
+    // An Eidola pin reads as its tag and the weights it holds to, never as
+    // the raw digest reference.
+    if let Ok(eidola_app_core::model_reference::ModelReference::Pin { tag, sha256 }) =
+        eidola_app_core::model_reference::ModelReference::parse(&mref.model)
+    {
+        return (
+            crate::i18n::msg::participants_model_pinned(cx, tag.to_string(), short_hash(sha256)),
+            backend_name.into(),
+        );
+    }
     let local = stores.local_models.read(cx);
     let model_name = local
         .models()
@@ -163,13 +179,35 @@ pub(crate) fn model_groups(
         if let Some(models) = catalog.models.value()
             && !models.is_empty()
         {
-            groups.push((
-                header,
-                models
-                    .iter()
-                    .map(|m| (m.id.clone(), m.id.clone()))
-                    .collect(),
-            ));
+            let eidola = catalog.backend.kind == eidola_app_core::BackendKind::Eidola;
+            let mut options = Vec::new();
+            for m in models {
+                options.push((m.id.clone(), m.id.clone()));
+                // Beside following an Eidola tag, the choice to **pin** these
+                // exact weights: stored qualified (`tag@sha256:<hex>@eidola`),
+                // shown with the hash it holds to.
+                // Only a model listed under a tag gets one: a model listed by
+                // its hash alone (`sha256:<hex>`) is already pinned.
+                if eidola
+                    && eidola_app_core::model_reference::is_tag(&m.id)
+                    && let Some(sha256) = &m.sha256
+                {
+                    let pin = eidola_app_core::qualified_model_id(
+                        &eidola_app_core::model_reference::pinned(Some(&m.id), sha256),
+                        eidola_app_core::EIDOLA_BACKEND_ID,
+                    );
+                    options.push((
+                        pin,
+                        crate::i18n::msg::participants_model_pinned(
+                            cx,
+                            m.id.clone(),
+                            short_hash(sha256),
+                        )
+                        .to_string(),
+                    ));
+                }
+            }
+            groups.push((header, options));
         }
     }
     groups
@@ -354,7 +392,7 @@ pub(crate) fn model_field<V: 'static>(
     // weights hash and where the weights come from, and where to learn how to
     // check them without trusting this app. From the catalog compiled into
     // this build, so it names exactly what the gateway this build pins serves.
-    if let Some((weights, verify)) = current.and_then(|sel| model_identity_lines(sel, cx)) {
+    if let Some((weights, verify)) = current.and_then(|sel| model_identity_lines(stores, sel, cx)) {
         col = col
             .child(
                 div()
@@ -389,11 +427,12 @@ pub(crate) fn model_field<V: 'static>(
 /// source, and where to learn how to check them. `None` for a choice on any
 /// other backend or one this build's catalog does not know.
 pub(crate) fn model_identity_lines(
+    stores: &Stores,
     selection: &str,
     cx: &gpui::App,
 ) -> Option<(SharedString, SharedString)> {
-    let identity = eidola_app_core::model_identity(selection)?;
-    let short = format!("{}…", &identity.sha256[..12]);
+    let identity = stores.model_identity(selection)?;
+    let short = short_hash(&identity.sha256);
     let source = format!(
         "{}@{}",
         identity.repo,

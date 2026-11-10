@@ -1038,6 +1038,23 @@ CREATE INDEX idx_request_credential
 -- may delete never has one; the reaper deletes any anyway
 -- (see `db::discard_space_if_pristine`).
 -- ============================================================
+-- A user's acknowledgement of a "model updated" notice: the participant
+-- `participant_id`, answering in `space_id` under the followed selection
+-- `model` (canonical), was told its tag now names the weights `sha256`, and
+-- dismissed it. The notice stays dismissed while the tag names those
+-- weights; the next move of the tag shows it again. One row per lineage
+-- and selection, overwritten by the next dismissal.
+CREATE TABLE model_update_ack (
+    space_id        TEXT NOT NULL REFERENCES space(id),
+    participant_id  TEXT NOT NULL REFERENCES participant(id),
+    model           TEXT NOT NULL,
+    sha256          TEXT NOT NULL CHECK (length(sha256) = 64
+                    AND sha256 NOT GLOB '*[^0-9a-f]*'),
+    acknowledged_at INTEGER NOT NULL,
+
+    PRIMARY KEY (space_id, participant_id, model)
+);
+
 CREATE TABLE prefix_cache_key (
     space_id        TEXT NOT NULL REFERENCES space(id),
     participant_id  TEXT NOT NULL REFERENCES participant(id),

@@ -1744,6 +1744,8 @@ mod driver {
         vec![
             ModelInfo {
                 id: "gemma4-31b".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1754,6 +1756,8 @@ mod driver {
             },
             ModelInfo {
                 id: "kimi-k2-6".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 262_144,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1764,6 +1768,8 @@ mod driver {
             },
             ModelInfo {
                 id: "qwen3-coder-watt".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1777,6 +1783,8 @@ mod driver {
             // fixture for the picker's own scroll indicator.
             ModelInfo {
                 id: "llama4-scout".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1787,6 +1795,8 @@ mod driver {
             },
             ModelInfo {
                 id: "deepseek-v3".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1797,6 +1807,8 @@ mod driver {
             },
             ModelInfo {
                 id: "mistral-large-3".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1807,6 +1819,8 @@ mod driver {
             },
             ModelInfo {
                 id: "gpt-oss-120b".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1817,6 +1831,8 @@ mod driver {
             },
             ModelInfo {
                 id: "phi5-moe".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1827,6 +1843,8 @@ mod driver {
             },
             ModelInfo {
                 id: "command-r-plus-2".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1837,6 +1855,8 @@ mod driver {
             },
             ModelInfo {
                 id: "yi-large-2".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1847,6 +1867,8 @@ mod driver {
             },
             ModelInfo {
                 id: "glm-5-air".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,

@@ -194,6 +194,14 @@ pub enum AppError {
     #[error("config error: {message}")]
     Config { message: String },
 
+    /// A model notice's action (switching to newer weights, dismissing a
+    /// "model updated" notice) was asked of a participant that no longer has
+    /// that notice: the catalog, its model or its answers moved since the
+    /// notice was shown. Nothing was written; re-reading the roster shows
+    /// what applies now.
+    #[error("the model notice for participant {participant_id} no longer applies")]
+    ModelNoticeStale { participant_id: String },
+
     /// An internal runtime or system error.
     #[error("internal error: {message}")]
     Internal { message: String },

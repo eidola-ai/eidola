@@ -659,7 +659,7 @@ const STAMP_LEDGER: &[(&str, &str)] = &[
     ),
     ("ensure_space_participant", "stamps before the write"),
     (
-        "update_space_participant_override",
+        "update_space_participant_override_if",
         "stamps before the write",
     ),
     ("leave_space_participant", "stamps before the write"),
