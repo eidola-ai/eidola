@@ -36,7 +36,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use eidola_common::engine_protocol::ContinueField;
 use eidola_common::issuer_calendar::{ISSUER_CALENDAR, IssuerCalendar, rfc3339_utc};
-use eidola_common::refund_key::REFUND_KEY_HEADER;
+use eidola_common::spend_credentials::ACT_L;
 use rand_core::OsRng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -4166,7 +4166,7 @@ impl Inner {
             }
             let spend_proof_cbor = row.spend_proof_data;
 
-            let spend_proof = match SpendProof::<128>::from_cbor(&spend_proof_cbor) {
+            let spend_proof = match SpendProof::<ACT_L>::from_cbor(&spend_proof_cbor) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
@@ -4184,12 +4184,11 @@ impl Inner {
                 Err(_) => continue,
             };
 
-            // Reconstruct the PrivateToken auth header
-            let auth_value = spend_authorization(&issuer_key_hash, &spend_proof_cbor);
-
-            let refund_key = refund_recovery_key(&row.pre_refund_data);
+            // The spend exactly as it was presented.
+            let presented =
+                PresentedSpend::new(&issuer_key_hash, &spend_proof_cbor, &row.pre_refund_data);
             if let Ok(refund_obj) =
-                recover_refund(&client, base_url, &auth_value, &refund_key).await
+                recover_refund(&client, base_url, &presented, Some(row.spend_until)).await
                 && process_refund(
                     &refund_obj,
                     &params,
@@ -7839,10 +7838,10 @@ impl Inner {
                 // Spend budget ceiling — checked *per round*, so a tool loop's
                 // later rounds re-check it against their own (grown) estimate.
                 check_turn_budget(charge_credits, budget)?;
-                let (spend, auth_value) = self
+                let spend = self
                     .acquire_spend(&cfg, &db_conn, charge_credits, now)
                     .await?;
-                (charge_credits, Some(spend), Some(auth_value))
+                (charge_credits, Some(spend), None)
             }
         };
         let spend_is_none = spend.is_none();
@@ -7890,7 +7889,7 @@ impl Inner {
             // The turn's first hold is unsettled until its round processes a
             // refund; a turn with no spend at all has nothing to settle.
             spend_settled: spend_is_none,
-            auth_value,
+            external_auth: auth_value,
             plain_route: backend_kind != BackendKind::Eidola,
             bus: self.bus.clone(),
         })
@@ -7958,8 +7957,8 @@ impl Inner {
     }
 
     /// Acquire the credential spend for one request: the ACT provisioning
-    /// queue's acquire → spend-proof → flip-to-`spending` step, plus the
-    /// `Authorization` header value it produces.
+    /// queue's acquire → spend-proof → flip-to-`spending` step, with the
+    /// spend as it will be presented in the request body ([`PresentedSpend`]).
     ///
     /// Factored out of `prepare_turn` because a tool loop needs it **once per
     /// round**: the ACT protocol consumes a credential per request (the spend
@@ -7978,7 +7977,7 @@ impl Inner {
         db_conn: &turso::Connection,
         charge_credits: u128,
         now: i64,
-    ) -> Result<(SpendPrep, String), AppError> {
+    ) -> Result<SpendPrep, AppError> {
         // ACT provisioning queue: serialize acquire → spend-proof →
         // flip-to-`spending` across concurrent turns so two turns fired at
         // once can never both spend the same credential. The gate is held only
@@ -8002,11 +8001,11 @@ impl Inner {
         let params = params_from_domain_separator(cfg.domain_separator())?;
 
         let charge_scalar =
-            credit_to_scalar::<128>(charge_credits).map_err(|e| AppError::Credential {
+            credit_to_scalar::<ACT_L>(charge_credits).map_err(|e| AppError::Credential {
                 message: format!("invalid charge amount: {e:?}"),
             })?;
         let (spend_proof, pre_refund) = credit_token
-            .prove_spend::<128>(&params, charge_scalar, OsRng)
+            .prove_spend::<ACT_L>(&params, charge_scalar, OsRng)
             .map_err(|e| AppError::Credential {
                 message: format!("failed to create spend proof: {e:?}"),
             })?;
@@ -8047,21 +8046,18 @@ impl Inner {
         self.bus.emit(Change::Wallet);
 
         let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
-        let auth_value = spend_authorization(&issuer_key_hash, &spend_proof_cbor);
+        let presented = PresentedSpend::new(&issuer_key_hash, &spend_proof_cbor, &pre_refund_cbor);
 
-        Ok((
-            SpendPrep {
-                cred,
-                public_key,
-                params,
-                spend_proof,
-                pre_refund,
-                refund_key: refund_recovery_key(&pre_refund_cbor),
-                pre_cred_id,
-                _live: live,
-            },
-            auth_value,
-        ))
+        Ok(SpendPrep {
+            cred,
+            public_key,
+            params,
+            spend_proof,
+            pre_refund,
+            presented,
+            pre_cred_id,
+            _live: live,
+        })
     }
 
     /// Begin the next round of a turn's tool loop: re-estimate the charge over
@@ -8106,14 +8102,13 @@ impl Inner {
             });
         }
         check_turn_budget(charge_credits, prep.budget)?;
-        let (spend, auth_value) = self
+        let spend = self
             .acquire_spend(&cfg, &prep.db_conn, charge_credits, prep.now)
             .await?;
         prep.charge_credits = charge_credits;
         prep.total_credits += charge_credits;
         prep.spend = Some(spend);
         prep.spend_settled = false;
-        prep.auth_value = Some(auth_value);
         Ok(())
     }
 
@@ -8317,11 +8312,7 @@ impl Inner {
                 .post(format!("{}/v1/chat/completions", prep.base_url)),
             &request_body_json,
         );
-        request = with_credentials(
-            request,
-            prep.auth_value.as_deref(),
-            prep.spend.as_ref().map(|s| &*s.refund_key),
-        );
+        request = with_authorization(request, prep.external_auth.as_deref());
         let chat_result = prep.send(request).await;
         let response_at = now_ms();
 
@@ -8436,7 +8427,7 @@ impl Inner {
         // spend, hence nothing to refund. A tool round settles its own hold
         // here, before the next round acquires a fresh one.
         if prep.spend.is_some() {
-            match body.get("refund") {
+            match inline_refund(&body) {
                 Some(refund_obj) => {
                     prep.process_refund_obj(refund_obj)
                         .await
@@ -9140,11 +9131,7 @@ impl Inner {
                 .header("Accept", "text/event-stream"),
             &request_body_json,
         );
-        request = with_credentials(
-            request,
-            prep.auth_value.as_deref(),
-            prep.spend.as_ref().map(|s| &*s.refund_key),
-        );
+        request = with_authorization(request, prep.external_auth.as_deref());
         let chat_result = prep.send(request).await;
 
         let resp = match chat_result {
@@ -9212,7 +9199,7 @@ impl Inner {
             let inline = (!answer.over_ceiling)
                 .then(|| serde_json::from_str::<serde_json::Value>(&response_text).ok())
                 .flatten()
-                .and_then(|body| body.get("refund").cloned());
+                .and_then(|body| inline_refund(&body).cloned());
             prep.settle(inline.as_ref()).await;
             // The ceiling decides first, whatever the status
             // (`peer_read::answer_past_ceiling`).
@@ -9374,7 +9361,7 @@ impl Inner {
 
                     // Read before every other field and before the delta gate:
                     // the metadata event carries no `choices` at all.
-                    if let Some(refund) = json.get("refund") {
+                    if let Some(refund) = crate::inline_refund(&json) {
                         inline_refund = Some(refund.clone());
                     }
 
@@ -9484,7 +9471,7 @@ impl Inner {
             && let Ok(tail) = std::str::from_utf8(&buf)
             && let Some(payload) = sse_event_data(tail)
             && let Ok(json) = serde_json::from_str::<serde_json::Value>(payload.trim_start())
-            && let Some(refund) = json.get("refund")
+            && let Some(refund) = crate::inline_refund(&json)
         {
             inline_refund = Some(refund.clone());
         }
@@ -13892,7 +13879,7 @@ impl Continuation {
 
 /// Extract a refund token from a JSON object and store the resulting credential.
 ///
-/// `refund_obj` is the `"refund"` value from a server response (either a chat
+/// `refund_obj` is the one element of a server response's `refunds` (either a chat
 /// completion or the recovery endpoint). Returns `true` if the credential was
 /// successfully stored.
 #[allow(clippy::too_many_arguments)]
@@ -14054,8 +14041,10 @@ struct TurnPrep {
     /// unsettled hold, which is what makes that unrepresentable rather than
     /// merely avoided at each call site.
     spend_settled: bool,
-    /// The `Authorization` header value; present iff `spend` is.
-    auth_value: Option<String>,
+    /// An external backend's own `Authorization` value (an OpenAI-compatible
+    /// backend's key); `None` for every Eidola turn, whose spend travels in
+    /// the body ([`TurnPrep::with_body`]).
+    external_auth: Option<String>,
     /// The invalidation bus, so the one place a settled hold is durably
     /// committed ([`Self::process_refund_obj`]) can emit at the write.
     bus: BroadcastSource,
@@ -14099,11 +14088,12 @@ struct SpendPrep {
     cred: db::SpendableCredential,
     public_key: PublicKey,
     params: Params,
-    spend_proof: SpendProof<128>,
+    spend_proof: SpendProof<ACT_L>,
     pre_refund: PreRefund,
-    /// [`refund_recovery_key`] of this spend's stored `PreRefund` bytes: sent
-    /// with the spend and with any recovery of it.
-    refund_key: zeroize::Zeroizing<[u8; 32]>,
+    /// The spend as the request body presents it: its Token and the
+    /// [`refund_recovery_key`] of its stored `PreRefund` bytes. Sent with the
+    /// spend and with any recovery of it.
+    presented: PresentedSpend,
     pre_cred_id: String,
     /// Marks this hold as one a request is in flight for, for as long as
     /// these materials exist. `SpendPrep` is the only in-memory handle to a
@@ -14194,17 +14184,22 @@ impl TurnPrep {
         }
     }
 
-    /// Attach `body` to `request`: as JSON, exactly as before keys existed,
-    /// for every turn without a prefix cache; as a [`keyed_body`] otherwise.
+    /// Attach `body` to `request`: as JSON for every turn without a prefix
+    /// cache, as a [`keyed_body`] otherwise, and with this round's spend in
+    /// its `credentials` member when it has one.
+    ///
+    /// The spend goes onto a copy, on its way to the wire: `body` itself is
+    /// what the Record keeps, and it never holds a credential.
     fn with_body(
         &self,
         request: reqwest::RequestBuilder,
         body: &serde_json::Value,
     ) -> reqwest::RequestBuilder {
+        let body = body_with_spend(body, self.spend.as_ref().map(|s| &s.presented));
         if self.cache_scope.is_none() {
-            return request.json(body);
+            return request.json(&*body);
         }
-        let (stream, len) = keyed_body(self, body);
+        let (stream, len) = keyed_body(self, &body);
         request
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::CONTENT_LENGTH, len)
@@ -14269,12 +14264,10 @@ impl TurnPrep {
     /// decide its own control flow, never to decide whether to emit. Always
     /// `false` for local turns — there is no spend to recover.
     async fn try_refund_recovery(&mut self) -> bool {
-        let (Some(spend), Some(auth_value)) = (&self.spend, &self.auth_value) else {
+        let Some(spend) = &self.spend else {
             return false;
         };
-        let auth_value = auth_value.clone();
-        let refund_key = spend.refund_key.clone();
-        match recover_refund(&self.client, &self.base_url, &auth_value, &refund_key).await {
+        match recover_refund(&self.client, &self.base_url, &spend.presented, None).await {
             Ok(refund_obj) => self.process_refund_obj(&refund_obj).await.is_ok(),
             Err(_) => false,
         }
@@ -15121,7 +15114,7 @@ impl TurnPrep {
 async fn process_refund(
     refund_obj: &serde_json::Value,
     params: &Params,
-    spend_proof: &SpendProof<128>,
+    spend_proof: &SpendProof<ACT_L>,
     pre_refund: &PreRefund,
     public_key: &PublicKey,
     db_conn: &turso::Connection,
@@ -15165,7 +15158,7 @@ async fn process_refund(
     })?;
 
     let new_token = pre_refund
-        .to_credit_token::<128>(params, spend_proof, &refund, public_key)
+        .to_credit_token::<ACT_L>(params, spend_proof, &refund, public_key)
         .map_err(|e| AppError::Credential {
             message: format!("failed to construct refund credit token: {e:?}"),
         })?;
@@ -15175,7 +15168,7 @@ async fn process_refund(
     })?;
     let new_nonce = hex_encode(&new_token.nullifier().to_bytes());
     let new_credits =
-        scalar_to_credit::<128>(&new_token.credits()).map_err(|e| AppError::Credential {
+        scalar_to_credit::<ACT_L>(&new_token.credits()).map_err(|e| AppError::Credential {
             message: format!("invalid credit amount in refund token: {e}"),
         })?;
 
@@ -15195,24 +15188,37 @@ async fn process_refund(
 }
 
 /// Attempt to recover a refund token from the server via
-/// `POST /v1/credentials/refund`. Returns the refund JSON object on success.
+/// `POST /v1/credentials/refund`. Returns the refund JSON object
+/// (`{refund, issuer_key_id}`) when it is one to settle on.
 ///
-/// `refund_key` is the spend's [`refund_recovery_key`]: the server stores the
-/// refund sealed under it and opens it only for the same key.
+/// The spend is presented exactly as it was with its request: the same Token
+/// and refund recovery key in the body's `credentials` member. The server
+/// stores the refund sealed under that key and opens it only for the same key.
+///
+/// **A provisional answer is not a settlement.** While the spend's request
+/// may still be served, the server holds a refund of nothing (`t = 0`) for
+/// it, and says so (`"provisional": true`). Its successor shares a nullifier
+/// with the final refund's, so spending it would destroy the larger one when
+/// it comes. It is refused here (an error, so the spend stays `spending` for
+/// a later ask) until the server answers `"provisional": false`, which it
+/// does once the provisional refund is the spend's last word (no request is
+/// serving the spend any more: a crash or a restart left it), or until the
+/// spent key's `spend_until` has passed (`spend_until`, when known), when the
+/// successor must be taken while it is worth anything.
 async fn recover_refund(
     client: &reqwest::Client,
     base_url: &str,
-    auth_value: &str,
-    refund_key: &[u8; 32],
+    spend: &PresentedSpend,
+    spend_until: Option<i64>,
 ) -> Result<serde_json::Value, AppError> {
-    let resp = with_credentials(
-        client.post(format!("{base_url}/v1/credentials/refund")),
-        Some(auth_value),
-        Some(refund_key),
-    )
-    .send()
-    .await
-    .map_err(AppError::from_request)?;
+    let resp = client
+        .post(format!("{base_url}/v1/credentials/refund"))
+        .json(&serde_json::json!({
+            eidola_common::spend_credentials::CREDENTIALS_MEMBER: spend.credentials(),
+        }))
+        .send()
+        .await
+        .map_err(AppError::from_request)?;
 
     let (status, body_text) =
         crate::peer_read::read_api_answer(resp, "the recovery response").await?;
@@ -15231,11 +15237,45 @@ async fn recover_refund(
         });
     }
 
-    body.get("refund")
+    let provisional = body
+        .get("provisional")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| AppError::Credential {
+            message: "recovery response missing its provisional marker".into(),
+        })?;
+    if provisional && !accepts_provisional_refund(spend_until, now_ms()) {
+        return Err(AppError::Credential {
+            message: "the spend's request has not ended yet; its refund is provisional".into(),
+        });
+    }
+    inline_refund(&body)
         .cloned()
         .ok_or_else(|| AppError::Credential {
-            message: "recovery response missing refund field".into(),
+            message: "recovery response missing its refund".into(),
         })
+}
+
+/// Whether a refund the server still calls provisional may be settled on at
+/// `now`: only once the spent key's `spend_until` has passed, when waiting
+/// longer would leave the successor worth nothing. Whether the request may
+/// still settle is the server's to say: it alone knows whether it is still
+/// serving it. All in ms.
+fn accepts_provisional_refund(spend_until: Option<i64>, now: i64) -> bool {
+    spend_until.is_some_and(|until| now >= until)
+}
+
+/// The one refund a response carries for a one-spend request: the single
+/// element of its `refunds` array. Anything else (no array, an empty one, more
+/// than one) is no refund, and the hold is recovered instead.
+pub(crate) fn inline_refund(body: &serde_json::Value) -> Option<&serde_json::Value> {
+    match body
+        .get(eidola_common::spend_credentials::REFUNDS_MEMBER)?
+        .as_array()?
+        .as_slice()
+    {
+        [refund] => Some(refund),
+        _ => None,
+    }
 }
 
 // ============================================================================
@@ -18544,7 +18584,7 @@ async fn complete_issuance(
         })?;
     let credit_token = pending
         .pre_issuance
-        .to_credit_token::<128>(
+        .to_credit_token::<ACT_L>(
             pending.params,
             pending.public_key,
             &pending.issuance_request,
@@ -18554,7 +18594,7 @@ async fn complete_issuance(
             message: format!("failed to construct credit token: {e}"),
         })?;
     let token_credits =
-        scalar_to_credit::<128>(&credit_token.credits()).map_err(|e| AppError::Credential {
+        scalar_to_credit::<ACT_L>(&credit_token.credits()).map_err(|e| AppError::Credential {
             message: format!("invalid credit amount in token: {e}"),
         })?;
     check_issued_credential(
@@ -18641,7 +18681,7 @@ fn check_issued_credential(
         });
     }
     let (probe, _) = token
-        .prove_spend::<128>(params, anonymous_credit_tokens::Scalar::ZERO, OsRng)
+        .prove_spend::<ACT_L>(params, anonymous_credit_tokens::Scalar::ZERO, OsRng)
         .map_err(|e| AppError::Credential {
             message: format!("failed to check the issued credential: {e:?}"),
         })?;
@@ -18701,19 +18741,71 @@ fn compute_challenge_digest() -> [u8; 32] {
     Sha256::digest(serialize_token_challenge()).into()
 }
 
-/// The `Authorization` value presenting one spend: the ACT Token
-/// (`token_type`, `challenge_digest`, `issuer_key_id`, the encoded spend
-/// proof) in the `PrivateToken` scheme, spelled by
-/// `eidola_common::private_token` (padded base64url, RFC 9577), the one
-/// spelling the gateway accepts. The spend and every recovery of it build
-/// the value here.
-fn spend_authorization(issuer_key_hash: &[u8], spend_proof_cbor: &[u8]) -> String {
+/// One spend's ACT Token: `token_type`, `challenge_digest`, `issuer_key_id`,
+/// the encoded spend proof (draft-schlesinger-privacypass-act).
+fn spend_token(issuer_key_hash: &[u8], spend_proof_cbor: &[u8]) -> Vec<u8> {
     let mut token = Vec::with_capacity(2 + 32 + issuer_key_hash.len() + spend_proof_cbor.len());
     token.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
     token.extend_from_slice(&compute_challenge_digest());
     token.extend_from_slice(issuer_key_hash);
     token.extend_from_slice(spend_proof_cbor);
-    eidola_common::private_token::authorization_value(&token)
+    token
+}
+
+/// One spend as a request presents it: its Token and its refund recovery key,
+/// written into the request body's `credentials` member
+/// (`eidola_common::spend_credentials`, the one spelling the gateway
+/// accepts). The spend and every recovery of it build it here.
+///
+/// **A secret on its way to the wire, and nowhere else.** The member is put
+/// onto a copy of a body as it is sent ([`body_with_spend`]); the body a
+/// request row records never holds it. `Debug` prints neither value, and the
+/// refund key is zeroed on drop.
+pub(crate) struct PresentedSpend {
+    token: Vec<u8>,
+    refund_key: zeroize::Zeroizing<[u8; 32]>,
+}
+
+impl PresentedSpend {
+    fn new(issuer_key_hash: &[u8], spend_proof_cbor: &[u8], pre_refund_cbor: &[u8]) -> Self {
+        Self {
+            token: spend_token(issuer_key_hash, spend_proof_cbor),
+            refund_key: refund_recovery_key(pre_refund_cbor),
+        }
+    }
+
+    /// The `credentials` member's value: an array of this one spend.
+    pub(crate) fn credentials(&self) -> serde_json::Value {
+        eidola_common::spend_credentials::credentials_member(&[(&self.token, &self.refund_key)])
+    }
+}
+
+impl std::fmt::Debug for PresentedSpend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PresentedSpend(<redacted>)")
+    }
+}
+
+/// `body` as sent: with `spend` in its `credentials` member when there is
+/// one, and `body` itself otherwise. A copy, so the caller's `body` (what the
+/// Record keeps) never holds a credential.
+pub(crate) fn body_with_spend<'a>(
+    body: &'a serde_json::Value,
+    spend: Option<&PresentedSpend>,
+) -> std::borrow::Cow<'a, serde_json::Value> {
+    match spend {
+        None => std::borrow::Cow::Borrowed(body),
+        Some(spend) => {
+            let mut sent = body.clone();
+            if let Some(object) = sent.as_object_mut() {
+                object.insert(
+                    eidola_common::spend_credentials::CREDENTIALS_MEMBER.to_string(),
+                    spend.credentials(),
+                );
+            }
+            std::borrow::Cow::Owned(sent)
+        }
+    }
 }
 
 /// Domain separator for [`refund_recovery_key`].
@@ -18742,46 +18834,28 @@ fn refund_recovery_key(pre_refund_cbor: &[u8]) -> zeroize::Zeroizing<[u8; 32]> {
     zeroize::Zeroizing::new(hasher.finalize().into())
 }
 
-/// Put a request's secrets on it: the `Authorization` value (an ACT spend
-/// proof, or an external backend's key) and an ACT spend's refund recovery
-/// key, each as a header value marked sensitive so an HTTP client's own
-/// `Debug` never shows it.
+/// Put an external backend's own key on a request, as an `Authorization`
+/// value marked sensitive so an HTTP client's own `Debug` never shows it.
+/// (An Eidola spend never travels in a header: it is in the body,
+/// [`body_with_spend`].)
 ///
-/// **The one place these headers are built** for the app's own requests (the
-/// turn transports, the chores, refund recovery); the local proxy builds its
-/// enumerated set through `proxy::route::is_secret_header`, which marks the
-/// same two. A value that cannot be a header value is passed through as the
-/// string, so the builder refuses it exactly as it did before (the refusal
-/// carries no value).
-pub(crate) fn with_credentials(
+/// A value that cannot be a header value is passed through as the string,
+/// so the builder refuses it exactly as it did before (the refusal carries no
+/// value).
+pub(crate) fn with_authorization(
     request: reqwest::RequestBuilder,
     authorization: Option<&str>,
-    refund_key: Option<&[u8; 32]>,
 ) -> reqwest::RequestBuilder {
-    let mut request = request;
-    if let Some(auth) = authorization {
-        request = match reqwest::header::HeaderValue::from_str(auth) {
+    match authorization {
+        None => request,
+        Some(auth) => match reqwest::header::HeaderValue::from_str(auth) {
             Ok(mut value) => {
                 value.set_sensitive(true);
                 request.header(reqwest::header::AUTHORIZATION, value)
             }
             Err(_) => request.header(reqwest::header::AUTHORIZATION, auth),
-        };
+        },
     }
-    if let Some(key) = refund_key {
-        request = request.header(REFUND_KEY_HEADER, refund_key_header_value(key));
-    }
-    request
-}
-
-/// The [`eidola_common::refund_key::REFUND_KEY_HEADER`] value for `key`,
-/// marked sensitive so it is never shown by an HTTP client's own debug output.
-fn refund_key_header_value(key: &[u8; 32]) -> reqwest::header::HeaderValue {
-    let text = zeroize::Zeroizing::new(eidola_common::refund_key::encode_refund_key(key));
-    let mut value = reqwest::header::HeaderValue::from_bytes(text.as_ref())
-        .expect("lowercase hex is a valid header value");
-    value.set_sensitive(true);
-    value
 }
 
 /// Current time as milliseconds since Unix epoch.
@@ -19028,20 +19102,20 @@ mod tests {
         let pre = anonymous_credit_tokens::PreIssuance::random(OsRng);
         let request = pre.request(&params, OsRng);
         let response = issuer
-            .issue::<128>(
+            .issue::<ACT_L>(
                 &params,
                 &request,
-                credit_to_scalar::<128>(1000).unwrap(),
+                credit_to_scalar::<ACT_L>(1000).unwrap(),
                 anonymous_credit_tokens::Scalar::ZERO,
                 OsRng,
             )
             .unwrap();
         let token = pre
-            .to_credit_token::<128>(&params, issuer.public(), &request, &response)
+            .to_credit_token::<ACT_L>(&params, issuer.public(), &request, &response)
             .unwrap();
         let spend = |token: &CreditToken| {
             let (proof, pre_refund) = token
-                .prove_spend::<128>(&params, credit_to_scalar::<128>(300).unwrap(), OsRng)
+                .prove_spend::<ACT_L>(&params, credit_to_scalar::<ACT_L>(300).unwrap(), OsRng)
                 .unwrap();
             (proof, pre_refund.to_cbor().unwrap())
         };
@@ -19067,49 +19141,80 @@ mod tests {
             eidola_common::refund_key::decode_refund_key(&text),
             Some(*key)
         );
-        assert!(refund_key_header_value(&key).is_sensitive());
     }
 
-    /// **A request's secrets travel as sent and print as nothing.** Both the
-    /// spend proof (or an external key) and the refund recovery key go on
-    /// marked sensitive, so the built request's `Debug` shows neither.
+    /// **A spend travels in the body it is sent with, and nowhere else.** The
+    /// copy that goes to the wire carries the `credentials` member, exactly
+    /// as the gateway reads it; the body the caller keeps (what the Record
+    /// stores) does not, and no header carries any of it. Printed, the spend
+    /// is nothing.
     #[test]
-    fn a_requests_credentials_are_sensitive_headers() {
+    fn a_spend_travels_only_in_the_sent_body() {
         let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
-        let client = reqwest::Client::builder().build().unwrap();
-        let proof = "PrivateToken token=\"c3BlbmQtcHJvb2Y=\"";
-        let key = [0x6du8; 32];
-        let key_text =
-            String::from_utf8(eidola_common::refund_key::encode_refund_key(&key).to_vec()).unwrap();
-        let request = with_credentials(
-            client.post("http://127.0.0.1:9/v1/chat/completions"),
-            Some(proof),
-            Some(&key),
+        let spend = PresentedSpend::new(&[7u8; 32], b"spend-proof", b"pre-refund");
+        let key_text = String::from_utf8(
+            eidola_common::refund_key::encode_refund_key(&spend.refund_key).to_vec(),
         )
-        .build()
         .unwrap();
+        let recorded = serde_json::json!({ "model": "m", "messages": [] });
 
-        let auth = request
-            .headers()
-            .get(reqwest::header::AUTHORIZATION)
-            .unwrap();
-        assert!(auth.is_sensitive());
-        assert_eq!(auth.as_bytes(), proof.as_bytes());
-        let sent_key = request.headers().get(REFUND_KEY_HEADER).unwrap();
-        assert!(sent_key.is_sensitive());
-        assert_eq!(sent_key.as_bytes(), key_text.as_bytes());
+        let sent = body_with_spend(&recorded, Some(&spend));
+        assert!(
+            recorded.get("credentials").is_none(),
+            "the kept body has none"
+        );
+        let credentials = sent["credentials"].as_array().unwrap();
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(
+            credentials[0]["token"],
+            eidola_common::spend_credentials::encode_token(&spend.token)
+        );
+        assert_eq!(credentials[0]["refund_key"], key_text.as_str());
+        assert_eq!(&spend.token[..2], &ACT_TOKEN_TYPE.to_be_bytes());
+        // No spend, no member, and no copy.
+        assert!(matches!(
+            body_with_spend(&recorded, None),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(!format!("{spend:?}").contains(&key_text));
 
-        let shown = format!("{request:?}");
-        assert!(!shown.contains("c3BlbmQtcHJvb2Y"), "{shown}");
-        assert!(!shown.contains(&key_text), "{shown}");
-
-        // An external backend's bearer key, with no spend, is sensitive too.
-        let bearer = with_credentials(client.get("http://127.0.0.1:9/"), Some("Bearer sk-x"), None)
+        // An external backend's bearer key is a sensitive header.
+        let client = reqwest::Client::builder().build().unwrap();
+        let bearer = with_authorization(client.get("http://127.0.0.1:9/"), Some("Bearer sk-x"))
             .build()
             .unwrap();
         assert!(bearer.headers()[reqwest::header::AUTHORIZATION].is_sensitive());
-        assert!(bearer.headers().get(REFUND_KEY_HEADER).is_none());
         assert!(!format!("{bearer:?}").contains("sk-x"));
+    }
+
+    /// **A refund the server still calls provisional is settled on only when
+    /// waiting longer would leave it worth nothing**: at the spent key's
+    /// `spend_until`, and never on this client's own reckoning of when the
+    /// request might have ended.
+    #[test]
+    fn a_provisional_refund_is_accepted_only_at_the_spend_deadline() {
+        let until = 1_000_000;
+        assert!(!accepts_provisional_refund(None, i64::MAX));
+        assert!(!accepts_provisional_refund(Some(until), until - 1));
+        assert!(accepts_provisional_refund(Some(until), until));
+    }
+
+    /// **One spend, one refund.** A response's `refunds` is read only when it
+    /// is an array of exactly one; anything else is no refund, and the hold is
+    /// recovered.
+    #[test]
+    fn a_response_refund_is_its_refunds_array_of_one() {
+        let one = serde_json::json!({ "refunds": [{ "refund": "r", "issuer_key_id": "k" }] });
+        assert_eq!(inline_refund(&one).unwrap()["refund"], "r");
+        for none in [
+            serde_json::json!({}),
+            serde_json::json!({ "refunds": [] }),
+            serde_json::json!({ "refunds": [{ "refund": "a" }, { "refund": "b" }] }),
+            serde_json::json!({ "refunds": { "refund": "r" } }),
+            serde_json::json!({ "refund": { "refund": "r", "issuer_key_id": "k" } }),
+        ] {
+            assert!(inline_refund(&none).is_none(), "{none}");
+        }
     }
 
     /// **An event ends at any two line terminators the format allows.**

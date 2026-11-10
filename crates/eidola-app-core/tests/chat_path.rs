@@ -432,6 +432,125 @@ fn blocking_chat_recovers_refund_when_no_inline_refund() {
     });
 }
 
+/// **A spend travels in the request body, and the Record never keeps it.**
+/// The wire body carries exactly one `credentials` element (a padded
+/// base64url Token and its refund recovery key) and no header carries a
+/// credential; the request row the Record keeps has neither.
+#[test]
+fn a_spend_travels_in_the_body_and_the_record_never_keeps_it() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat should succeed");
+
+        assert_eq!(mock.chat_auths(), vec![false], "no credential in a header");
+        let token = mock.chat_spends()[0].clone().expect("the body's one spend");
+        assert_eq!(token.len() % 4, 0, "padded base64url");
+        assert_eq!(mock.keyed_spends(), 1, "with its refund key beside it");
+        assert_eq!(
+            mock.hold_mismatches(),
+            0,
+            "the hold is exactly the worst case"
+        );
+
+        let requests = core
+            .runtime()
+            .block_on(core.list_requests(10, 0))
+            .expect("requests");
+        let row = requests
+            .iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("the chat request's row");
+        let detail = request_detail(&core, &row.id);
+        let recorded = String::from_utf8(detail.request_body.expect("a recorded body")).unwrap();
+        assert!(!recorded.contains("credentials"), "{recorded}");
+        assert!(
+            !detail
+                .request_headers
+                .unwrap_or_default()
+                .contains("PrivateToken"),
+            "no spend in the recorded headers"
+        );
+        assert!(!recorded.contains(&token[..32]), "{recorded}");
+    });
+}
+
+/// **A provisional refund is not a settlement.** While a spend's request may
+/// still be served, the gateway's recovery answers with a refund of nothing
+/// marked `provisional`; its successor shares a nullifier with the final
+/// refund's, so settling on it could destroy the larger one. The turn and the
+/// startup sweep both leave the hold `spending` (no successor, no `Wallet` for
+/// it) while the gateway calls the refund provisional. Once the gateway says
+/// it is the spend's last word (no request is serving it any more: a crash
+/// or a restart left it), the sweep settles on it, and the successor holds the credential's
+/// untouched remainder.
+#[test]
+fn a_provisional_refund_is_settled_on_only_when_the_gateway_calls_it_final() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            refund: RefundMode::ProvisionalFirst(2),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("the answer arrives; only its settlement waits");
+        assert_eq!(
+            mock.refund_hits(),
+            1,
+            "no inline refund, so recovery was asked"
+        );
+        let spending = |core: &AppCore| {
+            core.runtime()
+                .block_on(core.wallet_lifecycle())
+                .expect("lifecycle")
+                .into_iter()
+                .filter(|c| c.state == "spending")
+                .collect::<Vec<_>>()
+        };
+        let held = spending(&core);
+        assert_eq!(
+            held.len(),
+            1,
+            "the provisional answer did not settle the hold"
+        );
+        let hold = held[0].spend_amount.expect("a spend amount");
+        let before = held[0].credits;
+
+        // The sweep, too, waits while the gateway calls it provisional.
+        let mut rx = core.subscribe_changes();
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_spending_credentials())
+            .expect("sweep");
+        assert!(recovered.is_empty(), "{recovered:?}");
+        assert_eq!(spending(&core).len(), 1);
+        assert!(!drain(&mut rx).contains(&Change::Wallet));
+
+        // The gateway now calls it final: the provisional successor is the
+        // settlement.
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_spending_credentials())
+            .expect("sweep");
+        assert_eq!(recovered.len(), 1);
+        assert!(spending(&core).is_empty());
+        assert!(drain(&mut rx).contains(&Change::Wallet));
+        let creds = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert!(
+            creds.iter().any(|c| c.credits == before - hold),
+            "the successor holds the untouched remainder c - s: {creds:?}"
+        );
+    });
+}
+
 /// **Recovery opens the stored refund only with the key the spend carried.**
 /// The server seals the refund it stores under the spend's refund recovery
 /// key and refuses a spend without one; the mock holds both rules, answering
@@ -3153,7 +3272,7 @@ fn a_rejected_tools_field_on_a_spending_backend_settles_both_holds() {
 
         // Each attempt presented its own ACT token: a hold is bound to one
         // request, so reusing the rejected one would have been the bug.
-        let auths = mock.chat_auth_values();
+        let auths = mock.chat_spends();
         assert!(
             auths[2].is_some() && auths[3].is_some(),
             "both attempts spend: {auths:?}"
@@ -4257,6 +4376,86 @@ fn mid_sse_abort_emits_user_turn_and_keeps_the_post() {
     });
 }
 
+/// **A stream the gateway cut short is not an answer, and it settles from
+/// the refund it carried.** The gateway ends a cut-short stream with its
+/// metadata event (the refund it settled on) and no `[DONE]`: the turn fails
+/// as a stream that never finished, writes no answer (a regeneration keeps
+/// what it would have replaced), and the hold settles from the in-band refund
+/// without asking recovery.
+#[test]
+fn a_stream_cut_short_is_not_an_answer_and_settles_in_band() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingCutShortWithRefund,
+            refund: RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let (tx, _events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let err = core
+            .runtime()
+            .block_on(core.chat_stream("stream me".into(), MODEL.into(), None, tx))
+            .expect_err("an interrupted stream is not an answer");
+        assert!(matches!(err, AppError::Network { .. }), "got {err:?}");
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(only_space(&core)))
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "only the user's turn: {messages:?}");
+        assert_eq!(mock.refund_hits(), 0, "settled from the refund in band");
+        assert_settled(&core);
+    });
+}
+
+/// **A stream the gateway cut short settles on what was generated.** When a
+/// stream ends early (its client went away, it reached its deadline, or its
+/// engine failed), the gateway releases the engine and stores a final refund
+/// charging the prompt and the output generated up to the cut: never the
+/// whole hold for what was not produced, never nothing. The client recovers
+/// it like any refund, and its successor holds the credential's balance less
+/// exactly that charge.
+#[test]
+fn a_stream_cut_short_settles_on_what_was_generated() {
+    run(|| {
+        const CHARGED: u128 = 17;
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingMidAbort,
+            refund: RefundMode::ChargedEarly(CHARGED),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let lifecycle = |core: &AppCore| {
+            core.runtime()
+                .block_on(core.wallet_lifecycle())
+                .expect("lifecycle")
+        };
+        let mut rx = core.subscribe_changes();
+
+        let (tx, _events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.chat_stream("stream me".into(), MODEL.into(), None, tx))
+            .expect_err("the stream was cut short");
+
+        assert!(mock.refund_hits() >= 1, "the hold went to recovery");
+        assert!(drain(&mut rx).contains(&Change::Wallet));
+        let spent = lifecycle(&core)
+            .into_iter()
+            .find(|c| c.state == "spent")
+            .expect("the spent credential");
+        let hold = spent.spend_amount.expect("its hold");
+        let successor = lifecycle(&core)
+            .into_iter()
+            .find(|c| c.state == "active")
+            .expect("its successor");
+        assert_eq!(
+            successor.credits,
+            spent.credits - i64::try_from(CHARGED).unwrap(),
+            "charged {CHARGED} of a {hold}-credit hold"
+        );
+        assert_settled(&core);
+    });
+}
+
 // ===========================================================================
 // Re-request (`respond_stream`): request a response to an already-persisted
 // post without re-posting — the retry entry point after a failed ask.
@@ -4895,16 +5094,25 @@ fn each_tool_round_acquires_its_own_hold() {
             .block_on(core.chat("use the tool".into(), MODEL.into(), None))
             .expect("tool turn succeeds");
 
-        // Two `PrivateToken` headers, and they differ — each round proved a
-        // fresh spend.
+        // Two spends in the body's `credentials`, none in a header, and they
+        // differ — each round proved a fresh spend.
         let auths: Vec<String> = mock
-            .chat_auth_values()
+            .chat_spends()
             .into_iter()
-            .map(|a| a.expect("every eidola round sends an ACT header"))
+            .map(|a| a.expect("every eidola round carries a spend"))
             .collect();
         assert_eq!(auths.len(), 2);
-        assert!(auths.iter().all(|a| a.starts_with("PrivateToken token=")));
+        assert_eq!(
+            mock.chat_auths(),
+            vec![false, false],
+            "no credential in a header"
+        );
         assert_ne!(auths[0], auths[1], "each round proves its own spend");
+        assert_eq!(
+            mock.hold_mismatches(),
+            0,
+            "each round holds exactly its worst case"
+        );
 
         let requests = core
             .runtime()

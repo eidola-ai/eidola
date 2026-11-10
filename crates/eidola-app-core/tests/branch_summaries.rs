@@ -727,9 +727,9 @@ fn a_remote_utility_model_summarizes_and_spends() {
         assert_eq!(calls[0]["model"], chat_harness::ROUTER_REMOTE_MODEL);
         assert_eq!(summary_actions(&core, &fx.space).len(), 1);
 
-        let auths = mock.chat_auth_values();
+        let spends = mock.chat_spends();
         assert!(
-            auths.last().expect("an auth slot").is_some(),
+            spends.last().expect("a spend slot").is_some(),
             "a remote summary call carries a spend token"
         );
         let lifecycle = core

@@ -85,6 +85,7 @@ pub fn engine_request_headers(token: &EngineToken, model: &PinnedModel) -> Heade
 /// prompt), and the gateway's parse (`serde_json`'s sorted maps) does not keep
 /// it. So a request bound for a node keeps its bytes, and the only
 /// constructor parses exactly those bytes, so the two cannot disagree.
+#[derive(Clone)]
 pub struct ValidatedRequest {
     raw: bytes::Bytes,
     parsed: ChatCompletionRequest,
@@ -144,6 +145,9 @@ impl ValidatedRequest {
 /// first position and its last value, `serde_json`'s reading of it). The
 /// output is compact.
 ///
+/// `credentials`, the anonymous credits that paid for the request, is the
+/// gateway's alone and is never forwarded.
+///
 /// Three top-level members are the gateway's to decide, and are written last:
 ///
 /// - `stream` / `stream_options`: for a streaming request, `"stream":true`
@@ -195,6 +199,8 @@ pub fn engine_request_body(request: &ValidatedRequest) -> Zeroizing<Vec<u8>> {
                 })
             }
             "cache_key" => value.scrub(),
+            // The spends paid the gateway, not the node: never forwarded.
+            "credentials" => value.scrub(),
             "model" => member(&mut body, &key, &|out| {
                 serde_json::to_writer(&mut *out, &parsed.model).expect("a string serializes")
             }),

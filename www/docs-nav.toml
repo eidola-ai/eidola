@@ -28,6 +28,10 @@ pages = [
 ]
 
 [[sections]]
+title = "Specifications"
+pages = [["specs/act-multi-spend.md", "Multi-credential spends"]]
+
+[[sections]]
 title = "Release flow"
 pages = [
     ["releases.md", "Releases"],

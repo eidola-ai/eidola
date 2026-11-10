@@ -38,9 +38,9 @@ pub struct EidolaResponse {
     /// Verification metadata with cryptographic attestations.
     pub verification: VerificationMetadata,
 
-    /// Refund token for unspent credits (only present for ACT-authenticated requests).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refund: Option<RefundInfo>,
+    /// One refund per spend, in the order the request presented them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refunds: Vec<RefundInfo>,
 }
 
 impl EidolaResponse {
@@ -60,7 +60,7 @@ impl EidolaResponse {
             usage: response.usage,
             privacy,
             verification,
-            refund,
+            refunds: refund.into_iter().collect(),
         }
     }
 }
@@ -206,9 +206,9 @@ pub struct EidolaStreamMetadata {
     /// Verification metadata.
     pub verification: VerificationMetadata,
 
-    /// Refund token for unspent credits.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refund: Option<RefundInfo>,
+    /// One refund per spend, in the order the request presented them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refunds: Vec<RefundInfo>,
 }
 
 impl EidolaStreamMetadata {
@@ -223,7 +223,7 @@ impl EidolaStreamMetadata {
             id,
             privacy,
             verification,
-            refund,
+            refunds: refund.into_iter().collect(),
         }
     }
 }
@@ -320,7 +320,7 @@ mod tests {
                 proxy: None,
                 backend: None,
             },
-            refund: None,
+            refunds: Vec::new(),
         };
 
         let json = serde_json::to_string(&response).unwrap();

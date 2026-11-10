@@ -1650,8 +1650,7 @@ fn register_record(s: &mut Snapshots) {
                 method: "POST".into(),
                 path: "/v1/chat/completions".into(),
                 request_headers: Some(
-                    "content-type: application/json\nauthorization: PrivateToken token=\"…\""
-                        .into(),
+                    "content-type: application/json\naccept: text/event-stream".into(),
                 ),
                 request_body: Some(
                     br#"{"model":"gemma4-31b","stream":true,"messages":[{"role":"user","content":"Why is the sky blue?"}]}"#

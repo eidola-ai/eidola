@@ -410,6 +410,13 @@ fn chunk(r: &ResponseMeta, choices: Value, usage: Option<Value>) -> Event {
 /// (`choices: []`) when `stream_options.include_usage`, then `[DONE]`. Dropping the
 /// stream (the client went away) drops the request's guard, which cancels it in the
 /// engine.
+///
+/// With `include_usage`, the role chunk and every delta chunk also carry the running
+/// `usage` (the prompt, and the completion tokens decoded so far, held-back text
+/// included): the gateway, which bills, keeps the last count it received, so a
+/// request it cuts short (its client went away, or it reached its deadline) is
+/// charged for what was generated rather than for nothing or for everything. The
+/// gateway forwards only the final usage chunk to its client.
 fn stream_response(run: Run, decoder: Decoder, include_usage: bool) -> Response {
     struct S {
         run: Run,
@@ -417,6 +424,18 @@ fn stream_response(run: Run, decoder: Decoder, include_usage: bool) -> Response 
         started: bool,
         finished: bool,
         include_usage: bool,
+    }
+    impl S {
+        /// The running `usage`, when the request asked for usage.
+        fn running_usage(&self) -> Option<Value> {
+            self.include_usage.then(|| {
+                usage(
+                    self.run.response.prompt_tokens,
+                    self.decoder.completion_tokens(),
+                    self.run.cached_prompt_tokens,
+                )
+            })
+        }
     }
     let state = S {
         run,
@@ -433,20 +452,22 @@ fn stream_response(run: Run, decoder: Decoder, include_usage: bool) -> Response 
         if !s.started {
             // The role chunk goes out at once, before the first token is computed.
             s.started = true;
+            let running = s.running_usage();
             out.push(chunk(
                 &s.run.response,
                 json!([{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]),
-                None,
+                running,
             ));
             return Some((stream::iter(out.into_iter().map(Ok::<_, Infallible>)), s));
         }
         match s.run.next(&mut s.decoder).await {
             Polled::Step(step) => {
                 if !step.delta.is_empty() {
+                    let running = s.running_usage();
                     out.push(chunk(
                         &s.run.response,
                         json!([{"index": 0, "delta": step.delta.to_openai_delta(), "finish_reason": null}]),
-                        None,
+                        running,
                     ));
                 }
                 if let Some(reason) = step.finish {
