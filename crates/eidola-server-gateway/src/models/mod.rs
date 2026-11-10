@@ -3,7 +3,8 @@
 //!
 //! The rows are the hand-written files under `models/` at the workspace root
 //! (`models/<family>/<label>.toml`), checked and rendered as Rust by
-//! `build.rs` ([`file`]) and compiled in as [`MODEL_CATALOG`]. The build also
+//! `build.rs` (`eidola_common::model_catalog`, the reader the client's build
+//! runs too) and compiled in as [`MODEL_CATALOG`]. The build also
 //! binds them to the engine pins (`releases/trust/engine-enclaves.json`) one
 //! to one by hash, so a gateway that builds serves exactly the rows it pins.
 //!
@@ -17,10 +18,8 @@
 //! everything after it (routing, placement, billing, logs, telemetry) sees
 //! only the hash.
 
-#[cfg(test)]
-pub(crate) mod file;
-
 use eidola_common::architecture::Architecture;
+pub use eidola_common::model_reference::{DIGEST_PREFIX, MAX_TAG_LEN, ModelReference, is_tag};
 
 use crate::types::{Modality, OutputBudgetClass};
 
@@ -124,64 +123,6 @@ impl CatalogRow {
     }
 }
 
-/// A client's `model` field, parsed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelReference<'a> {
-    /// `tag`: whatever the tag resolves to.
-    Follow { tag: &'a str },
-    /// `tag@sha256:<hex>`: the weights `sha256`. The digest is
-    /// authoritative; the tag is the client's label for it, syntax-checked
-    /// and echoed, never resolved.
-    Pin { tag: &'a str, sha256: &'a str },
-    /// `sha256:<hex>`: the weights, under whatever tags.
-    Hash { sha256: &'a str },
-}
-
-/// The prefix of a digest in a reference.
-pub const DIGEST_PREFIX: &str = "sha256:";
-
-impl<'a> ModelReference<'a> {
-    /// Parse a reference. Only full digests are accepted: 64 lowercase hex
-    /// digits after `sha256:`.
-    pub fn parse(text: &'a str) -> Result<Self, ModelRefError> {
-        let digest = |d: &'a str| -> Result<&'a str, ModelRefError> {
-            d.strip_prefix(DIGEST_PREFIX)
-                .filter(|hex| eidola_common::weights_manifest::is_lower_hex_sha256(hex))
-                .ok_or(ModelRefError::Malformed)
-        };
-        if text.starts_with(DIGEST_PREFIX) {
-            return Ok(ModelReference::Hash {
-                sha256: digest(text)?,
-            });
-        }
-        let (tag, pinned) = match text.split_once('@') {
-            Some((tag, rest)) => (tag, Some(digest(rest)?)),
-            None => (text, None),
-        };
-        if !is_tag(tag) {
-            return Err(ModelRefError::Malformed);
-        }
-        Ok(match pinned {
-            Some(sha256) => ModelReference::Pin { tag, sha256 },
-            None => ModelReference::Follow { tag },
-        })
-    }
-}
-
-/// The tag grammar (`file::is_tag`, the rule the build checks rows with).
-pub fn is_tag(tag: &str) -> bool {
-    !tag.is_empty()
-        && tag.len() <= MAX_TAG_LEN
-        && tag
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
-
-/// The longest tag accepted (`file::MAX_TAG_LEN`), in a catalog row and in
-/// a reference alike. Bounded so a reference's label cannot grow what is
-/// echoed into every response and stream chunk.
-pub const MAX_TAG_LEN: usize = 64;
-
 /// Why a reference was refused. Every message is fixed text, never the
 /// reference itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,7 +190,8 @@ pub fn resolve<'r>(
 ) -> Result<(&'r CatalogRow, String), ModelRefError> {
     let by_tag = |tag: &str| rows.iter().find(|r| r.tags.contains(&tag));
     let by_hash = |sha256: &str| rows.iter().find(|r| r.sha256 == sha256);
-    let (row, echo) = match ModelReference::parse(reference)? {
+    let parsed = ModelReference::parse(reference).map_err(|_| ModelRefError::Malformed)?;
+    let (row, echo) = match parsed {
         ModelReference::Follow { tag } => {
             let row = by_tag(tag).ok_or(ModelRefError::Unknown)?;
             (row, format!("{tag}@sha256:{}", row.sha256))

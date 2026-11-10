@@ -11695,3 +11695,356 @@ fn a_pending_issuance_is_retried_under_its_own_key_after_the_epoch_moves() {
         assert_eq!(mock.issuance_debits(), 1);
     });
 }
+
+// ===========================================================================
+// Hash-keyed models: an Eidola model reference (`tag`, `tag@sha256:<hex>`,
+// `sha256:<hex>`) is matched against the catalog as the gateway resolves it,
+// and every request of a turn names the weights the turn resolved to.
+// ===========================================================================
+
+const HASH_1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const HASH_2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+/// A followed tag is pinned to the hash the catalog gives it when the turn
+/// starts, on **every** request of the turn — the tool round and the answer
+/// after it — so a release moving the tag mid-turn cannot split one turn
+/// across two sets of weights. Each action records the hash it came from;
+/// the selection itself stays the tag.
+#[test]
+fn every_round_of_a_turn_names_the_hash_its_tag_resolved_to() {
+    run(|| {
+        let script = chat_harness::tool_script();
+        let config = MockConfig {
+            chat: ChatBehavior::ToolScript,
+            tool_script: script.clone(),
+            ..MockConfig::default()
+        };
+        *config.published_sha256.lock().unwrap() = Some(HASH_1.to_string());
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+        with_echo_tool(&core);
+
+        *script.lock().unwrap() = vec![(TOOL_NAME.to_string(), r#"{"text":"x"}"#.to_string())];
+        let result = core
+            .runtime()
+            .block_on(core.chat("use the tool".into(), MODEL.into(), None))
+            .expect("turn");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2, "a tool round and the answer");
+        for body in &bodies {
+            assert_eq!(body["model"], format!("{MODEL}@sha256:{HASH_1}"));
+        }
+        assert_eq!(result.model, MODEL, "the selection stays the tag");
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(result.space_id))
+            .expect("actions");
+        let paid: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a.action_type.as_str(), "tool_call" | "inference"))
+            .collect();
+        assert_eq!(paid.len(), 2);
+        for action in paid {
+            assert_eq!(action.model.as_deref(), Some(MODEL));
+            assert_eq!(
+                action.model_sha256.as_deref(),
+                Some(HASH_1),
+                "{}",
+                action.action_type
+            );
+        }
+    });
+}
+
+/// When a release moves the tag, the next turn follows it, and the record
+/// says which weights each answer came from — what the client's "model
+/// updated" notice compares. A gateway that publishes no hashes leaves the
+/// reference as the tag and records none.
+#[test]
+fn a_followed_tag_moves_with_the_catalog_and_the_record_says_which_weights_answered() {
+    run(|| {
+        let config = MockConfig::default();
+        let published = config.published_sha256.clone();
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("before any hash".into(), MODEL.into(), None))
+            .expect("turn 1");
+        let space = first.space_id.clone();
+        *published.lock().unwrap() = Some(HASH_1.to_string());
+        core.runtime()
+            .block_on(core.chat(
+                "on the first weights".into(),
+                MODEL.into(),
+                Some(space.clone()),
+            ))
+            .expect("turn 2");
+        *published.lock().unwrap() = Some(HASH_2.to_string());
+        core.runtime()
+            .block_on(core.chat(
+                "after the tag moved".into(),
+                MODEL.into(),
+                Some(space.clone()),
+            ))
+            .expect("turn 3");
+
+        let models: Vec<String> = mock
+            .chat_bodies()
+            .iter()
+            .map(|b| b["model"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            models,
+            [
+                MODEL.to_string(),
+                format!("{MODEL}@sha256:{HASH_1}"),
+                format!("{MODEL}@sha256:{HASH_2}"),
+            ]
+        );
+        let answered: Vec<Option<String>> = core
+            .runtime()
+            .block_on(core.test_space_actions(space))
+            .expect("actions")
+            .into_iter()
+            .filter(|a| a.action_type == "inference")
+            .map(|a| a.model_sha256)
+            .collect();
+        assert_eq!(
+            answered,
+            [None, Some(HASH_1.to_string()), Some(HASH_2.to_string())]
+        );
+    });
+}
+
+/// A pin is stored qualified (`tag@sha256:<hex>@eidola`), matched in the
+/// catalog by its hash alone, and sent bare; once the catalog no longer
+/// carries those weights it is refused by name before anything is spent,
+/// rather than answered by whatever the tag names now.
+#[test]
+fn a_pin_is_matched_by_its_hash_and_refused_by_name_when_its_weights_are_gone() {
+    run(|| {
+        let config = MockConfig::default();
+        let published = config.published_sha256.clone();
+        *published.lock().unwrap() = Some(HASH_1.to_string());
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+        let pin = format!("{MODEL}@sha256:{HASH_1}");
+        let selection = format!("{pin}@eidola");
+
+        let result = core
+            .runtime()
+            .block_on(core.chat("pinned".into(), selection.clone(), None))
+            .expect("pinned turn");
+        assert_eq!(mock.chat_bodies()[0]["model"], pin);
+        assert_eq!(
+            result.model, selection,
+            "a pin's canonical spelling is qualified"
+        );
+
+        // The bare spelling of the same pin reaches the same weights.
+        core.runtime()
+            .block_on(core.chat(
+                "bare pin".into(),
+                pin.clone(),
+                Some(result.space_id.clone()),
+            ))
+            .expect("bare pinned turn");
+        assert_eq!(mock.chat_bodies()[1]["model"], pin);
+
+        *published.lock().unwrap() = Some(HASH_2.to_string());
+        match core.runtime().block_on(core.chat(
+            "after".into(),
+            selection.clone(),
+            Some(result.space_id),
+        )) {
+            Err(AppError::ModelUnavailable { model }) => assert_eq!(model, selection),
+            other => panic!("expected ModelUnavailable, got {other:?}"),
+        }
+        assert_eq!(
+            mock.chat_bodies().len(),
+            2,
+            "nothing was sent for the refused pin"
+        );
+    });
+}
+
+/// **An answer from new weights announces the roster.** A participant's
+/// "model updated" notice compares the hash its last answer came from with
+/// what the tag names now, and the surfaces that show notices refresh on
+/// `Change::Participants` — so the turn whose answer first comes from the new
+/// weights is the write that changes the notice, and it says so. The first
+/// hash ever recorded and an answer from the same weights again change no
+/// notice, and announce nothing.
+#[test]
+fn an_answer_from_new_weights_announces_the_participants_change() {
+    run(|| {
+        let config = MockConfig::default();
+        let published = config.published_sha256.clone();
+        *published.lock().unwrap() = Some(HASH_1.to_string());
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        let participants_in = |rx: &mut tokio::sync::broadcast::Receiver<ChangeEvent>| {
+            drain(rx)
+                .into_iter()
+                .filter(|c| matches!(c, Change::Participants))
+                .count()
+        };
+
+        let mut rx = core.subscribe_changes();
+        let first = core
+            .runtime()
+            .block_on(core.chat("first".into(), MODEL.into(), None))
+            .expect("turn 1");
+        let space = first.space_id.clone();
+        assert_eq!(participants_in(&mut rx), 0, "a first hash moves no notice");
+
+        core.runtime()
+            .block_on(core.chat("same weights".into(), MODEL.into(), Some(space.clone())))
+            .expect("turn 2");
+        assert_eq!(
+            participants_in(&mut rx),
+            0,
+            "the same weights again move nothing"
+        );
+
+        *published.lock().unwrap() = Some(HASH_2.to_string());
+        core.runtime()
+            .block_on(core.chat("new weights".into(), MODEL.into(), Some(space.clone())))
+            .expect("turn 3");
+        assert_eq!(
+            participants_in(&mut rx),
+            1,
+            "the answer from new weights announces the roster once"
+        );
+
+        core.runtime()
+            .block_on(core.chat("settled".into(), MODEL.into(), Some(space)))
+            .expect("turn 4");
+        assert_eq!(participants_in(&mut rx), 0);
+    });
+}
+
+/// **A continuation is asked of the weights that wrote what it continues.**
+/// With the tag where it was, the continuation names those weights and
+/// records them; once a release has moved the tag and those weights are no
+/// longer served, it is refused by name before anything is spent, rather
+/// than finished by other weights under the same tag.
+#[test]
+fn a_continuation_is_pinned_to_the_weights_that_wrote_the_partial_answer() {
+    run(|| {
+        let config = MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Answer,
+                again: false,
+            },
+            ..MockConfig::default()
+        };
+        let published = config.published_sha256.clone();
+        *published.lock().unwrap() = Some(HASH_1.to_string());
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+
+        // The tag where it was: continued on the same weights.
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        let res = core
+            .runtime()
+            .block_on(core.continue_answer(cut.response_action_id.clone().unwrap()))
+            .expect("the continuation");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies[1]["model"], format!("{MODEL}@sha256:{HASH_1}"));
+        let recorded: Vec<Option<String>> = core
+            .runtime()
+            .block_on(core.test_space_actions(cut.space_id.clone()))
+            .expect("actions")
+            .into_iter()
+            .filter(|a| a.action_type == "inference")
+            .map(|a| a.model_sha256)
+            .collect();
+        assert!(
+            recorded.iter().all(|h| h.as_deref() == Some(HASH_1)),
+            "{recorded:?}"
+        );
+        assert!(!res.truncated);
+
+        // Cut again, then the tag moves and the old weights are gone.
+        let cut = core
+            .runtime()
+            .block_on(core.chat(
+                "And the moon?".into(),
+                MODEL.into(),
+                Some(cut.space_id.clone()),
+            ))
+            .expect("the second cut-off turn");
+        *published.lock().unwrap() = Some(HASH_2.to_string());
+        let sent = mock.chat_bodies().len();
+        match core
+            .runtime()
+            .block_on(core.continue_answer(cut.response_action_id.clone().unwrap()))
+        {
+            Err(AppError::ModelUnavailable { model }) => assert_eq!(model, MODEL),
+            other => panic!("expected ModelUnavailable, got {other:?}"),
+        }
+        assert_eq!(mock.chat_bodies().len(), sent, "nothing was sent");
+    });
+}
+
+/// **A failed generation is not an answer from new weights.** After the tag
+/// moves, a turn that errors upstream records which weights erred, but the
+/// participant's last answer is still the one from the earlier weights: the
+/// roster is not announced, and the next successful answer is the one that
+/// moves it.
+#[test]
+fn a_failed_generation_does_not_move_the_last_answers_weights() {
+    run(|| {
+        let config = MockConfig::default();
+        let published = config.published_sha256.clone();
+        let fail = config.fail_next_chat.clone();
+        *published.lock().unwrap() = Some(HASH_1.to_string());
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        let first = core
+            .runtime()
+            .block_on(core.chat("first".into(), MODEL.into(), None))
+            .expect("turn 1");
+        let space = first.space_id.clone();
+
+        *published.lock().unwrap() = Some(HASH_2.to_string());
+        *fail.lock().unwrap() = Some(503);
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.chat("fails".into(), MODEL.into(), Some(space.clone())))
+            .expect_err("the upstream refused");
+        let errored = core
+            .runtime()
+            .block_on(core.test_space_actions(space.clone()))
+            .expect("actions")
+            .into_iter()
+            .rfind(|a| a.action_type == "inference")
+            .expect("the error generation");
+        assert_eq!(errored.status, "error");
+        assert_eq!(errored.model_sha256.as_deref(), Some(HASH_2));
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Change::Participants)),
+            "a failed generation moves no notice"
+        );
+
+        core.runtime()
+            .block_on(core.chat("succeeds".into(), MODEL.into(), Some(space)))
+            .expect("turn 3");
+        assert_eq!(
+            drain(&mut rx)
+                .iter()
+                .filter(|c| matches!(c, Change::Participants))
+                .count(),
+            1,
+            "the first successful answer from the new weights announces the roster"
+        );
+    });
+}

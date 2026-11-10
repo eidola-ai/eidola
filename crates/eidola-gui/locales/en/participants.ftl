@@ -27,3 +27,24 @@ participants-router-list = Router models
 # notifies by its participants' own policies. Keep the register neutral: a word
 # that reads as "disabled" or "broken" would misdescribe the common case.
 participants-router-off = Off
+
+# Notices about an Eidola model choice, under the participant's name. A tag is
+# a name for a set of model weights; a release can move a tag onto newer
+# weights. Plain statements of fact, never alarms: the conversation still works.
+#
+# A followed tag now names newer weights than this participant's last answer
+# came from.
+participants-model-updated = Model updated: { $tag } now names newer weights.
+# A participant pinned to specific weights whose tag has moved on.
+participants-model-newer = Newer weights are available as { $tag }. This agent stays on the ones it is pinned to.
+# The weights are deprecated and will stop being served after the date.
+participants-model-retiring = These weights retire after { $date }.
+# The announced retirement date has passed; they may stop answering at any time.
+participants-model-retiring-past = These weights were due to retire on { $date }. Choose another model.
+# The weights are retired: requests naming them are refused.
+participants-model-retired = These weights are retired. Choose another model.
+# The model's identity in the editor: its weights hash (shortened) and where
+# the weights come from (`owner/name@revision`).
+participants-model-weights = Weights { $hash } from { $source }
+# Where to learn how to check the weights independently.
+participants-model-verify = Check these weights yourself: { $url }

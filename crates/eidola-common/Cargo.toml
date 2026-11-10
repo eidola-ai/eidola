@@ -37,8 +37,15 @@ unsafe-libyaml = { version = "0.2.11", optional = true }
 # gateway, both of which depend on `base64 0.23` and `serde` (derive)
 # themselves.
 base64 = { version = "0.23", optional = true }
+# `model_catalog`: the model catalog's source files (`models/`), read by the
+# gateway's and the client's build scripts alike. Optional, enabled only by
+# those two build scripts and their tests, each of which already depends on
+# `toml 1` and `sha2 0.11`.
+toml = { version = "1", optional = true }
+sha2 = { version = "0.11", optional = true }
 
 [features]
 argon2 = ["dep:argon2"]
 deployment = ["argon2", "dep:serde_yaml", "dep:serde", "dep:unsafe-libyaml"]
 spend-credentials = ["dep:base64", "dep:serde"]
+catalog = ["dep:toml", "dep:sha2", "dep:serde"]

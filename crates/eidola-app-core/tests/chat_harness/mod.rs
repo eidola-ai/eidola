@@ -587,6 +587,14 @@ pub enum RefundMode {
     ChargedEarly(u128),
 }
 
+/// The weights hash the mock catalog publishes for [`MODEL`] (see
+/// [`MockConfig::published_sha256`]).
+pub type PublishedSha = Arc<std::sync::Mutex<Option<String>>>;
+
+/// A one-shot non-2xx for the next chat request (see
+/// [`MockConfig::fail_next_chat`]).
+pub type FailNextChat = Arc<std::sync::Mutex<Option<u16>>>;
+
 /// Mock upstream configuration.
 #[derive(Clone)]
 pub struct MockConfig {
@@ -636,6 +644,16 @@ pub struct MockConfig {
     /// publishes its standard row), which leaves a turn on the fallback
     /// ceiling every test written before declarations were read expects.
     pub declared_max_output: Option<u64>,
+    /// The weights hash `GET /v1/models` publishes for [`MODEL`], with
+    /// [`MODEL`] as its tag. Shared and interior-mutable so a test can move
+    /// the tag onto other weights between turns, as a release does. `None` —
+    /// the default — publishes none, the shape of a gateway older than
+    /// hash-keyed models.
+    pub published_sha256: PublishedSha,
+    /// When set, the **next** chat request is answered with this non-2xx
+    /// status (an error document) and the setting clears, whatever `chat`
+    /// says — so a test can fail one turn between ordinary ones.
+    pub fail_next_chat: FailNextChat,
     /// Armed by a test to make the mock **stop listening** once it has served
     /// the next `GET /v1/models` — so the turn that fetched the catalog then
     /// meets a refused connection for its completion, the one failure that
@@ -877,6 +895,8 @@ impl Default for MockConfig {
             declared_tool_calling: None,
             declared_prompt_cache: None,
             declared_max_output: None,
+            published_sha256: PublishedSha::default(),
+            fail_next_chat: FailNextChat::default(),
             close_switch: CloseSwitch::default(),
             list_flat_model: false,
             chat_delay_ms: 0,
@@ -2236,6 +2256,14 @@ async fn handle_chat(
 ) -> std::io::Result<()> {
     if config.chat_delay_ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(config.chat_delay_ms)).await;
+    }
+    let fail = config
+        .fail_next_chat
+        .lock()
+        .expect("fail-next lock poisoned")
+        .take();
+    if let Some(status) = fail {
+        return write_json(stream, status, &error_body("upstream model error")).await;
     }
     // The inline refunds of a completed request, computed once (shared by
     // the blocking happy path): one per input, settled at the configured
@@ -3784,6 +3812,15 @@ fn models_body(config: &MockConfig) -> String {
     }
     if let Some(ceiling) = config.declared_max_output {
         primary["max_output_tokens"] = serde_json::json!(ceiling);
+    }
+    if let Some(sha256) = config
+        .published_sha256
+        .lock()
+        .expect("published hash lock poisoned")
+        .clone()
+    {
+        primary["sha256"] = serde_json::json!(sha256);
+        primary["tags"] = serde_json::json!([MODEL]);
     }
     let router = serde_json::json!({
         "id": ROUTER_REMOTE_MODEL,

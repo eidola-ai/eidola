@@ -1,10 +1,11 @@
-//! The model catalog's format, its build-time checks (`file.rs`, the code
-//! `build.rs` runs) over fixture files, and the reference syntax.
+//! The model catalog's format and its build-time checks
+//! (`eidola_common::model_catalog`, the reader `build.rs` runs) over fixture
+//! files, and the gateway's resolution of references.
 
 use eidola_common::architecture::Architecture;
 
-use super::file::{self, Lifecycle, PinView, Row};
 use super::{CatalogRow, ModelRefError, ModelReference};
+use eidola_common::model_catalog::{self as file, Lifecycle, PinView, Row};
 
 const FIXTURE_PATH: &str = "models/fixture-family/flash.toml";
 const FIXTURE: &str = include_str!("../../tests/fixtures/models/fixture-family/flash.toml");
@@ -384,48 +385,6 @@ fn the_compiled_catalog_holds_its_invariants() {
     }
 }
 
-#[test]
-fn a_reference_is_a_tag_a_pin_or_a_hash() {
-    let hash = "a".repeat(64);
-    assert_eq!(
-        ModelReference::parse("mimo-v2.6-flash"),
-        Ok(ModelReference::Follow {
-            tag: "mimo-v2.6-flash"
-        })
-    );
-    assert_eq!(
-        ModelReference::parse(&format!("mimo-v2.6-flash@sha256:{hash}")),
-        Ok(ModelReference::Pin {
-            tag: "mimo-v2.6-flash",
-            sha256: &hash
-        })
-    );
-    assert_eq!(
-        ModelReference::parse(&format!("sha256:{hash}")),
-        Ok(ModelReference::Hash { sha256: &hash })
-    );
-    // Only full, lowercase digests, and only these forms.
-    for bad in [
-        String::new(),
-        "tag@".into(),
-        "@sha256:".to_string() + &hash,
-        format!("tag@sha256:{}", &hash[..63]),
-        format!("tag@sha256:{}", hash.to_uppercase()),
-        format!("tag@sha512:{hash}"),
-        format!("tag@{hash}"),
-        format!("sha256:{}", &hash[..12]),
-        format!("tag@sha256:{hash}@eidola"),
-        "has space".into(),
-        "a:b".into(),
-    ] {
-        assert_eq!(
-            ModelReference::parse(&bad),
-            Err(ModelRefError::Malformed),
-            "{bad:?}"
-        );
-    }
-}
-
 /// The typed refusals: a fixed message each, never the reference.
 #[test]
 fn refusals_are_typed_and_say_nothing_of_the_reference() {
@@ -531,25 +490,4 @@ fn a_listed_id_never_holds_an_at_sign() {
         untagged.pinned_reference(),
         format!("sha256:{}", ROWS[0].sha256)
     );
-}
-
-/// The runtime's tag grammar is the one the build checks rows with.
-#[test]
-fn the_runtime_and_the_build_read_tags_alike() {
-    assert_eq!(super::MAX_TAG_LEN, file::MAX_TAG_LEN);
-    let long = "x".repeat(65);
-    for tag in [
-        "a",
-        "A.b_c-9",
-        "mimo-v2.6-flash",
-        "",
-        "a@b",
-        "a:b",
-        "a b",
-        "a/b",
-        "é",
-        &long,
-    ] {
-        assert_eq!(super::is_tag(tag), file::is_tag(tag), "{tag:?}");
-    }
 }
