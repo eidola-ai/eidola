@@ -22,6 +22,8 @@
 //! A response cut off by `length` keeps the calls already completed; a call
 //! whose closing tag never arrived is dropped (see [`crate::tool_call`]).
 
+use std::ops::Range;
+
 use crate::args::ToolSchemas;
 use crate::error::ChatError;
 use crate::reasoning::ReasoningParser;
@@ -215,8 +217,32 @@ impl OutputParser {
     /// start, right after a lone `<think>`) each make it false — so a resumed parse of the rest splits exactly as an
     /// uninterrupted one would.
     pub fn resumes_exactly(&self) -> bool {
+        self.continued_text()
+            .is_some_and(|(expected, _)| expected == self.raw)
+    }
+
+    /// [`Self::resumes_exactly`], **in tokens as well as in text**. `added` is
+    /// where in the text fed in the model sampled an added token (`<think>`,
+    /// `</think>`, `<tool_call>`, …): the byte range of each one's text, in
+    /// order. A continued prompt encodes an added token only where the template
+    /// writes one, the `<think>` and `</think>` around the reasoning, and
+    /// everything given out as reasoning or content is request data there, which
+    /// spells none ([`crate::MimoTokenizer::encode_prompt`]). So the verdict is
+    /// true only when the model sampled exactly those tags as tokens and no
+    /// other: a sampled added token that reached the text, or a tag the model
+    /// wrote out of ordinary tokens, would come back as different tokens.
+    pub fn resumes_exactly_as_tokens(&self, added: &[Range<usize>]) -> bool {
+        self.continued_text()
+            .is_some_and(|(expected, tags)| expected == self.raw && added == tags)
+    }
+
+    /// What the template renders after the prompt when the reasoning and
+    /// content given out come back as a continued final message, and where in it
+    /// the template's own `<think>` and `</think>` are. `None` where no
+    /// continuation would resume this parse.
+    fn continued_text(&self) -> Option<(String, Vec<Range<usize>>)> {
         if self.tool_calls_emitted || self.lossy || self.cut_in_delimiter {
-            return false;
+            return None;
         }
         let (r, c) = (&self.emitted_reasoning, &self.emitted_content);
         // **The splitter must be in the mode a resumed one starts in**: the
@@ -231,24 +257,30 @@ impl OutputParser {
             self.reasoning.in_content()
         };
         if !resumed_mode {
-            return false;
+            return None;
         }
         let after_reasoning = |open: &str| {
-            if c.is_empty() {
-                format!("{open}{r}")
-            } else {
-                format!("{open}{r}</think>{c}")
+            let mut text = String::new();
+            let mut tags = Vec::new();
+            for (tag, written) in [(open, true), (r, false), ("</think>", true), (c, false)] {
+                if tag == "</think>" && written && c.is_empty() {
+                    break;
+                }
+                if written && !tag.is_empty() {
+                    tags.push(text.len()..text.len() + tag.len());
+                }
+                text.push_str(tag);
             }
+            (text, tags)
         };
-        let expected = match self.continuing {
-            None if self.thinking => after_reasoning("<think>"),
-            Some("reasoning_content") => after_reasoning(""),
+        match self.continuing {
+            None if self.thinking => Some(after_reasoning("<think>")),
+            Some("reasoning_content") => Some(after_reasoning("")),
             // Thinking disabled, or the answer continued: the prompt already
             // holds any reasoning, so all the output is answer.
-            _ if r.is_empty() => c.clone(),
-            _ => return false,
-        };
-        expected == self.raw
+            _ if r.is_empty() => Some((c.clone(), Vec::new())),
+            _ => None,
+        }
     }
 
     /// Feeds one generated token. An id the tokenizer does not define is refused

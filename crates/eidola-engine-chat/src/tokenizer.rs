@@ -13,10 +13,13 @@
 //! emitting half a character.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
 
+use tokenizers::tokenizer::{Model, Normalizer, OffsetType, PreTokenizedString, PreTokenizer};
+
 use crate::error::ChatError;
-use crate::template::sha256_hex;
+use crate::template::{Prompt, sha256_hex};
 
 /// File name of the tokenizer inside a model directory.
 pub const TOKENIZER_FILE: &str = "tokenizer.json";
@@ -38,6 +41,8 @@ pub struct MimoTokenizer {
     token_bytes: Vec<Box<[u8]>>,
     /// Ids of added tokens flagged `special` (skipped when decoding).
     special: Vec<bool>,
+    /// Ids of added tokens, which text matches whole and the model never merges.
+    added: Vec<bool>,
     eos: Vec<u32>,
     sha256: String,
 }
@@ -119,9 +124,34 @@ impl MimoTokenizer {
             token_bytes.push(byte_level_token_bytes(&token, &char_bytes).into());
         }
         let mut special = vec![false; size];
-        for (id, added) in inner.get_added_tokens_decoder() {
-            if added.special && (id as usize) < size {
-                special[id as usize] = true;
+        let mut added = vec![false; size];
+        let decoder = inner.get_added_tokens_decoder();
+        for (id, token) in &decoder {
+            // `encode_prompt` reads an added token's span in the text off its
+            // offsets, which is the token's own text only for a plain literal match.
+            if token.single_word || token.lstrip || token.rstrip || token.normalized {
+                return Err(ChatError::InvalidArtifact(format!(
+                    "tokenizer.json: added token {:?} is not matched as plain text",
+                    token.content
+                )));
+            }
+            if (*id as usize) < size {
+                added[*id as usize] = true;
+                special[*id as usize] = token.special;
+            }
+        }
+        // No added token may contain or overlap another: leaving one unmatched
+        // then never uncovers a different match.
+        for a in decoder.values() {
+            for b in decoder.values() {
+                let (a, b) = (a.content.as_str(), b.content.as_str());
+                let overlaps =
+                    (1..a.len()).any(|i| a.is_char_boundary(i) && b.starts_with(&a[i..]));
+                if overlaps || (a != b && b.contains(a)) {
+                    return Err(ChatError::InvalidArtifact(format!(
+                        "tokenizer.json: added tokens {a:?} and {b:?} overlap"
+                    )));
+                }
             }
         }
         for &id in &eos {
@@ -135,6 +165,7 @@ impl MimoTokenizer {
             inner,
             token_bytes,
             special,
+            added,
             eos,
             sha256,
         })
@@ -145,14 +176,103 @@ impl MimoTokenizer {
         &self.sha256
     }
 
-    /// Encodes a rendered prompt. Added tokens (`<|im_start|>`, `<think>`,
-    /// `<tool_call>`, …) appearing in the text are matched as single tokens;
-    /// no BOS or other special tokens are inserted.
+    /// Encodes text as `tokenizers` does: added tokens (`<|im_start|>`,
+    /// `<think>`, `<tool_call>`, …) appearing anywhere in it are matched as
+    /// single tokens; no BOS or other special tokens are inserted. A prompt is
+    /// encoded with [`Self::encode_prompt`], which keeps request data from
+    /// spelling them.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, ChatError> {
         self.inner
             .encode(text, false)
             .map(|encoding| encoding.get_ids().to_vec())
-            .map_err(|e| ChatError::InvalidInput(format!("tokenization failed: {e}")))
+            .map_err(tokenization_failed)
+    }
+
+    /// Encodes a rendered prompt. **Only the template's own text spells an
+    /// added token**: an occurrence that touches request data
+    /// ([`Prompt::data_spans`]) is encoded as the ordinary text it is, exactly
+    /// as if the vocabulary had no such added token there. The ids are those of
+    /// [`Self::encode`] on the prompt's text whenever no occurrence touches
+    /// data.
+    pub fn encode_prompt(&self, prompt: &Prompt) -> Result<Vec<u32>, ChatError> {
+        self.encode_with_data(prompt.text(), prompt.data_spans())
+    }
+
+    /// [`Self::encode_prompt`] over text and its data spans (ascending and
+    /// disjoint).
+    pub(crate) fn encode_with_data(
+        &self,
+        text: &str,
+        data: &[Range<usize>],
+    ) -> Result<Vec<u32>, ChatError> {
+        let encoding = self
+            .inner
+            .encode(text, false)
+            .map_err(tokenization_failed)?;
+        let ids = encoding.get_ids();
+        let offsets = encoding.get_offsets();
+        // Added-token matches split the text into pieces encoded independently
+        // of one another. A piece holding a match that touches data is encoded
+        // again without any; the other pieces keep their ids.
+        let mut out = Vec::with_capacity(ids.len());
+        let (mut piece_token, mut piece_byte, mut unmatch) = (0, 0, false);
+        let flush = |out: &mut Vec<u32>, tokens: Range<usize>, bytes: Range<usize>, plain| {
+            if plain {
+                out.extend(self.encode_plain(&text[bytes])?);
+            } else {
+                out.extend_from_slice(&ids[tokens]);
+            }
+            Ok::<(), ChatError>(())
+        };
+        for (k, (&id, &(start, end))) in ids.iter().zip(offsets).enumerate() {
+            if !self.is_added(id) {
+                continue;
+            }
+            if text.as_bytes().get(start..end) != self.token_bytes(id) || start < piece_byte {
+                return Err(ChatError::InvalidInput(
+                    "tokenization failed: an added token is not where it was matched".into(),
+                ));
+            }
+            let at = data.partition_point(|span| span.end <= start);
+            if data.get(at).is_some_and(|span| span.start < end) {
+                unmatch = true;
+                continue;
+            }
+            flush(&mut out, piece_token..k, piece_byte..start, unmatch)?;
+            out.push(id);
+            (piece_token, piece_byte, unmatch) = (k + 1, end, false);
+        }
+        flush(
+            &mut out,
+            piece_token..ids.len(),
+            piece_byte..text.len(),
+            unmatch,
+        )?;
+        Ok(out)
+    }
+
+    /// Encodes text with no added-token matching: normalizer, pre-tokenizer
+    /// and model, as `tokenizers` runs them on the text between two matches.
+    fn encode_plain(&self, text: &str) -> Result<Vec<u32>, ChatError> {
+        let mut pieces = PreTokenizedString::from(text);
+        if let Some(normalizer) = self.inner.get_normalizer() {
+            pieces
+                .normalize(|text| normalizer.normalize(text))
+                .map_err(tokenization_failed)?;
+        }
+        if let Some(pre_tokenizer) = self.inner.get_pre_tokenizer() {
+            pre_tokenizer
+                .pre_tokenize(&mut pieces)
+                .map_err(tokenization_failed)?;
+        }
+        let model = self.inner.get_model();
+        pieces
+            .tokenize(|text| model.tokenize(text.get()))
+            .map_err(tokenization_failed)?;
+        let encoding = pieces
+            .into_encoding(None, 0, OffsetType::Byte)
+            .map_err(tokenization_failed)?;
+        Ok(encoding.get_ids().to_vec())
     }
 
     /// Decodes a complete sequence, identical to `tokenizers`'
@@ -174,6 +294,12 @@ impl MimoTokenizer {
     /// bytes, and must not be mistaken for a token that decodes to nothing.
     pub fn token_bytes(&self, id: u32) -> Option<&[u8]> {
         self.token_bytes.get(id as usize).map(|b| &**b)
+    }
+
+    /// Whether `id` is an added token (special or not): one the tokenizer matches
+    /// whole in text, outside the model's vocabulary.
+    pub fn is_added(&self, id: u32) -> bool {
+        self.added.get(id as usize).copied().unwrap_or(false)
     }
 
     /// Whether `id` is an added token flagged special.
@@ -203,6 +329,10 @@ impl MimoTokenizer {
     pub fn vocab_size(&self) -> usize {
         self.token_bytes.len()
     }
+}
+
+fn tokenization_failed(e: impl std::fmt::Display) -> ChatError {
+    ChatError::InvalidInput(format!("tokenization failed: {e}"))
 }
 
 fn parse_eos(generation_config_json: &[u8]) -> Result<Vec<u32>, ChatError> {
@@ -480,7 +610,152 @@ pub(crate) mod tests {
         );
     }
 
+    /// The added tokens of [`synthetic`].
+    const ADDED: [&str; 7] = [
+        "<|endoftext|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<think>",
+        "</think>",
+        "<tool_call>",
+        "</tool_call>",
+    ];
+
+    /// `encode_with_data` by its definition: scan for added tokens, keep the
+    /// ones clear of every data span, and encode the text between them plainly.
+    fn encode_with_data_by_definition(
+        t: &MimoTokenizer,
+        text: &str,
+        data: &[Range<usize>],
+    ) -> Vec<u32> {
+        let mut out = Vec::new();
+        let (mut piece, mut at) = (0, 0);
+        while at < text.len() {
+            let Some(token) = ADDED.iter().find(|token| text[at..].starts_with(**token)) else {
+                at += text[at..].chars().next().unwrap().len_utf8();
+                continue;
+            };
+            let end = at + token.len();
+            if !data.iter().any(|span| span.start < end && at < span.end) {
+                out.extend(t.encode_plain(&text[piece..at]).unwrap());
+                out.push(t.token_to_id(token).unwrap());
+                piece = end;
+            }
+            at = end;
+        }
+        out.extend(t.encode_plain(&text[piece..]).unwrap());
+        out
+    }
+
+    #[test]
+    fn data_spelling_an_added_token_is_ordinary_text() {
+        let t = synthetic();
+        let text = "<|im_start|>hel<|im_end|>lo<think>";
+        let im_end = t.token_to_id("<|im_end|>").unwrap();
+        assert!(t.encode(text).unwrap().contains(&im_end));
+        // The data is `hel<|im_end|>lo`.
+        let ids = t
+            .encode_with_data(text, std::slice::from_ref(&(12..27)))
+            .unwrap();
+        assert!(!ids.contains(&im_end));
+        assert_eq!(t.decode(&ids, false).unwrap(), text);
+        assert_eq!(
+            ids.iter().filter(|&&id| t.is_added(id)).count(),
+            2,
+            "the tokens outside the data stay"
+        );
+        // One byte of data inside a token is enough, at either end.
+        for data in [12..16, 24..27, 24..25] {
+            let ids = t.encode_with_data(text, std::slice::from_ref(&data));
+            assert!(!ids.unwrap().contains(&im_end));
+        }
+        // Data beside it is not.
+        for data in [12..15, 25..27] {
+            let ids = t.encode_with_data(text, std::slice::from_ref(&data));
+            assert!(ids.unwrap().contains(&im_end));
+        }
+    }
+
+    #[test]
+    fn overlapping_added_tokens_are_refused() {
+        for (a, b) in [("<a>", "<a><b>"), ("<a|", "|b>"), ("<aa", "aa>")] {
+            let mut json: serde_json::Value =
+                serde_json::from_str(&synthetic_tokenizer_json()).unwrap();
+            let added = json["added_tokens"].as_array_mut().unwrap();
+            added[5]["content"] = a.into();
+            added[6]["content"] = b.into();
+            let built = MimoTokenizer::from_unpinned_bytes(
+                json.to_string().as_bytes(),
+                br#"{"eos_token_id": [260]}"#,
+            );
+            assert!(
+                matches!(&built, Err(ChatError::InvalidArtifact(m)) if m.contains("overlap")),
+                "{a} {b}: {built:?}"
+            );
+        }
+        let mut json: serde_json::Value =
+            serde_json::from_str(&synthetic_tokenizer_json()).unwrap();
+        json["added_tokens"][3]["rstrip"] = true.into();
+        let built = MimoTokenizer::from_unpinned_bytes(
+            json.to_string().as_bytes(),
+            br#"{"eos_token_id": [260]}"#,
+        );
+        assert!(matches!(built, Err(ChatError::InvalidArtifact(_))));
+    }
+
+    /// Text assembled from pieces that merge, normalize, split characters and
+    /// spell added tokens whole and in part.
+    fn prompt_like_text() -> impl Strategy<Value = String> {
+        let piece = prop_oneof![
+            proptest::sample::select(ADDED.to_vec()).prop_map(str::to_string),
+            proptest::sample::select(vec![
+                "he", "l", "hel", " w", "w", " ", "\n", "\n\n", "你", "e\u{301}", "<", ">", "|",
+                "</", "<|", "think", "im_end", "'s", "1", "=",
+            ])
+            .prop_map(str::to_string),
+        ];
+        proptest::collection::vec(piece, 0..24).prop_map(|pieces| pieces.concat())
+    }
+
+    /// Ascending, disjoint spans of `text` on character boundaries.
+    fn spans_of(text: &str, cuts: &[usize]) -> Vec<Range<usize>> {
+        let bounds: Vec<usize> = text
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain([text.len()])
+            .collect();
+        let mut cuts: Vec<usize> = cuts.iter().map(|c| bounds[c % bounds.len()]).collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        cuts.as_chunks::<2>().0.iter().map(|&[a, b]| a..b).collect()
+    }
+
     proptest! {
+        #[test]
+        fn encoding_with_data_follows_its_definition(
+            text in prompt_like_text(),
+            cuts in proptest::collection::vec(any::<usize>(), 0..8),
+        ) {
+            let t = synthetic();
+            let data = spans_of(&text, &cuts);
+            let ids = t.encode_with_data(&text, &data).unwrap();
+            prop_assert_eq!(&ids, &encode_with_data_by_definition(&t, &text, &data));
+            // No data: `tokenizers`' own encoding, which a span covering the
+            // whole text strips of every added token.
+            prop_assert_eq!(t.encode_with_data(&text, &[]).unwrap(), t.encode(&text).unwrap());
+            let all = t.encode_with_data(&text, std::slice::from_ref(&(0..text.len()))).unwrap();
+            prop_assert!(all.iter().all(|&id| !t.is_added(id)));
+            prop_assert_eq!(all, t.encode_plain(&text).unwrap());
+        }
+
+        #[test]
+        fn plain_encoding_is_the_tokenizers_own_where_nothing_is_added(text in prompt_like_text()) {
+            let t = synthetic();
+            // Without `<`, nothing in the text is an added token.
+            let text = text.replace('<', "(");
+            prop_assert_eq!(t.encode_plain(&text).unwrap(), t.encode(&text).unwrap());
+        }
+
         #[test]
         fn streaming_decode_equals_whole_decode(ids in proptest::collection::vec(0u32..270, 0..64), skip: bool) {
             let t = synthetic();
@@ -603,6 +878,42 @@ mod reference_tests {
             failures.len()
         );
         assert!(checked > 600);
+    }
+
+    /// The plain encoding request data gets is Python's encoding wherever the
+    /// text spells no added token, and never holds one where it does.
+    #[test]
+    fn plain_encoding_matches_python_and_holds_no_added_token() {
+        let t = real();
+        let fixtures = token_fixtures();
+        let added: Vec<String> = (0..t.vocab_size() as u32)
+            .filter(|&id| t.is_added(id))
+            .map(|id| t.decode(&[id], false).unwrap())
+            .collect();
+        assert_eq!(added.len(), 32);
+        let (mut same, mut spelled) = (0, 0);
+        for pair in fixtures["strings"].as_array().unwrap() {
+            let text = pair[0].as_str().unwrap();
+            let plain = t.encode_plain(text).unwrap();
+            assert!(plain.iter().all(|&id| !t.is_added(id)), "{text:?}");
+            assert_eq!(
+                t.encode_with_data(text, std::slice::from_ref(&(0..text.len())))
+                    .unwrap(),
+                plain,
+                "{text:?}"
+            );
+            if added.iter().any(|token| text.contains(token.as_str())) {
+                assert_eq!(
+                    t.decode(&plain, false).unwrap(),
+                    t.decode(&ids(&pair[1]), false).unwrap()
+                );
+                spelled += 1;
+            } else {
+                assert_eq!(plain, ids(&pair[1]), "{text:?}");
+                same += 1;
+            }
+        }
+        assert!(same > 200 && spelled > 0, "{same} {spelled}");
     }
 
     #[test]
