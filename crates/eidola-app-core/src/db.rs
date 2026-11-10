@@ -512,7 +512,7 @@ async fn set_user_version(conn: &Connection, version: i64) -> Result<(), AppErro
 /// advertised `expires_at`: that is the key's `accept_until`, the row may
 /// have been written when it recorded `issue_until` instead, and a stale
 /// value expires every credential under the key while the server still
-/// takes them.
+/// takes them. Returns whether a row was written or its expiry moved.
 pub async fn upsert_issuer_key(
     conn: &Connection,
     id: &str,
@@ -521,11 +521,12 @@ pub async fn upsert_issuer_key(
     params_data: &[u8],
     expires_at: i64,
     created_at: i64,
-) -> Result<(), AppError> {
-    conn.execute(
+) -> Result<bool, AppError> {
+    let changed = conn.execute(
         "INSERT INTO issuer_key (id, params_hash, public_key_data, params_data, expires_at, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-         ON CONFLICT(id) DO UPDATE SET expires_at = excluded.expires_at",
+         ON CONFLICT(id) DO UPDATE SET expires_at = excluded.expires_at \
+         WHERE expires_at IS NOT excluded.expires_at",
         (
             Value::Text(id.to_string()),
             Value::Text(params_hash.to_string()),
@@ -539,7 +540,7 @@ pub async fn upsert_issuer_key(
     .map_err(|e| AppError::Database {
         message: format!("failed to upsert issuer key: {e}"),
     })?;
-    Ok(())
+    Ok(changed > 0)
 }
 
 // ---------------------------------------------------------------------------

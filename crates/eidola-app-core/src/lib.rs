@@ -3305,22 +3305,33 @@ impl Inner {
         // already on file from before that was so, or rotated out of issuance
         // since, keeps a stale expiry unless the advertised one overwrites it.
         let db_conn = self.db_conn().await?;
+        let mut expiry_moved = false;
         for advertised in keys
             .data
             .iter()
             .filter(|k| k.domain_separator == expected_ds)
         {
-            let advertised_public_key =
-                URL_SAFE_NO_PAD
-                    .decode(&advertised.public_key)
-                    .map_err(|e| AppError::Credential {
-                        message: format!("invalid base64 public key: {e}"),
-                    })?;
+            // A malformed entry is skipped, not fatal: this stores *every*
+            // accepted key, and one bad grace-window entry must not block
+            // issuance. The key issuance selects is parsed again, strictly, by
+            // the caller.
+            let (advertised_public_key, expires_at) = match (
+                URL_SAFE_NO_PAD.decode(&advertised.public_key),
+                iso_to_ms(&advertised.accept_until),
+            ) {
+                (Ok(public_key), Ok(expires_at)) => (public_key, expires_at),
+                _ => {
+                    eprintln!(
+                        "warning: skipping a malformed advertised issuer key {}",
+                        advertised.id
+                    );
+                    continue;
+                }
+            };
             let params_hash = blake3::hash(advertised.domain_separator.as_bytes())
                 .to_hex()
                 .to_string();
-            let expires_at = iso_to_ms(&advertised.accept_until)?;
-            db::upsert_issuer_key(
+            expiry_moved |= db::upsert_issuer_key(
                 &db_conn,
                 &advertised.id,
                 &params_hash,
@@ -3330,6 +3341,12 @@ impl Inner {
                 now,
             )
             .await?;
+        }
+        // Rewriting an expiry flips credentials between `expired` and
+        // `active`/`spending` in the lifecycle view: a durable wallet change,
+        // and every durable commit broadcasts its invalidation.
+        if expiry_moved {
+            self.bus.emit(Change::Wallet);
         }
 
         Ok(keys)
@@ -3660,6 +3677,12 @@ impl Inner {
         let db_conn = self.db_conn().await?;
         let params = params_from_domain_separator(cfg.domain_separator())?;
         let now = now_ms();
+
+        // A `spending` credential under a key row with a stale expiry reads
+        // `expired` and would be skipped by the sweep (the lifecycle view
+        // ranks `expired` first); refresh the advertised keys before listing,
+        // best-effort as on the turn path.
+        let _ = self.refresh_issuer_keys(&cfg, &client, base_url).await;
 
         let rows = db::list_spending_credentials(&db_conn).await?;
         let mut recovered = Vec::new();
@@ -11002,12 +11025,6 @@ impl AppCore {
         );
     }
 
-    /// Test-only seam: `chat` with an explicit per-round spend `budget`.
-    ///
-    /// The `budget` parameter is threaded through `run_turn` but no production
-    /// entry point sets it yet (it exists for the agent loop's per-iteration
-    /// ceiling — see [`MAX_TURN_ROUNDS`]). This exposes it so the chat-path
-    /// tests can pin the mid-loop budget exit, which is otherwise unreachable.
     /// Set every local issuer key's `expires_at`, as a profile written before
     /// `accept_until` was stored (or a key rotated out of issuance since) looks
     /// to the wallet; the harness has no other way to produce that row.
@@ -11024,6 +11041,12 @@ impl AppCore {
         Ok(())
     }
 
+    /// Test-only seam: `chat` with an explicit per-round spend `budget`.
+    ///
+    /// The `budget` parameter is threaded through `run_turn` but no production
+    /// entry point sets it yet (it exists for the agent loop's per-iteration
+    /// ceiling — see [`MAX_TURN_ROUNDS`]). This exposes it so the chat-path
+    /// tests can pin the mid-loop budget exit, which is otherwise unreachable.
     #[doc(hidden)]
     #[cfg(feature = "test-support")]
     pub async fn test_chat_with_budget(
