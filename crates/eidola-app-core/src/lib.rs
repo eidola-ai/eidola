@@ -14317,11 +14317,15 @@ async fn chosen_inputs(
 ///
 /// 1. If the first credential covers the hold `W`, it pays alone, its share
 ///    `W`.
-/// 2. Otherwise the first, with balance `a < W`, is drained: presented first
-///    with its whole balance as its share, then the first later credential
-///    that covers `W − a`, with share `W − a`.
-/// 3. If no later credential covers `W − a` (or the wallet is empty), a new
-///    credential is allocated, and the rule runs again.
+/// 2. Otherwise the first credential in the order, with balance `a < W`, for
+///    which some later credential covers `W − a` is drained: presented first
+///    with its whole balance as its share, then the first such later
+///    credential, with share `W − a`. That is normally the first credential;
+///    a later one is drained only when the first has no fill but another pair
+///    covers `W`, so a wallet able to pay is never sent to allocation.
+/// 3. If no pair covers `W` (or the wallet is empty), a new credential is
+///    allocated to fill beside the first credential's drain (or to pay alone),
+///    and the rule runs again.
 ///
 /// Every share is `W`, a drained balance, or the rest of `W` after a drain,
 /// so the shares sum to exactly `W` and reveal nothing but the drained
@@ -14333,8 +14337,9 @@ pub(crate) enum InputChoice {
     /// The credential at `drain` is drained and the one at `fill` (later in
     /// the order) pays the rest.
     Two { drain: usize, fill: usize },
-    /// Nothing in the wallet covers what is missing (`need`): the whole hold,
-    /// or the hold less the first credential's balance.
+    /// No pair in the wallet covers the hold: a new credential must cover
+    /// `need`, the whole hold, or the hold less the first credential's
+    /// balance.
     Allocate { need: i64 },
 }
 
@@ -14347,13 +14352,20 @@ pub(crate) fn choose_inputs(balances: &[i64], worst: i64) -> InputChoice {
     if first >= worst {
         return InputChoice::One(0);
     }
-    let rest = worst - first;
-    match balances[1..].iter().position(|&balance| balance >= rest) {
-        Some(i) => InputChoice::Two {
-            drain: 0,
-            fill: i + 1,
-        },
-        None => InputChoice::Allocate { need: rest },
+    // The first credential with a later one covering the rest of the hold.
+    // Every credential after the first is below the hold too, or the first
+    // would have a fill in it.
+    for (drain, &balance) in balances.iter().enumerate() {
+        let rest = worst - balance;
+        if let Some(i) = balances[drain + 1..].iter().position(|&b| b >= rest) {
+            return InputChoice::Two {
+                drain,
+                fill: drain + 1 + i,
+            };
+        }
+    }
+    InputChoice::Allocate {
+        need: worst - first,
     }
 }
 
@@ -19430,9 +19442,64 @@ mod tests {
         );
         // Exactly the rest is enough.
         assert_eq!(choose_inputs(&[1, 6_199], w), Two { drain: 0, fill: 1 });
-        // No later credential covers the rest: a new one, for the rest only.
+        // No pair covers the hold: a new credential, for the rest of the
+        // first credential's drain only.
         assert_eq!(choose_inputs(&[3_000, 3_199], w), Allocate { need: 3_200 });
         assert_eq!(choose_inputs(&[3_000], w), Allocate { need: 3_200 });
+        // The first has no fill, but a later pair covers the hold: that pair
+        // pays, rather than allocation ($0.10, $0.60 and $0.60 against $1).
+        assert_eq!(
+            choose_inputs(&[100_000, 600_000, 600_000], 1_000_000),
+            Two { drain: 1, fill: 2 }
+        );
+    }
+
+    /// **Allocation happens only when no pair covers the hold**, and every
+    /// pair chosen pays it exactly: over every wallet of up to four
+    /// credentials drawn from a few balances, in every order.
+    #[test]
+    fn allocation_happens_only_when_no_pair_covers_the_hold() {
+        use InputChoice::*;
+        let values = [0i64, 1, 3, 4, 6, 7, 10];
+        let worst = 10;
+        let mut wallets: Vec<Vec<i64>> = vec![Vec::new()];
+        for _ in 0..4 {
+            let longer: Vec<Vec<i64>> = wallets
+                .iter()
+                .filter(|w| w.len() == wallets.last().map_or(0, Vec::len))
+                .flat_map(|w| {
+                    values.iter().map(move |&v| {
+                        let mut w = w.clone();
+                        w.push(v);
+                        w
+                    })
+                })
+                .collect();
+            wallets.extend(longer);
+        }
+        for wallet in &wallets {
+            let pair_covers = (0..wallet.len())
+                .any(|i| (i + 1..wallet.len()).any(|j| wallet[i] + wallet[j] >= worst));
+            let first_covers = wallet.first().is_some_and(|&b| b >= worst);
+            match choose_inputs(wallet, worst) {
+                One(i) => assert!(i == 0 && first_covers, "{wallet:?}"),
+                Two { drain, fill } => {
+                    assert!(!first_covers && drain < fill, "{wallet:?}");
+                    assert!(wallet[drain] < worst, "{wallet:?}");
+                    assert!(wallet[drain] + wallet[fill] >= worst, "{wallet:?}");
+                    // The first credential with a fill is the one drained.
+                    assert!(
+                        (0..drain)
+                            .all(|i| (i + 1..wallet.len()).all(|j| wallet[i] + wallet[j] < worst)),
+                        "{wallet:?}"
+                    );
+                }
+                Allocate { need } => {
+                    assert!(!first_covers && !pair_covers, "{wallet:?}");
+                    assert_eq!(need, worst - wallet.first().copied().unwrap_or(0));
+                }
+            }
+        }
     }
 
     /// **Waiting for in-flight refunds is worth it when their successors could

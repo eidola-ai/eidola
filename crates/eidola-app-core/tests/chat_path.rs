@@ -752,6 +752,40 @@ fn every_exit_of_a_two_input_round_settles_every_input() {
     }
 }
 
+/// **A wallet able to pay is never sent to allocation.** The first
+/// credential (1,000) has no fill, since no later credential covers the rest
+/// of the hold, but the two 3,000-credit credentials together do: the first
+/// of them is drained and the second fills, with nothing converted (the
+/// account has no balance to convert), and the 1,000 is left for a later
+/// request.
+#[test]
+fn a_later_pair_pays_when_the_first_credential_has_no_fill() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            balance: 0,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        for amount in [1_000, 3_000, 3_000] {
+            core.runtime()
+                .block_on(core.account_allocate(amount))
+                .expect("an allocation");
+        }
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("the wallet pays without converting anything");
+        let worst = mock.chat_charges()[0].expect("a hold");
+        assert!(
+            worst > 4_000 && worst <= 6_000,
+            "the pair, and only the pair, covers {worst}"
+        );
+        assert_eq!(mock.chat_shares()[0], vec![3_000, worst - 3_000]);
+        assert_eq!(mock.issuance_debits(), 3, "no conversion");
+        assert!(spending_credentials(&core).is_empty());
+        assert_eq!(active_balances(&core), vec![1_000, 3_000, 3_000]);
+    });
+}
+
 /// **Mixed keys, to drain an older key's residual.** A 1,000-credit residual
 /// under the epoch just ended is drained into a request whose fill is under
 /// the new epoch's key: the older key sorts first (its value lapses first),
