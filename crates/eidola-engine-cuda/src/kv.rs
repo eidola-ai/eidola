@@ -24,7 +24,9 @@
 //! no table maps it and no maintenance reaches it. A replayed decode graph
 //! points its padding rows' KV writes and attention reads at it, so padding
 //! never touches a block the host allocates, shares or caches; it holds
-//! only what padding rows wrote (functions of the constant padding token).
+//! only what padding rows wrote: functions of the constant padding token
+//! and, with drafting, of the drafts a padding row takes greedily from real
+//! row 0's logits. The executor zeroes it when the engine goes idle.
 //!
 //! Block tables live on the device as `[slot][group][index]` `i32` rows (the
 //! attention kernels' index type) and change only through table updates and
@@ -908,6 +910,56 @@ impl KvStore {
 
     pub fn state(&self) -> &CudaSlice<f32> {
         &self.state
+    }
+
+    /// Every group's pad block, its tap included: what padding rows of a
+    /// graph step wrote, which with drafting depends on the real rows (a
+    /// padding row drafts greedily from real row 0's logits). The executor's
+    /// idle scrub zeroes them; nothing reads a pad block's earlier contents
+    /// into a real row.
+    pub(crate) fn pad_ranges(&self, s: &CudaStream) -> Vec<crate::launch::DeviceRange> {
+        let mut out = Vec::new();
+        for (g, geom) in self.geometry.iter().enumerate() {
+            for r in geom.block_ranges(geom.pad_block()) {
+                let (base, offset, bytes) = match r {
+                    BlockRange::Pool { offset, elems } => {
+                        (dptr(&self.pools[g], s), offset * 2, elems * 2)
+                    }
+                    BlockRange::Taps { offset, elems } => match self.taps[g].as_ref() {
+                        Some(t) => (dptr(t, s), offset * 4, elems * 4),
+                        None => continue,
+                    },
+                };
+                out.push(crate::launch::DeviceRange {
+                    name: "kv.pad_block",
+                    ptr: base + offset as u64,
+                    bytes,
+                });
+            }
+        }
+        out
+    }
+
+    /// Every device allocation of the store, whole: the pools (live KV
+    /// included), the taps, the per-slot state and the device tables. What
+    /// the executor zeroes before it frees them on drop. The host tier is not
+    /// listed: it only ever holds ciphertext.
+    pub(crate) fn device_ranges(&self, s: &CudaStream) -> Vec<crate::launch::DeviceRange> {
+        use crate::launch::DeviceRange;
+        let mut out: Vec<DeviceRange> = self
+            .pools
+            .iter()
+            .map(|p| DeviceRange::of("kv.pool", p, s))
+            .collect();
+        out.extend(
+            self.taps
+                .iter()
+                .flatten()
+                .map(|t| DeviceRange::of("kv.taps", t, s)),
+        );
+        out.push(DeviceRange::of("kv.state", &self.state, s));
+        out.push(DeviceRange::of("kv.tables", &self.tables_dev, s));
+        out
     }
 
     /// The host mirror.

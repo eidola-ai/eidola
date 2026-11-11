@@ -628,6 +628,22 @@ pub struct DecodeGraphs {
     capture_bytes: Vec<i64>,
 }
 
+impl DecodeGraphs {
+    /// The step table and the read-back: a step's token ids, positions,
+    /// page lists and sampled tokens (the executor's idle scrub). Zeroed in
+    /// place: the graphs captured their addresses.
+    pub(crate) fn residue_ranges(
+        &self,
+        s: &cudarc::driver::CudaStream,
+    ) -> Vec<crate::launch::DeviceRange> {
+        use crate::launch::DeviceRange;
+        vec![
+            DeviceRange::of("decode.table", &self.table, s),
+            DeviceRange::of("decode.readback", &self.readback, s),
+        ]
+    }
+}
+
 impl std::fmt::Debug for DecodeGraphs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DecodeGraphs")

@@ -28,7 +28,7 @@ use crate::device::ImageArch;
 use crate::engine_ops::{COPY_BUFFERS, CopyArgs, EngineOps, QkvArgs};
 use crate::gemm::{Gemm, GemmArgs, GemmKind};
 use crate::kv::{GroupGeometry, KvStore};
-use crate::launch::{dptr, dptr_at};
+use crate::launch::{DeviceRange, dptr, dptr_at};
 use crate::module::{ImageSource, KernelModule};
 use crate::moe_gemm::{BLOCK_M, MoeGemm, MoeGemmArgs, MoeProj};
 use crate::sampler::Sampler;
@@ -574,6 +574,84 @@ impl GpuModel {
 
     pub fn logits(&self) -> &CudaSlice<f32> {
         &self.scratch.logits
+    }
+
+    /// Every scratch buffer, each whole: everything a forward leaves of its
+    /// step (token ids, positions, KV targets, activations, routing, logits,
+    /// split attention's partials). The RoPE tables and the MTP copy lists
+    /// are constants and not listed.
+    pub(crate) fn scratch_ranges(&self, s: &cudarc::driver::CudaStream) -> Vec<DeviceRange> {
+        // Destructured whole, so a new scratch buffer must be listed here or
+        // named as exempt.
+        let Scratch {
+            max_tokens: _,
+            tokens,
+            positions,
+            kv_block,
+            kv_slot,
+            h,
+            x,
+            proj,
+            xq,
+            xsf,
+            qkv,
+            q,
+            attn,
+            gu,
+            ffn_out,
+            topk_ids,
+            topk_w,
+            router_scores,
+            row_of,
+            grouped,
+            permute,
+            ea,
+            esf,
+            egu,
+            eact,
+            eact_sf,
+            edown,
+            logit_rows,
+            sel,
+            logits,
+            partials_v,
+            partials_s,
+            partial_rows: _,
+            partial_heads: _,
+        } = &self.scratch;
+        vec![
+            DeviceRange::of("model.tokens", tokens, s),
+            DeviceRange::of("model.positions", positions, s),
+            DeviceRange::of("model.kv_block", kv_block, s),
+            DeviceRange::of("model.kv_slot", kv_slot, s),
+            DeviceRange::of("model.h", h, s),
+            DeviceRange::of("model.x", x, s),
+            DeviceRange::of("model.proj", proj, s),
+            DeviceRange::of("model.xq", xq, s),
+            DeviceRange::of("model.xsf", xsf, s),
+            DeviceRange::of("model.qkv", qkv, s),
+            DeviceRange::of("model.q", q, s),
+            DeviceRange::of("model.attn", attn, s),
+            DeviceRange::of("model.gu", gu, s),
+            DeviceRange::of("model.ffn_out", ffn_out, s),
+            DeviceRange::of("model.topk_ids", topk_ids, s),
+            DeviceRange::of("model.topk_w", topk_w, s),
+            DeviceRange::of("model.router_scores", router_scores, s),
+            DeviceRange::of("model.row_of", row_of, s),
+            DeviceRange::of("model.grouped", grouped, s),
+            DeviceRange::of("model.permute", permute, s),
+            DeviceRange::of("model.ea", ea, s),
+            DeviceRange::of("model.esf", esf, s),
+            DeviceRange::of("model.egu", egu, s),
+            DeviceRange::of("model.eact", eact, s),
+            DeviceRange::of("model.eact_sf", eact_sf, s),
+            DeviceRange::of("model.edown", edown, s),
+            DeviceRange::of("model.logit_rows", logit_rows, s),
+            DeviceRange::of("model.sel", sel, s),
+            DeviceRange::of("model.logits", logits, s),
+            DeviceRange::of("model.partials_v", partials_v, s),
+            DeviceRange::of("model.partials_s", partials_s, s),
+        ]
     }
 
     /// The f32 rows of `hidden` a forward leaves its states in, and the MTP

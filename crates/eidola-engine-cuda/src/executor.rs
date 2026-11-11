@@ -41,7 +41,7 @@ use crate::graph::{
     decode_rows, max_decode_pages, pack, rung_for, split_readback,
 };
 use crate::kv::{GroupGeometry, KvLayout, KvStore};
-use crate::launch::dptr;
+use crate::launch::{DeviceRange, dptr};
 use crate::model::{
     ForwardInput, GpuModel, InputParts, Kernels, group_geometry, group_layers, read_config,
 };
@@ -191,6 +191,10 @@ pub struct CudaExecutor {
     /// measurement can switch it on an executor an engine owns.
     decode_path: Cell<DecodePath>,
     stats: DecodeStats,
+    /// Whether a step with rows ran since the last idle scrub.
+    residue: bool,
+    /// Idle scrubs so far.
+    scrubs: u64,
 }
 
 /// Steps by how they ran (see [`CudaExecutor::decode_stats`]).
@@ -221,6 +225,28 @@ struct Drafting {
     /// (entry `j` at `base + j`) and the sequence continues from `at`.
     slots: Vec<Option<(u32, u32)>>,
     graphs: Option<crate::draft::DraftGraphs>,
+    /// An eager drafted step's table (a step's token ids, positions and
+    /// drafts): grown to a power of two, the old one zeroed before it is
+    /// freed.
+    eager_table: Option<cudarc::driver::CudaSlice<u32>>,
+}
+
+impl Drafting {
+    /// The eager table, at least `words` long.
+    fn eager_table(
+        &mut self,
+        s: &Arc<cudarc::driver::CudaStream>,
+        words: usize,
+    ) -> Result<&mut cudarc::driver::CudaSlice<u32>> {
+        let need = words.max(1);
+        if self.eager_table.as_ref().is_none_or(|t| t.len() < need) {
+            if let Some(mut old) = self.eager_table.take() {
+                s.memset_zeros(&mut old)?;
+            }
+            self.eager_table = Some(s.alloc_zeros(need.next_power_of_two())?);
+        }
+        Ok(self.eager_table.as_mut().expect("ensured above"))
+    }
 }
 
 /// One row's drafts in a drafted step (see [`CudaExecutor::record_drafts`]).
@@ -462,6 +488,7 @@ impl CudaExecutor {
                 ctx,
                 slots: vec![None; cfg.num_state_slots as usize],
                 graphs: None,
+                eager_table: None,
             })
         } else {
             None
@@ -491,6 +518,8 @@ impl CudaExecutor {
             decode: None,
             decode_path: Cell::new(decode_path),
             stats: DecodeStats::default(),
+            residue: false,
+            scrubs: 0,
         };
         if let Some(d) = ex.draft.as_mut() {
             d.ctx = draft_ctx(&ex.spec, &ex.model, &ex.cfg)?;
@@ -629,6 +658,115 @@ impl CudaExecutor {
             .read_host_block(&self.gpu, group as usize, host)?
             .iter()
             .all(|&x| x == 0))
+    }
+
+    /// Every device buffer that holds what a step with rows leaves behind:
+    /// the model's scratch, the sampler's, the drafting buffers and tables,
+    /// the decode graphs' step table and read-back, and every pool's pad
+    /// block. The KV pools' other blocks, the taps and the per-slot state are
+    /// the seam's (zeroed, encrypted and reset by maintenance), and the rest
+    /// of the device holds weights and constants.
+    fn residue_ranges(&self) -> Vec<DeviceRange> {
+        let s = self.gpu.stream();
+        let mut out = self.model.scratch_ranges(s);
+        out.extend([
+            DeviceRange::of("sampler.rows", &self.sample_rows, s),
+            DeviceRange::of("sampler.probs", &self.probs, s),
+            DeviceRange::of("sampler.tokens", &self.tokens, s),
+            DeviceRange::of("sampler.status", &self.status, s),
+        ]);
+        if let Some(d) = &self.draft {
+            out.extend(d.bufs.ranges(s));
+            if let Some(t) = &d.eager_table {
+                out.push(DeviceRange::of("draft.eager_table", t, s));
+            }
+            if let Some(g) = &d.graphs {
+                out.push(g.table_range(s));
+            }
+        }
+        if let Some(g) = &self.decode {
+            out.extend(g.residue_ranges(s));
+        }
+        out.extend(self.kv.pad_ranges(s));
+        out
+    }
+
+    /// Queue a memset of every range on the stream. Each is inside a live
+    /// allocation this executor owns, and the stream is the only one that
+    /// uses them.
+    fn zero_ranges(&self, ranges: &[DeviceRange]) -> Result<()> {
+        let s = self.gpu.stream();
+        self.gpu.context().bind_to_thread()?;
+        for r in ranges {
+            // SAFETY: `r` lies inside a live allocation of this executor
+            // (`residue_ranges`, `KvStore::device_ranges`), freed only when
+            // the executor is, after the stream has run this memset.
+            unsafe { cudarc::driver::sys::cuMemsetD8Async(r.ptr, 0, r.bytes, s.cu_stream()) }
+                .result()?;
+        }
+        Ok(())
+    }
+
+    /// Zero [`CudaExecutor::residue_ranges`] in place (the graphs captured
+    /// their addresses) and wait for it.
+    fn scrub_residue(&mut self) -> Result<()> {
+        self.zero_ranges(&self.residue_ranges())?;
+        self.gpu.synchronize()?;
+        self.residue = false;
+        self.scrubs += 1;
+        Ok(())
+    }
+
+    /// Idle scrubs so far: one per maintenance-only step that follows a step
+    /// with rows.
+    pub fn idle_scrubs(&self) -> u64 {
+        self.scrubs
+    }
+
+    /// The names of the buffers the idle scrub zeroes that hold a nonzero
+    /// byte, copied back from the device (tests and diagnostics).
+    pub fn residue_nonzero(&self) -> Result<Vec<&'static str>> {
+        const CHUNK: usize = 1 << 24;
+        self.gpu.synchronize()?;
+        self.gpu.context().bind_to_thread()?;
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; CHUNK];
+        for r in self.residue_ranges() {
+            let mut at = 0;
+            while at < r.bytes {
+                let n = CHUNK.min(r.bytes - at);
+                // SAFETY: the range is inside a live allocation and the stream
+                // has drained.
+                unsafe {
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        buf.as_mut_ptr().cast(),
+                        r.ptr + at as u64,
+                        n,
+                    )
+                }
+                .result()?;
+                if buf[..n].iter().any(|&b| b != 0) {
+                    if !out.contains(&r.name) {
+                        out.push(r.name);
+                    }
+                    break;
+                }
+                at += n;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Zero every device buffer that can hold request data, live KV
+    /// included, and wait for it: what dropping the executor does, best
+    /// effort. Every block's contents are lost; for teardown and tests.
+    pub fn scrub_device(&mut self) -> Result<()> {
+        let mut ranges = self.residue_ranges();
+        ranges.extend(self.kv.device_ranges(self.gpu.stream()));
+        self.zero_ranges(&ranges)?;
+        self.gpu.synchronize()?;
+        self.residue = false;
+        Ok(())
     }
 
     fn step(&mut self, step: &StepInput) -> Result<StepOutput> {
@@ -1176,7 +1314,7 @@ impl CudaExecutor {
         crate::draft::check_plan(&plan, &self.model, &self.kv, drafter)?;
         let layout;
         let launches;
-        let mut fresh_table = None;
+        let eager = rung.is_none();
         match rung {
             Some(r) => {
                 let g = self
@@ -1214,16 +1352,15 @@ impl CudaExecutor {
                 g.table_ptr(&s)
             }
             None => {
-                let t = s.clone_htod(&words)?;
-                let ptr = crate::launch::dptr(&t, &s);
-                fresh_table = Some(t);
-                ptr
+                let t = d.eager_table(&s, words.len())?;
+                s.memcpy_htod(&words, &mut t.slice_mut(..words.len()))?;
+                crate::launch::dptr(t, &s)
             }
         };
-        let table_words = match (&fresh_table, d.graphs.as_ref(), rung) {
-            (Some(t), _, _) => t.len(),
-            (None, Some(g), Some(_)) => g.table_words(),
-            _ => unreachable!("a table was chosen above"),
+        let table_words = match (eager, d.graphs.as_ref()) {
+            (true, _) => words.len(),
+            (false, Some(g)) => g.table_words(),
+            (false, None) => unreachable!("a table was chosen above"),
         };
         let mut target = crate::draft::RunTarget {
             model: &mut self.model,
@@ -1267,14 +1404,16 @@ impl CudaExecutor {
         if rb.status & crate::engine_ops::STATUS_BAD_INDEX != 0 {
             return Err(CudaError::new("a drafted step's copy index out of range"));
         }
+        let d = self.draft.as_mut().expect("drafting");
         if self.record_drafts {
-            let lanes = match &fresh_table {
-                Some(t) => s.clone_dtoh(&t.slice(layout.lanes..layout.kv_chunk))?,
-                None => d
-                    .graphs
+            let lanes = if eager {
+                let t = d.eager_table.as_ref().expect("an eager step's table");
+                s.clone_dtoh(&t.slice(layout.lanes..layout.kv_chunk))?
+            } else {
+                d.graphs
                     .as_ref()
                     .expect("a rung")
-                    .read_words(&self.gpu, layout.lanes..layout.kv_chunk)?,
+                    .read_words(&self.gpu, layout.lanes..layout.kv_chunk)?
             };
             self.drafts
                 .borrow_mut()
@@ -1352,8 +1491,17 @@ impl CudaExecutor {
                 );
             }
         }
-        drop(fresh_table);
         Ok(out)
+    }
+}
+
+/// Device memory is freed unzeroed, so the executor zeroes it first: the KV
+/// pools (live plaintext KV included), taps, state, tables and every buffer
+/// the idle scrub covers. Best effort: on a failed context the memsets fail
+/// and the memory is freed as it is.
+impl Drop for CudaExecutor {
+    fn drop(&mut self) {
+        let _ = self.scrub_device();
     }
 }
 
@@ -1364,12 +1512,22 @@ impl Executor for CudaExecutor {
 
     fn execute(&mut self, step: &StepInput) -> std::result::Result<StepOutput, ExecutorError> {
         self.steps += 1;
+        let rows = !step.seqs.is_empty();
+        // Set before the step: one that fails part way may have launched.
+        self.residue |= rows;
         let out = self.step(step).map_err(|e| ExecutorError(e.to_string()))?;
         // Host-tier zeros wait for the copies queued before them; they are done
         // before the step returns.
         self.kv
             .finish_host(&self.gpu)
             .map_err(|e| ExecutorError(e.to_string()))?;
+        // A step with no rows is the maintenance-only step the engine runs when
+        // it goes idle (and on sweeps): the first one after a step with rows
+        // scrubs what those steps left.
+        if !rows && self.residue {
+            self.scrub_residue()
+                .map_err(|e| ExecutorError(e.to_string()))?;
+        }
         Ok(out)
     }
 }
