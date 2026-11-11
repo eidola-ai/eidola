@@ -469,13 +469,10 @@ fn model_show_lines(
         ),
         format!("  files:       {} ({})", id.files.len(), fmt_size(total)),
     ];
+    // Each file's exact size, which is what a download is checked against
+    // (a rounded one reads a 4 KB template as "0 MB").
     for f in &id.files {
-        out.push(format!(
-            "    {}  {}  {}",
-            f.sha256,
-            f.path,
-            fmt_size(f.size)
-        ));
+        out.push(format!("    {}  {}  {} bytes", f.sha256, f.path, f.size));
     }
     out.push(format!("  check them:  {}", id.doc_url));
     for notice in mc::notices(catalog, &mref.model, None, None, today) {
@@ -2439,7 +2436,13 @@ mod tests {
                 ),
                 "{text}"
             );
-            assert!(text.contains("model.safetensors"), "{text}");
+            assert!(
+                text.contains(&format!(
+                    "{}  model.safetensors  2048 bytes",
+                    "5".repeat(64)
+                )),
+                "each file with its exact size: {text}"
+            );
             assert!(
                 text.contains(eidola_app_core::model_catalog::MODEL_IDENTITY_DOC),
                 "{text}"
@@ -2466,6 +2469,34 @@ mod tests {
                 text.contains("these weights retire after 2027-06-01"),
                 "{text}"
             );
+        }
+
+        /// Every tag of the catalog compiled into this binary shows its
+        /// weights, with every file the hash covers.
+        #[test]
+        fn the_shipped_catalog_shows_every_tag() {
+            use eidola_app_core::model_catalog::CATALOG;
+            for row in CATALOG {
+                for tag in row.tags {
+                    let text = super::super::model_show_lines(CATALOG, tag, "2026-11-09")
+                        .unwrap()
+                        .join("\n");
+                    assert!(
+                        text.contains(&format!("sha256:      {}", row.sha256)),
+                        "{text}"
+                    );
+                    for file in row.files {
+                        assert!(
+                            text.contains(&format!(
+                                "{}  {}  {} bytes",
+                                file.sha256, file.path, file.size
+                            )),
+                            "{tag}: {}",
+                            file.path
+                        );
+                    }
+                }
+            }
         }
 
         #[test]
