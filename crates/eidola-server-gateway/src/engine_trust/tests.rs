@@ -244,8 +244,30 @@ fn the_fixture_deployment_is_accepted() {
                 max_age_secs: 7200,
             },
             deployments: vec![CONFIG.to_string()],
+            max_model_len: 131_072,
         }]
     );
+}
+
+/// A catalog row may not publish a longer context window than its
+/// deployments serve: clients size prompts to the published window, and the
+/// node refuses a sequence beyond its `EIDOLA_ENGINE_MAX_MODEL_LEN`.
+#[test]
+fn a_rows_window_is_one_its_deployments_serve() {
+    let checked = Tree::fixture().check().expect("the fixture is valid");
+    let row = "models/fixture/flash.toml";
+    let model = "3".repeat(64);
+    manifest::check_context_windows(&[(row, &model, 131_072)], &checked)
+        .expect("the deployment's own length");
+    manifest::check_context_windows(&[(row, &model, 8_192)], &checked).expect("a shorter window");
+    let err = manifest::check_context_windows(&[(row, &model, 131_073)], &checked).unwrap_err();
+    assert!(
+        err.contains(row) && err.contains("EIDOLA_ENGINE_MAX_MODEL_LEN"),
+        "{err}"
+    );
+    // An unpinned row is the catalog binding's to refuse.
+    manifest::check_context_windows(&[(row, &"9".repeat(64), u64::MAX)], &checked)
+        .expect("not this check's");
 }
 
 #[tokio::test]

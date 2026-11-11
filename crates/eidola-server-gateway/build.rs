@@ -108,6 +108,12 @@ fn model_catalog(workspace_root: &Path, pinned: &[engine_manifest::CheckedModel]
         .collect();
     models::check_binding(&rows, &pins)
         .unwrap_or_else(|e| panic!("the model catalog and the engine pins disagree: {e}"));
+    let windows: Vec<(&str, &str, u64)> = rows
+        .iter()
+        .map(|r| (r.path.as_str(), r.sha256.as_str(), r.context_length))
+        .collect();
+    engine_manifest::check_context_windows(&windows, pinned)
+        .unwrap_or_else(|e| panic!("the model catalog and the engine pins disagree: {e}"));
     render_catalog(&rows)
 }
 
