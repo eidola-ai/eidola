@@ -20,7 +20,8 @@
 //!   ([`MODEL_IDENTITY_DOC`]).
 //!
 //! Every function takes the rows it reads, so tests run against fixtures
-//! while the shipped catalog is empty.
+//! (tags moved, weights deprecated and retired) as well as the shipped
+//! catalog.
 
 use serde::{Deserialize, Serialize};
 

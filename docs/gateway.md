@@ -105,7 +105,7 @@ The gateway does not run models. Models run on Eidola's inference engines, in se
 3. Send the request, and stream the response back, re-framed so that what a network observer sees does not follow the tokens (see [Response shape](#response-shape)).
 4. Charge the credential for the tokens used, and return the change.
 
-Inference content is therefore cleartext in two enclaves: the gateway's, in transit, and the engine's confidential VM, which performs the inference. The client verifies the attestation of the gateway on every handshake, and the gateway verifies the engine's on every handshake, against the deployments its own build pins. What that verification covers, and where it stops, is detailed in [engine.md](engine.md). No deployment is pinned yet, so today the gateway sells no models.
+Inference content is therefore cleartext in two enclaves: the gateway's, in transit, and the engine's confidential VM, which performs the inference. The client verifies the attestation of the gateway on every handshake, and the gateway verifies the engine's on every handshake, against the deployments its own build pins. What that verification covers, and where it stops, is detailed in [engine.md](engine.md). One deployment is pinned and none is running yet, so today the gateway lists one model and refuses its requests, with a full refund.
 
 ### Response shape
 
