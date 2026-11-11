@@ -18,6 +18,10 @@
 #   cargo run -p hash-secret -- "<secret>"
 # and verified at server startup via verify_measured_secrets().
 
+# Platform release 0.15.3-rc.1 was rebuilt from source on 2026-11-11 and every
+# published file was byte-identical (docs/contributing/
+# rebuilding-platform-images.md). Rebuild again, and update this note, when
+# the version below changes.
 cvm-version: 0.15.3-rc.1@sha256:ddd2e76a629df1bd4ec507441a387ac5db010ebc1bda3e372756e095df8692eb
 cpus: 2
 memory: 8192

@@ -13,6 +13,11 @@
 # this exact file accepts no caller. Before deploying, replace it with the
 # hash of the token the gateway's ENGINE_TOKEN secret carries
 # (`cargo run -p hash-secret`) and re-measure.
+#
+# Platform release 0.15.3-rc.1+gpu was rebuilt from source on 2026-11-11 and every
+# published file was byte-identical (docs/contributing/
+# rebuilding-platform-images.md). Rebuild again, and update this note, when
+# the version below changes.
 cvm-version: 0.15.3-rc.1+gpu@sha256:1421cbb45dc428f6270d106d8eb68faab3ce7ca02ff2fbb2dc0968605004579f
 cpus: 24
 memory: 196608

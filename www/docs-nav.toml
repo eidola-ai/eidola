@@ -50,4 +50,5 @@ pages = [
     ["contributing/README.md", "Runbooks"],
     ["contributing/release-attestant-yubikey.md", "Attestant YubiKey"],
     ["contributing/release-apple-signing-yubikey.md", "Apple CI YubiKey"],
+    ["contributing/rebuilding-platform-images.md", "Platform image rebuild"],
 ]

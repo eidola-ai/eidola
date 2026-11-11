@@ -3,13 +3,13 @@
     "2a94a85c36b9d4d29ef733142091f88853fcce4d9f3ca4a1725dbfabab7f1dec": [
       {
         "config": "deploy/engine/mimo-v2.6-flash/b300x1/tinfoil-config.yml",
-        "config_sha256": "1f805725529b31ae6286f50598cc0a362c246a6a9a03d4b588260d616a546d17",
+        "config_sha256": "c35d11c5cba24efbf56efe101d4c8a4d84c03e748718d0fc323092dcac01f961",
         "cvm_version": "0.15.3-rc.1+gpu@sha256:1421cbb45dc428f6270d106d8eb68faab3ce7ca02ff2fbb2dc0968605004579f",
         "pin": {
           "expected_gpus": 1,
           "platform": {
             "tdx": {
-              "mrconfigid": "1f805725529b31ae6286f50598cc0a362c246a6a9a03d4b588260d616a546d1700000000000000000000000000000000",
+              "mrconfigid": "c35d11c5cba24efbf56efe101d4c8a4d84c03e748718d0fc323092dcac01f96100000000000000000000000000000000",
               "mrtd": "bf582997bf2145f275db3bc2542d703fdd889c85927b3ee199138298f863631711f41b37d8d347d5aee18036ff02c16c",
               "policy": {
                 "cached_keys": "true",

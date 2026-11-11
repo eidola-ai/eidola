@@ -39,7 +39,7 @@
     "igvm_sha256": "8fe54c46ceb111b7cc41f12f60bd479211870c7bc5186c8566d71f286ad0d5ac",
     "sev_snp": {
       "guest_policy": "0x30133",
-      "host_data": "5c2699627efafd0e3c9e343a2ffe4e3efcdbb061a74f2be53a37ccec0c12be9a",
+      "host_data": "649e2ac2b86cd99a02ddde36f9b0eb8de865c407fc1adde1f4cc214d631d7ff5",
       "measurement": "d712705df47368b82a283ba74501c5cf807f5a099c67906a5e1d861037514b9efe382024d4eb6245bb8c9877c7fe6858"
     }
   },
