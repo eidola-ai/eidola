@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1@sha256:a7f5ec8c4a35a7f8cd9e6e413f59fd1bfd33f8b623c26981c684f5065dfe3044
+
+# The inference node (eidola-server-engine) with the CUDA executor.
+#
+# Unlike the other images this one is not compiled by StageX. The node loads
+# the NVIDIA driver (`libcuda.so.1`, `libnvidia-ml.so.1`) with `dlopen` at run
+# time, which a static musl binary cannot do and a musl process cannot host,
+# so it is a dynamic glibc binary; StageX's Rust targets musl only. The binary,
+# the C runtime it ships with and the GPU kernel images are all built by the
+# repository flake (`packages.x86_64-linux.eidola-server-engine-image-root`,
+# whose comments say what goes in and why), with Nix running inside a pinned
+# container exactly as the kernel build's own `build-in-docker.sh` does. The
+# final stage is that tree and nothing else.
+
+# ── inputs ─────────────────────────────────────────────────────────────────────
+# nixos/nix 2.32.4, the release the kernel build pins; the linux/amd64
+# manifest digest of the multi-arch index that script names.
+FROM nixos/nix:2.32.4@sha256:59627baee1756479291d429a94fb60d2d4552d32ca61bcd70b853e476f9eb90e AS inputs
+
+# The container is the isolation boundary: Nix's own sandbox needs privileges
+# a build container lacks, and its seccomp filter cannot be loaded under amd64
+# emulation. Every input is still fixed by hash (flake.lock, Cargo.lock, the
+# toolchain and kernel-source pins), and the image root derivation checks what
+# it ships.
+RUN printf '%s\n' \
+      'experimental-features = nix-command flakes' \
+      'sandbox = false' \
+      'filter-syscalls = false' \
+      'max-jobs = 1' \
+      >> /etc/nix/nix.conf
+
+WORKDIR /src
+
+# What the flake evaluates and builds from: the flake itself, the workspace
+# manifests and toolchain pin, and the crates (the flake reads every member's
+# manifest, then filters the node's own crate closure, the kernel crate
+# included, out of them).
+COPY flake.nix flake.lock Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ ./crates/
+
+# ── eval ───────────────────────────────────────────────────────────────────────
+# Not part of the image. `scripts/check-oci-stub-workspace.sh` builds this
+# stage on PRs, so an input the flake reads but the steps above do not copy
+# fails there rather than first in the image build on `main`.
+FROM inputs AS eval
+
+RUN nix eval --raw .#eidola-server-engine-image-root.drvPath
+
+# ── build ──────────────────────────────────────────────────────────────────────
+FROM inputs AS build
+
+# One step, so the store this build fills is not kept in any layer: the root
+# tree is copied out and everything else collected.
+RUN root="$(nix build --no-link --print-out-paths --print-build-logs .#eidola-server-engine-image-root)" \
+    && mkdir /rootfs \
+    && cp -R --preserve=mode "$root"/. /rootfs/ \
+    && nix-collect-garbage >/dev/null
+
+# ── package ────────────────────────────────────────────────────────────────────
+# Final minimal image: the node, its C runtime in /lib64, the kernel images in
+# /opt/eidola/kernels. The driver is not here: the NVIDIA container runtime
+# mounts the host's into the container. The weights are not here: a deployment
+# mounts them read-only under /tinfoil/models. Every setting is the
+# deployment's measured environment; the image sets none.
+FROM scratch AS package
+
+COPY --from=build /rootfs/ /
+USER 65534:65534
+ENTRYPOINT ["/eidola-server-engine"]

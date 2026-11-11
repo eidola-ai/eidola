@@ -1784,6 +1784,179 @@ with open(path, "wb") as f:
                 dpkg-deb --contents "$out"
               '';
 
+        # ── The inference node's image root (eidola-server-engine) ──────────
+        #
+        # The tree `oci/eidola-server-engine/Containerfile` copies into a
+        # `FROM scratch` image, built for the one platform a node runs on
+        # (x86_64 Linux, Blackwell GPUs). Three things go in, and nothing else:
+        # the node binary, the C runtime it and the NVIDIA driver need, and the
+        # GPU kernel images. Weights are not in the image: a deployment mounts
+        # them read-only from a model pack, under /tinfoil/models.
+        #
+        # Why glibc and not the static musl every other image is. The CUDA
+        # executor reaches the driver through `cudarc`'s dynamic loading, and
+        # the confidential-computing check reaches NVML through `libloading`:
+        # both `dlopen` `libcuda.so.1` and `libnvidia-ml.so.1` at run time, and
+        # nothing of CUDA is linked at build time. Static musl cannot `dlopen`
+        # at all, and a dynamic musl process cannot host NVIDIA's libraries,
+        # which are built against glibc. So the node is a dynamic glibc binary.
+        # StageX's Rust targets musl only, so this one image is built here,
+        # with the workspace's Rust toolchain (`rust-toolchain.toml`, through
+        # fenix) and nixpkgs' glibc, like the Linux GUI.
+        #
+        # Where the driver comes from. The image carries none of it. On the
+        # platform the GPU image's measured root holds the driver's user space
+        # under /usr/lib/x86_64-linux-gnu, and the NVIDIA container runtime's
+        # CDI spec bind-mounts those files into the container at the same
+        # paths; its hooks add the soname links. The binary therefore carries a
+        # DT_RPATH, not a RUNPATH: a RUNPATH covers only the executable's own
+        # lookups, while an RPATH on the executable is also consulted for every
+        # library without a search path of its own, which is how the driver's
+        # libraries find each other and theirs. nixpkgs' glibc never reads
+        # /etc/ld.so.cache (it is patched to look under its own prefix), so the
+        # ld.so.cache the runtime's hook writes is not what finds them; the
+        # RPATH is.
+        #
+        # What the driver needs from the image. libcuda, NVML and every library
+        # libcuda loads need only glibc (libc, libm, libdl, libpthread, librt,
+        # the loader) — except one: in confidential-computing mode libcuda
+        # loads `libnvidia-pkcs11-openssl3.so.<driver>` (mounted with the
+        # driver), which needs OpenSSL 3's `libcrypto.so.3`. The container must
+        # supply that, so it ships here. The Rust binary adds `libgcc_s.so.1`.
+        #
+        # Every shipped file is copied out of the store, never referenced
+        # (docs/verification.md): the loader is installed at the path the
+        # filesystem hierarchy standard gives it, the libraries beside it in
+        # /lib64, and nothing in the image names a /nix/store path a loader
+        # follows.
+        engineImagePlatform = system == "x86_64-linux";
+
+        # The kernel build, imported unchanged and given this flake's nixpkgs,
+        # so the toolchain record it writes into its manifest is the one
+        # `kernels.manifest.json` holds.
+        engineKernels =
+          if !engineImagePlatform then
+            null
+          else
+            import ./crates/eidola-engine-kernels/nix {
+              nixpkgsSrc = nixpkgs;
+              nixpkgsRev = nixpkgs.rev;
+              inherit system;
+            };
+
+        # The node built with the CUDA executor, against glibc. Its tests run
+        # in the workspace gates (`cargo test -p eidola-server-engine
+        # --features cuda`); a release-profile test build here would compile
+        # the whole graph a second time for nothing the gates do not check.
+        eidolaServerEngineCuda =
+          if !engineImagePlatform then
+            null
+          else
+            mkPackage {
+              pname = "eidola-server-engine";
+              rustTarget = "x86_64-unknown-linux-gnu";
+              nixCrossSystem = null;
+              extraCargoArgs = "--features cuda";
+              doCheck = false;
+            };
+
+        engineGlibc = pkgs.stdenv.cc.libc;
+        engineLoader = "ld-linux-x86-64.so.2";
+        # Where the platform's runtime mounts the driver (the Debian layout of
+        # the GPU image's root), then the other common layout, after the
+        # image's own libraries.
+        engineRpath = "/lib64:/usr/lib/x86_64-linux-gnu:/usr/lib64";
+        # Where the kernel images live in the image. A deployment's
+        # EIDOLA_ENGINE_KERNELS_DIR names this directory.
+        engineKernelsDir = "/opt/eidola/kernels";
+
+        eidolaServerEngineImageRoot =
+          if !engineImagePlatform then
+            null
+          else
+            pkgs.runCommand "eidola-server-engine-image-root"
+              {
+                nativeBuildInputs = [
+                  pkgs.patchelf
+                  pkgs.jq
+                ];
+                committedManifest = ./crates/eidola-engine-kernels/kernels.manifest.json;
+              }
+              ''
+                set -euo pipefail
+                export LC_ALL=C
+                fail() { echo "error: $*" >&2; exit 1; }
+
+                bin=${eidolaServerEngineCuda}/bin/eidola-server-engine
+                glibc=${engineGlibc}/lib
+                gcclib=${pkgs.stdenv.cc.cc.lib}/lib
+                crypto=${pkgs.openssl.out}/lib
+
+                # The binary was linked against exactly the glibc shipped
+                # below: its loader is that glibc's, and every library it
+                # names resolves there or in the compiler's runtime.
+                [ "$(patchelf --print-interpreter "$bin")" = "$glibc/${engineLoader}" ] \
+                  || fail "the node's loader is not $glibc/${engineLoader}"
+                for dir in $(patchelf --print-rpath "$bin" | tr ':' ' '); do
+                  case "$dir" in
+                    "$glibc" | "$gcclib") ;;
+                    *) fail "the node's RUNPATH names $dir, which the image does not ship" ;;
+                  esac
+                done
+
+                mkdir -p $out/lib64
+                install -m 0555 "$bin" $out/eidola-server-engine
+                chmod u+w $out/eidola-server-engine
+                patchelf --set-interpreter /lib64/${engineLoader} $out/eidola-server-engine
+                patchelf --force-rpath --set-rpath ${engineRpath} $out/eidola-server-engine
+                chmod a-w $out/eidola-server-engine
+
+                for lib in ${engineLoader} libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1; do
+                  install -m 0555 "$glibc/$lib" $out/lib64/$lib
+                done
+                install -m 0555 "$gcclib/libgcc_s.so.1" $out/lib64/libgcc_s.so.1
+                install -m 0555 "$crypto/libcrypto.so.3" $out/lib64/libcrypto.so.3
+                # Their own search paths name the store; inside the image
+                # every library they need is already loaded by soname or found
+                # through the node's RPATH.
+                for lib in libgcc_s.so.1 libcrypto.so.3; do
+                  chmod u+w $out/lib64/$lib
+                  patchelf --remove-rpath $out/lib64/$lib
+                  chmod a-w $out/lib64/$lib
+                done
+
+                # Every library any shipped ELF names is shipped.
+                for elf in $out/eidola-server-engine $out/lib64/*; do
+                  for needed in $(patchelf --print-needed "$elf"); do
+                    [ -e "$out/lib64/$needed" ] \
+                      || fail "$(basename "$elf") needs $needed, which the image does not ship"
+                  done
+                done
+
+                # The kernel images: this build's output must be the committed
+                # manifest's, byte for byte, and every image it lists must
+                # hash to its record. The node checks each image against the
+                # same manifest (compiled in) before it loads it, so a
+                # mismatch here is a node that could not boot.
+                kernels=${engineKernels}
+                cmp -s "$kernels/manifest.json" "$committedManifest" || {
+                  diff -u "$committedManifest" "$kernels/manifest.json" >&2 || true
+                  fail "the kernel build does not reproduce kernels.manifest.json"
+                }
+                dest=$out${engineKernelsDir}
+                listed=0
+                while IFS=$'\t' read -r file size sha256; do
+                  src="$kernels/$file"
+                  [ "$(stat -c %s "$src")" = "$size" ] || fail "$file: size is not $size"
+                  [ "$(sha256sum "$src" | cut -d' ' -f1)" = "$sha256" ] || fail "$file: sha256 is not $sha256"
+                  install -D -m 0444 "$src" "$dest/$file"
+                  listed=$((listed + 1))
+                done < <(jq -r '(.kernels[], .fatbins[]) | [.file, (.size | tostring), .sha256] | @tsv' "$committedManifest")
+                built=$(find "$kernels/cubin" "$kernels/fatbin" -type f | wc -l)
+                [ "$built" -eq "$listed" ] \
+                  || fail "the kernel build has $built images, the manifest lists $listed"
+              '';
+
       in
       {
         packages = {
@@ -1832,6 +2005,14 @@ with open(path, "wb") as f:
           eidola-gui-linux-fdo = eidolaGuiLinuxFdo;
           eidola-linux-deb-tree = eidolaLinuxDebTree;
           eidola-linux-deb = eidolaLinuxDeb;
+        }
+        // pkgs.lib.optionalAttrs engineImagePlatform {
+          # The inference node's image: the kernel build, the CUDA node
+          # binary, and the root tree `oci/eidola-server-engine/Containerfile`
+          # copies into the image.
+          eidola-engine-kernels = engineKernels;
+          eidola-server-engine-cuda = eidolaServerEngineCuda;
+          eidola-server-engine-image-root = eidolaServerEngineImageRoot;
         };
 
         # Development shell (lightweight — daily Rust dev uses rustup)

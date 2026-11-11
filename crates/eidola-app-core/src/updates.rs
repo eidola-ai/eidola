@@ -62,7 +62,7 @@
 //!
 //! | Claim key | Expected value | Derivation |
 //! |---|---|---|
-//! | `manifest.schema_version` | `2 or 3` | [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`] — the manifest shapes this module's parser understands; a jump outside the set is a release-gated trust event (`docs/trust-root.md`) |
+//! | `manifest.schema_version` | `2 or 3 or 4` | [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`] — the manifest shapes this module's parser understands; a jump outside the set is a release-gated trust event (`docs/trust-root.md`) |
 //! | `enclave.snp_measurement` | `SEV-SNP launch measurement (48-byte hex)` | the embedded trust root pins a SEV-SNP measurement (`trust_root::SERVER_SNP_MEASUREMENT`), so the paired server's SEV-SNP platform must keep being attested |
 //! | `enclave.tdx_measurement.rtmr1` | `TDX runtime measurement (48-byte hex)` | ditto, `trust_root::SERVER_TDX_RTMR1` |
 //! | `enclave.tdx_measurement.rtmr2` | `TDX runtime measurement (48-byte hex)` | ditto, `trust_root::SERVER_TDX_RTMR2` |
@@ -77,10 +77,12 @@
 //! | `artifacts.eidola-gui-linux-deb-arm64` | `file (linux/arm64) or absent` | ditto, 64-bit ARM |
 //! | `artifacts.eidola-gui-linux-nix-amd64` | `nix (linux/amd64) or absent` | ditto — the Linux Nix installable under the name schema 3 gives it |
 //! | `artifacts.eidola-gui-macos-universal-zip` | `file (darwin/universal) or absent` | ditto — the macOS unsigned shipping zip |
+//! | `artifacts.eidola-server-engine` | `oci (linux/amd64) or absent` | [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_4`] — the inference node's image, the one every Eidola-hosted engine deployment pins by digest |
 //!
 //! The `or absent` rows are the schema-conditional half: absent from the
-//! schema-2 manifests this build also accepts, required of any manifest
-//! declaring schema 3 — and, for the retiring row, the reverse. The
+//! older manifests this build also accepts, required of any manifest
+//! declaring the schema that introduced them — and, for the retiring row,
+//! the reverse. The
 //! retiring row is bounded on both sides, because a row that stops being
 //! recorded also started somewhere: below the oldest schema this build
 //! accepts it gets no verdict at all, since the artifact set of a shape
@@ -130,13 +132,17 @@ use crate::updater::ci_sigstore;
 /// manifest shape [`attested_claims`] walks. A version outside this set is a
 /// *claims change* (authentic but unintelligible to this build), not a
 /// verification failure.
-pub const SUPPORTED_MANIFEST_SCHEMA_VERSIONS: &[u32] = &[2, 3];
+pub const SUPPORTED_MANIFEST_SCHEMA_VERSIONS: &[u32] = &[2, 3, 4];
 
 /// The schema the current artifact set was introduced at:
 /// [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`] rows become required at it, and
 /// [`EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2`] rows retire at it. Named once so
 /// requirement, retirement and tolerance cannot drift apart.
 const ARTIFACT_SET_SCHEMA: u64 = 3;
+
+/// The schema the inference node's image arrives at:
+/// [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_4`] rows become required at it.
+const ENGINE_IMAGE_SCHEMA: u64 = 4;
 
 /// The artifact entries every accepted `artifact-manifest.json` records, as
 /// `(name, type, platform)`. Structure only — digests / narHashes /
@@ -190,6 +196,35 @@ pub const EXPECTED_ARTIFACTS_SINCE_SCHEMA_3: &[(&str, &str, &str)] = &[
 /// further edit here.
 pub const EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2: &[(&str, &str, &str)] =
     &[("eidola-gui-linux-amd64", "nix", "linux/amd64")];
+
+/// Artifact entries schema 4 adds: the inference node's OCI image
+/// (`ghcr.io/eidola-ai/eidola-server-engine`), the image every Eidola-hosted
+/// engine deployment pins by digest in its measured config. The gateway's
+/// own measurement already binds those pins; this row is what ties the
+/// digest to a reproducible build of the release's source, the way
+/// `eidola-server` does for the gateway.
+///
+/// The same tolerance as [`EXPECTED_ARTIFACTS_SINCE_SCHEMA_3`], one schema
+/// later: absent from every manifest declaring an older schema, required
+/// of any declaring 4 or later, and unconditional once no older schema is
+/// accepted.
+pub const EXPECTED_ARTIFACTS_SINCE_SCHEMA_4: &[(&str, &str, &str)] =
+    &[("eidola-server-engine", "oci", "linux/amd64")];
+
+/// One slice of the artifact set, as `(name, type, platform)` rows.
+type ArtifactRows = &'static [(&'static str, &'static str, &'static str)];
+
+/// Every arriving slice of the artifact set, with the schema it is recorded
+/// from. One table, so the expected side and the attested side cannot
+/// disagree about where a row starts.
+const ARRIVING_ARTIFACTS: &[(u64, ArtifactRows)] = &[
+    (ARTIFACT_SET_SCHEMA, EXPECTED_ARTIFACTS_SINCE_SCHEMA_3),
+    (ENGINE_IMAGE_SCHEMA, EXPECTED_ARTIFACTS_SINCE_SCHEMA_4),
+];
+
+/// Every retiring slice, with the first schema that no longer records it.
+const RETIRING_ARTIFACTS: &[(u64, ArtifactRows)] =
+    &[(ARTIFACT_SET_SCHEMA, EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2)];
 
 /// How often the background poll re-checks while the app is running.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
@@ -811,8 +846,6 @@ fn expected_claims_for(supported: &[u32]) -> Vec<Claim> {
     // not. `" or absent"` is what makes acceptance real — without it every
     // release emitting the other schema would read as a claims change on
     // that row.
-    let accepts_older = accepts_schema(supported, |v| v < ARTIFACT_SET_SCHEMA);
-    let accepts_current = accepts_schema(supported, |v| v >= ARTIFACT_SET_SCHEMA);
     let mut push_conditional = |rows: &[(&str, &str, &str)], recorded: bool, tolerated: bool| {
         if !recorded {
             return;
@@ -831,18 +864,22 @@ fn expected_claims_for(supported: &[u32]) -> Vec<Claim> {
     };
     // Retiring rows: recorded only by the older schemas, so they leave the
     // expected set outright once no accepted schema records them.
-    push_conditional(
-        EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2,
-        accepts_older,
-        accepts_current,
-    );
+    for (retired_at, rows) in RETIRING_ARTIFACTS {
+        push_conditional(
+            rows,
+            accepts_schema(supported, |v| v < *retired_at),
+            accepts_schema(supported, |v| v >= *retired_at),
+        );
+    }
     // Arriving rows, the mirror: tolerated absent while an older accepted
     // schema still lacks them.
-    push_conditional(
-        EXPECTED_ARTIFACTS_SINCE_SCHEMA_3,
-        accepts_current,
-        accepts_older,
-    );
+    for (since, rows) in ARRIVING_ARTIFACTS {
+        push_conditional(
+            rows,
+            accepts_schema(supported, |v| v >= *since),
+            accepts_schema(supported, |v| v < *since),
+        );
+    }
     claims
 }
 
@@ -942,7 +979,7 @@ pub fn attested_claims(manifest: &serde_json::Value) -> Vec<Claim> {
             // newest shape: the field's absence is already a delta of its
             // own, and reading the rest under the *older* shape would let a
             // manifest escape a requirement by dropping the field.
-            let records_current = schema_version.is_none_or(|v| v >= ARTIFACT_SET_SCHEMA);
+            let records_from = |since: u64| schema_version.is_none_or(|v| v >= since);
             // The retiring rows are bounded on *both* sides, unlike the
             // arriving ones: a row that stops being recorded also started
             // being recorded somewhere. Below the oldest schema this build
@@ -951,12 +988,20 @@ pub fn attested_claims(manifest: &serde_json::Value) -> Vec<Claim> {
             // entirely — so it says so once, on `manifest.schema_version`,
             // rather than reporting a row missing from a shape it never
             // understood.
-            let records_older = schema_version
-                .is_some_and(|v| v >= oldest_supported_schema() && v < ARTIFACT_SET_SCHEMA);
+            let records_through = |retired_at: u64| {
+                schema_version.is_some_and(|v| v >= oldest_supported_schema() && v < retired_at)
+            };
             let declared =
                 || schema_version.map_or_else(|| "«missing»".into(), |v: u64| v.to_string());
             for (name, entry) in artifacts_obj {
-                let in_set = |rows: &[(&str, &str, &str)]| rows.iter().any(|(n, _, _)| n == name);
+                let boundary = |table: &[(u64, ArtifactRows)]| {
+                    table
+                        .iter()
+                        .find(|(_, rows)| rows.iter().any(|(n, _, _)| n == name))
+                        .map(|(schema, _)| *schema)
+                };
+                let arrives = boundary(ARRIVING_ARTIFACTS);
+                let retires = boundary(RETIRING_ARTIFACTS);
                 claims.push(Claim {
                     key: format!("artifacts.{name}"),
                     // A row the declared schema does not record is a claim
@@ -967,23 +1012,25 @@ pub fn attested_claims(manifest: &serde_json::Value) -> Vec<Claim> {
                     // shape without bumping the version, and neither the
                     // gate on the committed manifest nor this verifier
                     // would say a word.
-                    value: if in_set(EXPECTED_ARTIFACTS_SINCE_SCHEMA_3) && !records_current {
+                    value: if let Some(since) = arrives.filter(|since| !records_from(*since)) {
                         format!(
                             "present, but schema {} records it only from \
-                             schema {ARTIFACT_SET_SCHEMA} on",
+                             schema {since} on",
                             declared()
                         )
-                    // `records_current`, not `!records_older`: the row is a
+                    // `records_from`, not `!records_through`: the row is a
                     // claim out of shape once its schema has *retired* it,
                     // which is not the same as any schema that does not
                     // record it — a schema older than this build accepts
                     // does neither, and gets no verdict here.
-                    } else if in_set(EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2) && records_current {
+                    } else if let Some(retired_at) =
+                        retires.filter(|retired_at| records_from(*retired_at))
+                    {
                         format!(
                             "present, but schema {} records it only through \
                              schema {}",
                             declared(),
-                            ARTIFACT_SET_SCHEMA - 1
+                            retired_at - 1
                         )
                     } else {
                         describe_artifact(entry, schema_version)
@@ -1007,19 +1054,20 @@ pub fn attested_claims(manifest: &serde_json::Value) -> Vec<Claim> {
                     }
                 }
             };
-            note_missing(
-                EXPECTED_ARTIFACTS_SINCE_SCHEMA_3,
-                records_current,
-                format!("missing (recorded from schema {ARTIFACT_SET_SCHEMA} on)"),
-            );
-            note_missing(
-                EXPECTED_ARTIFACTS_THROUGH_SCHEMA_2,
-                records_older,
-                format!(
-                    "missing (recorded through schema {})",
-                    ARTIFACT_SET_SCHEMA - 1
-                ),
-            );
+            for (since, rows) in ARRIVING_ARTIFACTS {
+                note_missing(
+                    rows,
+                    records_from(*since),
+                    format!("missing (recorded from schema {since} on)"),
+                );
+            }
+            for (retired_at, rows) in RETIRING_ARTIFACTS {
+                note_missing(
+                    rows,
+                    records_through(*retired_at),
+                    format!("missing (recorded through schema {})", retired_at - 1),
+                );
+            }
         } else {
             claims.push(Claim {
                 key: "artifacts".into(),
@@ -1275,6 +1323,7 @@ mod tests {
                 "artifacts.eidola-gui-linux-deb-arm64",
                 "artifacts.eidola-gui-linux-nix-amd64",
                 "artifacts.eidola-gui-macos-universal-zip",
+                "artifacts.eidola-server-engine",
             ]
         );
     }
@@ -1315,6 +1364,30 @@ mod tests {
             value(&only_2, "artifacts.eidola-gui-macos-universal-zip"),
             None
         );
+        assert_eq!(value(&only_2, "artifacts.eidola-server-engine"), None);
+
+        // The engine image's own boundary, one schema later: a build that
+        // accepts only schema 3 does not expect it, one that accepts 3 and 4
+        // tolerates its absence, and one that accepts only 4 requires it.
+        assert_eq!(value(&only_3, "artifacts.eidola-server-engine"), None);
+        assert_eq!(
+            value(
+                &expected_claims_for(&[3, 4]),
+                "artifacts.eidola-server-engine"
+            )
+            .as_deref(),
+            Some("oci (linux/amd64) or absent")
+        );
+        let only_4 = expected_claims_for(&[4]);
+        assert_eq!(
+            value(&only_4, "artifacts.eidola-server-engine").as_deref(),
+            Some("oci (linux/amd64)")
+        );
+        assert_eq!(
+            value(&only_4, "artifacts.eidola-gui-linux-nix-amd64").as_deref(),
+            Some("nix (linux/amd64)")
+        );
+        assert_eq!(value(&only_4, "artifacts.eidola-gui-linux-amd64"), None);
     }
 
     /// A schema-3 manifest — the shape a later release will emit. It adds
@@ -1357,6 +1430,72 @@ mod tests {
             }),
         );
         manifest
+    }
+
+    /// A schema-4 manifest: schema 3's shape plus the inference node's image.
+    fn schema_4_manifest() -> serde_json::Value {
+        let mut manifest = schema_3_manifest();
+        manifest["schema_version"] = serde_json::json!(4);
+        manifest["artifacts"]["eidola-server-engine"] =
+            serde_json::json!({"digest": "sha256:dd", "platform": "linux/amd64", "type": "oci"});
+        manifest
+    }
+
+    #[test]
+    fn schema_4_manifest_with_its_own_rows_is_not_a_claims_change() {
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&schema_4_manifest()));
+        assert!(deltas.is_empty(), "unexpected deltas: {deltas:#?}");
+    }
+
+    #[test]
+    fn schema_4_manifest_missing_the_engine_image_is_a_delta() {
+        let mut manifest = schema_4_manifest();
+        manifest["artifacts"]
+            .as_object_mut()
+            .unwrap()
+            .remove("eidola-server-engine");
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        assert_eq!(deltas.len(), 1, "unexpected deltas: {deltas:#?}");
+        assert_eq!(deltas[0].key, "artifacts.eidola-server-engine");
+        assert_eq!(
+            deltas[0].attested.as_deref(),
+            Some("missing (recorded from schema 4 on)")
+        );
+    }
+
+    #[test]
+    fn the_engine_image_before_schema_4_is_a_delta() {
+        // Emission without the bump, at both older schemas this build reads.
+        for (mut manifest, declared) in [(current_manifest(), 2), (schema_3_manifest(), 3)] {
+            manifest["artifacts"]["eidola-server-engine"] =
+                schema_4_manifest()["artifacts"]["eidola-server-engine"].clone();
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert_eq!(deltas.len(), 1, "schema {declared}: deltas {deltas:#?}");
+            assert_eq!(deltas[0].key, "artifacts.eidola-server-engine");
+            assert_eq!(
+                deltas[0].attested.as_deref(),
+                Some(
+                    format!("present, but schema {declared} records it only from schema 4 on")
+                        .as_str()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn schema_4_manifest_missing_a_schema_3_row_is_a_delta() {
+        // Schema 4 is schema 3 plus a row, not instead of it.
+        for (row, _, _) in EXPECTED_ARTIFACTS_SINCE_SCHEMA_3 {
+            let mut manifest = schema_4_manifest();
+            manifest["artifacts"].as_object_mut().unwrap().remove(*row);
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert_eq!(deltas.len(), 1, "{row}: unexpected deltas: {deltas:#?}");
+            assert_eq!(
+                deltas[0].attested.as_deref(),
+                Some("missing (recorded from schema 3 on)"),
+                "{row}"
+            );
+        }
     }
 
     #[test]
@@ -1559,12 +1698,12 @@ mod tests {
     fn schema_version_jump_is_a_delta() {
         // Built on the newest shape this build knows, so the schema row is
         // the only thing that can differ.
-        let mut manifest = schema_3_manifest();
+        let mut manifest = schema_4_manifest();
         manifest["schema_version"] = serde_json::json!(99);
         let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].key, "manifest.schema_version");
-        assert_eq!(deltas[0].expected.as_deref(), Some("2 or 3"));
+        assert_eq!(deltas[0].expected.as_deref(), Some("2 or 3 or 4"));
         assert_eq!(deltas[0].attested.as_deref(), Some("99"));
     }
 

@@ -331,6 +331,154 @@ jobs:
           echo "=== Committed manifest ==="
           jq . artifact-manifest.json
 
+  # ── The inference node's image (cheap ubuntu runner, long build) ────────────
+  # Its own job because nothing in the `oci` chain consumes it and its build
+  # is the longest of the images: Nix in the Containerfile's builder stage
+  # compiles the GPU kernels (fetching the pinned CUDA toolkit) and the node
+  # from a cold store. Built on every run, so the build is exercised before
+  # the manifest schema that records its digest is emitted; below that
+  # schema its partial is empty and `verify` checks nothing for it.
+  oci-engine:
+    name: Build the inference node image
+    needs: guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      ENGINE_BAKE_METADATA_FILE: ${{ github.workspace }}/.bake-server-engine.json
+    outputs:
+      artifact_manifest: ${{ steps.partial.outputs.actual }}
+    permissions:
+      contents: read
+      packages: write # push OCI images to ghcr.io on push events
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free up disk space
+        # The builder stage holds the Rust toolchain, the CUDA toolkit and
+        # a release build's target directory at once.
+        run: |
+          before=$(df --output=avail -BG / | tail -1)
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift
+          echo "Root disk avail: $before -> $(df --output=avail -BG / | tail -1)"
+
+      - name: Set up Docker Buildx # zizmor: ignore[cache-poisoning]
+        # Same pinned buildx and BuildKit as the `oci` job, for the same
+        # reasons (see there).
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.31.1
+          platforms: linux/amd64
+          cache-binary: false
+          driver-opts: |
+            image=moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b
+
+      - name: Log in to GHCR
+        # Same gating as the `oci` job.
+        if: github.event_name == 'push' || (github.event.pull_request.head.ref == 'next' && github.event.pull_request.head.repo.full_name == github.repository)
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine tags
+        if: github.event_name == 'push'
+        id: tags
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+          COMMIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+        run: |
+          OWNER=$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')
+          REGISTRY="ghcr.io/${OWNER}"
+          SHORT_SHA=$(echo "${COMMIT_SHA}" | cut -c1-7)
+
+          TAGS="sha-${SHORT_SHA}"
+
+          if [ "${GIT_REF}" = "refs/heads/main" ]; then
+            TAGS="${TAGS},main"
+          elif [[ "${GIT_REF}" == refs/tags/v* ]]; then
+            VERSION="${GIT_REF#refs/tags/}"
+            TAGS="${TAGS},${VERSION}"
+          fi
+
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
+      - name: Build the inference node image
+        env:
+          REGISTRY: ${{ steps.tags.outputs.registry || '' }}
+          TAGS: ${{ steps.tags.outputs.tags || 'dev' }}
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.repository }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          PUSH_FLAG=""
+          if [ "${EVENT_NAME}" = "push" ]; then
+            PUSH_FLAG="--push"
+          fi
+
+          # Same trusted-producer gating of the shared registry cache as the
+          # `oci` job's phases. Empty on v* release tags for a clean
+          # attested build.
+          if [[ "${GIT_REF}" == refs/tags/v* ]]; then
+            export CACHE_REGISTRY=""
+          elif [[ "${EVENT_NAME}" == "push" ]] || { [[ "${PR_HEAD_REF}" == "next" ]] && [[ "${PR_HEAD_REPO}" == "${REPO}" ]]; }; then
+            export CACHE_REGISTRY="ghcr.io/$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          else
+            export CACHE_REGISTRY=""
+          fi
+
+          ./scripts/artifact-manifest.sh build \
+            ${PUSH_FLAG} --targets server-engine \
+            --metadata-file "${ENGINE_BAKE_METADATA_FILE}"
+
+      - name: Record the engine OCI partial
+        id: partial
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          PUSH_FLAG=""
+          if [ "${EVENT_NAME}" = "push" ]; then
+            PUSH_FLAG="--push"
+          fi
+          jq . "${ENGINE_BAKE_METADATA_FILE}"
+          {
+            echo 'actual<<__EIDOLA_EOF__'
+            ./scripts/artifact-manifest.sh print ${PUSH_FLAG} \
+              --metadata-file "${ENGINE_BAKE_METADATA_FILE}" --targets server-engine
+            echo '__EIDOLA_EOF__'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify the engine OCI artifact
+        # Reported, not fatal, like the `oci` job's subset check: the
+        # `artifact-manifest` job composes every partial, fails on any
+        # mismatch, and on a PR posts the regenerated files.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          PUSH_FLAG=""
+          if [ "${EVENT_NAME}" = "push" ]; then
+            PUSH_FLAG="--push"
+          fi
+          ./scripts/artifact-manifest.sh verify ${PUSH_FLAG} \
+            --metadata-file "${ENGINE_BAKE_METADATA_FILE}" --targets server-engine \
+            --manifest artifact-manifest.json \
+            || echo "::warning::the committed manifest does not record this engine image; the artifact-manifest job will fail"
+
   # ── Apple (expensive macOS runner) ───────────────────────────────────────────
   # This uses https://github.com/khoi/sand to provision a runner from a known image:
   # ghcr.io/cirruslabs/macos-tahoe-xcode@sha256:a914e5b3fc1197d61832009778a77ca30717314fd32702cfdf90a42f2c279ea3
@@ -646,6 +794,7 @@ jobs:
     name: Verify artifact manifest
     needs:
       - oci
+      - oci-engine
       - apple
       - linux-gui
       - linux-deb-arm64
@@ -689,6 +838,7 @@ jobs:
           STAMPED_CONFIG: ${{ needs.oci.outputs.stamped_tinfoil_config }}
           SERVER_ENCLAVE: ${{ needs.oci.outputs.server_enclave }}
           OCI_MANIFEST: ${{ needs.oci.outputs.artifact_manifest }}
+          ENGINE_MANIFEST: ${{ needs.oci-engine.outputs.artifact_manifest }}
           APPLE_MANIFEST: ${{ needs.apple.outputs.artifact_manifest }}
           LINUX_GUI_MANIFEST: ${{ needs.linux-gui.outputs.artifact_manifest }}
           LINUX_DEB_MANIFEST: ${{ needs.linux-deb-arm64.outputs.artifact_manifest }}
@@ -703,6 +853,7 @@ jobs:
           printf '%s\n' "$STAMPED_CONFIG" > tinfoil-config.yml
           printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
           printf '%s' "$OCI_MANIFEST" > /tmp/oci-artifact-manifest.json
+          printf '%s' "$ENGINE_MANIFEST" > /tmp/engine-artifact-manifest.json
           printf '%s' "$APPLE_MANIFEST" > /tmp/apple-artifact-manifest.json
           printf '%s' "$LINUX_GUI_MANIFEST" > /tmp/linux-gui-artifact-manifest.json
           printf '%s' "$LINUX_DEB_MANIFEST" > /tmp/linux-deb-artifact-manifest.json
@@ -714,6 +865,7 @@ jobs:
         run: |
           if ./scripts/artifact-manifest.sh verify-full \
             --partial /tmp/oci-artifact-manifest.json \
+            --partial /tmp/engine-artifact-manifest.json \
             --partial /tmp/apple-artifact-manifest.json \
             --partial /tmp/linux-gui-artifact-manifest.json \
             --partial /tmp/linux-deb-artifact-manifest.json \
