@@ -80,14 +80,8 @@ impl Config {
 
         // The gateway's token for Eidola's inference nodes: a secret, measured
         // by its Argon2id hash like the others when `ENGINE_TOKEN_HASH` is set.
+        // Absent, the gateway starts without an engine router (see `main`).
         let engine_token = std::env::var("ENGINE_TOKEN").ok().filter(|s| !s.is_empty());
-        if engine_token.is_none() && !eidola_server_gateway::engine_trust::PINNED_MODELS.is_empty()
-        {
-            return Err(
-                "ENGINE_TOKEN is required: this build pins Eidola-hosted engine deployments"
-                    .to_string(),
-            );
-        }
 
         let pricing_markup = std::env::var("PRICING_MARKUP")
             .ok()
@@ -323,6 +317,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // probe run before the server listens, so a healthy deployment takes
     // traffic from the start; a failure there is not fatal (the refresh task
     // keeps trying, and requests for those models are refused meanwhile).
+    //
+    // Without `ENGINE_TOKEN` there is no router: no node would accept this
+    // gateway, so it serves accounts, billing and the catalog, and refuses
+    // every inference request as unavailable, with its charge refunded.
+    if config.engine_token.is_none()
+        && !eidola_server_gateway::engine_trust::PINNED_MODELS.is_empty()
+    {
+        error!(
+            "ENGINE_TOKEN is not set: this build pins engine deployments and cannot reach them; \
+             inference requests are refused until the deployment supplies it"
+        );
+    }
     let engines = match config.engine_token.clone() {
         Some(token) if !eidola_server_gateway::engine_trust::PINNED_MODELS.is_empty() => {
             use eidola_server_gateway::engine_router::{self, placement};

@@ -266,8 +266,9 @@ async fn dispatch_stream(
 }
 
 /// The engine router. Every catalog row is pinned, and a gateway pinning any
-/// model starts with a router, so this refuses only what cannot be routed
-/// anyway.
+/// model starts with a router unless its deployment supplies no
+/// `ENGINE_TOKEN`; without one nothing can be routed, and the request is
+/// refused as unavailable.
 fn engines(state: &AppState) -> Result<&crate::engine_router::EngineRouter, ServerError> {
     state.engines.as_ref().ok_or_else(|| {
         ServerError::ServiceUnavailable("no engine is available for this model".to_string())
