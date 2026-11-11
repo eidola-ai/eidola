@@ -11,9 +11,11 @@ license = "AGPL-3.0-only"
 eidola-engine = { path = "../eidola-engine" }
 eidola-engine-model = { path = "../eidola-engine-model" }
 rayon = "1"
-# `mlock` for the host tier's pools (page-locked, so never swapped), and the
-# memory-lock limit a refusal names.
-rustix = { version = "1", features = ["mm", "process"] }
+# `mlock` for the host tier's pools (page-locked, so never swapped), the page size
+# pools are allocated in, and the memory-lock limit a refusal names.
+rustix = { version = "1", features = ["mm", "param", "process"] }
+# Scrubbing a pool's memory before it is freed.
+zeroize = "1"
 
 [dev-dependencies]
 serde_json = "1"
