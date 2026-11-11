@@ -152,11 +152,31 @@ pub struct EidolaTrust {
     pub hardware_intermediate_ca_pem: Option<String>,
 }
 
+/// One trusted server launch identity (SEV-SNP, IGVM launch model).
 #[derive(Clone, Debug)]
 pub struct MeasurementInfo {
-    pub snp: String,
-    pub tdx_rtmr1: String,
-    pub tdx_rtmr2: String,
+    /// The launch digest of the release image (96 hex).
+    pub measurement: String,
+    /// HOST_DATA: the SHA-256 of the server's config (64 hex).
+    pub host_data: String,
+    /// The guest policy a launch must carry (`0x30133`).
+    pub guest_policy: String,
+}
+
+impl MeasurementInfo {
+    /// The key it is untrusted by: `<measurement>:<host_data>`.
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.measurement, self.host_data)
+    }
+
+    /// Its trust spec, `<measurement>:<host_data>:<guest_policy>`, the form
+    /// `trust_measurement` reads back.
+    pub fn spec(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.measurement, self.host_data, self.guest_policy
+        )
+    }
 }
 
 // --- Participants & space templates (Participants v1) ----------------------
@@ -2903,10 +2923,10 @@ impl Inner {
     /// override-vs-pin honesty flags the UIs render.
     async fn eidola_trust(&self) -> Result<EidolaTrust, AppError> {
         let resolved = self.eidola_resolved().await?;
-        let to_info = |m: &tinfoil_verifier::EnclaveMeasurement| MeasurementInfo {
-            snp: m.snp_measurement.clone(),
-            tdx_rtmr1: m.tdx_measurement.rtmr1.clone(),
-            tdx_rtmr2: m.tdx_measurement.rtmr2.clone(),
+        let to_info = |m: &tinfoil_verifier::SevSnpPin| MeasurementInfo {
+            measurement: m.measurement.to_ascii_lowercase(),
+            host_data: m.host_data.to_ascii_lowercase(),
+            guest_policy: m.guest_policy.clone(),
         };
         Ok(EidolaTrust {
             base_url: resolved.base_url.clone(),
@@ -2927,7 +2947,7 @@ impl Inner {
     /// is NULL — the read-modify-write base for trust/untrust.
     async fn eidola_measurement_overrides(
         &self,
-    ) -> Result<Vec<tinfoil_verifier::EnclaveMeasurement>, AppError> {
+    ) -> Result<Vec<tinfoil_verifier::SevSnpPin>, AppError> {
         let conn = self.db_conn().await?;
         let row = db::get_backend(&conn, backends::EIDOLA_BACKEND_ID).await?;
         match row.and_then(|r| r.trusted_measurements) {
@@ -2941,16 +2961,16 @@ impl Inner {
     }
 
     /// Add a measurement to the eidola row's override list (idempotent by
-    /// SNP measurement). Returns whether it was newly added.
+    /// launch identity, digest and HOST_DATA). Returns whether it was newly
+    /// added; an entry for the same identity under another guest policy is
+    /// not added beside it.
     async fn trust_measurement(
         &self,
-        entry: tinfoil_verifier::EnclaveMeasurement,
+        entry: tinfoil_verifier::SevSnpPin,
     ) -> Result<bool, AppError> {
         let mut list = self.eidola_measurement_overrides().await?;
-        if list.iter().any(|m| {
-            m.snp_measurement
-                .eq_ignore_ascii_case(&entry.snp_measurement)
-        }) {
+        let key = config::measurement_key(&entry);
+        if list.iter().any(|m| config::measurement_key(m) == key) {
             return Ok(false);
         }
         list.push(entry);
@@ -2968,15 +2988,12 @@ impl Inner {
         Ok(true)
     }
 
-    /// Remove a measurement (by SNP key) from the eidola row's override list.
-    /// Clears the column back to NULL (= pin) when the list empties. Returns
-    /// whether a measurement was removed.
+    /// Remove a measurement (by its `<measurement>:<host_data>` key) from the
+    /// eidola row's override list. Clears the column back to NULL (= pin)
+    /// when the list empties. Returns whether a measurement was removed.
     async fn untrust_measurement(&self, key: String) -> Result<bool, AppError> {
         let mut list = self.eidola_measurement_overrides().await?;
-        let Some(pos) = list
-            .iter()
-            .position(|m| m.snp_measurement.eq_ignore_ascii_case(&key))
-        else {
+        let Some(pos) = list.iter().position(|m| config::measurement_key(m) == key) else {
             return Ok(false);
         };
         list.remove(pos);
@@ -3052,12 +3069,13 @@ impl Inner {
             "hardware_intermediate_ca",
         )?;
 
-        // Release records pin their SEV-SNP launch digest only: the client
-        // path accepts no TDX evidence.
+        // The server is pinned on SEV-SNP only (launch digest, HOST_DATA and
+        // guest policy): the client path accepts no TDX evidence.
         let allowed: Vec<tinfoil_verifier::AllowedMeasurement> = eidola
             .measurements
             .iter()
-            .map(tinfoil_verifier::AllowedMeasurement::from)
+            .cloned()
+            .map(tinfoil_verifier::AllowedMeasurement::sev_snp)
             .collect();
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
             allowed_measurements: &allowed,
@@ -3148,7 +3166,7 @@ impl Inner {
 struct EidolaResolved {
     base_url: String,
     base_url_is_override: bool,
-    measurements: Vec<tinfoil_verifier::EnclaveMeasurement>,
+    measurements: Vec<tinfoil_verifier::SevSnpPin>,
     measurements_are_override: bool,
     hardware_root_ca: Option<String>,
     hardware_intermediate_ca: Option<String>,
@@ -3174,7 +3192,7 @@ impl EidolaResolved {
         let base_url_is_override = base_url_override.is_some();
         let base_url = base_url_override.unwrap_or_else(|| trust_root::SERVER_URL.to_string());
 
-        let measurements_override: Vec<tinfoil_verifier::EnclaveMeasurement> =
+        let measurements_override: Vec<tinfoil_verifier::SevSnpPin> =
             match row.and_then(|r| r.trusted_measurements.as_deref()) {
                 Some(json) if !json.trim().is_empty() => {
                     serde_json::from_str(json).map_err(|e| AppError::Database {
@@ -11659,15 +11677,16 @@ impl AppCore {
     }
 
     /// Add a trusted enclave measurement to the eidola backend row's override
-    /// list. Returns whether it was newly added (idempotent by SNP
-    /// measurement). Emits [`Change::Backends`] when it writes.
+    /// list: a SEV-SNP launch digest, the HOST_DATA (config hash) beside it,
+    /// and the guest policy. Returns whether it was newly added (idempotent
+    /// by digest and HOST_DATA). Emits [`Change::Backends`] when it writes.
     pub async fn trust_measurement(
         &self,
-        snp: String,
-        tdx_rtmr1: String,
-        tdx_rtmr2: String,
+        measurement: String,
+        host_data: String,
+        guest_policy: String,
     ) -> Result<bool, AppError> {
-        let spec = format!("{snp}:{tdx_rtmr1}:{tdx_rtmr2}");
+        let spec = format!("{measurement}:{host_data}:{guest_policy}");
         let entry = config::parse_trust_measurement(&spec)?;
         let inner = self.inner.clone();
         self.runtime
@@ -11676,11 +11695,12 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    /// Remove a trusted measurement (by SNP key) from the eidola backend
-    /// row's override list. Returns whether one was removed; clearing the
-    /// last reverts to the pin. Emits [`Change::Backends`] when it writes.
-    pub async fn untrust_measurement(&self, snp: String) -> Result<bool, AppError> {
-        let key = config::parse_untrust_key(&snp)?;
+    /// Remove a trusted measurement (by its `<measurement>:<host_data>` key,
+    /// or its whole trust spec) from the eidola backend row's override list.
+    /// Returns whether one was removed; clearing the last reverts to the
+    /// pin. Emits [`Change::Backends`] when it writes.
+    pub async fn untrust_measurement(&self, key: String) -> Result<bool, AppError> {
+        let key = config::parse_untrust_key(&key)?;
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.untrust_measurement(key).await })

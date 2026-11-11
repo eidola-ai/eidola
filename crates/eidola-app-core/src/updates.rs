@@ -63,10 +63,11 @@
 //! | Claim key | Expected value | Derivation |
 //! |---|---|---|
 //! | `manifest.schema_version` | `2 or 3 or 4` | [`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`] — the manifest shapes this module's parser understands; a jump outside the set is a release-gated trust event (`docs/trust-root.md`) |
-//! | `enclave.snp_measurement` | `SEV-SNP launch measurement (48-byte hex)` | the embedded trust root pins a SEV-SNP measurement (`trust_root::SERVER_SNP_MEASUREMENT`), so the paired server's SEV-SNP platform must keep being attested |
-//! | `enclave.tdx_measurement.rtmr1` | `TDX runtime measurement (48-byte hex)` | ditto, `trust_root::SERVER_TDX_RTMR1` |
-//! | `enclave.tdx_measurement.rtmr2` | `TDX runtime measurement (48-byte hex)` | ditto, `trust_root::SERVER_TDX_RTMR2` |
-//! | `enclave.cmdline` | `kernel command line (non-empty)` | manifest schema 2 — the cmdline binds the tinfoil-config hash into the measurement |
+//! | `enclave.cvm_version` | `platform release with its manifest pinned (VERSION@sha256)` | the embedded trust root pins the paired server's SEV-SNP launch identity in the IGVM launch model (`trust_root::SERVER_SNP_MEASUREMENT` and friends), which is the launch of one release image |
+//! | `enclave.igvm_sha256` | `SEV-SNP IGVM image hash (32-byte hex)` | ditto: the image the digest is computed over |
+//! | `enclave.sev_snp.measurement` | `SEV-SNP launch measurement (48-byte hex)` | ditto, `trust_root::SERVER_SNP_MEASUREMENT` |
+//! | `enclave.sev_snp.host_data` | `SEV-SNP HOST_DATA, the config hash (32-byte hex)` | ditto, `trust_root::SERVER_SNP_HOST_DATA`: what binds the server's config, since the digest is the same for every deployment of an image |
+//! | `enclave.sev_snp.guest_policy` | `SEV-SNP guest policy (0x-prefixed hex)` | ditto, `trust_root::SERVER_SNP_GUEST_POLICY` |
 //! | `artifacts.eidola-cli` | `oci (linux/amd64)` | [`EXPECTED_ARTIFACTS`] — the artifact set every accepted schema records |
 //! | `artifacts.eidola-cli-macos-universal` | `nix (darwin/universal)` | ditto |
 //! | `artifacts.eidola-gui-macos-universal` | `nix (darwin/universal)` | ditto |
@@ -768,9 +769,22 @@ fn hex(bytes: &[u8]) -> String {
 /// accepts. [`compare_claims`] reads it on the attested side's absence.
 const ABSENT_CLAIM: &str = "absent";
 
+const CVM_VERSION_CLAIM_VALUE: &str = "platform release with its manifest pinned (VERSION@sha256)";
+const IGVM_CLAIM_VALUE: &str = "SEV-SNP IGVM image hash (32-byte hex)";
 const SNP_CLAIM_VALUE: &str = "SEV-SNP launch measurement (48-byte hex)";
-const TDX_CLAIM_VALUE: &str = "TDX runtime measurement (48-byte hex)";
-const CMDLINE_CLAIM_VALUE: &str = "kernel command line (non-empty)";
+const HOST_DATA_CLAIM_VALUE: &str = "SEV-SNP HOST_DATA, the config hash (32-byte hex)";
+const GUEST_POLICY_CLAIM_VALUE: &str = "SEV-SNP guest policy (0x-prefixed hex)";
+
+/// The enclave block's claims: the server's SEV-SNP launch identity in the
+/// IGVM launch model, and what names its image. `(key, value)` in the order
+/// they are listed.
+const ENCLAVE_CLAIMS: &[(&str, &str)] = &[
+    ("enclave.cvm_version", CVM_VERSION_CLAIM_VALUE),
+    ("enclave.igvm_sha256", IGVM_CLAIM_VALUE),
+    ("enclave.sev_snp.measurement", SNP_CLAIM_VALUE),
+    ("enclave.sev_snp.host_data", HOST_DATA_CLAIM_VALUE),
+    ("enclave.sev_snp.guest_policy", GUEST_POLICY_CLAIM_VALUE),
+];
 
 /// The structural claim set this build expects an authentic release
 /// manifest to carry. See the module docs for the full table and the
@@ -807,33 +821,21 @@ fn expected_claims_for(supported: &[u32]) -> Vec<Claim> {
             .collect::<Vec<_>>()
             .join(" or "),
     });
-    // Enclave platform claims, derived from the embedded trust root: this
-    // build pins SEV-SNP + TDX measurements for the paired server, so an
-    // authentic future manifest is expected to keep attesting both
-    // platforms. A platform disappearing is exactly the "threat model
-    // changed" signal the claims comparison exists to catch.
+    // Enclave claims, derived from the embedded trust root: this build pins
+    // the paired server's SEV-SNP launch identity in the IGVM launch model
+    // (digest, HOST_DATA, guest policy, and the release image they come
+    // from), so an authentic future manifest is expected to keep stating
+    // exactly that. A different launch model, or a field disappearing, is
+    // the "threat model changed" signal the claims comparison exists to
+    // catch.
     if !trust_root::SERVER_SNP_MEASUREMENT.is_empty() {
-        claims.push(Claim {
-            key: "enclave.snp_measurement".into(),
-            value: SNP_CLAIM_VALUE.into(),
-        });
+        for (key, value) in ENCLAVE_CLAIMS {
+            claims.push(Claim {
+                key: (*key).into(),
+                value: (*value).into(),
+            });
+        }
     }
-    if !trust_root::SERVER_TDX_RTMR1.is_empty() {
-        claims.push(Claim {
-            key: "enclave.tdx_measurement.rtmr1".into(),
-            value: TDX_CLAIM_VALUE.into(),
-        });
-    }
-    if !trust_root::SERVER_TDX_RTMR2.is_empty() {
-        claims.push(Claim {
-            key: "enclave.tdx_measurement.rtmr2".into(),
-            value: TDX_CLAIM_VALUE.into(),
-        });
-    }
-    claims.push(Claim {
-        key: "enclave.cmdline".into(),
-        value: CMDLINE_CLAIM_VALUE.into(),
-    });
     for (name, ty, platform) in EXPECTED_ARTIFACTS {
         claims.push(Claim {
             key: format!("artifacts.{name}"),
@@ -913,52 +915,67 @@ pub fn attested_claims(manifest: &serde_json::Value) -> Vec<Claim> {
 
     if let Some(enclave) = obj.get("enclave") {
         if let Some(enclave_obj) = enclave.as_object() {
-            if let Some(snp) = enclave_obj.get("snp_measurement") {
+            if let Some(v) = enclave_obj.get("cvm_version") {
                 claims.push(Claim {
-                    key: "enclave.snp_measurement".into(),
-                    value: describe_hex96(snp, SNP_CLAIM_VALUE),
+                    key: "enclave.cvm_version".into(),
+                    value: describe_cvm_version(v),
                 });
             }
-            if let Some(tdx) = enclave_obj.get("tdx_measurement") {
-                if let Some(tdx_obj) = tdx.as_object() {
-                    for rtmr in ["rtmr1", "rtmr2"] {
-                        if let Some(v) = tdx_obj.get(rtmr) {
-                            claims.push(Claim {
-                                key: format!("enclave.tdx_measurement.{rtmr}"),
-                                value: describe_hex96(v, TDX_CLAIM_VALUE),
-                            });
-                        }
+            if let Some(v) = enclave_obj.get("igvm_sha256") {
+                claims.push(Claim {
+                    key: "enclave.igvm_sha256".into(),
+                    value: describe_hex(v, 32, IGVM_CLAIM_VALUE),
+                });
+            }
+            if let Some(snp) = enclave_obj.get("sev_snp") {
+                if let Some(snp_obj) = snp.as_object() {
+                    if let Some(v) = snp_obj.get("measurement") {
+                        claims.push(Claim {
+                            key: "enclave.sev_snp.measurement".into(),
+                            value: describe_hex(v, 48, SNP_CLAIM_VALUE),
+                        });
                     }
-                    for key in tdx_obj.keys() {
-                        if key != "rtmr1" && key != "rtmr2" {
+                    if let Some(v) = snp_obj.get("host_data") {
+                        claims.push(Claim {
+                            key: "enclave.sev_snp.host_data".into(),
+                            value: describe_hex(v, 32, HOST_DATA_CLAIM_VALUE),
+                        });
+                    }
+                    if let Some(v) = snp_obj.get("guest_policy") {
+                        claims.push(Claim {
+                            key: "enclave.sev_snp.guest_policy".into(),
+                            value: match v.as_str() {
+                                Some(s)
+                                    if s.len() > 2
+                                        && s.starts_with("0x")
+                                        && s[2..].chars().all(|c| c.is_ascii_hexdigit()) =>
+                                {
+                                    GUEST_POLICY_CLAIM_VALUE.into()
+                                }
+                                Some(_) => {
+                                    "present but malformed (expected 0x-prefixed hex)".into()
+                                }
+                                None => "present but not a string".into(),
+                            },
+                        });
+                    }
+                    for key in snp_obj.keys() {
+                        if !matches!(key.as_str(), "measurement" | "host_data" | "guest_policy") {
                             claims.push(Claim {
-                                key: format!("enclave.tdx_measurement.{key}"),
+                                key: format!("enclave.sev_snp.{key}"),
                                 value: "unrecognized field".into(),
                             });
                         }
                     }
                 } else {
                     claims.push(Claim {
-                        key: "enclave.tdx_measurement".into(),
+                        key: "enclave.sev_snp".into(),
                         value: "present but not an object".into(),
                     });
                 }
             }
-            if let Some(cmdline) = enclave_obj.get("cmdline") {
-                claims.push(Claim {
-                    key: "enclave.cmdline".into(),
-                    value: match cmdline.as_str() {
-                        Some(s) if !s.trim().is_empty() => CMDLINE_CLAIM_VALUE.into(),
-                        Some(_) => "present but empty".into(),
-                        None => "present but not a string".into(),
-                    },
-                });
-            }
             for key in enclave_obj.keys() {
-                if !matches!(
-                    key.as_str(),
-                    "snp_measurement" | "tdx_measurement" | "cmdline"
-                ) {
+                if !matches!(key.as_str(), "cvm_version" | "igvm_sha256" | "sev_snp") {
                     claims.push(Claim {
                         key: format!("enclave.{key}"),
                         value: "unrecognized field".into(),
@@ -1088,10 +1105,26 @@ pub fn attested_claims(manifest: &serde_json::Value) -> Vec<Claim> {
     claims
 }
 
-fn describe_hex96(v: &serde_json::Value, ok: &str) -> String {
+fn describe_hex(v: &serde_json::Value, bytes: usize, ok: &str) -> String {
     match v.as_str() {
-        Some(s) if s.len() == 96 && s.chars().all(|c| c.is_ascii_hexdigit()) => ok.into(),
-        Some(_) => "present but malformed (expected 96 hex chars)".into(),
+        Some(s) if s.len() == bytes * 2 && s.chars().all(|c| c.is_ascii_hexdigit()) => ok.into(),
+        Some(_) => format!("present but malformed (expected {} hex chars)", bytes * 2),
+        None => "present but not a string".into(),
+    }
+}
+
+fn describe_cvm_version(v: &serde_json::Value) -> String {
+    match v.as_str() {
+        Some(s) => match s.split_once("@sha256:") {
+            Some((version, pin))
+                if !version.is_empty()
+                    && pin.len() == 64
+                    && pin.chars().all(|c| c.is_ascii_hexdigit()) =>
+            {
+                CVM_VERSION_CLAIM_VALUE.into()
+            }
+            _ => "present but malformed (expected VERSION@sha256:<64 hex>)".into(),
+        },
         None => "present but not a string".into(),
     }
 }
@@ -1293,9 +1326,13 @@ mod tests {
                 "eidola-server": {"digest": "sha256:cc", "platform": "linux/amd64", "type": "oci"}
             },
             "enclave": {
-                "cmdline": "readonly=on root=/dev/mapper/root",
-                "snp_measurement": "a".repeat(96),
-                "tdx_measurement": {"rtmr1": "b".repeat(96), "rtmr2": "c".repeat(96)}
+                "cvm_version": format!("0.15.3-rc.1@sha256:{}", "d".repeat(64)),
+                "igvm_sha256": "e".repeat(64),
+                "sev_snp": {
+                    "guest_policy": "0x30133",
+                    "host_data": "b".repeat(64),
+                    "measurement": "a".repeat(96)
+                }
             },
             "schema_version": 2
         })
@@ -1309,10 +1346,11 @@ mod tests {
             keys,
             [
                 "manifest.schema_version",
-                "enclave.snp_measurement",
-                "enclave.tdx_measurement.rtmr1",
-                "enclave.tdx_measurement.rtmr2",
-                "enclave.cmdline",
+                "enclave.cvm_version",
+                "enclave.igvm_sha256",
+                "enclave.sev_snp.measurement",
+                "enclave.sev_snp.host_data",
+                "enclave.sev_snp.guest_policy",
                 "artifacts.eidola-cli",
                 "artifacts.eidola-cli-macos-universal",
                 "artifacts.eidola-gui-macos-universal",
@@ -1786,11 +1824,65 @@ mod tests {
         manifest["enclave"]
             .as_object_mut()
             .unwrap()
-            .remove("snp_measurement");
+            .remove("sev_snp");
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        let keys: Vec<&str> = deltas.iter().map(|d| d.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "enclave.sev_snp.measurement",
+                "enclave.sev_snp.host_data",
+                "enclave.sev_snp.guest_policy"
+            ]
+        );
+        assert!(
+            deltas.iter().all(|d| d.attested.is_none()),
+            "claims should be absent"
+        );
+    }
+
+    /// A manifest from before the IGVM launch model (the captured v0.0.8
+    /// release's enclave block) states a different server identity: every
+    /// field it carries is unrecognized and every field this build pins is
+    /// missing, which is the "threat model changed" answer, not an update.
+    #[test]
+    fn a_kernel_cmdline_enclave_block_is_a_changed_threat_model() {
+        let mut manifest = current_manifest();
+        manifest["enclave"] = serde_json::json!({
+            "cmdline": "readonly=on root=/dev/mapper/root",
+            "snp_measurement": "a".repeat(96),
+            "tdx_measurement": {"rtmr1": "b".repeat(96), "rtmr2": "c".repeat(96)}
+        });
+        let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+        for key in [
+            "enclave.cvm_version",
+            "enclave.sev_snp.host_data",
+            "enclave.sev_snp.measurement",
+        ] {
+            assert!(
+                deltas.iter().any(|d| d.key == key && d.attested.is_none()),
+                "{key}: {deltas:?}"
+            );
+        }
+        for key in [
+            "enclave.cmdline",
+            "enclave.snp_measurement",
+            "enclave.tdx_measurement",
+        ] {
+            assert!(
+                deltas.iter().any(|d| d.key == key && d.expected.is_none()),
+                "{key}: {deltas:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_sev_snp_field_is_a_delta() {
+        let mut manifest = current_manifest();
+        manifest["enclave"]["sev_snp"]["vmpl"] = serde_json::json!(0);
         let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
         assert_eq!(deltas.len(), 1);
-        assert_eq!(deltas[0].key, "enclave.snp_measurement");
-        assert!(deltas[0].attested.is_none(), "claim should be absent");
+        assert_eq!(deltas[0].key, "enclave.sev_snp.vmpl");
     }
 
     #[test]
@@ -1830,14 +1922,25 @@ mod tests {
 
     #[test]
     fn malformed_measurement_is_a_delta() {
+        for (field, value) in [
+            ("measurement", serde_json::json!("deadbeef")),
+            ("host_data", serde_json::json!("a".repeat(96))),
+            ("guest_policy", serde_json::json!("196915")),
+        ] {
+            let mut manifest = current_manifest();
+            manifest["enclave"]["sev_snp"][field] = value;
+            let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
+            assert_eq!(deltas.len(), 1, "{field}");
+            assert!(
+                deltas[0].attested.as_deref().unwrap().contains("malformed"),
+                "{field}: {deltas:?}"
+            );
+        }
         let mut manifest = current_manifest();
-        manifest["enclave"]["snp_measurement"] = serde_json::json!("deadbeef");
+        manifest["enclave"]["cvm_version"] = serde_json::json!("0.15.3-rc.1");
         let deltas = compare_claims(&expected_claims(), &attested_claims(&manifest));
         assert_eq!(deltas.len(), 1);
-        assert!(
-            deltas[0].attested.as_deref().unwrap().contains("malformed"),
-            "got: {deltas:?}"
-        );
+        assert!(deltas[0].attested.as_deref().unwrap().contains("malformed"));
     }
 
     #[test]

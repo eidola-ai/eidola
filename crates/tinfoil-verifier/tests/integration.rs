@@ -326,8 +326,14 @@ async fn mock_attesting_client_e2e() {
         )))
         .expect("add tls-ca");
 
+    // What the mock shim's report carries unless DEV_MEASUREMENT /
+    // DEV_HOST_DATA are set.
     let allowed = vec![tinfoil_verifier::AllowedMeasurement::sev_snp(
-        "00".repeat(48),
+        tinfoil_verifier::SevSnpPin {
+            measurement: "00".repeat(48),
+            host_data: "00".repeat(32),
+            guest_policy: "0x30133".to_string(),
+        },
     )];
     let client = tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
         allowed_measurements: &allowed,
@@ -403,9 +409,14 @@ async fn live_attesting_client() {
             .await
             .expect("fetch live measurement");
     let report = tinfoil_verifier::sevsnp::parse_report(&resolved.report_bytes).unwrap();
-    let allowed = vec![tinfoil_verifier::AllowedMeasurement::sev_snp(hex::encode(
-        report.measurement,
-    ))];
+    let policy = u64::from_le_bytes(resolved.report_bytes[0x08..0x10].try_into().unwrap());
+    let allowed = vec![tinfoil_verifier::AllowedMeasurement::sev_snp(
+        tinfoil_verifier::SevSnpPin {
+            measurement: hex::encode(report.measurement),
+            host_data: hex::encode(report.host_data),
+            guest_policy: format!("{policy:#x}"),
+        },
+    )];
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let client = tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {

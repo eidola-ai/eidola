@@ -272,7 +272,7 @@ pub struct BackendUpdate {
     /// `llamacpp` only: flip request-triggered auto-start.
     pub auto_start: Option<bool>,
     /// `eidola` only: set/clear the enclave-measurement override list (a JSON
-    /// array of the `EnclaveMeasurement` shape). `Some(None)` reverts to pin.
+    /// array of the `tinfoil_verifier::SevSnpPin` shape). `Some(None)` reverts to pin.
     pub trusted_measurements: Option<Option<String>>,
     /// `eidola` only: set/clear the PEM ARK certificate override.
     pub hardware_root_ca: Option<Option<String>>,

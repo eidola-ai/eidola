@@ -1,15 +1,6 @@
-//! Enclave measurement types: what a release records, and what a caller pins.
+//! Enclave pins: the launch identities a caller accepts.
 //!
-//! Two shapes live here and they answer different questions.
-//!
-//! [`EnclaveMeasurement`] is the *record*: the JSON shape of Tinfoil's
-//! `tinfoil-deployment.json` (predicate `snp-tdx-multiplatform/v1`) and of our
-//! own `artifact-manifest.json`, pairing a SEV-SNP launch digest with the
-//! RTMR1/RTMR2 values the same release would extend on Intel TDX. Recording a
-//! TDX value is not accepting it: RTMR1/RTMR2 are guest-extendable, so a pin
-//! made from a record is SEV-SNP-only (see [`AllowedMeasurement::from`]).
-//!
-//! [`AllowedMeasurement`] is the *pin*: one platform-tagged entry of the set a
+//! [`AllowedMeasurement`] is one platform-tagged entry of the set a
 //! verifier accepts. The verifier dispatches on the platform of the presented
 //! evidence and consults only entries of that platform; a platform with no
 //! entry is refused before its evidence is even authenticated. A document's
@@ -24,32 +15,6 @@ use sha2::{Digest, Sha256};
 
 use crate::Error;
 use crate::bundle::Platform;
-
-/// Recorded code measurements for a single Tinfoil enclave release, on both
-/// hardware platforms.
-///
-/// Field names match the JSON shape used by `tinfoil-deployment.json` and our
-/// own `artifact-manifest.json`, so config files and manifests can round-trip
-/// through this type via serde.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnclaveMeasurement {
-    /// Hex-encoded SEV-SNP launch digest (48 bytes / 96 hex characters).
-    pub snp_measurement: String,
-    /// Intel TDX runtime measurement registers, recorded only.
-    pub tdx_measurement: TdxMeasurement,
-}
-
-/// Intel TDX runtime measurement registers in Tinfoil's kernel-cmdline
-/// measurement scheme. RTMR1 binds the kernel/initrd/cmdline; RTMR2 binds the
-/// dm-verity-protected rootfs. Recorded for transparency; never accepted on
-/// their own, because guest firmware can extend any value into them.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TdxMeasurement {
-    /// Hex-encoded RTMR1 (48 bytes / 96 hex characters).
-    pub rtmr1: String,
-    /// Hex-encoded RTMR2 (48 bytes / 96 hex characters).
-    pub rtmr2: String,
-}
 
 /// One entry of the set of measurements a verifier accepts.
 ///
@@ -76,13 +41,48 @@ pub struct AllowedMeasurement {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PlatformMeasurement {
-    /// An AMD SEV-SNP launch digest (lowercase or uppercase hex, 48 bytes).
-    SevSnp {
-        /// Hex-encoded launch digest.
-        measurement: String,
-    },
+    /// An AMD SEV-SNP launch identity.
+    SevSnp(SevSnpPin),
     /// An Intel TDX launch identity and the platform policy it runs under.
     Tdx(TdxPin),
+}
+
+/// An AMD SEV-SNP pin in the IGVM launch model (Tinfoil CVM v0.15 and later).
+///
+/// The launch digest is a function of the release's IGVM image alone (every
+/// page the host adds, then the boot processor's VMSA; hosts launch with
+/// `KVM_SEV_SNP_MEASURE_BSP_ONLY`, so the processor count is not in it, and
+/// the RAM size reaches the guest through an unmeasured parameter page), so
+/// it is the same for every deployment of that image. What distinguishes a
+/// deployment is HOST_DATA, which the host passes at launch, the firmware
+/// copies into every report, and the guest checks against its config before
+/// booting: the SHA-256 of the deployment's config. The guest policy is
+/// chosen by the host at launch and is not in the digest either: a relaunch
+/// of the pinned image with DEBUG set keeps the same digest while handing
+/// the hypervisor `SNP_DBG_DECRYPT`, so the policy is pinned too. All three
+/// are required; a pin without HOST_DATA would accept every deployment of
+/// the image, anyone's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SevSnpPin {
+    /// Hex-encoded launch digest (48 bytes).
+    pub measurement: String,
+    /// Hex-encoded HOST_DATA (32 bytes). See [`SevSnpPin::host_data_for_config`].
+    pub host_data: String,
+    /// The guest policy the image is built for, spelled `0x` + lowercase
+    /// hex with no leading zeros (`0x30133`). A report's policy must equal it
+    /// in every bit except the firmware ABI minimum (bits 0-15), which may be
+    /// higher (a launch asking for newer firmware). The pin must have DEBUG
+    /// and MIGRATE_MA clear and the must-be-one bit 17 set.
+    pub guest_policy: String,
+}
+
+impl SevSnpPin {
+    /// The HOST_DATA a guest launched with `config` reports: the SHA-256 of
+    /// the exact config bytes, hex-encoded.
+    pub fn host_data_for_config(config: &[u8]) -> String {
+        hex::encode(Sha256::digest(config))
+    }
 }
 
 /// An Intel TDX pin in the IGVM launch model (Tinfoil CVM v0.15 and later).
@@ -173,12 +173,10 @@ pub enum PckFlag {
 }
 
 impl AllowedMeasurement {
-    /// A SEV-SNP pin for the given hex launch digest.
-    pub fn sev_snp(measurement: impl Into<String>) -> Self {
+    /// An AMD SEV-SNP pin.
+    pub fn sev_snp(pin: SevSnpPin) -> Self {
         Self {
-            platform: PlatformMeasurement::SevSnp {
-                measurement: measurement.into(),
-            },
+            platform: PlatformMeasurement::SevSnp(pin),
             expected_gpus: None,
         }
     }
@@ -200,19 +198,19 @@ impl AllowedMeasurement {
     /// The platform this entry pins.
     pub fn platform(&self) -> Platform {
         match self.platform {
-            PlatformMeasurement::SevSnp { .. } => Platform::SevSnp,
+            PlatformMeasurement::SevSnp(_) => Platform::SevSnp,
             PlatformMeasurement::Tdx(_) => Platform::Tdx,
         }
     }
 }
 
-/// A release record pins its SEV-SNP launch digest only. The recorded TDX
-/// RTMR1/RTMR2 are dropped on purpose: they are guest-extendable, so a pin
-/// built from them would let any firmware on a genuine TDX machine pass.
-impl From<&EnclaveMeasurement> for AllowedMeasurement {
-    fn from(record: &EnclaveMeasurement) -> Self {
-        Self::sev_snp(record.snp_measurement.clone())
-    }
+/// The launch identity of a SEV-SNP report that matched a pin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SevSnpLaunchMeasurement {
+    /// Hex-encoded launch digest.
+    pub measurement: String,
+    /// Hex-encoded HOST_DATA.
+    pub host_data: String,
 }
 
 /// The launch identity of a TDX quote that matched a pin.
@@ -228,8 +226,8 @@ pub struct TdxLaunchMeasurement {
 /// attestation. Only the platform that produced the attestation is populated.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MatchedMeasurement {
-    /// AMD SEV-SNP launch digest, hex-encoded.
-    SevSnp(String),
+    /// AMD SEV-SNP launch identity, hex-encoded.
+    SevSnp(SevSnpLaunchMeasurement),
     /// Intel TDX launch identity, hex-encoded.
     Tdx(TdxLaunchMeasurement),
 }
@@ -237,7 +235,11 @@ pub enum MatchedMeasurement {
 impl fmt::Display for MatchedMeasurement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SevSnp(m) => write!(f, "sev-snp:{m}"),
+            Self::SevSnp(s) => write!(
+                f,
+                "sev-snp:measurement={},host_data={}",
+                s.measurement, s.host_data
+            ),
             Self::Tdx(t) => write!(f, "tdx:mrtd={},mrconfigid={}", t.mrtd, t.mrconfigid),
         }
     }
@@ -253,14 +255,21 @@ pub(crate) struct CompiledPin {
 
 #[derive(Clone, Debug)]
 pub(crate) enum CompiledPlatform {
-    SevSnp { measurement: [u8; 48] },
+    SevSnp(CompiledSevSnpPin),
     Tdx(Box<CompiledTdxPin>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompiledSevSnpPin {
+    pub measurement: [u8; 48],
+    pub host_data: [u8; 32],
+    pub guest_policy: u64,
 }
 
 impl CompiledPin {
     pub fn platform(&self) -> Platform {
         match self.platform {
-            CompiledPlatform::SevSnp { .. } => Platform::SevSnp,
+            CompiledPlatform::SevSnp(_) => Platform::SevSnp,
             CompiledPlatform::Tdx(_) => Platform::Tdx,
         }
     }
@@ -282,6 +291,16 @@ pub(crate) struct CompiledTdxPin {
     pub smt_enabled: PckFlag,
 }
 
+/// Guest policy bits 0-15: the minimum firmware ABI (major in 15:8, minor in
+/// 7:0) the launch requires.
+pub(crate) const POLICY_ABI_MASK: u64 = 0xffff;
+/// Guest policy bit 17: reserved, must be one.
+pub(crate) const POLICY_RESERVED_MBO: u64 = 1 << 17;
+/// Guest policy bit 18: a migration agent may be associated with the guest.
+pub(crate) const POLICY_MIGRATE_MA: u64 = 1 << 18;
+/// Guest policy bit 19: the host may debug (decrypt) the guest.
+pub(crate) const POLICY_DEBUG: u64 = 1 << 19;
+
 /// TD_ATTRIBUTES bit 0: the TD is debuggable by the host.
 const TD_ATTRIBUTES_DEBUG: u64 = 1 << 0;
 /// TD_ATTRIBUTES bit 28: EPT violations are not converted to #VE.
@@ -292,9 +311,9 @@ pub(crate) fn compile_pins(pins: &[AllowedMeasurement]) -> Result<Vec<CompiledPi
         .enumerate()
         .map(|(index, pin)| {
             let platform = match &pin.platform {
-                PlatformMeasurement::SevSnp { measurement } => CompiledPlatform::SevSnp {
-                    measurement: pin_hex(measurement, index, "sev_snp.measurement")?,
-                },
+                PlatformMeasurement::SevSnp(snp) => {
+                    CompiledPlatform::SevSnp(compile_sev_snp(snp, index)?)
+                }
                 PlatformMeasurement::Tdx(tdx) => {
                     CompiledPlatform::Tdx(Box::new(compile_tdx(tdx, index)?))
                 }
@@ -305,6 +324,37 @@ pub(crate) fn compile_pins(pins: &[AllowedMeasurement]) -> Result<Vec<CompiledPi
             })
         })
         .collect()
+}
+
+fn compile_sev_snp(pin: &SevSnpPin, index: usize) -> Result<CompiledSevSnpPin, Error> {
+    let guest_policy = parse_guest_policy(&pin.guest_policy).ok_or_else(|| {
+        Error::InvalidPin(format!(
+            "allowed measurement {index}: sev_snp.guest_policy must be 0x followed by lowercase \
+             hex with no leading zeros (got {:?})",
+            pin.guest_policy
+        ))
+    })?;
+    if guest_policy & (POLICY_DEBUG | POLICY_MIGRATE_MA) != 0
+        || guest_policy & POLICY_RESERVED_MBO == 0
+    {
+        return Err(Error::InvalidPin(format!(
+            "allowed measurement {index}: sev_snp.guest_policy must have DEBUG and MIGRATE_MA \
+             clear and the reserved bit 17 set"
+        )));
+    }
+    Ok(CompiledSevSnpPin {
+        measurement: pin_hex(&pin.measurement, index, "sev_snp.measurement")?,
+        host_data: pin_hex(&pin.host_data, index, "sev_snp.host_data")?,
+        guest_policy,
+    })
+}
+
+/// A guest policy in its one spelling: `0x`, then lowercase hex with no
+/// leading zeros, fitting 64 bits.
+fn parse_guest_policy(text: &str) -> Option<u64> {
+    let digits = text.strip_prefix("0x")?;
+    let value = u64::from_str_radix(digits, 16).ok()?;
+    (format!("{value:#x}") == text).then_some(value)
 }
 
 fn compile_tdx(pin: &TdxPin, index: usize) -> Result<CompiledTdxPin, Error> {
@@ -403,18 +453,97 @@ pub(crate) mod tests {
         );
     }
 
+    pub(crate) fn sev_snp_pin() -> SevSnpPin {
+        SevSnpPin {
+            measurement: "ab".repeat(48),
+            host_data: SevSnpPin::host_data_for_config(b"config"),
+            guest_policy: "0x30133".to_string(),
+        }
+    }
+
     #[test]
-    fn record_conversion_pins_sev_snp_only() {
-        let record = EnclaveMeasurement {
-            snp_measurement: "ab".repeat(48),
-            tdx_measurement: TdxMeasurement {
-                rtmr1: "cd".repeat(48),
-                rtmr2: "ef".repeat(48),
-            },
+    fn host_data_is_the_config_sha256() {
+        assert_eq!(
+            SevSnpPin::host_data_for_config(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn compile_accepts_a_well_formed_sev_snp_pin() {
+        let compiled = compile_pins(&[AllowedMeasurement::sev_snp(sev_snp_pin())]).unwrap();
+        let CompiledPlatform::SevSnp(snp) = &compiled[0].platform else {
+            panic!("expected a SEV-SNP pin");
         };
-        let pin = AllowedMeasurement::from(&record);
-        assert_eq!(pin.platform(), Platform::SevSnp);
-        assert_eq!(pin, AllowedMeasurement::sev_snp("ab".repeat(48)));
+        assert_eq!(snp.measurement, [0xab; 48]);
+        assert_eq!(snp.guest_policy, 0x30133);
+        assert_eq!(compiled[0].platform(), Platform::SevSnp);
+    }
+
+    #[test]
+    fn compile_rejects_malformed_and_unsafe_sev_snp_pins() {
+        type Mutation = Box<dyn Fn(&mut SevSnpPin)>;
+        let policy =
+            |text: &'static str| -> Mutation { Box::new(move |p| p.guest_policy = text.into()) };
+        let cases: Vec<(&str, Mutation)> = vec![
+            (
+                "sev_snp.measurement",
+                Box::new(|p| p.measurement = "ab".repeat(47)),
+            ),
+            (
+                "sev_snp.host_data",
+                Box::new(|p| p.host_data = "ab".repeat(48)),
+            ),
+            (
+                "sev_snp.host_data",
+                Box::new(|p| p.host_data = "zz".repeat(32)),
+            ),
+            // One spelling only.
+            ("guest_policy must be 0x", policy("0x030133")),
+            ("guest_policy must be 0x", policy("0X30133")),
+            ("guest_policy must be 0x", policy("0x30133 ")),
+            ("guest_policy must be 0x", policy("196915")),
+            ("guest_policy must be 0x", policy("0x3013A")),
+            ("guest_policy must be 0x", policy("0x10000000000000000")),
+            // A policy no sound launch uses: DEBUG, MIGRATE_MA, bit 17 clear.
+            ("DEBUG and MIGRATE_MA", policy("0xb0133")),
+            ("DEBUG and MIGRATE_MA", policy("0x70133")),
+            ("DEBUG and MIGRATE_MA", policy("0x10133")),
+        ];
+        for (needle, mutate) in cases {
+            let mut pin = sev_snp_pin();
+            mutate(&mut pin);
+            let err = compile_pins(&[AllowedMeasurement::sev_snp(pin.clone())])
+                .expect_err(needle)
+                .to_string();
+            assert!(err.contains(needle), "{needle} ({pin:?}): {err}");
+        }
+    }
+
+    #[test]
+    fn sev_snp_pins_round_trip_through_strict_json() {
+        let pin = AllowedMeasurement::sev_snp(sev_snp_pin());
+        let json = serde_json::to_value(&pin).unwrap();
+        assert_eq!(json["platform"]["sev_snp"]["guest_policy"], "0x30133");
+        assert_eq!(
+            serde_json::from_value::<AllowedMeasurement>(json.clone()).unwrap(),
+            pin
+        );
+        // Every member is required, and nothing else is accepted.
+        for member in ["measurement", "host_data", "guest_policy"] {
+            let mut missing = json.clone();
+            missing["platform"]["sev_snp"]
+                .as_object_mut()
+                .unwrap()
+                .remove(member);
+            let err = serde_json::from_value::<AllowedMeasurement>(missing)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(member), "{member}: {err}");
+        }
+        let mut unknown = json.clone();
+        unknown["platform"]["sev_snp"]["rtmr1"] = "00".repeat(48).into();
+        assert!(serde_json::from_value::<AllowedMeasurement>(unknown).is_err());
     }
 
     #[test]

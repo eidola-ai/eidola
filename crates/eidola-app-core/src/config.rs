@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tinfoil_verifier::EnclaveMeasurement;
+use tinfoil_verifier::SevSnpPin;
 
 use crate::error::AppError;
 
@@ -378,40 +378,71 @@ impl Config {
 // Measurement parsing helpers
 // ---------------------------------------------------------------------------
 
-/// Parse a `<snp>:<rtmr1>:<rtmr2>` trust spec into an [`EnclaveMeasurement`].
-pub fn parse_trust_measurement(spec: &str) -> Result<EnclaveMeasurement, AppError> {
+/// The trust-spec form a trusted server measurement is written in:
+/// `<measurement>:<host_data>:<guest_policy>`.
+pub const TRUST_SPEC_FORM: &str = "<measurement>:<host_data>:<guest_policy>";
+
+/// Parse a `<measurement>:<host_data>:<guest_policy>` trust spec (the SEV-SNP
+/// launch digest, 96 hex; HOST_DATA, 64 hex; the guest policy, such as
+/// `0x30133`) into a [`SevSnpPin`], refused unless the attesting client's own
+/// pin compiler accepts it.
+pub fn parse_trust_measurement(spec: &str) -> Result<SevSnpPin, AppError> {
     let parts: Vec<&str> = spec.split(':').collect();
-    if parts.len() != 3 {
+    let [measurement, host_data, guest_policy] = parts.as_slice() else {
         return Err(AppError::Config {
-            message: "trust_measurement must be `<snp>:<rtmr1>:<rtmr2>` \
-                      (three colon-separated 96-char hex strings)"
+            message: format!(
+                "trust_measurement must be `{TRUST_SPEC_FORM}` (the SEV-SNP launch digest, \
+                 96 hex; HOST_DATA, 64 hex; the guest policy, such as 0x30133)"
+            ),
+        });
+    };
+    let pin = SevSnpPin {
+        measurement: validate_hex_field(measurement, "measurement", 48)?,
+        host_data: validate_hex_field(host_data, "host_data", 32)?,
+        guest_policy: guest_policy.to_string(),
+    };
+    tinfoil_verifier::validate_pins(&[tinfoil_verifier::AllowedMeasurement::sev_snp(pin.clone())])
+        .map_err(|e| AppError::Config {
+            message: format!("trust_measurement: {e}"),
+        })?;
+    Ok(pin)
+}
+
+/// The key a trusted measurement is untrusted by: its launch identity,
+/// `<measurement>:<host_data>`, lowercase.
+pub fn measurement_key(pin: &SevSnpPin) -> String {
+    format!(
+        "{}:{}",
+        pin.measurement.to_ascii_lowercase(),
+        pin.host_data.to_ascii_lowercase()
+    )
+}
+
+/// Extract the key from an `--untrust_measurement` argument: either
+/// `<measurement>:<host_data>` or the full trust spec.
+pub fn parse_untrust_key(spec: &str) -> Result<String, AppError> {
+    let mut parts = spec.split(':');
+    let (Some(measurement), Some(host_data)) = (parts.next(), parts.next()) else {
+        return Err(AppError::Config {
+            message: "untrust_measurement must be `<measurement>:<host_data>` or the full \
+                      trust spec"
                 .into(),
         });
-    }
-    let snp = validate_hex_field(parts[0], "snp_measurement")?;
-    let rtmr1 = validate_hex_field(parts[1], "tdx.rtmr1")?;
-    let rtmr2 = validate_hex_field(parts[2], "tdx.rtmr2")?;
-    Ok(EnclaveMeasurement {
-        snp_measurement: snp,
-        tdx_measurement: tinfoil_verifier::TdxMeasurement { rtmr1, rtmr2 },
-    })
-}
-
-/// Extract the SNP measurement key from an `--untrust_measurement` argument.
-/// Accepts either a bare 96-char SNP measurement or the full
-/// `<snp>:<rtmr1>:<rtmr2>` triple.
-pub fn parse_untrust_key(spec: &str) -> Result<String, AppError> {
-    let snp = match spec.split_once(':') {
-        Some((snp, _)) => snp,
-        None => spec,
     };
-    validate_hex_field(snp, "snp_measurement")
+    Ok(format!(
+        "{}:{}",
+        validate_hex_field(measurement, "measurement", 48)?,
+        validate_hex_field(host_data, "host_data", 32)?
+    ))
 }
 
-fn validate_hex_field(value: &str, field: &str) -> Result<String, AppError> {
-    if value.len() != 96 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+fn validate_hex_field(value: &str, field: &str, bytes: usize) -> Result<String, AppError> {
+    if value.len() != bytes * 2 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(AppError::Config {
-            message: format!("{field} must be 96 hex characters (48 bytes)"),
+            message: format!(
+                "{field} must be {} hex characters ({bytes} bytes)",
+                bytes * 2
+            ),
         });
     }
     Ok(value.to_ascii_lowercase())
@@ -471,27 +502,45 @@ mod tests {
 
     #[test]
     fn parse_trust_measurement_valid() {
-        let snp = "a".repeat(96);
-        let rtmr1 = "b".repeat(96);
-        let rtmr2 = "c".repeat(96);
-        let spec = format!("{snp}:{rtmr1}:{rtmr2}");
+        let measurement = "A".repeat(96);
+        let host_data = "b".repeat(64);
+        let spec = format!("{measurement}:{host_data}:0x30133");
         let m = parse_trust_measurement(&spec).unwrap();
-        assert_eq!(m.snp_measurement, snp);
-        assert_eq!(m.tdx_measurement.rtmr1, rtmr1);
-        assert_eq!(m.tdx_measurement.rtmr2, rtmr2);
+        assert_eq!(m.measurement, "a".repeat(96));
+        assert_eq!(m.host_data, host_data);
+        assert_eq!(m.guest_policy, "0x30133");
+        assert_eq!(
+            measurement_key(&m),
+            format!("{}:{host_data}", "a".repeat(96))
+        );
     }
 
     #[test]
-    fn parse_trust_measurement_rejects_bad_length() {
-        assert!(parse_trust_measurement("aa:bb:cc").is_err());
+    fn parse_trust_measurement_rejects_what_the_verifier_would() {
+        let (m, h) = ("a".repeat(96), "b".repeat(64));
+        for spec in [
+            "aa:bb:cc".to_string(),
+            // The legacy triple: a digest and two RTMRs.
+            format!("{m}:{m}:{m}"),
+            // A digest alone pins every deployment of the image.
+            m.clone(),
+            format!("{m}:{h}"),
+            format!("{m}:{h}:0x30133:extra"),
+            // A debug or migratable policy, or another spelling.
+            format!("{m}:{h}:0xb0133"),
+            format!("{m}:{h}:0x70133"),
+            format!("{m}:{h}:196915"),
+        ] {
+            assert!(parse_trust_measurement(&spec).is_err(), "{spec}");
+        }
     }
 
     #[test]
-    fn parse_untrust_key_bare_and_triple() {
-        let snp = "a".repeat(96);
-        assert_eq!(parse_untrust_key(&snp).unwrap(), snp);
-        let triple = format!("{}:{}:{}", snp, "b".repeat(96), "c".repeat(96));
-        assert_eq!(parse_untrust_key(&triple).unwrap(), snp);
+    fn parse_untrust_key_pair_and_spec() {
+        let key = format!("{}:{}", "a".repeat(96), "b".repeat(64));
+        assert_eq!(parse_untrust_key(&key).unwrap(), key);
+        assert_eq!(parse_untrust_key(&format!("{key}:0x30133")).unwrap(), key);
+        assert!(parse_untrust_key(&"a".repeat(96)).is_err());
     }
 
     #[test]

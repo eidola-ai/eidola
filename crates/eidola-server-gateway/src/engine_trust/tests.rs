@@ -52,6 +52,7 @@ fn fixture_root() -> PathBuf {
 }
 
 /// The fixture tree, in memory, so a test can change one file of it.
+#[derive(Clone)]
 struct Tree {
     json: serde_json::Value,
     files: BTreeMap<String, Vec<u8>>,
@@ -744,14 +745,35 @@ fn a_pin_names_exactly_one_platform() {
     refused(&tree, "engine-enclaves.json: ");
 
     // SEV-SNP stays expressible, and then the sidecar states no TDX policy.
+    // Its HOST_DATA is the config's hash, as MRCONFIGID is on TDX.
     let mut tree = Tree::fixture();
-    tree.deployment()["pin"]["platform"] =
-        serde_json::json!({"sev_snp": {"measurement": "a".repeat(96)}});
+    let config_sha256 = tree.deployment()["config_sha256"].clone();
+    let snp = |host_data: serde_json::Value| {
+        serde_json::json!({"sev_snp": {
+            "measurement": "a".repeat(96),
+            "host_data": host_data,
+            "guest_policy": "0x30133",
+        }})
+    };
+    tree.deployment()["pin"]["platform"] = snp(config_sha256.clone());
     refused(&tree, "a SEV-SNP pin, but");
     let mut sidecar = tree.sidecar();
     sidecar.as_object_mut().unwrap().remove("tdx");
     tree.set_sidecar(sidecar);
     tree.check().expect("a SEV-SNP deployment is expressible");
+
+    let mut other = tree.clone();
+    other.deployment()["pin"]["platform"] = snp("b".repeat(64).into());
+    refused(&other, "sev_snp.host_data is not the hash of");
+    let mut legacy = tree.clone();
+    legacy.deployment()["pin"]["platform"] =
+        serde_json::json!({"sev_snp": {"measurement": "a".repeat(96)}});
+    // A digest alone, the pre-IGVM pin shape, is no pin: the typed parse
+    // refuses it.
+    refused(&legacy, "missing field `host_data`");
+    let mut debug = tree.clone();
+    debug.deployment()["pin"]["platform"]["sev_snp"]["guest_policy"] = "0xb0133".into();
+    refused(&debug, "the attesting client refuses this pin");
 }
 
 #[test]

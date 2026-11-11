@@ -152,25 +152,21 @@ impl ConfigStore {
     /// `Change::Backends`.
     pub fn revert_trusted_measurements(&mut self, cx: &mut Context<Self>) {
         self.write(cx, |c| {
-            let snps: Vec<String> = c
+            let keys: Vec<String> = c
                 .runtime()
                 .block_on(c.eidola_trust())
-                .map(|t| {
-                    t.trusted_measurements
-                        .iter()
-                        .map(|m| m.snp.clone())
-                        .collect()
-                })
+                .map(|t| t.trusted_measurements.iter().map(|m| m.key()).collect())
                 .unwrap_or_default();
-            for snp in snps {
-                c.runtime().block_on(c.untrust_measurement(snp))?;
+            for key in keys {
+                c.runtime().block_on(c.untrust_measurement(key))?;
             }
             Ok(())
         });
     }
 
     /// Add a trusted enclave measurement to the eidola row's override list.
-    /// `spec` is the CLI's `<snp>:<rtmr1>:<rtmr2>` triple; a parse failure is
+    /// `spec` is the CLI's `<measurement>:<host_data>:<guest_policy>` spec; a
+    /// parse failure is
     /// surfaced in the store's `error` (the settings op-error banner) rather
     /// than silently dropped. Writes through the backend row; emits
     /// `Change::Backends`.
@@ -178,21 +174,18 @@ impl ConfigStore {
         self.write(cx, |c| {
             let m = eidola_app_core::config::parse_trust_measurement(spec.trim())?;
             c.runtime()
-                .block_on(c.trust_measurement(
-                    m.snp_measurement,
-                    m.tdx_measurement.rtmr1,
-                    m.tdx_measurement.rtmr2,
-                ))
+                .block_on(c.trust_measurement(m.measurement, m.host_data, m.guest_policy))
                 .map(|_| ())
         });
     }
 
-    /// Remove a trusted measurement (by SNP key) from the eidola row's
+    /// Remove a trusted measurement (by its `<measurement>:<host_data>` key)
+    /// from the eidola row's
     /// override list. Clearing the last one reverts to the pin. Writes through
     /// the backend row; emits `Change::Backends`.
-    pub fn untrust_measurement(&mut self, snp: String, cx: &mut Context<Self>) {
+    pub fn untrust_measurement(&mut self, key: String, cx: &mut Context<Self>) {
         self.write(cx, |c| {
-            c.runtime().block_on(c.untrust_measurement(snp)).map(|_| ())
+            c.runtime().block_on(c.untrust_measurement(key)).map(|_| ())
         });
     }
 

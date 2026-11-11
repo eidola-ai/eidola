@@ -402,7 +402,7 @@ fn check_deployment(
             let snp = object(&platform["sev_snp"], &format!("{at}: pin.platform.sev_snp"))?;
             exact_keys(
                 snp,
-                &["measurement"],
+                &["measurement", "host_data", "guest_policy"],
                 &[],
                 &format!("{at}: pin.platform.sev_snp"),
             )?;
@@ -411,6 +411,17 @@ fn check_deployment(
                 48,
                 &format!("{at}: pin.platform.sev_snp.measurement"),
             )?;
+            let host_data = hex_string(
+                &snp["host_data"],
+                32,
+                &format!("{at}: pin.platform.sev_snp.host_data"),
+            )?;
+            if host_data != config_sha256 {
+                return Err(format!(
+                    "{at}: pin.platform.sev_snp.host_data is not the hash of {config_path} \
+                     (expected {config_sha256})"
+                ));
+            }
             if checked.tdx.is_some() {
                 return Err(format!(
                     "{at}: a SEV-SNP pin, but {sidecar_path} states tdx machines"

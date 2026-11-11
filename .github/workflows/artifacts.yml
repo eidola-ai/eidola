@@ -116,8 +116,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache CVM artifacts # zizmor: ignore[cache-poisoning]
-        # Not gated on tags: CVM artifacts are content-addressed (kernel/initrd
-        # hash-verified on fetch), so a restored entry cannot alter outputs.
+        # Not gated on tags: CVM artifacts are content-addressed (the release
+        # manifest against the config's pin, the SEV-SNP image against the
+        # manifest, re-hashed on every use), so a restored entry cannot alter
+        # outputs.
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/eidola/cvm
@@ -816,7 +818,7 @@ jobs:
       - name: Cache cargo registry and build artifacts # zizmor: ignore[cache-poisoning]
         # Skipped entirely on v* release tags so the release recomputes
         # measurements from a clean cargo state (no restore, no save) — leaving
-        # no shared-cache common mode with the independent Python sevsnpmeasure
+        # no shared-cache common mode with the independent `cvmc measure`
         # cross-check in tinfoil-build.yml. save-if scopes writes to main
         # otherwise; this job only verifies the manifest and publishes nothing.
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
@@ -825,9 +827,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache CVM artifacts # zizmor: ignore[cache-poisoning]
-        # CVM kernel/initrd downloads are Sigstore-verified by the
-        # --verify-attestations flag below, so a poisoned cache is rejected
-        # at verification time.
+        # The CVM release manifest and SEV-SNP image are hash-pinned and
+        # Sigstore-verified by the --verify-attestations flag below, so a
+        # poisoned cache is rejected at verification time.
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/eidola/cvm
