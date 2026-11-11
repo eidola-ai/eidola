@@ -625,8 +625,8 @@ fn check_hold_equals_worst_case(
         (status = 404, description = "The model reference names no model (`model_not_found`); refunded in full", body = ErrorResponse),
         (status = 409, description = "A credential already spent; none of the request's credentials is recorded", body = ErrorResponse),
         (status = 410, description = "The model reference names a retired model (`model_retired`); refunded in full", body = ErrorResponse),
-        (status = 502, description = "Upstream provider error", body = ErrorResponse),
-        (status = 503, description = "No upstream is available for the model", body = ErrorResponse)
+        (status = 502, description = "Inference engine error", body = ErrorResponse),
+        (status = 503, description = "No engine is available for the model", body = ErrorResponse)
     )
 )]
 pub async fn chat_completions(

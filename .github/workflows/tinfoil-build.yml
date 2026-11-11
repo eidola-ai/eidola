@@ -2,10 +2,10 @@
 #
 # Two responsibilities, one workflow:
 #
-# 1. **The server enclave, cross-checked and released.** The server runs on
+# 1. **The gateway enclave, cross-checked and released.** The gateway runs on
 #    the platform provider's IGVM launch model: `tinfoil-config.yml` pins a
 #    cvmimage release manifest inline, that manifest names one SEV-SNP IGVM
-#    image, and the server's identity is that image's launch digest plus
+#    image, and the gateway's identity is that image's launch digest plus
 #    HOST_DATA, the config's SHA-256. Before anything is released, the
 #    enclave block of `artifact-manifest.json` (computed by our Rust
 #    `measure-enclave`) is checked against the provider's own measurer,

@@ -310,7 +310,7 @@ pub struct Message {
     /// follow-up request.
     ///
     /// **Opaque pass-through**, like [`ChatCompletionRequest::tools`]: the
-    /// client is required to replay the provider's own call objects
+    /// client is required to replay the call objects it received
     /// unchanged (ids and any provider extension fields intact), so the
     /// server must not normalize them through a narrower struct.
     #[serde(default, skip_serializing_if = "Option::is_none")]

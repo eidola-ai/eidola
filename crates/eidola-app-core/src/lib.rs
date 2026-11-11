@@ -14917,7 +14917,7 @@ async fn chosen_inputs(
 /// Which credentials pay for a request, chosen from the wallet in its spend
 /// order ([`db::spendable_credentials`]: soonest-lapsing key first, then
 /// smallest, then nullifier), by a rule with no thresholds
-/// (`docs/specs/act-multi-spend.md` §7.2):
+/// (`docs/anonymous-credits.md` → Spending several tokens in one request):
 ///
 /// 1. If the first credential covers the hold `W`, it pays alone, its share
 ///    `W`.
@@ -20146,7 +20146,7 @@ mod tests {
         }
     }
 
-    /// **The input rule** (`docs/specs/act-multi-spend.md` §7.2), over a
+    /// **The input rule** (`docs/anonymous-credits.md` → Spending several tokens in one request), over a
     /// wallet already in its spend order: the first credential alone when it
     /// covers the hold; otherwise drained, with the first *later* credential
     /// that covers the rest; otherwise a new credential for what is missing.
@@ -20250,7 +20250,7 @@ mod tests {
     }
 
     /// **The partial returns a response carries are checked against the
-    /// in-order allocation** (`docs/specs/act-multi-spend.md` §7.7): a drain
+    /// in-order allocation** (`docs/anonymous-credits.md` → Spending several tokens in one request): a drain
     /// consumed first and the change on the fill passes; change landing on
     /// the drain while the fill was charged does not, nor does a successor
     /// worth more than its predecessor.

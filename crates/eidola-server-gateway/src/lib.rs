@@ -1,6 +1,6 @@
-//! Eidola Server Library
+//! Eidola gateway library
 //!
-//! This module exposes the server's internal types for testing and reuse.
+//! This module exposes the gateway's internal types for testing and reuse.
 
 use std::sync::Arc;
 

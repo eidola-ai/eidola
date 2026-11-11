@@ -323,7 +323,7 @@ impl PromptCharge {
     /// as the UTF-8 byte length of its compact JSON serialization.
     ///
     /// **The whole entry, not just `function.{name,arguments}`.** A client
-    /// replays the provider's call object verbatim and the proxy forwards it
+    /// replays the call object it received verbatim and the proxy forwards it
     /// verbatim, so the `id`, the `type`, and any provider extension field
     /// all reach the upstream — and which of them the chat template renders
     /// into the prompt is a per-model decision the proxy cannot see (Mistral
@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     fn the_whole_tool_call_entry_is_charged_not_just_name_and_arguments() {
-        // The client replays the provider's call object verbatim — id, `type`
+        // The client replays the call object it received verbatim — id, `type`
         // and any provider extension included — and those bytes reach the
         // upstream, where a template like Mistral's renders the call id
         // straight into the prompt.

@@ -607,7 +607,7 @@
             }
           },
           "502": {
-            "description": "Upstream provider error",
+            "description": "Inference engine error",
             "content": {
               "application/json": {
                 "schema": {
@@ -617,7 +617,7 @@
             }
           },
           "503": {
-            "description": "No upstream is available for the model",
+            "description": "No engine is available for the model",
             "content": {
               "application/json": {
                 "schema": {
@@ -1940,7 +1940,7 @@
               "null"
             ],
             "items": {},
-            "description": "Tool calls the assistant made, replayed by the client verbatim on the\nfollow-up request.\n\n**Opaque pass-through**, like [`ChatCompletionRequest::tools`]: the\nclient is required to replay the provider's own call objects\nunchanged (ids and any provider extension fields intact), so the\nserver must not normalize them through a narrower struct."
+            "description": "Tool calls the assistant made, replayed by the client verbatim on the\nfollow-up request.\n\n**Opaque pass-through**, like [`ChatCompletionRequest::tools`]: the\nclient is required to replay the call objects it received\nunchanged (ids and any provider extension fields intact), so the\nserver must not normalize them through a narrower struct."
           }
         },
         "additionalProperties": false

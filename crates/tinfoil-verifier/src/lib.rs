@@ -48,7 +48,7 @@
 //! # Prerequisites
 //!
 //! A rustls `CryptoProvider` must be installed before calling [`attesting_client`].
-//! The eidola server does this in `main.rs` via `rustls_rustcrypto::provider()`.
+//! The Eidola gateway does this in `main.rs` via `rustls_rustcrypto::provider()`.
 //!
 //! # TLS root sourcing
 //!
@@ -57,7 +57,7 @@
 //! attested inference endpoint. Each consumer picks the source that fits its
 //! environment:
 //!
-//! - **Server (in enclave):** `webpki-roots`. The server runs `FROM scratch`
+//! - **Gateway (in enclave):** `webpki-roots`. The gateway runs `FROM scratch`
 //!   inside an enclave with no system trust store, so it bundles the Mozilla
 //!   list. Tinfoil's production cert and the public services it talks to all
 //!   chain under it.
@@ -125,7 +125,7 @@ pub struct AttestingClientConfig<'a> {
     /// TLS root store used for the attested inference endpoint. The verifier
     /// is intentionally agnostic about where these roots come from — the caller decides
     /// whether to populate the store from `webpki-roots`, the OS keychain
-    /// via `rustls-native-certs`, a custom PEM, or some union. The server
+    /// via `rustls-native-certs`, a custom PEM, or some union. The gateway
     /// (running inside an enclave with no system trust store) typically
     /// uses `webpki-roots`; the CLI and macOS app use `rustls-native-certs`
     /// so developers can install local dev CAs in their keychain. Custom

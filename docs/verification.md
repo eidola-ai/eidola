@@ -8,7 +8,7 @@ A **release** publishes **artifacts**. Each artifact has a measured **payload**,
 
 | Term | Meaning |
 | --- | --- |
-| **Release** | The unit of trust: everything published for one git ref — every artifact, `artifact-manifest.json`, human attestations, and the paired server enclave. See [releases.md](releases.md). |
+| **Release** | The unit of trust: everything published for one git ref — every artifact, `artifact-manifest.json`, human attestations, and the paired gateway enclave. See [releases.md](releases.md). |
 | **Artifact** | One named, measured output of a release. The keys in `artifact-manifest.json` (`eidola-gui-macos-universal`, `eidola-server`, …). An artifact is the tuple of payload + archive, and where applicable envelope + installable. |
 | **Payload** | The functional file tree: binaries, the `llama-server` sidecar, plist/icons, the embedded trust root. Every executable that ships is **copied in**, never referenced. Not Developer ID signatures. Not Mesa on the Nix Linux GUI (host GPU stack). *Trust object* is the threat-model synonym. |
 | **Archive** | A canonical byte-stream of the payload. For Nix artifacts, a gzip'd POSIX/pax tar produced inside the flake (`nix build .#…-archive`); its SHA-256 is `archiveSha256`. For OCI artifacts, the image; its digest is `digest`. This is the hash a user can `shasum` / `sha256sum` without Nix. |
@@ -31,13 +31,13 @@ Attestations and `artifact-manifest.json` live **beside** the installable on the
 
 Every value in this file is a function of source. Nothing key-dependent may enter it — no signed-artifact hash, no detached-bundle hash, no Team ID, no ticket; those live in the human attestation, which is signed and non-deterministic already. That is enforced rather than remembered: `scripts/check-manifest-determinism.sh` (run by `just check` and by the `Rust checks` workflow) validates the document's envelope and holds each artifact type to an exact field list (so an unrecognized field is rejected whether or not it names a key), rejects any key naming signing material, and asserts over `.github/workflows/artifacts.yml` that no ancestor of the job assembling the manifest is a signing job and that no job computing part of it holds the signing environment.
 
-`narHash` is kept because it is free and isolates "the packer changed" from "the payload changed." It is not the user-facing check. Two serializations of the same tree: if they disagree, the archive derivation is impure. That split is load-bearing in one routine case: the archive is gzip-compressed, so the pinned **gzip version** is an input to `archiveSha256`. A `flake.lock` bump can move the archive hash with a byte-identical payload — `narHash` holding steady while `archiveSha256` moves is that, not tampering.
+`narHash` is kept because it is free and isolates "the packer changed" from "the payload changed." It is not the user-facing check. Two serializations of the same tree: if they disagree, the archive derivation is impure. That split matters in one routine case: the archive is gzip-compressed, so the pinned **gzip version** is an input to `archiveSha256`. A `flake.lock` bump can move the archive hash with a byte-identical payload — `narHash` holding steady while `archiveSha256` moves is that, not tampering.
 
 ### Copied, not referenced
 
 Anything **copied into** the payload is in both hashes. A store-path *reference* is not.
 
-This is not a stylistic preference. Nix store paths are **input-addressed**: the path is a function of the derivation's inputs, not of its output bytes. A payload that names a binary by store path therefore binds the *build recipe* but not the *result* — a non-reproducible build, or a compromised builder, yields the same path and so the same `narHash` and `archiveSha256`, while the user's machine resolves whatever bytes its substituter holds for that path. Copying moves the bytes into the measured tree, where a substitution changes the hash.
+Nix store paths are **input-addressed**: the path is a function of the derivation's inputs, not of its output bytes. A payload that names a binary by store path therefore binds the *build recipe* but not the *result* — a non-reproducible build, or a compromised builder, yields the same path and so the same `narHash` and `archiveSha256`, while the user's machine resolves whatever bytes its substituter holds for that path. Copying moves the bytes into the measured tree, where a substitution changes the hash.
 
 So every executable that ships is copied: the macOS `.app` copies `llama-server` into `Contents/MacOS/`, and the Linux Nix GUI copies **both** the GUI binary (to `bin/.eidola-gui-wrapped`, kept a sibling of the sidecar) and `llama-server` into `$out/bin`. The only deliberate references left are the ones we have decided *not* to measure — the nixpkgs Mesa ICDs reached via `VK_ADD_DRIVER_FILES`, because the device's GPU stack is pre-trusted.
 
@@ -90,7 +90,7 @@ Its payload is the same release binary and the same `llama-server` sidecar, with
 
 **The Nix archive** (`eidola-gui-linux-nix-amd64`) is *not* a standalone installable. Its archive is a serialization of a Nix store path: the payload contains the real GUI binary and the real sidecar, so the hash means what it should, but the tree is Nix-shaped — `bin/eidola-gui` is a wrapper script with a `/nix/store/…` interpreter, and the GUI binary's `RUNPATH` resolves Wayland, libxkbcommon and the Vulkan loader out of the store. Extracted onto a machine with no Nix store, it will not start.
 
-That is the correct artifact for NixOS, for `nix profile install`, and for anyone reproducing the build, and this page does not pretend otherwise: for that artifact, `archiveSha256` is a verification identity and a Nix-ecosystem installable, not a browser download that runs.
+It is the right artifact for NixOS, for `nix profile install`, and for anyone reproducing the build. For it, `archiveSha256` is a verification identity and a Nix installable, not a download that runs by itself.
 
 ## Linux GPU stack
 

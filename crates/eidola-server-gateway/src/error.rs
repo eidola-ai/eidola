@@ -1,4 +1,4 @@
-//! Unified error handling for the Eidola server.
+//! Unified error handling for the Eidola gateway.
 
 use axum::http::StatusCode;
 use tracing::{error, warn};

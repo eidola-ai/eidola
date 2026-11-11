@@ -163,7 +163,7 @@ assert_manifest_complete() {
   return 1
 }
 
-# CVM image artifacts for enclave measurement computation. The server runs on
+# CVM image artifacts for enclave measurement computation. The gateway runs on
 # the platform provider's IGVM launch model: one SEV-SNP image per release,
 # named by the release manifest the config's `cvm-version` pins inline
 # (`cvm-version: X@sha256:HEX`). That pin is the only one: the manifest is
@@ -308,7 +308,7 @@ parse_cvm_version() {
   fi
   if [[ ! "$CVM_VERSION" =~ ^[0-9][0-9A-Za-z.-]*$ ]]; then
     echo "error: cvm-version in $CONFIG_FILE is not a plain release version: $CVM_VERSION" >&2
-    echo "  the server runs on a release's CPU image (no +build tag)" >&2
+    echo "  the gateway runs on a release's CPU image (no +build tag)" >&2
     exit 1
   fi
   CVM_MANIFEST_PIN="${digest#sha256:}"
@@ -417,7 +417,7 @@ stamp_config_digests() {
   rm -f "${CONFIG_FILE}.bak"
 }
 
-# Compute the server's SEV-SNP launch identity with the measure-enclave
+# Compute the gateway's SEV-SNP launch identity with the measure-enclave
 # binary: `{cvm_version, igvm_sha256, sev_snp: {measurement, host_data,
 # guest_policy}}`.
 compute_measurements() {
@@ -1276,7 +1276,7 @@ verify_oci_manifest() {
 #
 #   Phase 1: build {server, postgres}. Neither image consumes the enclave
 #            measurement, so they can be built first.
-#   Phase 2: stamp the new server digest into `tinfoil-config.yml`, recompute
+#   Phase 2: stamp the new gateway digest into `tinfoil-config.yml`, recompute
 #            the enclave block, and write `releases/trust/server-enclave.json`.
 #   Phase 3: build the cli OCI image plus the current host's native desktop
 #            artifacts — the macOS universal CLI + GUI .app on Darwin, the
@@ -1432,8 +1432,8 @@ case "$COMMAND" in
     fi
     ;;
   stamp-config)
-    # Stamp the freshly-built server digest from --metadata-file into
-    # tinfoil-config.yml. Used by CI's two-phase oci job after the server
+    # Stamp the freshly-built gateway digest from --metadata-file into
+    # tinfoil-config.yml. Used by CI's two-phase oci job after the gateway
     # bake completes and before the enclave is recomputed.
     stamp_config_digests
     echo "Stamped $CONFIG_FILE with server digest from $METADATA_FILE"

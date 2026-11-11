@@ -1002,7 +1002,7 @@ pub struct SpendableCredential {
 }
 
 /// Every credential a spend may begin from now, with anything in it, in the
-/// order inputs are chosen from (`docs/specs/act-multi-spend.md` §7.2): its
+/// order inputs are chosen from (`docs/anonymous-credits.md` → Spending several tokens in one request): its
 /// key's `accept_until` ascending (the soonest-lapsing value first), then
 /// balance ascending, then nonce (the nullifier's bytes, as hex, so text
 /// order is byte order). Every element of the order is public or random, so

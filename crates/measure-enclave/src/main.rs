@@ -1,7 +1,7 @@
-//! Compute the SEV-SNP launch identity of the Eidola server's Tinfoil
+//! Compute the SEV-SNP launch identity of the Eidola gateway's Tinfoil
 //! Container from public inputs only.
 //!
-//! The server runs on the platform provider's IGVM launch model: one
+//! The gateway runs on the platform provider's IGVM launch model: one
 //! firmware-less SEV-SNP image per release, whose launch digest is a function
 //! of the image alone, and the deployment's config bound into every report
 //! through HOST_DATA. The output is the `releases/trust/server-enclave.json`
@@ -16,7 +16,7 @@
 //!
 //! The config must pin the release manifest inline (`cvm-version:
 //! X@sha256:<hex>`) and select the release's CPU image (no `+` build tag: the
-//! server attaches no GPUs). The manifest must hash to that pin, the image to
+//! gateway attaches no GPUs). The manifest must hash to that pin, the image to
 //! the manifest's `igvm.snp`, and the recomputed launch digest must equal the
 //! manifest's `igvm.snp_launch.measurement`; see
 //! `measure_enclave::snp_igvm::release_pin`.
@@ -27,9 +27,9 @@ use anyhow::{Context, Result, ensure};
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(about = "Compute the SEV-SNP launch identity of the Eidola server enclave")]
+#[command(about = "Compute the SEV-SNP launch identity of the Eidola gateway enclave")]
 struct Cli {
-    /// The server's `tinfoil-config.yml`, exactly as deployed.
+    /// The gateway's `tinfoil-config.yml`, exactly as deployed.
     #[arg(long)]
     config: PathBuf,
     /// cvmimage release manifest (`tinfoil-inference-v<version>-manifest.json`).
@@ -48,7 +48,7 @@ fn main() -> Result<()> {
     let release = measure_enclave::tdx_igvm::config_release(&config)?;
     ensure!(
         !release.version.contains('+'),
-        "cvm-version {} names a tagged image; the server runs on the release's plain CPU image",
+        "cvm-version {} names a tagged image; the gateway runs on the release's plain CPU image",
         release.version
     );
     let pin = measure_enclave::snp_igvm::release_pin(

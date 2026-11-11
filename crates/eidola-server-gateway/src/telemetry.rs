@@ -408,7 +408,7 @@ pub mod metrics {
         "db.get_refund_token",
         "db.get_valid_issuer_keys",
         "db.insert_credit_ledger",
-        "db.record_nullifier",
+        "db.record_nullifiers",
         "db.replace_refund_token",
         "db.store_refund_token",
         "upstream.chat",
@@ -609,7 +609,7 @@ pub mod metrics {
     /// `channel_closed` (the upstream channel ended without a Done event).
     ///
     /// This is the classes-of-bugs instrument. A rising `channel_closed` rate
-    /// is a server or upstream defect; a rising `client_disconnect` rate is a
+    /// is a gateway or engine defect; a rising `client_disconnect` rate is a
     /// client or network story.
     pub static CHAT_STREAM_OUTCOME: LazyLock<Counter<u64>> = LazyLock::new(|| {
         meter()
@@ -723,8 +723,8 @@ mod tests {
     #[test]
     fn unknown_span_names_collapse_to_one_bucket() {
         assert_eq!(
-            metrics::span_operation("db.record_nullifier"),
-            Some("db.record_nullifier")
+            metrics::span_operation("db.record_nullifiers"),
+            Some("db.record_nullifiers")
         );
         assert_eq!(metrics::span_operation("something.new"), Some("other"));
         assert_eq!(metrics::span_operation("id-42-suffixed"), Some("other"));

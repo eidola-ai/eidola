@@ -1,22 +1,22 @@
 # Model identity
 
-A model the Eidola server sells is identified by its **weights hash**: a SHA-256 over every file the inference engine reads from its weights directory. The hash is the model's key everywhere: in the server's catalog, in the engine deployments it pins, in the engine's own refusal of a request naming other weights, and in what the server publishes. Names are a convenience on top of it. This page specifies the hash well enough to reimplement it without Eidola's code, says what it does and does not pin, and shows how to check it against files you download yourself.
+A model Eidola sells is identified by its **weights hash**: a SHA-256 over every file the inference engine reads from its weights directory. The hash is the model's key everywhere: in the catalog, in the engine deployments the gateway pins, in the engine's own refusal of a request naming other weights, and in what the gateway publishes. Names are a convenience on top of it. This page specifies the hash well enough to reimplement it without Eidola's code, says what it does and does not pin, and shows how to check it against files you download yourself.
 
 ## Naming a model
 
 A request's `model` field takes one of three forms:
 
-- **`tag`**, such as `mimo-v2.6-flash`: whatever weights the tag resolves to in this server build. A tag matches `[A-Za-z0-9._-]+`, is at most 64 characters, and names exactly one hash at a time. Tags move only with a server release, so following a tag means accepting the release's choice.
-- **`tag@sha256:<64 lowercase hex digits>`**: a pin. As in a container image reference, **the digest is authoritative**: the server serves exactly those weights, and reads the tag only as the client's label for them, whether it names that hash now, named it once, or never did. A pin keeps its weights across a release that moves its tag, for as long as the server serves them.
+- **`tag`**, such as `mimo-v2.6-flash`: whatever weights the tag resolves to in this release. A tag matches `[A-Za-z0-9._-]+`, is at most 64 characters, and names exactly one hash at a time. Tags move only with a release, so following a tag means accepting the release's choice.
+- **`tag@sha256:<64 lowercase hex digits>`**: a pin. As in a container image reference, **the digest is authoritative**: the gateway serves exactly those weights, and reads the tag only as the client's label for them, whether it names that hash now, named it once, or never did. A pin keeps its weights across a release that moves its tag, for as long as the gateway serves them.
 - **`sha256:<64 lowercase hex digits>`**: those weights, with no label.
 
-Only full digests are accepted. The server resolves the reference to a hash as the request arrives; everything after that point works with the hash alone. A response's `model` names what was resolved: the reference as the client sent it, normalised (`tag@sha256:<hex>` for a tag, with the hash it resolved to, or for a pin; `sha256:<hex>` for a hash named alone). A reference that is malformed, names no model the server serves, or names a retired model is refused, with a full refund of the request's charge. Telling a user that a tag they pinned now names other weights is the client's job, from the catalog compiled into it.
+Only full digests are accepted. The gateway resolves the reference to a hash as the request arrives; everything after that point works with the hash alone. A response's `model` names what was resolved: the reference as the client sent it, normalised (`tag@sha256:<hex>` for a tag, with the hash it resolved to, or for a pin; `sha256:<hex>` for a hash named alone). A reference that is malformed, names no model the gateway serves, or names a retired model is refused, with a full refund of the request's charge. Telling a user that a tag they pinned now names other weights is the client's job, from the catalog compiled into it.
 
-Every model's catalog entry is a file in the source tree, `models/<family>/<label>.toml`, compiled into the server, so the catalog a server publishes is part of what its enclave measurement covers. A model is **current** or **deprecated** (still served, with a retirement date announced) while it is listed, and **retired** when a release stops serving it; a retired model is refused by name, tag or hash.
+Every model's catalog entry is a file in the source tree, `models/<family>/<label>.toml`, compiled into the gateway, so the catalog a gateway publishes is part of what its enclave measurement covers. A model is **current** or **deprecated** (still served, with a retirement date announced) while it is listed, and **retired** when a release stops serving it; a retired model is refused by name, tag or hash.
 
 ## In the Eidola app
 
-The app compiles in the same catalog files the server does, so it knows what each name resolves to in the server release it trusts, without asking anyone.
+The app compiles in the same catalog files the gateway does, so it knows what each name resolves to in the release it trusts, without asking anyone.
 
 - **Choosing a model** stores the choice as you made it: a tag, which follows the tag, or a pin, which keeps the weights it names.
 - **Each answer is sent under the exact weights its turn resolved to.** A turn that follows a tag names the tag's current hash on every request it makes, tool calls included, so one answer never mixes two sets of weights. The app records which weights each answer came from.
@@ -27,13 +27,13 @@ The app compiles in the same catalog files the server does, so it knows what eac
 
 ## What `/v1/models` publishes
 
-For each model the server sells, `/v1/models` publishes:
+For each model the gateway sells, `/v1/models` publishes:
 
 - `sha256`, the weights hash, and `tags`, every tag that resolves to it;
 - `weights`: the source repository and revision (on Hugging Face) and the per-file manifest, each file's `path`, `size` and `sha256`;
 - `architecture`, the model family the engine runs it as;
 - `lifecycle`: `status` (`current` or `deprecated`) and, for a deprecated model, `retire_after`;
-- `deployments`: for every engine deployment the server accepts for these weights, the SHA-256 of its committed configuration and the attestation measurement the server holds every connection to it to.
+- `deployments`: for every engine deployment the gateway accepts for these weights, the SHA-256 of its committed configuration and the attestation measurement the gateway holds every connection to it to.
 
 Its `id` is the model's first tag, or `sha256:<hex>` when it has none.
 
@@ -63,7 +63,7 @@ The published per-file manifest lets you check one file at a time, and its sizes
 
 ## What the hash pins, and what it does not
 
-The hash pins **the bytes of the weights**, and with them the tokenizer, the chat template and the default sampling settings. A node refuses a request naming any other hash before the request is admitted, and the server names the hash on every request it sends.
+The hash pins **the bytes of the weights**, and with them the tokenizer, the chat template and the default sampling settings. A node refuses a request naming any other hash before the request is admitted, and the gateway names the hash on every request it sends.
 
 It does **not** pin exact behaviour. The engine's code and version, its numerics (the kernels, the order floating-point work is done in, the batch a request shares) and the sampling seed are outside it. The engine build is pinned separately, by the deployment's launch identity ([Inference engine](engine.md#what-pins-the-engine)); two engines serving the same hash run the same model, not necessarily to the same bit.
 

@@ -1,6 +1,6 @@
 //! Eidola-specific response types with inline privacy and verification metadata.
 //!
-//! These types define the public API contract between the eidola server and its clients.
+//! These types define the public API contract between the Eidola gateway and its clients.
 //! They wrap standard chat completion data with privacy transparency and cryptographic
 //! verification information.
 

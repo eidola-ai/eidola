@@ -29,9 +29,9 @@
 //!
 //! ## Freshness — and its limits
 //!
-//! Re-attesting on every new TLS handshake means TCB-floor bumps and
-//! `ALLOWED_MEASUREMENTS` changes take effect immediately rather than only at
-//! process restart. The per-handshake nonce adds *freshness*: the enclave
+//! Re-attesting on every new TLS handshake means a change to the TCB floor
+//! or to the pinned measurements takes effect immediately rather than only
+//! at process restart. The per-handshake nonce adds *freshness*: the enclave
 //! folds our random nonce into the hardware report's `REPORT_DATA`
 //! (`REPORT_DATA == sha256(report-data-v1 URI || nonce ||
 //! sha256(crypto_material) || sha256(device_evidence))`), and the endorsed
@@ -116,7 +116,7 @@ pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Cli
     // Build a rustls config that pins ALPN to http/1.1 so the connection we
     // attest is the same connection hyper will use for the real request. The
     // root store comes from the caller verbatim — we do not consult any
-    // bundled or OS source here. The server (running inside an enclave with
+    // bundled or OS source here. The gateway (running inside an enclave with
     // no system trust store) supplies `webpki-roots`; the CLI / macOS app
     // supply `rustls-native-certs` so developers can install local dev CAs
     // in their keychain. We deliberately do not inject the AMD attestation

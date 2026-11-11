@@ -63,15 +63,15 @@ jobs:
   # Mirrors the local `just update-manifest` two-phase flow so every
   # downstream consumer (cli OCI build, apple Nix build, artifact-manifest
   # verification) sees a single coherent trust root derived from the
-  # freshly-built server image:
+  # freshly-built gateway image:
   #
-  #   Phase 1: bake server + postgres → server digest.
-  #   Phase 2: stamp the server digest into tinfoil-config.yml.
+  #   Phase 1: bake server + postgres → gateway digest.
+  #   Phase 2: stamp the gateway digest into tinfoil-config.yml.
   #   Phase 3: recompute the enclave from the stamped config and overwrite
   #            releases/trust/server-enclave.json in the workspace.
   #   Phase 4: bake cli (its OCI Containerfile COPYs server-enclave.json
   #            from Phase 3, so the cli is hardcoded against the same
-  #            enclave the actually-built server will produce).
+  #            enclave the actually-built gateway will produce).
   #   Phase 5: emit the stamped config, recomputed enclave, and combined
   #            OCI partial as job outputs for apple + artifact-manifest.
   #
@@ -217,7 +217,7 @@ jobs:
             ${PUSH_FLAG} --targets server \
             --metadata-file "${SERVER_BAKE_METADATA_FILE}"
 
-      - name: Phase 2 — stamp tinfoil-config.yml with built server digest
+      - name: Phase 2 — stamp tinfoil-config.yml with built gateway digest
         id: stamp
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -240,7 +240,7 @@ jobs:
           # Overwrite the workspace file in place. Phase 4 (cli build)
           # COPYs releases/trust/server-enclave.json into its build
           # context, so this makes the cli embed the enclave that
-          # corresponds to the actually-built server.
+          # corresponds to the actually-built gateway.
           ./scripts/artifact-manifest.sh measure \
             --server-enclave-output releases/trust/server-enclave.json
           {
@@ -518,7 +518,7 @@ jobs:
           SERVER_ENCLAVE: ${{ needs.oci.outputs.server_enclave }}
         run: |
           # Overwrite the workspace copies with the authoritative values the
-          # `oci` job produced from its end-to-end run (server build →
+          # `oci` job produced from its end-to-end run (gateway build →
           # stamp → measure). The flake's source filter picks up the
           # working-tree content (both files are git-tracked), so this
           # makes the macOS cli embed exactly the same trust root the
@@ -894,7 +894,7 @@ jobs:
           SERVER_ENCLAVE_FORMATTED=$(printf '%s' "$SERVER_ENCLAVE" | jq -S '.')
 
           # Post a REQUEST_CHANGES review with all three expected files.
-          # The oci job built the server, stamped its digest into
+          # The oci job built the gateway, stamped its digest into
           # tinfoil-config.yml, recomputed the enclave, then built the cli
           # against that — and apple did the same — so the three files
           # below form an internally-consistent set: committing them

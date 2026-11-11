@@ -438,7 +438,7 @@ pub struct ProxyChatRequest {
     /// `continue_final_message` and `add_generation_prompt`, as sent: the
     /// OpenAI-compatible convention (vLLM's, SGLang's) for asking the model to
     /// continue the final assistant message, which the Eidola server accepts.
-    /// Forwarded rather than judged here — the server and its engines hold
+    /// Forwarded rather than judged here — the gateway and its engines hold
     /// them to their rule, and an external backend to its own.
     pub continue_final_message: Option<Value>,
     pub add_generation_prompt: Option<Value>,

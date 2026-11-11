@@ -38,7 +38,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 
 # TLS verification. Trust roots are supplied by the caller via
 # `AttestingClientConfig::tls_roots` — the verifier intentionally does not
-# bundle `webpki-roots` or `rustls-native-certs` so each consumer (server in
+# bundle `webpki-roots` or `rustls-native-certs` so each consumer (gateway in
 # enclave, CLI on developer machine, etc.) can pick the source that fits its
 # environment without dragging the wrong dep into the others.
 rustls = { version = "0.23", default-features = false, features = ["std"] }

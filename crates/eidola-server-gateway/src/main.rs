@@ -1,6 +1,6 @@
-//! Eidola Server - A privacy-transparent AI proxy.
+//! Eidola gateway - A privacy-transparent AI proxy.
 //!
-//! This server accepts requests in OpenAI Chat Completions API format and
+//! The gateway accepts requests in OpenAI Chat Completions API format and
 //! routes them to Eidola's own inference engines, in confidential VMs it
 //! attests against the deployments pinned in its own build, enriching
 //! responses with inline privacy metadata and cryptographic verification.

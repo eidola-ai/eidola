@@ -1266,7 +1266,7 @@ pub async fn record_nullifier(
 ///
 /// What the database sees is what one request is: its rows commit together.
 /// That discloses the request's input count and key set to whoever watches
-/// the database, never an amount (`docs/specs/act-multi-spend.md` §9.6).
+/// the database, never an amount (`docs/anonymous-credits.md` → What Postgres may hold).
 #[tracing::instrument(skip_all, name = "db.record_nullifiers", err)]
 pub async fn record_nullifiers(
     pool: &Pool,

@@ -577,7 +577,7 @@ fn spending_credentials(core: &AppCore) -> Vec<(i64, i64)> {
 }
 
 /// **A credential that cannot cover the hold is drained, and the rest
-/// filled** (`docs/specs/act-multi-spend.md` §7.2). The wallet's first
+/// filled** (`docs/anonymous-credits.md` → Spending several tokens in one request). The wallet's first
 /// credential in spend order (smallest, under the one key) holds 1,000
 /// credits, below the hold `W`: it is presented first with its whole balance
 /// as its share, and the 1,000,000-credit credential second with `W − 1,000`.
