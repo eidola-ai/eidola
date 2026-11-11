@@ -6,8 +6,8 @@
 //! ([`AllowedMeasurement`]): AMD SEV-SNP evidence is checked only against
 //! SEV-SNP entries and Intel TDX evidence only against TDX entries, and
 //! evidence from a platform with no entry is refused before it is
-//! authenticated. A pin set built from release records
-//! ([`EnclaveMeasurement`]) is SEV-SNP-only.
+//! authenticated. A SEV-SNP entry ([`SevSnpPin`]) pins the launch digest,
+//! HOST_DATA and guest policy of an IGVM-model launch.
 //!
 //! All verification happens in the data-plane connector layer (see
 //! [`attesting_client`]). On every new TCP+TLS handshake the connector
@@ -82,8 +82,8 @@ pub mod tdx;
 pub use bundle::Platform;
 pub use error::Error;
 pub use measurement::{
-    AllowedMeasurement, EnclaveMeasurement, MatchedMeasurement, PckFlag, PlatformMeasurement,
-    TdxLaunchMeasurement, TdxMeasurement, TdxPin, TdxPolicy,
+    AllowedMeasurement, MatchedMeasurement, PckFlag, PlatformMeasurement, SevSnpLaunchMeasurement,
+    SevSnpPin, TdxLaunchMeasurement, TdxPin, TdxPolicy,
 };
 pub use sevsnp::{SevSnpObserver, SevSnpTcbObservation, SevSnpTcbPolicy, SevSnpTcbSvns};
 

@@ -103,17 +103,37 @@ async fn mount_release(server: &MockServer, tag: &str, manifest: &[u8], bundle: 
 /// (A real pre-linux-gui / schema-1 client checking a post-linux-gui /
 /// schema-2 release seeing `ClaimsChanged` is by design: a new artifact
 /// class or manifest shape is a threat-model change the user reviews once.)
+///
+/// The fixture's enclave block is likewise of the kernel-cmdline launch
+/// model, which this build does not pin: it reads that block's three
+/// members as unrecognized fields and expects the IGVM-model members in
+/// their place. The fixture-era set states that reading of the block, so
+/// the matrix rows stay about their own deltas
+/// (`a_kernel_cmdline_enclave_block_is_a_changed_threat_model` in
+/// `updates.rs` is the test of the enclave change itself).
 fn fixture_expected_claims() -> Vec<Claim> {
-    expected_claims()
+    let mut claims: Vec<Claim> = expected_claims()
         .into_iter()
         .filter(|c| !c.key.starts_with("artifacts.eidola-gui-linux"))
+        .filter(|c| !c.key.starts_with("enclave."))
         .map(|mut c| {
             if c.key == "manifest.schema_version" {
                 c.value = "1".into();
             }
             c
         })
-        .collect()
+        .collect();
+    for key in [
+        "enclave.cmdline",
+        "enclave.snp_measurement",
+        "enclave.tdx_measurement",
+    ] {
+        claims.push(Claim {
+            key: key.into(),
+            value: "unrecognized field".into(),
+        });
+    }
+    claims
 }
 
 fn ctx(server: &MockServer, installed: &str) -> CheckContext {

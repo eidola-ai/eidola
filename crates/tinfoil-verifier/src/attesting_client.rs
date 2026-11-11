@@ -66,7 +66,8 @@ use sha2::Digest as _;
 
 use crate::bundle::Platform;
 use crate::measurement::{
-    CompiledPin, CompiledPlatform, CompiledTdxPin, MatchedMeasurement, TdxLaunchMeasurement,
+    CompiledPin, CompiledPlatform, CompiledSevSnpPin, CompiledTdxPin, MatchedMeasurement,
+    SevSnpLaunchMeasurement, TdxLaunchMeasurement,
 };
 use crate::{Error, bundle, device, sevsnp, sevsnp_crl, tdx};
 
@@ -495,22 +496,11 @@ impl AttestationCheck {
         }
         policy_result?;
 
-        let measurement_hex = hex::encode(report.measurement);
-        let matching: Vec<&CompiledPin> = candidates
-            .iter()
-            .copied()
-            .filter(|pin| {
-                matches!(pin.platform, CompiledPlatform::SevSnp { measurement }
-                    if measurement == report.measurement)
-            })
-            .collect();
-        if matching.is_empty() {
-            return Err(Error::MeasurementMismatch {
-                observed: MatchedMeasurement::SevSnp(measurement_hex),
-                allowed_count: candidates.len(),
-            });
-        }
-        let matched = MatchedMeasurement::SevSnp(measurement_hex.clone());
+        let policy = sevsnp::raw_policy(&resolved.report_bytes)?;
+        let (observed, matching) =
+            appraise_snp_launch(candidates, &report.measurement, &report.host_data, policy)?;
+        let pcr_digest = format!("{}:{}", observed.measurement, observed.host_data);
+        let matched = MatchedMeasurement::SevSnp(observed);
 
         // Bind the hardware report to the nonce/TLS-key/HPKE-key the document
         // claimed. `verify_document_binding` already proved `tls_key_fp ==
@@ -518,7 +508,10 @@ impl AttestationCheck {
         // actually commits to those same values — and to the exact device
         // evidence section the next check reads.
         self.verify_report_data_binding(resolved, &report.report_data)?;
-        first_passing(matching, |pin| check_device_policy(resolved, pin))?;
+        first_passing(matching, |(pin, snp)| {
+            sevsnp::check_guest_policy(policy, snp.guest_policy)?;
+            check_device_policy(resolved, pin)
+        })?;
 
         tracing::info!(
             measurement = %matched,
@@ -535,7 +528,7 @@ impl AttestationCheck {
                 matched_measurement: matched,
                 attestation_hash: hex::encode(sha2::Sha256::digest(&resolved.report_bytes)),
                 attestation_doc: resolved.report_bytes.clone(),
-                pcr_digest: measurement_hex,
+                pcr_digest,
                 peer_spki_hash: hex::encode(peer_spki),
             });
         }
@@ -632,6 +625,54 @@ impl AttestationCheck {
         }
         Ok(())
     }
+}
+
+/// The SEV-SNP entries an authenticated report's launch matches.
+///
+/// Entries are selected by launch identity: the image's digest and the
+/// deployment's config hash (HOST_DATA). The digest alone names every
+/// deployment of the image, anyone's. Among those, the guest policy, which
+/// the host chose at launch and which is outside the digest, must satisfy at
+/// least one entry's (`sevsnp::check_guest_policy`); the entries are returned
+/// for the device check, which re-applies it per entry.
+#[allow(clippy::type_complexity)]
+fn appraise_snp_launch<'a>(
+    candidates: &[&'a CompiledPin],
+    measurement: &[u8; 48],
+    host_data: &[u8; 32],
+    policy: u64,
+) -> Result<
+    (
+        SevSnpLaunchMeasurement,
+        Vec<(&'a CompiledPin, &'a CompiledSevSnpPin)>,
+    ),
+    Error,
+> {
+    let observed = SevSnpLaunchMeasurement {
+        measurement: hex::encode(measurement),
+        host_data: hex::encode(host_data),
+    };
+    let matching: Vec<(&CompiledPin, &CompiledSevSnpPin)> = candidates
+        .iter()
+        .filter_map(|pin| match &pin.platform {
+            CompiledPlatform::SevSnp(snp)
+                if snp.measurement == *measurement && snp.host_data == *host_data =>
+            {
+                Some((*pin, snp))
+            }
+            _ => None,
+        })
+        .collect();
+    if matching.is_empty() {
+        return Err(Error::MeasurementMismatch {
+            observed: MatchedMeasurement::SevSnp(observed),
+            allowed_count: candidates.len(),
+        });
+    }
+    first_passing(matching.clone(), |(_, snp)| {
+        sevsnp::check_guest_policy(policy, snp.guest_policy)
+    })?;
+    Ok((observed, matching))
 }
 
 /// Apply a matched entry's device-evidence requirement. Only called after
@@ -850,7 +891,7 @@ mod tests {
     use crate::tdx::tests::{
         FIXTURE_MRTD, FIXTURE_NOW, FIXTURE_QUOTE, authenticated, fixture_responses,
     };
-    use crate::{AllowedMeasurement, EnclaveMeasurement, TdxMeasurement, TdxPin};
+    use crate::{AllowedMeasurement, TdxPin};
 
     const PEER_SPKI: [u8; 32] = [0x19; 32];
     const NONCE: [u8; 32] = [0x47; 32];
@@ -886,34 +927,18 @@ mod tests {
         }
     }
 
-    /// A release record whose recorded TDX registers are exactly the real
-    /// quote's RTMR1/RTMR2 — the strongest form of the old, replayable
-    /// TDX check.
-    fn snp_record_matching_fixture_rtmrs() -> EnclaveMeasurement {
-        let quote = tdx::authenticate(
-            FIXTURE_QUOTE,
-            &fixture_responses(),
-            tdx::INTEL_SGX_ROOT_CA_DER,
-            FIXTURE_NOW,
-        )
-        .unwrap();
-        EnclaveMeasurement {
-            snp_measurement: "ab".repeat(48),
-            tdx_measurement: TdxMeasurement {
-                rtmr1: hex::encode(quote.report.rt_mr1),
-                rtmr2: hex::encode(quote.report.rt_mr2),
-            },
-        }
+    /// The server pin a client builds from its release record: SEV-SNP only.
+    fn server_pin() -> AllowedMeasurement {
+        AllowedMeasurement::sev_snp(crate::measurement::tests::sev_snp_pin())
     }
 
     /// The platform-branch attack: a genuine TDX quote presented to a
-    /// client whose pins came from release records. The document chooses
-    /// the TDX branch; with no TDX entry there is no such branch, and the
-    /// quote is never even parsed.
+    /// client whose pins are SEV-SNP only, as the server pin is. The
+    /// document chooses the TDX branch; with no TDX entry there is no such
+    /// branch, and the quote is never even parsed.
     #[test]
     fn tdx_evidence_against_sev_snp_only_pins_is_refused_before_authentication() {
-        let record = snp_record_matching_fixture_rtmrs();
-        let check = check(&[AllowedMeasurement::from(&record)]);
+        let check = check(&[server_pin()]);
 
         for report in [FIXTURE_QUOTE.to_vec(), b"not a quote".to_vec()] {
             let mut doc = resolved(Platform::Tdx, report);
@@ -951,9 +976,7 @@ mod tests {
             "collateral": [],
         }))
         .unwrap();
-        let snp_only = check(&[AllowedMeasurement::from(
-            &snp_record_matching_fixture_rtmrs(),
-        )]);
+        let snp_only = check(&[server_pin()]);
         let err = snp_only.parse_document(&tdx_envelope).err().unwrap();
         assert!(
             matches!(
@@ -965,7 +988,7 @@ mod tests {
             "{err}"
         );
         let both = check(&[
-            AllowedMeasurement::from(&snp_record_matching_fixture_rtmrs()),
+            server_pin(),
             AllowedMeasurement::tdx(crate::measurement::tests::tdx_pin()),
         ]);
         let err = both.parse_document(&tdx_envelope).err().unwrap();
@@ -995,9 +1018,7 @@ mod tests {
 
     #[test]
     fn document_binding_runs_before_platform_dispatch() {
-        let check = check(&[AllowedMeasurement::from(
-            &snp_record_matching_fixture_rtmrs(),
-        )]);
+        let check = check(&[server_pin()]);
         let err = check
             .verify(&resolved(Platform::Tdx, vec![]), &PEER_SPKI, &[0; 32])
             .unwrap_err();
@@ -1006,6 +1027,77 @@ mod tests {
             .verify(&resolved(Platform::Tdx, vec![]), &[0; 32], &NONCE)
             .unwrap_err();
         assert!(matches!(err, Error::FingerprintMismatch { .. }), "{err}");
+    }
+
+    fn snp_candidates(pins: &[AllowedMeasurement]) -> Vec<CompiledPin> {
+        compile_pins(pins).unwrap()
+    }
+
+    /// The adversarial relaunches of a pinned SEV-SNP image: the image's
+    /// digest is fixed, so the host's levers are the config it passes
+    /// (HOST_DATA) and the guest policy. Each is refused; the honest launch
+    /// is accepted.
+    #[test]
+    fn sev_snp_launches_are_selected_by_digest_and_config_then_held_to_the_policy() {
+        let pin = crate::measurement::tests::sev_snp_pin();
+        let compiled = snp_candidates(&[AllowedMeasurement::sev_snp(pin.clone())]);
+        let candidates: Vec<&CompiledPin> = compiled.iter().collect();
+        let measurement = [0xab; 48];
+        let host_data: [u8; 32] = hex::decode(&pin.host_data).unwrap().try_into().unwrap();
+
+        let (observed, matching) =
+            appraise_snp_launch(&candidates, &measurement, &host_data, 0x30133).unwrap();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(observed.host_data, pin.host_data);
+
+        // The pinned image launched with another config: anyone's deployment
+        // of the same release, or ours with a changed secret hash or shape.
+        let other_config: [u8; 32] = hex::decode(crate::SevSnpPin::host_data_for_config(b"other"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        for host_data in [other_config, [0; 32]] {
+            let err =
+                appraise_snp_launch(&candidates, &measurement, &host_data, 0x30133).unwrap_err();
+            assert!(
+                matches!(&err, Error::MeasurementMismatch { observed: MatchedMeasurement::SevSnp(s), .. }
+                    if s.host_data == hex::encode(host_data)),
+                "{err}"
+            );
+        }
+        // Another image with our config.
+        let err = appraise_snp_launch(&candidates, &[0xcd; 48], &host_data, 0x30133).unwrap_err();
+        assert!(matches!(err, Error::MeasurementMismatch { .. }), "{err}");
+        // The pinned image and config with a weaker policy: DEBUG (the
+        // hypervisor may decrypt guest memory), a migration agent, CXL
+        // memory, or an older firmware ABI.
+        for policy in [0xb0133, 0x70133, 0x230133, 0x30100] {
+            let err =
+                appraise_snp_launch(&candidates, &measurement, &host_data, policy).unwrap_err();
+            assert!(matches!(err, Error::Report(_)), "{policy:#x}: {err}");
+        }
+        // A TDX entry never matches SEV-SNP evidence, whatever it pins.
+        let tdx = snp_candidates(&[AllowedMeasurement::tdx(crate::measurement::tests::tdx_pin())]);
+        let tdx: Vec<&CompiledPin> = tdx.iter().collect();
+        assert!(appraise_snp_launch(&tdx, &measurement, &host_data, 0x30133).is_err());
+    }
+
+    #[test]
+    fn sev_snp_entries_sharing_a_launch_identity_are_alternatives_by_policy() {
+        let strict = crate::measurement::tests::sev_snp_pin();
+        let mut newer = strict.clone();
+        newer.guest_policy = "0x30155".into();
+        let compiled = snp_candidates(&[
+            AllowedMeasurement::sev_snp(newer),
+            AllowedMeasurement::sev_snp(strict.clone()),
+        ]);
+        let candidates: Vec<&CompiledPin> = compiled.iter().collect();
+        let host_data: [u8; 32] = hex::decode(&strict.host_data).unwrap().try_into().unwrap();
+        appraise_snp_launch(&candidates, &[0xab; 48], &host_data, 0x30133)
+            .expect("the second entry's policy holds");
+        let err = appraise_snp_launch(&candidates, &[0xab; 48], &host_data, 0x30100).unwrap_err();
+        // The first entry's violation is the one reported.
+        assert!(err.to_string().contains("0x30155"), "{err}");
     }
 
     fn fixture_pin(mrtd: &str) -> AllowedMeasurement {

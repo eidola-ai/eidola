@@ -37,10 +37,12 @@ enum Command {
         /// Path to PEM-encoded SEV-SNP ASK (Intermediate CA) certificate
         #[arg(long)]
         hardware_intermediate_ca: Option<String>,
-        /// Add a trusted enclave release: `<snp>:<rtmr1>:<rtmr2>`
+        /// Add a trusted server launch identity:
+        /// `<measurement>:<host_data>:<guest_policy>` (the SEV-SNP launch
+        /// digest, the config hash it is launched with, the guest policy)
         #[arg(long)]
         trust_measurement: Option<String>,
-        /// Remove a trusted enclave release by SNP measurement
+        /// Remove a trusted server launch identity: `<measurement>:<host_data>`
         #[arg(long)]
         untrust_measurement: Option<String>,
         /// Drop every trusted-measurement override (revert to the pin)
@@ -764,9 +766,9 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                 }
             );
             for m in &trust.trusted_measurements {
-                println!("  - snp = {}", m.snp);
-                println!("    tdx.rtmr1 = {}", m.tdx_rtmr1);
-                println!("    tdx.rtmr2 = {}", m.tdx_rtmr2);
+                println!("  - sev_snp.measurement = {}", m.measurement);
+                println!("    sev_snp.host_data = {}", m.host_data);
+                println!("    sev_snp.guest_policy = {}", m.guest_policy);
             }
             println!(
                 "hardware_root_ca: {}",
@@ -869,18 +871,21 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
             if let Some(m) = trust_entry {
                 let added = core
                     .trust_measurement(
-                        m.snp_measurement.clone(),
-                        m.tdx_measurement.rtmr1.clone(),
-                        m.tdx_measurement.rtmr2.clone(),
+                        m.measurement.clone(),
+                        m.host_data.clone(),
+                        m.guest_policy.clone(),
                     )
                     .await?;
                 if added {
                     println!(
-                        "added trusted measurement: snp={}, tdx.rtmr1={}, tdx.rtmr2={}",
-                        m.snp_measurement, m.tdx_measurement.rtmr1, m.tdx_measurement.rtmr2,
+                        "added trusted measurement: measurement={}, host_data={}, guest_policy={}",
+                        m.measurement, m.host_data, m.guest_policy,
                     );
                 } else {
-                    println!("measurement already trusted (snp={})", m.snp_measurement);
+                    println!(
+                        "measurement already trusted (measurement={}, host_data={})",
+                        m.measurement, m.host_data
+                    );
                 }
             }
             if clear_trusted_measurements {
@@ -890,9 +895,9 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
             if let Some(key) = untrust_key {
                 let removed = core.untrust_measurement(key.clone()).await?;
                 if removed {
-                    println!("removed trusted measurement (snp={key})");
+                    println!("removed trusted measurement ({key})");
                 } else {
-                    println!("measurement not found (snp={key})");
+                    println!("measurement not found ({key})");
                 }
             }
             Ok(())

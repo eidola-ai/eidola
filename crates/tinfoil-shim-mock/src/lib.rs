@@ -122,6 +122,7 @@ const OFF_SIG_ALGO: usize = 0x034; // u32 LE (1 = ECDSA P-384 SHA-384)
 const OFF_CURRENT_TCB: usize = 0x038; // 8 bytes (legacy: [bl, tee, 0,0,0,0, snp, ucode])
 const OFF_REPORT_DATA: usize = 0x050; // 64 bytes
 const OFF_MEASUREMENT: usize = 0x090; // 48 bytes
+const OFF_HOST_DATA: usize = 0x0C0; // 32 bytes
 const OFF_REPORTED_TCB: usize = 0x180; // 8 bytes
 const OFF_CPUID_FAM: usize = 0x188; // 3 bytes: family, model, stepping (V3+)
 const OFF_CHIP_ID: usize = 0x1A0; // 64 bytes
@@ -129,6 +130,10 @@ const OFF_COMMITTED_TCB: usize = 0x1E0; // 8 bytes
 const OFF_LAUNCH_TCB: usize = 0x1F0; // 8 bytes
 const OFF_SIGNATURE: usize = 0x2A0; // 512 bytes (72 R + 72 S + 368 reserved)
 const REPORT_SIZE: usize = 0x4A0; // 1184 bytes
+
+/// The guest policy every mock report carries: the one the platform's IGVM
+/// images ask for, which a verifier's SEV-SNP pin names.
+pub const MOCK_GUEST_POLICY: u64 = 0x30133;
 
 /// The TCB `(bl, tee, snp, ucode)` every TCB field of a mock report claims,
 /// and the one the mock VCEK is endorsed for. Must pass the verifier's
@@ -182,6 +187,7 @@ struct NonceQuery {
 /// ephemeral per-boot key material; the only per-request input is the nonce.
 struct FreshBuilder {
     measurement: Vec<u8>,
+    host_data: [u8; 32],
     /// SHA-256 of the TLS leaf SPKI — the document's `tls_key_fp`.
     tls_key_fp: [u8; 32],
     /// Mock HPKE key (random per boot); real shims publish a meaningful one.
@@ -248,7 +254,7 @@ impl FreshBuilder {
         h.update(device_evidence_hash);
         let report_data_prefix: [u8; 32] = h.finalize().into();
 
-        let mut report = build_report(&self.measurement, &report_data_prefix);
+        let mut report = build_report(&self.measurement, &self.host_data, &report_data_prefix);
         sign_report(&mut report, &self.vcek_signing_key);
 
         let b64 = &base64::engine::general_purpose::STANDARD;
@@ -661,16 +667,23 @@ fn write_tcb(report: &mut [u8], offset: usize, (bl, tee, snp, ucode): (u8, u8, u
 /// `report_data_prefix` is written into the first 32 bytes of `REPORT_DATA`
 /// (the remaining 32 stay zero). For the fresh nonce-bound flow this is
 /// the domain-separated v1 envelope digest.
-fn build_report(measurement: &[u8], report_data_prefix: &[u8; 32]) -> [u8; REPORT_SIZE] {
+fn build_report(
+    measurement: &[u8],
+    host_data: &[u8; 32],
+    report_data_prefix: &[u8; 32],
+) -> [u8; REPORT_SIZE] {
     let mut report = [0u8; REPORT_SIZE];
+
+    // HOST_DATA: what a real host passes at launch (the config's SHA-256).
+    report[OFF_HOST_DATA..OFF_HOST_DATA + 32].copy_from_slice(host_data);
 
     // Version = 3 (V3 report, adds the CPUID family/model/stepping fields)
     report[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&3u32.to_le_bytes());
 
-    // Guest policy: SMT allowed + the reserved must-be-one bit — the value
-    // Tinfoil's production fleet presents. DEBUG and MIGRATE_MA stay 0,
-    // which the verifier's hygiene checks require.
-    report[OFF_POLICY..OFF_POLICY + 8].copy_from_slice(&0x30000u64.to_le_bytes());
+    // Guest policy: the platform's IGVM images' (`0x30133`: firmware ABI
+    // 1.51, SMT allowed, the reserved must-be-one bit; DEBUG and MIGRATE_MA
+    // clear).
+    report[OFF_POLICY..OFF_POLICY + 8].copy_from_slice(&MOCK_GUEST_POLICY.to_le_bytes());
 
     // sig_algo = 1 (ECDSA P-384 SHA-384)
     report[OFF_SIG_ALGO..OFF_SIG_ALGO + 4].copy_from_slice(&1u32.to_le_bytes());
@@ -1084,6 +1097,8 @@ pub struct ShimConfig {
     pub listen_addr: SocketAddr,
     /// The launch measurement the mock SEV-SNP report carries (48 bytes).
     pub measurement: Vec<u8>,
+    /// The HOST_DATA the mock SEV-SNP report carries.
+    pub host_data: [u8; 32],
     /// Where the persistent ARK, ASK and TLS-CA live (created if missing).
     pub cert_dir: PathBuf,
     /// NVIDIA GPU evidence items each attestation carries, every one bound to
@@ -1143,6 +1158,7 @@ pub async fn start(config: ShimConfig) -> Result<RunningShim, BoxError> {
         upstream_url,
         listen_addr,
         measurement,
+        host_data,
         cert_dir,
         gpus,
     } = config;
@@ -1250,6 +1266,7 @@ pub async fn start(config: ShimConfig) -> Result<RunningShim, BoxError> {
 
     let fresh = Arc::new(FreshBuilder {
         measurement,
+        host_data,
         tls_key_fp: tls_fingerprint,
         hpke_key,
         vcek_signing_key,

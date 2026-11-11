@@ -152,11 +152,14 @@ require_nonempty_setting() {
 CERT_DIR="$(setting EIDOLA_DEV_CERT_DIR .dev-certs)"
 BASE_URL="$(setting EIDOLA_DEV_BASE_URL https://localhost:8443)"
 
-# 48 zero bytes as hex — what tinfoil-shim-mock advertises unless DEV_MEASUREMENT
-# is set on the shim. All three fields (SNP, TDX rtmr1, TDX rtmr2) carry it.
+# 48 zero bytes as hex — the launch digest tinfoil-shim-mock advertises unless
+# DEV_MEASUREMENT is set on the shim. Its reports carry a zero HOST_DATA (no
+# DEV_HOST_DATA is passed to it here) and the platform images' guest policy,
+# so the trusted launch identity is `<measurement>:<zeros>:0x30133`.
 ZERO_MEASUREMENT="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
 MEASUREMENT="$(setting DEV_MEASUREMENT "$ZERO_MEASUREMENT")"
-MEASUREMENT_TRIPLE="$MEASUREMENT:$MEASUREMENT:$MEASUREMENT"
+ZERO_HOST_DATA="0000000000000000000000000000000000000000000000000000000000000000"
+MEASUREMENT_SPEC="$MEASUREMENT:$ZERO_HOST_DATA:0x30133"
 
 TLS_CA="$CERT_DIR/tls-ca.pem"
 ARK="$CERT_DIR/ark.pem"
@@ -526,7 +529,7 @@ cmd_enable() {
         --base-url "$BASE_URL" \
         --hardware-root-ca "$ARK" \
         --hardware-intermediate-ca "$ASK" \
-        --trust-measurement "$MEASUREMENT_TRIPLE"
+        --trust-measurement "$MEASUREMENT_SPEC"
     echo ""
     warn_if_shim_down
     cmd_status

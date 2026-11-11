@@ -2,15 +2,18 @@
 #
 # Two responsibilities, one workflow:
 #
-# 1. **Tinfoil deployment manifest** (driven by the Tinfoil action).
-#    Tinfoil's closed-source deployment system requires this workflow's
-#    file to be named `tinfoil-build.yml` — do not rename. The action
-#    recomputes enclave measurements from `tinfoil-config.yml` using
-#    Python/sevsnpmeasure (independent of our Rust `measure-enclave`),
-#    attests the resulting deployment manifest to Sigstore via
-#    `actions/attest` (producing a Rekor transparency log entry), and
-#    creates the GitHub release with the manifest + its SHA-256 hash.
-#    Tinfoil's verifier (`tinfoil-go`) consumes that release.
+# 1. **The server enclave, cross-checked and released.** The server runs on
+#    the platform provider's IGVM launch model: `tinfoil-config.yml` pins a
+#    cvmimage release manifest inline, that manifest names one SEV-SNP IGVM
+#    image, and the server's identity is that image's launch digest plus
+#    HOST_DATA, the config's SHA-256. Before anything is released, the
+#    enclave block of `artifact-manifest.json` (computed by our Rust
+#    `measure-enclave`) is checked against the provider's own measurer,
+#    `cvmc measure`, run over the same provenance-verified image, and
+#    against the provider's statements of the digest and guest policy. The
+#    GitHub release is created with the config and the release manifest it
+#    names. Tinfoil's closed-source deployment system requires this
+#    workflow's file to be named `tinfoil-build.yml` — do not rename.
 #
 # 2. **Eidola release signing** (the cosign / upload steps below).
 #    `cosign sign-blob` signs `artifact-manifest.json` keyless via the
@@ -37,13 +40,12 @@ permissions: {}
 
 jobs:
   release:
-    name: Attest and release
+    name: Cross-check the enclave and release
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write # create the GitHub release for the tag
-      id-token: write # mint the OIDC token used for Sigstore attestation
-      attestations: write # publish the Sigstore attestation via actions/attest
+      id-token: write # mint the OIDC token cosign signs with
 
     steps:
       - name: Checkout code
@@ -51,64 +53,112 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build and release
-        uses: tinfoilsh/measure-image-action@768ada355b32b301839c983409304dc53bcc03ff # v0.13.1
-        with:
-          config-file: ${{ github.workspace }}/tinfoil-config.yml
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Verify measurements match artifact-manifest.json
+      - name: Cross-check the enclave against the platform's own measurer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Cross-check: the action recomputed measurements from tinfoil-config.yml
-          # using Python/sevsnpmeasure. Our artifact-manifest.json was computed by
-          # measure-enclave (Rust/sev crate) and verified by CI. They must agree.
-          EXPECTED_SNP=$(jq -r '.enclave.snp_measurement' artifact-manifest.json)
-          ACTUAL_SNP=$(jq -r '.snp_measurement' output/tinfoil-deployment.json)
-
-          EXPECTED_CMDLINE=$(jq -r '.enclave.cmdline' artifact-manifest.json)
-          ACTUAL_CMDLINE=$(jq -r '.cmdline' output/tinfoil-deployment.json)
-
-          EXPECTED_RTMR1=$(jq -r '.enclave.tdx_measurement.rtmr1' artifact-manifest.json)
-          ACTUAL_RTMR1=$(jq -r '.tdx_measurement.rtmr1' output/tinfoil-deployment.json)
-
-          EXPECTED_RTMR2=$(jq -r '.enclave.tdx_measurement.rtmr2' artifact-manifest.json)
-          ACTUAL_RTMR2=$(jq -r '.tdx_measurement.rtmr2' output/tinfoil-deployment.json)
-
-          FAIL=0
-          # A missing path renders as the literal string "null" on BOTH
-          # sides, so absent-vs-absent would compare equal and an assertion
-          # would silently assert nothing. Every expected value must
-          # actually exist — if a field is deliberately retired (e.g. the
-          # TDX block), delete its comparison here in the same change.
-          for v in "$EXPECTED_SNP" "$EXPECTED_CMDLINE" "$EXPECTED_RTMR1" "$EXPECTED_RTMR2"; do
-            if [ -z "$v" ] || [ "$v" = "null" ]; then
-              echo "::error::artifact-manifest.json is missing a measurement this cross-check compares"
-              FAIL=1
-            fi
-          done
-          if [ "$EXPECTED_SNP" != "$ACTUAL_SNP" ]; then
-            echo "::error::SNP measurement mismatch: expected $EXPECTED_SNP, got $ACTUAL_SNP"
-            FAIL=1
-          fi
-          if [ "$EXPECTED_CMDLINE" != "$ACTUAL_CMDLINE" ]; then
-            echo "::error::Cmdline mismatch: expected $EXPECTED_CMDLINE, got $ACTUAL_CMDLINE"
-            FAIL=1
-          fi
-          if [ "$EXPECTED_RTMR1" != "$ACTUAL_RTMR1" ]; then
-            echo "::error::TDX RTMR1 mismatch: expected $EXPECTED_RTMR1, got $ACTUAL_RTMR1"
-            FAIL=1
-          fi
-          if [ "$EXPECTED_RTMR2" != "$ACTUAL_RTMR2" ]; then
-            echo "::error::TDX RTMR2 mismatch: expected $EXPECTED_RTMR2, got $ACTUAL_RTMR2"
-            FAIL=1
-          fi
-
-          if [ "$FAIL" -eq 1 ]; then
-            echo "::error::Measurement cross-check failed. Our measure-enclave and Tinfoil's action disagree."
+          set -euo pipefail
+          # The release this config launches, and the manifest it pins.
+          raw="$(sed -n 's/^cvm-version:[[:space:]]*//p' tinfoil-config.yml)"
+          version="${raw%%@sha256:*}"
+          pin="${raw#*@sha256:}"
+          if [[ "$raw" != *@sha256:* || ! "$pin" =~ ^[0-9a-f]{64}$ || ! "$version" =~ ^[0-9][0-9A-Za-z.-]*$ ]]; then
+            echo "::error::tinfoil-config.yml must pin a CPU-image release manifest inline: $raw"
             exit 1
           fi
+          cvm_dir="$RUNNER_TEMP/cvm"
+          mkdir -p "$cvm_dir"
+          base="https://github.com/tinfoilsh/cvmimage/releases/download/v${version}"
+          manifest="$cvm_dir/tinfoil-inference-v${version}-manifest.json"
+          checksums="$cvm_dir/tinfoil-inference-v${version}-checksums.sha256"
+          igvm="$cvm_dir/tinfoil-snp-v${version}.igvm"
+          igvm_manifest="$cvm_dir/tinfoil-snp-v${version}.igvm.manifest.json"
+          cvmc="$cvm_dir/cvmc-v${version}"
+          curl -fsSL --retry 3 -o "$manifest" "$base/$(basename "$manifest")"
+          curl -fsSL --retry 3 -o "$checksums" "$base/$(basename "$checksums")"
+          for file in "$igvm" "$igvm_manifest" "$cvmc"; do
+            curl -fsSL --retry 3 -o "$file" "https://images.tinfoil.sh/cvm/$(basename "$file")"
+          done
 
-          echo "All measurements match between artifact-manifest.json and tinfoil-deployment.json"
+          # Every file is the provider's: hash-pinned where a pin exists,
+          # and built by its release workflow at this release's tag.
+          [ "$(sha256sum "$manifest" | cut -d' ' -f1)" = "$pin" ] || {
+            echo "::error::the release manifest does not hash to the config's pin"; exit 1; }
+          [ "$(sha256sum "$igvm" | cut -d' ' -f1)" = "$(jq -er '.igvm.snp' "$manifest")" ] || {
+            echo "::error::the SEV-SNP image is not the one the release manifest records"; exit 1; }
+          for file in "$igvm_manifest" "$cvmc"; do
+            expected="$(awk -v name="./$(basename "$file")" '$2 == name { print $1 }' "$checksums")"
+            [ -n "$expected" ] && [ "$(sha256sum "$file" | cut -d' ' -f1)" = "$expected" ] || {
+              echo "::error::$(basename "$file") is not the file the release's checksums record"; exit 1; }
+          done
+          for file in "$manifest" "$checksums" "$igvm" "$cvmc"; do
+            gh attestation verify "$file" -R tinfoilsh/cvmimage \
+              --signer-workflow tinfoilsh/cvmimage/.github/workflows/release.yml \
+              --source-ref "refs/tags/v${version}" \
+              --deny-self-hosted-runners
+          done
+
+          # The provider's measurer over the same image: its compiler's
+          # own digest code, independent of measure-enclave's.
+          chmod +x "$cvmc"
+          measured="$("$cvmc" measure "$igvm" | sed -n 's/^expected_snp_measurement: //p')"
+
+          fail=0
+          check() {
+            local what="$1" expected="$2" actual="$3"
+            # An absent field reads as "null" on both sides; every expected
+            # value must exist, or the comparison asserts nothing.
+            if [ -z "$expected" ] || [ "$expected" = "null" ] || [ "$expected" != "$actual" ]; then
+              echo "::error::$what: artifact-manifest.json records '$expected', the platform says '$actual'"
+              fail=1
+            fi
+          }
+          enclave() { jq -r ".enclave.$1" artifact-manifest.json; }
+          check "launch digest (cvmc measure)" "$(enclave sev_snp.measurement)" "$measured"
+          check "launch digest (release manifest)" "$(enclave sev_snp.measurement)" \
+            "$(jq -r '.igvm.snp_launch.measurement' "$manifest")"
+          check "guest policy (image manifest)" "$(enclave sev_snp.guest_policy)" \
+            "$(jq -r '.launch.policy' "$igvm_manifest")"
+          check "HOST_DATA (config SHA-256)" "$(enclave sev_snp.host_data)" \
+            "$(sha256sum tinfoil-config.yml | cut -d' ' -f1)"
+          check "IGVM image" "$(enclave igvm_sha256)" "$(sha256sum "$igvm" | cut -d' ' -f1)"
+          check "release" "$(enclave cvm_version)" "$raw"
+          # The image is launched without an ID block, which the client
+          # refuses: the provider must state none.
+          check "ID key digest (image manifest)" "$(printf '0%.0s' $(seq 96))" \
+            "$(jq -r '.launch.id_key_digest' "$igvm_manifest")"
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::The server enclave in artifact-manifest.json does not match the platform's measurement of the image tinfoil-config.yml launches."
+            exit 1
+          fi
+          cp "$manifest" "$RUNNER_TEMP/"
+          echo "The server enclave matches the platform's own measurement: $measured"
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists; refusing to re-publish."
+            exit 1
+          fi
+          sha256sum tinfoil-config.yml > "$RUNNER_TEMP/tinfoil-config.sha256"
+          printf 'Server enclave: SEV-SNP launch digest `%s`, HOST_DATA `%s` (the SHA-256 of `tinfoil-config.yml`), guest policy `%s`, on cvmimage `%s`.\n' \
+            "$(jq -r '.enclave.sev_snp.measurement' artifact-manifest.json)" \
+            "$(jq -r '.enclave.sev_snp.host_data' artifact-manifest.json)" \
+            "$(jq -r '.enclave.sev_snp.guest_policy' artifact-manifest.json)" \
+            "$(jq -r '.enclave.cvm_version' artifact-manifest.json)" > "$RUNNER_TEMP/release-notes.md"
+          gh release create "$TAG" \
+            --verify-tag \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --latest=false \
+            tinfoil-config.yml \
+            "$RUNNER_TEMP/tinfoil-config.sha256" \
+            "$RUNNER_TEMP"/tinfoil-inference-v*-manifest.json
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2

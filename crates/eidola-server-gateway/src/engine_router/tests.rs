@@ -58,7 +58,11 @@ fn pinned(id: &'static str, sha256: &'static str) -> PinnedModel {
 }
 
 fn pin(measurement: [u8; 48], gpus: Option<u32>) -> AllowedMeasurement {
-    let mut pin = AllowedMeasurement::sev_snp(hex::encode(measurement));
+    let mut pin = AllowedMeasurement::sev_snp(tinfoil_verifier::SevSnpPin {
+        measurement: hex::encode(measurement),
+        host_data: hex::encode([0u8; 32]),
+        guest_policy: format!("{:#x}", tinfoil_shim_mock::MOCK_GUEST_POLICY),
+    });
     pin.expected_gpus = gpus;
     pin
 }
@@ -237,6 +241,7 @@ async fn engine(identity: Identity) -> Engine {
         upstream_url: format!("http://{addr}"),
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         measurement: identity.measurement.to_vec(),
+        host_data: [0; 32],
         cert_dir,
         gpus: identity.gpus,
     })

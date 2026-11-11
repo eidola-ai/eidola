@@ -22,8 +22,8 @@
 //!
 //! Each input file is rerun-watched; the generator validates that everything
 //! parses as JSON before emitting. The server URL is derived as
-//! `template.replace("{hash}", sha256(snp_bytes || rtmr1_bytes || rtmr2_bytes)
-//! [..hash_length_hex_chars])`.
+//! `template.replace("{hash}", sha256(snp_measurement_bytes ||
+//! host_data_bytes)[..hash_length_hex_chars])`.
 
 use std::env;
 use std::fs;
@@ -77,18 +77,45 @@ fn main() {
     });
 
     let enclave_schema_version = get_u32(&server_enclave, "schema_version");
-    if enclave_schema_version != 1 {
+    if enclave_schema_version != 2 {
         panic!(
-            "server-enclave.json schema_version `{enclave_schema_version}` is not supported by this build.rs (expected `1`)"
+            "server-enclave.json schema_version `{enclave_schema_version}` is not supported by this build.rs (expected `2`)"
         );
     }
-
-    let snp = get_hex_str(&server_enclave, "snp_measurement", 96);
-    let tdx = server_enclave
-        .get("tdx_measurement")
-        .expect("server-enclave.json missing `tdx_measurement`");
-    let rtmr1 = get_hex_str(tdx, "rtmr1", 96);
-    let rtmr2 = get_hex_str(tdx, "rtmr2", 96);
+    exact_keys(
+        &server_enclave,
+        &["cvm_version", "igvm_sha256", "schema_version", "sev_snp"],
+        "server-enclave.json",
+    );
+    let cvm_version = get_str(&server_enclave, "cvm_version");
+    if cvm_version
+        .split_once("@sha256:")
+        .is_none_or(|(version, pin)| {
+            version.is_empty() || version.contains('+') || !is_lower_hex(pin, 64)
+        })
+    {
+        panic!(
+            "server-enclave.json `cvm_version` must be a CPU image release with its manifest \
+             pinned (VERSION@sha256:<64 lowercase hex>), got {cvm_version:?}"
+        );
+    }
+    let igvm_sha256 = get_hex_str(&server_enclave, "igvm_sha256", 64);
+    let sev_snp = server_enclave
+        .get("sev_snp")
+        .expect("server-enclave.json missing `sev_snp`");
+    exact_keys(
+        sev_snp,
+        &["guest_policy", "host_data", "measurement"],
+        "server-enclave.json sev_snp",
+    );
+    let snp = get_hex_str(sev_snp, "measurement", 96);
+    let host_data = get_hex_str(sev_snp, "host_data", 64);
+    // Its spelling and safety bits are checked by the verifier's pin
+    // compiler when the client builds its pins; here, only that it is one.
+    let guest_policy = get_str(sev_snp, "guest_policy");
+    if !guest_policy.starts_with("0x") {
+        panic!("server-enclave.json sev_snp.guest_policy must be 0x-prefixed hex");
+    }
 
     let url_template = get_str(&trust_constants, "server_url_template");
     let url_hash_length = trust_constants
@@ -99,7 +126,7 @@ fn main() {
     if !url_template.contains("{hash}") {
         panic!("server_url_template must contain `{{hash}}` placeholder");
     }
-    let server_url_hash = derive_url_hash(&snp, &rtmr1, &rtmr2, url_hash_length);
+    let server_url_hash = derive_url_hash(&snp, &host_data, url_hash_length);
     let server_url = url_template.replace("{hash}", &server_url_hash);
 
     let expected_ci_identity_pattern = get_str(&trust_constants, "expected_ci_identity_pattern");
@@ -127,9 +154,11 @@ fn main() {
 
     push_str_const(&mut out, "SERVER_URL", &server_url);
     push_str_const(&mut out, "SERVER_URL_HASH", &server_url_hash);
+    push_str_const(&mut out, "SERVER_CVM_VERSION", cvm_version);
+    push_str_const(&mut out, "SERVER_IGVM_SHA256", &igvm_sha256);
     push_str_const(&mut out, "SERVER_SNP_MEASUREMENT", &snp);
-    push_str_const(&mut out, "SERVER_TDX_RTMR1", &rtmr1);
-    push_str_const(&mut out, "SERVER_TDX_RTMR2", &rtmr2);
+    push_str_const(&mut out, "SERVER_SNP_HOST_DATA", &host_data);
+    push_str_const(&mut out, "SERVER_SNP_GUEST_POLICY", guest_policy);
     push_str_const(
         &mut out,
         "EXPECTED_CI_IDENTITY_PATTERN",
@@ -231,11 +260,30 @@ fn get_hex_str(value: &serde_json::Value, key: &str, expected_len: usize) -> Str
     s
 }
 
-fn derive_url_hash(snp: &str, rtmr1: &str, rtmr2: &str, hash_len: usize) -> String {
+fn is_lower_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Refuse a member this build does not read: an unread field of the trust
+/// root is a claim nobody enforces.
+fn exact_keys(value: &serde_json::Value, keys: &[&str], at: &str) {
+    let object = value
+        .as_object()
+        .unwrap_or_else(|| panic!("{at} must be an object"));
+    let mut found: Vec<&str> = object.keys().map(String::as_str).collect();
+    found.sort_unstable();
+    if found != keys {
+        panic!("{at} must have exactly the members {keys:?}, found {found:?}");
+    }
+}
+
+/// The URL hash: the launch digest says which image, HOST_DATA which
+/// deployment of it (the digest alone is the same for every deployment of a
+/// release).
+fn derive_url_hash(snp: &str, host_data: &str, hash_len: usize) -> String {
     let mut hasher = Sha256::new();
     hasher.update(decode_hex(snp));
-    hasher.update(decode_hex(rtmr1));
-    hasher.update(decode_hex(rtmr2));
+    hasher.update(decode_hex(host_data));
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(digest.len() * 2);
     for b in digest {

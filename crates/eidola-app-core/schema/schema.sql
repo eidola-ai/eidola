@@ -164,8 +164,8 @@ CREATE TABLE credential (
 -- (0). The 'local' backend always auto-starts (it's ours).
 --
 -- trusted_measurements: for the 'eidola' backend only, a JSON
--- array of enclave-measurement overrides ({snp_measurement,
--- tdx_measurement:{rtmr1,rtmr2}}). NULL/absent = the single build
+-- array of SEV-SNP launch-identity overrides ({measurement,
+-- host_data, guest_policy}). NULL/absent = the single build
 -- measurement pinned in the trust root.
 --
 -- hardware_root_ca / hardware_intermediate_ca: for the 'eidola'

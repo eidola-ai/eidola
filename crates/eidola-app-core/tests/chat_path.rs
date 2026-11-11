@@ -10890,6 +10890,19 @@ fn active_credentials(core: &AppCore) -> Vec<(i64, i64)> {
         .collect()
 }
 
+/// A mock whose current issuer key is halfway through its issuing window, so
+/// a provisioner pass is never inside [`PROVISION_LATE_WINDOW`] whatever the
+/// wall clock reads. The production calendar's epochs turn over at a fixed
+/// weekday, and a pass in the hours before that defers.
+fn mid_epoch() -> MockConfig {
+    let (_, calendar) =
+        KeyWindow::epoch_ending_at(now_unix_secs() + WEEK_SECS / 2, WEEK_SECS as u64);
+    MockConfig {
+        issuer_calendar: Some(calendar),
+        ..MockConfig::default()
+    }
+}
+
 fn provision(core: &AppCore) -> ProvisionOutcome {
     core.runtime()
         .block_on(core.test_provision_once())
@@ -10903,7 +10916,7 @@ fn provision(core: &AppCore) -> ProvisionOutcome {
 #[test]
 fn the_provisioner_tops_up_a_wallet_running_low() {
     run(|| {
-        let (mock, core, _dir) = setup(MockConfig::default());
+        let (mock, core, _dir) = setup(mid_epoch());
         spend_from_a_small_credential(&core, 100_000);
         assert_eq!(mock.issuance_debits(), 1);
 
@@ -11013,7 +11026,7 @@ fn a_pair_interrupted_by_a_lost_response_is_finished_later() {
 #[test]
 fn a_background_credential_is_not_spent_by_the_next_request() {
     run(|| {
-        let (mock, core, _dir) = setup(MockConfig::default());
+        let (mock, core, _dir) = setup(mid_epoch());
         spend_from_a_small_credential(&core, 100_000);
         assert!(matches!(provision(&core), ProvisionOutcome::Issued { .. }));
 
@@ -11035,7 +11048,7 @@ fn a_background_credential_is_not_spent_by_the_next_request() {
 #[test]
 fn the_provisioner_keeps_no_buffer_for_a_wallet_that_has_not_spent() {
     run(|| {
-        let (mock, core, _dir) = setup(MockConfig::default());
+        let (mock, core, _dir) = setup(mid_epoch());
         with_account(&core);
         assert_eq!(provision(&core), ProvisionOutcome::Idle);
         assert_eq!(mock.issuance_requests(), 0);
@@ -11047,7 +11060,7 @@ fn the_provisioner_keeps_no_buffer_for_a_wallet_that_has_not_spent() {
 #[test]
 fn the_provisioner_does_nothing_without_an_account() {
     run(|| {
-        let (mock, core, _dir) = setup(MockConfig::default());
+        let (mock, core, _dir) = setup(mid_epoch());
         assert_eq!(provision(&core), ProvisionOutcome::NoAccount);
         assert_eq!(mock.issuance_requests(), 0);
     });
@@ -11061,7 +11074,7 @@ fn the_provisioner_never_issues_from_a_balance_below_a_standard_allocation() {
     run(|| {
         let (mock, core, _dir) = setup(MockConfig {
             balance: DEFAULT_ALLOCATION_CREDITS - 1,
-            ..MockConfig::default()
+            ..mid_epoch()
         });
         spend_from_a_small_credential(&core, 100_000);
         assert_eq!(provision(&core), ProvisionOutcome::LowBalance);
@@ -11123,7 +11136,7 @@ fn the_provisioner_prefers_a_keys_early_life() {
 #[test]
 fn the_provisioner_issues_only_after_its_interval() {
     run(|| {
-        let (mock, core, _dir) = setup(MockConfig::default());
+        let (mock, core, _dir) = setup(mid_epoch());
         spend_from_a_small_credential(&core, 100_000);
         let min = std::time::Duration::from_millis(600);
         core.test_set_provision_interval(min, std::time::Duration::from_millis(900));
@@ -11154,7 +11167,7 @@ fn the_provisioner_issues_only_after_its_interval() {
 #[test]
 fn the_just_in_time_path_remains_the_fallback() {
     run(|| {
-        let (mock, core, _dir) = setup(MockConfig::default());
+        let (mock, core, _dir) = setup(mid_epoch());
         with_account(&core);
         core.start_credential_provisioner();
         core.runtime()
@@ -11236,7 +11249,7 @@ fn a_lost_issuance_response_is_recovered_without_a_second_debit() {
 #[test]
 fn the_provisioner_recovers_a_lost_issuance_instead_of_issuing_again() {
     run(|| {
-        let (mock, core, _dir) = setup(MockConfig::default());
+        let (mock, core, _dir) = setup(mid_epoch());
         spend_from_a_small_credential(&core, 100_000);
         mock.issuance_knobs().lose_next(1);
         core.runtime()
@@ -11256,7 +11269,7 @@ fn the_provisioner_recovers_a_lost_issuance_instead_of_issuing_again() {
 #[test]
 fn a_refused_issuance_is_not_asked_for_again() {
     run(|| {
-        let (mock, core, _dir) = setup(MockConfig::default());
+        let (mock, core, _dir) = setup(mid_epoch());
         let knobs = mock.issuance_knobs();
         with_account(&core);
         knobs.refuse_with(Some(402));
@@ -11280,7 +11293,7 @@ fn a_refused_issuance_is_not_asked_for_again() {
 #[test]
 fn a_pending_issuance_is_never_retried_for_another_account() {
     run(|| {
-        let (mock, core, _dir) = setup(MockConfig::default());
+        let (mock, core, _dir) = setup(mid_epoch());
         with_account(&core);
         mock.issuance_knobs().lose_next(1);
         core.runtime()
@@ -11313,7 +11326,7 @@ fn a_pending_issuance_is_never_retried_for_another_account() {
 #[test]
 fn what_is_held_stays_within_the_threshold_plus_two_allocations() {
     run(|| {
-        let (mock, core, _dir) = setup(MockConfig::default());
+        let (mock, core, _dir) = setup(mid_epoch());
         spend_from_a_small_credential(&core, 100_000);
         let bound = eidola_app_core::PROVISION_THRESHOLD_CREDITS
             + eidola_app_core::PROVISION_CREDENTIALS_PER_KEY * DEFAULT_ALLOCATION_CREDITS;
@@ -11352,7 +11365,7 @@ fn what_is_held_stays_within_the_threshold_plus_two_allocations() {
 #[test]
 fn an_unresolved_issuance_holds_off_a_fresh_one() {
     run(|| {
-        let (mock, core, _dir) = setup(MockConfig::default());
+        let (mock, core, _dir) = setup(mid_epoch());
         spend_from_a_small_credential(&core, 50_000);
         mock.issuance_knobs().lose_next(1);
         core.runtime()
@@ -11373,7 +11386,7 @@ fn an_unresolved_issuance_holds_off_a_fresh_one() {
 #[test]
 fn the_provisioner_leaves_a_disabled_backend_alone() {
     run(|| {
-        let (mock, core, _dir) = setup(MockConfig::default());
+        let (mock, core, _dir) = setup(mid_epoch());
         spend_from_a_small_credential(&core, 100_000);
         mock.issuance_knobs().lose_next(1);
         core.runtime()
@@ -11396,7 +11409,7 @@ fn the_provisioner_leaves_a_disabled_backend_alone() {
 #[test]
 fn a_stalled_issuance_gives_up_at_its_deadline() {
     run(|| {
-        let (mock, core, _dir) = setup(MockConfig::default());
+        let (mock, core, _dir) = setup(mid_epoch());
         spend_from_a_small_credential(&core, 100_000);
         core.test_set_issuance_timeouts(
             std::time::Duration::from_millis(400),
@@ -11431,7 +11444,7 @@ fn a_stalled_issuance_gives_up_at_its_deadline() {
 #[test]
 fn a_turn_waiting_on_a_stalled_issuance_times_out() {
     run(|| {
-        let (mock, core, _dir) = setup(MockConfig::default());
+        let (mock, core, _dir) = setup(mid_epoch());
         with_account(&core);
         core.test_set_issuance_timeouts(
             std::time::Duration::from_secs(10),

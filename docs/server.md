@@ -57,7 +57,7 @@ The server runs inside a **Tinfoil Container** on confidential-compute hardware 
 
 - **TLS termination is inside the enclave.** The Tinfoil shim's self-contained v3 attestation endorses the TLS certificate's SPKI and an HPKE public key; its fresh hardware report binds those exact endorsed bytes and the client's nonce. The certificate is issued by a public CA via ACME, so any client can validate the chain; the *binding to the enclave* is what the Eidola verifier checks beyond the basic WebPKI chain.
 - **Secrets are sealed into the enclave.** Both `CREDENTIAL_MASTER_KEY` and `DATABASE_PASSWORD` are Tinfoil secrets, decrypted only inside the verified enclave. They are not visible to the host, the orchestrator, or any operator.
-- **The enclave measurement is deterministic from source.** The client's pinned measurement is computed from the same OVMF, kernel, initrd, and `tinfoil-config.yml` that the production enclave is built from. See [trust-root.md](trust-root.md#whats-pinned).
+- **The enclave measurement is deterministic from source.** The client's pinned launch identity is computed from the platform release image `tinfoil-config.yml` names (its SEV-SNP launch digest) and from `tinfoil-config.yml` itself (its SHA-256, which the enclave reports as HOST_DATA). See [trust-root.md](trust-root.md#whats-pinned).
 
 The server is `FROM scratch`, statically linked musl, runs as non-root, and ships no shell or package manager. The attack surface inside the enclave is limited to the server binary itself.
 
