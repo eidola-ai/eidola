@@ -13645,8 +13645,8 @@ impl AppCore {
 
     /// **Test-only seam.** Replace the Eidola model catalog this core reads
     /// (notices, identity, pins, the newer-weights switch) with `rows`. The
-    /// shipped catalog is empty until the first model is pinned, so this is
-    /// how those paths are exercised end to end. Emits nothing.
+    /// shipped catalog never moves a tag or retires weights within one build,
+    /// so this is how those paths are exercised end to end. Emits nothing.
     #[doc(hidden)]
     #[cfg(feature = "test-support")]
     pub fn test_set_model_catalog(&self, rows: &'static [model_catalog::CatalogRow]) {

@@ -12261,7 +12261,7 @@ fn an_answer_from_new_weights_announces_the_participants_change() {
 
 // ---------------------------------------------------------------------------
 // Notices, identity and the notice actions, end to end over a fixture catalog
-// (the shipped catalog is empty until the first model is pinned).
+// (a fixture can move a tag and retire weights, which the shipped one does not).
 // ---------------------------------------------------------------------------
 
 use eidola_app_core::model_catalog::{CatalogRow, Lifecycle, ModelNotice, WeightsFile};
@@ -12452,7 +12452,7 @@ fn a_models_identity_and_pins_come_from_the_catalog() {
         let (_mock, core, _dir) = setup(MockConfig::default());
         assert!(
             core.model_identity(MODEL).is_none(),
-            "the shipped catalog is empty"
+            "the shipped catalog does not list the harness's model"
         );
         core.test_set_model_catalog(MOVED_CATALOG);
         let identity = core.model_identity(MODEL).expect("identity");
@@ -12472,6 +12472,58 @@ fn a_models_identity_and_pins_come_from_the_catalog() {
             core.model_pins(),
             vec![(MODEL.to_string(), format!("{MODEL}@sha256:{HASH_2}@eidola"))]
         );
+    });
+}
+
+/// With no seam, the core reads the catalog compiled into it: every served
+/// shipped row has its identity by each tag, by its pin and by its hash, a
+/// pin offered per tag, and a current row raises no notice for a selection
+/// whose last answer came from those weights.
+#[test]
+fn the_shipped_catalogs_models_have_identities_and_pins() {
+    use eidola_app_core::model_catalog::{CATALOG, notices};
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig::default());
+        let served: Vec<&CatalogRow> = CATALOG
+            .iter()
+            .filter(|r| !matches!(r.lifecycle, Lifecycle::Retired { .. }))
+            .collect();
+        assert!(!served.is_empty(), "the shipped catalog serves a model");
+        let pins = core.model_pins();
+        for row in served {
+            for tag in row.tags {
+                let pin = format!("{tag}@sha256:{}@eidola", row.sha256);
+                for selection in [
+                    tag.to_string(),
+                    format!("{tag}@eidola"),
+                    pin.clone(),
+                    format!("sha256:{}", row.sha256),
+                ] {
+                    let identity = core.model_identity(&selection).expect(&selection);
+                    assert_eq!(identity.sha256, row.sha256, "{selection}");
+                    assert_eq!(identity.repo, row.repo);
+                    assert_eq!(identity.revision, row.revision);
+                    assert_eq!(identity.files.len(), row.files.len());
+                    for (shown, file) in identity.files.iter().zip(row.files) {
+                        assert_eq!(
+                            (shown.path.as_str(), shown.size, shown.sha256.as_str()),
+                            (file.path, file.size, file.sha256)
+                        );
+                    }
+                }
+                assert!(
+                    pins.contains(&(tag.to_string(), pin)),
+                    "{tag} is offered pinned"
+                );
+                if row.lifecycle == Lifecycle::Current {
+                    assert_eq!(
+                        notices(CATALOG, tag, Some(row.sha256), None, "2026-11-11"),
+                        vec![],
+                        "{tag}"
+                    );
+                }
+            }
+        }
     });
 }
 
