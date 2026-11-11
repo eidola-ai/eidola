@@ -211,10 +211,12 @@ pub fn newest_vendored(workspace: &std::path::Path) -> Result<Option<String>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use eidola_common::engine_deployment::deployment::PLATFORM_ENDORSEMENTS_ROOT;
 
-    /// The release vendored today, and its file's hash.
+    /// The release the known answers are about, and its file's hash. The
+    /// tests read it from a fixture copy, so the vendored tree can rotate.
     const TAG: &str = "platform-v0.1.11";
     const SHA256: &str = "ba0ccfbe8fb8a92d77a072ffeab362dc4b67faa0c88e7114eee7939ad9dd9548";
     /// The one machine the release maps to `tdx-b300-prod`.
@@ -224,17 +226,23 @@ mod tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
 
-    fn read(path: &str) -> Result<Vec<u8>> {
-        std::fs::read(workspace().join(path)).with_context(|| format!("reading {path}"))
+    fn fixtures() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/platform-endorsements")
+    }
+
+    /// Reads a committed file by its workspace path, except that a vendored
+    /// release is read from the fixture releases instead.
+    pub(crate) fn read(path: &str) -> Result<Vec<u8>> {
+        let at = match path.strip_prefix(&format!("{PLATFORM_ENDORSEMENTS_ROOT}/")) {
+            Some(release) => fixtures().join(release),
+            None => workspace().join(path),
+        };
+        std::fs::read(at).with_context(|| format!("reading {path}"))
     }
 
     fn fixture(name: &str) -> Vec<u8> {
-        std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/platform-endorsements")
-                .join(name),
-        )
-        .unwrap()
+        std::fs::read(fixtures().join(name)).unwrap()
     }
 
     fn vendored() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
@@ -549,6 +557,29 @@ mod tests {
             platform_endorsements::release_version("platform-v0.1.11")
                 < platform_endorsements::release_version("platform-v0.2.0")
         );
-        assert_eq!(newest_vendored(&workspace()).unwrap().as_deref(), Some(TAG));
+    }
+
+    /// Every release under the vendored tree verifies as its tag, and there
+    /// is one: the newest stays vendored while no deployment names it, as
+    /// the baseline newer provider releases are compared against.
+    #[test]
+    fn every_vendored_release_verifies() {
+        let read = |path: &str| {
+            std::fs::read(workspace().join(path)).with_context(|| format!("reading {path}"))
+        };
+        let newest = newest_vendored(&workspace()).unwrap();
+        assert!(
+            newest.is_some(),
+            "no release under {PLATFORM_ENDORSEMENTS_ROOT}"
+        );
+        let mut tags = Vec::new();
+        for entry in std::fs::read_dir(workspace().join(PLATFORM_ENDORSEMENTS_ROOT)).unwrap() {
+            let tag = entry.unwrap().file_name().into_string().unwrap();
+            let (file, _) = platform_endorsement_files(&tag);
+            let sha256 = hex::encode(Sha256::digest(read(&file).unwrap()));
+            verify_vendored(&tag, &sha256, &read).unwrap_or_else(|e| panic!("{tag}: {e:#}"));
+            tags.push(tag);
+        }
+        assert!(tags.contains(newest.as_ref().unwrap()));
     }
 }

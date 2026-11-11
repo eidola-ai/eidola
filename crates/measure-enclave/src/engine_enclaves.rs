@@ -324,17 +324,14 @@ containers:
         }
     }"#;
 
-    /// Reads the committed tree (the vendored endorsements and the Sigstore
-    /// trusted root), as the tool's binary does.
+    /// Reads the committed tree as the tool's binary does, with the
+    /// endorsement releases from the test fixtures.
     fn workspace_file(relative: &str) -> Result<Vec<u8>> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join(relative);
-        std::fs::read(&path).with_context(|| format!("reading {relative}"))
+        crate::platform_endorsements::tests::read(relative)
     }
 
-    /// The machine policy `SIDECAR` names: `tdx-b300-prod` of the vendored
-    /// `platform-v0.1.11`, with the sidecar's PCK flags.
+    /// The machine policy `SIDECAR` names: `tdx-b300-prod` of the fixture
+    /// release `platform-v0.1.11`, with the sidecar's PCK flags.
     fn b300_policy() -> Value {
         json!({
             "mr_seam": ["aef4ed3e686fe6cf44c9a8d1cc63105443b558ac4f40c282abf78271e9a4586c50408c8584c7b43fd21edb736700ba5f"],

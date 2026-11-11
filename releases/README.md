@@ -128,7 +128,7 @@ An engine pin's TDX machine policy and the machines it accepts come from a vendo
 
 1. `just engine-platform-endorsements platform-vX.Y.Z` downloads the release file and its attestation, verifies them offline as the gateway's build does, and writes `trust/platform-endorsements/platform-vX.Y.Z/`.
 2. Diff its `platform-endorsements.json` against the release it replaces: floors raised or lowered, TDX modules changed, machines added to or removed from the policy a deployment names. A lowered floor or an added machine widens what the pins accept and needs a reason.
-3. Point each deployment's `deployment.json` at the new `release` and `sha256`, re-measure (`measure-engine-enclaves`), and roll out as any pin change (below: the engines' configs do not change, but the gateway carrying the new pins does). Delete a vendored release once no deployment names it.
+3. Point each deployment's `deployment.json` at the new `release` and `sha256`, re-measure (`measure-engine-enclaves`), and roll out as any pin change (below: the engines' configs do not change, but the gateway carrying the new pins does). Delete a vendored release once no deployment names it, but keep the newest: it is the baseline the drift workflow compares the provider's releases against, and `cargo test -p measure-enclave` requires one to be vendored and every one vendored to verify.
 
 ### Rotating the server URL pattern or hash length
 
