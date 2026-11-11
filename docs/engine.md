@@ -57,3 +57,7 @@ The gateway's outbound HTTPS client for each engine (`tinfoil-verifier::attestin
 - Binding of the quote's `REPORT_DATA` to the verifier nonce and the exact endorsed-section hashes, then exactly the pinned number of GPU evidence items, each labelled with this handshake's nonce.
 
 A failed attestation rejects the request before any inference data crosses the wire. Before an engine takes traffic, and periodically after, the gateway also asks it (over an attested connection) which model and weights it serves, and refuses to route to one that reports anything but the pinned model, the pinned weights hash and read-only verified weights storage.
+
+## Response shape
+
+The engine writes a streamed answer to the gateway as frames of one fixed size at a fixed interval, from the moment the stream opens until it ends, and pads every other response to a size bucket, as the gateway does for its client ([gateway.md § Response shape](gateway.md#response-shape)). The host and the network between the enclaves see how long a response ran, not the size or timing of its tokens. What framing cannot hide is the engine's own activity: the host observes the confidential VM's scheduling and its devices' work, whose timing follows the computation.

@@ -12,7 +12,6 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use tinfoil_shim_mock::{RunningShim, ShimConfig};
@@ -25,6 +24,7 @@ use crate::types::{
     PinnedWeightsCapability, PromptCacheCapability, ScaledPrice,
 };
 use eidola_common::engine_protocol::error_type as kind;
+use eidola_common::stream_shape::{Framer, StreamEvent, pad_body};
 
 const TOKEN: &str = "test-gateway-token-0123456789";
 
@@ -263,22 +263,44 @@ fn authorized(state: &EngineState, headers: &HeaderMap) -> bool {
         && !state.model.is_empty()
 }
 
-fn error(status: StatusCode, error_type: &str) -> Response {
+/// A body padded to its size bucket, as the node pads every response that
+/// is not a stream.
+fn padded(status: StatusCode, content_type: &'static str, body: Vec<u8>) -> Response {
     (
         status,
-        axum::Json(serde_json::json!({
-            "error": {"message": "refused", "type": error_type, "code": null}
-        })),
+        [(axum::http::header::CONTENT_TYPE, content_type)],
+        pad_body(body),
     )
         .into_response()
+}
+
+fn padded_json(status: StatusCode, value: serde_json::Value) -> Response {
+    padded(status, "application/json", value.to_string().into_bytes())
+}
+
+fn error(status: StatusCode, error_type: &str) -> Response {
+    padded_json(
+        status,
+        serde_json::json!({
+            "error": {"message": "refused", "type": error_type, "code": null}
+        }),
+    )
 }
 
 async fn healthz(State(state): State<Arc<EngineState>>) -> Response {
     state.health_checks.fetch_add(1, Ordering::Relaxed);
     if state.healthy.load(Ordering::Relaxed) {
-        state.health.clone().into_response()
+        padded(
+            StatusCode::OK,
+            "text/plain",
+            state.health.clone().into_bytes(),
+        )
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response()
+        padded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "text/plain",
+            b"unavailable".to_vec(),
+        )
     }
 }
 
@@ -286,22 +308,24 @@ async fn info(State(state): State<Arc<EngineState>>, headers: HeaderMap) -> Resp
     if !authorized(&state, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error");
     }
-    axum::Json(serde_json::json!({
-        "model": state.model,
-        "weights_sha256": state.weights,
-        "weights_storage": state.storage,
-        "build": {"crate": "fake", "version": "0", "git_sha": null},
-        "executor": "cuda",
-        "device": null,
-    }))
-    .into_response()
+    padded_json(
+        StatusCode::OK,
+        serde_json::json!({
+            "model": state.model,
+            "weights_sha256": state.weights,
+            "weights_storage": state.storage,
+            "build": {"crate": "fake", "version": "0", "git_sha": null},
+            "executor": "cuda",
+            "device": null,
+        }),
+    )
 }
 
 fn chunk(
     state: &EngineState,
     choices: serde_json::Value,
     usage: Option<serde_json::Value>,
-) -> Event {
+) -> Written {
     let mut body = serde_json::json!({
         "id": "chatcmpl-fake",
         "object": "chat.completion.chunk",
@@ -312,7 +336,7 @@ fn chunk(
     if let Some(usage) = usage {
         body["usage"] = usage;
     }
-    Event::default().data(body.to_string())
+    Written::Event(StreamEvent::Json(body.to_string()))
 }
 
 fn usage() -> serde_json::Value {
@@ -360,42 +384,49 @@ async fn chat(
     }
     let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
     if request["stream"] != serde_json::json!(true) {
-        return axum::Json(serde_json::json!({
-            "id": "chatcmpl-fake",
-            "object": "chat.completion",
-            "created": 0,
-            "model": state.model,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "hello"},
-                "finish_reason": "stop",
-            }],
-            "usage": usage(),
-        }))
-        .into_response();
+        return padded_json(
+            StatusCode::OK,
+            serde_json::json!({
+                "id": "chatcmpl-fake",
+                "object": "chat.completion",
+                "created": 0,
+                "model": state.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop",
+                }],
+                "usage": usage(),
+            }),
+        );
     }
     let role = chunk(
         &state,
         serde_json::json!([{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]),
         None,
     );
-    let rest: Vec<Event> = match mode {
-        Mode::StreamError => vec![Event::default().event("error").data(
+    let rest: Vec<Written> = match mode {
+        Mode::StreamError => vec![Written::Event(StreamEvent::Error(
             serde_json::json!({"error": {"message": "the engine stopped", "type": "engine_unavailable", "code": null}})
                 .to_string(),
-        )],
+        ))],
         Mode::StreamTruncated => vec![],
         Mode::MalformedChunk | Mode::UnknownEvent => {
             let odd = if mode == Mode::MalformedChunk {
-                Event::default().data(r#"{"id":"chatcmpl-fake","choices":"#)
+                Written::Event(StreamEvent::Json(
+                    r#"{"id":"chatcmpl-fake","choices":"#.to_string(),
+                ))
             } else {
-                // A well-formed chunk, so only its event type is wrong.
-                chunk(
+                // A well-formed chunk, so only its event type is wrong. No
+                // node writes one, so it goes out between frames.
+                let Written::Event(StreamEvent::Json(data)) = chunk(
                     &state,
                     serde_json::json!([{"index": 0, "delta": {"content": "x"}, "finish_reason": null}]),
                     None,
-                )
-                .event("progress")
+                ) else {
+                    unreachable!()
+                };
+                Written::Raw(format!("event: progress\ndata: {data}\n\n").into_bytes())
             };
             vec![
                 odd,
@@ -405,7 +436,7 @@ async fn chat(
                     None,
                 ),
                 chunk(&state, serde_json::json!([]), Some(usage())),
-                Event::default().data("[DONE]"),
+                Written::Event(StreamEvent::Done),
             ]
         }
         _ => vec![
@@ -420,25 +451,33 @@ async fn chat(
                 None,
             ),
             chunk(&state, serde_json::json!([]), Some(usage())),
-            Event::default().data("[DONE]"),
+            Written::Event(StreamEvent::Done),
         ],
     };
     let hold = mode == Mode::Hold;
-    let state = state.clone();
-    let events = async_stream(role, hold, state, rest);
-    Sse::new(events).into_response()
+    shaped_stream(role, hold, state, rest)
 }
 
 const WEIGHTS_HEADER_NAME: &str = eidola_common::engine_protocol::WEIGHTS_HEADER;
 
-/// The role chunk at once; then, for a held stream, nothing until released;
-/// then the rest.
-fn async_stream(
-    role: Event,
+/// What a fake engine writes into its stream.
+enum Written {
+    /// An event, framed as the node frames it.
+    Event(StreamEvent),
+    /// Bytes no node writes, sent as they are between two frames.
+    Raw(Vec<u8>),
+}
+
+/// The stream as the node writes it: frames at the node's cadence from the
+/// moment it opens, the role chunk in the first; for a held stream, padding
+/// until released; then the rest, ending after the frame that carries its
+/// last event (or, with no `[DONE]`, once everything is out).
+fn shaped_stream(
+    role: Written,
     hold: bool,
     state: Arc<EngineState>,
-    rest: Vec<Event>,
-) -> impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>> {
+    rest: Vec<Written>,
+) -> Response {
     /// Counts a held stream dropped (its connection gone) before release.
     struct Abandon(Option<Arc<EngineState>>);
     impl Drop for Abandon {
@@ -450,17 +489,56 @@ fn async_stream(
             }
         }
     }
-    let head = futures_util::stream::once(async move { Ok(role) });
-    let tail = futures_util::stream::once(async move {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Written>();
+    let _ = tx.send(role);
+    tokio::spawn(async move {
         if hold {
             let mut abandon = Abandon(Some(state.clone()));
-            state.release.notified().await;
-            abandon.0 = None;
+            tokio::select! {
+                () = state.release.notified() => abandon.0 = None,
+                () = tx.closed() => return,
+            }
         }
-        futures_util::stream::iter(rest.into_iter().map(Ok))
-    })
-    .flatten();
-    head.chain(tail)
+        for written in rest {
+            let _ = tx.send(written);
+        }
+    });
+    let cadence = eidola_common::engine_protocol::STREAM_CADENCE;
+    let interval = tokio::time::interval(cadence.tick());
+    let body = futures_util::stream::unfold(
+        (rx, Framer::new(cadence), interval, false),
+        |(mut rx, mut framer, mut interval, mut closed)| async move {
+            if framer.backlog() == 0 && (framer.done() || closed) {
+                return None;
+            }
+            interval.tick().await;
+            let mut out = Vec::new();
+            loop {
+                match rx.try_recv() {
+                    Ok(Written::Event(event)) => framer.push(&event),
+                    Ok(Written::Raw(raw)) => {
+                        out.extend_from_slice(&framer.frame());
+                        out.extend_from_slice(&raw);
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+            out.extend_from_slice(&framer.frame());
+            Some((
+                Ok::<_, std::convert::Infallible>(bytes::Bytes::from(out)),
+                (rx, framer, interval, closed),
+            ))
+        },
+    );
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+        axum::body::Body::from_stream(body),
+    )
+        .into_response()
 }
 
 fn router_for(engines: &[&Engine], models: Vec<EngineModel>) -> EngineRouter {
@@ -1489,32 +1567,4 @@ async fn an_unreadable_stream_event_ends_the_stream_as_an_error() {
             "{mode:?}: counted as failures"
         );
     }
-}
-
-/// The parser takes complete events only, joins multi-line data, passes over
-/// data-less blocks as the format defines, and refuses a block that is not
-/// UTF-8 rather than repairing it.
-#[test]
-fn the_stream_parser_reads_events_and_refuses_bad_bytes() {
-    let mut buffer =
-        b": keep-alive\n\nevent: error\ndata: a\ndata: b\n\ndata: [DONE]\n\ndata: par".to_vec();
-    assert_eq!(
-        next_event(&mut buffer),
-        Ok(Some(SseEvent {
-            event: Some("error".into()),
-            data: "a\nb".into()
-        }))
-    );
-    assert_eq!(
-        next_event(&mut buffer),
-        Ok(Some(SseEvent {
-            event: None,
-            data: "[DONE]".into()
-        }))
-    );
-    assert_eq!(next_event(&mut buffer), Ok(None));
-    assert_eq!(buffer, b"data: par");
-
-    let mut bad = b"data: \xff\xfe\n\n".to_vec();
-    assert_eq!(next_event(&mut bad), Err(Unreadable));
 }

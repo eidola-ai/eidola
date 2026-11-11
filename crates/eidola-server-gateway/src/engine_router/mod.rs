@@ -62,6 +62,7 @@ use crate::engine_trust::{self, PinnedModel};
 use crate::error::ServerError;
 use crate::types::{ChatCompletionChunk, ChatCompletionResponse, ErrorResponse};
 use eidola_common::engine_protocol::{PreAdmission, refused_before_admission};
+use eidola_common::stream_shape::{StreamEvent, StreamReader, Unreadable, unpadded};
 
 mod breaker;
 pub mod placement;
@@ -457,11 +458,12 @@ impl EngineRouter {
             .map_err(|e| format!("unreachable: {}", error_chain(&e)))?;
         let status = health.status();
         let body = health
-            .text()
+            .bytes()
             .await
             .map_err(|e| format!("health body: {}", error_chain(&e)))?;
-        // A development node answers `ok; weights-storage=dev-writable`.
-        if !status.is_success() || body != "ok" {
+        // A node pads its body to a size bucket; a development node answers
+        // `ok; weights-storage=dev-writable`.
+        if !status.is_success() || unpadded(&body) != b"ok" {
             return Err(format!("unhealthy ({status})"));
         }
 
@@ -736,54 +738,9 @@ fn error_chain(e: &reqwest::Error) -> String {
     text
 }
 
-/// One server-sent event.
-#[derive(Debug, PartialEq, Eq)]
-struct SseEvent {
-    event: Option<String>,
-    data: String,
-}
-
-/// An event block the relay cannot read.
-#[derive(Debug, PartialEq, Eq)]
-struct Unreadable;
-
-/// Take the next complete event (terminated by a blank line) off `buffer`.
-/// A block that is not UTF-8 is unreadable, never repaired: a lossy decode
-/// would forward altered output as if the engine had sent it.
-fn next_event(buffer: &mut Vec<u8>) -> Result<Option<SseEvent>, Unreadable> {
-    loop {
-        let Some(end) = buffer.windows(2).position(|w| w == b"\n\n") else {
-            return Ok(None);
-        };
-        let block: Vec<u8> = buffer.drain(..end + 2).collect();
-        let text = std::str::from_utf8(&block[..end]).map_err(|_| Unreadable)?;
-        let mut event = None;
-        let mut data: Option<String> = None;
-        for line in text.lines() {
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            if let Some(value) = line.strip_prefix("event:") {
-                event = Some(value.trim_start().to_string());
-            } else if let Some(value) = line.strip_prefix("data:") {
-                let value = value.strip_prefix(' ').unwrap_or(value);
-                match &mut data {
-                    Some(d) => {
-                        d.push('\n');
-                        d.push_str(value);
-                    }
-                    None => data = Some(value.to_string()),
-                }
-            }
-        }
-        // A block with no data (a comment, a keep-alive) dispatches no event,
-        // as the SSE format defines.
-        if let Some(data) = data {
-            return Ok(Some(SseEvent { event, data }));
-        }
-    }
-}
-
-/// Relay an engine's SSE stream as backend events. Every way the stream can
-/// go wrong ends it with an error, counted against the upstream's health, and
+/// Relay an engine's SSE stream as backend events, read out of the node's
+/// frames by `stream_shape`'s reader (the padding dispatches nothing). Every
+/// way the stream can go wrong ends it with an error, counted against the upstream's health, and
 /// the handler settles it as a failed stream: the node's `event: error` frame,
 /// an end without `[DONE]`, a broken connection, a chunk that does not parse,
 /// a block that is not UTF-8, or an event type the node does not send. Nothing
@@ -797,7 +754,7 @@ async fn relay_stream(
     tx: mpsc::Sender<Result<BackendStreamEvent, ServerError>>,
 ) {
     let mut stream = std::pin::pin!(response.bytes_stream());
-    let mut buffer: Vec<u8> = Vec::new();
+    let mut reader = StreamReader::new();
     let mut chat_id: Option<String> = None;
     let mut backend_model = model;
     let mut usage = None;
@@ -808,8 +765,9 @@ async fn relay_stream(
     loop {
         // The handler dropping its receiver (the client went away, or the
         // request reached its deadline) ends the relay at once, even while
-        // the engine is still sending nothing (a long prefill): dropping the
-        // response closes the connection, which cancels the node's request.
+        // the engine is still sending nothing but padding (a long prefill):
+        // dropping the response closes the connection, which cancels the
+        // node's request.
         let read = tokio::select! {
             biased;
             () = tx.closed() => return,
@@ -827,65 +785,61 @@ async fn relay_stream(
         };
         // One stamp per socket read, before any send can wait on the client.
         let received_at = Instant::now();
-        buffer.extend_from_slice(&bytes);
+        reader.push(&bytes);
         loop {
-            let event = match next_event(&mut buffer) {
+            let event = match reader.next_event() {
                 Ok(Some(event)) => event,
                 Ok(None) => break,
-                Err(Unreadable) => {
+                Err(unreadable) => {
                     let _ = tx
                         .send(fail(ServerError::Parse(
-                            "the engine's stream was not UTF-8".to_string(),
+                            match unreadable {
+                                Unreadable::NotUtf8 => "the engine's stream was not UTF-8",
+                                // Nothing else is in the node's stream: an
+                                // event this relay does not know ends it
+                                // rather than being passed over.
+                                Unreadable::UnknownEvent => {
+                                    "the engine sent an unknown stream event"
+                                }
+                            }
+                            .to_string(),
                         )))
                         .await;
                     return;
                 }
             };
-            match event.event.as_deref() {
-                // An ordinary data event.
-                None | Some("message") => {}
-                Some("error") => {}
-                // Nothing else is in the node's stream: an event this relay
-                // does not know ends it rather than being passed over.
-                Some(_) => {
+            let data = match event {
+                StreamEvent::Json(data) => data,
+                StreamEvent::Error(data) => {
+                    let (error_type, message) = match serde_json::from_str::<ErrorResponse>(&data) {
+                        Ok(e) => (e.error.error_type, e.error.message),
+                        Err(_) => ("unknown".to_string(), "the engine failed".to_string()),
+                    };
                     let _ = tx
-                        .send(fail(ServerError::Parse(
-                            "the engine sent an unknown stream event".to_string(),
-                        )))
+                        .send(fail(ServerError::Backend {
+                            status: 502,
+                            error_type,
+                            message,
+                        }))
                         .await;
                     return;
                 }
-            }
-            if event.event.as_deref() == Some("error") {
-                let (error_type, message) = match serde_json::from_str::<ErrorResponse>(&event.data)
-                {
-                    Ok(e) => (e.error.error_type, e.error.message),
-                    Err(_) => ("unknown".to_string(), "the engine failed".to_string()),
-                };
-                let _ = tx
-                    .send(fail(ServerError::Backend {
-                        status: 502,
-                        error_type,
-                        message,
-                    }))
-                    .await;
-                return;
-            }
-            if event.data == "[DONE]" {
-                upstream.breaker().on_success();
-                let meta = BackendMeta {
-                    provider: PROVIDER.to_string(),
-                    chat_id,
-                    backend_model,
-                    tee_type: Some(TeeType::EidolaEngine),
-                    usage,
-                };
-                let _ = tx
-                    .send(Ok(BackendStreamEvent::Done(meta, Instant::now())))
-                    .await;
-                return;
-            }
-            match serde_json::from_str::<ChatCompletionChunk>(&event.data) {
+                StreamEvent::Done => {
+                    upstream.breaker().on_success();
+                    let meta = BackendMeta {
+                        provider: PROVIDER.to_string(),
+                        chat_id,
+                        backend_model,
+                        tee_type: Some(TeeType::EidolaEngine),
+                        usage,
+                    };
+                    let _ = tx
+                        .send(Ok(BackendStreamEvent::Done(meta, Instant::now())))
+                        .await;
+                    return;
+                }
+            };
+            match serde_json::from_str::<ChatCompletionChunk>(&data) {
                 Ok(chunk) => {
                     if chat_id.is_none() {
                         chat_id = Some(chunk.id.clone());
