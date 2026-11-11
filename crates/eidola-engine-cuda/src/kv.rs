@@ -65,7 +65,9 @@
 //! host block otherwise. `ZeroHost` is applied by the host CPU once the
 //! stream has drained ([`KvStore::finish_host`], which the executor calls
 //! before `execute` returns), so it never races a copy still reading the
-//! block. Under confidential computing every one of these copies passes
+//! block; `stage` refuses a step that demotes into or promotes from a host
+//! block after listing its zero, the one order that deferral would change.
+//! Under confidential computing every one of these copies passes
 //! through the driver's encrypted staging buffer: the host sees their sizes
 //! and timing, never their contents.
 
@@ -460,10 +462,14 @@ impl Staged {
 /// order: a block is encrypted or decrypted at most once and never also
 /// copied; nothing zeroes or promotes into a block after its encryption or
 /// decryption; a demote reads a block nothing earlier in the step changed.
+/// Nothing demotes into or promotes from a host block after its zero: host
+/// zeros run once every copy has ([`KvStore::finish_host`]), which is the
+/// order given only when each comes after every copy of its block.
 fn check_order(maintenance: &[Maintenance]) {
     let mut crypted = BTreeSet::new();
     let mut copied = BTreeSet::new();
     let mut changed = BTreeSet::new();
+    let mut hosts_zeroed = BTreeSet::new();
     for m in maintenance {
         match *m {
             Maintenance::Encrypt { group, block, .. }
@@ -477,11 +483,10 @@ fn check_order(maintenance: &[Maintenance]) {
                     "group {group} block {block}: copied and encrypted or decrypted in one step"
                 );
             }
-            Maintenance::Zero { group, block } | Maintenance::Promote { group, block, .. } => {
+            Maintenance::Zero { group, block } => {
                 assert!(
                     !crypted.contains(&(group, block)),
-                    "group {group} block {block}: zeroed or promoted into after its encryption \
-                     or decryption"
+                    "group {group} block {block}: zeroed after its encryption or decryption"
                 );
                 changed.insert((group, block));
             }
@@ -494,15 +499,34 @@ fn check_order(maintenance: &[Maintenance]) {
                     copied.insert((group, b));
                 }
             }
-            Maintenance::Demote { group, block, .. } => {
+            Maintenance::Demote { group, block, host } => {
                 let b = (group, block);
                 assert!(
                     !crypted.contains(&b) && !copied.contains(&b) && !changed.contains(&b),
                     "group {group} block {block}: demoted after an earlier operation of the \
                      step changed it"
                 );
+                assert!(
+                    !hosts_zeroed.contains(&(group, host)),
+                    "group {group} host block {host}: demoted into after its zero"
+                );
             }
-            Maintenance::ResetSlot { .. } | Maintenance::ZeroHost { .. } => {}
+            Maintenance::Promote { group, host, block } => {
+                assert!(
+                    !crypted.contains(&(group, block)),
+                    "group {group} block {block}: promoted into after its encryption or \
+                     decryption"
+                );
+                changed.insert((group, block));
+                assert!(
+                    !hosts_zeroed.contains(&(group, host)),
+                    "group {group} host block {host}: promoted from after its zero"
+                );
+            }
+            Maintenance::ZeroHost { group, host } => {
+                hosts_zeroed.insert((group, host));
+            }
+            Maintenance::ResetSlot { .. } => {}
         }
     }
 }
@@ -1675,6 +1699,45 @@ mod tests {
             let r = catch_unwind(AssertUnwindSafe(|| run(m, h)));
             assert!(r.is_err(), "{m:?}");
         }
+        // A host block's copies come before its zero, whatever else the step does
+        // with it: the core reuses a host block within a step (a demote into one
+        // dropped earlier in the step, a demoted entry dropped or hit again).
+        let demote = |block, host| Maintenance::Demote {
+            group: 1,
+            block,
+            host,
+        };
+        let promote = |host, block| Maintenance::Promote {
+            group: 1,
+            host,
+            block,
+        };
+        let zero_host = |host| Maintenance::ZeroHost { group: 1, host };
+        let after_zero: [&[Maintenance]; 2] = [
+            &[zero_host(1), demote(2, 1)],
+            &[zero_host(1), promote(1, 5)],
+        ];
+        for m in after_zero {
+            let r = catch_unwind(AssertUnwindSafe(|| run(m, &hosts)));
+            assert!(r.is_err(), "{m:?}");
+        }
+        run(
+            &[
+                demote(2, 1),
+                demote(4, 1),
+                demote(6, 2),
+                demote(7, 3),
+                promote(3, 5),
+                zero_host(2),
+                zero_host(3),
+                zero_host(1),
+            ],
+            &hosts,
+        );
+        run(
+            &[Maintenance::ZeroHost { group: 0, host: 1 }, demote(2, 1)],
+            &hosts,
+        );
     }
 
     /// Zero and copy of a drafter block touch exactly its plane rows and its
