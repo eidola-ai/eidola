@@ -1,0 +1,64 @@
+# Tinfoil Container configuration for one Eidola inference node serving
+# MiMo-V2.6-Flash (weights 2a94a85c…, models/mimo/mimo-v2.6-flash.toml) on
+# one NVIDIA B300, Intel TDX.
+#
+# The SHA-256 of this file is the deployment's MRCONFIGID: the guest refuses
+# to boot under any other config, and the gateway pins that hash beside the
+# MRTD of the release image `cvm-version` names (releases/trust/
+# engine-enclaves.json, from `measure-engine-enclaves`). Any change here is a
+# different engine identity, and needs a re-measure and a gateway release.
+#
+# GATEWAY_TOKEN_HASH below is the Argon2id hash of a placeholder token that
+# was generated and discarded: no gateway holds it, so a node booted from
+# this exact file accepts no caller. Before deploying, replace it with the
+# hash of the token the gateway's ENGINE_TOKEN secret carries
+# (`cargo run -p hash-secret`) and re-measure.
+cvm-version: 0.15.3-rc.1+gpu@sha256:1421cbb45dc428f6270d106d8eb68faab3ce7ca02ff2fbb2dc0968605004579f
+cpus: 24
+memory: 196608
+gpus: 1
+
+models:
+  - name: "weights"
+    repo: "XiaomiMiMo/MiMo-V2.6-Flash-MOPD@2479e2d0029eca9a34cc7e7f55a121925f81908e"
+    mpk: "789dbcd4dcbcb39eecb8d0a3b556f95f855b515d0bc9593786caec090c65b9c7_177765052416_d3834dd2-a832-50d4-bac0-83517f28b6b1"
+    schema: 1
+
+containers:
+  - name: "eidola-server-engine"
+    image: "ghcr.io/eidola-ai/eidola-server-engine@sha256:d887a034f30a669afe5e0c65b145bbe00a611e53241da473763e73b640b66a5c"
+    runtime: nvidia
+    models: ["weights"]
+    gpus: all
+    secrets:
+      - GATEWAY_TOKEN
+    env:
+      - EIDOLA_ENGINE_MODEL_ID: "2a94a85c36b9d4d29ef733142091f88853fcce4d9f3ca4a1725dbfabab7f1dec"
+      - EIDOLA_ENGINE_WEIGHTS_DIR: "/tinfoil/models/weights"
+      - EIDOLA_ENGINE_WEIGHTS_SHA256: "2a94a85c36b9d4d29ef733142091f88853fcce4d9f3ca4a1725dbfabab7f1dec"
+      - EIDOLA_ENGINE_WEIGHTS_STORAGE: "verified-readonly"
+      - GATEWAY_TOKEN_HASH: "$argon2id$v=19$m=19456,t=2,p=1$Rl9QzToi0dbiI+Zx7Lfh5Q$qt/OOoCtSewGB+zx13U6VPv+tgyeHJb4CnUUPk7w/2U"
+      - EIDOLA_ENGINE_EXECUTOR: "cuda"
+      - EIDOLA_ENGINE_BIND_ADDR: "0.0.0.0:8080"
+      - EIDOLA_ENGINE_KV_BLOCK_SIZE: "16"
+      - EIDOLA_ENGINE_KV_DEVICE_BYTES: "85899345920"
+      - EIDOLA_ENGINE_KERNELS_DIR: "/opt/eidola/kernels"
+      - EIDOLA_ENGINE_CUDA_GRAPHS: "on"
+      - EIDOLA_ENGINE_GPU_CC: "required"
+      - EIDOLA_ENGINE_MAX_MODEL_LEN: "1048576"
+      - EIDOLA_ENGINE_MAX_SEQS: "64"
+      - EIDOLA_ENGINE_MAX_BATCHED_TOKENS: "8192"
+      - EIDOLA_ENGINE_MAX_PREFILL_CHUNK: "4096"
+      - EIDOLA_ENGINE_DRAFT_TOKENS: "3"
+      - EIDOLA_ENGINE_MAX_REQUESTS: "64"
+      - EIDOLA_ENGINE_PREFIX_CACHE: "true"
+      - EIDOLA_ENGINE_CACHE_IDLE_TTL_SECS: "900"
+      - EIDOLA_ENGINE_CACHE_MAX_AGE_SECS: "7200"
+      - EIDOLA_ENGINE_KV_HOST_BYTES: "68719476736"
+
+shim:
+  upstream-port: 8080
+  paths:
+    - /v1/chat/completions
+    - /v1/engine/info
+    - /healthz
