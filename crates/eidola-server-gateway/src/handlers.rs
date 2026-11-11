@@ -326,6 +326,21 @@ pub(crate) const MAX_REQUEST_DURATION: Duration = Duration::from_secs(30 * 60);
 /// hand it over in band, on every ending.
 const DEADLINE_DELIVERY_GRACE: Duration = Duration::from_secs(5);
 
+/// How long a stream's client may take nothing at all before the stream is
+/// ended as if it had gone.
+///
+/// The client-facing stream writes a frame every tick (50 ms) while its
+/// client reads, so this is a client, and every buffer between it and this
+/// server, that has accepted nothing for that long. A client that stops
+/// reading but keeps its connection open would otherwise hold its engine's
+/// admission slot to the request's deadline, at the price of what was
+/// generated before the backpressure reached the engine: a few cheap requests
+/// could hold every slot. A minute is long past a reader's hiccups (TCP
+/// retransmissions, a brief loss of signal); the cost of a shorter one is a
+/// paused reader's answer cut off, settled on what was generated like any
+/// early ending.
+pub(crate) const CLIENT_STALL_LIMIT: Duration = Duration::from_secs(60);
+
 /// The answer to a request ended at its deadline
 /// ([`MAX_REQUEST_DURATION`] after its nullifier was recorded).
 fn request_deadline_error() -> ServerError {
@@ -1209,11 +1224,14 @@ async fn handle_streaming_request(
                 );
                 let refunds = settle_inputs(&state, &spent, cost).await;
                 if reason != EarlyEnding::ClientGone {
-                    let until = if matches!(reason, EarlyEnding::Deadline) {
-                        tokio::time::Instant::now() + DEADLINE_DELIVERY_GRACE
-                    } else {
-                        delivery_until
-                    };
+                    // A client cut off at the deadline or for not reading is
+                    // offered its refund in band for the grace alone.
+                    let until =
+                        if matches!(reason, EarlyEnding::Deadline | EarlyEnding::ClientStalled) {
+                            tokio::time::Instant::now() + DEADLINE_DELIVERY_GRACE
+                        } else {
+                            delivery_until
+                        };
                     let privacy = build_privacy_metadata(&auth_context, true, provider);
                     let verification = build_verification_metadata(None);
                     // No `[DONE]`: the answer did not finish, and the
@@ -1270,6 +1288,8 @@ async fn send_metadata_event(
 enum EarlyEnding {
     /// The client went away (its stream was dropped).
     ClientGone,
+    /// The client stopped reading ([`CLIENT_STALL_LIMIT`]).
+    ClientStalled,
     /// The request reached its deadline ([`MAX_REQUEST_DURATION`]).
     Deadline,
     /// The engine failed partway.
@@ -1283,6 +1303,7 @@ impl EarlyEnding {
     fn label(self) -> &'static str {
         match self {
             EarlyEnding::ClientGone => "client_disconnect",
+            EarlyEnding::ClientStalled => "client_stalled",
             EarlyEnding::Deadline => "deadline",
             EarlyEnding::UpstreamError => "upstream_error",
             EarlyEnding::ChannelClosed => "channel_closed",
@@ -1302,8 +1323,10 @@ enum StreamEnding {
 /// ended, with the last usage the engine reported (its running count, or its
 /// final one).
 ///
-/// The client going away and the deadline are watched while the engine is
-/// still working (a long prefill sends nothing), and on either, or on any
+/// The client going away, the client no longer reading
+/// ([`CLIENT_STALL_LIMIT`]) and the deadline are watched while the engine is
+/// still working (a long prefill sends nothing) and while a chunk waits for
+/// room in the client's stream, and on any of them, or on any
 /// early ending, the upstream receiver is dropped before this returns, which
 /// ends the engine's work at once (the relay closes its connection, and the
 /// node cancels the request in its scheduler). The engine's running count
@@ -1326,6 +1349,7 @@ async fn forward_stream(
             biased;
             () = tx.closed() => Err(EarlyEnding::ClientGone),
             () = tokio::time::sleep_until(deadline) => Err(EarlyEnding::Deadline),
+            () = tx.stalled(CLIENT_STALL_LIMIT) => Err(EarlyEnding::ClientStalled),
             event = upstream_rx.recv() => Ok(event),
         };
         let event = match next {
@@ -1354,8 +1378,10 @@ async fn forward_stream(
                     sent = tx.send(StreamEvent::Json(json_str)) => sent.map_err(|_| EarlyEnding::ClientGone),
                     // A client reading too slowly to take the stream holds
                     // the request past its deadline no more than an engine
-                    // does.
+                    // does, and one that has stopped reading holds it no
+                    // longer than the stall limit.
                     () = tokio::time::sleep_until(deadline) => Err(EarlyEnding::Deadline),
+                    () = tx.stalled(CLIENT_STALL_LIMIT) => Err(EarlyEnding::ClientStalled),
                 };
                 if let Err(early) = sent {
                     return (StreamEnding::Early(early), final_usage);
@@ -2148,6 +2174,87 @@ pub(crate) mod tests {
             ));
             assert_eq!(usage.map(|u| u.completion_tokens), Some(9));
             assert!(up_tx.is_closed(), "the engine's receiver was dropped");
+        }
+
+        /// **A client that stops reading releases the engine within the
+        /// stall limit and keeps the count**: nothing takes the stream's
+        /// frames, so the loop ends as `ClientStalled` once the limit has
+        /// passed, not at the deadline, with the engine's receiver dropped and
+        /// its last running count kept for the early charge.
+        #[tokio::test(start_paused = true)]
+        async fn a_client_that_stops_reading_releases_the_engine_and_keeps_the_count() {
+            let (up_tx, up_rx) = mpsc::channel(8);
+            // Held, never read.
+            let (tx, _padded) = padding::channel(CADENCE);
+            up_tx.send(Ok(delta("a", Some((30, 3))))).await.unwrap();
+            up_tx.send(Ok(delta("b", Some((30, 7))))).await.unwrap();
+            let deadline = tokio::time::Instant::now() + MAX_REQUEST_DURATION;
+            let started = tokio::time::Instant::now();
+            let mut timing = timing();
+            let (ending, usage) = forward_stream(up_rx, &tx, deadline, "m", &mut timing).await;
+            assert!(matches!(
+                ending,
+                StreamEnding::Early(EarlyEnding::ClientStalled)
+            ));
+            let waited = started.elapsed();
+            assert!(
+                waited >= CLIENT_STALL_LIMIT
+                    && waited < CLIENT_STALL_LIMIT + Duration::from_secs(1),
+                "{waited:?}"
+            );
+            assert_eq!(usage.map(|u| u.completion_tokens), Some(7));
+            assert!(up_tx.is_closed(), "the engine's receiver was dropped");
+        }
+
+        /// **A slow reader is not a stalled one, nor a quiet engine**: a
+        /// client taking the stream's frames at their rate keeps the stream
+        /// going while the engine sends nothing for longer than the stall
+        /// limit (a long prefill: the frames are padding), and then while
+        /// the engine outruns it, each send waiting for room; the stream ends
+        /// as the engine's answer does.
+        #[tokio::test(start_paused = true)]
+        async fn a_slow_reader_is_not_taken_for_a_stalled_one() {
+            use futures_util::StreamExt;
+            let (up_tx, up_rx) = mpsc::channel(8);
+            let (tx, padded) = padding::channel(CADENCE);
+            let reader = tokio::spawn(padded.map(|f| f.unwrap().len()).fold(0, async |n, l| n + l));
+            // Eight times what the stream holds waiting, so the sends wait
+            // on the reader for most of the run.
+            let text = "x".repeat(4096);
+            let chunks = 8 * CADENCE.max_backlog_bytes / text.len();
+            let engine = tokio::spawn(async move {
+                tokio::time::sleep(2 * CLIENT_STALL_LIMIT).await;
+                for i in 0..chunks {
+                    let c = u32::try_from(i).unwrap();
+                    up_tx.send(Ok(delta(&text, Some((30, c))))).await.unwrap();
+                }
+                let meta = BackendMeta {
+                    provider: "eidola".to_string(),
+                    chat_id: Some("c".to_string()),
+                    backend_model: "m".to_string(),
+                    tee_type: None,
+                    usage: None,
+                };
+                let _ = up_tx
+                    .send(Ok(BackendStreamEvent::Done(meta, Instant::now())))
+                    .await;
+            });
+            let deadline = tokio::time::Instant::now() + MAX_REQUEST_DURATION;
+            let started = tokio::time::Instant::now();
+            let mut timing = timing();
+            let (ending, _) = forward_stream(up_rx, &tx, deadline, "m", &mut timing).await;
+            assert!(
+                matches!(ending, StreamEnding::Done(..)),
+                "not cut as stalled"
+            );
+            assert!(
+                started.elapsed() > 4 * CLIENT_STALL_LIMIT,
+                "the reader set the pace: {:?}",
+                started.elapsed()
+            );
+            engine.await.unwrap();
+            drop(tx);
+            assert!(reader.await.unwrap() > 8 * CADENCE.max_backlog_bytes);
         }
 
         /// The deadline ends the loop the same way, engine quiet or not.
