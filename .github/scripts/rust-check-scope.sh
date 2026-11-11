@@ -24,8 +24,10 @@ while IFS= read -r path; do
     # carry the word.
     scripts/*apple*|scripts/macho_facts.py)
       apple=true ;;
-    # The OCI images' manifest-only fetch stage, and its rehearsal.
-    scripts/check-oci-stub-workspace.sh|oci/*/Containerfile)
+    # The OCI images' manifest-only fetch stage, and its rehearsal; and what
+    # the flake-built image's `eval` stage reads: the flake itself and the
+    # build context's filter.
+    scripts/check-oci-stub-workspace.sh|oci/*/Containerfile|flake.nix|flake.lock|.dockerignore)
       oci=true ;;
     *.md|.rumdl.toml) : ;;
     .github/*|docs/*|www/*|scripts/*|*.sh|justfile) : ;;

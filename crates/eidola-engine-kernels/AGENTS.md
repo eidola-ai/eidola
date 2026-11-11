@@ -171,16 +171,16 @@ Editing a kernel or the build recipe without rebuilding fails here.
 3. Run `scripts/build-in-docker.sh --check --update`, inspect `inspect/<name>.<arch>.sass` / `.res-usage` (register spills show as `STACK`), and commit the source and manifest together.
 4. If the kernel exists for a particular tensor-core path, assert it in `tests/manifest.rs`.
 
-## Repository integration (not yet wired)
+## Repository integration
 
-The derivation is self-contained so the root flake can adopt it unchanged:
+The root flake imports the derivation unchanged, with its own nixpkgs, so the toolchain record the build writes is the one the committed manifest holds:
 
 ```nix
 engineKernels = import ./crates/eidola-engine-kernels/nix {
   nixpkgsSrc = nixpkgs;
   nixpkgsRev = nixpkgs.rev;
-  system = "x86_64-linux";
+  inherit system;
 };
 ```
 
-Any import must pass the root's own nixpkgs revision, or the manifest's toolchain record changes. A CI job would run the build on a native x86_64 Linux runner and `cmp` its `manifest.json` against `kernels.manifest.json`. That run also closes the gap left by building x86_64 only under emulation so far.
+It is `packages.x86_64-linux.eidola-engine-kernels`, and the inference node's image root (`eidola-server-engine-image-root`, `crates/eidola-server-engine/AGENTS.md` → The image) is built from it: that derivation fails unless the build's `manifest.json` equals `kernels.manifest.json` byte for byte, every cubin and fatbin the committed manifest lists has its recorded size and SHA-256, and the build produced no image the manifest does not list; it then copies exactly the listed images into the image at `/opt/eidola/kernels`. So every image build is also an x86_64 `--verify` of this crate, natively on CI's amd64 runner. Any import must pass the root's own nixpkgs revision, or the manifest's toolchain record changes.

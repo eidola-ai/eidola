@@ -78,9 +78,10 @@ apple=true
 markdown=true
 oci=true' .github/scripts/rust-check-scope.sh
 
-# The OCI stub-resolution rehearsal runs for its own script and for the
-# Containerfiles it rehearses, without pulling in the cargo gates.
-for oci_path in scripts/check-oci-stub-workspace.sh oci/eidola-server-gateway/Containerfile oci/eidola-cli/Containerfile; do
+# The OCI stub-resolution rehearsal runs for its own script, for the
+# Containerfiles it rehearses, and for what the flake-built image's `eval`
+# stage reads, without pulling in the cargo gates.
+for oci_path in scripts/check-oci-stub-workspace.sh oci/eidola-server-gateway/Containerfile oci/eidola-cli/Containerfile oci/eidola-server-engine/Containerfile flake.nix flake.lock .dockerignore; do
   assert_scope 'rust=false
 apple=false
 markdown=false

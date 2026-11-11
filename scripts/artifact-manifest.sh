@@ -24,9 +24,10 @@ Options:
                                Requires a docker-container driver (--ensure-builder or
                                setup-buildx-action).
   --targets GROUP              For `build`: bake group to build (default: full manifest).
-                               Recognized values: `all` (default), `server`, `cli`. Both push
-                               and non-push modes accept the split selectors so CI's
-                               two-phase build can push each phase independently.
+                               Recognized values: `all` (default), `server`, `cli`,
+                               `server-engine` (the inference node's image). Both push
+                               and non-push modes accept the split selectors so CI can
+                               build and push each phase independently.
                                For `print`/`verify`: space-separated list of target names
                                whose digests to read from the preceding --metadata-file
                                (e.g. "server postgres" or "cli"). Pairs are matched
@@ -85,6 +86,14 @@ MANIFEST_SCHEMA_VERSION=2
 # compares against.
 ARTIFACT_SET_SCHEMA=3
 
+# The schema at which the inference node's image (`eidola-server-engine`,
+# built by the `server-engine` bake target) is recorded. Below it the image
+# is still built — CI builds it on every run, so the build is exercised long
+# before the release that first records it — but no row is emitted for it:
+# a row the declared schema does not have is a claims change to every
+# installed client, exactly like a missing one.
+ENGINE_IMAGE_SCHEMA=4
+
 # Every artifact key the emitted schema requires — the emitter's half of the
 # contract `crates/eidola-app-core/src/updates.rs` states for clients. A
 # manifest that omits one of these is not merely incomplete: an installed
@@ -104,6 +113,9 @@ required_artifact_keys() {
     eidola-postgres
     eidola-server
   )
+  if records_engine_image; then
+    keys+=(eidola-server-engine)
+  fi
   if records_current_linux_shape; then
     keys+=(
       eidola-gui-linux-deb-amd64
@@ -574,21 +586,23 @@ build_metadata() {
   # --push.
   if [[ "$PUSH_MODE" -eq 1 ]]; then
     case "$TARGETS" in
-      all)    bake_targets=(ci-server ci-cli ci-postgres) ;;
+      all)    bake_targets=(ci-server ci-cli ci-postgres ci-server-engine) ;;
       server) bake_targets=(ci-server ci-postgres) ;;
       cli)    bake_targets=(ci-cli) ;;
+      server-engine) bake_targets=(ci-server-engine) ;;
       *)
-        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli)" >&2
+        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli, server-engine)" >&2
         exit 1
         ;;
     esac
   else
     case "$TARGETS" in
-      all)    bake_targets=(server cli postgres) ;;
+      all)    bake_targets=(server cli postgres server-engine) ;;
       server) bake_targets=(server postgres) ;;
       cli)    bake_targets=(cli) ;;
+      server-engine) bake_targets=(server-engine) ;;
       *)
-        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli)" >&2
+        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli, server-engine)" >&2
         exit 1
         ;;
     esac
@@ -627,6 +641,7 @@ print_oci_partial_for_targets() {
 
   jq_filter="{ schema_version: ${MANIFEST_SCHEMA_VERSION}, artifacts: {} }"
   for target in "${targets[@]}"; do
+    records_oci_target "$target" || continue
     digest="$(metadata_digest "$METADATA_FILE" "$(target_key "$target")")"
     jq_filter+=" | .artifacts[\"eidola-${target}\"] = { type: \"oci\", platform: \"linux/amd64\", digest: \"${digest}\" }"
   done
@@ -692,6 +707,20 @@ manifest_arch() {
 # Does the emitted schema record the current Linux artifact shape?
 records_current_linux_shape() {
   ((MANIFEST_SCHEMA_VERSION >= ARTIFACT_SET_SCHEMA))
+}
+
+# Does the emitted schema record the inference node's image?
+records_engine_image() {
+  ((MANIFEST_SCHEMA_VERSION >= ENGINE_IMAGE_SCHEMA))
+}
+
+# Does the emitted schema record this OCI bake target's image? Every target
+# but the engine's is recorded by every schema this script emits.
+records_oci_target() {
+  case "$1" in
+    server-engine) records_engine_image ;;
+    *) return 0 ;;
+  esac
 }
 
 # The manifest key for the Nix Linux installable, per emitted schema.
@@ -1257,22 +1286,45 @@ verify_full_manifest() {
   return "$rc"
 }
 
+# The manifest keys the given OCI targets are recorded under by the emitted
+# schema, as a JSON array (the targets `print_oci_partial_for_targets` would
+# emit a row for).
+oci_target_keys() {
+  local target
+  for target in "$@"; do
+    if records_oci_target "$target"; then
+      printf 'eidola-%s\n' "$target"
+    fi
+  done | jq -R . | jq -cs .
+}
+
 verify_oci_manifest() {
-  local actual_norm committed_subset
+  local actual_norm committed_subset keys
   local tmp_partial
 
   tmp_partial="$(write_temp_file "$(print_oci_manifest)")"
   PARTIAL_FILES=("$tmp_partial")
 
+  # The committed rows for exactly the targets this run built: every
+  # (metadata-file, targets) pair, or the legacy default set.
+  local -a requested=()
+  if [[ "${#PRINT_TARGETS_LIST[@]}" -eq 0 ]]; then
+    requested=(server cli postgres)
+  else
+    local entry
+    local -a tgts
+    for entry in "${PRINT_TARGETS_LIST[@]}"; do
+      read -ra tgts <<<"$entry"
+      requested+=("${tgts[@]}")
+    done
+  fi
+  keys="$(oci_target_keys "${requested[@]}")"
+
   actual_norm="$(merge_partials | jq -cS .)"
-  committed_subset="$(jq -cS --argjson schema "$MANIFEST_SCHEMA_VERSION" '
-    {
+  committed_subset="$(jq -cS --argjson schema "$MANIFEST_SCHEMA_VERSION" --argjson keys "$keys" '
+    . as $m | {
       schema_version: $schema,
-      artifacts: {
-        "eidola-server": .artifacts["eidola-server"],
-        "eidola-cli": .artifacts["eidola-cli"],
-        "eidola-postgres": .artifacts["eidola-postgres"]
-      }
+      artifacts: (reduce $keys[] as $k ({}; .[$k] = $m.artifacts[$k]))
     }
   ' "$MANIFEST_FILE")"
 
@@ -1308,7 +1360,10 @@ verify_oci_manifest() {
 #            entries are carried over from the committed manifest (no single
 #            host can build both; CI's linux-gui + apple jobs are the
 #            cross-platform authority and verify the full set).
-#   Phase 4: compose `artifact-manifest.json` from all of the above.
+#   Phase 4: from the schema that records it, build the inference node's
+#            image. It consumes no enclave measurement and nothing above
+#            consumes its digest, so its place in the order is free.
+#   Phase 5: compose `artifact-manifest.json` from all of the above.
 #
 # This breaks the previous self-reference (the cli build's OCI digest is
 # recorded in the very file the cli build was COPYing into its build context),
@@ -1316,7 +1371,7 @@ verify_oci_manifest() {
 update_manifest() {
   local server_oci_partial cli_oci_partial macos_partial linux_gui_partial actual_manifest
   local server_oci_partial_file cli_oci_partial_file macos_partial_file linux_gui_partial_file
-  local server_metadata cli_metadata original_metadata original_targets host_os
+  local server_metadata cli_metadata engine_metadata original_metadata original_targets host_os
 
   if [[ -z "$OUTPUT_FILE" ]]; then
     OUTPUT_FILE="$REPO_ROOT/artifact-manifest.json"
@@ -1378,7 +1433,18 @@ update_manifest() {
     echo "note: darwin narHash/archiveSha256 and the ${other_arch} .deb carried over from committed manifest (not buildable on this host); CI verifies them" >&2
   fi
 
-  # ── Phase 4: compose final artifact-manifest.json ───────────────────────
+  # ── Phase 4: the inference node's image, once a schema records it ──────
+  local engine_oci_partial engine_oci_partial_file
+  engine_oci_partial="$(jq -n --argjson schema "$MANIFEST_SCHEMA_VERSION" '{ schema_version: $schema, artifacts: {} }')"
+  if records_engine_image; then
+    engine_metadata="${TMPDIR:-/tmp}/bake-metadata-server-engine.json"
+    METADATA_FILE="$engine_metadata"
+    TARGETS="server-engine"
+    build_metadata
+    engine_oci_partial="$(print_oci_partial_for_targets server-engine)"
+  fi
+
+  # ── Phase 5: compose final artifact-manifest.json ───────────────────────
   METADATA_FILE="$server_metadata"
   server_oci_partial="$(print_oci_partial_for_targets server postgres)"
   METADATA_FILE="$cli_metadata"
@@ -1386,12 +1452,13 @@ update_manifest() {
 
   server_oci_partial_file="$(write_temp_file "$server_oci_partial")"
   cli_oci_partial_file="$(write_temp_file "$cli_oci_partial")"
+  engine_oci_partial_file="$(write_temp_file "$engine_oci_partial")"
   macos_partial_file="$(write_temp_file "$macos_partial")"
   linux_gui_partial_file="$(write_temp_file "$linux_gui_partial")"
-  PARTIAL_FILES=("$server_oci_partial_file" "$cli_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file")
+  PARTIAL_FILES=("$server_oci_partial_file" "$cli_oci_partial_file" "$engine_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file")
 
   actual_manifest="$(merge_partials)"
-  rm -f "$server_oci_partial_file" "$cli_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file"
+  rm -f "$server_oci_partial_file" "$cli_oci_partial_file" "$engine_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file"
 
   # Nothing is written until the composition is whole. A short manifest is
   # not a smaller version of a good one — every installed client reads the

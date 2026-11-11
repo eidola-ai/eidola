@@ -4,6 +4,8 @@ One directory per Eidola-hosted engine deployment: `deploy/engine/<name>/<varian
 
 `deployment.json` names the weights' architecture, an implemented `eidola_common::architecture::Architecture` (`"architecture": "MimoV26Flash"`): the resource checks (KV bytes per position, the drafter, the executor's scratch) read that architecture's shape, and the draft width is held to its MTP layers. A stub architecture (`MimoV26Pro` today) is refused.
 
+A deployment's one container is the node's release image, `ghcr.io/eidola-ai/eidola-server-engine@sha256:<digest>` (built by `oci/eidola-server-engine/Containerfile`; `just engine-image` prints the digest a source tree builds to), with `EIDOLA_ENGINE_KERNELS_DIR: "/opt/eidola/kernels"`, where that image ships the GPU kernels.
+
 A deployment runs the `cuda` executor on the platform release's GPU image (`cvm-version: X+gpu@sha256:<that image's release manifest>`; the CPU image refuses GPUs) with `EIDOLA_ENGINE_GPU_CC: "required"`, so the node checks its GPUs' confidential-computing mode before opening one; `not-required` is for unpinned development boots on a GPU without confidential computing, and the gateway's build refuses to pin it.
 
 Every deployment committed here must be pinned in `releases/trust/engine-enclaves.json`, and every pin there must match the files here: the gateway's build checks both directions and refuses to build otherwise. Layout, the pin's derivation, and the release-time measurement are in `crates/measure-enclave/AGENTS.md`.
