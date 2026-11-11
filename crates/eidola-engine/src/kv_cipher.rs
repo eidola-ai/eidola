@@ -120,19 +120,23 @@ pub fn chacha20_block(key: &[u32; 8], counter: u32, nonce: &[u32; 3], out: &mut 
 }
 
 /// The keystream of one block's image (see the module docs): ranges in order, each from a
-/// fresh keystream block. Holds the key's words, and zeroes them and its buffered keystream
-/// when dropped.
+/// fresh keystream block. Holds the key's words and its buffered keystream in one fixed heap
+/// allocation, written in place and zeroed on drop, so moving a keystream copies neither.
 pub struct KvKeystream {
-    key: [u32; 8],
+    secret: Box<KeystreamState>,
     nonce: [u32; 3],
     counter: u32,
+}
+
+struct KeystreamState {
+    key: [u32; 8],
     block: [u32; 16],
 }
 
 impl Drop for KvKeystream {
     fn drop(&mut self) {
-        self.key.zeroize();
-        self.block.zeroize();
+        self.secret.key.zeroize();
+        self.secret.block.zeroize();
     }
 }
 
@@ -150,14 +154,16 @@ impl KvKeystream {
 
     /// The keystream from block `counter` on (RFC 8439's test vectors start at 1).
     pub fn with_counter(key: &KvKey, nonce: &KvNonce, counter: u32) -> Self {
-        let mut k = [0u32; 8];
-        key.words_into(&mut k);
-        Self {
-            key: k,
+        let mut ks = Self {
+            secret: Box::new(KeystreamState {
+                key: [0; 8],
+                block: [0; 16],
+            }),
             nonce: nonce.0,
             counter,
-            block: [0; 16],
-        }
+        };
+        key.words_into(&mut ks.secret.key);
+        ks
     }
 
     /// The block counter the next range starts at.
@@ -174,14 +180,15 @@ impl KvKeystream {
             .ok()
             .and_then(|b| self.counter.checked_add(b))
             .expect("a KV block image fits the 32-bit ChaCha20 counter");
+        let state = &mut *self.secret;
         for (n, start) in (0..words).step_by(BLOCK_WORDS).enumerate() {
             chacha20_block(
-                &self.key,
+                &state.key,
                 self.counter + n as u32,
                 &self.nonce,
-                &mut self.block,
+                &mut state.block,
             );
-            for (j, &k) in self.block[..(words - start).min(BLOCK_WORDS)]
+            for (j, &k) in state.block[..(words - start).min(BLOCK_WORDS)]
                 .iter()
                 .enumerate()
             {
@@ -311,6 +318,21 @@ mod tests {
                 assert_eq!(ours.counter(), at + words.div_ceil(16) as u32);
             }
         }
+    }
+
+    /// The key's words are written into the keystream's own allocation and stay there
+    /// through moves, so there is one copy to zero.
+    #[test]
+    fn moves_never_copy_the_key_words() {
+        let key = key_0_to_31();
+        let ks = KvKeystream::new(&key, &KvNonce::from_words([1, 2, 3]));
+        let addr = ks.secret.key.as_ptr();
+        let mut want = [0u32; 8];
+        key.words_into(&mut want);
+        let moved = vec![ks];
+        let ks = moved.into_iter().next().unwrap();
+        assert_eq!(ks.secret.key.as_ptr(), addr);
+        assert_eq!(ks.secret.key, want);
     }
 
     #[test]
