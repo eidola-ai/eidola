@@ -863,7 +863,9 @@ mod rekor {
             ));
         }
         let inner = u64::from(u64::BITS - (index ^ (tree_size - 1)).leading_zeros());
-        let border = u64::from((index >> inner).count_ones());
+        // `inner` reaches 64 for a tree past 2^63 leaves, where a plain shift
+        // overflows.
+        let border = u64::from(index.checked_shr(inner as u32).unwrap_or(0).count_ones());
         if hashes.len() as u64 != inner + border {
             return Err(format!(
                 "the inclusion proof has {} hashes, not {}",
@@ -947,6 +949,8 @@ mod tests {
         assert!(rekor::verify_inclusion(0, b, 2, &[lb], &root).is_err());
         assert!(rekor::verify_inclusion(2, a, 2, &[lb], &root).is_err());
         assert!(rekor::verify_inclusion(0, a, 2, &[], &root).is_err());
+        let err = rekor::verify_inclusion(0, a, u64::MAX, &[lb], &root).unwrap_err();
+        assert!(err.contains("not 64"), "{err}");
     }
 
     fn rekor_leaf(data: &[u8]) -> [u8; 32] {
