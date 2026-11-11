@@ -6,7 +6,9 @@
 //! outer chat-request construction ([`chat_completion_request_body`]), the
 //! wire contract shared by clients, the gateway and the inference nodes
 //! ([`engine_protocol`]: the prefix-cache key's shape and the weights
-//! header), the refund recovery key's wire form ([`refund_key`]), the public
+//! header, and the cadence a node's stream is framed at), the traffic shape
+//! of a streamed response, its writer and its reader ([`stream_shape`]), the
+//! refund recovery key's wire form ([`refund_key`]), the public
 //! calendar issuer key windows are checked against ([`issuer_calendar`]), the
 //! `credentials` member a spend travels in and the ACT parameter `L`
 //! (`spend_credentials`, behind the `spend-credentials` feature), and the
@@ -135,6 +137,7 @@ pub mod model_reference;
 pub mod refund_key;
 #[cfg(feature = "spend-credentials")]
 pub mod spend_credentials;
+pub mod stream_shape;
 pub mod weights_manifest;
 
 use serde_json::Value;

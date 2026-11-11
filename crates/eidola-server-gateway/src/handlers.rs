@@ -2095,8 +2095,7 @@ pub(crate) mod tests {
         use crate::backend::BackendMeta;
 
         const CADENCE: Cadence = Cadence {
-            frame_bytes: 256,
-            tick: Duration::from_millis(5),
+            frames: eidola_common::stream_shape::Cadence::new(256, Duration::from_millis(5)),
             max_backlog_bytes: 1 << 20,
         };
 
