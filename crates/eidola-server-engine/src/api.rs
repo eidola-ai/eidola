@@ -1,6 +1,6 @@
 //! The wire contract: the strict request the gateway forwards, and the response shapes.
 //!
-//! The request is the server's strict chat-completions subset (`eidola-server`'s
+//! The request is the gateway's strict chat-completions subset (`eidola-server-gateway`'s
 //! `types.rs`: the same fields, nullability and `deny_unknown_fields`), plus one field the
 //! gateway adds, `cache_key`. Anything else is refused, so the engine's own parameter
 //! surface is not reachable from outside. A continuation (`continue_final_message`, with

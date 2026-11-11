@@ -1,6 +1,6 @@
-//! Eidola Server - A privacy-transparent AI proxy.
+//! Eidola gateway - A privacy-transparent AI proxy.
 //!
-//! This server accepts requests in OpenAI Chat Completions API format and
+//! The gateway accepts requests in OpenAI Chat Completions API format and
 //! routes them to Eidola's own inference engines, in confidential VMs it
 //! attests against the deployments pinned in its own build, enriching
 //! responses with inline privacy metadata and cryptographic verification.
@@ -352,7 +352,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The catalog, priced. `PRICING_OVERRIDES` is keyed by weights hash, and
     // an override that names no served model, or does not fit its pricing,
     // refuses the boot rather than being ignored.
-    let pricing_overrides = std::env::var("PRICING_OVERRIDES").ok();
+    let pricing_overrides = std::env::var("PRICING_OVERRIDES")
+        .ok()
+        .filter(|s| !s.is_empty());
     let catalog =
         Catalog::new(config.pricing_markup, pricing_overrides.as_deref()).map_err(|e| {
             error!("{e}");

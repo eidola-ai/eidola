@@ -125,6 +125,11 @@ pub(crate) fn model_display(
         .chain(local.external().iter().flat_map(|b| b.models.iter()))
         .find(|m| m.id == selection)
         .map(|m| m.display_name.clone())
+        // A curated model not yet downloaded still has its catalog name.
+        .or_else(|| {
+            eidola_app_core::catalog_entry_for_model_ref(selection)
+                .map(|entry| entry.display_name.to_string())
+        })
         .unwrap_or_else(|| mref.model.clone());
     (model_name.into(), backend_name.into())
 }

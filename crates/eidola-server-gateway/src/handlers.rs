@@ -143,14 +143,13 @@ fn check_completion_ceiling(
 /// Compute the worst-case cost in credits for a request — the pre-flight
 /// minimum hold.
 ///
-/// For per-request models (e.g., Whisper, TTS), returns the flat per-request
-/// price. For token-based models, the prompt side is the shared client/server
+/// For a model priced per request, returns the flat per-request price. For token-based models, the prompt side is the shared client/server
 /// pricing contract (`eidola_common::chargeable_prompt_tokens`: a content-byte
 /// term at the safe cost factor plus per-message and per-request constants),
 /// and the completion side uses `max_completion_tokens` (or context_length).
 /// The client sizes its hold with the identical function of the identical
 /// request, so the client and server go/no-go decisions agree bit-for-bit.
-fn worst_case_cost(request: &ChatCompletionRequest, model: &Model) -> u128 {
+pub(crate) fn worst_case_cost(request: &ChatCompletionRequest, model: &Model) -> u128 {
     // Per-request pricing: flat cost regardless of token count.
     if let Some(ref per_req) = model.pricing.per_request {
         return (per_req.value as u128).div_ceil(per_req.scale_factor as u128);
@@ -626,14 +625,14 @@ fn check_hold_equals_worst_case(
         (status = 404, description = "The model reference names no model (`model_not_found`); refunded in full", body = ErrorResponse),
         (status = 409, description = "A credential already spent; none of the request's credentials is recorded", body = ErrorResponse),
         (status = 410, description = "The model reference names a retired model (`model_retired`); refunded in full", body = ErrorResponse),
-        (status = 502, description = "Upstream provider error", body = ErrorResponse),
-        (status = 503, description = "No upstream is available for the model", body = ErrorResponse)
+        (status = 502, description = "Inference engine error", body = ErrorResponse),
+        (status = 503, description = "No engine is available for the model", body = ErrorResponse)
     )
 )]
 pub async fn chat_completions(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    ChatRequest(mut validated): ChatRequest,
+    ChatRequest(mut validated, reading): ChatRequest,
 ) -> Result<axum::response::Response, ServerError> {
     // The model reference is resolved to a weights hash here, at the edge:
     // the request is rewritten to name the hash, so routing, the node,
@@ -650,7 +649,6 @@ pub async fn chat_completions(
         // the node would fill the rest of its window, past what was priced.
         validated.default_completion_ceiling(resolved.model.max_output_tokens);
     }
-    let request = validated.request();
     // The counter's `model` label must come from the catalog, never the
     // caller's string (the fixed-list rule bounding label cardinality): the
     // resolved hash, with anything unresolved collapsing to `other`.
@@ -658,20 +656,12 @@ pub async fn chat_completions(
         .as_ref()
         .map(|r| r.model.sha256.clone())
         .unwrap_or_else(|_| "other".to_string());
-    let stream = request.stream;
+    let stream = validated.request().stream;
 
-    let result = match crate::auth::refuse_header_credentials(&headers)
-        .and_then(|()| crate::auth::presented_spends(&request.credentials.0))
-    {
-        Ok(acts) => {
-            chat_completions_phases(
-                &state,
-                acts,
-                &validated,
-                resolution.as_ref().map_err(|e| *e),
-            )
-            .await
-        }
+    let presented = crate::auth::refuse_header_credentials(&headers)
+        .and_then(|()| crate::auth::presented_spends(&validated.request().credentials.0));
+    let result = match presented {
+        Ok(acts) => chat_completions_phases(&state, acts, validated, resolution, reading).await,
         Err(e) => Err(e),
     };
 
@@ -702,40 +692,54 @@ pub async fn chat_completions(
 async fn chat_completions_phases(
     state: &AppState,
     acts: Vec<ActSpend>,
-    validated: &ValidatedRequest,
-    resolution: Result<&ResolvedModel, crate::models::ModelRefError>,
+    validated: ValidatedRequest,
+    resolution: Result<ResolvedModel, crate::models::ModelRefError>,
+    reading: BodyPermit,
 ) -> Result<axum::response::Response, ServerError> {
-    let request = validated.request();
     // Phase 1: Check and verify every input. Errors here mean a token is
     // invalid/malformed — no nullifier recorded, no refund needed.
     let (shares, provisionals) = check_presented_spends(state, &acts).await?;
+    // The request is paid for: it stops counting against the memory set
+    // aside for unverified large bodies.
+    drop(reading);
 
-    // Phase 2: Record every nullifier, all or none, each with its provisional
-    // refund (`t = 0`) stored beside it. After this succeeds, every input is
-    // consumed and we MUST issue a refund for each on every subsequent code
-    // path; the final ones overwrite the provisional ones.
-    //
-    // Every input enters this process's live set first, so there is no
-    // instant at which a provisional refund is stored and recovery could take
-    // it for one a crash left behind; each leaves when the last holder of its
-    // input lets go, after its final refund's write has been attempted.
+    // Phases 2 to 4, in a task that outlives this handler.
+    run_paid_request(
+        state.clone(),
+        validated,
+        resolution,
+        record_inputs(state.clone(), acts, shares, provisionals),
+    )
+    .await
+}
+
+/// Phase 2: Record every nullifier, all or none, each with its provisional
+/// refund (`t = 0`) stored beside it. After this succeeds, every input is
+/// consumed and a refund MUST be issued for each on every subsequent code
+/// path; the final ones overwrite the provisional ones.
+///
+/// Every input enters this process's live set first, so there is no instant
+/// at which a provisional refund is stored and recovery could take it for one
+/// a crash left behind; each leaves when the last holder of its input lets
+/// go, after its final refund's write has been attempted.
+async fn record_inputs(
+    state: AppState,
+    acts: Vec<ActSpend>,
+    shares: Vec<u128>,
+    provisionals: Vec<SignedRefund>,
+) -> Result<PaidInputs, ServerError> {
     let lives: Vec<_> = acts
         .iter()
         .map(|act| std::sync::Arc::new(state.live_spends.serve(act)))
         .collect();
-    let deadline = tokio::time::Instant::now() + MAX_REQUEST_DURATION;
     let recording: Vec<(&ActSpend, &SignedRefund)> = acts.iter().zip(&provisionals).collect();
-    let recorded = credentials::record_spends(state, &recording, RefundStage::Provisional).await?;
+    let recorded = credentials::record_spends(&state, &recording, RefundStage::Provisional).await?;
     let Some(recorded) = recorded else {
         return Err(ServerError::Conflict {
             message: "credential already spent (duplicate nullifier)".to_string(),
         });
     };
-
-    // --- POINT OF NO RETURN: every nullifier is recorded ---
-    // From here on, we MUST issue a refund for every input on any error, and
-    // the request ends by `deadline` whatever the engine does.
-    let inputs = PaidInputs {
+    Ok(PaidInputs {
         acts: acts
             .into_iter()
             .zip(recorded)
@@ -747,37 +751,67 @@ async fn chat_completions_phases(
             })
             .collect(),
         shares,
-    };
+    })
+}
 
-    // Phase 3: Validate the request (model, hold). On failure, every input's
-    // share is returned in full.
-    let resolved = match validate_request(inputs.hold(), request, resolution) {
-        Ok(resolved) => resolved,
-        Err(e) => {
-            warn!("Request validation failed after nullifier recorded, issuing full refund: {e}");
-            let refunds = settle_inputs(state, &inputs, 0).await;
-            return Ok(error_response_with_refunds(&e, refunds));
-        }
-    };
+/// Record a verified request's inputs (`recording`) and serve it, in a task
+/// of its own, answering with what the task returns.
+///
+/// **The task outlives its caller.** A client that goes away drops the
+/// handler's future wherever it is waiting; were recording or anything after
+/// it awaited there, the nullifiers could be recorded with nothing left to
+/// settle them, and recovery would declare each provisional refund final: the
+/// whole hold charged for nothing. So recording, the validation refusal, the
+/// dispatch and every settlement run here for both transports, and a request
+/// whose handler has gone still ends with its final refunds stored for
+/// recovery. A stream whose handler went away before it opened is dispatched
+/// to its answer like any other: a refusal settles as a full refund, and an
+/// opened stream finds its client gone at once, releases the engine and
+/// settles as that early ending ([`forward_stream`]). A blocking request runs
+/// to its end and is billed by its reported usage (a blocking engine request
+/// reports what it generated only when it completes, so a cut would leave
+/// nothing trustworthy to charge). The deadline bounds both.
+pub(crate) async fn run_paid_request(
+    state: AppState,
+    validated: ValidatedRequest,
+    resolution: Result<ResolvedModel, crate::models::ModelRefError>,
+    recording: impl Future<Output = Result<PaidInputs, ServerError>> + Send + 'static,
+) -> Result<axum::response::Response, ServerError> {
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + MAX_REQUEST_DURATION;
+        let inputs = recording.await?;
 
-    // Phase 4: Handle the request.
-    if request.stream {
-        handle_streaming_request(state.clone(), validated, inputs, &resolved, deadline).await
-    } else {
-        // In a task of its own, so a client that goes away (which drops this
-        // handler) does not take the settlement with it: the request runs to
-        // its end and its final refunds are stored for recovery. A blocking
-        // engine request reports what it generated only when it completes, so
-        // it is not cut short on a disconnect (a cut would leave nothing
-        // trustworthy to charge); the deadline still bounds it.
-        let state = state.clone();
-        let validated = validated.clone();
-        tokio::spawn(async move {
+        // --- POINT OF NO RETURN: every nullifier is recorded ---
+        // From here on, we MUST issue a refund for every input on any error,
+        // and the request ends by `deadline` whatever the engine does.
+        let request = validated.request();
+
+        // Phase 3: Validate the request (model, hold). On failure, every
+        // input's share is returned in full.
+        let resolved = match validate_request(
+            inputs.hold(),
+            request,
+            resolution.as_ref().map_err(|e| *e),
+        ) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                warn!(
+                    "Request validation failed after nullifier recorded, issuing full refund: {e}"
+                );
+                let refunds = settle_inputs(&state, &inputs, 0).await;
+                return Ok(error_response_with_refunds(&e, refunds));
+            }
+        };
+
+        // Phase 4: Handle the request.
+        if request.stream {
+            handle_streaming_request(state.clone(), &validated, inputs, &resolved, deadline).await
+        } else {
             handle_non_streaming_request(&state, &validated, &inputs, &resolved, deadline).await
-        })
-        .await
-        .map_err(|_| ServerError::Internal("the request's task failed".to_string()))?
-    }
+        }
+    })
+    .await
+    .map_err(|_| ServerError::Internal("the request's task failed".to_string()))?
 }
 
 /// Handle a non-streaming chat completion request.
@@ -801,8 +835,8 @@ async fn handle_non_streaming_request(
     {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => {
-            // Known error — backend didn't charge. Full refunds.
-            warn!("Backend error, issuing full refund: {}", e);
+            // The engine refused the request or never took it. Full refunds.
+            warn!("Engine error, issuing full refund: {}", e);
             let refunds = settle_inputs(state, inputs, 0).await;
             return Ok(error_response_with_refunds(&e, refunds));
         }
@@ -1028,6 +1062,27 @@ fn carries_output(chunk: &ChatCompletionChunk) -> bool {
     })
 }
 
+/// Whether a streamed chunk is the engine's running count and nothing else:
+/// `usage`, on choices that say nothing (no role, output, finish reason or
+/// `continuable`). The node sends one for a step that generated tokens and
+/// gave out no text (a tool call still being read, held-back text); it is
+/// kept for billing and never offered to the client. The final usage chunk
+/// has no choices and is not one of these.
+fn carries_only_a_count(chunk: &ChatCompletionChunk) -> bool {
+    chunk.usage.is_some()
+        && !chunk.choices.is_empty()
+        && chunk.choices.iter().all(|choice| {
+            let delta = &choice.delta;
+            choice.finish_reason.is_none()
+                && choice.continuable.is_none()
+                && delta.role.is_none()
+                && delta.content.is_none()
+                && delta.reasoning_content.is_none()
+                && delta.reasoning.is_none()
+                && delta.tool_calls.is_none()
+        })
+}
+
 /// Handle a streaming chat completion request.
 async fn handle_streaming_request(
     state: AppState,
@@ -1251,10 +1306,11 @@ enum StreamEnding {
 /// early ending, the upstream receiver is dropped before this returns, which
 /// ends the engine's work at once (the relay closes its connection, and the
 /// node cancels the request in its scheduler). The engine's running count
-/// rides on every delta chunk and is kept before the client is offered the
-/// chunk, so what was generated is counted whether or not it was delivered;
-/// only the final usage chunk (no choices) reaches the client, as the stream
-/// always carried it. Every chunk names the model as `echo`, the client's
+/// rides on every delta chunk, and alone on a chunk with an empty delta for a
+/// step that gave out no text ([`carries_only_a_count`], kept and not
+/// forwarded); it is kept before the client is offered the chunk, so what was
+/// generated is counted whether or not it was delivered; only the final usage
+/// chunk (no choices) reaches the client, as the stream always carried it. Every chunk names the model as `echo`, the client's
 /// reference resolved.
 async fn forward_stream(
     mut upstream_rx: mpsc::Receiver<Result<BackendStreamEvent, ServerError>>,
@@ -1284,6 +1340,9 @@ async fn forward_stream(
                 }
                 if chunk.usage.is_some() {
                     final_usage.clone_from(&chunk.usage);
+                    if carries_only_a_count(&chunk) {
+                        continue;
+                    }
                     if !chunk.choices.is_empty() {
                         chunk.usage = None;
                     }
@@ -1339,6 +1398,10 @@ async fn forward_stream(
 /// response's length would carry the echoed value to anyone watching the
 /// ciphertext, padding or not (a bucket is a function of length).
 ///
+/// A body longer than [`crate::MAX_REQUEST_BODY_BYTES`] is refused (413), and
+/// one past [`crate::UNGATED_REQUEST_BODY_BYTES`] is read only under a
+/// [`BodyPermit`] (`checked_body`).
+///
 /// Before any of that, the body's JSON shape is held to the limits an
 /// Eidola-hosted engine enforces (`eidola_common::engine_protocol::
 /// check_request_json`: at most `MAX_REQUEST_JSON_VALUES` values, nested at
@@ -1356,29 +1419,98 @@ where
     type Rejection = axum::response::Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let (parts, bytes) = checked_body::<T, S>(req, state).await?;
+        let (parts, bytes, _permit) = checked_body::<T, S>(req, state).await?;
         parse_logged(parts, bytes, state).await.map(Self)
     }
 }
 
-/// The body's bytes, held to the JSON shape limits (see [`LoggedJson`]).
+/// The large request bodies being read and parsed right now, at most
+/// [`crate::large_body_permits`].
+static LARGE_BODIES: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(crate::large_body_permits()));
+
+/// How long a large request body may take to arrive: its permit is one of
+/// few, and a sender that stalls must not keep it.
+const LARGE_BODY_READ_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The hold a large request body has on the memory set aside for them
+/// (`None` for a body within [`crate::UNGATED_REQUEST_BODY_BYTES`]): taken
+/// before the body is read and kept while it and its parse are held
+/// unverified.
+pub struct BodyPermit(#[allow(dead_code)] Option<tokio::sync::SemaphorePermit<'static>>);
+
+/// The body's bytes, within the size limit and held to the JSON shape limits
+/// (see [`LoggedJson`]).
+///
+/// **Size.** A body that declares a length of at most
+/// [`crate::UNGATED_REQUEST_BODY_BYTES`], or declares none, is read up to that
+/// many bytes. One that declares more, up to [`crate::MAX_REQUEST_BODY_BYTES`],
+/// takes a [`BodyPermit`] first and is refused (503) when none is free, so
+/// the memory unverified large bodies and their parses take is bounded; one
+/// that declares more than that is refused (413) unread.
 // The error is the refusal itself, built once and returned as the extractor's
 // rejection.
 #[allow(clippy::result_large_err)]
 async fn checked_body<T, S: Send + Sync>(
     req: Request,
     state: &S,
-) -> Result<(axum::http::request::Parts, axum::body::Bytes), axum::response::Response> {
+) -> Result<(axum::http::request::Parts, axum::body::Bytes, BodyPermit), axum::response::Response> {
+    use axum::http::StatusCode;
+    let too_large = || {
+        warn!(
+            payload_type = std::any::type_name::<T>(),
+            "request body rejected: too large"
+        );
+        refusal(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the request body is too large",
+        )
+    };
+    let unreadable = |status| {
+        warn!(
+            payload_type = std::any::type_name::<T>(),
+            "request body rejected: bytes error"
+        );
+        refusal(status, "the request body could not be read")
+    };
     let (parts, body) = req.into_parts();
-    let bytes = axum::body::Bytes::from_request(Request::from_parts(parts.clone(), body), state)
-        .await
-        .map_err(|rejection| {
-            warn!(
-                payload_type = std::any::type_name::<T>(),
-                "request body rejected: bytes error"
-            );
-            refusal(rejection.status(), "the request body could not be read")
-        })?;
+    let declared = parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let (bytes, permit) = match declared {
+        Some(len) if len > crate::MAX_REQUEST_BODY_BYTES as u64 => return Err(too_large()),
+        Some(len) if len > crate::UNGATED_REQUEST_BODY_BYTES as u64 => {
+            let Ok(permit) = LARGE_BODIES.try_acquire() else {
+                warn!(
+                    payload_type = std::any::type_name::<T>(),
+                    "request body rejected: no large-body permit free"
+                );
+                return Err(ServerError::ServiceUnavailable(
+                    "too many large requests are being read; try again".to_string(),
+                )
+                .into_response());
+            };
+            let read = axum::body::to_bytes(body, len as usize);
+            match tokio::time::timeout(LARGE_BODY_READ_TIMEOUT, read).await {
+                Ok(Ok(bytes)) => (bytes, Some(permit)),
+                Ok(Err(_)) => return Err(unreadable(StatusCode::BAD_REQUEST)),
+                Err(_) => return Err(unreadable(StatusCode::REQUEST_TIMEOUT)),
+            }
+        }
+        _ => {
+            let read =
+                axum::body::Bytes::from_request(Request::from_parts(parts.clone(), body), state);
+            match read.await {
+                Ok(bytes) => (bytes, None),
+                Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                    return Err(too_large());
+                }
+                Err(rejection) => return Err(unreadable(rejection.status())),
+            }
+        }
+    };
     // A malformed body goes on to axum's parse, which refuses it as it always has
     // (and, since the scan counts values as it goes, holds no more of them before
     // the error than the cap).
@@ -1400,7 +1532,16 @@ async fn checked_body<T, S: Send + Sync>(
         }
         .into_response());
     }
-    Ok((parts, bytes))
+    Ok((parts, bytes, BodyPermit(permit)))
+}
+
+/// A request over a body [`checked_body`] has already read and held to the
+/// size limits, for axum's own extractors to parse: the router's limit for
+/// unread bodies does not apply to it.
+fn read_body(parts: axum::http::request::Parts, bytes: axum::body::Bytes) -> Request {
+    let mut req = Request::from_parts(parts, axum::body::Body::from(bytes));
+    axum::extract::DefaultBodyLimit::disable().apply(&mut req);
+    req
 }
 
 /// axum's `Json` over `bytes`: its value, or its refusal, logged by class.
@@ -1414,8 +1555,7 @@ where
     Json<T>: FromRequest<S, Rejection = JsonRejection>,
     S: Send + Sync,
 {
-    let req = Request::from_parts(parts, axum::body::Body::from(bytes));
-    match Json::<T>::from_request(req, state).await {
+    match Json::<T>::from_request(read_body(parts, bytes), state).await {
         Ok(Json(value)) => Ok(value),
         Err(rejection) => {
             // Class only — the rejection's message can quote body
@@ -1462,31 +1602,33 @@ fn refusal(status: axum::http::StatusCode, message: &'static str) -> axum::respo
 /// The content type and the JSON syntax are checked first by axum's own
 /// extractor over a parse that keeps nothing; a body that fails any check is
 /// refused by axum's parse of the strict type, exactly as before.
-pub struct ChatRequest(pub ValidatedRequest);
+pub struct ChatRequest(pub ValidatedRequest, pub BodyPermit);
 
 impl<S: Send + Sync> FromRequest<S> for ChatRequest {
     type Rejection = axum::response::Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let (parts, bytes) = checked_body::<ChatCompletionRequest, S>(req, state).await?;
+        let (parts, bytes, permit) = checked_body::<ChatCompletionRequest, S>(req, state).await?;
         let shape_ok = Json::<serde::de::IgnoredAny>::from_request(
-            Request::from_parts(parts.clone(), axum::body::Body::from(bytes.clone())),
+            read_body(parts.clone(), bytes.clone()),
             state,
         )
         .await
         .is_ok();
         if shape_ok && let Ok(validated) = ValidatedRequest::from_bytes(bytes.clone()) {
-            return Ok(Self(validated));
+            return Ok(Self(validated, permit));
         }
         parse_logged::<ChatCompletionRequest, S>(parts, bytes.clone(), state).await?;
         // axum accepted a body the strict parse refused; both parse the same
         // bytes with the same type, so this is not reached.
-        ValidatedRequest::from_bytes(bytes).map(Self).map_err(|_| {
-            ServerError::BadRequest {
-                message: "invalid request body".to_string(),
-            }
-            .into_response()
-        })
+        ValidatedRequest::from_bytes(bytes)
+            .map(|validated| Self(validated, permit))
+            .map_err(|_| {
+                ServerError::BadRequest {
+                    message: "invalid request body".to_string(),
+                }
+                .into_response()
+            })
     }
 }
 
@@ -1542,7 +1684,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_chat_extractor_keeps_the_bytes_and_refuses_as_before() {
         let valid = r#"{"model":"m", "messages":[{"role":"user","content":"hi"}]}"#;
-        let ChatRequest(validated) =
+        let ChatRequest(validated, _) =
             ChatRequest::from_request(chat_request(valid, Some("application/json")), &())
                 .await
                 .unwrap_or_else(|_| panic!("accepted"));
@@ -1592,6 +1734,85 @@ pub(crate) mod tests {
         );
     }
 
+    /// The size limits on the shaped router, at their boundaries: a body that
+    /// declares its length is read up to `MAX_REQUEST_BODY_BYTES` (24 MiB,
+    /// what a node reads less what forwarding can add) and refused one byte
+    /// past it; one that declares none is read up to
+    /// `UNGATED_REQUEST_BODY_BYTES`; a large body is read only under a
+    /// permit, and refused while none is free. Every refusal says what it is
+    /// and is padded like any other response.
+    #[tokio::test]
+    async fn request_bodies_are_held_to_the_size_limits() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        async fn body_only(LoggedJson(_): LoggedJson<serde_json::Value>) -> &'static str {
+            "ok"
+        }
+        let (router, _) = crate::build_router()
+            .route("/body", axum::routing::post(body_only))
+            .with_state(crate::credentials::tests::unreachable_state(
+                Default::default(),
+            ))
+            .split_for_parts();
+        let app = padding::shape(router);
+        let post = async |len: usize, declared: bool| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/body")
+                .header("content-type", "application/json");
+            if declared {
+                request = request.header("content-length", len);
+            }
+            let body = format!("\"{}\"", "x".repeat(len - 2));
+            let response = app
+                .clone()
+                .oneshot(request.body(axum::body::Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(bytes.len().is_power_of_two() && bytes.len() >= padding::MIN_BODY_BUCKET);
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        };
+
+        const MAX: usize = 24 * 1024 * 1024;
+        const UNGATED: usize = 2 * 1024 * 1024;
+        assert_eq!(crate::MAX_REQUEST_BODY_BYTES, MAX);
+        assert_eq!(crate::UNGATED_REQUEST_BODY_BYTES, UNGATED);
+        const {
+            assert!(
+                MAX + eidola_common::engine_protocol::FORWARDED_BODY_GROWTH_BYTES
+                    <= eidola_common::engine_protocol::MAX_REQUEST_BODY_BYTES
+            )
+        };
+
+        assert_eq!(post(MAX, true).await.0, StatusCode::OK);
+        let (status, text) = post(MAX + 1, true).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(text.contains("the request body is too large"), "{text}");
+
+        // Without a declared length, the ungated limit is the limit.
+        assert_eq!(post(UNGATED, false).await.0, StatusCode::OK);
+        let (status, text) = post(UNGATED + 1, false).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(text.contains("the request body is too large"), "{text}");
+
+        // With every permit taken, a large body is refused and a small one
+        // is still read.
+        let permits = crate::large_body_permits();
+        assert_eq!(permits, 10);
+        let held = LARGE_BODIES.acquire_many(permits as u32).await.unwrap();
+        let (status, text) = post(UNGATED + 1, true).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(text.contains("too many large requests"), "{text}");
+        assert_eq!(post(UNGATED, true).await.0, StatusCode::OK);
+        drop(held);
+        assert_eq!(post(UNGATED + 1, true).await.0, StatusCode::OK);
+        assert_eq!(LARGE_BODIES.available_permits(), permits);
+    }
+
     /// A body past the engine's JSON value or depth limit is refused with a 400 before
     /// anything is parsed; one at the limits, and a malformed one, go on as before.
     #[tokio::test]
@@ -1615,6 +1836,23 @@ pub(crate) mod tests {
         // Malformed JSON is axum's refusal, unchanged.
         let (status, _) = extract("[1,".into()).await.unwrap_err();
         assert_eq!(status, bad);
+        // A body past the value limit is refused for it whatever its strings
+        // hold: one that is not UTF-8 never reaches a parser that allocates
+        // per value.
+        let mut hostile = values(MAX_REQUEST_JSON_VALUES + 1).into_bytes();
+        let end = hostile.len() - 1;
+        hostile.splice(end..end, *b",\"\xff\"");
+        let req = Request::builder()
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(hostile))
+            .unwrap();
+        let Err(response) = LoggedJson::<serde_json::Value>::from_request(req, &()).await else {
+            panic!("accepted");
+        };
+        let (status, text) = refusal_of(response).await;
+        assert_eq!(status, bad);
+        assert!(text.contains("JSON values"), "{text}");
     }
     use crate::types::{
         Capability, Modality, ModelCapabilities, ModelPricing, OutputBudgetClass,
@@ -1962,6 +2200,58 @@ pub(crate) mod tests {
                 assert!(text.contains("\"refunds\""), "{text}");
                 assert_eq!(text.contains("[DONE]"), finished, "{text}");
             }
+        }
+
+        /// A chunk carrying the running count alone (a step that generated
+        /// tokens and gave out no text) is kept for billing and never reaches
+        /// the client: a stream cut after it is charged by its count, and the
+        /// client's bytes are those of the stream without it.
+        #[tokio::test]
+        async fn a_count_alone_is_kept_and_never_forwarded() {
+            use futures_util::StreamExt;
+            let count_alone = |p: u32, c: u32| {
+                let chunk = serde_json::json!({
+                    "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": null}],
+                    "usage": {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c},
+                });
+                BackendStreamEvent::Chunk(serde_json::from_value(chunk).unwrap(), Instant::now())
+            };
+            let run = async |with_counts: bool| {
+                let (up_tx, up_rx) = mpsc::channel(8);
+                let (tx, padded) = padding::channel(CADENCE);
+                up_tx.send(Ok(delta("a", Some((30, 3))))).await.unwrap();
+                if with_counts {
+                    up_tx.send(Ok(count_alone(30, 40))).await.unwrap();
+                    up_tx.send(Ok(count_alone(30, 80))).await.unwrap();
+                }
+                // The engine's connection breaks while a tool call is read.
+                drop(up_tx);
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                let mut timing = timing();
+                let (ending, usage) = forward_stream(up_rx, &tx, deadline, "m", &mut timing).await;
+                assert!(matches!(
+                    ending,
+                    StreamEnding::Early(EarlyEnding::ChannelClosed)
+                ));
+                drop(tx);
+                let bytes: Vec<u8> = padded.map(|frame| frame.unwrap().to_vec()).concat().await;
+                // The events, without the padding between them (the number
+                // of padding frames follows the clock).
+                let events: Vec<String> = String::from_utf8(bytes)
+                    .unwrap()
+                    .lines()
+                    .filter(|line| line.starts_with("data:"))
+                    .map(|line| line.trim_end().to_string())
+                    .collect();
+                (usage.map(|u| u.completion_tokens), events)
+            };
+            let (count, events) = run(true).await;
+            assert_eq!(count, Some(80), "the cut is charged by the last count");
+            let (plain_count, plain_events) = run(false).await;
+            assert_eq!(plain_count, Some(3));
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_eq!(events, plain_events, "the client's events are unchanged");
         }
 
         /// A completed stream forwards no running count to the client: only

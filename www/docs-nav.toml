@@ -21,15 +21,11 @@ pages = [
 title = "Design pieces"
 pages = [
     ["client.md", "The client"],
-    ["server.md", "The server"],
+    ["gateway.md", "The gateway"],
     ["engine.md", "Inference engine"],
     ["model-identity.md", "Model identity"],
     ["anonymous-credits.md", "Anonymous credits"],
 ]
-
-[[sections]]
-title = "Specifications"
-pages = [["specs/act-multi-spend.md", "Multi-credential spends"]]
 
 [[sections]]
 title = "Release flow"

@@ -212,6 +212,17 @@ pub enum AppError {
     #[error("local model error: {message}")]
     LocalModel { message: String },
 
+    /// A turn or chore named a model of the managed local store whose file is
+    /// not on this machine. Distinct from [`AppError::LocalModel`] so a
+    /// surface can name the model and say how to get it, rather than show a
+    /// sentence with a filesystem path in it. Nothing was sent.
+    ///
+    /// **Data, not prose.** `model` is the `<slug>@local` selection; a curated
+    /// one maps back to its catalog entry through
+    /// [`crate::local_models::catalog_entry_for_model_ref`].
+    #[error("the local model `{model}` is not downloaded")]
+    LocalModelNotDownloaded { model: String },
+
     /// A self-update verification step failed.
     ///
     /// Used by [`crate::updater`] to surface fetch/parse/schema/continuity

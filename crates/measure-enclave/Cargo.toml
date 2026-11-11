@@ -24,14 +24,12 @@ name = "vendor-platform-endorsements"
 path = "src/bin/vendor-platform-endorsements.rs"
 
 [dependencies]
-# SEV-SNP measurement
-sev = { version = "8", default-features = false, features = ["snp", "crypto_nossl"] }
-
-# TDX measurement
-tdx-measure = { git = "https://github.com/virtee/tdx-measure", tag = "v0.1.1" }
-# IGVM image parsing, for MRTD of IGVM-model releases
+# IGVM image parsing: the SEV-SNP launch digest and the TDX MRTD of
+# IGVM-model releases
 igvm = "0.5"
 igvm_defs = "0.5"
+# The VMSA page bytes of an IGVM SEV-SNP VP context.
+zerocopy = "0.8"
 
 # The engine-deployment config grammar shared with the gateway and the node
 # (`cvm-version`, cache retention).

@@ -56,7 +56,8 @@ pub use eidola_common::model_reference;
 use error::{AppError, IssuerKeyRefusal};
 pub use local_models::{
     ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
-    LocalModelStatus, LocalModelsState, ModelDownloadTarget, RunningEngine, resolve_model_download,
+    LocalModelStatus, LocalModelsState, ModelDownloadTarget, RunningEngine,
+    catalog_entry_for_model_ref, resolve_model_download,
 };
 pub use subspace_driver::{
     ANCHOR_WAIT_GRACE, DelegationEnd, DelegationFailure, MAX_ATTEMPTS_PER_TAIL,
@@ -151,11 +152,31 @@ pub struct EidolaTrust {
     pub hardware_intermediate_ca_pem: Option<String>,
 }
 
+/// One trusted server launch identity (SEV-SNP, IGVM launch model).
 #[derive(Clone, Debug)]
 pub struct MeasurementInfo {
-    pub snp: String,
-    pub tdx_rtmr1: String,
-    pub tdx_rtmr2: String,
+    /// The launch digest of the release image (96 hex).
+    pub measurement: String,
+    /// HOST_DATA: the SHA-256 of the server's config (64 hex).
+    pub host_data: String,
+    /// The guest policy a launch must carry (`0x30133`).
+    pub guest_policy: String,
+}
+
+impl MeasurementInfo {
+    /// The key it is untrusted by: `<measurement>:<host_data>`.
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.measurement, self.host_data)
+    }
+
+    /// Its trust spec, `<measurement>:<host_data>:<guest_policy>`, the form
+    /// `trust_measurement` reads back.
+    pub fn spec(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.measurement, self.host_data, self.guest_policy
+        )
+    }
 }
 
 // --- Participants & space templates (Participants v1) ----------------------
@@ -793,6 +814,18 @@ pub struct AllocateResult {
     pub nonce: String,
     pub credits: i64,
     pub issuer_key_id: String,
+}
+
+/// What asking again for this account's pending issuances did
+/// ([`AppCore::recover_pending_issuances`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IssuanceRecovery {
+    /// The nonces of the credentials the gateway answered with.
+    pub recovered: Vec<String>,
+    /// Issuances too recent to be asked for again yet.
+    pub waiting: usize,
+    /// Issuances asked for again and still unanswered.
+    pub unresolved: usize,
 }
 
 /// A document (terms of service / privacy policy) whose current version the
@@ -1838,11 +1871,11 @@ pub struct SpendTrailEntry {
 ///
 /// Why 1,000,000: credits are micro-USD-denominated (the server's
 /// `PRICING_SCALE_FACTOR` is 1e6 — `usd_per_M_tokens × markup` becomes
-/// credits-per-token directly, e.g. gemma4-31b output $1.00/M × 1.5 markup
+/// credits-per-token directly, e.g. output at $1.00/M × 1.5 markup
 /// = 1.5 credits/token). A single chat turn's worst-case hold is
 /// `chargeable_prompt_tokens(bytes, msgs) × prompt_rate + 4096 ×
 /// completion_rate` (the shared `eidola-common` contract): ≈6,200 credits
-/// for the default gemma4-31b, ≈32,000 for the most expensive catalog
+/// at that rate, ≈32,000 for the most expensive catalog
 /// models (output 7.875 credits/token) — mostly refunded after the actual
 /// usage settles. 1,000,000 credits ($1.00 of balance) therefore covers
 /// ~30 worst-case holds or 100+ typical turns: small enough that only a
@@ -1927,6 +1960,11 @@ pub const PROVISION_DEFER_FLOOR_CREDITS: i64 = DEFAULT_ALLOCATION_CREDITS / 10;
 /// the two, but a retry refused while the original is still signing would
 /// abandon a row the original then pays for).
 const ISSUANCE_SETTLE_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The deadline on each request for a stranded hold's refund, connection to
+/// last byte: one that stalls leaves its hold `spending`, to be asked for
+/// again.
+const SPEND_RECOVERY_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The deadline on every request an issuance makes (the key listing, the
 /// balance read, the issuance itself), connection to last byte. The attesting
@@ -2251,6 +2289,10 @@ struct Inner {
     /// flight. Never held across a spend; the just-in-time path takes it under
     /// `spend_gate`, nothing takes them in the other order.
     issuance_gate: tokio::sync::Mutex<()>,
+    /// Serializes recovery of stranded holds
+    /// ([`Inner::recover_stranded_spends`]), so two callers never ask for,
+    /// and settle, the same hold at once.
+    spend_recovery_gate: tokio::sync::Mutex<()>,
     /// Latch so `start_credential_provisioner` spawns at most one loop.
     provisioner_started: std::sync::atomic::AtomicBool,
     /// The provisioner's look interval bounds in milliseconds (see
@@ -2787,6 +2829,7 @@ impl Inner {
             .db
             .get_or_try_init(|| async {
                 let database = db::open(&self.data_dir).await?;
+                self.forget_other_domains_cache_keys(&database).await;
                 self.sweep_pristine_spaces(&database).await;
                 Ok::<_, AppError>(database)
             })
@@ -2794,6 +2837,50 @@ impl Inner {
         // FK enforcement is per-connection (turso defaults it OFF), and the
         // scope-owned schema depends on it — enable it on every connection.
         db::connect(database).await
+    }
+
+    /// Forget every prefix-cache key minted under a trust domain other than
+    /// the one this process resolves, once per process — inside the
+    /// `OnceCell` initializer, before any turn can claim.
+    ///
+    /// **The trust domain can change with no write to the eidola row**: a
+    /// build with another compiled-in server URL or measurement resolves
+    /// another domain from the same NULL columns, so the configuration door's
+    /// cleanup (`backends::update_backend`) never runs for it. Each lineage
+    /// would still rotate at its next claim, and a lineage never used again
+    /// would keep its key on disk; this overwrites and deletes them all, and
+    /// empties the log, exactly as that door does.
+    ///
+    /// **A failed cleanup is never a failed open**: no key crosses domains
+    /// either way (the claim mints under a mismatch), so it is warned about,
+    /// naming no key, and left to the next open.
+    async fn forget_other_domains_cache_keys(&self, database: &turso::Database) {
+        let forgotten = async {
+            let conn = db::connect(database).await?;
+            let row = db::get_backend(&conn, backends::EIDOLA_BACKEND_ID).await?;
+            let domain = EidolaResolved::from_row(row.as_ref())?.cache_trust_domain();
+            db::begin_write(&conn).await?;
+            let forgotten = match db::forget_cache_keys_outside(&conn, &domain).await {
+                Ok(n) => {
+                    conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+                    n
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            };
+            if forgotten > 0 {
+                db::truncate_log_after_forgetting_keys(&conn).await;
+            }
+            Ok::<_, AppError>(())
+        }
+        .await;
+        if let Err(e) = forgotten {
+            eprintln!(
+                "warning: could not forget prefix-cache keys of other trust configurations: {e}"
+            );
+        }
     }
 
     /// The startup sweep, run exactly once per process — inside the `OnceCell`
@@ -2836,10 +2923,10 @@ impl Inner {
     /// override-vs-pin honesty flags the UIs render.
     async fn eidola_trust(&self) -> Result<EidolaTrust, AppError> {
         let resolved = self.eidola_resolved().await?;
-        let to_info = |m: &tinfoil_verifier::EnclaveMeasurement| MeasurementInfo {
-            snp: m.snp_measurement.clone(),
-            tdx_rtmr1: m.tdx_measurement.rtmr1.clone(),
-            tdx_rtmr2: m.tdx_measurement.rtmr2.clone(),
+        let to_info = |m: &tinfoil_verifier::SevSnpPin| MeasurementInfo {
+            measurement: m.measurement.to_ascii_lowercase(),
+            host_data: m.host_data.to_ascii_lowercase(),
+            guest_policy: m.guest_policy.clone(),
         };
         Ok(EidolaTrust {
             base_url: resolved.base_url.clone(),
@@ -2860,7 +2947,7 @@ impl Inner {
     /// is NULL — the read-modify-write base for trust/untrust.
     async fn eidola_measurement_overrides(
         &self,
-    ) -> Result<Vec<tinfoil_verifier::EnclaveMeasurement>, AppError> {
+    ) -> Result<Vec<tinfoil_verifier::SevSnpPin>, AppError> {
         let conn = self.db_conn().await?;
         let row = db::get_backend(&conn, backends::EIDOLA_BACKEND_ID).await?;
         match row.and_then(|r| r.trusted_measurements) {
@@ -2874,16 +2961,16 @@ impl Inner {
     }
 
     /// Add a measurement to the eidola row's override list (idempotent by
-    /// SNP measurement). Returns whether it was newly added.
+    /// launch identity, digest and HOST_DATA). Returns whether it was newly
+    /// added; an entry for the same identity under another guest policy is
+    /// not added beside it.
     async fn trust_measurement(
         &self,
-        entry: tinfoil_verifier::EnclaveMeasurement,
+        entry: tinfoil_verifier::SevSnpPin,
     ) -> Result<bool, AppError> {
         let mut list = self.eidola_measurement_overrides().await?;
-        if list.iter().any(|m| {
-            m.snp_measurement
-                .eq_ignore_ascii_case(&entry.snp_measurement)
-        }) {
+        let key = config::measurement_key(&entry);
+        if list.iter().any(|m| config::measurement_key(m) == key) {
             return Ok(false);
         }
         list.push(entry);
@@ -2901,15 +2988,12 @@ impl Inner {
         Ok(true)
     }
 
-    /// Remove a measurement (by SNP key) from the eidola row's override list.
-    /// Clears the column back to NULL (= pin) when the list empties. Returns
-    /// whether a measurement was removed.
+    /// Remove a measurement (by its `<measurement>:<host_data>` key) from the
+    /// eidola row's override list. Clears the column back to NULL (= pin)
+    /// when the list empties. Returns whether a measurement was removed.
     async fn untrust_measurement(&self, key: String) -> Result<bool, AppError> {
         let mut list = self.eidola_measurement_overrides().await?;
-        let Some(pos) = list
-            .iter()
-            .position(|m| m.snp_measurement.eq_ignore_ascii_case(&key))
-        else {
+        let Some(pos) = list.iter().position(|m| config::measurement_key(m) == key) else {
             return Ok(false);
         };
         list.remove(pos);
@@ -2985,12 +3069,13 @@ impl Inner {
             "hardware_intermediate_ca",
         )?;
 
-        // Release records pin their SEV-SNP launch digest only: the client
-        // path accepts no TDX evidence.
+        // The server is pinned on SEV-SNP only (launch digest, HOST_DATA and
+        // guest policy): the client path accepts no TDX evidence.
         let allowed: Vec<tinfoil_verifier::AllowedMeasurement> = eidola
             .measurements
             .iter()
-            .map(tinfoil_verifier::AllowedMeasurement::from)
+            .cloned()
+            .map(tinfoil_verifier::AllowedMeasurement::sev_snp)
             .collect();
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
             allowed_measurements: &allowed,
@@ -3081,7 +3166,7 @@ impl Inner {
 struct EidolaResolved {
     base_url: String,
     base_url_is_override: bool,
-    measurements: Vec<tinfoil_verifier::EnclaveMeasurement>,
+    measurements: Vec<tinfoil_verifier::SevSnpPin>,
     measurements_are_override: bool,
     hardware_root_ca: Option<String>,
     hardware_intermediate_ca: Option<String>,
@@ -3107,7 +3192,7 @@ impl EidolaResolved {
         let base_url_is_override = base_url_override.is_some();
         let base_url = base_url_override.unwrap_or_else(|| trust_root::SERVER_URL.to_string());
 
-        let measurements_override: Vec<tinfoil_verifier::EnclaveMeasurement> =
+        let measurements_override: Vec<tinfoil_verifier::SevSnpPin> =
             match row.and_then(|r| r.trusted_measurements.as_deref()) {
                 Some(json) if !json.trim().is_empty() => {
                     serde_json::from_str(json).map_err(|e| AppError::Database {
@@ -3614,6 +3699,15 @@ impl Inner {
         )
     }
 
+    /// [`ISSUANCE_SETTLE_AGE`] in milliseconds.
+    fn issuance_settle_age_ms(&self) -> i64 {
+        i64::try_from(
+            self.issuance_settle_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .unwrap_or(i64::MAX)
+    }
+
     /// Take [`Inner::issuance_gate`], waiting no later than `deadline`. Every
     /// holder's network requests are bounded ([`ISSUANCE_REQUEST_TIMEOUT`]), so
     /// a wait this long means something is wrong, and the caller is told so
@@ -3664,11 +3758,25 @@ impl Inner {
 
     /// Convert `credits` from the account into a new credential: the explicit
     /// `account allocate` door. Serialized with every other issuance in this
-    /// process by [`Inner::issuance_gate`].
+    /// process by [`Inner::issuance_gate`]. An earlier issuance of the
+    /// account's still pending is asked for again first, and nothing new is
+    /// converted in a call that finds one: repeating a conversion whose
+    /// answer was lost would otherwise debit once per attempt.
     async fn account_allocate(&self, credits: i64) -> Result<AllocateResult, AppError> {
         let _issuing = self
             .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
             .await?;
+        let recovered = Box::pin(self.resolve_pending_issuances_locked()).await?;
+        if !recovered.is_empty() {
+            return Err(AppError::Credential {
+                message: format!(
+                    "an earlier conversion whose answer was lost has now been answered: \
+                     recovered {} credential(s). Nothing new was converted; run this again \
+                     to convert more",
+                    recovered.len()
+                ),
+            });
+        }
         Box::pin(self.allocate_locked(credits)).await
     }
 
@@ -3697,7 +3805,7 @@ impl Inner {
 
     /// [`Inner::allocate_locked`] on a task of its own, for the just-in-time
     /// path inside a turn. A turn's future is deep already, and an issuance
-    /// builds and checks 128-bit credentials on the stack, so it runs from the
+    /// builds and checks its credential's proofs on the stack, so it runs from the
     /// top of a worker's stack rather than from the bottom of the turn's. It
     /// also finishes if the turn is dropped meanwhile, so a request the server
     /// may have debited for is never abandoned half-sent.
@@ -3864,11 +3972,7 @@ impl Inner {
         };
         let db_conn = self.db_conn().await?;
         let now = now_ms();
-        let settle_ms = i64::try_from(
-            self.issuance_settle_ms
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
-        .unwrap_or(i64::MAX);
+        let settle_ms = self.issuance_settle_age_ms();
         let rows: Vec<db::PendingIssuance> = db::list_pending_issuances(&db_conn, now)
             .await?
             .into_iter()
@@ -3951,7 +4055,8 @@ impl Inner {
         // so it counts toward the buffer — and while one is unresolved nothing
         // new is issued beside it, retry hold-off included. Otherwise every
         // pass whose recovery failed would convert another allocation, and
-        // what is held would no longer be bounded by the threshold plus one.
+        // what is held would no longer be bounded by the threshold plus
+        // [`PROVISION_CREDENTIALS_PER_KEY`] allocations.
         let pending: Vec<db::PendingIssuance> = db::list_pending_issuances(&db_conn, now)
             .await?
             .into_iter()
@@ -4220,17 +4325,25 @@ impl Inner {
             .collect())
     }
 
-    async fn recover_spending_credentials(&self) -> Result<Vec<String>, AppError> {
-        let cfg = self.load_config();
-        let eidola = self.eidola_resolved().await?;
-        let base_url = eidola.base_url.as_str();
-        let client = self.build_client(&eidola, None).await?;
+    /// Ask the gateway again for the refund of every **stranded hold**: a
+    /// credential left `spending` that no turn in this process is flying with
+    /// ([`LiveSpends`]). Each is an unlinked `POST /v1/credentials/refund`,
+    /// named by the spend alone; nothing here is account-authenticated, and
+    /// nothing account-authenticated is sent beside it. A hold whose request
+    /// the gateway is still serving answers provisionally and stays
+    /// `spending` for a later ask ([`recover_refund`]). With nothing
+    /// stranded, nothing is sent. Returns the nonces settled.
+    ///
+    /// Who asks, and when: a turn for its own hold as it ends
+    /// ([`TurnPrep::try_refund_recovery`]); a request the wallet cannot pay,
+    /// before it converts or fails ([`Inner::ensure_spend_inputs`]); the
+    /// long-lived process at random times
+    /// ([`AppCore::start_credential_provisioner`]); and the reader, through
+    /// [`AppCore::recover_spending_credentials`].
+    async fn recover_stranded_spends(&self) -> Result<Vec<String>, AppError> {
+        let _recovering = self.spend_recovery_gate.lock().await;
         let db_conn = self.db_conn().await?;
-        let params = params_from_domain_separator(cfg.domain_separator())?;
-        let now = now_ms();
-
         let rows = db::list_spending_credentials(&db_conn).await?;
-        let mut recovered = Vec::new();
 
         // **A hold a request is still flying with is not a stranded hold.**
         // Recovery asks the server to refund a spend it has no record of, and
@@ -4238,20 +4351,30 @@ impl Inner {
         // arrived: it records it and refunds. Do that to a turn that is about
         // to arrive and the turn's own request is then refused as a replay —
         // the answer lost, and lost *because* somebody asked for their money
-        // back on its behalf. Embedded, this could not happen: the profile's
-        // one writer is this process and it is not taking a turn. Answering
-        // for the profile removes that accident, so the exclusion is stated
-        // rather than inherited from who happens to be running.
+        // back on its behalf. Read after the rows: a spend claims its place
+        // here before its row is written.
         let live = self
             .live_spends
             .lock()
             .expect("live spends lock poisoned")
             .clone();
+        let rows: Vec<db::SpendingCredentialRow> = rows
+            .into_iter()
+            .filter(|row| !live.contains(&row.pre_credential_id))
+            .collect();
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let cfg = self.load_config();
+        let eidola = self.eidola_resolved().await?;
+        let base_url = eidola.base_url.as_str();
+        let client = self.build_client(&eidola, None).await?;
+        let params = params_from_domain_separator(cfg.domain_separator())?;
+        let now = now_ms();
+        let mut recovered = Vec::new();
 
         for row in rows {
-            if live.contains(&row.pre_credential_id) {
-                continue;
-            }
             let spend_proof_cbor = row.spend_proof_data;
 
             let spend_proof = match SpendProof::<ACT_L>::from_cbor(&spend_proof_cbor) {
@@ -4275,8 +4398,12 @@ impl Inner {
             // The spend exactly as it was presented.
             let presented =
                 PresentedSpend::new(&issuer_key_hash, &spend_proof_cbor, &row.pre_refund_data);
-            if let Ok(refund_obj) =
-                recover_refund(&client, base_url, &presented, Some(row.spend_until)).await
+            let answer = tokio::time::timeout(
+                SPEND_RECOVERY_REQUEST_TIMEOUT,
+                recover_refund(&client, base_url, &presented, Some(row.spend_until)),
+            )
+            .await;
+            if let Ok(Ok(refund_obj)) = answer
                 && process_refund(
                     &refund_obj,
                     &params,
@@ -4291,27 +4418,85 @@ impl Inner {
                 .await
                 .is_ok()
             {
+                // Each successor is durable at its own write.
+                self.bus.emit(Change::Wallet);
                 recovered.push(row.nonce);
             }
         }
 
-        // Announced before anything below can fail: the successors above are
-        // durable, and a caller that gets an error from what follows does not
-        // re-read, so the bus is what tells it.
+        Ok(recovered)
+    }
+
+    /// [`Inner::recover_stranded_spends`] for the unattended loop: nothing is
+    /// sent for a backend the reader has turned off.
+    async fn sweep_stranded_spends(&self) -> Result<Vec<String>, AppError> {
+        if !self.eidola_enabled().await? {
+            return Ok(Vec::new());
+        }
+        self.recover_stranded_spends().await
+    }
+
+    /// Ask again for every issuance of this account whose response never
+    /// landed: the explicit door to
+    /// [`Inner::recover_pending_issuances_locked`], for a process with no
+    /// provisioner. Account-authenticated, so it is never run beside a spend
+    /// or its recovery except on the reader's own instruction.
+    async fn recover_pending_issuances(&self) -> Result<IssuanceRecovery, AppError> {
+        let _issuing = self
+            .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
+            .await?;
+        let recovered = Box::pin(self.recover_pending_issuances_locked()).await?;
+        let (waiting, unresolved) = self.pending_issuance_counts().await?;
+        Ok(IssuanceRecovery {
+            recovered,
+            waiting,
+            unresolved,
+        })
+    }
+
+    /// This account's pending issuances at this instant: how many are too
+    /// young to be asked for again ([`ISSUANCE_SETTLE_AGE`]), and how many
+    /// are old enough and still unanswered.
+    async fn pending_issuance_counts(&self) -> Result<(usize, usize), AppError> {
+        let cfg = self.load_config();
+        let Ok((account_id, _)) = self.require_credentials(&cfg) else {
+            return Ok((0, 0));
+        };
+        let db_conn = self.db_conn().await?;
+        let now = now_ms();
+        let settled_before = now.saturating_sub(self.issuance_settle_age_ms());
+        let (mut waiting, mut unresolved) = (0, 0);
+        for row in db::list_pending_issuances(&db_conn, now).await? {
+            if row.account_id != account_id {
+                continue;
+            }
+            if row.created_at > settled_before {
+                waiting += 1;
+            } else {
+                unresolved += 1;
+            }
+        }
+        Ok((waiting, unresolved))
+    }
+
+    /// Before a conversion the reader asked for: ask again for
+    /// this account's pending issuances, and refuse to convert beside one
+    /// that stays unresolved. A pending issuance may already have been paid
+    /// for, and each is asked for again until it is answered, so converting
+    /// beside it would debit once per attempt. The caller holds
+    /// [`Inner::issuance_gate`]. Returns the nonces recovered.
+    async fn resolve_pending_issuances_locked(&self) -> Result<Vec<String>, AppError> {
+        let recovered = Box::pin(self.recover_pending_issuances_locked()).await?;
         if !recovered.is_empty() {
-            self.bus.emit(Change::Wallet);
+            return Ok(recovered);
         }
-
-        // A lost issuance response strands its allocation the same way a lost
-        // refund strands a balance, so the explicit recovery asks for those
-        // too. Each one it recovers announces itself (`settle_issuance`).
-        {
-            let _issuing = self
-                .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
-                .await?;
-            recovered.extend(Box::pin(self.recover_pending_issuances_locked()).await?);
+        let (waiting, unresolved) = self.pending_issuance_counts().await?;
+        if waiting + unresolved > 0 {
+            return Err(AppError::ProvisioningTimeout {
+                message: "an earlier credit conversion has not been answered yet, and it is                           asked for again before another is made; try again in a few minutes"
+                    .into(),
+            });
         }
-
         Ok(recovered)
     }
 
@@ -6818,9 +7003,17 @@ impl Inner {
     /// 1. The wallet covers the hold, alone or as a drain and a fill → use it.
     /// 2. Otherwise `need` is what is missing: the whole hold, or the hold
     ///    less the first credential's balance when that one is to be drained.
-    ///    No account configured → [`AppError::NoAccount`] (the UI routes to
-    ///    account creation).
-    /// 3. Account exists and the available balance covers `need` → allocate
+    ///    A stranded hold is asked for first
+    ///    ([`Inner::recover_stranded_spends`], unlinked), and once more
+    ///    during any wait below. No account configured →
+    ///    [`AppError::NoAccount`] (the UI routes to account creation).
+    /// 3. An issuance of the account's is pending → nothing is converted, and
+    ///    nothing is sent to the account surface: the pending issuance is
+    ///    never asked for again from here (that is the provisioner's pass and
+    ///    the explicit doors'), and the request waits as in 4 with nothing
+    ///    convertible; when the wait cannot help,
+    ///    [`AppError::ProvisioningTimeout`]. Otherwise the available balance
+    ///    covers `need` → allocate
     ///    `min(available, max(DEFAULT_ALLOCATION_CREDITS, need))` (the pool)
     ///    and choose again: the new credential is the fill, or the whole.
     /// 4. Balance can't cover it but a mid-spend credential whose own
@@ -6838,10 +7031,24 @@ impl Inner {
         db_conn: &turso::Connection,
         charge_credits: i64,
     ) -> Result<Vec<(db::SpendableCredential, i64)>, AppError> {
-        let deadline = tokio::time::Instant::now() + self.provision_wait();
+        let wait = self.provision_wait();
+        let deadline = tokio::time::Instant::now() + wait;
+        // A hold no turn in this process is flying with settles only when
+        // somebody asks for it: once before anything is converted for this
+        // request, and once more while it waits, with the last quarter of
+        // the wait kept for that ask's answer.
+        let last_ask_at = deadline - wait / 4;
+        let mut stranded_asks = 2;
         loop {
             if let Ok(inputs) = chosen_inputs(db_conn, charge_credits).await? {
                 return Ok(inputs);
+            }
+
+            if stranded_asks == 2 {
+                stranded_asks = 1;
+                if self.recover_stranded_spends_by(deadline).await {
+                    continue;
+                }
             }
 
             if cfg.account_id.is_none() || cfg.account_secret.is_none() {
@@ -6852,7 +7059,7 @@ impl Inner {
             // never converts beside the ahead-of-need provisioner, and looks
             // again once it has it: a background issuance that landed while it
             // waited covers this turn without a second conversion.
-            let (balances, need) = {
+            let (convertible, need) = {
                 // Bounded by the queue's own deadline: this wait happens with
                 // `spend_gate` held, so an unbounded one would stall every
                 // paid turn behind it.
@@ -6861,16 +7068,29 @@ impl Inner {
                     Ok(inputs) => return Ok(inputs),
                     Err(need) => need,
                 };
-                let balances = self.account_balances_bounded().await?;
-                if balances.available >= need {
-                    // Enough to allocate at least what is missing — grow the
-                    // pool, and choose again.
-                    let amount = auto_allocation_amount(balances.available, need)?;
-                    self.allocate_on_its_own_task(amount).await?;
-                    continue;
+                // An issuance still pending may already have been paid for,
+                // so nothing is converted beside it. Nor is it asked for
+                // again from here: that request is account-authenticated,
+                // and this pass may just have asked for a stranded hold. The
+                // request can still be paid by what is in flight.
+                let (waiting, unresolved) = self.pending_issuance_counts().await?;
+                if waiting + unresolved > 0 {
+                    (None, need)
+                } else {
+                    let balances = self.account_balances_bounded().await?;
+                    if balances.available >= need {
+                        // Enough to allocate at least what is missing — grow
+                        // the pool, and choose again.
+                        let amount = auto_allocation_amount(balances.available, need)?;
+                        self.allocate_on_its_own_task(amount).await?;
+                        continue;
+                    }
+                    (Some(balances.available), need)
                 }
-                (balances, need)
             };
+            // What the account could still be converted into: nothing while
+            // an issuance is pending.
+            let available = convertible.unwrap_or(0);
 
             // Balance can't cover a fresh allocation. Waiting only helps if a
             // concurrent turn holds coverage this turn could actually use once
@@ -6892,10 +7112,16 @@ impl Inner {
                 .await?
                 .into_iter()
                 .map(|c| c.credits)
-                .chain(std::iter::once(balances.available))
+                .chain(std::iter::once(available))
                 .collect();
             let recoverable = settlement_could_cover(&in_flight, &held, charge_credits);
             if recoverable && tokio::time::Instant::now() < deadline {
+                if stranded_asks == 1 && tokio::time::Instant::now() >= last_ask_at {
+                    stranded_asks = 0;
+                    if self.recover_stranded_spends_by(deadline).await {
+                        continue;
+                    }
+                }
                 tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
                 continue;
             }
@@ -6921,7 +7147,7 @@ impl Inner {
             // a false negative from an in-flight sibling refund. It does NOT
             // promise to see funding that arrives *after* this re-read from a
             // write exogenous to the turn machinery (an explicit
-            // `account_allocate`, startup recovery); that is an ordinary
+            // `account_allocate`, a recovery outside the turn); that is an ordinary
             // post-read TOCTOU no non-serialized check can exclude, and the
             // recoverable error routes the caller to retry, which finds it.
             //
@@ -6931,7 +7157,7 @@ impl Inner {
             // is taken again rather than refused on the stale amount.
             match chosen_inputs(db_conn, charge_credits).await? {
                 Ok(inputs) => return Ok(inputs),
-                Err(missing) if missing < need && balances.available >= missing => continue,
+                Err(missing) if missing < need && available >= missing => continue,
                 Err(_) => {}
             }
             if recoverable {
@@ -6942,11 +7168,36 @@ impl Inner {
                     ),
                 });
             }
+            let Some(available) = convertible else {
+                return Err(AppError::ProvisioningTimeout {
+                    message: "an earlier credit conversion has not been answered yet, and \
+                              nothing is converted beside it; it is asked for again \
+                              separately, so try again later"
+                        .into(),
+                });
+            };
             return Err(AppError::InsufficientBalance {
-                available: balances.available,
+                available,
                 required: need,
             });
         }
+    }
+
+    /// [`Inner::recover_stranded_spends`] for a request waiting to be paid:
+    /// given up on at `deadline`, since the caller holds
+    /// [`Inner::spend_gate`]. Whether any hold settled.
+    ///
+    /// On a task of its own: a turn's future is deep already, and settling a
+    /// refund checks its proof on the stack.
+    async fn recover_stranded_spends_by(&self, deadline: tokio::time::Instant) -> bool {
+        let Some(inner) = self.self_ref.upgrade() else {
+            return false;
+        };
+        let recovery = tokio::spawn(async move { inner.recover_stranded_spends().await });
+        matches!(
+            tokio::time::timeout_at(deadline, recovery).await,
+            Ok(Ok(Ok(recovered))) if !recovered.is_empty()
+        )
     }
 
     /// Rename a space. **The existence check is the write's own**: a space can
@@ -8075,6 +8326,7 @@ impl Inner {
             weights_moved: false,
             model_participant_id,
             max_completion_tokens,
+            continues: continuation.is_some(),
             continuation,
             inf_item_id,
             inf_supersedes,
@@ -8303,7 +8555,7 @@ impl Inner {
         // overwrites `prep.spend`, which is the only in-memory handle to the
         // materials that settle the current one — so an unsettled hold would be
         // dropped mid-turn and its credential left `spending`, its face value
-        // locked out of the wallet until the next startup recovery sweep. The
+        // locked out of the wallet until a later recovery asks for it. The
         // round that took it normally settles it (inline refund, or recovery
         // when the response carries none); this is the last chance, and a
         // failure here ends the turn rather than spending a second credential
@@ -11030,6 +11282,7 @@ impl AppCore {
                 local: Arc::new(local_models::LocalRuntime::default()),
                 spend_gate: tokio::sync::Mutex::new(()),
                 issuance_gate: tokio::sync::Mutex::new(()),
+                spend_recovery_gate: tokio::sync::Mutex::new(()),
                 provisioner_started: std::sync::atomic::AtomicBool::new(false),
                 provision_check_ms: Mutex::new((
                     duration_ms(PROVISION_CHECK_MIN) as u64,
@@ -11424,15 +11677,16 @@ impl AppCore {
     }
 
     /// Add a trusted enclave measurement to the eidola backend row's override
-    /// list. Returns whether it was newly added (idempotent by SNP
-    /// measurement). Emits [`Change::Backends`] when it writes.
+    /// list: a SEV-SNP launch digest, the HOST_DATA (config hash) beside it,
+    /// and the guest policy. Returns whether it was newly added (idempotent
+    /// by digest and HOST_DATA). Emits [`Change::Backends`] when it writes.
     pub async fn trust_measurement(
         &self,
-        snp: String,
-        tdx_rtmr1: String,
-        tdx_rtmr2: String,
+        measurement: String,
+        host_data: String,
+        guest_policy: String,
     ) -> Result<bool, AppError> {
-        let spec = format!("{snp}:{tdx_rtmr1}:{tdx_rtmr2}");
+        let spec = format!("{measurement}:{host_data}:{guest_policy}");
         let entry = config::parse_trust_measurement(&spec)?;
         let inner = self.inner.clone();
         self.runtime
@@ -11441,11 +11695,12 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    /// Remove a trusted measurement (by SNP key) from the eidola backend
-    /// row's override list. Returns whether one was removed; clearing the
-    /// last reverts to the pin. Emits [`Change::Backends`] when it writes.
-    pub async fn untrust_measurement(&self, snp: String) -> Result<bool, AppError> {
-        let key = config::parse_untrust_key(&snp)?;
+    /// Remove a trusted measurement (by its `<measurement>:<host_data>` key,
+    /// or its whole trust spec) from the eidola backend row's override list.
+    /// Returns whether one was removed; clearing the last reverts to the
+    /// pin. Emits [`Change::Backends`] when it writes.
+    pub async fn untrust_measurement(&self, key: String) -> Result<bool, AppError> {
+        let key = config::parse_untrust_key(&key)?;
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.untrust_measurement(key).await })
@@ -11604,21 +11859,27 @@ impl AppCore {
     /// small buffer instead, issued at times unrelated to any request: at
     /// random intervals ([`PROVISION_CHECK_MIN`]..[`PROVISION_CHECK_MAX`], the
     /// first one interval after start) it recovers any issuance whose response
-    /// was lost, and issues one credential of [`DEFAULT_ALLOCATION_CREDITS`]
-    /// when what the wallet can spend past [`PROVISION_HORIZON`] is below
-    /// [`PROVISION_THRESHOLD_CREDITS`]. It keeps no buffer for a wallet that
+    /// was lost, and issues credentials of [`DEFAULT_ALLOCATION_CREDITS`]
+    /// ([`PROVISION_CREDENTIALS_PER_KEY`] under a key the account has not been
+    /// issued under, one more once it has them) when what the wallet can spend
+    /// past [`PROVISION_HORIZON`] is below [`PROVISION_THRESHOLD_CREDITS`]. It keeps no buffer for a wallet that
     /// has not spent within [`PROVISION_ACTIVITY_WINDOW`], issues nothing
     /// without an account, below a standard allocation of balance, or under a
     /// key that would lapse within the horizon, and prefers a key's early life
     /// ([`PROVISION_LATE_WINDOW`]). The just-in-time path stays as the
     /// fallback when nothing held covers a request.
     ///
+    /// **The same loop asks again for stranded holds**
+    /// ([`Inner::recover_stranded_spends`]): once inside each interval, at a
+    /// random point of its middle half, so the unlinked recovery of a spend
+    /// and the account-authenticated pass are never adjacent.
+    ///
     /// **For the long-lived process only** — the app, which holds the profile
     /// and answers for it over the control socket. A one-shot CLI invocation
     /// does not start it: it would exit before its first look. **On by
     /// default, with no setting**: the amounts and times are public constants,
-    /// what is held at once is bounded by the threshold plus one allocation,
-    /// an idle wallet is left alone, and turning it off would only restore the
+    /// what is held at once is bounded by the threshold plus
+    /// [`PROVISION_CREDENTIALS_PER_KEY`] allocations, an idle wallet is left alone, and turning it off would only restore the
     /// linkable default. Idempotent — at most one loop is ever spawned.
     pub fn start_credential_provisioner(&self) {
         if self
@@ -11635,11 +11896,24 @@ impl AppCore {
                     .provision_check_ms
                     .lock()
                     .expect("provision timing lock poisoned");
-                tokio::time::sleep(provision_delay(
+                let interval = provision_delay(
                     std::time::Duration::from_millis(min),
                     std::time::Duration::from_millis(max),
-                ))
+                );
+                // The look for stranded holds is an unlinked request and the
+                // provisioner's pass an account-authenticated one, so they
+                // are kept at least a quarter of the interval apart.
+                let before_sweep = provision_delay(interval / 4, interval * 3 / 4);
+                tokio::time::sleep(before_sweep).await;
+                let _ = tokio::time::timeout(
+                    PROVISION_PASS_DEADLINE,
+                    changes::with_origin(
+                        changes::ChangeOrigin::Unattended,
+                        Box::pin(inner.sweep_stranded_spends()),
+                    ),
+                )
                 .await;
+                tokio::time::sleep(interval.saturating_sub(before_sweep)).await;
                 // Offline, signed out, a server error: each is simply another
                 // look later. Nothing here is the reader's to see.
                 // Nobody is waiting on these writes.
@@ -11855,10 +12129,27 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Ask the gateway again for the refund of every stranded hold (a
+    /// credential left `spending` that no turn here is flying with), and
+    /// return the nonces settled. Unlinked requests only: a lost issuance
+    /// response is [`Self::recover_pending_issuances`]'s, and the
+    /// provisioner's.
     pub async fn recover_spending_credentials(&self) -> Result<Vec<String>, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.recover_spending_credentials().await })
+            .spawn(async move { inner.recover_stranded_spends().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Ask again for every issuance of this account whose response never
+    /// arrived. Account-authenticated: the provisioner does this at its own
+    /// random times, and this door is for the reader's explicit instruction
+    /// in a process that runs no provisioner.
+    pub async fn recover_pending_issuances(&self) -> Result<IssuanceRecovery, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.recover_pending_issuances().await })
             .await
             .map_err(join_err)?
     }
@@ -14130,6 +14421,7 @@ fn keyed_body(prep: &TurnPrep, body: &serde_json::Value) -> (reqwest::Body, usiz
     let space_id = prep.space_id.clone();
     let participant_id = prep.model_participant_id.clone();
     let model = prep.model.clone();
+    let weights = prep.resolved_sha256.clone();
     let scope = prep
         .cache_scope
         .clone()
@@ -14141,6 +14433,7 @@ fn keyed_body(prep: &TurnPrep, body: &serde_json::Value) -> (reqwest::Body, usiz
             &space_id,
             &participant_id,
             &model,
+            weights.as_deref(),
             &scope,
             clock.now_ms(),
         )
@@ -14250,6 +14543,10 @@ struct TurnPrep {
     /// first from new weights after an answer from other ones, and taken by
     /// [`Self::announce_moved_weights`] once the write has committed.
     weights_moved: bool,
+    /// Whether this is a [`ResponseMode::Continue`] turn, for all of its
+    /// rounds: its requests are pinned to the weights of the answer it
+    /// continues, and its actions say so ([`db::INTENT_CONTINUE`]).
+    continues: bool,
     /// The acting agent participant. Deliberately **no** scope alongside it:
     /// a turn spans HTTP round trips, and task 36's promotion can flip that
     /// scope mid-flight — so the pinned echo is derived from this id inside
@@ -14460,7 +14757,7 @@ impl SpendPrep {
     /// spend a credential and get nothing back. An in-band token that fails
     /// to apply is not retried through recovery here — the server would hand
     /// back the same token — and its input stays unsettled for a later
-    /// attempt and the startup sweep.
+    /// attempt and a later recovery ([`Inner::recover_stranded_spends`]).
     ///
     /// **Each successor written is announced at its write** (`Change::Wallet`
     /// on `bus`), before the next input's recovery is awaited: a recovery
@@ -14620,7 +14917,7 @@ async fn chosen_inputs(
 /// Which credentials pay for a request, chosen from the wallet in its spend
 /// order ([`db::spendable_credentials`]: soonest-lapsing key first, then
 /// smallest, then nullifier), by a rule with no thresholds
-/// (`docs/specs/act-multi-spend.md` §7.2):
+/// (`docs/anonymous-credits.md` → Spending several tokens in one request):
 ///
 /// 1. If the first credential covers the hold `W`, it pays alone, its share
 ///    `W`.
@@ -14882,7 +15179,8 @@ impl TurnPrep {
     /// would spend a credential and get nothing back. An in-band token that
     /// fails to apply is not retried through recovery here — the server would
     /// hand back the same token — and stays unsettled for
-    /// [`Inner::begin_next_round`]'s last-chance attempt and the startup sweep.
+    /// [`Inner::begin_next_round`]'s last-chance attempt and a later recovery
+    /// ([`Inner::recover_stranded_spends`]).
     ///
     /// Returns whether every input is settled; the `Wallet` emission is
     /// [`SpendPrep::settle`]'s. A no-op for a turn with no spend.
@@ -15009,7 +15307,8 @@ impl TurnPrep {
     /// under this model: the one write that changes what the participant's
     /// model notices say (`model_catalog::notices`' `Updated` compares the
     /// latest recorded hash with what the tag names now). The first hash
-    /// ever recorded moves nothing a notice reads.
+    /// ever recorded moves nothing a notice reads, and neither does a
+    /// continuation's, which that read skips.
     async fn record_resolved_hash(
         &mut self,
         action_id: &str,
@@ -15027,11 +15326,17 @@ impl TurnPrep {
         .await?;
         db::set_action_model_sha256(&self.db_conn, action_id, Some(&sha256)).await?;
         // A failed generation records which weights erred, and moves no
-        // notice: it is not an answer (`db::last_model_sha256`).
-        if answered && previous.is_some_and(|p| p != sha256) {
+        // notice: it is not an answer (`db::last_model_sha256`). Nor does a
+        // continuation, pinned to the weights of the answer it continues.
+        if answered && !self.continues && previous.is_some_and(|p| p != sha256) {
             self.weights_moved = true;
         }
         Ok(())
+    }
+
+    /// The `action.intent` of the model-call actions this turn writes.
+    fn action_intent(&self) -> Option<String> {
+        self.continues.then(|| db::INTENT_CONTINUE.to_string())
     }
 
     /// After a commit: when that write moved the participant's recorded
@@ -15116,7 +15421,7 @@ impl TurnPrep {
                 supersedes_action_id: None,
                 action_type: "tool_call".to_string(),
                 status: "complete".to_string(),
-                intent: None,
+                intent: self.action_intent(),
                 model: Some(self.model.clone()),
                 input_tokens,
                 output_tokens,
@@ -15562,7 +15867,7 @@ impl TurnPrep {
                 supersedes_action_id: self.inf_supersedes.clone(),
                 action_type: "inference".to_string(),
                 status: action_status.to_string(),
-                intent: None,
+                intent: self.action_intent(),
                 model: Some(self.model.clone()),
                 input_tokens,
                 output_tokens,
@@ -19040,9 +19345,9 @@ enum IssuanceAnswer {
 /// key, which decides what a refusal proves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IssuanceAttempt {
-    /// The first send. Any 4xx is the gateway (or something in front of it)
-    /// declining this one request, and it is the only one: nothing was
-    /// debited, and abandoning it strands nothing.
+    /// The first send, and so the only request under its key: a refusal the
+    /// gateway's issuance path itself gives means nothing was debited, and
+    /// abandoning it strands nothing ([`first_refusal_is_final`]).
     First,
     /// A retry after an answer that never arrived. The first attempt may have
     /// been debited and its response stored, or may still be in flight at the
@@ -19089,6 +19394,16 @@ fn retry_refusal_is_final(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 400 | 409 | 422)
 }
 
+/// Whether a first attempt's `status` is one of the refusals the gateway's
+/// issuance path gives, each before any debit: `400` and `422` (the request),
+/// `401` (authentication), `402` (the balance), `409` (the idempotency key or
+/// the named issuer key) and `428` (the terms). Any other status did not come
+/// from that path's own verdict on this request, so it proves nothing about
+/// whether the request reached the debit, and the issuance stays pending.
+fn first_refusal_is_final(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 400 | 401 | 402 | 409 | 422 | 428)
+}
+
 /// Send one issuance request.
 async fn send_issuance(
     client: &reqwest::Client,
@@ -19120,8 +19435,10 @@ async fn send_issuance(
         Err(e) => return IssuanceAnswer::Unknown(e),
     };
     if let Err(e) = check_status(status, &body) {
-        let refused = status.is_client_error()
-            && (attempt == IssuanceAttempt::First || retry_refusal_is_final(status));
+        let refused = match attempt {
+            IssuanceAttempt::First => first_refusal_is_final(status),
+            IssuanceAttempt::Retry => retry_refusal_is_final(status),
+        };
         return if refused {
             IssuanceAnswer::Refused(e)
         } else {
@@ -19695,7 +20012,7 @@ mod tests {
 
     /// **A spend's refund recovery key is a function of its stored
     /// `PreRefund` bytes, and of nothing the server sees.** The spend and every
-    /// later recovery (in the turn, or the startup sweep from the stored row)
+    /// later recovery (in the turn, or afterwards from the stored row)
     /// must rebuild the same key, and two spends must not share one.
     #[test]
     fn the_refund_recovery_key_is_rebuilt_from_the_stored_pre_refund() {
@@ -19829,7 +20146,7 @@ mod tests {
         }
     }
 
-    /// **The input rule** (`docs/specs/act-multi-spend.md` §7.2), over a
+    /// **The input rule** (`docs/anonymous-credits.md` → Spending several tokens in one request), over a
     /// wallet already in its spend order: the first credential alone when it
     /// covers the hold; otherwise drained, with the first *later* credential
     /// that covers the rest; otherwise a new credential for what is missing.
@@ -19933,7 +20250,7 @@ mod tests {
     }
 
     /// **The partial returns a response carries are checked against the
-    /// in-order allocation** (`docs/specs/act-multi-spend.md` §7.7): a drain
+    /// in-order allocation** (`docs/anonymous-credits.md` → Spending several tokens in one request): a drain
     /// consumed first and the change on the fill passes; change landing on
     /// the drain while the fill was charged does not, nor does a successor
     /// worth more than its predecessor.
@@ -20431,6 +20748,110 @@ mod tests {
         assert_eq!(model, config::DEFAULT_MODEL);
     }
 
+    /// **A profile opened under another trust domain keeps no key of the old
+    /// one.** A build with another compiled-in server URL or measurement
+    /// changes the domain with no write to the eidola row, so the open itself
+    /// forgets — overwritten, and gone from the database's files — every key
+    /// minted under another domain, and keeps the current domain's.
+    #[test]
+    fn opening_a_profile_forgets_the_keys_of_another_trust_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().to_path_buf();
+        let data_dir = dir.path().join("data");
+        let on_disk = |key: &[u8]| {
+            std::fs::read_dir(&data_dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.is_file())
+                .any(|p| {
+                    std::fs::read(p)
+                        .unwrap()
+                        .windows(key.len())
+                        .any(|w| w == key)
+                })
+        };
+
+        let core = AppCore::new(config_dir.clone(), data_dir.clone()).unwrap();
+        let spaces: Vec<String> = (0..2)
+            .map(|_| {
+                core.runtime
+                    .block_on(core.post_reply("How do tides work?".into(), None, None))
+                    .unwrap()
+                    .space_id
+            })
+            .collect();
+        let inner = core.inner.clone();
+        let (other, current) = core.runtime.block_on(async move {
+            let conn = inner.db_conn().await.unwrap();
+            let row = db::get_backend(&conn, backends::EIDOLA_BACKEND_ID)
+                .await
+                .unwrap();
+            let here = EidolaResolved::from_row(row.as_ref())
+                .unwrap()
+                .cache_trust_domain();
+            let mut keys = Vec::new();
+            // A lineage keyed by a build that resolved another domain, never
+            // used since; and one keyed under this build's.
+            for (space, domain) in spaces
+                .iter()
+                .zip(["another-build's-domain".to_string(), here])
+            {
+                let agent = db::list_space_owned_participants(&conn, space)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|p| p.kind == "agent")
+                    .unwrap();
+                let scope = prefix_cache::CacheScope {
+                    policy: prefix_cache::PromptCachePolicy {
+                        idle_ttl_ms: 900_000,
+                        max_age_ms: 7_200_000,
+                    },
+                    trust_domain: domain,
+                };
+                let model = canonical_model(agent.model_ref.as_deref().unwrap());
+                let claimed = db::claim_prefix_cache_key(
+                    &conn,
+                    space,
+                    &agent.id,
+                    &model,
+                    None,
+                    &scope,
+                    now_ms(),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(claimed, db::ClaimOutcome::Claimed(_)));
+                let mut rows = conn
+                    .query(
+                        "SELECT key_bytes FROM prefix_cache_key WHERE space_id = ?1",
+                        [turso::Value::Text(space.clone())],
+                    )
+                    .await
+                    .unwrap();
+                let row = rows.next().await.unwrap().unwrap();
+                keys.push(row.get::<Vec<u8>>(0).unwrap());
+            }
+            (keys.remove(0), keys.remove(0))
+        });
+        drop(core);
+        assert!(on_disk(&other), "the old key is stored (the premise)");
+
+        let core = AppCore::new(config_dir, data_dir.clone()).unwrap();
+        core.runtime.block_on(core.open_database()).unwrap();
+        assert!(
+            !on_disk(&other),
+            "a key of another trust domain is nowhere in the database's files"
+        );
+        assert!(on_disk(&current), "this domain's key is kept");
+        let inner = core.inner.clone();
+        let left = core.runtime.block_on(async move {
+            let conn = inner.db_conn().await.unwrap();
+            db::prefix_cache_lineages(&conn).await.unwrap()
+        });
+        assert_eq!(left.len(), 1);
+    }
+
     #[test]
     fn set_default_template_round_trips_and_rejects_blank() {
         let dir = tempfile::tempdir().unwrap();
@@ -20646,6 +21067,23 @@ mod tests {
         for code in [401, 402, 403, 404, 408, 413, 428, 429, 500, 502, 503] {
             assert!(
                 !retry_refusal_is_final(status(code)),
+                "{code} must stay pending"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_issuance_paths_own_refusals_end_a_first_attempt() {
+        let status = |code: u16| reqwest::StatusCode::from_u16(code).unwrap();
+        for code in [400, 401, 402, 409, 422, 428] {
+            assert!(
+                first_refusal_is_final(status(code)),
+                "{code} should be final"
+            );
+        }
+        for code in [403, 404, 405, 408, 413, 429, 431, 500, 502, 503] {
+            assert!(
+                !first_refusal_is_final(status(code)),
                 "{code} must stay pending"
             );
         }

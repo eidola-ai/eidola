@@ -2,7 +2,7 @@
 //!
 //! The gateway authenticates with a bearer token. The token is a secret delivered to the
 //! node as `GATEWAY_TOKEN`; its Argon2id hash is the measured half (`GATEWAY_TOKEN_HASH`),
-//! exactly as the server binds its injected secrets. Boot verifies the token against the
+//! exactly as the gateway binds its injected secrets. Boot verifies the token against the
 //! hash once and refuses to start on a mismatch, a malformed hash, or either value
 //! missing. Per request, the presented bearer is compared with the verified token in
 //! constant time (over SHA-256 digests, so the comparison does not depend on where the

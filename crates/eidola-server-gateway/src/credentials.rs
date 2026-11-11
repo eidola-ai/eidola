@@ -710,8 +710,44 @@ pub async fn record_spends(
             refund_token: sealed,
         })
         .collect();
-    let recorded = db::record_nullifiers(&state.db_pool, &rows).await?;
+    let recorded = match db::record_nullifiers(&state.db_pool, &rows).await {
+        Ok(recorded) => recorded,
+        // The insert's outcome is unknown: a commit can succeed while its
+        // acknowledgement is lost. Read the rows back before giving up, so a
+        // request whose inputs were in fact recorded goes on to settle them.
+        Err(e) => {
+            let mut stored = Vec::with_capacity(rows.len());
+            for row in &rows {
+                match db::get_refund_token(&state.db_pool, row.issuer_key_id, row.value).await {
+                    Ok(token) => stored.push(token),
+                    Err(_) => return Err(e),
+                }
+            }
+            if !recorded_by_this_call(&stored, &sealed) {
+                return Err(e);
+            }
+            true
+        }
+    };
     Ok(recorded.then_some(sealed))
+}
+
+/// Whether the rows read back after a recording whose outcome was unknown
+/// (`stored`, in input order) are the ones that recording wrote: every row
+/// present and holding exactly the token sealed for it (`sealed`). A seal's
+/// nonce is random, so a row another request recorded (a replay, a recovery)
+/// never holds this call's token. The insert is all or none, so anything
+/// short of every row is not this call's.
+fn recorded_by_this_call(
+    stored: &[Option<SealedRefundToken>],
+    sealed: &[SealedRefundToken],
+) -> bool {
+    stored.len() == sealed.len()
+        && stored.iter().zip(sealed).all(|(stored, sealed)| {
+            stored
+                .as_ref()
+                .is_some_and(|stored| stored.as_bytes() == sealed.as_bytes())
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -988,6 +1024,26 @@ fn epoch_to_mint(
     Ok(Some(wanted))
 }
 
+/// Most passes [`ensure_keys`] makes over the database before it loads what
+/// is there: two can each mint a key, and the rest are for races lost to
+/// another instance.
+const MINT_ATTEMPTS: u32 = 8;
+
+/// The pause before the first retry of a lost race; each later one waits one
+/// more.
+const MINT_RETRY_PAUSE: Duration = Duration::from_millis(50);
+
+/// Whether a failed mint lost a race to another instance minting the same
+/// epoch's key: a serialization failure (SQLSTATE 40001), or the table's
+/// one-key-per-epoch constraint refusing the second row (23505). Either way
+/// the other instance's row is there to be read.
+fn lost_mint_race(e: &ServerError) -> bool {
+    let ServerError::Internal(message) = e else {
+        return false;
+    };
+    message.contains("(sqlstate 40001)") || message.contains("(sqlstate 23505)")
+}
+
 /// Ensure that the current epoch's key and the next epoch's key exist in the
 /// database and are cached in memory. Returns the current key's hash (for
 /// issuance).
@@ -1019,7 +1075,7 @@ pub async fn ensure_keys(
 
     // Slow path: check the database and provision any missing keys.
     // We may need to create up to 2 keys (current + next), or just the next one.
-    loop {
+    for attempt in 0..MINT_ATTEMPTS {
         let mk = *master_key;
         let held: std::collections::HashSet<u64> =
             key_cache.read().await.values().map(|k| k.epoch).collect();
@@ -1061,10 +1117,11 @@ pub async fn ensure_keys(
                 break;
             }
             Err(e) => {
-                // Serialization failure means another instance raced us — retry.
-                let msg = format!("{e:?}");
-                if msg.contains("serialization") || msg.contains("40001") {
-                    info!("key provisioning serialization conflict, retrying");
+                // Another instance raced us: read again, and mint only what
+                // is still missing.
+                if lost_mint_race(&e) && attempt + 1 < MINT_ATTEMPTS {
+                    info!("key provisioning conflict, retrying");
+                    tokio::time::sleep(MINT_RETRY_PAUSE * (attempt + 1)).await;
                     continue;
                 }
                 return Err(e);
@@ -1244,7 +1301,7 @@ pub fn verify_and_sign_full_refund(
     let key = usable_key(cache, &act.issuer_key_hash, KeyUse::Refund, now)?;
     check_presented_context(key, act)?;
     // `t = s`. Any refusal is the proof's: a verified proof's charge fits the
-    // credential's 128 bits, and `t = s` is within `0 <= t <= s`.
+    // credential's `L` bits (`ACT_L`), and `t = s` is within `0 <= t <= s`.
     let refund =
         verify_and_refund(key, act, act.spend_proof.charge()).map_err(|_| invalid_spend_proof())?;
     SignedRefund::encode(act, refund)
@@ -1974,7 +2031,7 @@ pub(crate) async fn recover_presented_refund(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -2351,15 +2408,15 @@ mod tests {
     use anonymous_credit_tokens::{CreditToken, PreIssuance, PublicKey, scalar_to_credit};
 
     const HOUR: Duration = Duration::from_secs(3600);
-    const DAY: Duration = Duration::from_secs(86400);
+    pub(crate) const DAY: Duration = Duration::from_secs(86400);
 
-    type Cache = HashMap<[u8; 32], DecryptedIssuerKey>;
+    pub(crate) type Cache = HashMap<[u8; 32], DecryptedIssuerKey>;
 
     /// Cache a fresh key whose acceptance window ends at `accept_until`,
     /// returning its hash. (Keys are built straight into the map: `Params`
     /// is large enough that holding several on an unoptimized test stack
     /// overflows it.)
-    fn add_key(cache: &mut Cache, accept_until: SystemTime) -> [u8; 32] {
+    pub(crate) fn add_key(cache: &mut Cache, accept_until: SystemTime) -> [u8; 32] {
         let secret_key = PrivateKey::random(OsRng);
         let public_key = secret_key.public().to_cbor().unwrap();
         let key_hash = compute_key_hash(&public_key);
@@ -2404,7 +2461,7 @@ mod tests {
 
     /// Spend `charge` of a fresh credential under `key`, returning the token
     /// the server sees and the client's pre-refund state.
-    fn spend(
+    pub(crate) fn spend(
         key: &DecryptedIssuerKey,
         credits: u128,
         charge: u128,
@@ -3209,6 +3266,119 @@ mod tests {
         }
     }
 
+    /// A request refused after its nullifier is recorded is settled with its
+    /// final refund even when its handler is dropped first (the client went
+    /// away): the settlement runs in the request's own task. Held at the key
+    /// cache so the handler is dropped while the settlement is still waiting.
+    #[test]
+    fn a_refused_request_is_settled_after_its_handler_is_dropped() {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(a_refused_request_is_settled_without_its_handler())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn a_refused_request_is_settled_without_its_handler() {
+        let mut keys = Cache::new();
+        let hash = add_key(&mut keys, SystemTime::now() + DAY);
+        let (act, _) = spend(&keys[&hash], 100, 10);
+        let proof = act.spend_proof.clone();
+        let state = unreachable_state(keys);
+        crate::handlers::check_presented_spends(&state, std::slice::from_ref(&act))
+            .await
+            .unwrap();
+        assert_eq!(verification_count::of(&proof), 1);
+
+        let validated =
+            crate::engine_trust::protocol::ValidatedRequest::from_bytes(bytes::Bytes::from_static(
+                br#"{"model":"unknown","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+            ))
+            .unwrap();
+        let live = Arc::new(state.live_spends.serve(&act));
+        let recording = async move {
+            Ok(crate::handlers::tests::paid_inputs(
+                vec![crate::auth::ActSpend {
+                    live: Some(live),
+                    ..act
+                }],
+                vec![10],
+            ))
+        };
+
+        let settling = state.credential_key_cache.clone().write_owned().await;
+        let mut handler = Box::pin(crate::handlers::run_paid_request(
+            state.clone(),
+            validated,
+            Err(crate::models::ModelRefError::Unknown),
+            recording,
+        ));
+        for _ in 0..10 {
+            assert!(futures_util::poll!(&mut handler).is_pending());
+            tokio::task::yield_now().await;
+        }
+        drop(handler);
+        drop(settling);
+
+        let key_id = hex::encode(hash);
+        let nullifier = proof.nullifier().as_bytes().to_vec();
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while verification_count::of(&proof) < 2 || state.live_spends.is_live(&key_id, &nullifier) {
+            assert!(
+                std::time::Instant::now() < until,
+                "the request was never settled"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A mint refused by a serialization failure or by the one-key-per-epoch
+    /// constraint lost a race and is read again; any other failure is not.
+    #[test]
+    fn a_mint_that_lost_a_race_is_recognised() {
+        let internal = |m: &str| ServerError::Internal(m.to_string());
+        assert!(lost_mint_race(&internal(
+            "commit failed: db error (sqlstate 40001)"
+        )));
+        assert!(lost_mint_race(&internal(
+            "insert issuer_key failed: db error (sqlstate 23505)"
+        )));
+        assert!(!lost_mint_race(&internal(
+            "insert issuer_key failed: db error (sqlstate 23514)"
+        )));
+        assert!(!lost_mint_race(&internal("db pool error: closed")));
+        assert!(!lost_mint_race(&ServerError::ServiceUnavailable(
+            "(sqlstate 23505)".to_string()
+        )));
+    }
+
+    /// A recording whose outcome was unknown is this call's only when every
+    /// row read back holds exactly the token this call sealed for it.
+    #[test]
+    fn an_unacknowledged_recording_is_recognised_by_its_own_tokens() {
+        let token = |b: u8| SealedRefundToken::from_stored(vec![b; 8]);
+        let sealed = [token(1), token(2)];
+        assert!(recorded_by_this_call(
+            &[Some(token(1)), Some(token(2))],
+            &sealed
+        ));
+        // Not recorded, recorded in part, or recorded by another request.
+        assert!(!recorded_by_this_call(&[None, None], &sealed));
+        assert!(!recorded_by_this_call(&[Some(token(1)), None], &sealed));
+        assert!(!recorded_by_this_call(
+            &[Some(token(1)), Some(token(3))],
+            &sealed
+        ));
+        assert!(!recorded_by_this_call(&[Some(token(1))], &sealed));
+    }
+
     /// A request's inputs are recorded all or none, against Postgres: an
     /// input already recorded (a replay, or a recovery that raced the
     /// request) leaves the other unrecorded, and its recovery is then a full
@@ -3443,7 +3613,7 @@ mod tests {
     }
 
     /// An `AppState` holding `keys`, whose database is unreachable.
-    fn unreachable_state(keys: Cache) -> AppState {
+    pub(crate) fn unreachable_state(keys: Cache) -> AppState {
         let pool = db::create_pool(
             "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
             None,
@@ -4071,7 +4241,7 @@ mod tests {
         let mut calls = Vec::new();
         for (path, text) in &files {
             let shipped = text
-                .find("\n#[cfg(test)]\nmod tests")
+                .find("\n#[cfg(test)]\npub(crate) mod tests")
                 .map_or(text.as_str(), |end| &text[..end]);
             for pattern in [".refund(", ".refund::<", "::refund(", "::refund::<"] {
                 for (at, _) in shipped.match_indices(pattern) {

@@ -530,6 +530,19 @@ impl Session {
         }
     }
 
+    /// Ask again for this account's issuances whose answer never arrived.
+    /// `None` when another process answers for the profile: its provisioner
+    /// asks at its own times, and an account-authenticated request is not
+    /// sent on a caller's behalf beside the recovery of a spend.
+    pub async fn recover_pending_issuances(
+        &self,
+    ) -> Result<Option<eidola_app_core::IssuanceRecovery>, Failure> {
+        match &self.mode {
+            Mode::Embedded(core) => Ok(Some(core.recover_pending_issuances().await?)),
+            Mode::Client { .. } => Ok(None),
+        }
+    }
+
     pub async fn recover_spending_credentials(&self) -> Result<Vec<String>, Failure> {
         match &self.mode {
             Mode::Embedded(core) => Ok(core.recover_spending_credentials().await?),

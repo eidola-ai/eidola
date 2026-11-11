@@ -350,6 +350,7 @@ impl DelegationFailure {
             | AppError::IssuerKeyRefused { .. } => Self::Funding,
             AppError::NotConfigured { .. }
             | AppError::ModelUnavailable { .. }
+            | AppError::LocalModelNotDownloaded { .. }
             // Unreachable from a driven turn (only a notice's action raises
             // it); a stale choice of model is a configuration matter.
             | AppError::ModelNoticeStale { .. }

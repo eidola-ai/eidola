@@ -1540,6 +1540,27 @@ impl DraftBuffers {
     }
 }
 
+impl DraftBuffers {
+    /// Every buffer, whole (the executor's idle scrub; zeroed in place, the
+    /// graphs captured their addresses). The level buffer's zero row stays
+    /// zero.
+    pub(crate) fn ranges(&self, s: &cudarc::driver::CudaStream) -> Vec<crate::launch::DeviceRange> {
+        use crate::launch::DeviceRange;
+        let DraftBuffers {
+            levels,
+            target,
+            probs,
+            readback,
+        } = self;
+        vec![
+            DeviceRange::of("draft.levels", levels, s),
+            DeviceRange::of("draft.target", target, s),
+            DeviceRange::of("draft.probs", probs, s),
+            DeviceRange::of("draft.readback", readback, s),
+        ]
+    }
+}
+
 /// What a drafted step's launches run against besides the table: the
 /// model, the KV store and the drafting buffers.
 pub(crate) struct RunTarget<'a> {
@@ -2174,6 +2195,12 @@ impl DraftGraphs {
         gpu.stream()
             .memcpy_htod(words, &mut self.table.slice_mut(..words.len()))?;
         Ok(())
+    }
+
+    /// The step table (the executor's idle scrub; zeroed in place, the
+    /// graphs captured its address).
+    pub(crate) fn table_range(&self, s: &cudarc::driver::CudaStream) -> crate::launch::DeviceRange {
+        crate::launch::DeviceRange::of("draft.graph_table", &self.table, s)
     }
 
     pub(crate) fn table_ptr(&self, s: &cudarc::driver::CudaStream) -> u64 {

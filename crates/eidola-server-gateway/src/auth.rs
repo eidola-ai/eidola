@@ -1,4 +1,4 @@
-//! Authorization for the Eidola server.
+//! Authorization for the Eidola gateway.
 //!
 //! A metered request pays with ACT (Anonymous Credit Token) spend proofs,
 //! following draft-schlesinger-privacypass-act-01, presented in the request

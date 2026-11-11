@@ -1,6 +1,6 @@
 # Releases
 
-A **release** is the *unit of trust*. When a user is running Eidola release N, what they are trusting is the entire collection that comprises release N — every artifact, the paired server, build inputs, measurements, and the signatures attesting to them. This page explains how a new release becomes trustable.
+A **release** is the unit of trust: every artifact, the paired gateway, the inference engine deployments that gateway accepts, the build inputs, the measurements, and the signatures attesting to them. This page explains how a new release becomes trustable.
 
 How those artifacts are hashed, what a user `shasum`s, and the payload / archive / envelope / installable split live in [verification.md](verification.md). The compile-time pin set is [trust-root.md](trust-root.md).
 
@@ -9,7 +9,7 @@ How those artifacts are hashed, what a user `shasum`s, and the payload / archive
 A single release ships:
 
 - A **client artifact** for each supported platform (macOS and Linux GUI, CLI) whose **payload** embeds the trust root at compile time.
-- A **server image** (OCI **archive**) built reproducibly from the same source commit, whose confidential-compute measurement matches the value embedded in the client.
+- A **server image** (OCI **archive**) built reproducibly from the same source commit, whose confidential-compute measurement matches the value embedded in the client. The inference engine deployments the gateway accepts are pinned inside that image ([engine.md](engine.md#what-pins-the-engine)), so the client's one pin covers them too.
 - A signed **artifact manifest** (`artifact-manifest.json`) recording each artifact’s archive identity (`digest` or `archiveSha256`), Nix `narHash` where applicable, and the enclave measurement.
 - One or more **human attestations**, each signed under a pinned engineer's hardware-bound key, with their Sigstore Rekor inclusion proof. The attestation also binds Apple **envelope** / **installable** hashes, which must not appear in the CI-signed manifest.
 
@@ -59,10 +59,8 @@ If any step fails, the update is rejected. There is no override prompt.
 
 ## Why each piece is necessary
 
-A reader might ask: why is CI's signature not enough? Why is a single engineer's attestation not enough?
-
-- **CI alone is not enough.** A compromise of GitHub, the OIDC flow, or the workflow definition gives an attacker the CI signature. But CI cannot mint a `cosign sign-blob` from an engineer's hardware-held key. The human attestation is the defense-in-depth against pipeline compromise.
-- **A single human alone is not enough.** A single attestant is one legal target. The minimum-attestant policy (`MIN_HUMAN_ATTESTATIONS`) is pinned in the *prior* client, so a coerced engineer cannot lower the threshold by shipping a release that requires fewer signatures. **Today** `MIN_HUMAN_ATTESTATIONS` is `1` — the framework supports arbitrary M-of-N, but only one attestant key is currently provisioned. As additional attestants are onboarded, the threshold will be raised through the same release process that any other trust-constants change uses. See [gaps.md](gaps.md#single-attestant-policy).
+- **CI alone is not enough.** A compromise of GitHub, the OIDC flow, or the workflow definition gives an attacker the CI signature. CI cannot produce a signature from an engineer's hardware-held key, so the human attestation defends against pipeline compromise.
+- **A single human alone is not enough.** A single attestant is one legal target. The minimum-attestant policy (`MIN_HUMAN_ATTESTATIONS`) is pinned in the *prior* client, so a coerced engineer cannot lower the threshold by shipping a release that requires fewer signatures. **Today** `MIN_HUMAN_ATTESTATIONS` is `1`: the verifier supports M-of-N, but one attestant key is provisioned. Raising the threshold is a trust-constants change that goes through a release like any other. See [gaps.md](gaps.md#single-attestant-policy).
 - **Sigstore Rekor is not enough.** Sigstore proves that *a signature exists in a public log*. It does not prove that the signer was acting freely, that the source matches the release, or that the release does not weaken guarantees. The structured claims are what add that semantic content.
 
 ## Schema versions: every change is breaking

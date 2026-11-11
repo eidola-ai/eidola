@@ -1,7 +1,7 @@
 //! From a validated request to engine tokens, and from engine tokens to OpenAI output.
 //!
 //! In: the chat crate renders the prompt with the model's own template (byte-exact),
-//! tokenizes it, and the request becomes an engine [`Request`] with checked
+//! tokenizes it (request data never as a control token), and the request becomes an engine [`Request`] with checked
 //! [`SamplingParams`] and a [`CacheScope`]: the client's key turned into its lineage (the
 //! engine salt and the idle-KV key, by the per-boot HMAC) and dropped, or
 //! [`CacheScope::Private`] without one.
@@ -10,6 +10,7 @@
 //! sequences (applied here, to the decoded text, since the core leaves them to its
 //! caller), then the reasoning and tool-call parsers ([`OutputParser::push_text`]).
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use eidola_engine::engine::{CacheScope, FinishReason as EngineFinish, Request, RequestId};
@@ -91,11 +92,13 @@ pub fn prepare(
     };
     let prompt = model
         .template()
-        .render(&input, options)
+        .render_prompt(&input, options)
         .map_err(|e| ApiError::invalid(e.to_string()))?;
+    // Only the template's own text becomes control tokens: one spelled by the
+    // request's data is encoded as the text it is.
     let tokens = model
         .tokenizer()
-        .encode(&prompt)
+        .encode_prompt(&prompt)
         .map_err(|e| ApiError::invalid(e.to_string()))?;
     let prompt_tokens = tokens.len() as u32;
     if prompt_tokens >= max_model_len {
@@ -160,7 +163,19 @@ pub struct Decoder {
     completion_tokens: u32,
     done: bool,
     window_bound: bool,
+    skip_special_tokens: bool,
+    /// Bytes of text the detokenizer has given out.
+    decoded: usize,
+    /// Where in that text the model sampled an added token, for
+    /// [`OutputParser::resumes_exactly_as_tokens`]. Holds no more than
+    /// [`MAX_TRACKED_ADDED`]: a continuable ending has at most two.
+    added: Vec<Range<usize>>,
+    /// The model sampled a special token the text does not show, so nothing
+    /// given out can render it back.
+    dropped_token: bool,
 }
+
+const MAX_TRACKED_ADDED: usize = 3;
 
 impl Decoder {
     pub fn new(
@@ -171,6 +186,10 @@ impl Decoder {
     ) -> Self {
         Decoder {
             model,
+            skip_special_tokens: output.skip_special_tokens,
+            decoded: 0,
+            added: Vec::new(),
+            dropped_token: false,
             detok: Detokenizer::new(output.skip_special_tokens),
             stop: StopMatcher::new(stop),
             parser: OutputParser::new(output, PrefixedCallIds(call_prefix)),
@@ -212,6 +231,15 @@ impl Decoder {
                 .detok
                 .push(tokenizer, t)
                 .map_err(|_| ApiError::Internal("the engine produced an unknown token"))?;
+            self.decoded += text.len();
+            if self.skip_special_tokens && tokenizer.is_special(t) {
+                self.dropped_token = true;
+            } else if tokenizer.is_added(t) && self.added.len() < MAX_TRACKED_ADDED {
+                // An added token's text is whole characters, so it ends the text
+                // this push gave out.
+                let len = tokenizer.token_bytes(t).map_or(0, <[u8]>::len);
+                self.added.push(self.decoded - len..self.decoded);
+            }
             let (released, matched) = self.stop.push(&text);
             append(&mut step.delta, self.parser.push_text(&released));
             if matched {
@@ -255,10 +283,16 @@ impl Decoder {
             if reason == FinishReason::Length {
                 // Continuable only where a continuation would be exact and could
                 // run: not at the context window (no room is left for one), not
-                // inside a held stop sequence, and only where the chat layer says
-                // what it gave out renders the generated text and resumes its parse.
-                step.continuable =
-                    Some(!self.window_bound && !stop_held && self.parser.resumes_exactly());
+                // inside a held stop sequence, not after a sampled token the text
+                // does not show, and only where the chat layer says what it gave
+                // out renders the generated text, encodes to the added tokens the
+                // model sampled, and resumes its parse.
+                step.continuable = Some(
+                    !self.window_bound
+                        && !stop_held
+                        && !self.dropped_token
+                        && self.parser.resumes_exactly_as_tokens(&self.added),
+                );
             }
             step.finish = Some(reason);
             self.done = true;

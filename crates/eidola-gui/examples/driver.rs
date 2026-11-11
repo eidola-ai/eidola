@@ -1501,7 +1501,7 @@ mod driver {
             source: "owned".into(),
             kind: "agent".into(),
             label: "Assistant".into(),
-            model_ref: Some("gemma4-31b".into()),
+            model_ref: Some(eidola_app_core::config::DEFAULT_MODEL.into()),
             model_notices: Vec::new(),
             system_prompt: Some("Be concise and cite sources.".into()),
             notify_policy: "human".into(),
@@ -1535,8 +1535,8 @@ mod driver {
                 router_model: None,
                 participants: vec![TemplateParticipantInfo {
                     id: "t-default-1".into(),
-                    label: "Assistant".into(),
-                    model_ref: Some("gemma4-31b".into()),
+                    label: "Gemma 4 E4B".into(),
+                    model_ref: Some(eidola_app_core::config::DEFAULT_MODEL.into()),
                     system_prompt: None,
                     notify_policy: "human".into(),
                 }],
@@ -1727,10 +1727,10 @@ mod driver {
             trusted_measurements: Vec::new(),
             trusted_measurements_are_override: false,
             pinned_measurement: eidola_app_core::MeasurementInfo {
-                snp: "1122334455667788112233445566778811223344556677881122334455667788".into(),
-                tdx_rtmr1: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+                measurement: "112233445566778811223344556677881122334455667788112233445566778811223344556677881122334455667788".into(),
+                host_data: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
                     .into(),
-                tdx_rtmr2: "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa"
+                guest_policy: "0x30133"
                     .into(),
             },
             has_hardware_root_ca: false,

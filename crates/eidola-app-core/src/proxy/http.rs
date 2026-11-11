@@ -619,7 +619,7 @@ pub(crate) fn app_error_response(error: &AppError) -> Response<ProxyBody> {
             None,
             Disclosure::Fixed("This proxy could not verify its upstream."),
         ),
-        AppError::LocalModel { .. } => (
+        AppError::LocalModel { .. } | AppError::LocalModelNotDownloaded { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             "server_error",
             None,

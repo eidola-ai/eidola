@@ -164,8 +164,8 @@ CREATE TABLE credential (
 -- (0). The 'local' backend always auto-starts (it's ours).
 --
 -- trusted_measurements: for the 'eidola' backend only, a JSON
--- array of enclave-measurement overrides ({snp_measurement,
--- tdx_measurement:{rtmr1,rtmr2}}). NULL/absent = the single build
+-- array of SEV-SNP launch-identity overrides ({measurement,
+-- host_data, guest_policy}). NULL/absent = the single build
 -- measurement pinned in the trust root.
 --
 -- hardware_root_ca / hardware_intermediate_ca: for the 'eidola'
@@ -1018,9 +1018,11 @@ CREATE INDEX idx_request_credential
 -- value when the catalog's retention says the engine can no
 -- longer hold the lineage's cache — idle past `idle_ttl_secs`,
 -- older than `max_age_secs` — or when it would cross a boundary:
--- a different `model`, a different `trust_domain` (the digest of
--- the eidola endpoint and trust bundle it was minted under), or
--- a clock that ran backwards. So no key outlives the cache it
+-- a different `model` (the weights hash the turn resolved to,
+-- `sha256:<hex>`, or the selection where the catalog publishes
+-- none), a different `trust_domain` (the digest of the eidola
+-- endpoint and trust bundle it was minted under), or a clock
+-- that ran backwards. So no key outlives the cache it
 -- unlocks, and none reaches two trust domains.
 --
 -- A key is overwritten in place before it is replaced or

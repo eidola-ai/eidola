@@ -79,6 +79,17 @@ build system:
         ;;
     esac
 
+# Build the inference node's OCI image the way CI does (Docker, linux/amd64:
+# emulated on other hosts, and slow there) and print its digest, the value an
+# engine deployment's tinfoil-config.yml pins.
+engine-image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    metadata="$(mktemp)"
+    trap 'rm -f "$metadata"' EXIT
+    ./scripts/artifact-manifest.sh build --ensure-builder --targets server-engine --metadata-file "$metadata"
+    jq -r '."server-engine"."containerimage.digest"' "$metadata"
+
 # Build the inference engine's GPU kernels ahead of time on a GPU-less Linux
 # builder (pinned Nix in a pinned container; requires Docker). `--verify` fails
 # unless the result equals the committed kernels.manifest.json byte for byte;

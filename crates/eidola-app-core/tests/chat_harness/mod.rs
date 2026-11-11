@@ -650,6 +650,11 @@ pub struct MockConfig {
     /// the default — publishes none, the shape of a gateway older than
     /// hash-keyed models.
     pub published_sha256: PublishedSha,
+    /// Weights `GET /v1/models` also lists, under no tag: the row a release
+    /// leaves behind when it moves [`MODEL`]'s tag to other weights while the
+    /// earlier ones are still served. Otherwise [`MODEL`]'s row. `None` — the
+    /// default — lists none.
+    pub untagged_sha256: PublishedSha,
     /// When set, the **next** chat request is answered with this non-2xx
     /// status (an error document) and the setting clears, whatever `chat`
     /// says — so a test can fail one turn between ordinary ones.
@@ -896,6 +901,7 @@ impl Default for MockConfig {
             declared_prompt_cache: None,
             declared_max_output: None,
             published_sha256: PublishedSha::default(),
+            untagged_sha256: PublishedSha::default(),
             fail_next_chat: FailNextChat::default(),
             close_switch: CloseSwitch::default(),
             list_flat_model: false,
@@ -1155,8 +1161,8 @@ impl MockServer {
 // Participant-aware upstream rendering (roles + headers)
 // ===========================================================================
 
-/// The label of the seeded default agent — `db::default_agent_label` over the
-/// compiled-in `DEFAULT_MODEL`, which the harness's [`MODEL`] matches.
+/// The label of the harness profile's default agent — `db::default_agent_label`
+/// over [`MODEL`], the model [`core_for`] seats it on.
 pub const DEFAULT_AGENT_LABEL: &str = "Gemma4 31b";
 
 /// The shared human participant's label. Viewpoint-neutral on the wire since
@@ -3822,6 +3828,18 @@ fn models_body(config: &MockConfig) -> String {
         primary["sha256"] = serde_json::json!(sha256);
         primary["tags"] = serde_json::json!([MODEL]);
     }
+    let untagged = config
+        .untagged_sha256
+        .lock()
+        .expect("untagged hash lock poisoned")
+        .clone()
+        .map(|sha256| {
+            let mut row = primary.clone();
+            row["id"] = serde_json::json!(format!("sha256:{sha256}"));
+            row["sha256"] = serde_json::json!(sha256);
+            row["tags"] = serde_json::json!([]);
+            row
+        });
     let router = serde_json::json!({
         "id": ROUTER_REMOTE_MODEL,
         "context_length": 8192u64,
@@ -3850,6 +3868,7 @@ fn models_body(config: &MockConfig) -> String {
     let listed: Vec<serde_json::Value> = [primary, router]
         .into_iter()
         .chain(config.list_flat_model.then_some(flat))
+        .chain(untagged)
         .filter(|entry| {
             let id = entry["id"].as_str().unwrap_or_default();
             !omitted.iter().any(|o| o == id)
@@ -4088,8 +4107,35 @@ pub fn core_for(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) 
     core.runtime()
         .block_on(core.set_base_url(mock.base_url.clone()))
         .expect("set base url");
+    seat_default_agent_on_mock(&core);
     (mock, core, dir)
 }
+
+/// Re-seat the Default template's one agent on the mock's [`MODEL`], labelled
+/// [`DEFAULT_AGENT_LABEL`], so a space created from it is answered over the
+/// mock. The compiled default is a local model, which a harness profile has no
+/// file or engine for; `tests/template_seed.rs` and `tests/bus.rs` hold the
+/// real seed.
+fn seat_default_agent_on_mock(core: &AppCore) {
+    core.runtime()
+        .block_on(core.update_template(
+            eidola_app_core::DEFAULT_TEMPLATE_ID.into(),
+            None,
+            None,
+            Some(vec![eidola_app_core::NewTemplateParticipant {
+                label: DEFAULT_AGENT_LABEL.into(),
+                model_ref: Some(MODEL.into()),
+                system_prompt: Some(SEEDED_AGENT_SYSTEM_PROMPT.into()),
+                notify_policy: "human".into(),
+            }]),
+        ))
+        .expect("seat the default agent on the mock's model");
+}
+
+/// The generic prompt the seeded default agent carries
+/// (`db::DEFAULT_AGENT_SYSTEM_PROMPT`), kept on the re-seated agent.
+const SEEDED_AGENT_SYSTEM_PROMPT: &str =
+    "You are a helpful assistant. Answer clearly and concisely.";
 
 /// Re-open an `AppCore` over a directory a previous one used — the **restart**
 /// seam.

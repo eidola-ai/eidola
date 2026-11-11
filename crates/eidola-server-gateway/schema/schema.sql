@@ -1,5 +1,5 @@
 -- Eidola Billing Schema
--- Targeting PostgreSQL 16+
+-- Targeting PostgreSQL 17+
 --
 -- This schema covers the "identified" side of the system: accounts, payments,
 -- credit balances, and credential provisioning records. It also includes issuer

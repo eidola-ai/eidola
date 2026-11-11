@@ -91,7 +91,9 @@ fn group_block_bytes(g: &KvGroupSpec, sizing: &Sizing, hidden: u32) -> Result<u6
 /// sum to at most `H`, which the gateway's build charges to the VM's memory
 /// (`engine_deployment::check_resources`). The host tier takes what the device pools hold
 /// when they run short, in the same mix. 0 gives no host tier; a budget too small for two
-/// blocks in every group is refused.
+/// blocks in every group is refused. The least accepted budget is
+/// `eidola_common::engine_deployment::cuda_kv_host_min_bytes`, which the gateway's build
+/// holds every pinned deployment to; the two are kept equal by a test here.
 pub fn derive_host_blocks(
     spec: &ModelSpec,
     hidden: u32,
@@ -615,6 +617,55 @@ mod tests {
                         derive_kv_blocks(&spec, 4096, min - 1, &sizing, &cache(enabled)).is_err(),
                         "{at:?}"
                     );
+                }
+            }
+        }
+    }
+
+    /// The gateway's build holds a pinned deployment's non-zero host tier to
+    /// `cuda_kv_host_min_bytes`; it is exactly the least the host derivation accepts
+    /// for the device pools the same configuration derives, across block sizes, seats,
+    /// step sizes, the draft width and device budgets.
+    #[test]
+    fn the_shared_host_minimum_is_the_derivations() {
+        use eidola_common::architecture::MIMO_V26_FLASH;
+        use eidola_common::engine_deployment::{cuda_kv_host_min_bytes, cuda_kv_min_bytes};
+        for block in [1, 16, 64, 1024] {
+            for (seats, step) in [(1, 4), (8, 512), (64, 8192)] {
+                for draft in [0, 1, 3] {
+                    let sizing = Sizing {
+                        kv_block_size: block,
+                        max_seqs: seats,
+                        max_batched_tokens: step,
+                        max_prefill_chunk: step,
+                        draft_tokens: draft,
+                        ..sizing()
+                    };
+                    let mut spec = flash_drafting(draft);
+                    spec.block_size = block;
+                    let least = cuda_kv_min_bytes(&MIMO_V26_FLASH, &sizing, &cache(true));
+                    for device_bytes in [least, least + 12_345, 3 * least, 200 << 30] {
+                        let at = (block, seats, step, draft, device_bytes);
+                        let device =
+                            derive_kv_blocks(&spec, 4096, device_bytes, &sizing, &cache(true))
+                                .unwrap_or_else(|e| panic!("{at:?}: {e}"));
+                        let min = cuda_kv_host_min_bytes(
+                            &MIMO_V26_FLASH,
+                            &sizing,
+                            &cache(true),
+                            device_bytes,
+                        );
+                        let host = derive_host_blocks(&spec, 4096, min, &sizing, &device)
+                            .unwrap_or_else(|e| panic!("{at:?}: {e}"));
+                        assert!(
+                            host.global.min(host.sliding) >= 2 && (draft == 0 || host.drafter >= 2),
+                            "{at:?}: {host:?}"
+                        );
+                        assert!(
+                            derive_host_blocks(&spec, 4096, min - 1, &sizing, &device).is_err(),
+                            "{at:?}"
+                        );
+                    }
                 }
             }
         }

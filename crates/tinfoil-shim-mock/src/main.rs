@@ -6,6 +6,7 @@
 //!   UPSTREAM_URL    - upstream server URL (default: http://127.0.0.1:8080)
 //!   LISTEN_ADDR     - address to bind (default: 0.0.0.0:8443)
 //!   DEV_MEASUREMENT - measurement to advertise (default: 48 zero bytes hex)
+//!   DEV_HOST_DATA   - HOST_DATA to advertise (default: 32 zero bytes hex)
 //!   CERT_DIR        - directory to store persistent certs (default: .dev-certs)
 
 use std::net::SocketAddr;
@@ -37,11 +38,19 @@ async fn main() -> Result<(), BoxError> {
         std::env::var("DEV_MEASUREMENT").unwrap_or_else(|_| DEFAULT_MEASUREMENT.to_string());
     let cert_dir = std::env::var("CERT_DIR").unwrap_or_else(|_| ".dev-certs".to_string());
     let measurement = hex::decode(&measurement).expect("invalid DEV_MEASUREMENT hex");
+    let host_data: [u8; 32] = match std::env::var("DEV_HOST_DATA") {
+        Ok(hex_value) => hex::decode(&hex_value)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .expect("DEV_HOST_DATA must be 32 bytes of hex"),
+        Err(_) => [0; 32],
+    };
 
     let shim = tinfoil_shim_mock::start(ShimConfig {
         upstream_url,
         listen_addr,
         measurement,
+        host_data,
         cert_dir: cert_dir.into(),
         gpus: 0,
     })

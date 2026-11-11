@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 20;
+const LATEST_VERSION: i64 = 21;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -49,10 +49,14 @@ const DEFAULT_TEMPLATE_AGENT_ID: &str = "00000000-0000-7000-8000-000000000011";
 const DEFAULT_AGENT_SYSTEM_PROMPT: &str =
     "You are a helpful assistant. Answer clearly and concisely.";
 
-/// A readable default label derived from a model reference (e.g.
-/// `gemma4-31b` → `Gemma4 31b`). Only a *default* — the user edits it — so
-/// title-casing hyphen tokens is enough; it never needs to be canonical.
+/// A readable default label derived from a model reference: a curated local
+/// model's display name (`Gemma 4 E4B`), else the model title-cased by
+/// hyphen tokens (`my-model@ext` → `My Model`). Only a *default* — the user
+/// edits it — so it never needs to be canonical.
 pub fn default_agent_label(model_ref: &str) -> String {
+    if let Some(entry) = crate::local_models::catalog_entry_for_model_ref(model_ref) {
+        return entry.display_name.to_string();
+    }
     // Drop any `@backend` suffix, then title-case hyphen/underscore tokens.
     let model = model_ref
         .rsplit_once('@')
@@ -998,7 +1002,7 @@ pub struct SpendableCredential {
 }
 
 /// Every credential a spend may begin from now, with anything in it, in the
-/// order inputs are chosen from (`docs/specs/act-multi-spend.md` §7.2): its
+/// order inputs are chosen from (`docs/anonymous-credits.md` → Spending several tokens in one request): its
 /// key's `accept_until` ascending (the soonest-lapsing value first), then
 /// balance ascending, then nonce (the nullifier's bytes, as hex, so text
 /// order is byte order). Every element of the order is public or random, so
@@ -1701,8 +1705,9 @@ fn opt_str(v: Option<&str>) -> Value {
 pub(crate) enum ClaimOutcome {
     /// The lineage's key — reused, or freshly minted and stored.
     Claimed(crate::prefix_cache::CacheKey),
-    /// The lineage can no longer send ([`lineage_sendable_sql`]): nothing was
-    /// stored, and the request carries no key of the lineage's.
+    /// The lineage can no longer send ([`lineage_sendable_sql`]), or its
+    /// participant answers there with another model than the request's:
+    /// nothing was stored, and the request carries no key of the lineage's.
     Unsendable,
 }
 
@@ -1722,9 +1727,13 @@ impl ClaimOutcome {
 ///
 /// **A lineage is `(space_id, participant_id)`**: one participant answering in
 /// one space, on whatever branch and whether replying or regenerating. The key
-/// row carries the `model` and the `trust_domain` it was minted under, so a
+/// row carries the model and the `trust_domain` it was minted under, so a
 /// participant whose model changes, or a client pointed at another endpoint or
-/// trust bundle, starts a new key.
+/// trust bundle, starts a new key. **The model is the weights**
+/// ([`crate::prefix_cache::key_model`]): the hash the turn resolved to
+/// (`weights`) where the catalog publishes one, so a followed tag that moves
+/// rotates the key and no key reaches two engine deployments; the selection
+/// (`selection`, canonical) only where it publishes none.
 ///
 /// **Called at the instant the key becomes observable** — when the transport
 /// first asks for the request body, after the connection, TLS and attestation
@@ -1740,6 +1749,14 @@ impl ClaimOutcome {
 /// recreate the key that write just forgot; instead it is
 /// [`ClaimOutcome::Unsendable`] and nothing is stored.
 ///
+/// **So does a lineage whose model changed in the meantime.** The claim asks,
+/// in the same transaction, whether the participant's effective model in the
+/// space is still `selection`. The write that changes it forgets the key
+/// (the `prefix_cache_key_forget_on_model*` triggers), and a turn still
+/// running on the old model — a tool loop's next round — would otherwise mint
+/// that model a fresh key after the change, for a return to it to find
+/// standing.
+///
 /// Decided at the write, in one `BEGIN IMMEDIATE`: two turns of one lineage
 /// racing each other (a regeneration beside a reply, a driven turn beside a
 /// human's) both read the row the other wrote, so they share a key or one of
@@ -1751,12 +1768,23 @@ pub(crate) async fn claim_prefix_cache_key(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
-    model: &str,
+    selection: &str,
+    weights: Option<&str>,
     scope: &crate::prefix_cache::CacheScope,
     now: i64,
 ) -> Result<ClaimOutcome, AppError> {
     begin_write(conn).await?;
-    match claim_prefix_cache_key_body(conn, space_id, participant_id, model, scope, now).await {
+    let claimed = claim_prefix_cache_key_body(
+        conn,
+        space_id,
+        participant_id,
+        selection,
+        weights,
+        scope,
+        now,
+    )
+    .await;
+    match claimed {
         Ok((claimed, replaced)) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
             if replaced {
@@ -1776,11 +1804,12 @@ async fn claim_prefix_cache_key_body(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
-    model: &str,
+    selection: &str,
+    weights: Option<&str>,
     scope: &crate::prefix_cache::CacheScope,
     now: i64,
 ) -> Result<(ClaimOutcome, bool), AppError> {
-    use crate::prefix_cache::{CacheKey, Claim, StoredKeyAge, decide, mint};
+    use crate::prefix_cache::{CacheKey, Claim, StoredKeyAge, decide, key_model, mint};
     use eidola_common::engine_protocol::CACHE_KEY_BYTES;
     use zeroize::Zeroizing;
 
@@ -1803,6 +1832,24 @@ async fn claim_prefix_cache_key_body(
     if !open {
         return Ok((ClaimOutcome::Unsendable, false));
     }
+    let mut effective = conn
+        .query(EFFECTIVE_MODEL_SQL, lineage.clone())
+        .await
+        .map_err(AppError::db)?;
+    let answers_with = match effective.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<Option<String>>(0).map_err(AppError::db)?,
+        None => None,
+    };
+    drop(effective);
+    if answers_with
+        .as_deref()
+        .map(crate::canonical_model)
+        .as_deref()
+        != Some(selection)
+    {
+        return Ok((ClaimOutcome::Unsendable, false));
+    }
+    let model = key_model(selection, weights);
     let mut rows = conn
         .query(
             &format!(
@@ -1828,7 +1875,7 @@ async fn claim_prefix_cache_key_body(
     drop(rows);
 
     if let Some((age, generation, bytes)) = &stored
-        && decide(Some(age), model, &scope.trust_domain, &scope.policy, now) == Claim::Reuse
+        && decide(Some(age), &model, &scope.trust_domain, &scope.policy, now) == Claim::Reuse
         && let Ok(bytes) = <&[u8; CACHE_KEY_BYTES]>::try_from(&bytes[..])
     {
         conn.execute(
@@ -1855,7 +1902,7 @@ async fn claim_prefix_cache_key_body(
     };
     // **The retiring key is overwritten in place before it is replaced.** The
     // upsert below rewrites the row's cell in place only when the new record
-    // is exactly as long as the old one; a different `model` changes the
+    // is exactly as long as the old one; a different model can change the
     // length, and turso then frees the old cell without clearing it, leaving
     // the old key in the page's free space. Zeroing first is a same-length
     // write, so it always lands on the old bytes, whatever follows.
@@ -1881,7 +1928,7 @@ async fn claim_prefix_cache_key_body(
         vec![
             lineage.0,
             lineage.1,
-            Value::Text(model.to_string()),
+            Value::Text(model),
             Value::Text(scope.trust_domain.clone()),
             Value::Integer(generation),
             Value::Blob(fresh.to_vec()),
@@ -1954,6 +2001,14 @@ pub(crate) async fn forget_cache_keys_outside(
 
 /// One lineage's row, by `?1` (space) and `?2` (participant).
 const LINEAGE_IS: &str = "space_id = ?1 AND participant_id = ?2";
+
+/// The model selection participant `?2` answers with in space `?1`, as
+/// stored: its live membership's override, else its own — the resolution
+/// [`space_participants`] gives a turn.
+const EFFECTIVE_MODEL_SQL: &str = "SELECT COALESCE( \
+         (SELECT sp.override_model_ref FROM space_participant sp \
+           WHERE sp.space_id = ?1 AND sp.participant_id = ?2 AND sp.left_at IS NULL), \
+         (SELECT p.model_ref FROM participant p WHERE p.id = ?2))";
 
 /// **Whether a lineage can still send**, as one SQL boolean over the space
 /// `space` and the participant `participant` (column references or
@@ -6685,11 +6740,20 @@ pub async fn action_model_sha256(
     }
 }
 
+/// `action.intent` of the model calls of a turn that continues a truncated
+/// answer. Such a turn is asked of the weights that wrote the answer, not of
+/// what its selection resolves to, so it says nothing about where a followed
+/// tag points ([`last_model_sha256`]).
+pub(crate) const INTENT_CONTINUE: &str = "continue";
+
 /// The weights hash the last answer of `participant_id` in `space_id` under
 /// model selection `model` (canonical) came from, if any did — a failed
 /// generation (`status = 'error'`) is no answer, whatever it recorded: what a
 /// followed tag last resolved to, which the "model updated" notice compares
-/// with what it resolves to now.
+/// with what it resolves to now. A continuation ([`INTENT_CONTINUE`]) is
+/// skipped: it records the weights of the answer it continued, which may be
+/// ones the tag has since left, and counting it would raise the notice again
+/// for a move the participant's later answers already followed.
 pub async fn last_model_sha256(
     conn: &Connection,
     space_id: &str,
@@ -6701,6 +6765,7 @@ pub async fn last_model_sha256(
             "SELECT model_sha256 FROM action \
              WHERE space_id = ?1 AND participant_id = ?2 AND model = ?3 \
                AND model_sha256 IS NOT NULL AND status <> 'error' \
+               AND intent IS NOT ?4 \
              ORDER BY created_at DESC, id DESC LIMIT 1",
         )
         .await
@@ -6710,6 +6775,7 @@ pub async fn last_model_sha256(
             Value::Text(space_id.to_string()),
             Value::Text(participant_id.to_string()),
             Value::Text(model.to_string()),
+            Value::Text(INTENT_CONTINUE.to_string()),
         ))
         .await
         .map_err(AppError::db)?;
@@ -10241,6 +10307,20 @@ mod tests {
         }
     }
 
+    /// Have `agent` answer with `model`, as a participant's own model change
+    /// writes it.
+    async fn set_agent_model(conn: &Connection, agent: &str, model: &str) {
+        conn.execute(
+            "UPDATE participant SET model_ref = ?2 WHERE id = ?1",
+            (
+                Value::Text(agent.to_string()),
+                Value::Text(model.to_string()),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
     async fn stored_key_bytes(conn: &Connection) -> Vec<Vec<u8>> {
         let mut rows = conn
             .query("SELECT key_bytes FROM prefix_cache_key", ())
@@ -10254,7 +10334,7 @@ mod tests {
     }
 
     /// **A key replaced by one of another record length leaves no copy in
-    /// the database's files.** A different model makes the row longer or
+    /// the database's files.** A different model can make the row longer or
     /// shorter, so turso moves the cell and frees the old one without
     /// clearing it — and a *shorter* record is the case that leaves the old
     /// bytes outside the new cell; the key is overwritten in place first, and the log that
@@ -10279,26 +10359,32 @@ mod tests {
             .id
             .clone();
         let scope = cache_scope("d");
+        // Long enough that the shorter record placed after it does not reach
+        // back over where the old key lay.
+        let selection = "a-model-with-a-long-name/".repeat(8);
+        set_agent_model(&conn, &agent, &selection).await;
+        claim_prefix_cache_key(&conn, "s", &agent, &selection, None, &scope, 10_000)
+            .await
+            .unwrap()
+            .claimed()
+            .expect("a key");
+        let old = stored_key_bytes(&conn).await.remove(0);
+        // The same selection, now resolved to weights: another model to the
+        // key, and a shorter record.
+        let weights = "a".repeat(64);
         claim_prefix_cache_key(
             &conn,
             "s",
             &agent,
-            // Long enough that the shorter record placed after it does not
-            // reach back over where the old key lay.
-            &"a-model-with-a-long-name/".repeat(8),
+            &selection,
+            Some(&weights),
             &scope,
-            10_000,
+            10_001,
         )
         .await
         .unwrap()
         .claimed()
-        .expect("a key");
-        let old = stored_key_bytes(&conn).await.remove(0);
-        claim_prefix_cache_key(&conn, "s", &agent, "m", &scope, 10_001)
-            .await
-            .unwrap()
-            .claimed()
-            .expect("a new key for the new model");
+        .expect("a new key for the new model");
         let new = stored_key_bytes(&conn).await.remove(0);
         assert_ne!(old, new);
 
@@ -10344,7 +10430,8 @@ mod tests {
         let agent = list_space_owned_participants(&conn, "p").await.unwrap()[0]
             .id
             .clone();
-        claim_prefix_cache_key(&conn, "p", &agent, "m", &cache_scope("d"), 10)
+        set_agent_model(&conn, &agent, "m").await;
+        claim_prefix_cache_key(&conn, "p", &agent, "m", None, &cache_scope("d"), 10)
             .await
             .unwrap()
             .claimed()
@@ -10374,9 +10461,10 @@ mod tests {
         let agent = list_space_owned_participants(&conn, "c").await.unwrap()[0]
             .id
             .clone();
+        set_agent_model(&conn, &agent, "m").await;
         let scope = cache_scope("d");
         assert!(
-            claim_prefix_cache_key(&conn, "c", &agent, "m", &scope, 10)
+            claim_prefix_cache_key(&conn, "c", &agent, "m", None, &scope, 10)
                 .await
                 .unwrap()
                 .claimed()
@@ -10391,7 +10479,7 @@ mod tests {
             "the archival forgot the key"
         );
         assert!(matches!(
-            claim_prefix_cache_key(&conn, "c", &agent, "m", &scope, 30)
+            claim_prefix_cache_key(&conn, "c", &agent, "m", None, &scope, 30)
                 .await
                 .unwrap(),
             ClaimOutcome::Unsendable
@@ -10413,12 +10501,110 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(
-            claim_prefix_cache_key(&conn, "o", &agent, "m", &scope, 40)
+            claim_prefix_cache_key(&conn, "o", &agent, "m", None, &scope, 40)
                 .await
                 .unwrap(),
             ClaimOutcome::Unsendable
         ));
         assert!(stored_key_bytes(&conn).await.is_empty());
+    }
+
+    /// **A claim cannot recreate a key a model change just forgot.** A turn
+    /// still running on model A reaches its next round's claim after the
+    /// participant was switched to B: nothing is stored, so a return to A
+    /// finds no key of A's standing. The same for a per-space override.
+    #[tokio::test]
+    async fn a_claim_after_its_participants_model_changed_stores_nothing() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "s",
+            None,
+            "unlinked",
+            1,
+        )
+        .await
+        .unwrap();
+        let agent = list_space_owned_participants(&conn, "s").await.unwrap()[0]
+            .id
+            .clone();
+        set_agent_model(&conn, &agent, "a").await;
+        let scope = cache_scope("d");
+        let claim = |model: &'static str, now: i64| {
+            let (conn, agent, scope) = (conn.clone(), agent.clone(), scope.clone());
+            async move {
+                claim_prefix_cache_key(&conn, "s", &agent, model, None, &scope, now)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(claim("a", 10).await.claimed().is_some(), "the premise");
+
+        // The switch lands between two rounds of a turn on A.
+        set_agent_model(&conn, &agent, "b").await;
+        assert!(
+            stored_key_bytes(&conn).await.is_empty(),
+            "the model change forgot the key"
+        );
+        assert!(matches!(claim("a", 20).await, ClaimOutcome::Unsendable));
+        assert!(
+            stored_key_bytes(&conn).await.is_empty(),
+            "and the late claim recreated none"
+        );
+        // A spelling of the same selection is the same model.
+        assert!(claim("b", 30).await.claimed().is_some());
+        set_agent_model(&conn, &agent, "b@eidola").await;
+        assert!(claim("b", 40).await.claimed().is_some());
+
+        // A shared agent overridden in one space answers there with the
+        // override, and only there.
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "o",
+            None,
+            "unlinked",
+            1,
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE participant SET scope = 'global', owner_space_id = NULL WHERE id = ?1",
+            [Value::Text(agent.clone())],
+        )
+        .await
+        .unwrap();
+        for space in ["s", "o"] {
+            conn.execute(
+                "INSERT INTO space_participant \
+                     (space_id, participant_id, participant_scope, role, joined_at) \
+                 VALUES (?1, ?2, 'global', 'member', 1)",
+                (Value::Text(space.to_string()), Value::Text(agent.clone())),
+            )
+            .await
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE space_participant SET override_model_ref = 'c' \
+             WHERE space_id = 'o' AND participant_id = ?1",
+            [Value::Text(agent.clone())],
+        )
+        .await
+        .unwrap();
+        let claim_in = |space: &'static str, model: &'static str| {
+            let (conn, agent, scope) = (conn.clone(), agent.clone(), scope.clone());
+            async move {
+                claim_prefix_cache_key(&conn, space, &agent, model, None, &scope, 50)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(matches!(claim_in("o", "b").await, ClaimOutcome::Unsendable));
+        assert!(claim_in("o", "c").await.claimed().is_some());
+        assert!(claim_in("s", "b").await.claimed().is_some());
+        assert!(matches!(claim_in("s", "c").await, ClaimOutcome::Unsendable));
     }
 
     /// The configuration hook's primitive: keys of every other trust domain go,
@@ -10445,10 +10631,12 @@ mod tests {
         let agent_b = list_space_owned_participants(&conn, "b").await.unwrap()[0]
             .id
             .clone();
-        claim_prefix_cache_key(&conn, "a", &agent_a, "m", &cache_scope("old"), 10)
+        set_agent_model(&conn, &agent_a, "m").await;
+        set_agent_model(&conn, &agent_b, "m").await;
+        claim_prefix_cache_key(&conn, "a", &agent_a, "m", None, &cache_scope("old"), 10)
             .await
             .unwrap();
-        claim_prefix_cache_key(&conn, "b", &agent_b, "m", &cache_scope("new"), 10)
+        claim_prefix_cache_key(&conn, "b", &agent_b, "m", None, &cache_scope("new"), 10)
             .await
             .unwrap();
         begin_write(&conn).await.unwrap();

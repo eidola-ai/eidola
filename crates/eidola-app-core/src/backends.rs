@@ -35,8 +35,8 @@
 //! `<model>@<backend-id>`, parsed at the **last** `@` (backend ids are
 //! validated to `[a-z0-9-]`, so the split is unambiguous even for
 //! Ollama-style `name:tag` or HF-style `org/model` ids). The single sugar:
-//! `eidola`, being the default backend, may be written bare — `gemma4-31b`
-//! means `gemma4-31b@eidola`, and [`qualified_model_id`] keeps the bare
+//! `eidola`, being the default backend, may be written bare — `<tag>`
+//! means `<tag>@eidola`, and [`qualified_model_id`] keeps the bare
 //! form canonical so the common case reads clean everywhere (config,
 //! action rows, the CLI). Every other backend — the local singleton
 //! included — always spells its models qualified (`<slug>@local`). An Eidola
@@ -272,7 +272,7 @@ pub struct BackendUpdate {
     /// `llamacpp` only: flip request-triggered auto-start.
     pub auto_start: Option<bool>,
     /// `eidola` only: set/clear the enclave-measurement override list (a JSON
-    /// array of the `EnclaveMeasurement` shape). `Some(None)` reverts to pin.
+    /// array of the `tinfoil_verifier::SevSnpPin` shape). `Some(None)` reverts to pin.
     pub trusted_measurements: Option<Option<String>>,
     /// `eidola` only: set/clear the PEM ARK certificate override.
     pub hardware_root_ca: Option<Option<String>>,

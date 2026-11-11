@@ -4,7 +4,7 @@
 //! caller, over its own connection, and may describe what was wrong with the request.
 //! `Display` is what reaches the logs, and it is the variant's fixed category alone: no
 //! message here may interpolate anything derived from a request (a prompt, a token count,
-//! a cache key, a serde message quoting a value). The same rule as the server's
+//! a cache key, a serde message quoting a value). The same rule as the gateway's
 //! `ServerError`, made structural: the only variants that carry text carry it for the
 //! response, and `Display` never prints it.
 

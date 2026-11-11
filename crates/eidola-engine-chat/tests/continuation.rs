@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use eidola_engine_chat::json::Json;
 
 use eidola_engine_chat::{
-    ChatInput, ChatTemplate, MimoTokenizer, OutputConfig, OutputParser, PrefixedCallIds,
+    ChatInput, ChatTemplate, MimoTokenizer, OutputConfig, OutputParser, PrefixedCallIds, Prompt,
     RenderOptions, StopCause,
 };
 
@@ -69,6 +69,17 @@ fn continued_prompt(
     reasoning: &str,
     content: &str,
 ) -> (String, &'static str) {
+    let (prompt, field) = continued(template, question, reasoning, content);
+    (prompt.into_text(), field)
+}
+
+/// [`continued_prompt`] with its data spans, as serving encodes it.
+fn continued(
+    template: &ChatTemplate,
+    question: &str,
+    reasoning: &str,
+    content: &str,
+) -> (Prompt, &'static str) {
     let field = if content.is_empty() {
         "reasoning_content"
     } else {
@@ -80,7 +91,7 @@ fn continued_prompt(
     ]);
     let input = ChatInput::from_json(&messages.to_string(), None).unwrap();
     let prompt = template
-        .render(
+        .render_prompt(
             &input,
             RenderOptions {
                 add_generation_prompt: false,
@@ -162,7 +173,9 @@ fn a_generation_cut_after_any_token_continues_into_the_same_output() {
                 whole.starts_with(&prompt),
                 "cut after {k} tokens of {generation:?}: {prompt:?} is not a prefix"
             );
-            let prompt_ids = tokenizer.encode(&prompt).unwrap();
+            let prompt_ids = tokenizer
+                .encode_prompt(&continued(&template, question, &r, &c).0)
+                .unwrap();
             assert!(
                 whole_ids.starts_with(&prompt_ids),
                 "cut after {k} tokens of {generation:?}: its tokens are not a prefix"
