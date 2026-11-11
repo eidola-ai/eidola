@@ -1827,8 +1827,10 @@ with open(path, "wb") as f:
         # Every shipped file is copied out of the store, never referenced
         # (docs/verification.md): the loader is installed at the path the
         # filesystem hierarchy standard gives it, the libraries beside it in
-        # /lib64, and nothing in the image names a /nix/store path a loader
-        # follows.
+        # /lib64. What still names a store path is compiled-in defaults no
+        # lookup depends on (glibc's default library directory and cache
+        # file, OpenSSL's configuration directory), none of which exists in
+        # the image.
         engineImagePlatform = system == "x86_64-linux";
 
         # The kernel build, imported unchanged and given this flake's nixpkgs,
