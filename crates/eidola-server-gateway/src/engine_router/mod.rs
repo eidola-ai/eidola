@@ -251,7 +251,7 @@ impl Upstream {
     }
 
     fn routable(&self) -> bool {
-        self.breaker().routable()
+        self.breaker().routable(self.in_flight())
     }
 
     fn url(&self, path: &str) -> String {
