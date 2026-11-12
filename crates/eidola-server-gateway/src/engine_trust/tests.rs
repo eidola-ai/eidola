@@ -19,7 +19,8 @@ const MODEL: &str = "33333333333333333333333333333333333333333333333333333333333
 const FLASH: &engine_deployment::Shape = &eidola_common::architecture::MIMO_V26_FLASH;
 const CONFIG: &str = "deploy/engine/fixture-model/tdx-a/tinfoil-config.yml";
 const SIDECAR: &str = "deploy/engine/fixture-model/tdx-a/deployment.json";
-/// The platform endorsements the fixture sidecar names, as vendored.
+/// The platform endorsements the fixture sidecar names, where the fixture
+/// tree vendors them: a verbatim copy of that release.
 const ENDORSEMENTS: &str =
     "releases/trust/platform-endorsements/platform-v0.1.11/platform-endorsements.json";
 const ENDORSEMENTS_BUNDLE: &str =
@@ -75,15 +76,17 @@ impl Tree {
             .into_iter()
             .map(|p| (p.to_string(), read(p)))
             .collect();
-        // The vendored endorsements and the trusted root are the committed
-        // ones: the fixture deployment's machine policy is re-derived from
-        // the real signed release.
-        for path in [ENDORSEMENTS, ENDORSEMENTS_BUNDLE, TRUSTED_ROOT] {
-            files.insert(
-                path.to_string(),
-                std::fs::read(workspace_root().join(path)).unwrap(),
-            );
+        // The endorsements are a fixture copy of a real signed release, so
+        // the vendored tree can rotate; the trusted root is the committed
+        // one. The fixture deployment's machine policy is re-derived from
+        // both.
+        for path in [ENDORSEMENTS, ENDORSEMENTS_BUNDLE] {
+            files.insert(path.to_string(), read(path));
         }
+        files.insert(
+            TRUSTED_ROOT.to_string(),
+            std::fs::read(workspace_root().join(TRUSTED_ROOT)).unwrap(),
+        );
         Self {
             json: serde_json::from_slice(&read("engine-enclaves.json")).unwrap(),
             files,
