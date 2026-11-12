@@ -179,7 +179,7 @@ async fn serving_once(
         .unwrap()
 }
 
-async fn assembled(events: &[String]) -> Result<Answer, AnswerFailure> {
+async fn assembled(events: &[String]) -> Result<Answer, Box<AnswerFailure>> {
     let response = serving_once(200, "text/event-stream", framed(events), false).await;
     WholeAnswer::Assembled
         .read(response, peer_read::MAX_RESPONSE_BYTES, "eidola")

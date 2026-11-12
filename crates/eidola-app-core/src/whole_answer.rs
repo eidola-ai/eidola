@@ -84,7 +84,7 @@ impl WholeAnswer {
         response: reqwest::Response,
         ceiling: usize,
         backend_id: &str,
-    ) -> Result<Answer, AnswerFailure> {
+    ) -> Result<Answer, Box<AnswerFailure>> {
         let status = response.status();
         if self == WholeAnswer::Body || !status.is_success() {
             return read_body(response, ceiling).await;
@@ -102,11 +102,11 @@ impl WholeAnswer {
             } else {
                 not_an_event_stream(backend_id, status.as_u16())
             };
-            return Err(AnswerFailure {
+            return Err(Box::new(AnswerFailure {
                 error,
                 record: answer.record,
                 refund,
-            });
+            }));
         }
         let mut assembler = Assembler::under(ceiling);
         let envelope = peer_read::MAX_ASSEMBLED_STREAM_BYTES.max(ceiling);
@@ -115,26 +115,26 @@ impl WholeAnswer {
         })
         .await;
         if let Some(error) = read.read_error {
-            return Err(AnswerFailure {
+            return Err(Box::new(AnswerFailure {
                 error,
                 record: read.raw.seal_response(false),
                 refund: read.refund,
-            });
+            }));
         }
         // Read to its end all the same: the stream's refunds are at its end.
         if assembler.past_ceiling {
-            return Err(AnswerFailure {
+            return Err(Box::new(AnswerFailure {
                 error: peer_read::answer_past_ceiling(backend_id),
                 record: read.raw.seal_response(read.finished),
                 refund: read.refund,
-            });
+            }));
         }
         if !read.finished && !assembler.finished() {
-            return Err(AnswerFailure {
+            return Err(Box::new(AnswerFailure {
                 error: stream_ended_unfinished(),
                 record: read.raw.seal_response(true),
                 refund: read.refund,
-            });
+            }));
         }
         let body = assembler.finish(read.refund);
         Ok(Answer {
@@ -148,17 +148,20 @@ impl WholeAnswer {
 }
 
 /// A body read whole, bounded as it arrives.
-async fn read_body(response: reqwest::Response, ceiling: usize) -> Result<Answer, AnswerFailure> {
+async fn read_body(
+    response: reqwest::Response,
+    ceiling: usize,
+) -> Result<Answer, Box<AnswerFailure>> {
     match peer_read::read_bounded(response, ceiling).await {
         Ok(body) => {
             let record = recorded::recorded_answer(&body);
             Ok(Answer { body, record })
         }
-        Err(failure) => Err(AnswerFailure {
+        Err(failure) => Err(Box::new(AnswerFailure {
             error: failure.error,
             record: recorded::recorded_cut_answer(&failure.partial),
             refund: None,
-        }),
+        })),
     }
 }
 
