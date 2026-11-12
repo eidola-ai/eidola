@@ -8802,7 +8802,7 @@ impl Inner {
         let mut request = prep.with_body(post, &request_body_json);
         request = with_authorization(request, prep.external_auth.as_deref());
         let chat_result = prep.send(request).await;
-        let response_at = now_ms();
+        let response_at;
 
         let (status, response_text, body, response_record) = match chat_result {
             Ok(resp) => {
@@ -8822,6 +8822,9 @@ impl Inner {
                     .whole
                     .read(resp, peer_read::MAX_RESPONSE_BYTES, &prep.backend_id)
                     .await;
+                // The answer has arrived only now: an assembled one opens
+                // when generation starts and is read for as long as it runs.
+                response_at = now_ms();
                 let (answer, response_record) = match whole {
                     Ok(whole_answer::Answer { body, record }) => (body, record),
                     Err(failure) => {

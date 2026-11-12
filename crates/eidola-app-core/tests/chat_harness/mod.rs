@@ -679,6 +679,10 @@ pub struct MockConfig {
     /// answers instantly, which makes an in-flight turn unobservable, so a test
     /// about *concurrency* asks for a window it can act inside.
     pub chat_delay_ms: u64,
+    /// How long a completion answered as the gateway's stream runs after its
+    /// response headers and before its first delta: the time a model takes to
+    /// generate, which a stream's opening does not wait for.
+    pub answer_ms: u64,
     /// When set, the issuance response names this issuer key id instead of the
     /// key that actually signed it. `None` — the default — names the real key.
     pub issued_key_id: Option<String>,
@@ -917,6 +921,7 @@ impl Default for MockConfig {
             close_switch: CloseSwitch::default(),
             list_flat_model: false,
             chat_delay_ms: 0,
+            answer_ms: 0,
             issued_key_id: None,
             refund_key_id: None,
             settled_charge: None,
@@ -1712,7 +1717,7 @@ pub async fn start(config: MockConfig) -> MockServer {
                 let refund_hits = refund_hits.clone();
                 let models_hits = models_hits.clone();
                 tokio::spawn(
-                    GATEWAY_STREAM.scope(std::cell::Cell::new(false), async move {
+                    GATEWAY_STREAM.scope(std::cell::Cell::new(None), async move {
                         let _ = handle_conn(
                             stream,
                             issuer,
@@ -2020,7 +2025,8 @@ async fn handle_conn(
                     )
                     .await;
                 }
-                GATEWAY_STREAM.with(|on| on.set(!config.ignores_stream));
+                GATEWAY_STREAM
+                    .with(|on| on.set((!config.ignores_stream).then_some(config.answer_ms)));
             }
             let inputs: Option<Vec<Presented>> = req
                 .spends
@@ -3538,6 +3544,15 @@ async fn write_gateway_stream(
                 Transfer-Encoding: chunked\r\n\
                 Connection: close\r\n\r\n";
     stream.write_all(head.as_bytes()).await?;
+    let answer_ms = GATEWAY_STREAM
+        .try_with(std::cell::Cell::get)
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    if answer_ms > 0 {
+        stream.flush().await?;
+        tokio::time::sleep(std::time::Duration::from_millis(answer_ms)).await;
+    }
     let chunk = |choices: serde_json::Value| {
         let mut chunk = serde_json::json!({
             "id": "chatcmpl-mock",
@@ -4119,14 +4134,17 @@ tokio::task_local! {
     /// serves chat only as a stream, so every completion such a request is
     /// answered with is written as the gateway writes one
     /// ([`write_gateway_stream`]), whatever behaviour wrote it.
-    static GATEWAY_STREAM: std::cell::Cell<bool>;
+    ///
+    /// The value is how long such a stream runs before its first delta
+    /// ([`MockConfig::answer_ms`]).
+    static GATEWAY_STREAM: std::cell::Cell<Option<u64>>;
 }
 
 /// Whether this connection answers as the gateway does ([`GATEWAY_STREAM`]).
 fn gateway_stream() -> bool {
     GATEWAY_STREAM
         .try_with(std::cell::Cell::get)
-        .unwrap_or(false)
+        .is_ok_and(|on| on.is_some())
 }
 
 async fn write_json(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {

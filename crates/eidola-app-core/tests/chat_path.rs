@@ -171,6 +171,35 @@ fn assert_shared_request_body(body: &serde_json::Value, expected_stream: bool) {
 // Happy path — blocking chat
 // ===========================================================================
 
+/// **A turn's recorded duration covers the answer's generation.** The gateway
+/// answers with a stream that opens before the model has produced anything,
+/// so the response is timed when the whole answer has been read, not when
+/// the stream opened.
+#[test]
+fn a_blocking_turns_duration_covers_its_generation() {
+    run(|| {
+        let answer_ms = 400;
+        let (_mock, core, _dir) = setup(MockConfig {
+            answer_ms,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("chat should succeed");
+        let requests = core
+            .runtime()
+            .block_on(core.list_requests(10, 0))
+            .expect("requests");
+        assert_eq!(requests.len(), 1);
+        let duration = requests[0].duration_ms.expect("a duration");
+        assert!(
+            duration >= answer_ms as i64,
+            "recorded {duration} ms for an answer that took {answer_ms} ms to arrive"
+        );
+    })
+}
+
 #[test]
 fn blocking_chat_persists_and_emits() {
     run(|| {
@@ -9575,8 +9604,9 @@ fn a_blocking_answer_past_the_read_ceiling_is_refused_rather_than_parsed() {
 
 /// **The read ceiling bounds an answer assembled from a stream** as it bounds
 /// a blocking body: the Eidola backend's blocking turn reads a stream, and one
-/// whose data passes the ceiling is refused, the hold settled (by recovery,
-/// with no refund in band), and the Record keeps what was read.
+/// whose deltas pass the ceiling is refused once it has been read to its end,
+/// the hold settled (by recovery, with no refund in band), and the Record
+/// keeps what its cap allows of what was read.
 #[test]
 fn an_assembled_answer_past_the_read_ceiling_is_refused() {
     run(|| {
@@ -9622,9 +9652,11 @@ fn an_assembled_answer_past_the_read_ceiling_is_refused() {
             .response_body
             .expect("a recorded body");
         let text = String::from_utf8_lossy(&recorded);
+        // The stream was read to its end, where its refunds would be, so the
+        // Record states its whole size beside what it kept.
         assert!(
-            text.contains("at least that large"),
-            "a stopped read names a lower bound: {}",
+            text.contains("The rest was received and not retained"),
+            "the whole stream was read: {}",
             &text[text.len().saturating_sub(300)..]
         );
     });

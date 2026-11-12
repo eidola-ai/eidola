@@ -354,6 +354,58 @@ async fn the_ceiling_bounds_the_assembled_answer() {
     );
 }
 
+/// **The ceiling is on the answer, not on the stream it arrives in.** Every
+/// delta comes wrapped in an event many times its size, so a long answer in
+/// small deltas is a stream far past the ceiling and an answer well under it;
+/// the same stream with the deltas past the ceiling is refused, with the
+/// refunds its end carried.
+#[tokio::test]
+async fn the_ceiling_counts_the_answer_not_its_envelope() {
+    let ceiling = 4096;
+    let stream = |deltas: usize| -> Vec<String> {
+        let mut metadata = metadata_members();
+        metadata["object"] = METADATA_OBJECT.into();
+        (0..deltas)
+            .map(|_| {
+                serde_json::json!({
+                    "id": "chatcmpl-0123456789abcdef0123456789abcdef",
+                    "object": "chat.completion.chunk",
+                    "created": 1_700_000_000,
+                    "model": "a-model-name-of-some-length@sha256:0123456789abcdef",
+                    "choices": [{"index": 0, "delta": {"content": "y"}, "finish_reason": null}],
+                })
+                .to_string()
+            })
+            .chain([metadata.to_string(), "[DONE]".to_string()])
+            .collect()
+    };
+    let read = |events: Vec<String>| async move {
+        let response = serving_once(200, "text/event-stream", framed(&events), false).await;
+        WholeAnswer::Assembled
+            .read(response, ceiling, "eidola")
+            .await
+    };
+
+    let events = stream(128);
+    assert!(events.iter().map(String::len).sum::<usize>() > 4 * ceiling);
+    let answer = read(events)
+        .await
+        .ok()
+        .expect("an answer under the ceiling");
+    let body: Value = serde_json::from_slice(&answer.body.bytes).unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "y".repeat(128));
+
+    let Err(failure) = read(stream(1024)).await else {
+        panic!("an answer past the ceiling is refused");
+    };
+    assert!(
+        failure.error.to_string().contains("ceiling"),
+        "{}",
+        failure.error
+    );
+    assert_eq!(failure.refund, Some(metadata_members()["refunds"].clone()));
+}
+
 /// A `2xx` that is not a stream is refused, after its refunds are read.
 #[tokio::test]
 async fn a_blocking_body_to_a_stream_ask_is_refused_with_its_refunds() {

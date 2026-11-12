@@ -65,6 +65,17 @@ pub(crate) const API_ANSWER_MAX_BYTES: usize = 2 << 20;
 /// recorded as the truncation it is.
 pub(crate) const MAX_RESPONSE_BYTES: usize = 8 << 20;
 
+/// The most of a stream, padding aside, that is read to assemble one answer.
+///
+/// **A stream is an answer in an envelope.** Each delta arrives in an event
+/// that repeats the completion's id, model and framing around a few bytes of
+/// text, so a long answer's stream is many times the answer's size. The
+/// answer assembled from it is held to [`MAX_RESPONSE_BYTES`], as a body is;
+/// this bounds the envelope, which is read and not held, at enough for the
+/// longest output a catalog model declares with a kilobyte of event around
+/// every token. A stream past it is not one an answer comes out of.
+pub(crate) const MAX_ASSEMBLED_STREAM_BYTES: usize = 64 << 20;
+
 /// The most one server-sent event may accumulate before it is refused.
 ///
 /// **The frame accumulator's ceiling.** A stream's bytes go into a buffer and

@@ -72,8 +72,10 @@ impl WholeAnswer {
         self == WholeAnswer::Assembled
     }
 
-    /// Read `response` into one answer, under `ceiling` bytes of what it is
-    /// made of.
+    /// Read `response` into one answer of at most `ceiling` bytes: a body's
+    /// own length, or what is assembled out of a stream (its content,
+    /// reasoning and tool calls), whose envelope has a ceiling of its own
+    /// ([`peer_read::MAX_ASSEMBLED_STREAM_BYTES`]).
     ///
     /// A non-2xx is an error document on either transport and is read whole,
     /// as a blocking body: its refunds, when it carries them, are in it.
@@ -106,12 +108,24 @@ impl WholeAnswer {
                 refund,
             });
         }
-        let mut assembler = Assembler::default();
-        let read = read_events(response, backend_id, ceiling, |event| assembler.push(event)).await;
+        let mut assembler = Assembler::under(ceiling);
+        let envelope = peer_read::MAX_ASSEMBLED_STREAM_BYTES.max(ceiling);
+        let read = read_events(response, backend_id, envelope, |event| {
+            assembler.push(event)
+        })
+        .await;
         if let Some(error) = read.read_error {
             return Err(AnswerFailure {
                 error,
                 record: read.raw.seal_response(false),
+                refund: read.refund,
+            });
+        }
+        // Read to its end all the same: the stream's refunds are at its end.
+        if assembler.past_ceiling {
+            return Err(AnswerFailure {
+                error: peer_read::answer_past_ceiling(backend_id),
+                record: read.raw.seal_response(read.finished),
                 refund: read.refund,
             });
         }
@@ -355,13 +369,40 @@ struct Assembler {
     usage: Option<Value>,
     privacy: Option<Value>,
     verification: Option<Value>,
+    /// The most the deltas may add up to, when there is a limit.
+    ceiling: Option<usize>,
+    /// The bytes of delta taken in so far.
+    held: usize,
+    /// A delta passed `ceiling`: nothing more is taken in, and what was is
+    /// not an answer.
+    past_ceiling: bool,
 }
 
 impl Assembler {
+    /// An assembler that takes in at most `ceiling` bytes of deltas.
+    fn under(ceiling: usize) -> Self {
+        Assembler {
+            ceiling: Some(ceiling),
+            ..Assembler::default()
+        }
+    }
+
+    /// Count `bytes` of delta; false once they pass the ceiling.
+    fn take(&mut self, bytes: usize) -> bool {
+        self.held = self.held.saturating_add(bytes);
+        if self.ceiling.is_some_and(|ceiling| self.held > ceiling) {
+            self.past_ceiling = true;
+        }
+        !self.past_ceiling
+    }
+
     fn push(&mut self, event: &Value) {
         if event.get("object").and_then(Value::as_str) == Some(METADATA_OBJECT) {
             self.privacy = event.get("privacy").cloned();
             self.verification = event.get("verification").cloned();
+            return;
+        }
+        if self.past_ceiling {
             return;
         }
         if self.id.is_none() {
@@ -377,6 +418,11 @@ impl Assembler {
         };
         for choice in choices {
             let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+            if let Some(delta) = choice.get("delta").filter(|d| !d.is_null())
+                && !self.take(delta.to_string().len())
+            {
+                return;
+            }
             let parts = self.choices.entry(index).or_default();
             if let Some(delta) = choice.get("delta") {
                 if let Some(text) = delta.get("content").and_then(Value::as_str) {
