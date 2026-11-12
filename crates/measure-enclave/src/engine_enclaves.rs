@@ -41,7 +41,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use eidola_common::engine_deployment::deployment::{
-    ModelIdentity, check_deployment, check_model_agreement, release_manifest_file,
+    ModelIdentity, check_deployment, check_model_agreement, check_release_manifest,
+    release_manifest_file,
 };
 
 use tinfoil_verifier::{AllowedMeasurement, PlatformMeasurement, TdxPin};
@@ -76,6 +77,36 @@ pub fn required_release(config: &[u8]) -> Result<(String, String)> {
          (VERSION@sha256:<hex>)",
     )?;
     Ok((release.version, sha))
+}
+
+/// The platform release files a deployment's config launches on.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReleaseFiles {
+    /// The release tag the files belong to (`v0.15.3-rc.1`).
+    pub tag: String,
+    /// The vendored release manifest, relative to the workspace root.
+    pub manifest: String,
+    /// The TDX IGVM image's published file name (`tinfoil-tdx-v<version>.igvm`).
+    pub image: String,
+    /// The image's SHA-256, as the vendored manifest records it.
+    pub image_sha256: String,
+}
+
+/// The release files `config` names, its vendored manifest read through
+/// `read` by the gateway build's rule.
+pub fn release_files(config: &[u8], read: &ReadFile<'_>) -> Result<ReleaseFiles> {
+    let (version, manifest_sha256) = required_release(config)?;
+    let cvm_version = format!("{version}@sha256:{manifest_sha256}");
+    let manifest = release_manifest_file(&cvm_version).map_err(anyhow::Error::msg)?;
+    let launch = check_release_manifest(&cvm_version, &read(&manifest)?)
+        .map_err(|e| anyhow::anyhow!("{manifest}: {e}"))?;
+    let tag = version.split_once('+').map_or(version.as_str(), |(t, _)| t);
+    Ok(ReleaseFiles {
+        tag: format!("v{tag}"),
+        image: format!("tinfoil-tdx-v{version}.igvm"),
+        image_sha256: launch.igvm_sha256,
+        manifest,
+    })
 }
 
 /// The `engine-enclaves.json` entry for one deployment, filed under the
@@ -418,6 +449,26 @@ containers:
         let parsed: Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(parsed["schema_version"], 1);
         assert_eq!(parsed["models"][&"3".repeat(64)][0]["config"], PATH);
+    }
+
+    #[test]
+    fn the_release_files_are_named_by_the_vendored_manifest() {
+        let igvm = image(vec![page(0x2000, 1, IgvmPageDataFlags::new())]);
+        let mrtd = hex::encode(tdx_igvm::mrtd_from_igvm(&igvm).unwrap());
+        let release = manifest(&igvm, &mrtd, &"00".repeat(48));
+        let good = config(&hex::encode(Sha256::digest(&release)));
+        assert_eq!(
+            release_files(good.as_bytes(), &vendoring(&release)).unwrap(),
+            ReleaseFiles {
+                tag: "v0.0.0-test".into(),
+                manifest: MANIFEST.into(),
+                image: "tinfoil-tdx-v0.0.0-test+gpu.igvm".into(),
+                image_sha256: hex::encode(Sha256::digest(&igvm)),
+            }
+        );
+        let other = config(&"ab".repeat(32));
+        let err = release_files(other.as_bytes(), &vendoring(&release)).unwrap_err();
+        assert!(format!("{err:#}").contains("not the pinned"), "{err:#}");
     }
 
     /// Every deployment of one weights hash shares its provenance and

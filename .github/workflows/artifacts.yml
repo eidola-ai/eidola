@@ -481,6 +481,72 @@ jobs:
             --manifest artifact-manifest.json \
             || echo "::warning::the committed manifest does not record this engine image; the artifact-manifest job will fail"
 
+  # ── Engine pins, re-measured from the platform's images (cheap ubuntu) ──────
+  # Every gateway build holds each engine pin's MRTD to the platform release
+  # manifest its config pins, vendored under releases/trust/cvm-releases/.
+  # This job closes the remaining link: it fetches each TDX image those
+  # manifests name, holds it to the manifest's hash and both files to the
+  # provider's build provenance (as `artifact-manifest` does the gateway's),
+  # reruns measure-engine-enclaves and requires the committed
+  # engine-enclaves.json byte for byte. With no deployment it fetches nothing
+  # and the committed file must be the empty pin set.
+  engine-enclaves:
+    name: Re-measure engine deployments
+    needs: guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build artifacts # zizmor: ignore[cache-poisoning]
+        # Skipped on v* release tags, as in `artifact-manifest`, so a release
+        # measures from a clean cargo state.
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build the measurer
+        run: cargo build --locked -q -p measure-enclave --bin measure-engine-enclaves
+
+      - name: Fetch and verify the TDX images
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          images="$RUNNER_TEMP/cvm-images"
+          mkdir -p "$images"
+          ./target/debug/measure-engine-enclaves --images > "$RUNNER_TEMP/images.txt"
+          while read -r tag manifest image sha256; do
+            url="https://images.tinfoil.sh/cvm/$(printf '%s' "$image" | sed 's/+/%2B/g')"
+            curl -sfL --retry 3 -A curl/8 -o "$images/$image" "$url"
+            printf '%s  %s\n' "$sha256" "$images/$image" | sha256sum -c -
+            for file in "$manifest" "$images/$image"; do
+              gh attestation verify "$file" -R tinfoilsh/cvmimage \
+                --signer-workflow tinfoilsh/cvmimage/.github/workflows/release.yml \
+                --source-ref "refs/tags/$tag" \
+                --deny-self-hosted-runners
+            done
+          done < "$RUNNER_TEMP/images.txt"
+          echo "$(wc -l < "$RUNNER_TEMP/images.txt") release image(s) verified."
+
+      - name: Re-measure and compare with the committed pins
+        run: |
+          set -euo pipefail
+          ./target/debug/measure-engine-enclaves \
+            --release-dir "$RUNNER_TEMP/cvm-images" \
+            --output "$RUNNER_TEMP/engine-enclaves.json"
+          diff -u releases/trust/engine-enclaves.json "$RUNNER_TEMP/engine-enclaves.json"
+
   # ── Apple (expensive macOS runner) ───────────────────────────────────────────
   # This uses https://github.com/khoi/sand to provision a runner from a known image:
   # ghcr.io/cirruslabs/macos-tahoe-xcode@sha256:a914e5b3fc1197d61832009778a77ca30717314fd32702cfdf90a42f2c279ea3

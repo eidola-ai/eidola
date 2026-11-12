@@ -18,6 +18,10 @@
 //! `releases/trust/platform-endorsements/` and verified offline.
 //! Release-time work, like `just update-manifest`: nothing here downloads.
 //! With no deployments committed it writes the empty pin set.
+//!
+//! `--images` prints, instead, one line per release image the deployments
+//! launch on, `<tag> <vendored manifest> <image file name> <image SHA-256>`,
+//! for whoever fetches the images (the artifacts workflow).
 
 use std::path::{Path, PathBuf};
 
@@ -32,11 +36,15 @@ struct Cli {
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
     /// Directory holding each selected release's TDX IGVM image.
-    #[arg(long)]
-    release_dir: PathBuf,
+    #[arg(long, required_unless_present = "images")]
+    release_dir: Option<PathBuf>,
     /// Where to write the file (stdout when absent).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "images")]
     output: Option<PathBuf>,
+    /// List the release images the deployments launch on, and measure
+    /// nothing.
+    #[arg(long)]
+    images: bool,
 }
 
 fn main() -> Result<()> {
@@ -47,6 +55,7 @@ fn main() -> Result<()> {
     let workspace_file = |relative: &str| read(&cli.workspace.join(relative));
 
     let mut entries = Vec::new();
+    let mut images = std::collections::BTreeSet::new();
     for group in sorted_dirs(&root)? {
         let group_name = name(&group)?;
         for variant in sorted_dirs(&group)? {
@@ -55,9 +64,17 @@ fn main() -> Result<()> {
                 format!("deploy/engine/{group_name}/{variant_name}/tinfoil-config.yml");
             let config = read(&variant.join("tinfoil-config.yml"))?;
             let sidecar = read(&variant.join("deployment.json"))?;
-            let (version, _) =
-                engine_enclaves::required_release(&config).with_context(|| config_path.clone())?;
-            let igvm = read(&cli.release_dir.join(format!("tinfoil-tdx-v{version}.igvm")))?;
+            let files = engine_enclaves::release_files(&config, &workspace_file)
+                .with_context(|| config_path.clone())?;
+            if cli.images {
+                images.insert(files);
+                continue;
+            }
+            let release_dir = cli
+                .release_dir
+                .as_ref()
+                .context("--release-dir is required")?;
+            let igvm = read(&release_dir.join(&files.image))?;
             let entry = engine_enclaves::deployment_entry(&DeploymentInputs {
                 config_path: &config_path,
                 config: &config,
@@ -70,6 +87,12 @@ fn main() -> Result<()> {
         }
     }
 
+    if cli.images {
+        for f in images {
+            println!("{} {} {} {}", f.tag, f.manifest, f.image, f.image_sha256);
+        }
+        return Ok(());
+    }
     let rendered = engine_enclaves::render(entries)?;
     match cli.output {
         Some(path) => std::fs::write(&path, rendered)
