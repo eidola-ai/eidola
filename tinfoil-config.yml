@@ -43,7 +43,6 @@ containers:
       - DATABASE_PASSWORD
       - OTEL_EXPORTER_OTLP_HEADERS
       - STRIPE_API_KEY
-      - STRIPE_WEBHOOK_SECRET
     env:
       - BIND_ADDR: "0.0.0.0:8080"
       - OTEL_EXPORTER_OTLP_ENDPOINT: "https://otlp-gateway-prod-us-west-0.grafana.net/otlp"
@@ -54,7 +53,6 @@ containers:
       - DATABASE_PASSWORD_HASH: "$argon2id$v=19$m=19456,t=2,p=1$cysXhP6SVPuB83IC4iD4yw$ygvRvdmSVfH5zq5+8P/Fgnyz6q93VwCuiZxU0GfjtLs"
       - OTEL_EXPORTER_OTLP_HEADERS_HASH: "$argon2id$v=19$m=19456,t=2,p=1$BU7g3wAtS+gxm9ADqglQrw$KPSjwJlNFppw1/JncRV9Oby1BCNc/53TRPdBv0j3uOw"
       - STRIPE_API_KEY_HASH: "$argon2id$v=19$m=19456,t=2,p=1$qucRiGbS8rYcqJINDlHDcw$qdu/tD4Ymq1by0uPVawIFFneCq757OzZ3/5EPeyFQ4Q"
-      - STRIPE_WEBHOOK_SECRET_HASH: "$argon2id$v=19$m=19456,t=2,p=1$4j33RHeU39z3dQiVU/k2rw$NryykMC9uwJGIQYLG5WeYkP3FHD/Sb8uPlAS2qzsLDc"
 
 shim:
   upstream-port: 8080

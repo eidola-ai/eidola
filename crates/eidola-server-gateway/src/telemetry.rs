@@ -407,13 +407,13 @@ pub mod metrics {
         "db.get_issuer_key",
         "db.get_refund_token",
         "db.get_valid_issuer_keys",
-        "db.insert_credit_ledger",
+        "account.reconcile",
+        "account.reconcile_status",
         "db.record_nullifiers",
         "db.replace_refund_token",
         "db.store_refund_token",
         "upstream.chat",
         "upstream.chat_stream",
-        "webhook.process",
     ];
 
     /// Resolve a span name to its metric label, or `None` for a span the
@@ -461,20 +461,6 @@ pub mod metrics {
         meter()
             .u64_counter("traceparent.received")
             .with_description("Inbound traceparent headers by outcome")
-            .build()
-    });
-
-    /// Stripe webhook processing outcomes, by `event_type` and `reason`.
-    ///
-    /// The webhook is the one inbound path we cannot opt into a trace: Stripe
-    /// originates it, not us. This counter is what makes its failure modes
-    /// visible in aggregate — each distinct give-up branch in `webhook.rs`
-    /// increments a named reason, so a spike in any one of them is a
-    /// dashboard signal rather than a log line someone has to find.
-    pub static WEBHOOK_OUTCOME: LazyLock<Counter<u64>> = LazyLock::new(|| {
-        meter()
-            .u64_counter("webhook.outcome")
-            .with_description("Stripe webhook processing outcomes by reason")
             .build()
     });
 

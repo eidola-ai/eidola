@@ -34,6 +34,8 @@ The issuer key is stored encrypted at rest in Postgres using a `CREDENTIAL_MASTE
 
 Domain separation is baked into the credential construction (`ACT-v1:eidola:inference:production:<date>`) to prevent cross-deployment correlation if the issuer key were ever reused.
 
+Account billing recovery runs separately from the gateway. The authenticated `POST /v1/account/reconcile` records a durable request and returns `202`; `GET` on the same path reports the requested and completed generations and the last completed result. Neither route calls Stripe or accepts a caller-chosen balance change. Independently deployable webhook receivers and billing workers share PostgreSQL with live gateway versions and the private support CLI. Their linked-account work may run outside confidential compute; ACT issuance and signing remain inside the gateway. See [payment reversals](anonymous-credits.md#payment-reversals).
+
 ## Anonymity set
 
 The unlinkability invariants in [privacy-guarantees.md §2](privacy-guarantees.md#2-unlinkability) mean as much as each token's anonymity set is large, and hold only if the issuance and redemption policy introduces no linkable identifier of its own. The issuance and key-rotation policies are chosen for both.
@@ -79,7 +81,7 @@ A span is a per-request record (a trace id, a start time, a duration), and a req
 
 What is exported:
 
-- **Metrics.** Counters and histograms aggregated over the export interval. Content-derived quantities appear here and only here — token totals keyed by model — never attributed to an individual request. Every label value comes from a fixed set: the requested model reference is resolved to a catalog row's weights hash (never the tag the client sent), span names against a tracked list, Stripe event types against the handled list, and anything unrecognized collapses to a shared `other` bucket. The instruments are per-operation duration derived from spans; time to first token, stream duration, largest inter-chunk gap and sustained output rate for inference; a stream-outcome counter; and a webhook-outcome counter.
+- **Metrics.** Counters and histograms aggregated over the export interval. Content-derived quantities appear here and only here — token totals keyed by model — never attributed to an individual request. Every label value comes from a fixed set: the requested model reference is resolved to a catalog row's weights hash (never the tag the client sent), span names against a tracked list, and anything unrecognized collapses to a shared `other` bucket. The instruments are per-operation duration derived from spans; time to first token, stream duration, largest inter-chunk gap and sustained output rate for inference; and a stream-outcome counter. Stripe webhook delivery belongs to the separate billing receiver and is not part of gateway telemetry.
 - **Logs.** Error and warning events. An internal error has two renderings: the client gets the full detail on its own attested connection, and the log gets a redacted one. Fields that could carry request-derived values, and error strings authored outside Eidola's code, are never logged.
 
 No span captures a function's arguments as fields, so nullifiers, spend proofs and account ids cannot reach a span attribute, including under client-directed tracing.

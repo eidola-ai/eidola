@@ -99,6 +99,15 @@ target "cli" {
   tags       = ["eidola-cli:dev"]
 }
 
+# Operational image, runnable as receiver, worker or private support CLI.
+# Kept outside the client artifact manifest and release publication pipeline.
+target "billing" {
+  inherits   = ["_common"]
+  context    = "."
+  dockerfile = "oci/eidola-billing/Containerfile"
+  tags       = ["eidola-billing:dev"]
+}
+
 target "postgres" {
   inherits   = ["_common", "_cache_postgres"]
   context    = "."

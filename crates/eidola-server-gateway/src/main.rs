@@ -24,7 +24,6 @@ struct Config {
     database_password: Option<String>,
     database_ssl_cert: Option<String>,
     stripe_api_key: Option<String>,
-    stripe_webhook_secret: Option<String>,
     credential_master_key: [u8; 32],
     pricing_markup: Option<f64>,
     /// Static seed for the required-terms gate (dev/test pin; see
@@ -62,10 +61,6 @@ impl Config {
             .filter(|s| !s.is_empty());
 
         let stripe_api_key = std::env::var("STRIPE_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty());
-
-        let stripe_webhook_secret = std::env::var("STRIPE_WEBHOOK_SECRET")
             .ok()
             .filter(|s| !s.is_empty());
 
@@ -119,10 +114,6 @@ impl Config {
                 database_password.as_deref().unwrap_or(""),
             ),
             ("STRIPE_API_KEY", stripe_api_key.as_deref().unwrap_or("")),
-            (
-                "STRIPE_WEBHOOK_SECRET",
-                stripe_webhook_secret.as_deref().unwrap_or(""),
-            ),
             (
                 "OTEL_EXPORTER_OTLP_HEADERS",
                 otel_exporter_otlp_headers.as_deref().unwrap_or(""),
@@ -215,7 +206,6 @@ impl Config {
             database_password,
             database_ssl_cert,
             stripe_api_key,
-            stripe_webhook_secret,
             credential_master_key,
             pricing_markup,
             terms_seed,
@@ -301,10 +291,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create Stripe client (optional)
     let stripe = config.stripe_api_key.map(StripeClient::new);
     if stripe.is_none() {
-        warn!("STRIPE_API_KEY not set — account billing endpoints will return 503");
-    }
-    if config.stripe_webhook_secret.is_none() {
-        warn!("STRIPE_WEBHOOK_SECRET not set — webhook endpoint will return 503");
+        warn!(
+            "STRIPE_API_KEY not set — Stripe checkout, subscription and portal endpoints will return 503"
+        );
     }
 
     // Credential key cache. Key windows come from the public calendar
@@ -384,7 +373,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         engines,
         db_pool,
         stripe,
-        config.stripe_webhook_secret,
         config.credential_master_key,
         credential_key_cache,
     );
@@ -610,8 +598,25 @@ mod tests {
             "missing /v1/account/ledger path"
         );
         assert!(
-            spec.paths.paths.contains_key("/v1/webhooks/stripe"),
-            "missing /v1/webhooks/stripe path"
+            !spec.paths.paths.contains_key("/v1/webhooks/stripe"),
+            "webhooks belong to the independently deployed billing receiver"
+        );
+        let repair = spec
+            .paths
+            .paths
+            .get("/v1/account/reconcile")
+            .expect("missing account repair path");
+        assert!(repair.post.is_some(), "missing queued repair request");
+        assert!(repair.get.is_some(), "missing durable repair status");
+        assert!(
+            repair
+                .post
+                .as_ref()
+                .unwrap()
+                .responses
+                .responses
+                .contains_key("202"),
+            "repair must acknowledge its durable request without claiming completion"
         );
 
         // Verify schemas exist

@@ -770,7 +770,6 @@ async fn a_stream_dropped_before_it_opens_is_settled() {
         )
         .unwrap(),
         None,
-        None,
         [0u8; 32],
         Arc::new(tokio::sync::RwLock::new(keys)),
     );

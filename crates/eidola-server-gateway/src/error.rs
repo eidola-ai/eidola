@@ -53,6 +53,27 @@ pub enum ServerError {
     Internal(String),
 }
 
+impl From<eidola_billing::BillingError> for ServerError {
+    fn from(error: eidola_billing::BillingError) -> Self {
+        use eidola_billing::BillingError;
+        match error {
+            BillingError::Invalid(message) => Self::BadRequest { message },
+            BillingError::Conflict(message) => Self::Conflict { message },
+            BillingError::NotFound(message) => Self::NotFound { message },
+            BillingError::RequiresReview(_) => Self::Conflict {
+                message: "billing requires support review".into(),
+            },
+            BillingError::Database(message) => Self::Internal(message),
+            BillingError::Network(message) => Self::Network(message),
+            BillingError::Parse(message) => Self::Parse(message),
+            BillingError::ServiceUnavailable(message) => Self::ServiceUnavailable(message),
+            BillingError::ProviderRejected(_) => {
+                Self::ServiceUnavailable("payment provider could not complete the operation".into())
+            }
+        }
+    }
+}
+
 impl ServerError {
     /// Map this error to an HTTP status code.
     pub fn status_code(&self) -> StatusCode {

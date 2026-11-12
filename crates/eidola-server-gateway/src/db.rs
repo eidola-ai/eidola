@@ -2,12 +2,7 @@
 
 use std::time::SystemTime;
 
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
-use rustls_pki_types::CertificateDer;
-use rustls_pki_types::pem::PemObject;
-use tokio_postgres::NoTls;
-use tokio_postgres::config::SslMode;
-use tokio_postgres_rustls::MakeRustlsConnect;
+use deadpool_postgres::Pool;
 use uuid::Uuid;
 
 use crate::credentials::SealedRefundToken;
@@ -18,75 +13,11 @@ pub struct AccountRow {
     pub id: Uuid,
     pub secret_hash: String,
     pub stripe_customer_id: Option<String>,
+    pub billing_state: String,
     pub created_at: SystemTime,
 }
 
-/// Create a connection pool from a PostgreSQL connection string.
-pub fn create_pool(
-    database_url: &str,
-    database_password: Option<&str>,
-    database_ssl_cert: Option<&str>,
-) -> Result<Pool, String> {
-    let normalized_url = database_url.replace("sslmode=verify-full", "sslmode=require");
-    let normalized_url = normalized_url.replace("sslmode=verify-ca", "sslmode=require");
-
-    let mut pg_config: tokio_postgres::Config = normalized_url
-        .parse()
-        .map_err(|e| format!("invalid DATABASE_URL: {}", e))?;
-
-    if let Some(database_password) = database_password.filter(|value| !value.is_empty()) {
-        pg_config.password(database_password);
-    }
-
-    // `Verified` issues a cheap liveness check before handing a connection
-    // out of the pool. This costs one extra round-trip per checkout but is
-    // required when the upstream is a serverless Postgres (e.g. Neon) whose
-    // compute can autosuspend and silently kill long-lived sockets.
-    let manager_config = ManagerConfig {
-        recycling_method: RecyclingMethod::Verified,
-    };
-    let manager = match pg_config.get_ssl_mode() {
-        SslMode::Disable => Manager::from_config(pg_config, NoTls, manager_config),
-        _ => {
-            let tls = MakeRustlsConnect::new(build_tls_config(database_ssl_cert)?);
-            Manager::from_config(pg_config, tls, manager_config)
-        }
-    };
-
-    Pool::builder(manager)
-        .max_size(8)
-        .build()
-        .map_err(|e| format!("failed to build connection pool: {}", e))
-}
-
-fn build_tls_config(database_ssl_cert: Option<&str>) -> Result<rustls::ClientConfig, String> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    if let Some(database_ssl_cert) = database_ssl_cert.filter(|value| !value.is_empty()) {
-        let certificates = CertificateDer::pem_slice_iter(database_ssl_cert.as_bytes())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("invalid DATABASE_SSL_CERT PEM: {e:?}"))?;
-
-        if certificates.is_empty() {
-            return Err("DATABASE_SSL_CERT did not contain any PEM certificates".to_string());
-        }
-
-        let (added, ignored) = root_store.add_parsable_certificates(certificates);
-        if added == 0 {
-            return Err(
-                "DATABASE_SSL_CERT did not contain any usable root certificates".to_string(),
-            );
-        }
-        if ignored > 0 {
-            tracing::warn!("Ignored {ignored} invalid certificate(s) in DATABASE_SSL_CERT");
-        }
-    }
-
-    Ok(rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth())
-}
+pub use eidola_billing::connection::create_pool;
 
 /// Maximum tolerated clock skew between this server and the database.
 /// Anything beyond this is treated as a misconfigured time source and
@@ -236,7 +167,7 @@ pub async fn get_account_by_id(pool: &Pool, id: Uuid) -> Result<AccountRow, Serv
 
     let row = client
         .query_opt(
-            "SELECT id, secret_hash, stripe_customer_id, created_at \
+            "SELECT id, secret_hash, stripe_customer_id, billing_state, created_at \
              FROM account WHERE id = $1",
             &[&id],
         )
@@ -250,6 +181,7 @@ pub async fn get_account_by_id(pool: &Pool, id: Uuid) -> Result<AccountRow, Serv
             id: row.get("id"),
             secret_hash: row.get("secret_hash"),
             stripe_customer_id: row.get("stripe_customer_id"),
+            billing_state: row.get("billing_state"),
             created_at: row.get("created_at"),
         }),
         None => Err(ServerError::NotFound {
@@ -313,7 +245,7 @@ pub async fn get_account_by_stripe_customer(
 
     let row = client
         .query_opt(
-            "SELECT id, secret_hash, stripe_customer_id, created_at \
+            "SELECT id, secret_hash, stripe_customer_id, billing_state, created_at \
              FROM account WHERE stripe_customer_id = $1",
             &[&customer_id],
         )
@@ -329,54 +261,47 @@ pub async fn get_account_by_stripe_customer(
         id: row.get("id"),
         secret_hash: row.get("secret_hash"),
         stripe_customer_id: row.get("stripe_customer_id"),
+        billing_state: row.get("billing_state"),
         created_at: row.get("created_at"),
     }))
 }
 
-/// Insert a credit ledger entry. Returns true if inserted, false if duplicate
-/// (based on `stripe_event_id` uniqueness).
-///
-/// `stripe_payment_intent` links payment-originated credits to their Stripe
-/// PaymentIntent so a later refund can be matched back to the same pool.
-#[tracing::instrument(skip_all, name = "db.insert_credit_ledger", err)]
-pub async fn insert_credit_ledger(
+/// Test funding uses the same purchase operation as production; it grants a
+/// free lot so an issuance fixture needs no real payment-provider object.
+#[cfg(test)]
+pub(crate) async fn insert_credit_ledger(
     pool: &Pool,
     account_id: Uuid,
-    delta: i64,
-    reason: &str,
-    stripe_event_id: &str,
-    stripe_payment_intent: Option<&str>,
+    credits: i64,
+    _reason: &str,
+    source_id: &str,
+    _payment_intent: Option<&str>,
     expires_at: Option<SystemTime>,
 ) -> Result<bool, ServerError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
-
-    let result = client
-        .execute(
-            "INSERT INTO credit_ledger \
-                 (account_id, delta, reason, stripe_event_id, stripe_payment_intent, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (stripe_event_id) DO NOTHING",
-            &[
-                &account_id,
-                &delta,
-                &reason,
-                &stripe_event_id,
-                &stripe_payment_intent,
-                &expires_at,
-            ],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "insert credit_ledger failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
-
-    Ok(result == 1)
+    use std::time::{Duration, UNIX_EPOCH};
+    let purchased_at = UNIX_EPOCH
+        + Duration::from_secs(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
+    let purchase = eidola_billing::store::Purchase {
+        id: source_id.into(),
+        account_id,
+        charge_id: None,
+        payment_intent: None,
+        invoice_id: None,
+        currency: "usd".into(),
+        paid_minor: 0,
+        credits,
+        purchased_at,
+        expires_at: expires_at.unwrap_or(purchased_at + Duration::from_secs(365 * 86400)),
+        kind: "purchase".into(),
+    };
+    Ok(eidola_billing::store::Store::new(pool.clone())
+        .record_purchase(&purchase)
+        .await?)
 }
 
 // --- Account acceptance / required document queries ---
@@ -769,6 +694,9 @@ pub enum IssuanceRecord {
     /// The named key's issue window has closed by the database clock, read
     /// under the account lock; nothing debited or stored.
     Retired,
+    /// Account closure permanently forbids new conversions. Stored retries
+    /// are answered before this check, so no paid response is lost.
+    Closed,
     /// The balance could not cover the amount; nothing debited or stored.
     Insufficient,
 }
@@ -891,6 +819,7 @@ pub async fn record_credential_issuance(
         },
         "stored" => IssuanceRecord::Stored(map_stored_issuance(&row)),
         "retired" => IssuanceRecord::Retired,
+        "closed" => IssuanceRecord::Closed,
         "insufficient" => IssuanceRecord::Insufficient,
         other => {
             return Err(ServerError::Internal(format!(
@@ -968,114 +897,7 @@ pub async fn prune_expired_issuances(
     Ok(row.get("pruned"))
 }
 
-/// Debit an account for a Stripe-originated event (refund or clawback).
-///
-/// Credits are drawn from balance pools in FIFO order (earliest expiry
-/// first, permanent last).  Any remainder beyond existing pools is placed
-/// in the permanent (NULL expiry) pool.  Returns `Ok(true)` if inserted,
-/// `Ok(false)` if the `stripe_event_id` was already processed (duplicate).
-pub async fn debit_stripe_event(
-    pool: &Pool,
-    account_id: Uuid,
-    amount: i64,
-    reason: &str,
-    stripe_event_id: &str,
-) -> Result<bool, ServerError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
-
-    let row = client
-        .query_one(
-            "SELECT debit_account($1, $2, $3, $4, NULL, FALSE) AS ids",
-            &[&account_id, &amount, &reason, &stripe_event_id],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "debit_stripe_event failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
-
-    let ids: Option<Vec<Uuid>> = row.get("ids");
-    match ids {
-        None => Ok(true), // p_require_balance is FALSE, so NULL is never returned
-        Some(v) if v.is_empty() => Ok(false), // duplicate event
-        Some(_) => Ok(true),
-    }
-}
-
-/// Insert a refund debit matched to the original payment's balance pool.
-///
-/// Looks up the credit entry recorded for `payment_intent` and, if found,
-/// inserts the refund debit with that entry's `expires_at` — even when the
-/// pool has already expired — so the refund nets against exactly the credits
-/// it reverses instead of draining unrelated pools or creating a permanent
-/// negative entry. Returns `Ok(None)` when no credit entry carries this
-/// payment intent (caller should fall back to `debit_stripe_event`),
-/// `Ok(Some(false))` on a duplicate `stripe_event_id`, and `Ok(Some(true))`
-/// on success.
-pub async fn refund_matched_to_payment_intent(
-    pool: &Pool,
-    account_id: Uuid,
-    amount: i64,
-    stripe_event_id: &str,
-    payment_intent: &str,
-) -> Result<Option<bool>, ServerError> {
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| ServerError::Internal(format!("db pool error: {e}")))?;
-
-    let original = client
-        .query_opt(
-            "SELECT expires_at FROM credit_ledger \
-             WHERE account_id = $1 AND stripe_payment_intent = $2 AND delta > 0 \
-             ORDER BY created_at ASC LIMIT 1",
-            &[&account_id, &payment_intent],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "refund pool lookup failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
-
-    let Some(row) = original else {
-        return Ok(None);
-    };
-    let expires_at: Option<SystemTime> = row.get("expires_at");
-    let delta = -amount;
-
-    let result = client
-        .execute(
-            "INSERT INTO credit_ledger \
-                 (account_id, delta, reason, stripe_event_id, stripe_payment_intent, expires_at) \
-             VALUES ($1, $2, 'refund', $3, $4, $5) \
-             ON CONFLICT (stripe_event_id) DO NOTHING",
-            &[
-                &account_id,
-                &delta,
-                &stripe_event_id,
-                &payment_intent,
-                &expires_at,
-            ],
-        )
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!(
-                "matched refund insert failed: {}",
-                db_error_summary(&e)
-            ))
-        })?;
-
-    Ok(Some(result == 1))
-}
-
-/// Get the current available balance for an account.
+/// Current balance, including the shared billing ledger's outstanding debt.
 #[tracing::instrument(skip_all, name = "db.get_available_balance", err)]
 pub async fn get_available_balance(pool: &Pool, account_id: Uuid) -> Result<i64, ServerError> {
     let client = pool
@@ -1121,16 +943,11 @@ pub async fn get_balance_pools(
 
     let rows = client
         .query(
-            "SELECT cl.expires_at, SUM(cl.delta)::bigint as pool_amount, \
-               (SELECT reason FROM credit_ledger sub \
-                WHERE sub.account_id = cl.account_id \
-                  AND sub.expires_at IS NOT DISTINCT FROM cl.expires_at AND sub.delta > 0 \
-                ORDER BY sub.created_at ASC LIMIT 1) as source_reason \
-             FROM credit_ledger cl \
+            "SELECT cl.expires_at, SUM(cl.delta)::bigint AS pool_amount, p.kind AS source_reason \
+             FROM credit_ledger cl LEFT JOIN billing_purchase p ON p.id = cl.purchase_id \
              WHERE cl.account_id = $1 AND (cl.expires_at IS NULL OR cl.expires_at > now()) \
-             GROUP BY cl.account_id, cl.expires_at \
-             HAVING SUM(cl.delta)::bigint != 0 \
-             ORDER BY cl.expires_at NULLS LAST",
+             GROUP BY cl.purchase_id, cl.expires_at, p.kind \
+             HAVING SUM(cl.delta) != 0 ORDER BY cl.expires_at NULLS LAST, cl.purchase_id",
             &[&account_id],
         )
         .await
@@ -1427,14 +1244,7 @@ pub struct LedgerEntryRow {
     pub credential_credits: Option<i64>,
 }
 
-/// Whether Stripe has ever moved money for this account.
-///
-/// A `stripe_event_id` is stamped on exactly the ledger rows a Stripe
-/// webhook wrote — purchases, subscription renewals, refunds, dispute
-/// adjustments — so its presence is the honest test for "this account has a
-/// payment history", as distinct from merely having a Stripe customer
-/// record. Internal rows (credential issuance and the like) carry no event
-/// id and correctly do not count.
+/// Whether a reconciled payment has ever funded this account.
 #[tracing::instrument(skip_all, name = "db.has_stripe_ledger_history", err)]
 pub async fn has_stripe_ledger_history(pool: &Pool, account_id: Uuid) -> Result<bool, ServerError> {
     let client = pool
@@ -1445,8 +1255,8 @@ pub async fn has_stripe_ledger_history(pool: &Pool, account_id: Uuid) -> Result<
     let row = client
         .query_one(
             "SELECT EXISTS (\
-                 SELECT 1 FROM credit_ledger \
-                 WHERE account_id = $1 AND stripe_event_id IS NOT NULL\
+                 SELECT 1 FROM billing_purchase \
+                 WHERE account_id = $1\
              )",
             &[&account_id],
         )
@@ -1502,5 +1312,119 @@ mod tests {
         let normalized = "postgres://user@db.example.com/postgres?sslmode=verify-full"
             .replace("sslmode=verify-full", "sslmode=require");
         assert!(normalized.contains("sslmode=require"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests (require running postgres: just db && just db-reset)
+    // -----------------------------------------------------------------------
+
+    use super::*;
+
+    /// A throwaway issuer key row: `credit_ledger.credential_key_id` is a
+    /// foreign key, and `issuer_key.id` must be the hash of its public key.
+    ///
+    /// Its windows are all in the past. The row's `private_key_enc` is one
+    /// byte, which `credentials::cache_key` rejects, and `get_valid_issuer_keys`
+    /// selects every unexpired key regardless of domain — so a fixture that
+    /// was still accepted would stop a server started against this database
+    /// from issuing until it expired or someone deleted it. Expired, it is
+    /// only ever a foreign-key target.
+    async fn insert_dummy_issuer_key(pool: &Pool) -> String {
+        let public_key = Uuid::new_v4().as_bytes().to_vec();
+        let client = pool.get().await.unwrap();
+        let row = client
+            .query_one(
+                "INSERT INTO issuer_key \
+                     (id, private_key_enc, public_key, domain_separator, \
+                      issue_from, issue_until, accept_until) \
+                 VALUES (encode(sha256($1), 'hex'), '\\x00', $1, 'test', \
+                         now() - interval '20 days', now() - interval '13 days', \
+                         now() - interval '6 days') \
+                 RETURNING id",
+                &[&public_key],
+            )
+            .await
+            .unwrap();
+        row.get("id")
+    }
+
+    /// Concurrent issuance must never debit more than the account holds.
+    ///
+    /// `debit_account` checks `available_balance` and then inserts as separate
+    /// statements; without its account row lock, under READ COMMITTED,
+    /// requests that overlap each see the balance before the others' debits
+    /// commit. This guards the SQL function's own lock directly: the newer
+    /// `record_credential_issuance` also locks the account, which would mask
+    /// a missing lock here from this regression.
+    /// Each round funds a fresh account and fires `CONCURRENCY` issuances
+    /// for the whole balance at once; at most one may succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore]
+    async fn concurrent_issuance_never_overdraws() {
+        const CONCURRENCY: usize = 8;
+        const ROUNDS: usize = 20;
+        const BALANCE: i64 = 1_000_000;
+
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let pool = create_pool(&url, None, None).expect("failed to create test pool");
+        let key_id = insert_dummy_issuer_key(&pool).await;
+
+        let mut overdrawn = Vec::new();
+        for round in 0..ROUNDS {
+            let account_id = Uuid::new_v4();
+            insert_account(&pool, account_id, "test_hash")
+                .await
+                .unwrap();
+            insert_credit_ledger(
+                &pool,
+                account_id,
+                BALANCE,
+                "purchase",
+                &format!("evt_test_{}", Uuid::new_v4()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
+            let tasks: Vec<_> = (0..CONCURRENCY)
+                .map(|_| {
+                    let (pool, key_id, barrier) = (pool.clone(), key_id.clone(), barrier.clone());
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        let client = pool.get().await.unwrap();
+                        client
+                            .query_one(
+                                "SELECT debit_account($1, $2, 'credential_issuance', NULL, $3, TRUE) AS ids",
+                                &[&account_id, &BALANCE, &key_id],
+                            )
+                            .await
+                            .map(|row| {
+                                row.get::<_, Option<Vec<Uuid>>>("ids")
+                                    .and_then(|ids| ids.into_iter().next())
+                            })
+                    })
+                })
+                .collect();
+
+            let mut succeeded = 0;
+            for task in tasks {
+                if task.await.unwrap().unwrap().is_some() {
+                    succeeded += 1;
+                }
+            }
+            let balance = get_available_balance(&pool, account_id).await.unwrap();
+            if succeeded > 1 {
+                overdrawn.push((round, succeeded, balance));
+            }
+        }
+
+        assert!(
+            overdrawn.is_empty(),
+            "{} of {ROUNDS} rounds issued more than the balance \
+             (round, issuances that succeeded, final balance): {overdrawn:?}",
+            overdrawn.len()
+        );
     }
 }

@@ -33,6 +33,8 @@ pub struct GetAccountResponse {
     pub id: Uuid,
     pub stripe_customer_id: Option<String>,
     pub created_at: String,
+    /// `open`, `closing`, or `closed`. Closing accounts remain readable.
+    pub billing_state: String,
 }
 
 /// The account's subscription standing.
@@ -177,6 +179,85 @@ pub struct BalancesResponse {
     pub available: i64,
     /// Per-pool breakdown, earliest expiry first.
     pub pools: Vec<BalancePool>,
+    /// Unrecovered chargeback value, valued in the original payment currency.
+    pub debts: Vec<CashDebt>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CashDebt {
+    pub currency: String,
+    /// Decimal minor currency units. Fractional units preserve exact purchase
+    /// valuation internally; this is not a demand for another payment.
+    pub amount_minor: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ReconcileResponse {
+    pub state: ReconcileState,
+    /// Latest durable repair request. A request arriving during a run remains
+    /// pending until a subsequent run covers its generation.
+    pub requested_generation: i64,
+    /// Generation covered by `report`. While pending, this report describes
+    /// the last completed run, not the latest request.
+    pub completed_generation: i64,
+    pub report: Option<BillingReconcileReport>,
+    /// Fixed failure category from the last unsuccessful attempt, if any.
+    /// The durable request remains pending and may be retried by the worker.
+    pub last_error: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileState {
+    Idle,
+    Pending,
+    Complete,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct BillingReconcileReport {
+    /// Counts of current provider objects examined, not newly granted credits.
+    pub purchases: usize,
+    pub refunds: usize,
+    pub disputes: usize,
+    pub review: Vec<BillingReview>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct BillingReview {
+    pub object_id: String,
+    pub reason: String,
+}
+
+impl From<eidola_billing::store::RepairStatus> for ReconcileResponse {
+    fn from(status: eidola_billing::store::RepairStatus) -> Self {
+        let state = if status.requested_generation == 0 {
+            ReconcileState::Idle
+        } else if status.requested_generation > status.completed_generation {
+            ReconcileState::Pending
+        } else {
+            ReconcileState::Complete
+        };
+        Self {
+            state,
+            requested_generation: status.requested_generation,
+            completed_generation: status.completed_generation,
+            report: status.report.map(|report| BillingReconcileReport {
+                purchases: report.purchases,
+                refunds: report.refunds,
+                disputes: report.disputes,
+                review: report
+                    .review
+                    .into_iter()
+                    .map(|item| BillingReview {
+                        object_id: item.object_id,
+                        reason: item.reason,
+                    })
+                    .collect(),
+            }),
+            last_error: status.last_error,
+        }
+    }
 }
 
 /// One balance pool: credits sharing an origin and expiration.
@@ -427,6 +508,7 @@ pub async fn get_account(
         id: account.id,
         stripe_customer_id: account.stripe_customer_id,
         created_at: system_time_to_iso(account.created_at)?,
+        billing_state: account.billing_state,
     }))
 }
 
@@ -634,9 +716,9 @@ pub async fn list_prices(
         (status = 200, description = "Checkout session created", body = CheckoutUrlResponse),
         (status = 400, description = "Invalid request", body = crate::types::ErrorResponse),
         (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
-        (status = 409, description = "Already subscribed", body = crate::types::ErrorResponse),
+        (status = 409, description = "Already subscribed, or account is closing or closed", body = crate::types::ErrorResponse),
         (status = 428, description = "Terms acceptance required", body = crate::types::ErrorResponse),
-        (status = 503, description = "Stripe not configured", body = crate::types::ErrorResponse)
+        (status = 503, description = "Billing is busy or unavailable, or Stripe is not configured", body = crate::types::ErrorResponse)
     )
 )]
 pub async fn create_checkout(
@@ -645,6 +727,30 @@ pub async fn create_checkout(
     Json(checkout_req): Json<CheckoutRequest>,
 ) -> Result<Json<CheckoutUrlResponse>, ServerError> {
     let stripe = require_stripe(&state.stripe)?;
+
+    // Checkout, reconciliation and closure use the same per-account lock.
+    // The external session can outlive this call; a later payment on a closed
+    // account is reconciled into its closure refund workflow.
+    let store = eidola_billing::store::Store::new(state.db_pool.clone());
+    let _guard = store.lock_checkout(account_id).await.map_err(|error| {
+        match error {
+            // Account work is transient admission contention. A checkout 409
+            // means a persistent account state, such as an active subscription.
+            eidola_billing::BillingError::Conflict(_) => {
+                ServerError::ServiceUnavailable("account billing is busy; retry checkout".into())
+            }
+            error => error.into(),
+        }
+    })?;
+    if db::get_account_by_id(&state.db_pool, account_id)
+        .await?
+        .billing_state
+        != "open"
+    {
+        return Err(ServerError::Conflict {
+            message: "account is closing or closed".into(),
+        });
+    }
 
     ensure_terms_accepted(&state, account_id).await?;
 
@@ -671,7 +777,21 @@ pub async fn create_checkout(
     // writes nothing at all. (It does not remove the need for that ledger
     // test: an *abandoned* checkout still leaves a customer behind, and
     // nothing server-side hears about it.)
-    let price = stripe.get_price(&checkout_req.price_id).await?;
+    let price = stripe.get_price_expanded(&checkout_req.price_id).await?;
+    let credits = price
+        .product
+        .metadata
+        .get("credits")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|credits| *credits > 0)
+        .ok_or_else(|| ServerError::BadRequest {
+            message: "price does not specify a positive credit amount".into(),
+        })?;
+    if !price.active || price.unit_amount.is_none_or(|amount| amount < 0) {
+        return Err(ServerError::BadRequest {
+            message: "price is not available for checkout".into(),
+        });
+    }
 
     let customer_id = ensure_stripe_customer(&state.db_pool, stripe, account_id).await?;
 
@@ -721,11 +841,68 @@ pub async fn create_checkout(
         client_reference_id: Some(&account_id_str),
         submit_note: Some(submit_note),
         description: Some(description),
+        credits,
     };
 
     let checkout_url = stripe.create_checkout_session(&params).await?;
 
     Ok(Json(CheckoutUrlResponse { checkout_url }))
+}
+
+/// Durably request billing reconciliation for the authenticated account.
+/// An independent billing worker performs the provider calls. This remains
+/// available without Stripe credentials, while reviewing terms and after
+/// account closure. Poll GET on this path for completion and review items.
+#[utoipa::path(
+    post,
+    path = "/v1/account/reconcile",
+    tag = "Linked",
+    security(("basic" = [])),
+    responses(
+        (status = 202, description = "Repair request recorded; poll GET for its completed generation", body = ReconcileResponse),
+        (status = 400, description = "Repair does not accept a request body", body = crate::types::ErrorResponse),
+        (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
+        (status = 503, description = "Billing unavailable", body = crate::types::ErrorResponse)
+    )
+)]
+#[tracing::instrument(skip_all, name = "account.reconcile", err)]
+pub async fn reconcile_billing(
+    BasicAuth(account_id): BasicAuth,
+    State(state): State<AppState>,
+    body: bytes::Bytes,
+) -> Result<(StatusCode, Json<ReconcileResponse>), ServerError> {
+    if !body.is_empty() {
+        return Err(ServerError::BadRequest {
+            message: "billing repair does not accept a request body".into(),
+        });
+    }
+    let status = eidola_billing::store::Store::new(state.db_pool.clone())
+        .request_reconciliation(account_id)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(status.into())))
+}
+
+/// Read this account's durable repair status without initiating provider work.
+#[utoipa::path(
+    get,
+    path = "/v1/account/reconcile",
+    tag = "Linked",
+    security(("basic" = [])),
+    responses(
+        (status = 200, description = "Repair status; report covers completed_generation", body = ReconcileResponse),
+        (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
+        (status = 503, description = "Billing unavailable", body = crate::types::ErrorResponse)
+    )
+)]
+#[tracing::instrument(skip_all, name = "account.reconcile_status", err)]
+pub async fn get_reconciliation(
+    BasicAuth(account_id): BasicAuth,
+    State(state): State<AppState>,
+) -> Result<Json<ReconcileResponse>, ServerError> {
+    let status = eidola_billing::store::Store::new(state.db_pool.clone())
+        .reconciliation_status(account_id)
+        .await?;
+    Ok(Json(status.into()))
 }
 
 /// Ensure the account has a Stripe customer ID, creating one if needed.
@@ -780,6 +957,15 @@ pub async fn get_balances(
     Ok(Json(BalancesResponse {
         available: total,
         pools,
+        debts: eidola_billing::store::Store::new(state.db_pool.clone())
+            .debts(account_id)
+            .await?
+            .into_iter()
+            .map(|debt| CashDebt {
+                currency: debt.currency,
+                amount_minor: debt.amount_minor,
+            })
+            .collect(),
     }))
 }
 

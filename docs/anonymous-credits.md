@@ -247,7 +247,7 @@ What is held at once, unresolved issuances included, is at most the threshold pl
 
 **Enforced.** `debit_account` and `record_credential_issuance` in the gateway's `schema/schema.sql`; `concurrent_issuances_cannot_spend_one_balance_twice` and `an_issuance_racing_its_own_retry_is_debited_once` (`credentials.rs`, against Postgres).
 
-**What would break it.** Any balance check and debit that are not serialized per account, including a second debit path that bypasses `debit_account`.
+**What would break it.** Any balance check and debit that are not serialized per account, including a refund, dispute or closure path that bypasses the account row lock. Paid balance changes belong to the shared billing library and preserve the purchase allocation that `debit_account` consumes.
 
 ## Lost issuance responses
 
@@ -455,7 +455,7 @@ Recovering a spend is an unlinked request, named by the spend alone, and the cli
 
 Postgres runs outside the enclave. It is treated as adversarial: its operator or hosting provider could be compelled, under a gag order, to hand over or watch everything in it.
 
-**Decision.** For the account surface it holds what billing needs: accounts (a UUID and a secret hash), the credit ledger, Stripe references, terms acceptances, one ledger row per issuance (account, amount, key, time), and beside it the stored response of that issuance (account, idempotency key, request digest, key, amount, ledger entry, and the signed response, with no timestamp of its own), kept until its key can be used for nothing. For the inference surface it holds, per spend, only the issuer key id, the nullifier, and the sealed refund; the inputs of one request are rows written in one transaction. **Nullifier rows carry no timestamp and no amount, and nothing written on the inference path names an account.** Issuer private keys are stored encrypted.
+**Decision.** For the account surface it holds what billing needs: accounts (a UUID and a secret hash), the credit ledger and its purchase allocations, actual purchase prices and currencies, durable refund and closure operations, Stripe observations and references, the database identity responsible for an operation, terms acceptances, one ledger row per issuance (account, amount, key, time), and beside it the stored response of that issuance (account, idempotency key, request digest, key, amount, ledger entry, and the signed response, with no timestamp of its own), kept until its key can be used for nothing. For the inference surface it holds, per spend, only the issuer key id, the nullifier, and the sealed refund; the inputs of one request are rows written in one transaction. **Nullifier rows carry no timestamp and no amount, and nothing written on the inference path names an account.** Issuer private keys are stored encrypted.
 
 **Why.** The database is the one place both surfaces meet. A per-spend timestamp or amount beside per-account issuance timestamps and amounts would hand whoever reads it material to pair them.
 
@@ -483,11 +483,17 @@ Postgres runs outside the enclave. It is treated as adversarial: its operator or
 
 ## Payment reversals
 
-**Decision.** A Stripe refund or chargeback debits the account's ledger, netted against the credit pool it reverses. It cannot reach credits already converted: those are anonymous tokens that cannot be identified or recalled.
+**Decision.** `eidola-billing` owns the financial workflow shared by independent billing workers and the private support CLI. The CLI connects directly to the database and Stripe as its human or workload caller; it is not a privileged gateway endpoint. A separately runnable webhook receiver durably queues provider observations. The gateway authenticates an account-holder repair request and queues it in the database; it never executes that repair or runs an inbox worker. The account holder can read the completed generation and its report, with a newer request remaining pending even when it arrives during a repair. These linked-account operations can run outside the attested confidentiality boundary; ACT issuance and signing remain inside it.
 
-**Why.** That is the anonymity working as intended. It means buying credits, converting them, and then disputing the payment is a loss the business absorbs, bounded by how much was converted. Refunds to customers are possible only out of balance that has not been converted.
+Reconciliation fetches current provider facts under a per-account lock and applies purchases, refunds and disputes together, so a known chargeback cannot arrive one commit after spendable purchase credits. Every ledger change also takes the same account row lock as issuance. Durable work survives process loss, and database locks coordinate receiver/worker replicas and direct CLI execution. Supported producer and executor protocol versions are checked separately; an older producer can request work from a newer compatible executor, while unsupported work is retained rather than silently completed.
 
-**What would break it.** Any mechanism that could identify or revoke a particular customer's tokens. That would be a tracing capability, and the guarantees forbid it.
+A purchase retains the credits granted, cash actually paid, currency, original expiry and provider payment identity. An ordinary refund first reserves the exact eligible credits in a durable operation, then requests the cash refund, then records its outcome. A separately chosen cash-only remedy changes no credits. Refund observations without such an intent record money movement and require review; they cannot invent a credit cancellation. A lost response leaves the operation pending, with its reservation intact. The repair command and webhook worker reconcile that same operation; neither can create a second entitlement from a duplicate or reordered event.
+
+A chargeback deducts its cash value using the prices actually paid for affected credits, including other purchases. Any unrecovered value remains a deficit; it does not expire when the original credits do. Previous refunds and reversals prevent the same payment being recovered twice. A won dispute undoes the recorded deductions with their original expiries. Remaining positive credits stay usable while the account is open. Closure freezes new conversions and checkout before cancellation and refunds, and preserves the refund eligibility of credits that expire while closure is being processed.
+
+**Privacy boundary.** None of these operations can identify or recall ACTs already issued. The account holder's repair endpoint asks for reconciliation of their own account only; it accepts no token, spend history, refund key or caller-chosen credit adjustment. A cash refund for a service failure or other individual remedy does not exchange ACTs back into account balance.
+
+**What would break it.** A second balance writer that bypasses the shared transaction rules; guessing a purchase's value at par; letting a refund reservation be converted; treating a webhook delivery as an instruction to debit again; or any mechanism that identifies or revokes a particular customer's anonymous tokens.
 
 ## The local wallet
 
