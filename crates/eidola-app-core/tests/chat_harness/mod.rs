@@ -3396,7 +3396,7 @@ async fn write_padded_sse_stream(
     refund: Option<serde_json::Value>,
     idle_frames: usize,
 ) -> std::io::Result<()> {
-    use eidola_server_gateway::padding::{FRAME_BYTES, Framer, StreamEvent};
+    use eidola_server_gateway::padding::{Framer, StreamEvent};
     let head = "HTTP/1.1 200 OK\r\n\
                 Content-Type: text/event-stream\r\n\
                 Transfer-Encoding: chunked\r\n\
@@ -3404,7 +3404,7 @@ async fn write_padded_sse_stream(
     stream.write_all(head.as_bytes()).await?;
     stream.flush().await?;
 
-    let mut framer = Framer::new(FRAME_BYTES);
+    let mut framer = Framer::new(eidola_server_gateway::padding::Cadence::CLIENT_FACING.frames);
     // One write per frame, as the server's ticks write them.
     async fn tick(stream: &mut TcpStream, framer: &mut Framer) -> std::io::Result<()> {
         let frame = framer.frame();
@@ -3467,7 +3467,7 @@ async fn write_padded_sse_stream(
 /// See [`ChatBehavior::StreamingPaddedNearReadCeiling`]. The sizes are the
 /// server's own encoding (`data: ` + JSON + a blank line), summed here.
 async fn write_padded_near_ceiling(stream: &mut TcpStream) -> std::io::Result<()> {
-    use eidola_server_gateway::padding::{FRAME_BYTES, Framer, StreamEvent};
+    use eidola_server_gateway::padding::{Framer, StreamEvent};
     // Spelled here rather than imported: the mock is the peer.
     const TARGET: usize = 8 * 1024 * 1024 - 4096;
     let head = "HTTP/1.1 200 OK\r\n\
@@ -3506,7 +3506,7 @@ async fn write_padded_near_ceiling(stream: &mut TcpStream) -> std::io::Result<()
     }
     contents.push("y".repeat(TARGET - total - overhead));
 
-    let mut framer = Framer::new(FRAME_BYTES);
+    let mut framer = Framer::new(eidola_server_gateway::padding::Cadence::CLIENT_FACING.frames);
     let chunked = |frames: &[u8]| {
         let mut out = format!("{:x}\r\n", frames.len()).into_bytes();
         out.extend_from_slice(frames);

@@ -237,7 +237,10 @@ async fn gateway_token_is_required() {
         .unwrap();
     assert_eq!(r.status().as_u16(), 200);
     // A dev-writable node says so, even in its health check.
-    assert_eq!(r.text().await.unwrap(), "ok; weights-storage=dev-writable");
+    assert_eq!(
+        r.text().await.unwrap().trim_end(),
+        "ok; weights-storage=dev-writable"
+    );
     assert_eq!(node.stats().submitted, 0);
 }
 
@@ -484,6 +487,148 @@ async fn non_streaming_matches_the_engine_token_for_token() {
         .wait_for(Duration::from_secs(5), |s| s.finished == 3)
         .await;
     assert_eq!((s.submitted, s.cancelled, s.in_engine), (3, 0, 0));
+}
+
+/// One raw HTTP/1.1 exchange with the node: the response head, and each chunk of its
+/// chunked body with the instant it was read.
+async fn raw_exchange(
+    node: &TestNode,
+    request: String,
+) -> (String, Vec<(std::time::Instant, Vec<u8>)>) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let addr = node.base.strip_prefix("http://").unwrap();
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    socket.write_all(request.as_bytes()).await.unwrap();
+    let mut reader = BufReader::new(socket);
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        head.push_str(&line);
+        if line == "\r\n" {
+            break;
+        }
+    }
+    let mut chunks = Vec::new();
+    if !head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        return (head, chunks);
+    }
+    loop {
+        let mut size = String::new();
+        reader.read_line(&mut size).await.unwrap();
+        let size = usize::from_str_radix(size.trim(), 16).unwrap();
+        let mut chunk = vec![0; size + 2];
+        reader.read_exact(&mut chunk).await.unwrap();
+        chunk.truncate(size);
+        if size == 0 {
+            return (head, chunks);
+        }
+        chunks.push((std::time::Instant::now(), chunk));
+    }
+}
+
+/// A streamed answer is written as frames: every HTTP chunk is exactly the cadence's
+/// frame size, padding included, the writes are at least a tick apart, and what the
+/// frames carry reads back as the stream's events.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_answer_is_frames_of_one_size_on_a_tick() {
+    use eidola_common::engine_protocol::STREAM_CADENCE;
+    use eidola_common::stream_shape::{StreamEvent, StreamReader};
+    let node = TestNode::start(&[]).await;
+    let mut body = request(LONG_TEXT, 24);
+    body["stream"] = true.into();
+    body["stream_options"] = json!({"include_usage": true});
+    let body = body.to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nhost: node\r\nauthorization: Bearer {TOKEN}\r\n\
+         x-eidola-weights-sha256: {}\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+        weights_hash(),
+        body.len()
+    );
+    let (head, chunks) = raw_exchange(&node, request).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(chunks.len() > 1, "{} frames", chunks.len());
+    for (_, chunk) in &chunks {
+        assert_eq!(chunk.len(), STREAM_CADENCE.frame_bytes());
+    }
+    // The first frame goes out at once and each later one a tick after the last at the
+    // soonest, so n frames span at least n - 1 ticks.
+    let span = chunks.last().unwrap().0 - chunks[0].0;
+    let ticks = u32::try_from(chunks.len() - 1).unwrap();
+    assert!(
+        span + Duration::from_millis(5) >= STREAM_CADENCE.tick() * ticks,
+        "{} frames in {span:?}",
+        chunks.len()
+    );
+    let mut reader = StreamReader::new();
+    for (_, chunk) in &chunks {
+        reader.push(chunk);
+    }
+    let mut events = Vec::new();
+    while let Some(event) = reader.next_event().unwrap() {
+        events.push(event);
+    }
+    assert_eq!(events.last(), Some(&StreamEvent::Done));
+    let chunk_count = events
+        .iter()
+        .filter(|e| matches!(e, StreamEvent::Json(_)))
+        .count();
+    assert!(
+        chunk_count >= 3,
+        "role, deltas, finish and usage: {events:?}"
+    );
+}
+
+/// Every response that is not a stream is padded to a size bucket, with its length to
+/// match: a blocking answer, a refusal (here before any handler runs), an unknown path,
+/// the health check.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_other_response_is_padded_to_a_bucket() {
+    let node = TestNode::start(&[]).await;
+    let answered = node.chat(&request("hi", 4)).send().await.unwrap();
+    let refused = node
+        .client
+        .post(format!("{}/v1/chat/completions", node.base))
+        .json(&request("hi", 4))
+        .send()
+        .await
+        .unwrap();
+    let missing = node
+        .client
+        .get(format!("{}/v1/nothing-here", node.base))
+        .send()
+        .await
+        .unwrap();
+    let health = node
+        .client
+        .get(format!("{}/healthz", node.base))
+        .send()
+        .await
+        .unwrap();
+    for (what, response, status) in [
+        ("answer", answered, 200),
+        ("refusal", refused, 401),
+        ("unknown path", missing, 404),
+        ("health", health, 200),
+    ] {
+        assert_eq!(response.status().as_u16(), status, "{what}");
+        let declared = response.content_length();
+        let bytes = response.bytes().await.unwrap();
+        assert_eq!(declared, Some(bytes.len() as u64), "{what}");
+        assert!(
+            bytes.len().is_power_of_two()
+                && bytes.len() >= eidola_common::stream_shape::MIN_BODY_BUCKET,
+            "{what}: {} bytes",
+            bytes.len()
+        );
+        if what != "unknown path" && what != "health" {
+            let _: Value = serde_json::from_slice(&bytes).expect("still JSON");
+        }
+    }
 }
 
 fn parse_chunks(events: &[String]) -> (Vec<Value>, bool) {

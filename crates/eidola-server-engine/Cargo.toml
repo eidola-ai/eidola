@@ -55,3 +55,5 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = "0.0.2-alpha"
 tempfile = "3"
+# Reading the node's chunked stream off a raw socket (`tests/server.rs`).
+tokio = { version = "1", features = ["io-util"] }

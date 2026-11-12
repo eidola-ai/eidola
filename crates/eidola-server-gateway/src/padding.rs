@@ -11,7 +11,9 @@
 //!
 //! **Streaming** ([`padded_sse_response`]): the body is written as frames of
 //! exactly [`FRAME_BYTES`], one per [`TICK`], from the moment the response
-//! opens until the frame that carries `[DONE]`. A frame holds whatever event
+//! opens until the frame that carries `[DONE]`, cut by
+//! `eidola_common::stream_shape`'s [`Framer`], the one an inference node's
+//! stream to this server is cut by too. A frame holds whatever event
 //! bytes are waiting, up to its size, and the remainder is padding; an event
 //! larger than a frame continues in the next one. So every write is the same
 //! size and the writes run on a clock, whether a token arrived, a hundred did,
@@ -38,7 +40,6 @@
 //! Doctrine, and what an observer still learns:
 //! `crates/eidola-server-gateway/AGENTS.md` → Client-facing traffic shape.
 
-use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -52,7 +53,7 @@ use axum::extract::Request;
 use axum::http::{HeaderValue, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures_util::{FutureExt, Stream};
 use tokio::sync::Notify;
 use tokio::time::{Interval, MissedTickBehavior};
@@ -85,29 +86,13 @@ pub const TICK: Duration = Duration::from_millis(50);
 /// this on its own is held alone, and is cut across frames.
 pub const MAX_BACKLOG_BYTES: usize = 1 << 20;
 
-/// The smallest size a blocking JSON body is padded to.
-pub const MIN_BODY_BUCKET: usize = 4096;
+pub use eidola_common::stream_shape::{Framer, MIN_BODY_BUCKET, StreamEvent, body_bucket};
 
-/// A frame must hold a whole comment event (`:\n\n`) with room to spare.
-const MIN_FRAME_BYTES: usize = 16;
-
-/// One server-sent event of a chat response, before framing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StreamEvent {
-    /// A JSON payload (a completion chunk, or the metadata event): compact
-    /// `serde_json` output, so it holds no line break.
-    Json(String),
-    /// The `[DONE]` sentinel, which ends the stream.
-    Done,
-}
-
-/// How a streamed response is framed.
+/// How a streamed response is framed, and how much it holds waiting.
 #[derive(Debug, Clone, Copy)]
 pub struct Cadence {
-    /// The size of every frame, in bytes.
-    pub frame_bytes: usize,
-    /// The interval between frames.
-    pub tick: Duration,
+    /// The size of every frame and the interval between them.
+    pub frames: eidola_common::stream_shape::Cadence,
     /// See [`MAX_BACKLOG_BYTES`].
     pub max_backlog_bytes: usize,
 }
@@ -115,137 +100,9 @@ pub struct Cadence {
 impl Cadence {
     /// What every client of this server receives.
     pub const CLIENT_FACING: Self = Self {
-        frame_bytes: FRAME_BYTES,
-        tick: TICK,
+        frames: eidola_common::stream_shape::Cadence::new(FRAME_BYTES, TICK),
         max_backlog_bytes: MAX_BACKLOG_BYTES,
     };
-}
-
-/// Encodes events and cuts them into frames of one size.
-///
-/// Pure: what goes in a frame is decided here, when it goes out is
-/// [`PaddedStream`]'s.
-#[derive(Debug)]
-pub struct Framer {
-    frame_bytes: usize,
-    /// Encoded events not yet wholly in a frame, the front one possibly
-    /// started: `front_sent` of its bytes are already out. The queue always
-    /// ends at an event boundary, since events go in whole.
-    events: VecDeque<Bytes>,
-    front_sent: usize,
-    /// Event bytes not yet in a frame.
-    queued: usize,
-    /// Whether the last event pushed is JSON, which can take trailing
-    /// whitespace inside its data value.
-    last_is_json: bool,
-    done: bool,
-}
-
-/// `event` as it goes on the wire, and whether it is JSON.
-fn encode(event: &StreamEvent) -> (Bytes, bool) {
-    match event {
-        StreamEvent::Json(json) => {
-            let mut out = BytesMut::with_capacity(json.len() + 8);
-            // One `data:` field per line, as the format joins them back;
-            // compact JSON has none, so this is one field.
-            for line in json.split('\n') {
-                out.extend_from_slice(b"data: ");
-                out.extend_from_slice(line.trim_end_matches('\r').as_bytes());
-                out.extend_from_slice(b"\n");
-            }
-            out.extend_from_slice(b"\n");
-            (out.freeze(), true)
-        }
-        StreamEvent::Done => (Bytes::from_static(b"data: [DONE]\n\n"), false),
-    }
-}
-
-impl Framer {
-    /// # Panics
-    /// If `frame_bytes` is too small to hold a padding comment.
-    pub fn new(frame_bytes: usize) -> Self {
-        assert!(
-            frame_bytes >= MIN_FRAME_BYTES,
-            "a frame must hold a padding comment"
-        );
-        Self {
-            frame_bytes,
-            events: VecDeque::new(),
-            front_sent: 0,
-            queued: 0,
-            last_is_json: false,
-            done: false,
-        }
-    }
-
-    /// Queue one event. Nothing is queued after [`StreamEvent::Done`].
-    pub fn push(&mut self, event: &StreamEvent) {
-        let (encoded, is_json) = encode(event);
-        self.push_encoded(encoded, is_json);
-    }
-
-    fn push_encoded(&mut self, encoded: Bytes, is_json: bool) {
-        if self.done {
-            return;
-        }
-        self.queued += encoded.len();
-        self.events.push_back(encoded);
-        self.last_is_json = is_json;
-        self.done = !is_json;
-    }
-
-    /// Event bytes waiting for a frame.
-    pub fn backlog(&self) -> usize {
-        self.queued
-    }
-
-    /// Whether `[DONE]` has been queued.
-    pub fn done(&self) -> bool {
-        self.done
-    }
-
-    /// The next frame: exactly `frame_bytes` long, whatever is waiting.
-    pub fn frame(&mut self) -> Bytes {
-        let size = self.frame_bytes;
-        let mut frame = BytesMut::with_capacity(size);
-        while frame.len() < size {
-            let Some(front) = self.events.front() else {
-                break;
-            };
-            // Possibly mid-event; the next frame continues it.
-            let rest = &front[self.front_sent..];
-            let take = rest.len().min(size - frame.len());
-            frame.extend_from_slice(&rest[..take]);
-            self.front_sent += take;
-            self.queued -= take;
-            if self.front_sent == front.len() {
-                self.events.pop_front();
-                self.front_sent = 0;
-            }
-        }
-        if frame.len() == size {
-            return frame.freeze();
-        }
-        // Everything waiting fitted, and it ended at an event boundary.
-        let room = size - frame.len();
-        if room >= 3 {
-            frame.extend_from_slice(b":");
-            frame.resize(size - 2, b' ');
-            frame.extend_from_slice(b"\n\n");
-        } else if !frame.is_empty() && self.last_is_json {
-            // Too little room for a comment: trailing whitespace on the last
-            // event's data line, before the blank line that ends it.
-            let end = frame.len() - 2;
-            let tail = frame.split_off(end);
-            frame.resize(end + room, b' ');
-            frame.extend_from_slice(&tail);
-        } else {
-            // Only after `[DONE]`: empty lines, which dispatch nothing.
-            frame.resize(size, b'\n');
-        }
-        debug_assert_eq!(frame.len(), size);
-        frame.freeze()
-    }
 }
 
 /// What the producer and the stream share: the framer, bounded in bytes.
@@ -260,6 +117,9 @@ struct SharedState {
     framer: Framer,
     sender_alive: bool,
     stream_alive: bool,
+    /// When the stream last wrote a frame (or opened): how
+    /// [`EventSender::stalled`] tells a client that has stopped reading.
+    last_frame: tokio::time::Instant,
 }
 
 impl Shared {
@@ -289,7 +149,7 @@ impl EventSender {
     /// already held it) and cut across as many frames as it takes. Fails once
     /// the stream has gone, which is how the producer sees a disconnect.
     pub async fn send(&self, event: StreamEvent) -> Result<(), StreamClosed> {
-        let (encoded, is_json) = encode(&event);
+        let encoded = event.encode();
         drop(event);
         loop {
             let space = self.shared.space.notified();
@@ -300,7 +160,7 @@ impl EventSender {
                 }
                 let waiting = state.framer.backlog();
                 if waiting == 0 || waiting + encoded.len() <= self.shared.max_backlog_bytes {
-                    state.framer.push_encoded(encoded, is_json);
+                    state.framer.push_encoded(encoded);
                     return Ok(());
                 }
             }
@@ -321,6 +181,23 @@ impl EventSender {
     }
 }
 
+impl EventSender {
+    /// Resolves once the stream has written no frame for `limit`: its client
+    /// has stopped reading. The stream writes a frame every tick while the
+    /// client reads, whether or not anything is waiting, so a pause this long
+    /// is a client (and the buffers between it and this server) that has
+    /// taken nothing, not a slow model.
+    pub async fn stalled(&self, limit: Duration) {
+        loop {
+            let since = self.shared.lock().last_frame;
+            tokio::time::sleep_until(since + limit).await;
+            if self.shared.lock().last_frame == since {
+                return;
+            }
+        }
+    }
+}
+
 impl Drop for EventSender {
     fn drop(&mut self) {
         self.shared.lock().sender_alive = false;
@@ -333,14 +210,15 @@ impl Drop for EventSender {
 pub fn channel(cadence: Cadence) -> (EventSender, PaddedStream) {
     let shared = Arc::new(Shared {
         state: Mutex::new(SharedState {
-            framer: Framer::new(cadence.frame_bytes),
+            framer: Framer::new(cadence.frames),
             sender_alive: true,
             stream_alive: true,
+            last_frame: tokio::time::Instant::now(),
         }),
         space: Notify::new(),
         max_backlog_bytes: cadence.max_backlog_bytes,
     });
-    let mut interval = tokio::time::interval(cadence.tick);
+    let mut interval = tokio::time::interval(cadence.frames.tick());
     // A late tick moves the schedule rather than writing two frames back to
     // back.
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -394,9 +272,13 @@ impl Stream for PaddedStream {
         }
         match this.interval.poll_tick(cx) {
             Poll::Ready(_) => {
-                let frame = this.shared.lock().framer.frame();
+                let frame = {
+                    let mut state = this.shared.lock();
+                    state.last_frame = tokio::time::Instant::now();
+                    state.framer.frame()
+                };
                 this.shared.space.notify_one();
-                Poll::Ready(Some(Ok(frame)))
+                Poll::Ready(Some(Ok(Bytes::from(frame))))
             }
             Poll::Pending => Poll::Pending,
         }
@@ -419,12 +301,6 @@ pub fn padded_sse_response(stream: PaddedStream) -> Response {
         HeaderValue::from_static("no-cache, no-transform"),
     );
     response
-}
-
-/// The size a blocking body of `len` bytes is padded to: the next power of
-/// two, at least [`MIN_BODY_BUCKET`].
-pub fn body_bucket(len: usize) -> usize {
-    len.max(MIN_BODY_BUCKET).next_power_of_two()
 }
 
 /// Every response the server sends, shaped: the layer [`shape`] installs.
@@ -509,10 +385,8 @@ pub async fn pad_body(response: Response) -> Response {
             return Box::pin(pad_body(failed)).await;
         }
     };
-    let size = body_bucket(bytes.len());
-    let mut padded = Vec::with_capacity(size);
-    padded.extend_from_slice(&bytes);
-    padded.resize(size, b' ');
+    let padded = eidola_common::stream_shape::pad_body(bytes.to_vec());
+    let size = padded.len();
     parts
         .headers
         .insert(header::CONTENT_LENGTH, HeaderValue::from(size));

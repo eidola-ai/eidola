@@ -12,6 +12,13 @@
 //! that is too large, malformed, outside the subset, or for another model; a full
 //! admission bound. Only then is the prompt rendered, tokenized and submitted.
 //!
+//! **Every response is shaped** (`eidola_common::stream_shape`): a streamed one is
+//! written as frames of one size at [`STREAM_CADENCE`] from the moment it opens, and
+//! every other one, refusals included, is padded to a size bucket ([`shape_response`],
+//! around every route). The host and the network between this node and the gateway see
+//! how long a response ran and a padded one's bucket, not the size or timing of its
+//! steps.
+//!
 //! **Memory before the engine is bounded.** A request holds a slot of the read bound
 //! (`AppState::reading`, as many slots as the admission bound) from before its first
 //! body byte is read until it holds an admission permit or is refused, so at most
@@ -20,21 +27,26 @@
 //! no read slot free a request is refused at once (`overloaded`), unread.
 
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use eidola_common::engine_protocol::STREAM_CADENCE;
+use eidola_common::stream_shape::{Framer, StreamEvent, pad_body};
 use eidola_engine::engine::SubmitError;
 use eidola_engine::secret::SaltDeriver;
 use eidola_engine_chat::ChatDelta;
-use futures_util::stream::{self, Stream, StreamExt};
+use futures_util::stream::Stream;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio::time::{Interval, MissedTickBehavior};
 
 use crate::api::{self, ValidRequest};
 use crate::auth::GatewayToken;
@@ -80,7 +92,18 @@ pub struct AppState {
     pub reading: Arc<Admission>,
 }
 
-/// The node's router.
+/// The most event bytes a streamed response holds waiting for frames before it stops
+/// taking the engine's output.
+///
+/// A stream reads the engine's output for it once a tick, so this is what the request
+/// holds when the engine runs faster than [`STREAM_CADENCE`] carries: five seconds of
+/// frames, which bounds the latency it queues, and memory per stream rather than the
+/// whole answer. Past it the request's event buffer fills, and the engine cuts it off as
+/// it cuts off a reader that has stopped (`worker::EVENT_BUFFER`). One event larger than
+/// this on its own is still taken, and cut across frames.
+pub const STREAM_BACKLOG_BYTES: usize = 1 << 20;
+
+/// The node's router, every response shaped ([`shape_response`]).
 pub fn router(state: Arc<AppState>) -> Router {
     let authenticated = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -93,6 +116,48 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/healthz", get(healthz))
         .merge(authenticated)
         .with_state(state)
+        .layer(middleware::from_fn(shape_response))
+}
+
+/// Every response but a stream (which its frames shape), padded with trailing spaces to
+/// its size bucket (`eidola_common::stream_shape::body_bucket`), with a matching
+/// `Content-Length`. Around every route and the fallback, so it covers what no handler
+/// sees too: an authentication refusal, a 404, a 405. Trailing whitespace leaves a JSON
+/// body's value unchanged; the gateway reads `/healthz` without it.
+async fn shape_response(request: Request, next: Next) -> Response {
+    let response = next.run(request).await;
+    let status = response.status();
+    let stream = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
+    if stream
+        || status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED
+    {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes.to_vec(),
+        // Every body here is in memory; one that cannot be read is a defect, answered
+        // the same padded way.
+        Err(_) => {
+            let failed = ApiError::Internal("the response could not be read");
+            parts.status = failed.status();
+            parts.headers.insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/json"),
+            );
+            failed.to_body().to_string().into_bytes()
+        }
+    };
+    let padded = pad_body(bytes);
+    parts
+        .headers
+        .insert(header::CONTENT_LENGTH, padded.len().into());
+    Response::from_parts(parts, axum::body::Body::from(padded))
 }
 
 async fn require_gateway(
@@ -303,7 +368,13 @@ enum Polled {
 
 impl Run {
     async fn next(&mut self, decoder: &mut Decoder) -> Polled {
-        match self.events.recv().await {
+        let output = self.events.recv().await;
+        self.on_output(output, decoder)
+    }
+
+    /// What one engine event (or the channel's end, `None`) produced.
+    fn on_output(&mut self, output: Option<Output>, decoder: &mut Decoder) -> Polled {
+        match output {
             Some(Output::Tokens {
                 tokens,
                 cached_prompt_tokens,
@@ -392,7 +463,7 @@ fn finish_choice(mut choice: Value, continuable: Option<bool>) -> Value {
     choice
 }
 
-fn chunk(r: &ResponseMeta, choices: Value, usage: Option<Value>) -> Event {
+fn chunk(r: &ResponseMeta, choices: Value, usage: Option<Value>) -> StreamEvent {
     let mut c = json!({
         "id": r.id,
         "object": "chat.completion.chunk",
@@ -403,13 +474,13 @@ fn chunk(r: &ResponseMeta, choices: Value, usage: Option<Value>) -> Event {
     if let Some(u) = usage {
         c["usage"] = u;
     }
-    Event::default().data(c.to_string())
+    StreamEvent::Json(c.to_string())
 }
 
 /// SSE: a role chunk, one chunk per non-empty delta, a finish chunk, the usage chunk
-/// (`choices: []`) when `stream_options.include_usage`, then `[DONE]`. Dropping the
-/// stream (the client went away) drops the request's guard, which cancels it in the
-/// engine.
+/// (`choices: []`) when `stream_options.include_usage`, then `[DONE]`; a failure partway
+/// ends it with an `event: error`. Dropping the stream (the client went away) drops the
+/// request's guard, which cancels it in the engine.
 ///
 /// With `include_usage`, the role chunk and every delta chunk also carry the running
 /// `usage` (the prompt, and the completion tokens decoded so far, held-back text
@@ -420,114 +491,156 @@ fn chunk(r: &ResponseMeta, choices: Value, usage: Option<Value>) -> Event {
 /// away, or it reached its deadline) is charged for what was generated rather than
 /// for nothing or for everything. The gateway forwards only the final usage chunk to
 /// its client, and never a chunk that carries the count alone.
+///
+/// **Written in frames** ([`Shaped`]): the events go into a [`Framer`], and the body is
+/// one frame of [`STREAM_CADENCE`]'s size per tick, from the moment the response opens
+/// (the role chunk is in the first) until the frame that carries the last event.
 fn stream_response(run: Run, decoder: Decoder, include_usage: bool) -> Response {
-    struct S {
-        run: Run,
-        decoder: Decoder,
-        started: bool,
-        finished: bool,
-        include_usage: bool,
-        /// The completion count the last chunk sent carried.
-        reported: u32,
-    }
-    impl S {
-        /// The running `usage`, when the request asked for usage.
-        fn running_usage(&mut self) -> Option<Value> {
-            self.include_usage.then(|| {
-                self.reported = self.decoder.completion_tokens();
-                usage(
-                    self.run.response.prompt_tokens,
-                    self.decoder.completion_tokens(),
-                    self.run.cached_prompt_tokens,
-                )
-            })
-        }
-    }
-    let state = S {
+    let mut events = Events {
         run,
         decoder,
-        started: false,
-        finished: false,
         include_usage,
         reported: 0,
     };
-    let events = stream::unfold(state, |mut s| async move {
-        if s.finished {
-            return None;
-        }
-        let mut out: Vec<Event> = Vec::new();
-        if !s.started {
-            // The role chunk goes out at once, before the first token is computed.
-            s.started = true;
-            let running = s.running_usage();
-            out.push(chunk(
-                &s.run.response,
-                json!([{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]),
-                running,
-            ));
-            return Some((stream::iter(out.into_iter().map(Ok::<_, Infallible>)), s));
-        }
-        match s.run.next(&mut s.decoder).await {
+    let mut framer = Framer::new(STREAM_CADENCE);
+    // The role chunk goes out at once, before the first token is computed.
+    let running = events.running_usage();
+    framer.push(&chunk(
+        &events.run.response,
+        json!([{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]),
+        running,
+    ));
+    let mut interval = tokio::time::interval(STREAM_CADENCE.tick());
+    // A late tick moves the schedule rather than writing two frames back to back.
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut response = axum::body::Body::from_stream(Shaped {
+        events,
+        framer,
+        interval,
+    })
+    .into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-cache, no-transform"),
+    );
+    response
+}
+
+/// A streamed request's events, as the engine's output turns into them.
+struct Events {
+    run: Run,
+    decoder: Decoder,
+    include_usage: bool,
+    /// The completion count the last chunk sent carried.
+    reported: u32,
+}
+
+impl Events {
+    /// The running `usage`, when the request asked for usage.
+    fn running_usage(&mut self) -> Option<Value> {
+        self.include_usage.then(|| {
+            self.reported = self.decoder.completion_tokens();
+            usage(
+                self.run.response.prompt_tokens,
+                self.decoder.completion_tokens(),
+                self.run.cached_prompt_tokens,
+            )
+        })
+    }
+
+    /// Queue on `framer` the events one engine event (or the channel's end) produced.
+    fn on_output(&mut self, output: Option<Output>, framer: &mut Framer) {
+        match self.run.on_output(output, &mut self.decoder) {
             Polled::Step(step) => {
                 if !step.delta.is_empty() {
-                    let running = s.running_usage();
-                    out.push(chunk(
-                        &s.run.response,
+                    let running = self.running_usage();
+                    framer.push(&chunk(
+                        &self.run.response,
                         json!([{"index": 0, "delta": step.delta.to_openai_delta(), "finish_reason": null}]),
                         running,
                     ));
                 } else if step.finish.is_none()
-                    && s.include_usage
-                    && s.decoder.completion_tokens() != s.reported
+                    && self.include_usage
+                    && self.decoder.completion_tokens() != self.reported
                 {
                     // The count moved and nothing was given out: the count alone.
-                    let running = s.running_usage();
-                    out.push(chunk(
-                        &s.run.response,
+                    let running = self.running_usage();
+                    framer.push(&chunk(
+                        &self.run.response,
                         json!([{"index": 0, "delta": {}, "finish_reason": null}]),
                         running,
                     ));
                 }
                 if let Some(reason) = step.finish {
-                    out.push(chunk(
-                        &s.run.response,
+                    framer.push(&chunk(
+                        &self.run.response,
                         json!([finish_choice(
                             json!({"index": 0, "delta": {}, "finish_reason": reason.as_str()}),
                             step.continuable
                         )]),
                         None,
                     ));
-                    if s.include_usage {
-                        let r = &s.run.response;
-                        out.push(chunk(
+                    if self.include_usage {
+                        let r = &self.run.response;
+                        framer.push(&chunk(
                             r,
                             json!([]),
                             Some(usage(
                                 r.prompt_tokens,
-                                s.decoder.completion_tokens(),
-                                s.run.cached_prompt_tokens,
+                                self.decoder.completion_tokens(),
+                                self.run.cached_prompt_tokens,
                             )),
                         ));
                     }
-                    out.push(Event::default().data("[DONE]"));
-                    s.finished = true;
+                    framer.push(&StreamEvent::Done);
                 }
             }
             Polled::Failed(e) => {
                 tracing::warn!("stream ended early: {e}");
-                out.push(Event::default().event("error").data(e.to_body().to_string()));
-                s.finished = true;
+                framer.push(&StreamEvent::Error(e.to_body().to_string()));
             }
         }
-        Some((stream::iter(out.into_iter().map(Ok::<_, Infallible>)), s))
-    })
-    .flatten();
-    sse(events)
+    }
 }
 
-fn sse<S>(events: S) -> Response
-where
-    S: Stream<Item = Result<Event, Infallible>> + Send + 'static,
-{
-    Sse::new(events).into_response()
+/// The body of a streamed response: one frame per tick.
+///
+/// Each tick takes whatever the engine has produced since the last (up to
+/// [`STREAM_BACKLOG_BYTES`] waiting), then writes one frame, so a write's size and time
+/// depend on nothing the engine did. Writes nothing between ticks, and nothing more once
+/// the frame carrying `[DONE]` or the error is out. A reader that stops reading stops
+/// the ticks, and so the reading of the engine's output: the engine cuts the request off
+/// once its buffer is full, as before.
+struct Shaped {
+    events: Events,
+    framer: Framer,
+    interval: Interval,
+}
+
+impl Stream for Shaped {
+    type Item = Result<Vec<u8>, Infallible>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.framer.done() && this.framer.backlog() == 0 {
+            return Poll::Ready(None);
+        }
+        if this.interval.poll_tick(cx).is_pending() {
+            return Poll::Pending;
+        }
+        while !this.framer.done() && this.framer.backlog() < STREAM_BACKLOG_BYTES {
+            let output = match this.events.run.events.try_recv() {
+                Ok(output) => Some(output),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => None,
+            };
+            this.events.on_output(output, &mut this.framer);
+        }
+        Poll::Ready(Some(Ok(this.framer.frame())))
+    }
 }

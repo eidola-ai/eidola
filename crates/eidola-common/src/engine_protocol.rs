@@ -1,7 +1,7 @@
 //! The wire contract between Eidola's clients, its gateway, and its inference
 //! nodes (`eidola-server-engine`) that every side must spell identically.
 //!
-//! Five things live here:
+//! Six things live here:
 //!
 //! - **The prefix-cache key** a client may send as the request body's
 //!   `cache_key` member: [`CACHE_KEY_BYTES`] bytes, encoded as unpadded
@@ -28,6 +28,10 @@
 //! - **The node's error types** ([`error_type`]) and which refusals precede
 //!   admission ([`refused_before_admission`]): the only refusals a gateway
 //!   may send to another node.
+//! - **The shape of a node's response** ([`STREAM_CADENCE`]): a streamed one
+//!   is written as frames of one size on a fixed tick, through
+//!   `stream_shape`'s framer, and read back by its reader; every other one
+//!   is padded to `stream_shape::body_bucket`.
 //!
 //! The key is secret material on every side: a holder never logs it, prints
 //! it redacted, and scrubs it when done. Nothing here holds one; this module
@@ -70,6 +74,29 @@ const _: () = assert!(
 /// (2^20 positions) at 24 bytes of JSON a token.
 pub const GATEWAY_MAX_REQUEST_BODY_BYTES: usize =
     MAX_REQUEST_BODY_BYTES - FORWARDED_BODY_GROWTH_BYTES;
+
+/// The cadence a node writes a streamed chat response at: one frame of
+/// 4 KiB every 20 ms, from the moment the response opens until the frame
+/// that carries its last event (`stream_shape`).
+///
+/// **What it must carry.** A node sends one chunk per engine step, not per
+/// token: a step's accepted tokens (one, plus up to three accepted drafts at
+/// the deployments' draft width) are one delta. A chunk on the wire is about
+/// 400 bytes (the response id, the model's 64-digit hash, the choice
+/// envelope and the running usage, around a few bytes of text), so the rate,
+/// 200 KiB/s, carries about 500 chunks a second: a step every 2 ms, and up to
+/// 2,000 tokens a second for one stream at four tokens a step. The fastest
+/// single-request decode step measured for the served model on its GPU is
+/// 7.3 ms (in another serving engine), so the cap does not bind; past it, output waits in
+/// the node's backlog and is delivered at the cap. The engine's aggregate
+/// rate across streams is not what matters: each stream has its own frames.
+///
+/// **What it costs.** Up to one tick (20 ms) between a step's output and its
+/// frame, before the gateway re-frames it for its client; and 200 KiB/s on
+/// the connection between the gateway and the node for as long as a response
+/// runs, mostly padding.
+pub const STREAM_CADENCE: crate::stream_shape::Cadence =
+    crate::stream_shape::Cadence::new(4096, std::time::Duration::from_millis(20));
 
 /// The request header carrying the weights hash a gateway expects a node to
 /// serve: the node's weights hash, 64 hex digits. Header names are

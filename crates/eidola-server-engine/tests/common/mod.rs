@@ -183,24 +183,37 @@ impl TestNode {
         (status, r.json().await.unwrap())
     }
 
-    /// Streams a request and returns every SSE `data:` payload.
+    /// Streams a request and returns every SSE `data:` payload, read out of its frames
+    /// as the gateway reads them (`eidola_common::stream_shape::StreamReader`), with
+    /// the trailing whitespace a frame may pad a JSON payload with removed. Every
+    /// frame is checked to be the cadence's size.
     pub async fn chat_stream(&self, body: &Value) -> Vec<String> {
+        use eidola_common::stream_shape::{StreamEvent, StreamReader};
+        use futures_util::StreamExt;
         let r = self.chat(body).send().await.unwrap();
         assert_eq!(r.status().as_u16(), 200);
         assert_eq!(
             r.headers()["content-type"].to_str().unwrap(),
             "text/event-stream"
         );
-        let text = r.text().await.unwrap();
-        text.split("\n\n")
-            .filter(|e| !e.trim().is_empty())
-            .map(|e| {
-                e.lines()
-                    .filter_map(|l| l.strip_prefix("data: "))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .collect()
+        let frame = eidola_common::engine_protocol::STREAM_CADENCE.frame_bytes();
+        let mut wire = Vec::new();
+        let mut body = r.bytes_stream();
+        while let Some(bytes) = body.next().await {
+            wire.extend_from_slice(&bytes.unwrap());
+        }
+        assert_eq!(wire.len() % frame, 0, "the stream is whole frames");
+        let mut reader = StreamReader::new();
+        reader.push(&wire);
+        let mut out = Vec::new();
+        while let Some(event) = reader.next_event().unwrap() {
+            out.push(match event {
+                StreamEvent::Json(data) => data.trim_end().to_string(),
+                StreamEvent::Error(data) => format!("error: {}", data.trim_end()),
+                StreamEvent::Done => "[DONE]".to_string(),
+            });
+        }
+        out
     }
 
     /// Waits until `pred` holds for the stats (or panics after `timeout`).

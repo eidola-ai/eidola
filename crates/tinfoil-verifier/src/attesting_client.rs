@@ -79,6 +79,24 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// where a backend completes the TLS handshake but stalls on the GET.
 const ATTESTATION_DEADLINE: Duration = Duration::from_secs(10);
 
+/// How long an attested connection may sit with nothing to send before TCP
+/// starts probing whether its peer is still there, and the interval between
+/// probes; [`TCP_KEEPALIVE_PROBES`] unanswered probes close it.
+///
+/// A connection waiting on a long answer (a blocking completion, which sends
+/// nothing until it is done) or idle in the pool carries no bytes of its own,
+/// so a peer that vanished without closing it (a host gone, a path cut) is
+/// noticed only this way: within a minute (15 s, then three probes 15 s
+/// apart), as a connection error rather than a wait to the caller's own
+/// deadline. Shorter costs a probe every few seconds on every idle pooled
+/// connection; longer keeps a dead connection, and what waits on it, longer.
+/// The values are `reqwest`'s defaults, set here so the client does not
+/// depend on them.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(15);
+
+/// See [`TCP_KEEPALIVE`].
+const TCP_KEEPALIVE_PROBES: u32 = 3;
+
 /// Build a `reqwest::Client` whose connector verifies enclave attestation on
 /// every new TLS connection.
 ///
@@ -155,6 +173,9 @@ pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Cli
         .http1_only()
         .tls_info(true)
         .connect_timeout(Duration::from_secs(10))
+        .tcp_keepalive(TCP_KEEPALIVE)
+        .tcp_keepalive_interval(TCP_KEEPALIVE)
+        .tcp_keepalive_retries(TCP_KEEPALIVE_PROBES)
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(usize::MAX)
         .connector_layer(AttestingConnectorLayer { check })

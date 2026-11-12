@@ -105,13 +105,19 @@ fn expected(events: &[StreamEvent]) -> Vec<Read> {
         .map(|e| match e {
             StreamEvent::Json(s) => Read::Json(serde_json::from_str(s).unwrap()),
             StreamEvent::Done => Read::Done,
+            StreamEvent::Error(_) => unreachable!("the client's stream carries no error event"),
         })
         .collect()
 }
 
+/// Frames of `frame_bytes`, on the client-facing tick.
+fn frames(frame_bytes: usize) -> eidola_common::stream_shape::Cadence {
+    eidola_common::stream_shape::Cadence::new(frame_bytes, TICK)
+}
+
 /// Every frame a framer cuts from `events` pushed at once.
-fn frames_of(events: &[StreamEvent], frame_bytes: usize) -> Vec<Bytes> {
-    let mut framer = Framer::new(frame_bytes);
+fn frames_of(events: &[StreamEvent], frame_bytes: usize) -> Vec<Vec<u8>> {
+    let mut framer = Framer::new(frames(frame_bytes));
     for e in events {
         framer.push(e);
     }
@@ -122,8 +128,11 @@ fn frames_of(events: &[StreamEvent], frame_bytes: usize) -> Vec<Bytes> {
     frames
 }
 
-fn concat(frames: &[Bytes]) -> Vec<u8> {
-    frames.iter().flat_map(|f| f.iter().copied()).collect()
+fn concat<F: AsRef<[u8]>>(frames: &[F]) -> Vec<u8> {
+    frames
+        .iter()
+        .flat_map(|f| f.as_ref().iter().copied())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +239,7 @@ proptest! {
     ) {
         let events = stream_events(&deltas, &usage);
         let total: usize = {
-            let mut framer = Framer::new(frame_bytes);
+            let mut framer = Framer::new(frames(frame_bytes));
             for e in &events {
                 framer.push(e);
             }
@@ -301,7 +310,7 @@ fn a_one_or_two_byte_remainder_is_still_padding_every_client_ignores() {
             StreamEvent::Done,
         ];
         // The first event is all that is waiting when its frame is cut.
-        let mut framer = Framer::new(frame);
+        let mut framer = Framer::new(frames(frame));
         framer.push(&events[0]);
         let mut frames = vec![framer.frame()];
         framer.push(&events[1]);
@@ -364,7 +373,7 @@ fn a_one_or_two_byte_remainder_is_still_padding_every_client_ignores() {
 /// frame is carried across frames whole.
 #[test]
 fn an_empty_tick_is_a_comment_and_a_large_event_spans_frames() {
-    let mut framer = Framer::new(64);
+    let mut framer = Framer::new(frames(64));
     let empty = framer.frame();
     assert_eq!(empty.len(), 64);
     assert!(empty.starts_with(b":") && empty.ends_with(b"\n\n"));
@@ -393,8 +402,7 @@ fn an_empty_tick_is_a_comment_and_a_large_event_spans_frames() {
 // ---------------------------------------------------------------------------
 
 const TEST_CADENCE: Cadence = Cadence {
-    frame_bytes: 64,
-    tick: Duration::from_millis(50),
+    frames: eidola_common::stream_shape::Cadence::new(64, Duration::from_millis(50)),
     max_backlog_bytes: 1 << 20,
 };
 
@@ -454,9 +462,9 @@ async fn the_backlog_is_bounded_in_bytes_even_for_a_large_event() {
     let (tx, mut stream) = channel(cadence);
     // 50 bytes encoded each, and one of 500.
     let small = |i: usize| StreamEvent::Json(format!("{{\"i\":{i},\"p\":\"{}\"}}", "p".repeat(28)));
-    assert_eq!(encode(&small(0)).0.len(), 50);
+    assert_eq!(small(0).encode().len(), 50);
     let big = StreamEvent::Json(format!("{{\"big\":\"{}\"}}", "b".repeat(482)));
-    assert_eq!(encode(&big).0.len(), 500);
+    assert_eq!(big.encode().len(), 500);
     let sent = Arc::new(AtomicUsize::new(0));
     let producer = {
         let sent = sent.clone();
@@ -491,7 +499,7 @@ async fn the_backlog_is_bounded_in_bytes_even_for_a_large_event() {
         let backlog = state.framer.backlog();
         if backlog > 128 {
             // Only the one event larger than the bound, alone.
-            assert_eq!(state.framer.events.len(), 1, "{backlog}");
+            assert_eq!(state.framer.queued_events(), 1, "{backlog}");
             assert!(backlog <= 500);
             seen_big_alone = true;
         }
@@ -552,8 +560,7 @@ async fn a_dropped_stream_fails_the_producers_send() {
 #[tokio::test]
 async fn each_tick_is_one_http_chunk_of_the_frame_size() {
     let cadence = Cadence {
-        frame_bytes: 256,
-        tick: Duration::from_millis(10),
+        frames: eidola_common::stream_shape::Cadence::new(256, Duration::from_millis(10)),
         max_backlog_bytes: 1 << 20,
     };
     let (tx, padded) = channel(cadence);
