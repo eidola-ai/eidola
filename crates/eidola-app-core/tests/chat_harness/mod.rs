@@ -89,7 +89,9 @@ pub enum ChatBehavior {
     /// truncates into something that does not parse, so a mock that merely sent
     /// a huge body would be indistinguishable from the cured behaviour. Here
     /// the retained prefix parses perfectly, which is exactly why the ceiling
-    /// has to be asked about rather than inferred from the parse.
+    /// has to be asked about rather than inferred from the parse. Asked by a
+    /// spending request, which the gateway answers with a stream, it is a
+    /// stream whose data passes the read ceiling.
     OkBlockingPaddedPastCeiling,
     /// A **non-2xx** whose body is a complete JSON error document followed by
     /// enough whitespace to cross the read ceiling — in whichever transport
@@ -217,8 +219,9 @@ pub enum ChatBehavior {
     StreamingEndsWithoutDone,
     /// **The gateway cut the stream short** (its client left, its deadline,
     /// an engine failure): content deltas, no terminal `finish_reason`, then
-    /// the metadata event carrying the refund the gateway settled on, and no
-    /// `[DONE]`. The answer did not finish; its refund is in band.
+    /// the metadata event carrying the refund the gateway settled on (at
+    /// [`MockConfig::settled_charge`]), and no `[DONE]`. The answer did not
+    /// finish; its refund is in band.
     StreamingCutShortWithRefund,
     /// The first chat request answers ordinarily; every later one is
     /// [`ChatBehavior::StreamingEndsWithoutDone`]. Whichever transport asked.
@@ -492,6 +495,8 @@ pub enum SummaryBehavior {
     /// perfectly while the body as a whole is past the ceiling this app reads.
     /// The shape a caller that discards `over_ceiling` accepts as a whole
     /// answer: truncation lands in the padding and the object still parses.
+    /// Asked by a spending request, which the gateway answers with a stream,
+    /// it is a stream whose data passes that ceiling.
     ReplyPaddedPastCeiling(String),
 }
 
@@ -713,6 +718,11 @@ pub struct MockConfig {
     /// How `POST /v1/account/credentials` misbehaves, switchable mid-test
     /// (see [`IssuanceKnobs`]). The default answers every request.
     pub issuance: IssuanceKnobs,
+    /// Answer a spending request that asked for a stream with whatever the
+    /// behaviour writes, as a backend that ignored `stream: true` does.
+    /// `false` — the default — answers it as the gateway does: every
+    /// completion a behaviour writes goes out as a stream.
+    pub ignores_stream: bool,
 }
 
 /// See [`MockConfig::key_swap`].
@@ -890,6 +900,7 @@ impl Default for MockConfig {
     fn default() -> Self {
         Self {
             chat: ChatBehavior::OkBlocking,
+            ignores_stream: false,
             router: RouterBehavior::Passthrough,
             summary: SummaryBehavior::Passthrough,
             refund: RefundMode::Succeed,
@@ -1024,6 +1035,12 @@ impl MockServer {
     }
     /// Spends whose hold was not exactly the request's worst-case cost (each
     /// refused, as the gateway refuses it).
+    /// Spending chat requests that did not ask for a stream: each refused,
+    /// as the gateway refuses it, before anything is taken.
+    pub fn blocking_asks(&self) -> u64 {
+        self.issuer.blocking_asks.load(Ordering::SeqCst)
+    }
+
     pub fn hold_mismatches(&self) -> u64 {
         self.issuer.hold_mismatches.load(Ordering::SeqCst)
     }
@@ -1461,6 +1478,9 @@ struct Issuer {
     listed: std::sync::Mutex<std::collections::HashMap<u64, (String, String)>>,
     /// Spends whose hold was not exactly the request's worst-case cost.
     hold_mismatches: AtomicU64,
+    /// Spending chat requests that did not ask for a stream, which the
+    /// gateway refuses.
+    blocking_asks: AtomicU64,
 }
 
 impl Issuer {
@@ -1508,6 +1528,7 @@ impl Issuer {
                 .expect("encode decoy public key"),
             listed: std::sync::Mutex::new(std::collections::HashMap::new()),
             hold_mismatches: AtomicU64::new(0),
+            blocking_asks: AtomicU64::new(0),
         }
     }
 
@@ -1690,22 +1711,24 @@ pub async fn start(config: MockConfig) -> MockServer {
                 let chat_spends = chat_spends.clone();
                 let refund_hits = refund_hits.clone();
                 let models_hits = models_hits.clone();
-                tokio::spawn(async move {
-                    let _ = handle_conn(
-                        stream,
-                        issuer,
-                        config,
-                        chat_hits,
-                        chat_bodies,
-                        chat_raw_bodies,
-                        chat_auths,
-                        chat_auth_values,
-                        chat_spends,
-                        refund_hits,
-                        models_hits,
-                    )
-                    .await;
-                });
+                tokio::spawn(
+                    GATEWAY_STREAM.scope(std::cell::Cell::new(false), async move {
+                        let _ = handle_conn(
+                            stream,
+                            issuer,
+                            config,
+                            chat_hits,
+                            chat_bodies,
+                            chat_raw_bodies,
+                            chat_auths,
+                            chat_auth_values,
+                            chat_spends,
+                            refund_hits,
+                            models_hits,
+                        )
+                        .await;
+                    }),
+                );
             }
         })
     };
@@ -1954,7 +1977,7 @@ async fn handle_conn(
                 .and_then(|b| b.get("model"))
                 .and_then(|m| m.as_str())
                 .is_some_and(|m| m == ROUTER_MODEL || m == ROUTER_REMOTE_MODEL);
-            if let Some(mut body) = parsed {
+            if let Some(mut body) = parsed.clone() {
                 if let Some(object) = body.as_object_mut() {
                     object.remove("credentials");
                 }
@@ -1976,6 +1999,28 @@ async fn handle_conn(
             // refuses it.
             if req.has_credentials && (req.auth.is_some() || req.refund_key_header) {
                 return write_json(&mut stream, 400, &error_body("credential in a header")).await;
+            }
+            // **The gateway serves chat only as a stream**: a spending
+            // request that does not ask for one is refused before anything
+            // is taken, as the gateway refuses it, and counted, so a test can
+            // say none was sent. Every completion it is answered with is a
+            // stream ([`GATEWAY_STREAM`]).
+            if req.has_credentials {
+                let streams = parsed
+                    .as_ref()
+                    .and_then(|b| b.get("stream"))
+                    .and_then(|s| s.as_bool())
+                    == Some(true);
+                if !streams {
+                    issuer.blocking_asks.fetch_add(1, Ordering::SeqCst);
+                    return write_json(
+                        &mut stream,
+                        400,
+                        &error_body("a chat completion must ask for a stream"),
+                    )
+                    .await;
+                }
+                GATEWAY_STREAM.with(|on| on.set(!config.ignores_stream));
             }
             let inputs: Option<Vec<Presented>> = req
                 .spends
@@ -2057,6 +2102,13 @@ async fn handle_conn(
                 (true, SummaryBehavior::Fail(status)) => {
                     return write_json(&mut stream, *status, &error_body("summarizer unavailable"))
                         .await;
+                }
+                (true, SummaryBehavior::ReplyPaddedPastCeiling(_)) if gateway_stream() => {
+                    // A stream, which padding does not lengthen: past the
+                    // ceiling is an answer whose data passes it.
+                    let piece = "y".repeat(64 * 1024);
+                    let pieces: Vec<&str> = std::iter::repeat_n(piece.as_str(), 48).collect();
+                    return write_sse_stream(&mut stream, true, &pieces).await;
                 }
                 (true, SummaryBehavior::ReplyPaddedPastCeiling(content)) => {
                     let body = serde_json::json!({
@@ -2306,6 +2358,13 @@ async fn handle_chat(
             }
             write_json(stream, 200, &body.to_string()).await
         }
+        ChatBehavior::OkBlockingPaddedPastCeiling if gateway_stream() => {
+            // The gateway's answer is a stream, which padding does not
+            // lengthen: what passes the ceiling is an answer whose data does.
+            let piece = "y".repeat(64 * 1024);
+            let pieces: Vec<&str> = std::iter::repeat_n(piece.as_str(), 160).collect();
+            write_sse_stream(stream, true, &pieces).await
+        }
         ChatBehavior::OkBlockingPaddedPastCeiling => {
             let body = serde_json::json!({
                 "choices": [{ "message": {
@@ -2454,7 +2513,8 @@ async fn handle_chat(
             write_sse_unterminated_stream(stream, &[STREAM_CONTENT]).await
         }
         ChatBehavior::StreamingCutShortWithRefund => {
-            let refund = full_refunds();
+            // Settled on what was generated: `settled_charge`, or nothing.
+            let refund = completed_refunds();
             write_sse_cut_short(stream, &[STREAM_CONTENT], refund).await
         }
         ChatBehavior::OkThenStreamEndsWithoutDone if hit == 1 => {
@@ -3464,6 +3524,104 @@ async fn write_padded_sse_stream(
     Ok(())
 }
 
+/// A blocking completion as the gateway answers it: a stream framed by the
+/// gateway's own framer, each choice's reasoning, content and tool calls as
+/// deltas, its ending, the usage chunk, the metadata event carrying the
+/// completion's `refunds`, then `[DONE]`.
+async fn write_gateway_stream(
+    stream: &mut TcpStream,
+    completion: &serde_json::Value,
+) -> std::io::Result<()> {
+    use eidola_server_gateway::padding::{Framer, StreamEvent};
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    let chunk = |choices: serde_json::Value| {
+        let mut chunk = serde_json::json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "choices": choices,
+        });
+        if let Some(model) = completion.get("model") {
+            chunk["model"] = model.clone();
+        }
+        chunk
+    };
+    let mut events = Vec::new();
+    for (i, choice) in completion["choices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let message = &choice["message"];
+        let mut deltas = Vec::new();
+        for key in ["reasoning_content", "reasoning", "content"] {
+            if let Some(text) = message.get(key).and_then(|v| v.as_str())
+                && !text.is_empty()
+            {
+                deltas.push(serde_json::json!({ key: text }));
+            }
+        }
+        match message.get("tool_calls") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Array(calls)) => {
+                let calls: Vec<serde_json::Value> = calls
+                    .iter()
+                    .enumerate()
+                    .map(|(index, call)| {
+                        let mut call = call.clone();
+                        call["index"] = index.into();
+                        call
+                    })
+                    .collect();
+                deltas.push(serde_json::json!({ "tool_calls": calls }));
+            }
+            Some(other) => deltas.push(serde_json::json!({ "tool_calls": other })),
+        }
+        for delta in deltas {
+            events.push(chunk(serde_json::json!([{ "index": i, "delta": delta }])));
+        }
+        let mut ending = serde_json::json!({ "index": i, "delta": {} });
+        for key in ["finish_reason", "continuable"] {
+            if let Some(value) = choice.get(key) {
+                ending[key] = value.clone();
+            }
+        }
+        events.push(chunk(serde_json::json!([ending])));
+    }
+    if let Some(usage) = completion.get("usage") {
+        let mut tail = chunk(serde_json::json!([]));
+        tail["usage"] = usage.clone();
+        events.push(tail);
+    }
+    let mut metadata = serde_json::json!({
+        "object": "eidola.chat.completion.metadata",
+        "id": "chatcmpl-mock",
+    });
+    if let Some(refunds) = completion.get("refunds") {
+        metadata["refunds"] = refunds.clone();
+    }
+    events.push(metadata);
+
+    let mut framer = Framer::new(eidola_server_gateway::padding::Cadence::CLIENT_FACING.frames);
+    for event in events {
+        framer.push(&StreamEvent::Json(event.to_string()));
+    }
+    framer.push(&StreamEvent::Done);
+    while framer.backlog() > 0 {
+        let frame = framer.frame();
+        let mut out = format!("{:x}\r\n", frame.len()).into_bytes();
+        out.extend_from_slice(&frame);
+        out.extend_from_slice(b"\r\n");
+        stream.write_all(&out).await?;
+    }
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await
+}
+
 /// See [`ChatBehavior::StreamingPaddedNearReadCeiling`]. The sizes are the
 /// server's own encoding (`data: ` + JSON + a blank line), summed here.
 async fn write_padded_near_ceiling(stream: &mut TcpStream) -> std::io::Result<()> {
@@ -3955,7 +4113,33 @@ fn uuid_like() -> String {
     format!("{:016x}", rand_core::RngCore::next_u64(&mut OsRng))
 }
 
+tokio::task_local! {
+    /// Whether the chat request this connection is answering is one the
+    /// Eidola gateway answers: a spend, asking for a stream. The gateway
+    /// serves chat only as a stream, so every completion such a request is
+    /// answered with is written as the gateway writes one
+    /// ([`write_gateway_stream`]), whatever behaviour wrote it.
+    static GATEWAY_STREAM: std::cell::Cell<bool>;
+}
+
+/// Whether this connection answers as the gateway does ([`GATEWAY_STREAM`]).
+fn gateway_stream() -> bool {
+    GATEWAY_STREAM
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(false)
+}
+
 async fn write_json(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
+    if status == 200
+        && gateway_stream()
+        && let Ok(completion) = serde_json::from_str::<serde_json::Value>(body)
+        && completion
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .is_some_and(|choices| choices.iter().all(|c| c.get("message").is_some()))
+    {
+        return write_gateway_stream(stream, &completion).await;
+    }
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",

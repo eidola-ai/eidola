@@ -51,6 +51,7 @@ use crate::changes::Change;
 use crate::error::AppError;
 use crate::peer_read::MAX_RESPONSE_BYTES;
 use crate::recorded::{RecordedBody, recorded_answer, recorded_cut_answer, recorded_request};
+use crate::whole_answer::WholeAnswer;
 use crate::{
     ChargePricing, EidolaResolved, Inner, ModelInfo, backends, db, estimate_charge_credits,
     fetch_models, find_event_boundary, flush_attestations, is_event_stream, local_models, now_ms,
@@ -553,6 +554,9 @@ struct ProxyPreflight {
     db_conn: turso::Connection,
     spend: Option<crate::SpendPrep>,
     auth_value: Option<String>,
+    /// How a non-streamed completion gets its whole answer from this route's
+    /// backend.
+    whole: WholeAnswer,
 }
 
 /// Everything a post-send attestation flush needs.
@@ -1261,8 +1265,16 @@ impl Inner {
         let route = self.open_proxy_route(&target, epoch).await?;
         let max_completion_tokens =
             Self::proxy_completion_budget(request, route.declared_max_output);
-        let body =
-            Self::proxy_request_body(request, &route.wire_model, max_completion_tokens, stream);
+        // A non-streamed completion from a backend that answers chat only as
+        // a stream asks it for one, assembled into the answer
+        // (`whole_answer`).
+        let whole = WholeAnswer::for_backend(target.kind);
+        let body = Self::proxy_request_body(
+            request,
+            &route.wire_model,
+            max_completion_tokens,
+            stream || whole.streams(),
+        );
 
         let cfg = self.load_config();
         let now = now_ms();
@@ -1292,6 +1304,7 @@ impl Inner {
             db_conn,
             spend,
             auth_value,
+            whole,
         })
     }
 
@@ -1381,6 +1394,7 @@ impl Inner {
             db_conn,
             mut spend,
             auth_value,
+            whole,
         } = self.preflighted(&request, false).await?;
         let nonce = spend.as_ref().map(|s| s.first_nonce().to_string());
         // Materialised **once** for this attempt: the wire and the Record row
@@ -1388,7 +1402,7 @@ impl Inner {
         // set being a value rather than a recipe.
         let headers = UpstreamHeaders {
             authorization: auth_value.clone(),
-            streaming: false,
+            streaming: whole.streams(),
             trace: self.upstream_tracing(),
         }
         .materialize();
@@ -1460,18 +1474,27 @@ impl Inner {
             self.bus.emit(Change::Record);
         }
         let status = response.status();
-        let answer = match read_capped_body(response).await {
-            Ok(answer) => answer,
+        // **An answer that did not arrive whole is the failure it is**: a
+        // read that failed, or an assembled stream cut short. The exchange
+        // happened, so the hold settles on the refunds it delivered (recovery
+        // for their absence), the Record keeps what arrived with the failure
+        // as its error, and the caller is answered the failure, as for every
+        // upstream failure on this route.
+        let (answer, recorded) = match whole
+            .read(response, MAX_RESPONSE_BYTES, &route.backend_id)
+            .await
+        {
+            Ok(crate::whole_answer::Answer { body, record }) => (body, record),
             Err(failure) => {
                 let error = failure.error;
-                self.settle_proxy_refund(&db_conn, &mut spend, &route, None)
+                self.settle_proxy_refund(&db_conn, &mut spend, &route, failure.refund.as_ref())
                     .await;
                 self.record_proxy_request(
                     &route,
                     &headers,
                     &body,
                     Some(status.as_u16()),
-                    recorded_cut_answer(&failure.partial),
+                    failure.record,
                     Some(error.to_string()),
                     nonce,
                     request_at,
@@ -1549,7 +1572,7 @@ impl Inner {
             &headers,
             &body,
             Some(status.as_u16()),
-            recorded_answer(&answer),
+            recorded,
             refusal.as_ref().map(ToString::to_string),
             nonce,
             request_at,
@@ -1615,6 +1638,7 @@ impl Inner {
             db_conn,
             mut spend,
             auth_value,
+            whole: _,
         } = self.preflighted(&request, true).await?;
         let nonce = spend.as_ref().map(|s| s.first_nonce().to_string());
         // Materialised **once** for this attempt: the wire and the Record row

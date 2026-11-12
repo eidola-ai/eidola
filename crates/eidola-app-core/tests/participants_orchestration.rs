@@ -1383,6 +1383,47 @@ fn a_remote_routers_hold_is_settled_when_the_body_read_fails() {
     });
 }
 
+/// **A remote router's answer cut short at the gateway is no routing
+/// decision, and its hold settles on the refund the stream carried.** The
+/// chore asks the Eidola gateway for a stream; one that ends without finishing
+/// degrades the refinement like any router failure, and the in-band refund —
+/// the only copy, under `NotStored` — settles the hold.
+#[test]
+fn a_remote_routers_answer_cut_short_degrades_and_settles_in_band() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::StreamingCutShortWithRefund,
+            refund: chat_harness::RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let (space, post) = space_with_two_candidates(&core);
+        core.runtime()
+            .block_on(core.set_space_router_model(
+                space.clone(),
+                Some(chat_harness::ROUTER_REMOTE_MODEL.into()),
+            ))
+            .expect("set remote router model");
+
+        let mechanical = mechanical_turns(&core, &space, &post);
+        assert_eq!(
+            planned(&core, &space, &post),
+            NotificationPlan::Turns(mechanical),
+            "a cut answer degrades like any other router failure"
+        );
+        assert_eq!(mock.blocking_asks(), 0, "the chore asked for a stream");
+        assert_eq!(mock.refund_hits(), 0, "settled from the refund in band");
+        let lifecycle = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("wallet lifecycle");
+        assert!(
+            !lifecycle.iter().any(|c| c.state == "spending"),
+            "no credential is left stranded; got {lifecycle:?}"
+        );
+    });
+}
+
 /// A space's router model can go stale exactly as a participant's can — the
 /// catalog stops listing the row and nothing un-picks the space.
 ///

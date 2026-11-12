@@ -725,6 +725,10 @@ fn a_remote_utility_model_summarizes_and_spends() {
         let calls = summary_calls(&mock);
         assert_eq!(calls.len(), 1, "the remote model is used like any other");
         assert_eq!(calls[0]["model"], chat_harness::ROUTER_REMOTE_MODEL);
+        // The Eidola gateway serves only streams: the chore asked for one and
+        // read the summary assembled from it.
+        assert_eq!(calls[0]["stream"], true);
+        assert_eq!(mock.blocking_asks(), 0);
         assert_eq!(summary_actions(&core, &fx.space).len(), 1);
 
         let spends = mock.chat_spends();
@@ -890,8 +894,10 @@ fn a_committed_summary_emits_space() {
 /// nothing and parses as `Null` — a silent degradation reported as success —
 /// while the dangerous minority is a *complete* object followed by padding,
 /// where the cut lands in the padding and the object parses perfectly. That is
-/// what this mock sends, so the chore accepted a partial answer as a whole one
-/// and wrote a summary from a body it never finished reading.
+/// what this mock sends a blocking ask, so the chore accepted a partial answer
+/// as a whole one and wrote a summary from a body it never finished reading.
+/// The remote model here is answered with a stream whose data passes the
+/// ceiling, which the assembled read refuses the same way.
 #[test]
 fn a_summary_answer_past_the_ceiling_is_refused_rather_than_parsed() {
     run(|| {

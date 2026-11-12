@@ -23,6 +23,7 @@ pub mod trust_root;
 pub mod updater;
 pub mod updates;
 pub mod utility;
+mod whole_answer;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -8352,6 +8353,7 @@ impl Inner {
             spend,
             external_auth: auth_value,
             plain_route: backend_kind != BackendKind::Eidola,
+            whole: whole_answer::WholeAnswer::for_backend(backend_kind),
             bus: self.bus.clone(),
         })
     }
@@ -8782,17 +8784,22 @@ impl Inner {
             self.bus.emit(Change::Space(space_for_emit.clone()));
         };
 
-        let request_body_json = prep.request_body(false);
+        // A backend that answers chat only as a stream is asked for one, and
+        // its answer is assembled into the body this round reads
+        // (`whole_answer`).
+        let request_body_json = prep.request_body(prep.whole.streams());
         let request_at = now_ms();
 
         // Send the chat request. On failure, attempt refund recovery before
         // propagating the error so the credential isn't abandoned. Local
         // turns carry no Authorization header — there is nothing to spend.
-        let mut request = prep.with_body(
-            prep.client
-                .post(format!("{}/v1/chat/completions", prep.base_url)),
-            &request_body_json,
-        );
+        let mut post = prep
+            .client
+            .post(format!("{}/v1/chat/completions", prep.base_url));
+        if prep.whole.streams() {
+            post = post.header("Accept", "text/event-stream");
+        }
+        let mut request = prep.with_body(post, &request_body_json);
         request = with_authorization(request, prep.external_auth.as_deref());
         let chat_result = prep.send(request).await;
         let response_at = now_ms();
@@ -8804,32 +8811,37 @@ impl Inner {
                     .inspect_err(|_| emit_user_turn())?;
 
                 let status = resp.status();
-                // **Bounded as it arrives** (`peer_read`'s class rule), and a
-                // read that fails is a failure of an exchange that happened:
-                // the hold settles and the Record keeps the row, with the
-                // failure as its error.
-                let answer =
-                    match peer_read::read_bounded(resp, peer_read::MAX_RESPONSE_BYTES).await {
-                        Ok(answer) => answer,
-                        Err(failure) => {
-                            let e = failure.error;
-                            prep.settle(None).await;
-                            prep.insert_unattached_request(
-                                &request_body_json,
-                                request_at,
-                                now_ms(),
-                                status.as_u16(),
-                                recorded::recorded_cut_answer(&failure.partial),
-                                Some(e.to_string()),
-                            )
-                            .await?;
-                            self.bus.emit(Change::Space(prep.space_id.clone()));
-                            self.bus.emit(Change::Record);
-                            return Err(e);
-                        }
-                    };
+                // **Bounded as it arrives** (`peer_read`'s class rule), and an
+                // answer that did not arrive whole — a read that failed, or a
+                // stream cut short — is a failure of an exchange that
+                // happened: the hold settles on the refunds it delivered (or
+                // recovery for their absence) and the Record keeps the row,
+                // with the failure as its error, as the streaming twin keeps a
+                // cut stream's.
+                let whole = prep
+                    .whole
+                    .read(resp, peer_read::MAX_RESPONSE_BYTES, &prep.backend_id)
+                    .await;
+                let (answer, response_record) = match whole {
+                    Ok(whole_answer::Answer { body, record }) => (body, record),
+                    Err(failure) => {
+                        let e = failure.error;
+                        prep.settle(failure.refund.as_ref()).await;
+                        prep.insert_unattached_request(
+                            &request_body_json,
+                            request_at,
+                            now_ms(),
+                            status.as_u16(),
+                            failure.record,
+                            Some(e.to_string()),
+                        )
+                        .await?;
+                        self.bus.emit(Change::Space(prep.space_id.clone()));
+                        self.bus.emit(Change::Record);
+                        return Err(e);
+                    }
+                };
                 let text = answer.text().into_owned();
-                let response_record = recorded::recorded_answer(&answer);
                 // **The status classifies the response, not the body shape.**
                 // A non-2xx body is an error document and is never required to
                 // parse: a rejection raised by the endpoint's own body
@@ -9587,8 +9599,6 @@ impl Inner {
         round: usize,
         sender: &tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
     ) -> Result<RoundOutcome, AppError> {
-        use futures_util::StreamExt;
-
         // post already emitted the user turn's Space(id) + SpaceIndex; on an
         // error exit we re-signal the space (idempotent refresh). SpaceIndex is
         // post's concern, not re-emitted here.
@@ -9687,14 +9697,7 @@ impl Inner {
             let failure = if answer.over_ceiling {
                 peer_read::answer_past_ceiling(&prep.backend_id)
             } else if status.is_success() {
-                AppError::Network {
-                    message: format!(
-                        "`{}` answered {} to a streaming request with a body that is not \
-                         server-sent events",
-                        prep.backend_id,
-                        status.as_u16()
-                    ),
-                }
+                whole_answer::not_an_event_stream(&prep.backend_id, status.as_u16())
             } else {
                 AppError::Server {
                     status: status.as_u16(),
@@ -9722,21 +9725,11 @@ impl Inner {
             return Err(failure);
         }
 
-        // Consume the SSE body. Bytes accumulate in a frame buffer that is
-        // split at every event boundary the format allows
-        // (`find_event_boundary`); each event's data is assembled once from
-        // all of its `data:` fields (`sse_event_data`) and parsed once.
-        //
-        // **Three bounds, because a peer chooses every byte here.** What the
-        // Record keeps (`RecordedBody`, the retention cap), what one event may
-        // accumulate before it is refused (`MAX_SSE_EVENT_BYTES`, the frame
-        // buffer's ceiling — a backend that never ends an event would
-        // otherwise grow it until the process dies), and what the whole
-        // stream may deliver (`MAX_RESPONSE_BYTES` — the deltas below are
-        // assembled into an answer in memory, so a stream without end is an
-        // answer without end).
-        let mut byte_stream = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
+        // Consume the SSE body through the one stream reader
+        // (`whole_answer::read_events`): its bounds are the Record's
+        // retention cap, the frame ceiling, and `MAX_RESPONSE_BYTES` on what
+        // the whole stream delivers, since the deltas below are assembled
+        // into an answer in memory.
         let mut full_content = String::new();
         // Strip-on-receipt for the *live* stream: what the caller watches
         // arrive is what will be persisted (see `LeadingHeaderFilter`). The
@@ -9764,198 +9757,93 @@ impl Inner {
         let mut finish_reason: Option<String> = None;
         // The engine's verdict on a `length` ending (see the blocking twin).
         let mut continuable: Option<bool> = None;
-        // The raw bytes for the request log, kept to the retention cap.
-        let mut raw = recorded::RecordedBody::default();
+
         // **The refund the server closed the stream with**, if it sent one —
         // the terminal `eidola.chat.completion.metadata` event, emitted before
         // `[DONE]` even when the server's own persistence of that token failed
-        // (the one case recovery can never answer).
-        let mut inline_refund: Option<serde_json::Value> = None;
-        // What stopped the read before the upstream's own end, if anything did.
-        let mut read_error: Option<AppError> = None;
-        let mut finished = false;
+        // (the one case recovery can never answer) — is the reader's to find.
+        let whole_answer::EventsRead {
+            raw,
+            read_error,
+            finished,
+            refund: inline_refund,
+        } = whole_answer::read_events(
+            resp,
+            &prep.backend_id,
+            peer_read::MAX_RESPONSE_BYTES,
+            |json| {
+                if let Some(usage) = json.get("usage") {
+                    if let Some(v) = usage.get("prompt_tokens").and_then(|v| v.as_i64()) {
+                        input_tokens = Some(v);
+                    }
+                    if let Some(v) = usage.get("completion_tokens").and_then(|v| v.as_i64()) {
+                        output_tokens = Some(v);
+                    }
+                }
 
-        while let Some(chunk) = byte_stream.next().await {
-            let bytes = match chunk {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    read_error = Some(AppError::Network {
-                        message: format!("stream read failed: {e}"),
-                    });
-                    break;
+                if let Some(reason) = choice_finish_reason(json) {
+                    finish_reason = Some(reason.to_string());
                 }
-            };
-            buf.extend_from_slice(&bytes);
+                if let Some(c) = choice_continuable(json) {
+                    continuable = Some(c);
+                }
 
-            let mut oversized = false;
-            let mut past_ceiling = false;
-            while let Some((pos, boundary_len)) = find_event_boundary(&buf) {
-                // The frame ceiling is asked of a complete event **before** it
-                // is drained (`peer_read::event_past_ceiling`).
-                if peer_read::event_past_ceiling(Some(pos), 0) {
-                    oversized = true;
-                    break;
-                }
-                let event_bytes = buf.drain(..pos).collect::<Vec<u8>>();
-                // The boundary itself — 2, 3 or 4 bytes, whichever pair of
-                // line terminators `find_event_boundary` matched — goes to the
-                // Record with its event, and nowhere else.
-                let boundary = buf.drain(..boundary_len).collect::<Vec<u8>>();
-                raw.push_event(&event_bytes, &boundary);
-                // **The ceiling bounds what the answer is made of, not
-                // padding**, so it is asked of each event once it is
-                // classified, never of a transport chunk: the Eidola server
-                // streams fixed-size frames on a fixed tick, filled with
-                // comment events for as long as the answer runs, and a chunk
-                // counted whole would carry its padding into the sum. A
-                // padding event costs nothing to hold; what is not yet an
-                // event is the frame buffer, bounded on its own below. The
-                // event that crosses the ceiling is not used.
-                if raw.payload_received() > peer_read::MAX_RESPONSE_BYTES {
-                    read_error = Some(AppError::Network {
-                        message: format!(
-                            "the model's response stream passed the {}-byte ceiling this app \
-                             reads for one answer",
-                            peer_read::MAX_RESPONSE_BYTES
-                        ),
-                    });
-                    past_ceiling = true;
-                    break;
-                }
-                let event_str = match std::str::from_utf8(&event_bytes) {
-                    Ok(s) => s,
-                    Err(_) => continue,
+                let Some(delta) = json
+                    .get("choices")
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|c| c.get("delta"))
+                else {
+                    return;
                 };
-                // One data value per event, however many `data:` fields the
-                // sender split it across (`sse_event_data`); each `continue`
-                // below moves on to the next event.
-                if let Some(payload) = sse_event_data(event_str) {
-                    let payload = payload.trim_start();
-                    if payload == "[DONE]" {
-                        finished = true;
-                        continue;
-                    }
-                    let json: serde_json::Value = match serde_json::from_str(payload) {
-                        Ok(v) => v,
-                        Err(_) => continue, // ignore comments/heartbeats
-                    };
 
-                    // Read before every other field and before the delta gate:
-                    // the metadata event carries no `choices` at all.
-                    if let Some(refund) = crate::inline_refund(&json) {
-                        inline_refund = Some(refund.clone());
+                if let Some(text) = delta.get("content").and_then(|v| v.as_str())
+                    && !text.is_empty()
+                {
+                    full_content.push_str(text);
+                    let visible = header_filter.feed(text);
+                    if !visible.is_empty() {
+                        let _ = sender.send(ChatStreamEvent::ContentDelta(visible));
                     }
+                }
 
-                    if let Some(usage) = json.get("usage") {
-                        if let Some(v) = usage.get("prompt_tokens").and_then(|v| v.as_i64()) {
-                            input_tokens = Some(v);
-                        }
-                        if let Some(v) = usage.get("completion_tokens").and_then(|v| v.as_i64()) {
-                            output_tokens = Some(v);
-                        }
-                    }
-
-                    if let Some(reason) = choice_finish_reason(&json) {
-                        finish_reason = Some(reason.to_string());
-                    }
-                    if let Some(c) = choice_continuable(&json) {
-                        continuable = Some(c);
-                    }
-
-                    let Some(delta) = json
-                        .get("choices")
-                        .and_then(|c| c.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|c| c.get("delta"))
-                    else {
-                        continue;
-                    };
-
-                    if let Some(text) = delta.get("content").and_then(|v| v.as_str())
+                // OpenAI o1-style ("reasoning_content") and vLLM-style
+                // ("reasoning"). Either form is forwarded as a ReasoningDelta;
+                // we tolerate providers that emit one, both, or neither.
+                for key in ["reasoning_content", "reasoning"] {
+                    if let Some(text) = delta.get(key).and_then(|v| v.as_str())
                         && !text.is_empty()
                     {
-                        full_content.push_str(text);
-                        let visible = header_filter.feed(text);
-                        if !visible.is_empty() {
-                            let _ = sender.send(ChatStreamEvent::ContentDelta(visible));
-                        }
-                    }
-
-                    // OpenAI o1-style ("reasoning_content") and vLLM-style
-                    // ("reasoning"). Either form is forwarded as a
-                    // ReasoningDelta; we tolerate providers that emit one,
-                    // both, or neither.
-                    for key in ["reasoning_content", "reasoning"] {
-                        if let Some(text) = delta.get(key).and_then(|v| v.as_str())
-                            && !text.is_empty()
-                        {
-                            full_reasoning.push_str(text);
-                            let _ = sender.send(ChatStreamEvent::ReasoningDelta(text.to_string()));
-                        }
-                    }
-
-                    // Tool calls stream in pieces; fold each delta into the
-                    // per-index accumulator (nothing is forwarded to the
-                    // caller — tool rounds are invisible pauses in v1).
-                    // Absent/null is "no calls in this chunk"; anything
-                    // non-array is structurally unusable and fails the turn
-                    // (see `read_tool_calls`), never silently ignored.
-                    match delta.get("tool_calls") {
-                        None | Some(serde_json::Value::Null) => {}
-                        Some(serde_json::Value::Array(deltas)) => {
-                            accumulate_tool_call_deltas(&mut tool_call_acc, deltas);
-                        }
-                        Some(other) => {
-                            tool_call_shape_error.get_or_insert_with(|| AppError::ToolLoop {
-                                message: format!(
-                                    "the model streamed a `tool_calls` delta that is not an \
-                                     array ({})",
-                                    json_type_name(other)
-                                ),
-                            });
-                        }
+                        full_reasoning.push_str(text);
+                        let _ = sender.send(ChatStreamEvent::ReasoningDelta(text.to_string()));
                     }
                 }
-            }
 
-            // **What is left over is an event still being accumulated**, and
-            // a backend that never terminates one grows it without end — the
-            // other half of the frame ceiling, beside the complete event the
-            // drain refused above. Either way the event is refused, not used.
-            if past_ceiling {
-                break;
-            }
-            if oversized || peer_read::event_past_ceiling(None, buf.len()) {
-                read_error = Some(peer_read::oversized_event(&prep.backend_id));
-                raw.push_event(&buf, &[]);
-                buf.clear();
-                break;
-            }
-
-            if finished {
-                break;
-            }
-        }
-        // Whatever arrived and was not drained as an event — a partial event,
-        // or what followed `[DONE]` in its read — is recorded as it came, and
-        // padding (the rest of the frame `[DONE]` arrived in, usually) as
-        // padding.
-        raw.push_event(&buf, &[]);
+                // Tool calls stream in pieces; fold each delta into the
+                // per-index accumulator (nothing is forwarded to the caller —
+                // tool rounds are invisible pauses in v1). Absent/null is "no
+                // calls in this chunk"; anything non-array is structurally
+                // unusable and fails the turn (see `read_tool_calls`), never
+                // silently ignored.
+                match delta.get("tool_calls") {
+                    None | Some(serde_json::Value::Null) => {}
+                    Some(serde_json::Value::Array(deltas)) => {
+                        accumulate_tool_call_deltas(&mut tool_call_acc, deltas);
+                    }
+                    Some(other) => {
+                        tool_call_shape_error.get_or_insert_with(|| AppError::ToolLoop {
+                            message: format!(
+                                "the model streamed a `tool_calls` delta that is not an array \
+                                 ({})",
+                                json_type_name(other)
+                            ),
+                        });
+                    }
+                }
+            },
+        )
+        .await;
         let response_at = now_ms();
-
-        // An unterminated final event is not an event the format delivers, so
-        // nothing in it becomes part of the answer — but a refund in it is
-        // still the credential's successor, and wallet material settles
-        // wherever the server put it.
-        if read_error.is_none()
-            && !finished
-            && let Ok(tail) = std::str::from_utf8(&buf)
-            && let Some(payload) = sse_event_data(tail)
-            && let Ok(json) = serde_json::from_str::<serde_json::Value>(payload.trim_start())
-            && let Some(refund) = crate::inline_refund(&json)
-        {
-            inline_refund = Some(refund.clone());
-        }
 
         // **The in-band token first, recovery only for its absence** — see
         // [`TurnPrep::settle`]. A tool round settles its hold here, before the
@@ -10034,8 +9922,9 @@ impl Inner {
         // Reported as `Network` because that is what it is, which also puts it
         // in `DelegationFailure::Upstream` for a delegated room and leaves it
         // retryable for a window — re-asking is the right remedy for a dropped
-        // connection. The blocking twin needs no equivalent: a body that ends
-        // early fails in its bounded read and never reaches persistence.
+        // connection. The blocking twin reads a stream it asked for through
+        // `whole_answer`, which takes this same ending for no answer; a body
+        // that ends early fails in its bounded read.
         //
         // `finish_reason` is checked beside `[DONE]` so a provider that ends a
         // stream without the sentinel — the spec does not require it — is not
@@ -10052,9 +9941,7 @@ impl Inner {
             .await?;
             self.bus.emit(Change::Space(prep.space_id.clone()));
             self.bus.emit(Change::Record);
-            return Err(AppError::Network {
-                message: "the model's response stream ended without finishing".to_string(),
-            });
+            return Err(whole_answer::stream_ended_unfinished());
         }
 
         let assembled = match tool_call_shape_error {
@@ -14523,6 +14410,10 @@ struct TurnPrep {
     /// engine or an external backend — so its destination is recorded by a
     /// plain `connection` row rather than by a handshake.
     plain_route: bool,
+    /// How this turn's blocking rounds get one whole answer from its backend
+    /// (`whole_answer`): the completion itself, or a stream assembled into
+    /// one.
+    whole: whole_answer::WholeAnswer,
     base_url: String,
     /// The preparation timestamp — spend/refund rows key off it.
     now: i64,
@@ -16435,6 +16326,17 @@ fn accumulate_tool_call_deltas(
 fn finish_streaming_tool_calls(
     acc: std::collections::BTreeMap<u64, StreamingToolCall>,
 ) -> Result<Vec<ParsedToolCall>, AppError> {
+    streamed_tool_call_objects(acc)
+        .iter()
+        .map(parse_tool_call)
+        .collect()
+}
+
+/// The streamed accumulator as the tool-call objects it assembled, in index
+/// order: what a blocking `message.tool_calls` holds.
+fn streamed_tool_call_objects(
+    acc: std::collections::BTreeMap<u64, StreamingToolCall>,
+) -> Vec<serde_json::Value> {
     acc.into_values()
         .map(|c| {
             let call_type = if c.call_type.is_empty() {
@@ -16453,8 +16355,7 @@ fn finish_streaming_tool_calls(
             object.insert("id".into(), serde_json::Value::String(c.id));
             object.insert("type".into(), call_type);
             object.insert("function".into(), serde_json::Value::Object(function));
-
-            parse_tool_call(&serde_json::Value::Object(object))
+            serde_json::Value::Object(object)
         })
         .collect()
 }

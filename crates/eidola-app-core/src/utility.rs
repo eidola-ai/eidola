@@ -24,6 +24,7 @@
 //! decide what is stale before it starts an engine at all.
 
 use crate::error::AppError;
+use crate::whole_answer::WholeAnswer;
 use crate::{
     ChargePricing, EidolaResolved, Inner, backends, db, estimate_charge_credits, fetch_models,
     local_models, now_ms,
@@ -253,7 +254,9 @@ impl Inner {
         }
     }
 
-    /// One non-streaming chat completion against a resolved chore target.
+    /// One whole chat completion against a resolved chore target: a blocking
+    /// one, or for a backend that serves only streams, a stream assembled into
+    /// one (`whole_answer`).
     ///
     /// Opens the route, places and settles a hold when the target bills, and
     /// returns the assistant's content. Persists nothing.
@@ -296,16 +299,22 @@ impl Inner {
             }
         };
 
-        let body = serde_json::json!({
+        // A backend that answers chat only as a stream is asked for one, and
+        // its answer assembled into the body read below (`whole_answer`).
+        let whole = WholeAnswer::for_backend(target.kind);
+        let mut body = serde_json::json!({
             "model": route.wire_model,
             "messages": messages,
             "max_completion_tokens": max_completion_tokens,
         });
-
         let mut request = route
             .client
-            .post(format!("{}/v1/chat/completions", route.base_url))
-            .json(&*crate::body_with_spend(&body, spend.as_ref()));
+            .post(format!("{}/v1/chat/completions", route.base_url));
+        if whole.streams() {
+            body["stream"] = true.into();
+            request = request.header("Accept", "text/event-stream");
+        }
+        let mut request = request.json(&*crate::body_with_spend(&body, spend.as_ref()));
         request = crate::with_authorization(request, auth_value.as_deref());
 
         let response = match request.send().await {
@@ -337,22 +346,32 @@ impl Inner {
         // dangerous one (a complete object followed by padding parses
         // perfectly, and a partial answer is taken for a whole one). The hold
         // is settled first, exactly as for a read that failed outright.
+        //
+        // **A stream cut short is no answer either**, and it settles on the
+        // refunds it delivered (recovery for their absence), as a streaming
+        // twin settles one.
         let what = format!("the {} response", target.chore);
-        let text =
-            match crate::peer_read::read_bounded(response, crate::peer_read::API_ANSWER_MAX_BYTES)
-                .await
-                .map_err(AppError::from)
-                .and_then(|body| crate::peer_read::whole_text(body, &what))
-            {
-                Ok(text) => text,
-                Err(e) => {
-                    self.settle_utility_refund(db_conn, &mut spend, &route, None, now)
-                        .await;
-                    return Err(AppError::Network {
-                        message: format!("failed to read the {} response: {e}", target.chore),
-                    });
-                }
-            };
+        let read = whole
+            .read(
+                response,
+                crate::peer_read::API_ANSWER_MAX_BYTES,
+                &target.backend.id,
+            )
+            .await;
+        let (text, settled_with) = match read {
+            Ok(answer) => (crate::peer_read::whole_text(answer.body, &what), None),
+            Err(failure) => (Err(failure.error), failure.refund),
+        };
+        let text = match text {
+            Ok(text) => text,
+            Err(e) => {
+                self.settle_utility_refund(db_conn, &mut spend, &route, settled_with.as_ref(), now)
+                    .await;
+                return Err(AppError::Network {
+                    message: format!("failed to read the {} response: {e}", target.chore),
+                });
+            }
+        };
         let parsed: serde_json::Value =
             serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
 
