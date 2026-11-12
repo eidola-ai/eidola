@@ -32,7 +32,7 @@ eidola-app-core = { path = "../eidola-app-core" }
 gpui-markdown-editor = { path = "../gpui-markdown-editor" }
 
 # The recent-documents list lives in the platform config directory.
-dirs = "6"
+dirs = "7"
 # The open-URL channel: AppKit hands over files dropped on the Dock icon
 # before (and after) the app's run callback, outside any `App`.
 futures = "0.3"
