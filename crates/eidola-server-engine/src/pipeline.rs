@@ -13,6 +13,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use eidola_common::engine_protocol::DeclaredPrefixRefusal;
 use eidola_engine::engine::{CacheScope, FinishReason as EngineFinish, Request, RequestId};
 use eidola_engine::sampling::SamplingParams;
 use eidola_engine::secret::SaltDeriver;
@@ -35,6 +36,9 @@ pub struct Prepared {
     /// request's own `max_completion_tokens`: an ending there leaves no room for a
     /// continuation's prompt, so it is never reported continuable.
     pub window_bound: bool,
+    /// The request declares a cached prefix: the engine admits or refuses it before
+    /// anything is computed, and its response is opened only once it has been admitted.
+    pub declared: bool,
 }
 
 /// Renders, tokenizes and builds the engine request. CPU work: run it off the async
@@ -56,6 +60,7 @@ pub fn prepare(
         stop,
         cache_key,
         continuation,
+        cached_prefix,
         ..
     } = req;
     let defaults = model.defaults();
@@ -101,6 +106,11 @@ pub fn prepare(
         .encode_prompt(&prompt)
         .map_err(|e| ApiError::invalid(e.to_string()))?;
     let prompt_tokens = tokens.len() as u32;
+    // The declaration prices the prompt at `cached_tokens + new_tokens` at most: a longer
+    // one is refused here, before the engine sees it.
+    if cached_prefix.is_some_and(|p| u64::from(prompt_tokens) > p.prompt_limit()) {
+        return Err(ApiError::DeclaredPrefix(DeclaredPrefixRefusal::OverBudget));
+    }
     if prompt_tokens >= max_model_len {
         return Err(ApiError::ContextLengthExceeded(format!(
             "the prompt is {prompt_tokens} tokens; this model's limit is {max_model_len} \
@@ -120,11 +130,13 @@ pub fn prepare(
             max_tokens,
             stop_token_ids: Vec::new(),
             cache,
+            required_cached_tokens: cached_prefix.map_or(0, |p| p.cached_tokens),
         },
         prompt_tokens,
         output: OutputConfig::new(options.enable_thinking, schemas).continuing_in(continuing),
         stop,
         window_bound,
+        declared: cached_prefix.is_some(),
     })
 }
 
@@ -261,6 +273,10 @@ impl Decoder {
                 EngineFinish::Length | EngineFinish::KvExhausted => StopCause::MaxTokens,
                 EngineFinish::Cancelled => {
                     return Err(ApiError::Internal("the request was cancelled"));
+                }
+                // Answered before the response opens (`http`), never as a stream's end.
+                EngineFinish::CachedPrefixMissing => {
+                    return Err(ApiError::DeclaredPrefix(DeclaredPrefixRefusal::Missing));
                 }
             };
             if self.detok.pending_len() > 0 {

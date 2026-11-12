@@ -299,6 +299,7 @@ fn request(id: u64, prompt: Vec<u32>, sampling: SamplingParams, max_tokens: u32)
         prompt,
         sampling,
         max_tokens,
+        required_cached_tokens: 0,
         stop_token_ids: Vec::new(),
         cache: CacheScope::Private,
     }

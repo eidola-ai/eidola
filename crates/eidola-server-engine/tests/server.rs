@@ -90,6 +90,7 @@ fn direct_greedy(prompt: Vec<u32>, max_tokens: u32) -> (Vec<u32>, FinishReason) 
             prompt,
             sampling: SamplingParams::greedy(),
             max_tokens,
+            required_cached_tokens: 0,
             stop_token_ids: Vec::new(),
             cache: CacheScope::Private,
         })
@@ -137,7 +138,9 @@ fn expected_output_in(
     let cause = match finish {
         FinishReason::Stop => StopCause::EndOfSequence,
         FinishReason::Length | FinishReason::KvExhausted => StopCause::MaxTokens,
-        FinishReason::Cancelled => unreachable!("the direct run cancels nothing"),
+        FinishReason::Cancelled | FinishReason::CachedPrefixMissing => {
+            unreachable!("the direct run cancels nothing and requires no prefix")
+        }
     };
     let (d, reason) = parser.finish(cause);
     all.reasoning_content.push_str(&d.reasoning_content);

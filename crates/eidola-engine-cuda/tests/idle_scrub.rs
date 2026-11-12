@@ -136,6 +136,7 @@ fn request(id: u64, prompt: Vec<u32>) -> Request {
         prompt,
         sampling: SamplingParams::greedy(),
         max_tokens: 12,
+        required_cached_tokens: 0,
         stop_token_ids: Vec::new(),
         cache: CacheScope::Keyed(lineage),
     }

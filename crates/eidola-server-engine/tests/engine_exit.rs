@@ -52,6 +52,7 @@ async fn an_engine_thread_panic_stops_the_node() {
                 prompt: vec![1, 2, 3],
                 sampling: SamplingParams::greedy(),
                 max_tokens: 4,
+                required_cached_tokens: 0,
                 stop_token_ids: Vec::new(),
                 cache: CacheScope::Private,
             },
@@ -86,6 +87,7 @@ fn request(id: u64) -> Request {
         prompt: vec![1, 2, 3],
         sampling: SamplingParams::greedy(),
         max_tokens: 4,
+        required_cached_tokens: 0,
         stop_token_ids: Vec::new(),
         cache: CacheScope::Private,
     }

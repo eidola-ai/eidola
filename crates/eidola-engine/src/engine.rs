@@ -31,8 +31,12 @@
 //! function of the token prefix alone, a preempted-and-resumed sequence produces exactly
 //! the tokens an uninterrupted run would.
 //!
-//! The scheduler never prices anything; it reports cached prompt tokens for information
-//! only.
+//! The scheduler never prices anything, and the cached prompt tokens it reports are
+//! never an input to a price. A request may instead *require* a cached prefix
+//! ([`Request::required_cached_tokens`]): at its first admission, before anything of it is
+//! computed, the engine looks up the hit it would get without changing the cache
+//! ([`KvManager::lookup`]) and refuses it ([`FinishReason::CachedPrefixMissing`]) if the
+//! hit is shorter. Re-admission after a preemption does not check again.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -73,6 +77,11 @@ pub struct Request {
     pub stop_token_ids: Vec<u32>,
     /// Prefix-cache scope.
     pub cache: CacheScope,
+    /// The prompt positions that must be served from the prefix cache at the request's
+    /// first admission, or it is refused there with nothing computed
+    /// ([`FinishReason::CachedPrefixMissing`]). 0 requires nothing. At most
+    /// `prompt.len() - 1`: the final prompt token is always recomputed.
+    pub required_cached_tokens: u32,
 }
 
 /// Why a request finished.
@@ -89,6 +98,10 @@ pub enum FinishReason {
     KvExhausted,
     /// Cancelled by the caller.
     Cancelled,
+    /// Refused at first admission: the prefix cache held fewer of the prompt's leading
+    /// tokens than [`Request::required_cached_tokens`]. Nothing of the request was
+    /// computed, and no block was mapped, promoted or decrypted for it.
+    CachedPrefixMissing,
 }
 
 /// Progress for one request in one step.
@@ -121,6 +134,9 @@ pub enum SubmitError {
     /// A prompt token is outside the sampleable vocabulary (a padded logit row, or no
     /// row at all): no tokenizer produces it.
     InvalidToken,
+    /// The required cached prefix covers the final prompt token, which is always
+    /// recomputed: no hit can satisfy it.
+    UnsatisfiablePrefix,
 }
 
 /// Why an [`Engine`] could not be built.
@@ -208,6 +224,8 @@ pub struct Stats {
     pub drafted: u64,
     /// Drafted tokens accepted.
     pub accepted: u64,
+    /// Requests refused at first admission for a short prefix-cache hit.
+    pub prefix_refusals: u64,
 }
 
 /// The host engine over one executor.
@@ -325,6 +343,8 @@ impl<E: Executor> Engine<E> {
     }
 
     /// Cached prompt tokens at a request's first admission (informational; never priced).
+    /// `Some` from that admission on: a caller waiting to learn whether a request with a
+    /// required prefix was admitted or refused reads this.
     pub fn cached_prompt_tokens(&self, id: RequestId) -> Option<u32> {
         self.seqs.get(&id).and_then(|s| s.cached_prompt_tokens)
     }
@@ -361,6 +381,9 @@ impl<E: Executor> Engine<E> {
         }
         if self.seqs.contains_key(&req.id) {
             return Err(SubmitError::DuplicateId);
+        }
+        if req.required_cached_tokens as usize >= req.prompt.len() {
+            return Err(SubmitError::UnsatisfiablePrefix);
         }
         if req
             .prompt
@@ -530,6 +553,16 @@ impl<E: Executor> Engine<E> {
                     break;
                 };
                 let seq = &self.seqs[&id];
+                // A required prefix is checked once, at first admission, by a lookup that
+                // changes nothing: a request it refuses never touches the cache.
+                let required = match seq.cached_prompt_tokens {
+                    None => seq.req.required_cached_tokens,
+                    Some(_) => 0,
+                };
+                if required > 0 && self.kv.lookup(&seq.lineage, &seq.tokens, now) < required {
+                    events.push(self.refuse_prefix(arrival, id));
+                    continue;
+                }
                 let Some(cached) = self.kv.admit(
                     id,
                     seq.lineage.clone(),
@@ -540,6 +573,13 @@ impl<E: Executor> Engine<E> {
                 ) else {
                     break;
                 };
+                if cached < required {
+                    // The hit was shortened while mapping it (the device could not take
+                    // the demoted blocks it needed back): give back what was mapped.
+                    self.kv.release(id, Release::Finish, now);
+                    events.push(self.refuse_prefix(arrival, id));
+                    continue;
+                }
                 let Some((mut entry, mut cost)) = self.plan_row(id, budget, k) else {
                     self.kv.release(id, Release::Preempt, now);
                     break;
@@ -578,6 +618,20 @@ impl<E: Executor> Engine<E> {
         }
         events.extend(self.execute_and_commit(planned, now)?);
         Ok(events)
+    }
+
+    /// Ends a waiting request whose required cached prefix is not held.
+    fn refuse_prefix(&mut self, arrival: u64, id: RequestId) -> Event {
+        self.waiting.remove(&arrival);
+        self.seqs.remove(&id).expect("waiting sequence");
+        self.kv.forget(id);
+        self.stats.prefix_refusals += 1;
+        Event {
+            id,
+            tokens: Vec::new(),
+            finish: Some(FinishReason::CachedPrefixMissing),
+            cached_prompt_tokens: 0,
+        }
     }
 
     fn finish_now(&mut self, id: RequestId, reason: FinishReason, now: Millis) -> Event {
