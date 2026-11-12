@@ -111,6 +111,12 @@ pub fn install(recent: RecentDocuments, cx: &mut App) {
     gpui_component::init(cx);
     gpui_component::set_window_border_enabled(false, cx);
     eidola_gui::theme::install(cx);
+    // The shared theme installs the chat's image policy (only the app's own
+    // assets resolve: a post body is text the reader did not write). This
+    // host renders files the reader opened from disk, and resolves their
+    // relative images against the document's folder (`set_image_base_dir`),
+    // so it restores the open policy.
+    cx.set_global(gpui_markdown_editor::image::ImageSources::Any);
 
     cx.set_global(Notepad {
         recent,
@@ -784,6 +790,25 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shared theme installs the chat's image policy (only the app's own
+    /// assets). This host renders files the reader opened, so its own
+    /// `install` must leave the policy open — or every file-relative image
+    /// falls back to its markup. The behavior harness installs the theme
+    /// directly and would not notice.
+    #[gpui::test]
+    fn install_leaves_image_sources_open(cx: &mut gpui::TestAppContext) {
+        use gpui_markdown_editor::image::ImageSources;
+        let store = std::env::temp_dir().join(format!(
+            "eidola-notepad-test-{}-recent.txt",
+            std::process::id()
+        ));
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            install(RecentDocuments::load_from(store), cx);
+            assert_eq!(*cx.global::<ImageSources>(), ImageSources::Any);
+        });
+    }
 
     #[test]
     fn dock_drops_arrive_as_file_urls() {

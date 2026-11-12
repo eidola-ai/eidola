@@ -246,6 +246,7 @@ impl RenderOnce for CreateAccount {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let have_documents = self.documents.is_some();
+        let unsaved = matches!(self.error, Some(AppError::AccountNotSaved { .. }));
         let mut extras = v_flex().gap_3();
         match self.documents.as_deref() {
             // A server with no acceptance gate: nothing to record, but the
@@ -338,7 +339,25 @@ impl RenderOnce for CreateAccount {
                     ),
             )
             .when_some(self.error, |el, err| {
-                el.child(error_line("create", err.to_string(), cx))
+                let el = el.child(error_line("create", super::create_error_copy(&err, cx), cx));
+                // The server holds only the secret's hash: if this profile
+                // could not keep the account, these rows are the only copy.
+                match err {
+                    AppError::AccountNotSaved { account, .. } => el
+                        .child(credential_row(
+                            "unsaved-account-id",
+                            crate::i18n::msg::onboarding_account_id(cx),
+                            account.account_id.clone().into(),
+                            cx,
+                        ))
+                        .child(credential_row(
+                            "unsaved-account-secret",
+                            crate::i18n::msg::onboarding_account_secret(cx),
+                            account.secret.expose().to_string().into(),
+                            cx,
+                        )),
+                    _ => el,
+                }
             });
 
         let label = if self.creating {
@@ -350,7 +369,10 @@ impl RenderOnce for CreateAccount {
         // it is true only while the reader's agreement covers the snapshot
         // being rendered, so "no documents" and "documents the agreement no
         // longer covers" are the same disabled state, not two conditions.
-        let enabled = self.agreed && !self.creating;
+        // An unsaved account's rows are the only copy of its secret, and a
+        // second create would replace them with its own refusal: the CTA
+        // stays off while they are on screen.
+        let enabled = self.agreed && !self.creating && !unsaved;
         let cta = div()
             .id("onboarding-cta-create")
             .probe("onboarding/cta/create", Role::Button, label.clone())

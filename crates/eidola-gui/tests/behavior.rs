@@ -8254,7 +8254,8 @@ fn onboarding_says_what_happened_in_the_readers_language(cx: &mut TestAppContext
     // is the typed error's own text: English in every locale, because app-core
     // is locale-free and the payload a faithful translation would need is not
     // in the variant to read. Pinned so it stays a decision rather than an
-    // oversight — the day a variant earns a sentence here, this changes with it.
+    // oversight. One variant has earned a sentence: `AccountNotSaved`, pinned in
+    // `onboarding_an_unsaved_account_is_told_in_the_readers_language`.
     view.update(cx, |v, cx| {
         v.set_create_error_for_test(
             AppError::Server {
@@ -8264,15 +8265,71 @@ fn onboarding_says_what_happened_in_the_readers_language(cx: &mut TestAppContext
             cx,
         )
     });
-    let english = view.read_with(cx, |v, _| v.create_message_for_test());
+    let english = view.read_with(cx, |v, cx| v.create_message_for_test(cx));
     for tag in ["fr", "zh-Hans"] {
         cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
         assert_eq!(
-            view.read_with(cx, |v, _| v.create_message_for_test()),
+            view.read_with(cx, |v, cx| v.create_message_for_test(cx)),
             english,
             "the typed error's own words are what this surface still shows in {tag}"
         );
     }
+}
+
+/// **An account created but not saved has a sentence of its own.** Every
+/// other creation refusal shows the typed error's English text; this one
+/// carries the only copy of a secret, so the reader is told in their language
+/// what happened and what to do with the rows beneath it.
+#[gpui::test]
+fn onboarding_an_unsaved_account_is_told_in_the_readers_language(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |_| {});
+    let (_window, view) = open_onboarding(cx, &stores);
+    view.update(cx, |v, cx| {
+        v.set_create_error_for_test(
+            AppError::AccountNotSaved {
+                account: Box::new(eidola_app_core::error::UnsavedAccount {
+                    account_id: "00000000-0000-0000-0000-00000000000c".into(),
+                    secret: eidola_app_core::error::AccountSecret::new("only-copy".into()),
+                    terms: eidola_app_core::TermsAcceptance::Complete,
+                    recovery_file: None,
+                }),
+                reason: "config error: unreadable".into(),
+            },
+            cx,
+        )
+    });
+    let mut seen = Vec::new();
+    for tag in ["en", "fr", "zh-Hans"] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let message = view
+            .read_with(cx, |v, cx| v.create_message_for_test(cx))
+            .expect("a message is shown");
+        assert!(
+            message.contains("config error: unreadable") && !message.contains("only-copy"),
+            "{tag}: names the cause and never the secret: {message}"
+        );
+        assert!(
+            !seen.contains(&message),
+            "{tag} repeats another locale: {message}"
+        );
+        seen.push(message);
+    }
+
+    // A second create would replace the only copy of the secret on screen
+    // with its own outcome; it does not start, even with a snapshot agreed to
+    // (which is what would otherwise let it).
+    reveal(&view, cx, Slide::Responsibility, Slide::GetStarted);
+    reveal(&view, cx, Slide::GetStarted, Slide::CreateAccount);
+    set_terms(&stores, cx, vec![terms_doc("terms_of_service", 3, 'a')]);
+    view.update(cx, |v, cx| v.set_agreement(true, cx));
+    view.update(cx, |v, cx| v.begin_create(cx));
+    assert!(
+        !view.read_with(cx, |v, _| v.creating_for_test())
+            && view
+                .read_with(cx, |v, cx| v.create_message_for_test(cx))
+                .is_some_and(|m| m.contains("config error: unreadable")),
+        "another create started over an unsaved account"
+    );
 }
 
 /// **The slide prose is chosen at render, not seeded once.**

@@ -328,6 +328,16 @@ fn current_phases(now: &LocalNow, cx: &mut App) -> DayPhases {
 pub fn install(cx: &mut App) {
     load_fonts(cx);
 
+    // Every post body — a model's reply included, while it streams — is a
+    // `MarkdownEditor`, so `![alt](url)` in text the reader did not write
+    // would otherwise choose a fetch: a request to any host (the app has no
+    // HTTP client today, so that one fails, but only by accident) or an
+    // unbounded read of any local path. Only the app's own assets resolve;
+    // everything else shows its markdown. Set here because every context —
+    // the app, the tests, the driver — runs `install`. A host that renders
+    // files the reader opened (the notepad) sets `Any` after this call.
+    cx.set_global(gpui_markdown_editor::image::ImageSources::EmbeddedOnly);
+
     if !cx.has_global::<ThemeState>() {
         cx.set_global(ThemeState {
             // Neutral defaults until `wire_config` reads the real config:

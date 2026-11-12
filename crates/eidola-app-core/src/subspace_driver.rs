@@ -355,6 +355,8 @@ impl DelegationFailure {
             // it); a stale choice of model is a configuration matter.
             | AppError::ModelNoticeStale { .. }
             | AppError::Config { .. }
+            // Unreachable from a driven turn (only account creation raises it).
+            | AppError::AccountNotSaved { .. }
             // Unreachable from a driven turn (no turn writes proxy settings);
             // placed where the variant it replaced would have landed.
             | AppError::ProxyRefused { .. }

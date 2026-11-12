@@ -357,10 +357,65 @@ impl Config {
         toml::from_str(&contents).unwrap_or_default()
     }
 
+    /// Load config from `path` **to write it back**: a missing file is the
+    /// defaults, but one that cannot be read or parsed is an error. Every
+    /// setter rewrites the whole file, account secret included, so reading an
+    /// unparseable file as defaults (what [`Config::load_from`] does, which is
+    /// right for display) would save those defaults over the only copy of
+    /// the credentials on the next preference change.
+    pub fn load_for_update(path: &Path) -> Result<Config, AppError> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(e) => {
+                return Err(AppError::Config {
+                    message: format!("failed to read {}: {e}", path.display()),
+                });
+            }
+        };
+        // Where, never what: the parser's `Display` quotes the failing source
+        // line and its message can quote a value, and this file's lines
+        // include the account secret (a partial sync write that leaves
+        // `account_secret = "…` unterminated fails on exactly that line). The
+        // text reaches a settings alert and `AccountNotSaved`'s reason, so it
+        // names the position only.
+        toml::from_str(&contents).map_err(|e| {
+            let at = e
+                .span()
+                .map(|span| {
+                    let before = &contents[..span.start.min(contents.len())];
+                    let line = before.matches('\n').count() + 1;
+                    let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+                    format!(" (line {line}, column {column})")
+                })
+                .unwrap_or_default();
+            AppError::Config {
+                message: format!(
+                    "{} is not valid{at}; fix or move it aside (nothing was written)",
+                    path.display()
+                ),
+            }
+        })
+    }
+
     /// Serialize and write the config to `path`, creating parent directories
-    /// as needed.
+    /// as needed. The file is replaced whole — written beside it, synced, then
+    /// renamed over — so a reader or a crash never sees it truncated, and on
+    /// Unix it is created owner-only, since it holds the account secret.
     pub fn save_to(&self, path: &Path) -> Result<(), AppError> {
-        if let Some(parent) = path.parent() {
+        use std::io::Write;
+
+        // Directories created here are synced in *their* parents below, after
+        // the rename: a directory's own entry lives one level up, and the
+        // parent sync at the end covers only entries inside the config
+        // directory. On a fresh profile that is the whole `eidola` directory.
+        let mut created_dirs = Vec::new();
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let mut dir = Some(parent);
+            while let Some(d) = dir.filter(|d| !d.as_os_str().is_empty() && !d.exists()) {
+                created_dirs.push(d.to_path_buf());
+                dir = d.parent();
+            }
             fs::create_dir_all(parent).map_err(|e| AppError::Config {
                 message: format!("failed to create config directory: {e}"),
             })?;
@@ -368,9 +423,68 @@ impl Config {
         let contents = toml::to_string_pretty(self).map_err(|e| AppError::Config {
             message: format!("failed to serialize config: {e}"),
         })?;
-        fs::write(path, contents).map_err(|e| AppError::Config {
+        let write_err = |e: std::io::Error| AppError::Config {
             message: format!("failed to write config: {e}"),
-        })
+        };
+        // One temporary file per call, never a shared name: two saves can
+        // overlap (a background account create against a GUI preference
+        // write), and with one shared sibling the second could unlink the
+        // first's open file and the first then rename the second's
+        // half-written one into place — a torn file, and possibly the only
+        // copy of the account secret. With its own name, a call can only
+        // publish the bytes it wrote and synced; `create_new` makes that a
+        // guarantee rather than a convention. A crash between create and
+        // rename leaves a `config.toml.<id>.tmp` behind, owner-only and
+        // inert.
+        let tmp = path.with_extension(format!("toml.{}.tmp", uuid::Uuid::new_v4().simple()));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&tmp).map_err(write_err)?;
+        let written = file
+            .write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(write_err);
+        drop(file);
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        fs::rename(&tmp, path).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            write_err(e)
+        })?;
+        // `sync_all` above made the temporary's *contents* durable; the
+        // rename is an entry in the parent directory, which is its own
+        // metadata and on most filesystems is not durable until the directory
+        // is synced too. Without this, a crash right after the first account
+        // save returns could lose the file — the only copy of the secret —
+        // despite the successful result.
+        #[cfg(unix)]
+        {
+            let sync_dir = |dir: &Path| {
+                let dir = if dir.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    dir
+                };
+                fs::File::open(dir)
+                    .and_then(|dir| dir.sync_all())
+                    .map_err(write_err)
+            };
+            sync_dir(path.parent().unwrap_or(Path::new(".")))?;
+            // Deepest first is not required; each created directory's entry
+            // is made durable in the directory that holds it.
+            for created in &created_dirs {
+                if let Some(holder) = created.parent() {
+                    sync_dir(holder)?;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = created_dirs;
+        Ok(())
     }
 }
 
@@ -698,5 +812,48 @@ mod tests {
             parsed.update_feed_override.as_deref(),
             Some("http://localhost:8123")
         );
+    }
+
+    /// Saves can overlap (a background account create against a GUI
+    /// preference write). Each must publish only the bytes it wrote: every
+    /// save succeeds, nothing is left beside the file, and what is on disk
+    /// is one save's whole output — never a torn or empty file.
+    #[test]
+    fn overlapping_saves_each_publish_a_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let cfg = Config {
+                        account_id: Some(format!("account-{i}")),
+                        account_secret: Some(format!("secret-{i}")),
+                        ..Config::default()
+                    };
+                    for _ in 0..50 {
+                        cfg.save_to(&path).expect("every save succeeds");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let saved = Config::load_for_update(&path).expect("the file on disk is whole");
+        let id = saved.account_id.expect("one save's account");
+        let secret = saved.account_secret.expect("with its secret");
+        assert_eq!(
+            id.strip_prefix("account-"),
+            secret.strip_prefix("secret-"),
+            "the file is one save's output, not two interleaved"
+        );
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "config.toml")
+            .collect();
+        assert!(leftovers.is_empty(), "stray temporaries: {leftovers:?}");
     }
 }

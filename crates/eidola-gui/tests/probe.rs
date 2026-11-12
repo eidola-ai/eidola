@@ -10855,3 +10855,50 @@ fn a_cut_off_answer_offers_continue_where_it_can_be_continued(cx: &mut TestAppCo
     );
     probe::set_probes_enabled(false);
 }
+
+/// An account the server created but this profile could not keep: the create
+/// slide's alert says so, and the credential is on screen with its copy
+/// verbs — the server holds only the secret's hash, so these rows are the
+/// only copy there is.
+#[gpui::test]
+fn an_unsaved_account_shows_its_credential_to_copy(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::CreateAccount, cx);
+        v.set_create_error_for_test(
+            AppError::AccountNotSaved {
+                account: Box::new(eidola_app_core::error::UnsavedAccount {
+                    account_id: "00000000-0000-0000-0000-00000000000c".into(),
+                    secret: eidola_app_core::error::AccountSecret::new("only-copy".into()),
+                    terms: eidola_app_core::TermsAcceptance::Complete,
+                    recovery_file: None,
+                }),
+                reason: "config error: unreadable".into(),
+            },
+            cx,
+        );
+    });
+    draw(cx, window);
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    for expected in [
+        "onboarding/error/create",
+        "onboarding/copy/unsaved-account-id",
+        "onboarding/copy/unsaved-account-secret",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "unsaved-account probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+}

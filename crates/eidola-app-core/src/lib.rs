@@ -2250,6 +2250,10 @@ struct Inner {
     /// a strong self-reference would leak the database lock forever.
     self_ref: std::sync::Weak<Inner>,
     config_path: PathBuf,
+    /// Serializes every read-modify-write of `config.toml`, from the strict
+    /// load through the rename that publishes the save (see
+    /// [`Inner::update_config`]).
+    config_write: Mutex<()>,
     data_dir: PathBuf,
     db: tokio::sync::OnceCell<turso::Database>,
     /// Cached update-check state and the ordering that governs writes to it
@@ -2594,6 +2598,33 @@ impl MechanicalOutcome {
 impl Inner {
     fn load_config(&self) -> Config {
         Config::load_from(&self.config_path)
+    }
+
+    /// The config a setter is about to rewrite whole: see
+    /// [`Config::load_for_update`] (an unreadable file refuses the write
+    /// rather than reading as defaults the save would then persist).
+    fn load_config_for_update(&self) -> Result<Config, AppError> {
+        Config::load_for_update(&self.config_path)
+    }
+
+    /// Rewrite the config: load it strictly, apply `change`, save it whole —
+    /// under one process-wide lock for the whole span. Each save already
+    /// publishes only its own bytes, but a setter that loaded the file before
+    /// a background account create saved its credentials, and renamed after,
+    /// would publish a whole, well-formed snapshot with no account in it:
+    /// the only copy of the secret, lost to a zoom step. Every setter holds
+    /// the lock from load through rename, so the snapshot it saves is the
+    /// file it read. The lock is held across no `.await`: every caller loads,
+    /// changes and saves synchronously, and the account flows do their network
+    /// work before calling in.
+    fn update_config(
+        &self,
+        change: impl FnOnce(&mut Config) -> Result<(), AppError>,
+    ) -> Result<(), AppError> {
+        let _serialized = self.config_write.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = Config::load_for_update(&self.config_path)?;
+        change(&mut cfg)?;
+        cfg.save_to(&self.config_path)
     }
 
     fn require_credentials<'a>(&self, cfg: &'a Config) -> Result<(&'a str, &'a str), AppError> {
@@ -3272,7 +3303,7 @@ impl Inner {
         &self,
         accepted_terms: Vec<TermsDocument>,
     ) -> Result<AccountCreateResult, AppError> {
-        let cfg = self.load_config();
+        let cfg = self.load_config_for_update()?;
 
         if cfg.account_id.is_some() || cfg.account_secret.is_some() {
             return Err(AppError::Config {
@@ -3297,11 +3328,44 @@ impl Inner {
                 message: format!("failed to parse response: {e}"),
             })?;
 
-        let mut cfg = self.load_config();
-        cfg.account_id = Some(created.account_id.to_string());
-        cfg.account_secret = Some(created.secret.clone());
-        cfg.save_to(&self.config_path)?;
-        self.bus.emit(Change::Config);
+        // From here the server holds only the secret's hash: a failure to
+        // keep it must hand it back, never drop it with an ordinary error.
+        // The preflight above ran before the request; an account linked
+        // while it was in flight is seen only under the write lock, and is
+        // never overwritten (its secret would be the one lost).
+        let saved = self.update_config(|cfg| {
+            if cfg.account_id.is_some() || cfg.account_secret.is_some() {
+                return Err(AppError::Config {
+                    message: "an account was configured while this one was being created".into(),
+                });
+            }
+            cfg.account_id = Some(created.account_id.to_string());
+            cfg.account_secret = Some(created.secret.clone());
+            Ok(())
+        });
+        if saved.is_ok() {
+            self.bus.emit(Change::Config);
+        }
+        // Not kept: write the credential to a file of its own beside the
+        // profile, now, before any more network. The returned error carries it
+        // too, but a caller can drop that (a window closed mid-create, a
+        // process quitting during the terms round trip) and it is the only
+        // copy. Same `save_to` as the profile: whole-file, owner-only, synced.
+        // A separate file because the profile is exactly what could not be
+        // written (unreadable, or another account's).
+        let recovery_file = if saved.is_err() {
+            let path = self
+                .config_path
+                .with_file_name(format!("account-recovery-{}.toml", created.account_id));
+            let recovery = Config {
+                account_id: Some(created.account_id.to_string()),
+                account_secret: Some(created.secret.clone()),
+                ..Config::default()
+            };
+            recovery.save_to(&path).ok().map(|()| path)
+        } else {
+            None
+        };
 
         // Record the user's acceptance of exactly the documents the caller
         // presented — never a freshly fetched set, which would record consent
@@ -3317,10 +3381,31 @@ impl Inner {
         // nothing is known to have been recorded, nothing is assumed: the
         // standing is read with an empty recorded set, which lists everything
         // currently required.
-        let terms = match self.submit_terms(&accepted_terms).await {
+        //
+        // Submitted as the account just created, whether or not the profile
+        // kept it: the reader accepted this snapshot for *this* account, and an
+        // unsaved one linked later would otherwise come back gated, with
+        // nothing on the onboarding path that could accept for it again.
+        let account_id = created.account_id.to_string();
+        let terms = match self
+            .submit_terms_as(&account_id, &created.secret, &accepted_terms)
+            .await
+        {
             Ok(()) => self.terms_standing(&accepted_terms).await,
             Err(_) => self.terms_standing(&[]).await,
         };
+
+        if let Err(e) = saved {
+            return Err(AppError::AccountNotSaved {
+                account: Box::new(crate::error::UnsavedAccount {
+                    account_id,
+                    secret: crate::error::AccountSecret::new(created.secret),
+                    terms,
+                    recovery_file,
+                }),
+                reason: e.to_string(),
+            });
+        }
 
         Ok(AccountCreateResult {
             id: created.account_id.to_string(),
@@ -3395,11 +3480,26 @@ impl Inner {
         if presented.is_empty() {
             return Ok(());
         }
-
         let cfg = self.load_config();
+        let (id, secret) = self.require_credentials(&cfg)?;
+        self.submit_terms_as(id, secret, presented).await
+    }
+
+    /// [`Self::submit_terms`] for named credentials rather than the
+    /// profile's: account creation submits as the account it just created,
+    /// which the profile may have been unable to keep.
+    async fn submit_terms_as(
+        &self,
+        id: &str,
+        secret: &str,
+        presented: &[TermsDocument],
+    ) -> Result<(), AppError> {
+        if presented.is_empty() {
+            return Ok(());
+        }
+
         let eidola = self.eidola_resolved().await?;
         let base_url = eidola.base_url.as_str();
-        let (id, secret) = self.require_credentials(&cfg)?;
         let client = self.build_client(&eidola, None).await?;
 
         for d in presented {
@@ -11163,6 +11263,7 @@ impl AppCore {
             inner: Arc::new_cyclic(|self_ref| Inner {
                 self_ref: self_ref.clone(),
                 config_path: config_dir.join("config.toml"),
+                config_write: Mutex::new(()),
                 data_dir,
                 db: tokio::sync::OnceCell::new(),
                 update_state: Mutex::new(UpdateStateCell::default()),
@@ -11417,9 +11518,10 @@ impl AppCore {
                 message: "default template id must not be empty".into(),
             });
         }
-        let mut cfg = self.inner.load_config();
-        cfg.default_template_override = Some(template_id);
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            cfg.default_template_override = Some(template_id);
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         self.bus.emit(Change::Templates);
         Ok(())
@@ -11429,9 +11531,10 @@ impl AppCore {
     /// override): `system` tracks the OS appearance, `day`/`night` pin one
     /// palette family, `auto` switches on the system clock.
     pub fn set_appearance(&self, appearance: config::AppearanceSetting) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.appearance_override = Some(appearance);
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            cfg.appearance_override = Some(appearance);
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         Ok(())
     }
@@ -11440,9 +11543,10 @@ impl AppCore {
     /// config override): whether the palette takes on the character of the
     /// light at the current hour, or stays on the neutral palettes.
     pub fn set_time_of_day_tint(&self, tint: config::TimeOfDayTint) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.time_of_day_tint_override = Some(tint);
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            cfg.time_of_day_tint_override = Some(tint);
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         Ok(())
     }
@@ -11451,9 +11555,10 @@ impl AppCore {
     /// override) the palettes render under while the time-of-day axis is
     /// `off`.
     pub fn set_light_character(&self, character: config::LightCharacter) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.light_character_override = Some(character);
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            cfg.light_character_override = Some(character);
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         Ok(())
     }
@@ -11465,9 +11570,10 @@ impl AppCore {
     /// pre-validating. Emits [`Change::Config`] so every window's theme
     /// re-applies.
     pub fn set_font_scale(&self, scale: f32) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.font_scale_override = Some(config::clamp_font_scale(scale));
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            cfg.font_scale_override = Some(config::clamp_font_scale(scale));
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         Ok(())
     }
@@ -11479,11 +11585,12 @@ impl AppCore {
     /// what a tag resolves to and what an unrecognized one falls back to.
     /// Emits [`Change::Config`] so every window re-reads it.
     pub fn set_language(&self, language: Option<String>) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.language_override = language
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty());
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            cfg.language_override = language
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty());
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         Ok(())
     }
@@ -11492,9 +11599,10 @@ impl AppCore {
     /// used for local inference. When unset, the binary is discovered on
     /// `PATH` and in the usual install locations.
     pub fn set_llama_server_path(&self, path: Option<String>) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.llama_server_path_override = path.filter(|p| !p.trim().is_empty());
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            cfg.llama_server_path_override = path.filter(|p| !p.trim().is_empty());
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         Ok(())
     }
@@ -11624,25 +11732,26 @@ impl AppCore {
     }
 
     pub fn set_account_credentials(&self, id: String, secret: String) -> Result<(), AppError> {
-        let cfg = self.inner.load_config();
-        if cfg.account_id.is_some() || cfg.account_secret.is_some() {
-            return Err(AppError::Config {
-                message: "account credentials already configured — reset first".into(),
-            });
-        }
-        let mut cfg = cfg;
-        cfg.account_id = Some(id);
-        cfg.account_secret = Some(secret);
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            if cfg.account_id.is_some() || cfg.account_secret.is_some() {
+                return Err(AppError::Config {
+                    message: "account credentials already configured — reset first".into(),
+                });
+            }
+            cfg.account_id = Some(id);
+            cfg.account_secret = Some(secret);
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         Ok(())
     }
 
     pub fn reset_account(&self) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.account_id = None;
-        cfg.account_secret = None;
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            cfg.account_id = None;
+            cfg.account_secret = None;
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         Ok(())
     }
