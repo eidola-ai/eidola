@@ -244,7 +244,7 @@ pub fn check_record(
     } else {
         let k = r.drafts.len();
         let mut q_rows = Vec::new();
-        for i in 0..k {
+        for (i, &drafted) in r.drafts.iter().enumerate() {
             let drafter = logits(dense.drafter(i, p + i as u32).expect("draft row"));
             let pos = p as u64 + 1 + i as u64;
             let (d, q) = if params.is_greedy() {
@@ -259,7 +259,7 @@ pub fn check_record(
                     q,
                 )
             };
-            assert_eq!(d, r.drafts[i], "{ctx}: draft {i}");
+            assert_eq!(d, drafted, "{ctx}: draft {i}");
             q_rows.push(q);
         }
         let p_rows: Vec<Vec<f64>> = (0..=k as u32)
@@ -268,10 +268,10 @@ pub fn check_record(
         let out = sampling::chain_accept(&p_rows, &q_rows, &r.drafts, params, p as u64 + 1);
         sum.drafted += k;
         sum.accepted += out.len() - 1;
-        for i in 0..k {
-            sum.per_depth[i].0 += 1;
+        for (i, depth) in sum.per_depth[..k].iter_mut().enumerate() {
+            depth.0 += 1;
             if i < out.len() - 1 {
-                sum.per_depth[i].1 += 1;
+                depth.1 += 1;
             }
         }
         out

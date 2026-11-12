@@ -1114,8 +1114,9 @@ impl KvManager {
             for c in &e.children {
                 assert_eq!(self.entries[c].parent, Some(*id));
             }
-            for g in 0..e.blocks.len() {
-                if self.attention[g] == AttentionKind::Full {
+            assert_eq!(e.blocks.len(), self.attention.len(), "entry group count");
+            for (g, kind) in self.attention.iter().enumerate() {
+                if *kind == AttentionKind::Full {
                     assert!(e.holds(g), "entry lacks a full-attention block");
                 }
             }
