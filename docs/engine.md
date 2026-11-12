@@ -61,3 +61,7 @@ A failed attestation rejects the request before any inference data crosses the w
 ## Response shape
 
 The engine answers every chat request as a stream (the gateway asks for one whatever its client asked for, and builds a client's single answer from it), written to the gateway as frames of one fixed size at a fixed interval, from the moment the stream opens until it ends, and pads every other response to a size bucket, as the gateway does for its client ([gateway.md § Response shape](gateway.md#response-shape)). The host and the network between the enclaves see how long a response ran, not the size or timing of its tokens. What framing cannot hide is the engine's own activity: the host observes the confidential VM's scheduling and its devices' work, whose timing follows the computation.
+
+## When an engine stops
+
+An engine that fails stops serving: every request in flight ends with an error, the gateway settles each on what was generated and stops routing to the engine, and the process exits for the platform to restart it. That includes a computation step that never returns (a GPU driver call that hangs, say): a watchdog independent of the stuck step notices it once it has run far longer than the slowest legitimate step, and does the same. What such an exit cannot do is clean up after the stuck step: the engine normally zeroes the GPU memory a request used once it ends, and a forced exit leaves that memory, the requests in flight included, to the GPU driver as the process ends.
