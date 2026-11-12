@@ -232,15 +232,9 @@ fn basic(id: &str, secret: &str) -> String {
 
 /// Create an account, accepting [`presented_terms`], against a server whose
 /// create rewrites `config.toml` to `rewrite_to` first; returns the create's
-/// outcome, the file after it, and the `Authorization` of each terms
-/// submission.
-fn create_while_config_becomes(
-    rewrite_to: &'static str,
-) -> (
-    Result<eidola_app_core::AccountCreateResult, AppError>,
-    String,
-    Vec<String>,
-) {
+/// outcome, the file after it, the `Authorization` of each terms
+/// submission, and any recovery file the create left beside the profile.
+fn create_while_config_becomes(rewrite_to: &'static str) -> CreateOutcome {
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let dir = tempfile::tempdir().unwrap();
     let client = reqwest::Client::builder().build().unwrap();
@@ -289,7 +283,43 @@ fn create_while_config_becomes(
         .block_on(core.account_create(vec![presented_terms()]));
     let after = std::fs::read_to_string(&path).unwrap();
     let submitted = submissions.lock().unwrap().clone();
-    (created, after, submitted)
+    let recovery = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("account-recovery-"))
+        })
+        .map(|file| {
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777
+            };
+            // Only Unix has the bits; elsewhere the assertion holds trivially.
+            #[cfg(not(unix))]
+            let mode = 0o600;
+            (file.clone(), Config::load_from(&file), mode)
+        });
+    CreateOutcome {
+        created,
+        after,
+        submitted,
+        recovery,
+    }
+}
+
+/// What [`create_while_config_becomes`] observed.
+struct CreateOutcome {
+    created: Result<eidola_app_core::AccountCreateResult, AppError>,
+    /// `config.toml` afterwards.
+    after: String,
+    /// The `Authorization` of each terms submission.
+    submitted: Vec<String>,
+    /// A recovery file beside the profile: its path, what it loads as, and
+    /// its permission bits.
+    recovery: Option<(std::path::PathBuf, Config, u32)>,
 }
 
 /// The strict reload refuses a config that became unparseable while the
@@ -299,20 +329,38 @@ fn create_while_config_becomes(
 #[test]
 fn a_created_account_survives_a_config_that_broke_in_flight() {
     let broken = "font_scale = big\n";
-    let (created, after, submitted) = create_while_config_becomes(broken);
+    let CreateOutcome {
+        created,
+        after,
+        submitted,
+        recovery,
+    } = create_while_config_becomes(broken);
+    // The credential outlives a caller that drops the error (a window closed
+    // mid-create): it is on disk, owner-only, in the profile's own shape.
+    let (file, saved, mode) = recovery.expect("no recovery file was written");
+    assert_eq!(
+        (
+            saved.account_id.as_deref(),
+            saved.account_secret.as_deref(),
+            mode
+        ),
+        (
+            Some("00000000-0000-0000-0000-00000000000c"),
+            Some("only-copy-of-the-new-secret"),
+            0o600
+        ),
+        "the recovery file does not hold the credential privately"
+    );
     match created {
-        Err(AppError::AccountNotSaved {
-            account_id,
-            secret,
-            terms,
-            ..
-        }) => {
-            assert_eq!(account_id, "00000000-0000-0000-0000-00000000000c");
-            assert_eq!(secret.expose(), "only-copy-of-the-new-secret");
+        Err(AppError::AccountNotSaved { account, .. }) => {
+            assert_eq!(account.recovery_file.as_deref(), Some(file.as_path()));
+            assert_eq!(account.account_id, "00000000-0000-0000-0000-00000000000c");
+            assert_eq!(account.secret.expose(), "only-copy-of-the-new-secret");
+            let terms = &account.terms;
             // The snapshot the reader accepted is recorded for the account it
             // was accepted for, so linking it later does not come back gated.
             assert!(
-                matches!(*terms, eidola_app_core::TermsAcceptance::Complete),
+                matches!(terms, eidola_app_core::TermsAcceptance::Complete),
                 "the accepted terms were not recorded: {terms:?}"
             );
         }
@@ -335,7 +383,13 @@ fn a_created_account_survives_a_config_that_broke_in_flight() {
 #[test]
 fn an_account_linked_while_creating_is_never_overwritten() {
     let linked = "account_id = \"acct-1\"\naccount_secret = \"s3cret-never-lost\"\n";
-    let (created, after, submitted) = create_while_config_becomes(linked);
+    let CreateOutcome {
+        created,
+        after,
+        submitted,
+        recovery,
+    } = create_while_config_becomes(linked);
+    assert!(recovery.is_some(), "no recovery file was written");
     // Accepted for the account being created, never for the one that was
     // linked meanwhile.
     assert_eq!(
@@ -355,10 +409,10 @@ fn an_account_linked_while_creating_is_never_overwritten() {
         "the linked account was replaced:\n{after}"
     );
     // The secret travels for the surface to show, never into a log line.
-    let AppError::AccountNotSaved { secret, .. } = &err else {
+    let AppError::AccountNotSaved { account, .. } = &err else {
         unreachable!()
     };
-    assert_eq!(secret.expose(), "only-copy-of-the-new-secret");
+    assert_eq!(account.secret.expose(), "only-copy-of-the-new-secret");
     for printed in [format!("{err}"), format!("{err:?}")] {
         assert!(
             !printed.contains("only-copy-of-the-new-secret"),

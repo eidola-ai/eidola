@@ -343,19 +343,17 @@ impl RenderOnce for CreateAccount {
                 // The server holds only the secret's hash: if this profile
                 // could not keep the account, these rows are the only copy.
                 match err {
-                    AppError::AccountNotSaved {
-                        account_id, secret, ..
-                    } => el
+                    AppError::AccountNotSaved { account, .. } => el
                         .child(credential_row(
                             "unsaved-account-id",
                             crate::i18n::msg::onboarding_account_id(cx),
-                            account_id.into(),
+                            account.account_id.clone().into(),
                             cx,
                         ))
                         .child(credential_row(
                             "unsaved-account-secret",
                             crate::i18n::msg::onboarding_account_secret(cx),
-                            secret.expose().to_string().into(),
+                            account.secret.expose().to_string().into(),
                             cx,
                         )),
                     _ => el,

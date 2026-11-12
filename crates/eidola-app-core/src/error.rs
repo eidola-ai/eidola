@@ -206,15 +206,12 @@ pub enum AppError {
     /// `Display` names only the account id and the cause; the secret is in
     /// [`AccountSecret`], which prints redacted, so a log line cannot copy it.
     ///
-    /// The accepted terms were still submitted as the new account, and
-    /// `terms` is the standing that left — the same report a saved create
-    /// returns — so a surface can say what linking it will still need.
-    #[error("the account {account_id} was created but this profile could not save it: {reason}")]
+    /// The account's details are boxed ([`UnsavedAccount`]) so this rare
+    /// variant does not grow every `Result<_, AppError>` in the crate.
+    #[error("the account {} was created but this profile could not save it: {reason}", .account.account_id)]
     AccountNotSaved {
-        account_id: String,
-        secret: AccountSecret,
+        account: Box<UnsavedAccount>,
         reason: String,
-        terms: Box<crate::TermsAcceptance>,
     },
 
     /// A model notice's action (switching to newer weights, dismissing a
@@ -431,6 +428,23 @@ pub(crate) fn request_error_text(e: reqwest::Error) -> String {
         source = err.source();
     }
     chain
+}
+
+/// An account the server created that the profile could not keep — what
+/// [`AppError::AccountNotSaved`] carries back.
+#[derive(Debug, Clone)]
+pub struct UnsavedAccount {
+    pub account_id: String,
+    pub secret: AccountSecret,
+    /// The accepted terms were still submitted as the new account; this is
+    /// the standing that left — the same report a saved create returns — so a
+    /// surface can say what linking it will still need.
+    pub terms: crate::TermsAcceptance,
+    /// Where the credential was also written, owner-only, beside the profile
+    /// (`account-recovery-<id>.toml`, in the profile's own shape), so it
+    /// outlives a caller that drops the error. `None` only when that write
+    /// failed too.
+    pub recovery_file: Option<std::path::PathBuf>,
 }
 
 /// A freshly created account's secret, carried back in

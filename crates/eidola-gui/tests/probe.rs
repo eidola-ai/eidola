@@ -10876,10 +10876,13 @@ fn an_unsaved_account_shows_its_credential_to_copy(cx: &mut TestAppContext) {
         v.reveal(Slide::GetStarted, Slide::CreateAccount, cx);
         v.set_create_error_for_test(
             AppError::AccountNotSaved {
-                account_id: "00000000-0000-0000-0000-00000000000c".into(),
-                secret: eidola_app_core::error::AccountSecret::new("only-copy".into()),
+                account: Box::new(eidola_app_core::error::UnsavedAccount {
+                    account_id: "00000000-0000-0000-0000-00000000000c".into(),
+                    secret: eidola_app_core::error::AccountSecret::new("only-copy".into()),
+                    terms: eidola_app_core::TermsAcceptance::Complete,
+                    recovery_file: None,
+                }),
                 reason: "config error: unreadable".into(),
-                terms: Box::new(eidola_app_core::TermsAcceptance::Complete),
             },
             cx,
         );

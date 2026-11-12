@@ -8287,10 +8287,13 @@ fn onboarding_an_unsaved_account_is_told_in_the_readers_language(cx: &mut TestAp
     view.update(cx, |v, cx| {
         v.set_create_error_for_test(
             AppError::AccountNotSaved {
-                account_id: "00000000-0000-0000-0000-00000000000c".into(),
-                secret: eidola_app_core::error::AccountSecret::new("only-copy".into()),
+                account: Box::new(eidola_app_core::error::UnsavedAccount {
+                    account_id: "00000000-0000-0000-0000-00000000000c".into(),
+                    secret: eidola_app_core::error::AccountSecret::new("only-copy".into()),
+                    terms: eidola_app_core::TermsAcceptance::Complete,
+                    recovery_file: None,
+                }),
                 reason: "config error: unreadable".into(),
-                terms: Box::new(eidola_app_core::TermsAcceptance::Complete),
             },
             cx,
         )

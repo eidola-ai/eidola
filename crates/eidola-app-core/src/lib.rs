@@ -3345,6 +3345,26 @@ impl Inner {
         if saved.is_ok() {
             self.bus.emit(Change::Config);
         }
+        // Not kept: write the credential to a file of its own beside the
+        // profile, now, before any more network. The returned error carries it
+        // too, but a caller can drop that (a window closed mid-create, a
+        // process quitting during the terms round trip) and it is the only
+        // copy. Same `save_to` as the profile: whole-file, owner-only, synced.
+        // A separate file because the profile is exactly what could not be
+        // written (unreadable, or another account's).
+        let recovery_file = if saved.is_err() {
+            let path = self
+                .config_path
+                .with_file_name(format!("account-recovery-{}.toml", created.account_id));
+            let recovery = Config {
+                account_id: Some(created.account_id.to_string()),
+                account_secret: Some(created.secret.clone()),
+                ..Config::default()
+            };
+            recovery.save_to(&path).ok().map(|()| path)
+        } else {
+            None
+        };
 
         // Record the user's acceptance of exactly the documents the caller
         // presented — never a freshly fetched set, which would record consent
@@ -3376,10 +3396,13 @@ impl Inner {
 
         if let Err(e) = saved {
             return Err(AppError::AccountNotSaved {
-                account_id,
-                secret: crate::error::AccountSecret::new(created.secret),
+                account: Box::new(crate::error::UnsavedAccount {
+                    account_id,
+                    secret: crate::error::AccountSecret::new(created.secret),
+                    terms,
+                    recovery_file,
+                }),
                 reason: e.to_string(),
-                terms: Box::new(terms),
             });
         }
 

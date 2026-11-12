@@ -1126,11 +1126,13 @@ impl WireError {
             // account, and a socket is not where the only copy of a
             // credential should travel. The far side reads this as
             // unrecognized and renders `message`, which names the account.
-            AppError::AccountNotSaved {
-                account_id, reason, ..
-            } => (
+            AppError::AccountNotSaved { account, reason } => (
                 "AccountNotSaved",
-                json!({ "account_id": account_id, "reason": reason }),
+                json!({
+                    "account_id": account.account_id,
+                    "reason": reason,
+                    "recovery_file": account.recovery_file,
+                }),
             ),
             AppError::Internal { message } => ("Internal", json!({ "message": message })),
             AppError::LocalModel { message } => ("LocalModel", json!({ "message": message })),

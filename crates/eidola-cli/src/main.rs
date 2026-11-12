@@ -939,22 +939,20 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                     // The server kept only the secret's hash: this is the one
                     // chance to see it. Print it where the person is looking,
                     // with the command that links it once the profile is fixed.
-                    Err(AppError::AccountNotSaved {
-                        account_id,
-                        secret,
-                        reason,
-                        terms,
-                    }) => {
+                    Err(AppError::AccountNotSaved { account, reason }) => {
                         eprintln!(
                             "the account was created, but this profile could not save it: {reason}"
                         );
                         eprintln!("this is the only copy of its secret; save both lines now:");
-                        eprintln!("id: {account_id}");
-                        eprintln!("secret: {}", secret.expose());
+                        eprintln!("id: {}", account.account_id);
+                        eprintln!("secret: {}", account.secret.expose());
                         eprintln!(
                             "once the profile is fixed, link it with: eidola account configure --id <id> --secret <secret>"
                         );
-                        report_terms_standing(&terms);
+                        if let Some(file) = &account.recovery_file {
+                            eprintln!("a copy is also in {} (owner-only)", file.display());
+                        }
+                        report_terms_standing(&account.terms);
                         std::process::exit(1);
                     }
                     Err(e) => return Err(e.into()),
