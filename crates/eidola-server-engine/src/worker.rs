@@ -196,7 +196,7 @@ impl Admission {
     /// A permit, or `None` when every one is taken.
     pub fn try_acquire(self: &Arc<Self>) -> Option<Permit> {
         self.in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < self.limit).then_some(n + 1)
             })
             .ok()
