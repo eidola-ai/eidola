@@ -146,6 +146,12 @@ enum Mode {
     /// [`Mode::Wedge`], the role chunk carrying a running count of
     /// [`GENERATED`] completion tokens.
     CountThenWedge,
+    /// Refuse every chat request as the node does a declared cached prefix
+    /// its cache does not hold (409 `cached_prefix_missing`).
+    PrefixMissing,
+    /// Refuse every chat request as the node does a prompt past its
+    /// declaration (409 `prompt_budget_exceeded`).
+    OverBudget,
 }
 
 /// The completion tokens a counting mode's engine reports before it fails.
@@ -394,6 +400,8 @@ async fn chat(
         Mode::UnavailableAfterSubmit => {
             return error(StatusCode::SERVICE_UNAVAILABLE, kind::ENGINE_UNAVAILABLE);
         }
+        Mode::PrefixMissing => return error(StatusCode::CONFLICT, kind::CACHED_PREFIX_MISSING),
+        Mode::OverBudget => return error(StatusCode::CONFLICT, kind::PROMPT_BUDGET_EXCEEDED),
         _ => {}
     }
     let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -890,7 +898,7 @@ async fn a_stream_dropped_before_it_opens_is_settled() {
 
     let validated = request(MODEL_A, None, true);
     let model = catalog_model();
-    let hold = crate::handlers::worst_case_cost(validated.request(), &model);
+    let hold = crate::handlers::tests::worst_case_cost(validated.request(), &model).unwrap();
     let mut keys = Cache::new();
     let hash = add_key(&mut keys, std::time::SystemTime::now() + DAY);
     let (act, _) = spend(&keys[&hash], 1_000_000, hold);
@@ -1291,17 +1299,13 @@ async fn the_engines_usage_settles_the_charge() {
     let model = catalog_model();
     let sent = request(MODEL_A, None, true);
     let charge = 1_000_000u128;
-    let settle = |usage: Option<&crate::types::Usage>| {
-        crate::handlers::settled_cost(
-            usage,
-            &model,
-            crate::handlers::chargeable_prompt_tokens_for(sent.request()),
-            crate::handlers::effective_max_completion(sent.request(), &model),
-            charge,
-        )
-    };
-    // 1 credit per prompt token, 2 per completion token.
-    let expected = PROMPT_TOKENS as u128 + 2 * COMPLETION_TOKENS as u128;
+    let price = crate::handlers::RequestPrice::of(sent.request(), &model);
+    let settle =
+        |usage: Option<&crate::types::Usage>| crate::handlers::settled_cost(usage, &price, charge);
+    // The fee, 1 credit per prompt token, 2 per completion token.
+    let expected = eidola_common::pricing::REQUEST_FEE_CREDITS as u128
+        + PROMPT_TOKENS as u128
+        + 2 * COMPLETION_TOKENS as u128;
 
     let response = router.send(&sent).await.unwrap();
     assert_eq!(settle(response.meta.usage.as_ref()), expected);
@@ -1464,6 +1468,7 @@ fn catalog_model() -> Model {
         pricing: ModelPricing {
             per_prompt_token: price(crate::backend::PRICING_SCALE_FACTOR),
             per_completion_token: price(2 * crate::backend::PRICING_SCALE_FACTOR),
+            per_cached_prompt_token: Some(price(crate::backend::PRICING_SCALE_FACTOR / 4)),
             per_request: None,
         },
     }
@@ -1720,8 +1725,8 @@ async fn a_silent_engine_is_given_up_on_within_its_bounds() {
 /// silent is charged the prompt and the output it reported by its last chunk,
 /// the rest of the hold refunded in the stream's metadata event, and the
 /// stream ends without `[DONE]`; an engine that sends no response headers is
-/// no engine, and with none other to try the request is refused and refunded
-/// in full.
+/// no engine, and with none other to try the request is refused and charged
+/// the request fee alone.
 #[test]
 fn a_request_ended_early_is_settled_on_what_was_generated() {
     // Signing a refund needs more stack than a test thread has.
@@ -1741,13 +1746,16 @@ fn a_request_ended_early_is_settled_on_what_was_generated() {
 
 async fn a_request_ended_early_is_settled() {
     let model = catalog_model();
-    let hold = crate::handlers::worst_case_cost(request(MODEL_A, None, true).request(), &model);
-    // 1 credit a prompt token, 2 a completion token.
-    let generated = PROMPT_TOKENS as u128 + 2 * GENERATED as u128;
+    let hold =
+        crate::handlers::tests::worst_case_cost(request(MODEL_A, None, true).request(), &model)
+            .unwrap();
+    // The fee, 1 credit a prompt token, 2 a completion token.
+    let fee = eidola_common::pricing::REQUEST_FEE_CREDITS as u128;
+    let generated = fee + PROMPT_TOKENS as u128 + 2 * GENERATED as u128;
     for (mode, status, charged) in [
         (Mode::CountThenError, 200, generated),
         (Mode::CountThenWedge, 200, generated),
-        (Mode::Stall, 503, 0),
+        (Mode::Stall, 503, fee),
     ] {
         // An engine and router of its own, so no ending opens the breaker
         // for the next.
@@ -1798,9 +1806,17 @@ async fn paid_handler(
     router: &EngineRouter,
     hold: u128,
 ) -> (Handler, Completion, crate::AppState, String, Vec<u8>) {
+    paid_handler_for(router, request(MODEL_A, None, true), hold).await
+}
+
+/// [`paid_handler`] for `validated`.
+async fn paid_handler_for(
+    router: &EngineRouter,
+    validated: ValidatedRequest,
+    hold: u128,
+) -> (Handler, Completion, crate::AppState, String, Vec<u8>) {
     use crate::credentials::tests::{Cache, DAY, add_key, spend};
 
-    let validated = request(MODEL_A, None, true);
     let model = catalog_model();
     let mut keys = Cache::new();
     let hash = add_key(&mut keys, std::time::SystemTime::now() + DAY);
@@ -1855,8 +1871,20 @@ async fn paid_handler(
 /// `[DONE]`, and the credits the client holds after completing its refund:
 /// the one the stream's metadata event carried, or a refusal's.
 async fn paid_request(router: &EngineRouter, hold: u128) -> (u16, bool, u128) {
+    let (status, finished, credits, _) =
+        paid_request_for(router, request(MODEL_A, None, true), hold).await;
+    (status, finished, credits)
+}
+
+/// [`paid_request`] for `validated`, with the answer's body: a refusal's error
+/// body, or a stream's metadata event.
+async fn paid_request_for(
+    router: &EngineRouter,
+    validated: ValidatedRequest,
+    hold: u128,
+) -> (u16, bool, u128, serde_json::Value) {
     use base64::Engine as _;
-    let (handler, c, _, _, _) = paid_handler(router, hold).await;
+    let (handler, c, _, _, _) = paid_handler_for(router, validated, hold).await;
     let (status, finished, body) = tokio::time::timeout(Duration::from_secs(10), async {
         let response = handler.await.unwrap();
         let status = response.status().as_u16();
@@ -1909,7 +1937,176 @@ async fn paid_request(router: &EngineRouter, hold: u128) -> (u16, bool, u128) {
         { eidola_common::spend_credentials::ACT_L },
     >(&token.credits())
     .unwrap();
-    (status, finished, credits)
+    (status, finished, credits, body)
+}
+
+/// **A node's refusal of a declared cached prefix reaches the client as the
+/// node made it, and no other engine is tried.** Both refusals (`409`
+/// `cached_prefix_missing`, `409` `prompt_budget_exceeded`) come back from the
+/// router with their status and type and the gateway's own message, the
+/// engine the key ranks second never sees the request, and the refusing
+/// engine is not counted as failing.
+#[tokio::test]
+async fn a_declared_prefix_refusal_is_returned_not_retried() {
+    let engines = [
+        engine(Identity::of(MODEL_A)).await,
+        engine(Identity::of(MODEL_A)).await,
+    ];
+    let refs: Vec<&Engine> = engines.iter().collect();
+    let router = router_for(&refs, models());
+    let rows: Vec<EnginePlacementRow> = engines
+        .iter()
+        .map(|e| e.row(MODEL_A, DEPLOYMENT_A))
+        .collect();
+    router.apply_placement(&rows).await;
+    router.probe_due().await;
+    let (home, other) = (&engines[0], &engines[1]);
+    let key = key_text(key_ranking_first(
+        &router,
+        MODEL_A,
+        &home.base_url,
+        &[&other.base_url],
+    ));
+    let declared = |key: &str| {
+        ValidatedRequest::from_bytes(bytes::Bytes::from(request_text(
+            MODEL_A,
+            Some(key),
+            true,
+            r#","cached_prefix":{"cached_tokens":256,"new_tokens":40}"#,
+        )))
+        .unwrap()
+    };
+    for (mode, expected) in [
+        (Mode::PrefixMissing, kind::CACHED_PREFIX_MISSING),
+        (Mode::OverBudget, kind::PROMPT_BUDGET_EXCEEDED),
+    ] {
+        home.set_mode(mode);
+        // More refusals than the breaker's threshold: none is a failure.
+        for _ in 0..3 {
+            let before = other.chats().len();
+            match router.send_stream(&declared(&key)).await {
+                Err(ServerError::Backend {
+                    status: 409,
+                    error_type,
+                    message,
+                }) => {
+                    assert_eq!(error_type, expected);
+                    assert_ne!(message, "refused", "the node's message is not relayed");
+                }
+                other => panic!(
+                    "{mode:?}: expected the node's 409, got ok={}",
+                    other.is_ok()
+                ),
+            }
+            assert_eq!(other.chats().len(), before, "{mode:?}: tried elsewhere");
+        }
+        assert!(
+            upstream(&router, MODEL_A, &home.base_url).routable(),
+            "{mode:?}: counted against the engine"
+        );
+    }
+    // What the home engine received was the declaration, as priced.
+    let sent: serde_json::Value = serde_json::from_slice(&home.chats()[0].body).unwrap();
+    assert_eq!(
+        sent["cached_prefix"],
+        serde_json::json!({"cached_tokens": 256, "new_tokens": 40})
+    );
+}
+
+/// **A paid request refused before an engine produced anything is charged
+/// the request fee and nothing more**, through the chat handler's own
+/// settlement: each of the node's two declared-prefix refusals, relayed with
+/// its status and type; a request outside the node's subset (a declaration
+/// without a `cache_key`), refused before routing; an engine's error before
+/// it answered; and no engine at all. The declared hold is the declaration's.
+#[test]
+fn a_refused_paid_request_is_charged_the_fee() {
+    // Signing a refund needs more stack than a test thread has.
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(a_refused_paid_request())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn a_refused_paid_request() {
+    let fee = eidola_common::pricing::REQUEST_FEE_CREDITS as u128;
+    let model = catalog_model();
+    let key = key_text(3);
+    let declaration = r#","cached_prefix":{"cached_tokens":256,"new_tokens":40}"#;
+    let declared = request_text(MODEL_A, Some(&key), true, declaration);
+    let keyless = request_text(MODEL_A, None, true, declaration);
+    let plain = request_text(MODEL_A, None, true, "");
+    let hold_of = |text: &str| {
+        crate::handlers::tests::worst_case_cost(
+            ValidatedRequest::from_bytes(bytes::Bytes::from(text.to_string()))
+                .unwrap()
+                .request(),
+            &model,
+        )
+        .unwrap()
+    };
+    // 256 cached at 0.25, 40 new at 1, 16 completion at 2.
+    assert_eq!(hold_of(&declared), fee + 64 + 40 + 32);
+
+    for (case, mode, text, status, error_type) in [
+        (
+            "prefix missing",
+            Some(Mode::PrefixMissing),
+            &declared,
+            409,
+            kind::CACHED_PREFIX_MISSING,
+        ),
+        (
+            "over budget",
+            Some(Mode::OverBudget),
+            &declared,
+            409,
+            kind::PROMPT_BUDGET_EXCEEDED,
+        ),
+        (
+            "outside the subset",
+            Some(Mode::Serve),
+            &keyless,
+            400,
+            "invalid_request_error",
+        ),
+        (
+            "an engine error",
+            Some(Mode::Fail500),
+            &plain,
+            500,
+            kind::INTERNAL_ERROR,
+        ),
+        ("no engine", None, &plain, 503, "service_unavailable"),
+    ] {
+        let a = engine(Identity::of(MODEL_A)).await;
+        let router = router_for(&[&a], models());
+        if let Some(mode) = mode {
+            router
+                .apply_placement(&[a.row(MODEL_A, DEPLOYMENT_A)])
+                .await;
+            router.probe_due().await;
+            a.set_mode(mode);
+        }
+        let validated = ValidatedRequest::from_bytes(bytes::Bytes::from(text.clone())).unwrap();
+        let (answered, finished, credits, body) =
+            paid_request_for(&router, validated, hold_of(text)).await;
+        assert_eq!(answered, status, "{case}");
+        assert!(!finished, "{case}");
+        assert_eq!(body["error"]["type"], error_type, "{case}");
+        assert_eq!(credits, CREDITS - fee, "{case}: charged the fee alone");
+        if case == "outside the subset" {
+            assert!(a.chats().is_empty(), "{case}: no engine saw it");
+        }
+    }
 }
 
 /// A request whose client goes away while its engine works releases the
@@ -1941,8 +2138,11 @@ async fn a_client_leaves() {
         .await;
     router.probe_due().await;
     a.set_mode(Mode::Hold);
-    let hold =
-        crate::handlers::worst_case_cost(request(MODEL_A, None, true).request(), &catalog_model());
+    let hold = crate::handlers::tests::worst_case_cost(
+        request(MODEL_A, None, true).request(),
+        &catalog_model(),
+    )
+    .unwrap();
     let (handler, _, state, key_id, nullifier) = paid_handler(&router, hold).await;
     let until = std::time::Instant::now() + Duration::from_secs(10);
     // The stream opens; the engine holds its answer open.

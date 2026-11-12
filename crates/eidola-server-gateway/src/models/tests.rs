@@ -51,6 +51,7 @@ fn the_fixture_parses_whole() {
             output_per_m: 5.75
         }
     );
+    assert_eq!(row.cached_input_per_m, Some(0.45));
     assert_eq!(row.lifecycle, Lifecycle::Current);
 }
 
@@ -215,12 +216,30 @@ fn display_capabilities_and_price_are_complete() {
     let both = FIXTURE.replace("[price]\n", "[price]\nper_request = 0.01\n");
     assert!(parse(&both).unwrap_err().contains("price"));
     let per_request = FIXTURE.replace(
-        "input_per_m = 1.80\noutput_per_m = 5.75",
+        "input_per_m = 1.80\noutput_per_m = 5.75\ncached_input_per_m = 0.45",
         "per_request = 0.01",
     );
     assert_eq!(
         parse(&per_request).unwrap().price,
         file::Price::PerRequest { usd: 0.01 }
+    );
+    // A cached rate sits beside a per-token price, at most its input price.
+    let uncached = FIXTURE.replace("cached_input_per_m = 0.45\n", "");
+    assert_eq!(parse(&uncached).unwrap().cached_input_per_m, None);
+    let above = FIXTURE.replace("cached_input_per_m = 0.45", "cached_input_per_m = 1.81");
+    assert!(parse(&above).unwrap_err().contains("cached_input_per_m"));
+    let at_input = FIXTURE.replace("cached_input_per_m = 0.45", "cached_input_per_m = 1.80");
+    assert_eq!(parse(&at_input).unwrap().cached_input_per_m, Some(1.80));
+    let negative_cached = FIXTURE.replace("cached_input_per_m = 0.45", "cached_input_per_m = -0.1");
+    assert!(parse(&negative_cached).is_err());
+    let cached_per_request = FIXTURE.replace(
+        "input_per_m = 1.80\noutput_per_m = 5.75",
+        "per_request = 0.01",
+    );
+    assert!(
+        parse(&cached_per_request)
+            .unwrap_err()
+            .contains("cached_input_per_m")
     );
     let bad_repo = FIXTURE.replace("example/fixture-flash", "fixture-flash");
     assert!(parse(&bad_repo).unwrap_err().contains("source.repo"));

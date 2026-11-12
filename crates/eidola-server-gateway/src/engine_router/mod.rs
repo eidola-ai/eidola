@@ -36,7 +36,9 @@
 //! refused it before admission, by the node's exact status and error type
 //! (`eidola_common::engine_protocol::refused_before_admission`: a
 //! misconfiguration, or `overloaded`). Any other answer, an error included,
-//! may come after the engine ran the request, and is returned.
+//! may come after the engine ran the request, and is returned; so is a
+//! refusal of a declared cached prefix (`declared_prefix_refusal`), which
+//! another engine, not holding the prefix, could only repeat.
 //! Every request is a stream to the engine, as every chat request to the
 //! gateway is: it comes back as `BackendStreamEvent`s, which the handler
 //! forwards to its client and billing settles: usage → charge.
@@ -63,7 +65,9 @@ use crate::engine_trust::protocol::{
 use crate::engine_trust::{self, PinnedModel};
 use crate::error::ServerError;
 use crate::types::{ChatCompletionChunk, ErrorResponse};
-use eidola_common::engine_protocol::{PreAdmission, refused_before_admission};
+use eidola_common::engine_protocol::{
+    DeclaredPrefixRefusal, PreAdmission, declared_prefix_refusal, refused_before_admission,
+};
 use eidola_common::stream_shape::{StreamEvent, StreamReader, Unreadable, unpadded};
 
 mod breaker;
@@ -182,8 +186,8 @@ pub fn attesting_client_factory(roots: AttestationRoots) -> ClientFactory {
 /// Sixty seconds is several times that for the largest request, so only a
 /// node that has stopped answering reaches it; the cost of a lower value is a
 /// large prompt refused by every engine in turn. Nothing reached the client,
-/// so the request is refunded in full if no engine answers, as for any
-/// request no engine took.
+/// so the request is charged only the request fee if no engine answers, as
+/// for any request no engine took.
 pub const STREAM_HEADERS_LIMIT: Duration = Duration::from_secs(60);
 
 /// How long an open stream from an engine may deliver nothing at all before
@@ -715,6 +719,27 @@ impl EngineRouter {
                 "the engine refused the request".to_string(),
             ),
         };
+        // A refusal of the request's declared cached prefix is returned to
+        // the client as the node made it, never tried elsewhere: the cache a
+        // declaration names is on the engine its key routes to, and another
+        // engine holds less of it. It is no sign of ill health. The message is
+        // the gateway's own, so nothing the node wrote about the prompt
+        // travels on.
+        if let Some(refusal) = declared_prefix_refusal(status.as_u16(), &error_type) {
+            return Attempt::Fail(ServerError::Backend {
+                status: DeclaredPrefixRefusal::STATUS,
+                error_type: refusal.error_type().to_string(),
+                message: match refusal {
+                    DeclaredPrefixRefusal::Missing => {
+                        "the engine does not hold the declared cached prefix"
+                    }
+                    DeclaredPrefixRefusal::OverBudget => {
+                        "the prompt is longer than its declared cached prefix allows"
+                    }
+                }
+                .to_string(),
+            });
+        }
         // Only a refusal the node makes before admitting the request, read by
         // its exact status and error type (`refused_before_admission`, the
         // rule the node holds itself to), may go to another engine. Any other

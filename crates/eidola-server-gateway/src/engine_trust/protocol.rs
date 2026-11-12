@@ -166,6 +166,11 @@ impl ValidatedRequest {
 /// gateway gave the model's declared ceiling
 /// ([`ValidatedRequest::default_completion_ceiling`]) asks the node for it.
 ///
+/// `cached_prefix` is written from the typed request in its place, the two
+/// numbers the request was priced by in the shared shape
+/// (`eidola_common::engine_protocol::CachedPrefix::to_value`); a `null` one
+/// declares nothing and is not forwarded.
+///
 /// The returned buffer is scrubbed when dropped, and so are the copies of the
 /// key made here: the re-encoded text and the client's member as parsed out
 /// of `raw`. `raw` itself is an HTTP-stack buffer, out of reach like the
@@ -201,6 +206,14 @@ pub fn engine_request_body(request: &ValidatedRequest) -> Zeroizing<Vec<u8>> {
                 })
             }
             "cache_key" => value.scrub(),
+            "cached_prefix" => {
+                if let Some(prefix) = parsed.cached_prefix {
+                    member(&mut body, &key, &|out| {
+                        serde_json::to_writer(&mut *out, &prefix.0.to_value())
+                            .expect("a declaration serializes")
+                    })
+                }
+            }
             // The spends paid the gateway, not the node: never forwarded.
             "credentials" => value.scrub(),
             "model" => member(&mut body, &key, &|out| {
@@ -513,6 +526,37 @@ mod tests {
         assert_eq!(
             body.as_slice(),
             br#"{"model":"fixture-model","messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}"#
+        );
+    }
+
+    /// A declared cached prefix reaches the node in its place as the two
+    /// numbers the request was priced by, in the shared shape; a `null` one
+    /// declares nothing and is not forwarded.
+    #[test]
+    fn the_body_carries_the_declared_prefix_it_was_priced_by() {
+        let body_of = |member: &str| {
+            let request = ValidatedRequest::from_bytes(bytes::Bytes::from(format!(
+                r#"{{"model":"fixture-model","cached_prefix":{member},"messages":[{{"role":"user","content":"hi"}}],"stream":true}}"#
+            )))
+            .unwrap();
+            String::from_utf8(engine_request_body(&request).to_vec()).unwrap()
+        };
+        assert_eq!(
+            body_of(r#"{ "new_tokens" : 7, "cached_tokens" : 512 }"#),
+            r#"{"model":"fixture-model","cached_prefix":{"cached_tokens":512,"new_tokens":7},"messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}"#
+        );
+        assert_eq!(
+            body_of("null"),
+            r#"{"model":"fixture-model","messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}"#
+        );
+        let forwarded: serde_json::Value =
+            serde_json::from_str(&body_of(r#"{"cached_tokens":256,"new_tokens":0}"#)).unwrap();
+        assert_eq!(
+            eidola_common::engine_protocol::CachedPrefix::from_value(&forwarded["cached_prefix"]),
+            Some(eidola_common::engine_protocol::CachedPrefix {
+                cached_tokens: 256,
+                new_tokens: 0,
+            })
         );
     }
 

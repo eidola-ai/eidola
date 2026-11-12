@@ -647,7 +647,7 @@
             }
           },
           "400": {
-            "description": "Invalid request; a request that does not set `stream` to true (every chat answer is a stream), a malformed model reference (`invalid_model_reference`: not `tag`, `tag@sha256:<hex>` or `sha256:<hex>`), a malformed refund recovery key, more than two credentials, one credential presented twice, a share of zero, or a credential in a header (refused before any credential is spent); or a hold above the worst-case cost (refunded in full)",
+            "description": "Invalid request; a request that does not set `stream` to true (every chat answer is a stream), a malformed model reference (`invalid_model_reference`: not `tag`, `tag@sha256:<hex>` or `sha256:<hex>`), a malformed refund recovery key, more than two credentials, one credential presented twice, a share of zero, or a credential in a header (refused before any credential is spent); or, after the credentials are spent and charged only the request fee (each share's remainder refunded, in input order): a hold above the worst-case cost, a completion ceiling past the model's `max_output_tokens`, a `cached_prefix` without a `cache_key` or with no cached token, a `cached_prefix` to a model that sells no cached prompt rate or declaring a prompt longer than its context window",
             "content": {
               "application/json": {
                 "schema": {
@@ -667,7 +667,7 @@
             }
           },
           "402": {
-            "description": "A hold below the worst-case cost (refunded in full)",
+            "description": "A hold below the worst-case cost (charged the request fee, or the whole hold where it is smaller)",
             "content": {
               "application/json": {
                 "schema": {
@@ -677,7 +677,7 @@
             }
           },
           "404": {
-            "description": "The model reference names no model (`model_not_found`); refunded in full",
+            "description": "The model reference names no model (`model_not_found`); charged the request fee",
             "content": {
               "application/json": {
                 "schema": {
@@ -687,7 +687,7 @@
             }
           },
           "409": {
-            "description": "A credential already spent; none of the request's credentials is recorded",
+            "description": "A credential already spent (`conflict`; none of the request's credentials is recorded, nothing charged); or the engine refused the request's declared cached prefix before computing anything: `cached_prefix_missing` (its cache does not hold that many of the prompt's leading tokens under the request's `cache_key`) or `prompt_budget_exceeded` (the prompt is longer than `cached_tokens + new_tokens`), charged the request fee; send it again without the declaration",
             "content": {
               "application/json": {
                 "schema": {
@@ -697,7 +697,7 @@
             }
           },
           "410": {
-            "description": "The model reference names a retired model (`model_retired`); refunded in full",
+            "description": "The model reference names a retired model (`model_retired`); charged the request fee",
             "content": {
               "application/json": {
                 "schema": {
@@ -707,7 +707,7 @@
             }
           },
           "502": {
-            "description": "Inference engine error",
+            "description": "Inference engine error; charged the request fee when the engine produced nothing",
             "content": {
               "application/json": {
                 "schema": {
@@ -717,7 +717,7 @@
             }
           },
           "503": {
-            "description": "No engine is available for the model",
+            "description": "No engine is available for the model; charged the request fee",
             "content": {
               "application/json": {
                 "schema": {
@@ -735,7 +735,7 @@
           "Unlinked"
         ],
         "summary": "Recover a refund token for a previously spent ACT.",
-        "description": "If the ACT's nullifier was already recorded (the server received the\noriginal request), the refund stored with it is returned: the final one\nif the request has ended, or the provisional one (`t = 0`, marked\n`provisional`) if it is still being served.\n\nIf the nullifier was NOT recorded (the original request never arrived),\nthe server verifies the spend proof, records the nullifier with a full\nrefund (no credits consumed) stored beside it, and returns that refund.\n\nIn both cases, the client gets a refund token it can combine with its\nlocal `PreRefund` state to reconstruct a credential.\n\nThe stored token is sealed under the refund recovery key the client sent\nwith the spend, so recovery must present the same key: a different one\nopens nothing and is answered as no token stored (404).",
+        "description": "If the ACT's nullifier was already recorded (the server received the\noriginal request), the refund stored with it is returned: the final one\nif the request has ended, or the provisional one (`t = 0`, marked\n`provisional`) if it is still being served.\n\nIf the nullifier was NOT recorded (the original request never arrived),\nthe server verifies the spend proof, records the nullifier with the refund\nof a refused request stored beside it (the share returned less the request\nfee, or nothing where the share is smaller than the fee), and returns that\nrefund.\n\nIn both cases, the client gets a refund token it can combine with its\nlocal `PreRefund` state to reconstruct a credential.\n\nThe stored token is sealed under the refund recovery key the client sent\nwith the spend, so recovery must present the same key: a different one\nopens nothing and is answered as no token stored (404).",
         "operationId": "recover_refund",
         "requestBody": {
           "content": {
@@ -1086,6 +1086,28 @@
           }
         }
       },
+      "CachedPrefix": {
+        "type": "object",
+        "description": "A request's declared cached prefix (the member [`CachedPrefixMember`]\nreads): exactly these two members.",
+        "required": [
+          "cached_tokens",
+          "new_tokens"
+        ],
+        "properties": {
+          "cached_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Leading prompt tokens held in the prefix cache under the request's\n`cache_key`. At least 1.",
+            "minimum": 1
+          },
+          "new_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The most prompt tokens the request may have after them.",
+            "minimum": 0
+          }
+        }
+      },
       "Capability": {
         "type": "object",
         "description": "One capability leaf.\n\nAn object rather than a bare boolean, so a capability can grow a sibling\nkey later — an effort ladder, a weights measurement — without a type change\nbreaking a client already deployed against this shape.",
@@ -1188,6 +1210,17 @@
             "maxLength": 43,
             "minLength": 43,
             "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+          },
+          "cached_prefix": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CachedPrefix",
+                "description": "The prompt's declared cached prefix (`eidola_common::engine_protocol::\nCachedPrefix`): its first `cached_tokens` tokens are in the engine's\nprefix cache under this request's `cache_key`, and it has at most\n`new_tokens` after them. The request is held and charged by exactly\nthese numbers, the cached part at `per_cached_prompt_token`, and the\nengine refuses it before computing anything unless both hold (`409`,\n`cached_prefix_missing` or `prompt_budget_exceeded`). It needs a\n`cache_key`, at least one cached token, and a model that sells a\ncached rate."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "continue_final_message": {
             "oneOf": [
@@ -1987,7 +2020,7 @@
           },
           "pricing": {
             "$ref": "#/components/schemas/ModelPricing",
-            "description": "Pricing in integer credits per 1k tokens."
+            "description": "Pricing in scaled integer credits per token (or per request)."
           },
           "sha256": {
             "type": "string",
@@ -2078,11 +2111,24 @@
           "per_completion_token"
         ],
         "properties": {
+          "per_cached_prompt_token": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ScaledPrice",
+                "description": "A prompt token a request declares cached (its `cached_prefix`), for a\nmodel that sells one; absent when it sells none, and a request to it\nmay then declare no cached prefix. Never above `per_prompt_token`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "per_completion_token": {
-            "$ref": "#/components/schemas/ScaledPrice"
+            "$ref": "#/components/schemas/ScaledPrice",
+            "description": "A completion token."
           },
           "per_prompt_token": {
-            "$ref": "#/components/schemas/ScaledPrice"
+            "$ref": "#/components/schemas/ScaledPrice",
+            "description": "A prompt token the engine computes."
           },
           "per_request": {
             "oneOf": [

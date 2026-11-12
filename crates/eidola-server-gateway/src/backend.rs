@@ -110,7 +110,9 @@ pub fn validate_pricing_markup(markup: f64) -> Result<(), String> {
 }
 
 /// Fixed scale factor for pricing: credits per token = value / PRICING_SCALE_FACTOR.
-pub const PRICING_SCALE_FACTOR: u64 = 1_000_000;
+/// It is the shared pricing contract's own scale, so a published rate is the
+/// rate `eidola_common::pricing` computes with.
+pub const PRICING_SCALE_FACTOR: u64 = eidola_common::pricing::RATE_SCALE;
 
 /// Convert USD per million tokens to scaled integer credits, applying markup.
 ///
@@ -130,7 +132,8 @@ fn usd_per_req_to_scaled_credits(usd_per_request: f64, markup: f64) -> u64 {
 /// Runtime pricing override for one model, from `PRICING_OVERRIDES`.
 ///
 /// `PRICING_OVERRIDES` is a JSON object **keyed by weights hash** (64
-/// lowercase hex digits), e.g. `{"<sha256>": {"input": 4.0, "output": 20.0}}`:
+/// lowercase hex digits), e.g. `{"<sha256>": {"input": 4.0, "output": 20.0,
+/// "cached_input": 1.0}}`:
 /// a price belongs to the weights being served, so it neither moves with a
 /// tag nor follows one onto other weights. Every key must be a hash a served
 /// row has, and every member must suit the row's pricing shape; anything
@@ -143,12 +146,17 @@ pub struct PricingOverride {
     input: Option<f64>,
     /// Override: USD per million output tokens.
     output: Option<f64>,
+    /// Override: USD per million prompt tokens declared cached. At most the
+    /// effective input price.
+    cached_input: Option<f64>,
     /// Override: USD per request.
     request: Option<f64>,
 }
 
 /// Parse `PRICING_OVERRIDES` and hold it to `rows`: every key a served row's
-/// hash, every value a finite non-negative price of that row's shape.
+/// hash, every value a finite non-negative price of that row's shape, and a
+/// cached-input price, the override's or the row's, no higher than the input
+/// price it sits beside, the override's or the row's.
 pub fn parse_pricing_overrides(
     json: &str,
     rows: &[CatalogRow],
@@ -167,9 +175,13 @@ pub fn parse_pricing_overrides(
             })?;
         let per_request = matches!(row.price, RowPrice::PerRequest { .. });
         let shape_ok = if per_request {
-            ovr.input.is_none() && ovr.output.is_none() && ovr.request.is_some()
+            ovr.input.is_none()
+                && ovr.output.is_none()
+                && ovr.cached_input.is_none()
+                && ovr.request.is_some()
         } else {
-            ovr.request.is_none() && (ovr.input.is_some() || ovr.output.is_some())
+            ovr.request.is_none()
+                && (ovr.input.is_some() || ovr.output.is_some() || ovr.cached_input.is_some())
         };
         if !shape_ok {
             return Err(format!(
@@ -183,14 +195,33 @@ pub fn parse_pricing_overrides(
                 if per_request {
                     "`request` alone"
                 } else {
-                    "`input` and/or `output`"
+                    "`input`, `output` and/or `cached_input`"
                 }
             ));
         }
-        for value in [ovr.input, ovr.output, ovr.request].into_iter().flatten() {
+        for value in [ovr.input, ovr.output, ovr.cached_input, ovr.request]
+            .into_iter()
+            .flatten()
+        {
             if !(value.is_finite() && value >= 0.0) {
                 return Err(format!(
                     "PRICING_OVERRIDES[{key:?}]: prices must be finite and non-negative"
+                ));
+            }
+        }
+        if let RowPrice::PerToken {
+            input_per_m,
+            cached_input_per_m,
+            ..
+        } = row.price
+        {
+            let input = ovr.input.unwrap_or(input_per_m);
+            if let Some(cached) = ovr.cached_input.or(cached_input_per_m)
+                && cached > input
+            {
+                return Err(format!(
+                    "PRICING_OVERRIDES[{key:?}]: the cached input price may not exceed the \
+                     input price"
                 ));
             }
         }
@@ -214,13 +245,10 @@ pub fn parse_pricing_overrides(
 /// is told a model can do could change without any measurement moving. Only
 /// prices can be overridden at runtime.
 ///
-/// **Cached input is not modeled.** The pricing contract (`eidola-common`,
-/// and the `ModelPricing` shape clients read from `/v1/models`) has a single
-/// prompt-token rate with no cache-hit term. Charging every prompt token at
-/// the full input price therefore over-covers a turn whose prefix the engine
-/// reused rather than under-covering it, which is the safe direction for both
-/// the client's hold and the server's charge; modeling a discount would be a
-/// wire-visible contract change on both sides.
+/// **A cached rate is sold, never a cache hit.** A row may publish a rate for
+/// prompt tokens a request *declares* cached (`per_cached_prompt_token`); a
+/// request is priced by its declaration, which the engine refuses unless it
+/// holds, and never by what the engine reports about its cache.
 pub struct Catalog {
     rows: &'static [CatalogRow],
     /// The published entry of every served row, by weights hash.
@@ -341,6 +369,7 @@ fn published(
                     value: 0,
                     scale_factor: PRICING_SCALE_FACTOR,
                 },
+                per_cached_prompt_token: None,
                 per_request: Some(ScaledPrice {
                     value: usd_per_req_to_scaled_credits(per_req, markup),
                     scale_factor: PRICING_SCALE_FACTOR,
@@ -350,9 +379,11 @@ fn published(
         RowPrice::PerToken {
             input_per_m,
             output_per_m,
+            cached_input_per_m,
         } => {
             let input = ovr.and_then(|o| o.input).unwrap_or(input_per_m);
             let output = ovr.and_then(|o| o.output).unwrap_or(output_per_m);
+            let cached_input = ovr.and_then(|o| o.cached_input).or(cached_input_per_m);
             ModelPricing {
                 per_prompt_token: ScaledPrice {
                     value: usd_per_m_to_scaled_credits(input, markup),
@@ -362,6 +393,10 @@ fn published(
                     value: usd_per_m_to_scaled_credits(output, markup),
                     scale_factor: PRICING_SCALE_FACTOR,
                 },
+                per_cached_prompt_token: cached_input.map(|usd| ScaledPrice {
+                    value: usd_per_m_to_scaled_credits(usd, markup),
+                    scale_factor: PRICING_SCALE_FACTOR,
+                }),
                 per_request: None,
             }
         }
@@ -558,14 +593,15 @@ pub(crate) mod tests {
             price: RowPrice::PerToken {
                 input_per_m: 1.0,
                 output_per_m: 2.0,
+                cached_input_per_m: None,
             },
             lifecycle: Lifecycle::Current,
         }
     }
 
     /// A fixture catalog with the variety a real one has: a reasoning model
-    /// with a prompt cache, a deprecated standard one without tools or a
-    /// cache, and a retired one.
+    /// with a prompt cache and a cached prompt rate, a deprecated standard one
+    /// without tools, a cache or a cached rate, and a retired one.
     pub(crate) const FIXTURE_CATALOG: &[CatalogRow] = &[
         CatalogRow {
             name: "Engine Fixture",
@@ -576,6 +612,7 @@ pub(crate) mod tests {
             price: RowPrice::PerToken {
                 input_per_m: 1.80,
                 output_per_m: 5.75,
+                cached_input_per_m: Some(0.45),
             },
             ..row(ENGINE_SHA, &["engine-fixture", "engine-latest"])
         },
@@ -589,6 +626,7 @@ pub(crate) mod tests {
             price: RowPrice::PerToken {
                 input_per_m: 0.20,
                 output_per_m: 0.60,
+                cached_input_per_m: None,
             },
             lifecycle: Lifecycle::Deprecated {
                 retire_after: "2027-01-01",
@@ -693,8 +731,21 @@ pub(crate) mod tests {
                     RowPrice::PerToken {
                         input_per_m,
                         output_per_m,
+                        cached_input_per_m,
                     } => {
                         assert!(model.pricing.per_request.is_none(), "{id} request price");
+                        assert_eq!(
+                            model
+                                .pricing
+                                .per_cached_prompt_token
+                                .as_ref()
+                                .map(|p| p.value),
+                            cached_input_per_m.map(|usd| usd_per_m_to_scaled_credits(
+                                usd,
+                                DEFAULT_PRICING_MARKUP
+                            )),
+                            "{id} cached prompt price"
+                        );
                         assert_eq!(
                             model.pricing.per_prompt_token.value,
                             usd_per_m_to_scaled_credits(input_per_m, DEFAULT_PRICING_MARKUP),
@@ -766,6 +817,131 @@ pub(crate) mod tests {
         assert_eq!(
             other.pricing.per_prompt_token.value,
             usd_per_m_to_scaled_credits(0.20, 1.0)
+        );
+    }
+
+    /// A row's cached prompt rate reaches the wire with the markup applied
+    /// like its other prices, and is absent for a row that sells none; an
+    /// override's `cached_input` sets it, on a row that sold one or not.
+    #[test]
+    fn the_cached_prompt_rate_is_published_and_overridable() {
+        let models = fixture(1.5, None).list().data;
+        let engine = models.iter().find(|m| m.sha256 == ENGINE_SHA).unwrap();
+        assert_eq!(
+            engine
+                .pricing
+                .per_cached_prompt_token
+                .as_ref()
+                .map(|p| p.value),
+            Some(675_000),
+            "$0.45/M at 1.5"
+        );
+        let standard = models.iter().find(|m| m.sha256 == STANDARD_SHA).unwrap();
+        assert!(standard.pricing.per_cached_prompt_token.is_none());
+        let wire = serde_json::to_value(standard).unwrap();
+        assert!(wire["pricing"].get("per_cached_prompt_token").is_none());
+        let wire = serde_json::to_value(engine).unwrap();
+        assert_eq!(
+            wire["pricing"]["per_cached_prompt_token"],
+            serde_json::json!({"value": 675_000, "scale_factor": PRICING_SCALE_FACTOR})
+        );
+
+        let overrides = format!(
+            r#"{{"{ENGINE_SHA}": {{"cached_input": 0.30}}, "{STANDARD_SHA}": {{"cached_input": 0.05, "input": 0.10}}}}"#
+        );
+        let models = fixture(1.0, Some(&overrides)).list().data;
+        let engine = models.iter().find(|m| m.sha256 == ENGINE_SHA).unwrap();
+        assert_eq!(
+            engine
+                .pricing
+                .per_cached_prompt_token
+                .as_ref()
+                .map(|p| p.value),
+            Some(300_000)
+        );
+        assert_eq!(engine.pricing.per_prompt_token.value, 1_800_000);
+        let standard = models.iter().find(|m| m.sha256 == STANDARD_SHA).unwrap();
+        assert_eq!(
+            standard
+                .pricing
+                .per_cached_prompt_token
+                .as_ref()
+                .map(|p| p.value),
+            Some(50_000)
+        );
+
+        // The shipped catalog publishes its rows' cached rates too.
+        let shipped = Catalog::new(Some(DEFAULT_PRICING_MARKUP), None).unwrap();
+        for row in served(MODEL_CATALOG) {
+            let model = shipped
+                .resolve(&format!("sha256:{}", row.sha256))
+                .unwrap()
+                .model;
+            if let RowPrice::PerToken {
+                cached_input_per_m: Some(usd),
+                ..
+            } = row.price
+            {
+                assert_eq!(
+                    model.pricing.per_cached_prompt_token.map(|p| p.value),
+                    Some(usd_per_m_to_scaled_credits(usd, DEFAULT_PRICING_MARKUP))
+                );
+            }
+        }
+    }
+
+    /// `cached_input` fails loudly like its neighbours: on a per-request row,
+    /// negative, non-finite, or above the input price in force beside it
+    /// (the override's, or the row's when the override sets none), whether
+    /// the cached price is the override's or the row's.
+    #[test]
+    fn a_cached_input_override_that_cannot_apply_fails_loudly() {
+        let refused = |json: &str| {
+            Catalog::from_parts(FIXTURE_CATALOG, FIXTURE_PINS, 1.0, Some(json))
+                .err()
+                .unwrap_or_else(|| panic!("{json} was accepted"))
+        };
+        let on = |member: &str| format!(r#"{{"{ENGINE_SHA}": {{{member}}}}}"#);
+        assert!(refused(&on(r#""cached_input": -0.1"#)).contains("non-negative"));
+        assert!(refused(&on(r#""cached_input": 1e999"#)).contains("PRICING_OVERRIDES"));
+        assert!(refused(&on(r#""cached_input": 1.81"#)).contains("may not exceed"));
+        assert!(refused(&on(r#""cached_input": 0.5, "input": 0.4"#)).contains("may not exceed"));
+        // The row's own cached price ($0.45/M) above an overridden input.
+        assert!(refused(&on(r#""input": 0.40"#)).contains("may not exceed"));
+        assert!(refused(&on(r#""cached_input": "0.1""#)).contains("PRICING_OVERRIDES"));
+        // At the input price exactly, and with the input raised past it: fine.
+        for ok in [
+            on(r#""cached_input": 1.80"#),
+            on(r#""cached_input": 2.0, "input": 2.0"#),
+            on(r#""input": 0.45"#),
+        ] {
+            assert!(
+                Catalog::from_parts(FIXTURE_CATALOG, FIXTURE_PINS, 1.0, Some(&ok)).is_ok(),
+                "{ok}"
+            );
+        }
+        let per_request = format!(r#"{{"{PER_REQUEST_SHA}": {{"cached_input": 0.001}}}}"#);
+        assert!(
+            Catalog::from_parts(
+                PER_REQUEST_FIXTURE,
+                PER_REQUEST_PINS,
+                1.0,
+                Some(&per_request)
+            )
+            .err()
+            .expect("a per-request row takes no cached_input")
+            .contains("per request")
+        );
+        let with_request =
+            format!(r#"{{"{PER_REQUEST_SHA}": {{"request": 0.02, "cached_input": 0.001}}}}"#);
+        assert!(
+            Catalog::from_parts(
+                PER_REQUEST_FIXTURE,
+                PER_REQUEST_PINS,
+                1.0,
+                Some(&with_request)
+            )
+            .is_err()
         );
     }
 
