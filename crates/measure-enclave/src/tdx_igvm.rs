@@ -25,6 +25,8 @@ use igvm_defs::{IgvmPageDataType, IgvmPlatformType};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha384};
 
+use crate::igvm_parameters::{ParameterAreas, Step};
+
 const PAGE_SIZE: u64 = 4096;
 /// A 2 MiB page directive covers this many 4 KiB pages.
 const PAGES_PER_2MB: u64 = 512;
@@ -63,20 +65,20 @@ impl Mrtd {
 
 /// Recompute MRTD for a TDX IGVM image.
 ///
-/// Directives are applied in file order, as a loader imports them. Measured
-/// page data is added and extended; unmeasured page data and inserted
-/// parameter areas are added only, so their addresses reach MRTD and their
-/// contents do not; shared pages are never added to the private address
-/// space. A 2 MiB zero page is the 512 4 KiB zero pages it holds, added and
-/// measured in ascending order: the platform's image compiler emits each
-/// 2 MiB-aligned run of 512 zero pages as one such directive, and documents
-/// that a loader measures it as those pages (cvmimage `compiler/src/image.rs`,
-/// `zero_run` and `zero_directive`). Directives that only describe parameters
-/// or memory the host supplies after measurement contribute nothing. Anything
-/// this computation does not model — a 2 MiB page carrying data, which the
+/// Directives are applied in file order, as a loader imports them. Page data
+/// is added and extended. An inserted parameter area is added only, so its
+/// address reaches MRTD and its contents do not; which parameters it may hold
+/// is `igvm_parameters`' rule. A 2 MiB zero page is the 512 4 KiB zero pages
+/// it holds, added and measured in ascending order: the platform's image
+/// compiler emits each 2 MiB-aligned run of 512 zero pages as one such
+/// directive, and documents that a loader measures it as those pages
+/// (cvmimage `compiler/src/image.rs`, `zero_run` and `zero_directive`).
+/// Memory the host only supplies (required memory, an error range)
+/// contributes nothing. Anything this computation does not model is refused
+/// rather than guessed at: page data marked unmeasured or shared, whose
+/// contents the host would choose, a 2 MiB page carrying data, which the
 /// `igvm` parser reads only the first 4 KiB of, a misaligned 2 MiB page,
-/// non-normal page types, an explicit initial VP context — is refused rather
-/// than guessed at.
+/// non-normal page types, an explicit initial VP context.
 pub fn mrtd_from_igvm(bytes: &[u8]) -> Result<[u8; 48]> {
     let file = IgvmFile::new_from_binary(bytes, None).context("parsing IGVM image")?;
     let tdx_mask = match file.platforms() {
@@ -91,9 +93,19 @@ pub fn mrtd_from_igvm(bytes: &[u8]) -> Result<[u8; 48]> {
         ),
     };
 
-    let mut parameter_areas = std::collections::HashMap::new();
+    let mut parameter_areas = ParameterAreas::default();
     let mut mrtd = Mrtd(Sha384::new());
     for directive in file.directives() {
+        match parameter_areas.apply(directive, tdx_mask)? {
+            Step::Insert(insert) => {
+                for page in 0..insert.pages {
+                    mrtd.add_page(insert.gpa + page * PAGE_SIZE);
+                }
+                continue;
+            }
+            Step::Recorded => continue,
+            Step::Other => {}
+        }
         match directive {
             IgvmDirectiveHeader::PageData {
                 gpa,
@@ -105,6 +117,10 @@ pub fn mrtd_from_igvm(bytes: &[u8]) -> Result<[u8; 48]> {
                 if compatibility_mask & tdx_mask == 0 {
                     continue;
                 }
+                ensure!(
+                    !flags.unmeasured() && !flags.shared(),
+                    "page at {gpa:#x} is marked unmeasured or shared"
+                );
                 ensure!(
                     *data_type == IgvmPageDataType::NORMAL,
                     "page at {gpa:#x} has a non-normal data type"
@@ -122,9 +138,6 @@ pub fn mrtd_from_igvm(bytes: &[u8]) -> Result<[u8; 48]> {
                 } else {
                     1
                 };
-                if flags.shared() {
-                    continue;
-                }
                 let mut content = [0u8; PAGE_SIZE as usize];
                 ensure!(
                     data.is_empty() || data.len() == content.len(),
@@ -135,46 +148,11 @@ pub fn mrtd_from_igvm(bytes: &[u8]) -> Result<[u8; 48]> {
                 for page in 0..pages {
                     let page_gpa = gpa + page * PAGE_SIZE;
                     mrtd.add_page(page_gpa);
-                    if !flags.unmeasured() {
-                        mrtd.extend_page(page_gpa, &content);
-                    }
+                    mrtd.extend_page(page_gpa, &content);
                 }
             }
-            IgvmDirectiveHeader::ParameterArea {
-                number_of_bytes,
-                parameter_area_index,
-                ..
-            } => {
-                parameter_areas.insert(*parameter_area_index, *number_of_bytes);
+            IgvmDirectiveHeader::RequiredMemory { .. } | IgvmDirectiveHeader::ErrorRange { .. } => {
             }
-            IgvmDirectiveHeader::ParameterInsert(insert) => {
-                if insert.compatibility_mask & tdx_mask == 0 {
-                    continue;
-                }
-                let size = parameter_areas
-                    .get(&insert.parameter_area_index)
-                    .with_context(|| {
-                        format!(
-                            "parameter area {} inserted before it is declared",
-                            insert.parameter_area_index
-                        )
-                    })?;
-                for page in 0..size.div_ceil(PAGE_SIZE) {
-                    mrtd.add_page(insert.gpa + page * PAGE_SIZE);
-                }
-            }
-            IgvmDirectiveHeader::VpCount(_)
-            | IgvmDirectiveHeader::EnvironmentInfo(_)
-            | IgvmDirectiveHeader::Srat(_)
-            | IgvmDirectiveHeader::Madt(_)
-            | IgvmDirectiveHeader::Slit(_)
-            | IgvmDirectiveHeader::Pptt(_)
-            | IgvmDirectiveHeader::MmioRanges(_)
-            | IgvmDirectiveHeader::MemoryMap(_)
-            | IgvmDirectiveHeader::CommandLine(_)
-            | IgvmDirectiveHeader::DeviceTree(_)
-            | IgvmDirectiveHeader::RequiredMemory { .. }
-            | IgvmDirectiveHeader::ErrorRange { .. } => {}
             other => bail!("IGVM directive is outside the TDX measurement model: {other:?}"),
         }
     }
@@ -344,7 +322,7 @@ pub(crate) mod tests {
     use igvm_defs::{IGVM_VHS_PARAMETER, IGVM_VHS_PARAMETER_INSERT, IGVM_VHS_SUPPORTED_PLATFORM};
     use igvm_defs::{IgvmPageDataFlags, IgvmPlatformType};
 
-    const TDX_MASK: u32 = 0x1;
+    pub(crate) const TDX_MASK: u32 = 0x1;
 
     pub(crate) fn image(directives: Vec<IgvmDirectiveHeader>) -> Vec<u8> {
         let file = IgvmFile::new(
@@ -400,7 +378,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn mrtd_adds_every_private_page_and_extends_only_measured_ones() {
+    fn mrtd_extends_every_page_and_adds_parameter_areas_only() {
         let bytes = image(vec![
             IgvmDirectiveHeader::ParameterArea {
                 number_of_bytes: PAGE_SIZE,
@@ -417,17 +395,31 @@ pub(crate) mod tests {
                 parameter_area_index: 0,
             }),
             page(0x2000, 0xaa, IgvmPageDataFlags::new()),
-            page(0x3000, 0xbb, IgvmPageDataFlags::new().with_unmeasured(true)),
-            page(0x4000, 0xcc, IgvmPageDataFlags::new().with_shared(true)),
             page(0x5000, 0xdd, IgvmPageDataFlags::new()),
         ]);
         let expected = longhand(&[
             ("MEM.PAGE.ADD", 0x1000, None),
             ("MEM.PAGE.ADD", 0x2000, Some(0xaa)),
-            ("MEM.PAGE.ADD", 0x3000, None),
             ("MEM.PAGE.ADD", 0x5000, Some(0xdd)),
         ]);
         assert_eq!(mrtd_from_igvm(&bytes).unwrap(), expected);
+    }
+
+    /// Page data the host could replace under an unchanged MRTD.
+    #[test]
+    fn unmeasured_or_shared_page_data_is_refused() {
+        let lead = || page(0x1000, 0xee, IgvmPageDataFlags::new());
+        for flags in [
+            IgvmPageDataFlags::new().with_unmeasured(true),
+            IgvmPageDataFlags::new().with_shared(true),
+        ] {
+            for directive in [page(0x2000, 0xbb, flags), zero_2mb(0x20_0000, flags)] {
+                let err = mrtd_from_igvm(&image(vec![lead(), directive]))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("unmeasured or shared"), "{err}");
+            }
+        }
     }
 
     #[test]
@@ -492,25 +484,6 @@ pub(crate) mod tests {
         ops.extend((0..PAGES_PER_2MB).map(|i| ("MEM.PAGE.ADD", base + i * PAGE_SIZE, Some(0))));
         ops.push(("MEM.PAGE.ADD", 0x40_0000, Some(0xbb)));
         assert_eq!(huge, longhand(&ops));
-
-        // Unmeasured: every page added, none extended. Shared: none added.
-        // (Each image keeps one page of data: the parser refuses a file with
-        // no file data.)
-        let lead = || page(0x1000, 0xee, IgvmPageDataFlags::new());
-        let unmeasured = mrtd_from_igvm(&image(vec![
-            lead(),
-            zero_2mb(base, IgvmPageDataFlags::new().with_unmeasured(true)),
-        ]))
-        .unwrap();
-        let mut added = vec![("MEM.PAGE.ADD", 0x1000, Some(0xee))];
-        added.extend((0..PAGES_PER_2MB).map(|i| ("MEM.PAGE.ADD", base + i * PAGE_SIZE, None)));
-        assert_eq!(unmeasured, longhand(&added));
-        let shared = mrtd_from_igvm(&image(vec![
-            lead(),
-            zero_2mb(base, IgvmPageDataFlags::new().with_shared(true)),
-        ]))
-        .unwrap();
-        assert_eq!(shared, longhand(&[("MEM.PAGE.ADD", 0x1000, Some(0xee))]));
     }
 
     #[test]

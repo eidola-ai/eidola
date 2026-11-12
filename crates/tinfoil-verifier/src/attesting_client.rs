@@ -815,7 +815,8 @@ where
             rest.drain(..crlf + 2);
 
             if size == 0 {
-                // Last chunk; consume the trailing CRLF (assume no trailers).
+                // Last chunk: only the final CRLF may follow (no trailers),
+                // as nothing may follow a Content-Length body.
                 while rest.len() < 2 {
                     let mut chunk = [0u8; 64];
                     let n = io
@@ -826,6 +827,11 @@ where
                         return Err(Error::Connector("EOF after final chunk".to_string()));
                     }
                     rest.extend_from_slice(&chunk[..n]);
+                }
+                if rest != b"\r\n" {
+                    return Err(Error::Connector(
+                        "attestation endpoint sent bytes after the last chunk".to_string(),
+                    ));
                 }
                 break;
             }
@@ -1283,5 +1289,25 @@ mod tests {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
                          3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\n\r\n";
         assert_eq!(read_response(response).await.unwrap(), b"abcde");
+    }
+
+    /// Both framings refuse what follows the body.
+    #[tokio::test]
+    async fn bytes_after_the_body_are_refused() {
+        for response in [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nX"
+                .as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-T: 1\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nXY",
+        ] {
+            let err = read_response(response).await.unwrap_err().to_string();
+            assert!(err.contains("after the last chunk"), "{err}");
+        }
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcX";
+        let err = read_response(response).await.unwrap_err().to_string();
+        assert!(
+            err.contains("extra bytes after Content-Length body"),
+            "{err}"
+        );
     }
 }

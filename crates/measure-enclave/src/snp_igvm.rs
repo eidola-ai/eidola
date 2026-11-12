@@ -27,8 +27,6 @@
 //! equal the one the manifest states. A disagreement anywhere is an error
 //! rather than a choice between values.
 
-use std::collections::HashMap;
-
 use anyhow::{Context, Result, bail, ensure};
 use igvm::{IgvmDirectiveHeader, IgvmFile, IgvmInitializationHeader, IgvmPlatformHeader};
 use igvm_defs::{IgvmPageDataType, IgvmPlatformType};
@@ -36,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha384};
 use zerocopy::IntoBytes;
 
+use crate::igvm_parameters::{ParameterAreas, Step};
 use crate::tdx_igvm::config_release;
 
 const PAGE_SIZE: u64 = 4096;
@@ -104,14 +103,15 @@ pub struct SnpImage {
 /// page is measured by type and address only, and a 2 MiB zero page is the
 /// 512 4 KiB zero pages it holds, in ascending order (cvmimage's image
 /// compiler emits each 2 MiB-aligned run of zero pages that way). The boot
-/// processor's VMSA comes last, at [`VMSA_GPA`]. Directives that only
-/// describe parameters or memory the host supplies after measurement
-/// contribute nothing. Anything this computation does not model is refused
-/// rather than guessed at: a page marked unmeasured or shared, another page
-/// data type, a 2 MiB page carrying data or misaligned, a page of the wrong
-/// length, a parameter area inserted after page data, a VMSA anywhere but
-/// [`VMSA_GPA`] or for any processor but the boot processor (hosts measure
-/// that one only), and an ID block, which the verifier refuses at launch.
+/// processor's VMSA comes last, at [`VMSA_GPA`]. Which parameters an
+/// inserted area may hold is `igvm_parameters`' rule; memory the host only
+/// supplies (required memory, an error range) contributes nothing. Anything
+/// this computation does not model is refused rather than guessed at: a page
+/// marked unmeasured or shared, another page data type, a 2 MiB page carrying
+/// data or misaligned, a page of the wrong length, a parameter area inserted
+/// after page data, a VMSA anywhere but [`VMSA_GPA`] or for any processor
+/// but the boot processor (hosts measure that one only), and an ID block,
+/// which the verifier refuses at launch.
 pub fn launch_digest_from_igvm(bytes: &[u8]) -> Result<SnpImage> {
     let file = IgvmFile::new_from_binary(bytes, None).context("parsing IGVM image")?;
     let snp_mask = match file.platforms() {
@@ -141,12 +141,27 @@ pub fn launch_digest_from_igvm(bytes: &[u8]) -> Result<SnpImage> {
         "IGVM image states more than one SEV-SNP guest policy"
     );
 
-    let mut parameter_areas = HashMap::new();
+    let mut parameter_areas = ParameterAreas::default();
     let mut digest = LaunchDigest([0; 48]);
     let mut page_data_seen = false;
     let mut vmsa: Option<Vec<u8>> = None;
     let zero_page = [0u8; PAGE_SIZE as usize];
     for directive in file.directives() {
+        match parameter_areas.apply(directive, snp_mask)? {
+            Step::Insert(insert) => {
+                ensure!(
+                    !page_data_seen && vmsa.is_none(),
+                    "parameter area {} is inserted after page data",
+                    insert.index
+                );
+                for page in 0..insert.pages {
+                    digest.update(insert.gpa + page * PAGE_SIZE, PageType::Unmeasured, None);
+                }
+                continue;
+            }
+            Step::Recorded => continue,
+            Step::Other => {}
+        }
         match directive {
             IgvmDirectiveHeader::PageData {
                 gpa,
@@ -196,38 +211,6 @@ pub fn launch_digest_from_igvm(bytes: &[u8]) -> Result<SnpImage> {
                     other => bail!("page at {gpa:#x} has unsupported data type {other:?}"),
                 }
             }
-            IgvmDirectiveHeader::ParameterArea {
-                number_of_bytes,
-                parameter_area_index,
-                initial_data,
-            } => {
-                ensure!(
-                    initial_data.is_empty(),
-                    "parameter area {parameter_area_index} carries initial data"
-                );
-                parameter_areas.insert(*parameter_area_index, *number_of_bytes);
-            }
-            IgvmDirectiveHeader::ParameterInsert(insert) => {
-                if insert.compatibility_mask & snp_mask == 0 {
-                    continue;
-                }
-                ensure!(
-                    !page_data_seen && vmsa.is_none(),
-                    "parameter area {} is inserted after page data",
-                    insert.parameter_area_index
-                );
-                let size = parameter_areas
-                    .get(&insert.parameter_area_index)
-                    .with_context(|| {
-                        format!(
-                            "parameter area {} inserted before it is declared",
-                            insert.parameter_area_index
-                        )
-                    })?;
-                for page in 0..size.div_ceil(PAGE_SIZE) {
-                    digest.update(insert.gpa + page * PAGE_SIZE, PageType::Unmeasured, None);
-                }
-            }
             IgvmDirectiveHeader::SnpVpContext {
                 gpa,
                 compatibility_mask,
@@ -261,18 +244,8 @@ pub fn launch_digest_from_igvm(bytes: &[u8]) -> Result<SnpImage> {
             IgvmDirectiveHeader::SnpIdBlock { .. } => bail!(
                 "IGVM image carries an ID block; the verifier accepts only launches without one"
             ),
-            IgvmDirectiveHeader::VpCount(_)
-            | IgvmDirectiveHeader::EnvironmentInfo(_)
-            | IgvmDirectiveHeader::Srat(_)
-            | IgvmDirectiveHeader::Madt(_)
-            | IgvmDirectiveHeader::Slit(_)
-            | IgvmDirectiveHeader::Pptt(_)
-            | IgvmDirectiveHeader::MmioRanges(_)
-            | IgvmDirectiveHeader::MemoryMap(_)
-            | IgvmDirectiveHeader::CommandLine(_)
-            | IgvmDirectiveHeader::DeviceTree(_)
-            | IgvmDirectiveHeader::RequiredMemory { .. }
-            | IgvmDirectiveHeader::ErrorRange { .. } => {}
+            IgvmDirectiveHeader::RequiredMemory { .. } | IgvmDirectiveHeader::ErrorRange { .. } => {
+            }
             other => bail!("IGVM directive is outside the SEV-SNP measurement model: {other:?}"),
         }
     }
@@ -686,12 +659,37 @@ mod tests {
                         parameter_area_index: 0,
                         initial_data: vec![],
                     },
+                    IgvmDirectiveHeader::MemoryMap(IGVM_VHS_PARAMETER {
+                        parameter_area_index: 0,
+                        byte_offset: 0,
+                    }),
                     page(0x2000, 1),
                     IgvmDirectiveHeader::ParameterInsert(IGVM_VHS_PARAMETER_INSERT {
                         gpa: 0x5000,
                         compatibility_mask: SNP_MASK,
                         parameter_area_index: 0,
                     }),
+                    vmsa(),
+                ]),
+            ),
+            (
+                "kernel command line",
+                image(vec![
+                    IgvmDirectiveHeader::ParameterArea {
+                        number_of_bytes: PAGE_SIZE,
+                        parameter_area_index: 0,
+                        initial_data: vec![],
+                    },
+                    IgvmDirectiveHeader::CommandLine(IGVM_VHS_PARAMETER {
+                        parameter_area_index: 0,
+                        byte_offset: 0,
+                    }),
+                    IgvmDirectiveHeader::ParameterInsert(IGVM_VHS_PARAMETER_INSERT {
+                        gpa: 0x5000,
+                        compatibility_mask: SNP_MASK,
+                        parameter_area_index: 0,
+                    }),
+                    page(0x2000, 1),
                     vmsa(),
                 ]),
             ),

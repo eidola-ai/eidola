@@ -91,7 +91,7 @@ Pin-authoring code, never on a handshake: it is behind a feature that only `meas
 
 ALPN is pinned to HTTP/1.1 so the inline attestation and application request share one connection lifecycle. Pooled keepalive requests inherit the binding established for that connection. TLS roots are caller-supplied and authenticate only the inference endpoint; hardware roots are separate and never enter WebPKI. Keep the implementation pure Rust.
 
-The attestation response is read by hand (`read_http1_response`) from a peer nothing has authenticated yet, so its bounds are checked without arithmetic the peer controls: the release profile builds with `overflow-checks = false`, where `body.len() + size` for a peer-declared chunk size wraps past the bound into a panic. Compare the peer's number against the remaining room instead (`size > MAX_BODY - body.len()`). Test: `a_chunk_size_past_the_body_bound_is_refused_not_wrapped`.
+The attestation response is read by hand (`read_http1_response`) from a peer nothing has authenticated yet, so its bounds are checked without arithmetic the peer controls: the release profile builds with `overflow-checks = false`, where `body.len() + size` for a peer-declared chunk size wraps past the bound into a panic. Compare the peer's number against the remaining room instead (`size > MAX_BODY - body.len()`). Test: `a_chunk_size_past_the_body_bound_is_refused_not_wrapped`. Nothing may follow the body under either framing: bytes after a `Content-Length` body, and anything after the last chunk but its final CRLF (trailers included), are refused (`bytes_after_the_body_are_refused`).
 
 ## Threat-model note
 
