@@ -314,7 +314,12 @@ async fn weights_hash_mismatch_is_refused_before_admission() {
             "x-eidola-weights-sha256",
             weights_hash().to_ascii_uppercase(),
         )
-        .json(&request("hi", 2))
+        .json(&{
+            let mut body = request("hi", 2);
+            body["stream"] = true.into();
+            body["stream_options"] = json!({"include_usage": true});
+            body
+        })
         .send()
         .await
         .unwrap();
@@ -362,6 +367,10 @@ async fn strict_schema_refuses_what_it_does_not_name() {
             json!([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:,"}}]}]),
         ),
         with("stream_options", json!({"include_usage": true, "other": 1})),
+        // The node answers only a stream carrying its usage.
+        with("stream", false.into()),
+        with("stream_options", Value::Null),
+        with("stream_options", json!({"include_usage": false})),
         with("tool_choice", "required".into()),
         with(
             "tool_choice",
@@ -430,7 +439,8 @@ async fn strict_schema_refuses_what_it_does_not_name() {
         "max_completion_tokens": 2,
         "temperature": null,
         "top_p": null,
-        "stream": false,
+        "stream": true,
+        "stream_options": {"include_usage": true},
         "stop": null,
         "cache_key": "A".repeat(43),
     });
@@ -450,7 +460,7 @@ async fn strict_schema_refuses_what_it_does_not_name() {
 // ---------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn non_streaming_matches_the_engine_token_for_token() {
+async fn the_answer_matches_the_engine_token_for_token() {
     let node = TestNode::start(&[]).await;
     for (text, max) in [("Hello there", 12), (LONG_TEXT, 20), ("x", 1)] {
         let prompt = prompt_tokens(text);
@@ -584,12 +594,14 @@ async fn a_streamed_answer_is_frames_of_one_size_on_a_tick() {
 }
 
 /// Every response that is not a stream is padded to a size bucket, with its length to
-/// match: a blocking answer, a refusal (here before any handler runs), an unknown path,
-/// the health check.
+/// match: the chat handler's refusal of a body (one asking for a blocking answer), a
+/// refusal before any handler runs, an unknown path, the health check.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_other_response_is_padded_to_a_bucket() {
     let node = TestNode::start(&[]).await;
-    let answered = node.chat(&request("hi", 4)).send().await.unwrap();
+    let mut blocking = request("hi", 4);
+    blocking["stream"] = false.into();
+    let refused_body = node.chat(&blocking).send().await.unwrap();
     let refused = node
         .client
         .post(format!("{}/v1/chat/completions", node.base))
@@ -610,7 +622,7 @@ async fn every_other_response_is_padded_to_a_bucket() {
         .await
         .unwrap();
     for (what, response, status) in [
-        ("answer", answered, 200),
+        ("refused body", refused_body, 400),
         ("refusal", refused, 401),
         ("unknown path", missing, 404),
         ("health", health, 200),
@@ -718,13 +730,6 @@ async fn streaming_shapes_text_and_usage() {
         last = running;
     }
     assert!(last <= plain["usage"]["completion_tokens"].as_u64().unwrap());
-
-    // Without include_usage there is no usage chunk.
-    body["stream_options"] = Value::Null;
-    let (chunks, done) = parse_chunks(&node.chat_stream(&body).await);
-    assert!(done);
-    assert!(chunks.iter().all(|c| c.get("usage").is_none()));
-    assert!(!chunks.last().unwrap()["choices"][0]["finish_reason"].is_null());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -784,7 +789,7 @@ async fn stop_sequences_truncate_the_output_and_end_the_request() {
 /// A step that gives out no text still reports the running count: while the stop
 /// matcher holds back the beginning of a stop sequence the output then departs from,
 /// chunks with an empty delta carry the count, so a stream cut there is billed for the
-/// tokens generated; and without `include_usage` no such chunk is sent.
+/// tokens generated.
 #[tokio::test(flavor = "multi_thread")]
 async fn held_back_steps_report_the_running_count() {
     let node = TestNode::start(&[]).await;
@@ -828,15 +833,6 @@ async fn held_back_steps_report_the_running_count() {
     );
     assert_eq!(text, full_text, "held-back text is released whole");
     assert_eq!(chunks.last().unwrap()["usage"], plain["usage"]);
-
-    body["stream_options"] = Value::Null;
-    let (chunks, _) = parse_chunks(&node.chat_stream(&body).await);
-    assert!(
-        chunks[1..chunks.len() - 1]
-            .iter()
-            .all(|c| c["choices"][0]["delta"] != json!({})),
-        "no empty delta without include_usage"
-    );
 }
 
 /// A long stop sequence that the output never begins does not delay the stream: text is

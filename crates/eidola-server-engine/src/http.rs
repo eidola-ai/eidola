@@ -2,7 +2,7 @@
 //!
 //! | Route | Auth | Purpose |
 //! |---|---|---|
-//! | `POST /v1/chat/completions` | gateway token + weights hash | the strict chat subset, streaming or not |
+//! | `POST /v1/chat/completions` | gateway token + weights hash | the strict chat subset, answered as a stream |
 //! | `GET /v1/engine/info` | gateway token | model id, weights hash, build, executor, device |
 //! | `GET /healthz` | none | content-free liveness/readiness |
 //!
@@ -12,9 +12,9 @@
 //! that is too large, malformed, outside the subset, or for another model; a full
 //! admission bound. Only then is the prompt rendered, tokenized and submitted.
 //!
-//! **Every response is shaped** (`eidola_common::stream_shape`): a streamed one is
-//! written as frames of one size at [`STREAM_CADENCE`] from the moment it opens, and
-//! every other one, refusals included, is padded to a size bucket ([`shape_response`],
+//! **Every response is shaped** (`eidola_common::stream_shape`): a chat answer, always a
+//! stream, is written as frames of one size at [`STREAM_CADENCE`] from the moment it
+//! opens, and every other one, refusals included, is padded to a size bucket ([`shape_response`],
 //! around every route). The host and the network between this node and the gateway see
 //! how long a response ran and a padded one's bucket, not the size or timing of its
 //! steps.
@@ -41,7 +41,6 @@ use eidola_common::engine_protocol::STREAM_CADENCE;
 use eidola_common::stream_shape::{Framer, StreamEvent, pad_body};
 use eidola_engine::engine::SubmitError;
 use eidola_engine::secret::SaltDeriver;
-use eidola_engine_chat::ChatDelta;
 use futures_util::stream::Stream;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -253,8 +252,6 @@ async fn chat(state: Arc<AppState>, request: Request) -> Result<Response, ApiErr
     let permit = state.admission.try_acquire().ok_or(ApiError::Overloaded)?;
     drop(reading);
 
-    let stream = req.stream;
-    let include_usage = req.include_usage;
     let id = state.engine.next_id();
     let prep_state = state.clone();
     // The permit bounds the work, so the work owns it: it moves into the blocking task
@@ -301,11 +298,7 @@ async fn chat(state: Arc<AppState>, request: Request) -> Result<Response, ApiErr
         response,
         cached_prompt_tokens: 0,
     };
-    if stream {
-        Ok(stream_response(run, decoder, include_usage))
-    } else {
-        complete_response(run, decoder).await
-    }
+    Ok(stream_response(run, decoder))
 }
 
 fn prepare(state: &AppState, id: u64, req: ValidRequest) -> Result<Prepared, ApiError> {
@@ -367,11 +360,6 @@ enum Polled {
 }
 
 impl Run {
-    async fn next(&mut self, decoder: &mut Decoder) -> Polled {
-        let output = self.events.recv().await;
-        self.on_output(output, decoder)
-    }
-
     /// What one engine event (or the channel's end, `None`) produced.
     fn on_output(&mut self, output: Option<Output>, decoder: &mut Decoder) -> Polled {
         match output {
@@ -404,54 +392,6 @@ impl Run {
     }
 }
 
-async fn complete_response(mut run: Run, mut decoder: Decoder) -> Result<Response, ApiError> {
-    let mut all = ChatDelta::default();
-    let (reason, continuable) = loop {
-        match run.next(&mut decoder).await {
-            Polled::Step(step) => {
-                all.reasoning_content
-                    .push_str(&step.delta.reasoning_content);
-                all.content.push_str(&step.delta.content);
-                all.tool_calls.extend(step.delta.tool_calls);
-                if let Some(reason) = step.finish {
-                    break (reason, step.continuable);
-                }
-            }
-            Polled::Failed(e) => return Err(e),
-        }
-    };
-    let mut message = json!({"role": "assistant", "content": Value::Null});
-    if !all.content.is_empty() {
-        message["content"] = Value::String(all.content);
-    }
-    if !all.reasoning_content.is_empty() {
-        message["reasoning_content"] = Value::String(all.reasoning_content);
-    }
-    if !all.tool_calls.is_empty() {
-        message["tool_calls"] = all
-            .tool_calls
-            .iter()
-            .map(|c| {
-                let mut v = c.to_openai();
-                if let Some(o) = v.as_object_mut() {
-                    o.remove("index");
-                }
-                v
-            })
-            .collect();
-    }
-    let r = &run.response;
-    Ok(axum::Json(json!({
-        "id": r.id,
-        "object": "chat.completion",
-        "created": r.created,
-        "model": r.model,
-        "choices": [finish_choice(json!({"index": 0, "message": message, "finish_reason": reason.as_str()}), continuable)],
-        "usage": usage(r.prompt_tokens, decoder.completion_tokens(), run.cached_prompt_tokens),
-    }))
-    .into_response())
-}
-
 /// A finishing choice, carrying `continuable` on a `length` ending: whether the
 /// reasoning and content it gave out can be sent back as a continued final message
 /// that renders exactly the text the model generated (`OutputParser::resumes_exactly`).
@@ -477,13 +417,14 @@ fn chunk(r: &ResponseMeta, choices: Value, usage: Option<Value>) -> StreamEvent 
     StreamEvent::Json(c.to_string())
 }
 
-/// SSE: a role chunk, one chunk per non-empty delta, a finish chunk, the usage chunk
-/// (`choices: []`) when `stream_options.include_usage`, then `[DONE]`; a failure partway
-/// ends it with an `event: error`. Dropping the stream (the client went away) drops the
-/// request's guard, which cancels it in the engine.
+/// The only answer to an admitted request (`api::parse_request` refuses any request that
+/// does not ask for a stream with `stream_options.include_usage`): a role chunk, one
+/// chunk per non-empty delta, a finish chunk, the usage chunk (`choices: []`), then
+/// `[DONE]`; a failure partway ends it with an `event: error`. Dropping the stream (the
+/// client went away) drops the request's guard, which cancels it in the engine. A
+/// client's blocking request is the gateway's to assemble from this.
 ///
-/// With `include_usage`, the role chunk and every delta chunk also carry the running
-/// `usage` (the prompt, and the completion tokens decoded so far, held-back text
+/// The role chunk and every delta chunk also carry the running `usage` (the prompt, and the completion tokens decoded so far, held-back text
 /// included), and a step that moved the count while giving out no delta (a tool call
 /// still being read, a held stop prefix or partial tag, a skipped special token) sends
 /// a chunk with an empty delta carrying the count alone: the gateway, which bills,
@@ -495,11 +436,10 @@ fn chunk(r: &ResponseMeta, choices: Value, usage: Option<Value>) -> StreamEvent 
 /// **Written in frames** ([`Shaped`]): the events go into a [`Framer`], and the body is
 /// one frame of [`STREAM_CADENCE`]'s size per tick, from the moment the response opens
 /// (the role chunk is in the first) until the frame that carries the last event.
-fn stream_response(run: Run, decoder: Decoder, include_usage: bool) -> Response {
+fn stream_response(run: Run, decoder: Decoder) -> Response {
     let mut events = Events {
         run,
         decoder,
-        include_usage,
         reported: 0,
     };
     let mut framer = Framer::new(STREAM_CADENCE);
@@ -508,7 +448,7 @@ fn stream_response(run: Run, decoder: Decoder, include_usage: bool) -> Response 
     framer.push(&chunk(
         &events.run.response,
         json!([{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]),
-        running,
+        Some(running),
     ));
     let mut interval = tokio::time::interval(STREAM_CADENCE.tick());
     // A late tick moves the schedule rather than writing two frames back to back.
@@ -535,22 +475,19 @@ fn stream_response(run: Run, decoder: Decoder, include_usage: bool) -> Response 
 struct Events {
     run: Run,
     decoder: Decoder,
-    include_usage: bool,
     /// The completion count the last chunk sent carried.
     reported: u32,
 }
 
 impl Events {
-    /// The running `usage`, when the request asked for usage.
-    fn running_usage(&mut self) -> Option<Value> {
-        self.include_usage.then(|| {
-            self.reported = self.decoder.completion_tokens();
-            usage(
-                self.run.response.prompt_tokens,
-                self.decoder.completion_tokens(),
-                self.run.cached_prompt_tokens,
-            )
-        })
+    /// The running `usage`.
+    fn running_usage(&mut self) -> Value {
+        self.reported = self.decoder.completion_tokens();
+        usage(
+            self.run.response.prompt_tokens,
+            self.decoder.completion_tokens(),
+            self.run.cached_prompt_tokens,
+        )
     }
 
     /// Queue on `framer` the events one engine event (or the channel's end) produced.
@@ -562,18 +499,16 @@ impl Events {
                     framer.push(&chunk(
                         &self.run.response,
                         json!([{"index": 0, "delta": step.delta.to_openai_delta(), "finish_reason": null}]),
-                        running,
+                        Some(running),
                     ));
-                } else if step.finish.is_none()
-                    && self.include_usage
-                    && self.decoder.completion_tokens() != self.reported
+                } else if step.finish.is_none() && self.decoder.completion_tokens() != self.reported
                 {
                     // The count moved and nothing was given out: the count alone.
                     let running = self.running_usage();
                     framer.push(&chunk(
                         &self.run.response,
                         json!([{"index": 0, "delta": {}, "finish_reason": null}]),
-                        running,
+                        Some(running),
                     ));
                 }
                 if let Some(reason) = step.finish {
@@ -585,18 +520,16 @@ impl Events {
                         )]),
                         None,
                     ));
-                    if self.include_usage {
-                        let r = &self.run.response;
-                        framer.push(&chunk(
-                            r,
-                            json!([]),
-                            Some(usage(
-                                r.prompt_tokens,
-                                self.decoder.completion_tokens(),
-                                self.run.cached_prompt_tokens,
-                            )),
-                        ));
-                    }
+                    let r = &self.run.response;
+                    framer.push(&chunk(
+                        r,
+                        json!([]),
+                        Some(usage(
+                            r.prompt_tokens,
+                            self.decoder.completion_tokens(),
+                            self.run.cached_prompt_tokens,
+                        )),
+                    ));
                     framer.push(&StreamEvent::Done);
                 }
             }

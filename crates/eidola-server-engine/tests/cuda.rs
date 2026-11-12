@@ -442,10 +442,12 @@ async fn real_flash_serves_what_the_executor_computes() {
         "messages": [{"role": "user", "content": text}],
         "max_completion_tokens": max_tokens,
         "temperature": 0.0,
+        "stream": true,
+        "stream_options": {"include_usage": true},
     });
     let r = chat(body.clone()).send().await.unwrap();
     assert_eq!(r.status().as_u16(), 200);
-    let v: Value = r.json().await.unwrap();
+    let v = completion(&events_of(&r.bytes().await.unwrap()));
     eprintln!("node: {v}");
     let message = &v["choices"][0]["message"];
     let node_reasoning = message["reasoning_content"]
@@ -463,10 +465,8 @@ async fn real_flash_serves_what_the_executor_computes() {
         "{v}"
     );
 
-    // Streaming the same request: the same text.
-    let mut streamed = body.clone();
-    streamed["stream"] = json!(true);
-    let sse = chat(streamed).send().await.unwrap().text().await.unwrap();
+    // The same request read as plain server-sent events: the same text.
+    let sse = chat(body).send().await.unwrap().text().await.unwrap();
     let (mut reasoning, mut content) = (String::new(), String::new());
     for line in sse.lines().filter_map(|l| l.strip_prefix("data: ")) {
         if line == "[DONE]" {
@@ -661,7 +661,9 @@ async fn real_flash_continues_a_cut_off_generation_exactly() {
 
     let question = "Why is the sky blue? Explain in two short sentences.";
     let n: u64 = 1024;
-    let send = |body: Value| {
+    let send = |mut body: Value| {
+        body["stream"] = true.into();
+        body["stream_options"] = json!({"include_usage": true});
         let request = client
             .post(format!("{base}/v1/chat/completions"))
             .bearer_auth(TOKEN)
@@ -670,9 +672,9 @@ async fn real_flash_continues_a_cut_off_generation_exactly() {
         async move {
             let r = request.send().await.unwrap();
             let status = r.status().as_u16();
-            let v: Value = r.json().await.unwrap();
-            assert_eq!(status, 200, "{v}");
-            v
+            let bytes = r.bytes().await.unwrap();
+            assert_eq!(status, 200, "{}", String::from_utf8_lossy(&bytes));
+            completion(&events_of(&bytes))
         }
     };
     let text_of = |v: &Value, key: &str| {
