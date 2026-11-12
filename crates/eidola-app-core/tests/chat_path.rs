@@ -9506,25 +9506,47 @@ fn an_oversized_complete_event_fails_the_turn() {
     });
 }
 
-/// REGRESSION: **a stream may not deliver without end either.** Every event
-/// here is small and well framed, so no frame bound trips; the turn assembles
-/// the deltas into an answer in memory, and a stream without end was an answer
-/// without end. It now stops at the read ceiling, writes no answer, and keeps
-/// a Record row that states a lower bound rather than a size.
+/// REGRESSION: **a streamed answer is held to the read ceiling, and refused
+/// only once its stream has been read to the end.** Every event here is small
+/// and well framed, so no frame bound trips; the turn assembles the deltas
+/// into an answer in memory, so what it takes in stops at the ceiling and
+/// nothing past it reaches the caller. The stream is read on to its metadata
+/// event, whose refund settles the hold (the only copy, under
+/// `RefundMode::NotStored`), and the turn is refused as the blocking twin
+/// refuses an assembled answer past the ceiling: no answer written, the
+/// Record keeping what its cap allows of the whole stream.
 #[test]
 fn a_stream_past_the_read_ceiling_fails_the_turn() {
     run(|| {
-        let (_mock, core, _dir) = setup(MockConfig {
+        let (mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::StreamingPastReadCeiling,
+            refund: RefundMode::NotStored,
             ..MockConfig::default()
         });
         with_account(&core);
-        let err = stream_once(&core, "stream me").expect_err("refused at the ceiling");
+        let mut rx = core.subscribe_changes();
+        let (res, deltas) = stream_collecting(&core, "stream me");
+        let err = res.expect_err("refused at the ceiling");
         assert!(
-            matches!(&err, AppError::Network { message } if message.contains("ceiling")),
+            matches!(&err, AppError::Network { message }
+                if message.contains("ceiling") && message.contains("fragment")),
             "{err:?}"
         );
+        let forwarded: usize = deltas.iter().map(String::len).sum();
+        assert!(
+            forwarded <= 8 << 20,
+            "nothing past the ceiling reaches the caller: {forwarded} bytes"
+        );
         assert_settled(&core);
+        assert_eq!(
+            mock.refund_hits(),
+            0,
+            "the refund at the stream's end settled the hold"
+        );
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Wallet), "got {changes:?}");
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+
         let space_id = only_space(&core);
         let messages = core
             .runtime()
@@ -9537,15 +9559,52 @@ fn a_stream_past_the_read_ceiling_fails_the_turn() {
         );
 
         let rows = completion_rows(&core);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("fragment")),
+            "{:?}",
+            rows[0].error
+        );
         let recorded = request_detail(&core, &rows[0].id)
             .response_body
             .expect("a recorded body");
         let text = String::from_utf8_lossy(&recorded);
         assert!(
-            text.contains("at least that large"),
-            "a stopped read names a lower bound: {}",
+            text.contains("The rest was received and not retained"),
+            "the whole stream was read: {}",
             &text[text.len().saturating_sub(300)..]
         );
+    });
+}
+
+/// REGRESSION: **the read ceiling counts a streamed answer, not the stream it
+/// arrives in.** Every delta comes in an event many times its size, so a long
+/// answer's stream passes the ceiling while the answer is small; counted
+/// against the envelope, the read stopped mid-stream, the turn failed, and
+/// the refund at the stream's end never arrived.
+#[test]
+fn a_stream_whose_envelope_passes_the_read_ceiling_is_an_answer() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingEnvelopePastReadCeiling,
+            refund: RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let (res, deltas) = stream_collecting(&core, "stream me");
+        let res = res.expect("the turn completes");
+        assert_eq!(res.content, "y".repeat(160));
+        assert_eq!(deltas.concat(), res.content);
+        assert_settled(&core);
+        assert_eq!(
+            mock.refund_hits(),
+            0,
+            "the refund at the stream's end settled the hold"
+        );
+        let rows = completion_rows(&core);
+        assert_eq!(rows[0].error, None);
     });
 }
 

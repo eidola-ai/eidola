@@ -9830,9 +9830,14 @@ impl Inner {
 
         // Consume the SSE body through the one stream reader
         // (`whole_answer::read_events`): its bounds are the Record's
-        // retention cap, the frame ceiling, and `MAX_RESPONSE_BYTES` on what
-        // the whole stream delivers, since the deltas below are assembled
-        // into an answer in memory.
+        // retention cap, the frame ceiling, and `MAX_ASSEMBLED_STREAM_BYTES`
+        // on the stream's envelope, which is read and not held. What the
+        // deltas below assemble in memory — content, reasoning and tool calls
+        // — is held to `MAX_RESPONSE_BYTES`, as the blocking twin holds its
+        // assembled answer (`whole_answer::AnswerHold`): past it nothing more
+        // is kept or forwarded, and the stream is read to its end, where its
+        // refunds are.
+        let mut answer_hold = whole_answer::AnswerHold::under(peer_read::MAX_RESPONSE_BYTES);
         let mut full_content = String::new();
         // Strip-on-receipt for the *live* stream: what the caller watches
         // arrive is what will be persisted (see `LeadingHeaderFilter`). The
@@ -9873,8 +9878,11 @@ impl Inner {
         } = whole_answer::read_events(
             resp,
             &prep.backend_id,
-            peer_read::MAX_RESPONSE_BYTES,
+            peer_read::MAX_ASSEMBLED_STREAM_BYTES,
             |json| {
+                if answer_hold.past_ceiling() {
+                    return;
+                }
                 if let Some(usage) = json.get("usage") {
                     if let Some(v) = usage.get("prompt_tokens").and_then(|v| v.as_i64()) {
                         input_tokens = Some(v);
@@ -9899,6 +9907,9 @@ impl Inner {
                 else {
                     return;
                 };
+                if !delta.is_null() && !answer_hold.take(delta) {
+                    return;
+                }
 
                 if let Some(text) = delta.get("content").and_then(|v| v.as_str())
                     && !text.is_empty()
@@ -9965,6 +9976,27 @@ impl Inner {
         // the failure as its error. No `inference` — the upstream never claimed
         // a completion.
         if let Some(e) = read_error {
+            prep.insert_unattached_request(
+                &request_body_json,
+                request_at,
+                response_at,
+                status.as_u16(),
+                response_buf,
+                Some(e.to_string()),
+            )
+            .await?;
+            self.bus.emit(Change::Space(prep.space_id.clone()));
+            self.bus.emit(Change::Record);
+            return Err(e);
+        }
+
+        // **An answer past the ceiling is refused once its stream has been
+        // read to the end**, as the blocking twin refuses its assembled one:
+        // the hold has settled above from the refunds at that end, the Record
+        // keeps what its cap allows of the whole stream with the refusal as
+        // its error, and no answer is written from what was taken in.
+        if answer_hold.past_ceiling() {
+            let e = peer_read::answer_past_ceiling(&prep.backend_id);
             prep.insert_unattached_request(
                 &request_body_json,
                 request_at,

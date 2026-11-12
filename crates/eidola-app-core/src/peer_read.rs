@@ -47,8 +47,9 @@ use crate::error::AppError;
 /// that a dishonest one cannot spend this process's memory through it.
 pub(crate) const API_ANSWER_MAX_BYTES: usize = 2 << 20;
 
-/// The most of one **completion** this app will read at all — a blocking
-/// answer, or the whole of a stream.
+/// The most of one **completion** this app will hold — a blocking answer, or
+/// the answer assembled from a stream (its deltas, not the events they arrive
+/// in, which [`MAX_ASSEMBLED_STREAM_BYTES`] bounds).
 ///
 /// **The retention cap's other half, and the one the process feels.**
 /// [`crate::recorded::RECORD_BODY_MAX_BYTES`] bounds what a `request` row
@@ -62,7 +63,8 @@ pub(crate) const API_ANSWER_MAX_BYTES: usize = 2 << 20;
 /// answer is around half a megabyte, and a turn asks for at most 4096 tokens)
 /// and far short of a size worth holding. A body that reaches it is not an
 /// answer this app can use, so the read stops there and the exchange is
-/// recorded as the truncation it is.
+/// recorded as the truncation it is; a stream's answer that reaches it is
+/// read on to the stream's end, where its refunds are, and then refused.
 pub(crate) const MAX_RESPONSE_BYTES: usize = 8 << 20;
 
 /// The most of a stream, padding aside, that is read to assemble one answer.
@@ -73,7 +75,10 @@ pub(crate) const MAX_RESPONSE_BYTES: usize = 8 << 20;
 /// answer assembled from it is held to [`MAX_RESPONSE_BYTES`], as a body is;
 /// this bounds the envelope, which is read and not held, at enough for the
 /// longest output a catalog model declares with a kilobyte of event around
-/// every token. A stream past it is not one an answer comes out of.
+/// every token. A stream past it is not one an answer comes out of. Both
+/// readers of an Eidola stream hold to it: the blocking read that assembles
+/// one ([`crate::whole_answer::WholeAnswer::read`]) and a turn's streaming
+/// round.
 pub(crate) const MAX_ASSEMBLED_STREAM_BYTES: usize = 64 << 20;
 
 /// The most one server-sent event may accumulate before it is refused.

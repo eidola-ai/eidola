@@ -16,9 +16,11 @@
 //! answer is read ([`WholeAnswer::read`]).
 //!
 //! The stream is read by [`read_events`], the reader a turn's streaming round
-//! reads with, under the caller's ceiling on what the answer is made of
-//! (padding uncounted). A stream that ends without saying it finished — the
-//! gateway cut it short — is no whole answer: it is an [`AnswerFailure`]
+//! reads with, under the envelope's ceiling (padding uncounted), and what is
+//! taken out of it is held to the caller's ceiling on the answer
+//! ([`AnswerHold`], which the streaming round keeps too). A stream that ends
+//! without saying it finished — the gateway cut it short — is no whole
+//! answer: it is an [`AnswerFailure`]
 //! carrying the refunds the stream delivered and what the Record keeps of it,
 //! which is what a streaming twin does with the same ending.
 
@@ -122,7 +124,7 @@ impl WholeAnswer {
             }));
         }
         // Read to its end all the same: the stream's refunds are at its end.
-        if assembler.past_ceiling {
+        if assembler.hold.past_ceiling() {
             return Err(Box::new(AnswerFailure {
                 error: peer_read::answer_past_ceiling(backend_id),
                 record: read.raw.seal_response(read.finished),
@@ -205,8 +207,9 @@ pub(crate) struct EventsRead {
 /// before it is refused ([`peer_read::MAX_SSE_EVENT_BYTES`], the frame
 /// buffer's ceiling: a backend that never ends an event would otherwise grow
 /// it until the process dies), and what the whole stream may deliver
-/// (`ceiling`: the events are assembled into an answer in memory, so a stream
-/// without end is an answer without end).
+/// (`ceiling`, on its envelope: every event that is not padding counts in
+/// full, so this is the stream's bound and not the answer's — a caller holds
+/// what it takes out of the events to its own ceiling, [`AnswerHold`]).
 ///
 /// Bytes accumulate in a frame buffer split at every event boundary the
 /// format allows ([`crate::find_event_boundary`]); each event's data is
@@ -253,7 +256,7 @@ pub(crate) async fn read_events(
             // terminators matched — goes to the Record with its event.
             let boundary = buf.drain(..boundary_len).collect::<Vec<u8>>();
             raw.push_event(&event_bytes, &boundary);
-            // **The ceiling bounds what the answer is made of, not padding**,
+            // **The ceiling bounds what the stream is made of, not padding**,
             // so it is asked of each event once it is classified, never of a
             // transport chunk: the Eidola server streams fixed-size frames on
             // a fixed tick, filled with comment events for as long as the
@@ -262,7 +265,7 @@ pub(crate) async fn read_events(
                 read_error = Some(AppError::Network {
                     message: format!(
                         "the model's response stream passed the {ceiling}-byte ceiling this app \
-                         reads for one answer"
+                         reads for one answer's stream"
                     ),
                 });
                 past_ceiling = true;
@@ -372,31 +375,67 @@ struct Assembler {
     usage: Option<Value>,
     privacy: Option<Value>,
     verification: Option<Value>,
-    /// The most the deltas may add up to, when there is a limit.
-    ceiling: Option<usize>,
-    /// The bytes of delta taken in so far.
+    /// What the deltas taken in add up to, against the answer's ceiling.
+    hold: AnswerHold,
+}
+
+/// What an answer read out of a stream has taken in, against its ceiling.
+///
+/// **The ceiling is on the answer, not on the stream it arrives in**: every
+/// delta comes in an event many times its size (the completion's id, model
+/// and framing around a few bytes of text), so the stream is bounded by its
+/// own ceiling ([`peer_read::MAX_ASSEMBLED_STREAM_BYTES`], asked by
+/// [`read_events`]) and this counts each delta as it came. Once the deltas
+/// pass the ceiling nothing more is taken in, and what was is not an answer;
+/// the stream is still read to its end, where its refunds are. The blocking
+/// read's [`Assembler`] and the streaming turn round both hold to it.
+pub(crate) struct AnswerHold {
+    ceiling: usize,
     held: usize,
-    /// A delta passed `ceiling`: nothing more is taken in, and what was is
-    /// not an answer.
     past_ceiling: bool,
+}
+
+impl AnswerHold {
+    /// A hold of at most `ceiling` bytes of deltas.
+    pub(crate) fn under(ceiling: usize) -> Self {
+        AnswerHold {
+            ceiling,
+            held: 0,
+            past_ceiling: false,
+        }
+    }
+
+    /// Count one delta; false once the deltas pass the ceiling, and from then
+    /// on.
+    pub(crate) fn take(&mut self, delta: &Value) -> bool {
+        if self.past_ceiling {
+            return false;
+        }
+        self.held = self.held.saturating_add(delta.to_string().len());
+        self.past_ceiling = self.held > self.ceiling;
+        !self.past_ceiling
+    }
+
+    /// Whether a delta passed the ceiling.
+    pub(crate) fn past_ceiling(&self) -> bool {
+        self.past_ceiling
+    }
+}
+
+impl Default for AnswerHold {
+    /// A hold without a limit.
+    fn default() -> Self {
+        AnswerHold::under(usize::MAX)
+    }
 }
 
 impl Assembler {
     /// An assembler that takes in at most `ceiling` bytes of deltas.
     fn under(ceiling: usize) -> Self {
         Assembler {
-            ceiling: Some(ceiling),
+            hold: AnswerHold::under(ceiling),
             ..Assembler::default()
         }
-    }
-
-    /// Count `bytes` of delta; false once they pass the ceiling.
-    fn take(&mut self, bytes: usize) -> bool {
-        self.held = self.held.saturating_add(bytes);
-        if self.ceiling.is_some_and(|ceiling| self.held > ceiling) {
-            self.past_ceiling = true;
-        }
-        !self.past_ceiling
     }
 
     fn push(&mut self, event: &Value) {
@@ -405,7 +444,7 @@ impl Assembler {
             self.verification = event.get("verification").cloned();
             return;
         }
-        if self.past_ceiling {
+        if self.hold.past_ceiling() {
             return;
         }
         if self.id.is_none() {
@@ -422,7 +461,7 @@ impl Assembler {
         for choice in choices {
             let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
             if let Some(delta) = choice.get("delta").filter(|d| !d.is_null())
-                && !self.take(delta.to_string().len())
+                && !self.hold.take(delta)
             {
                 return;
             }
