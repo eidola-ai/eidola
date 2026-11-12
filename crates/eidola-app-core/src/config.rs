@@ -373,11 +373,28 @@ impl Config {
                 });
             }
         };
-        toml::from_str(&contents).map_err(|e| AppError::Config {
-            message: format!(
-                "{} is not valid; fix or move it aside (nothing was written): {e}",
-                path.display()
-            ),
+        // Where, never what: the parser's `Display` quotes the failing source
+        // line and its message can quote a value, and this file's lines
+        // include the account secret (a partial sync write that leaves
+        // `account_secret = "…` unterminated fails on exactly that line). The
+        // text reaches a settings alert and `AccountNotSaved`'s reason, so it
+        // names the position only.
+        toml::from_str(&contents).map_err(|e| {
+            let at = e
+                .span()
+                .map(|span| {
+                    let before = &contents[..span.start.min(contents.len())];
+                    let line = before.matches('\n').count() + 1;
+                    let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+                    format!(" (line {line}, column {column})")
+                })
+                .unwrap_or_default();
+            AppError::Config {
+                message: format!(
+                    "{} is not valid{at}; fix or move it aside (nothing was written)",
+                    path.display()
+                ),
+            }
         })
     }
 

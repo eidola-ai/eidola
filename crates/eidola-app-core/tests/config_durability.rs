@@ -65,6 +65,40 @@ fn an_unreadable_config_refuses_new_credentials() {
     );
 }
 
+/// The refusal is shown — a settings alert, an unsaved account's reason — and
+/// the parser's own text quotes the failing line. A sync write cut off inside
+/// the secret fails on exactly that line, so the refusal names where, never
+/// what.
+#[test]
+fn refusing_an_unreadable_config_never_quotes_the_secret() {
+    let (core, dir) = make_core();
+    let path = config_path(&dir);
+    std::fs::write(
+        &path,
+        "account_id = \"acct-1\"\naccount_secret = \"s3cret-cut-off-mid-wri",
+    )
+    .unwrap();
+    let refused = core
+        .set_appearance(AppearanceSetting::Day)
+        .expect_err("an unreadable config refuses the write");
+    let text = format!("{refused} {refused:?}");
+    assert!(
+        !text.contains("s3cret-cut-off") && text.contains("line 2"),
+        "the refusal quotes the secret, or loses its position: {text}"
+    );
+
+    // A value parsed into the wrong field is quoted by the message itself.
+    std::fs::write(&path, "font_scale = \"s3cret-in-the-wrong-field\"\n").unwrap();
+    let refused = core
+        .set_appearance(AppearanceSetting::Day)
+        .expect_err("an unreadable config refuses the write");
+    let text = format!("{refused} {refused:?}");
+    assert!(
+        !text.contains("s3cret-in-the-wrong-field"),
+        "the refusal quotes a value: {text}"
+    );
+}
+
 /// `fs::write` truncates in place, so a reader landing between the truncate
 /// and the write sees no account at all (and a crash there leaves it so). The
 /// file must only ever be replaced whole.
