@@ -1,7 +1,7 @@
 //! The wire contract between Eidola's clients, its gateway, and its inference
 //! nodes (`eidola-server-engine`) that every side must spell identically.
 //!
-//! Six things live here:
+//! Seven things live here:
 //!
 //! - **The prefix-cache key** a client may send as the request body's
 //!   `cache_key` member: [`CACHE_KEY_BYTES`] bytes, encoded as unpadded
@@ -28,6 +28,15 @@
 //! - **The node's error types** ([`error_type`]) and which refusals precede
 //!   admission ([`refused_before_admission`]): the only refusals a gateway
 //!   may send to another node.
+//! - **The declared cached prefix** a client may send as the request body's
+//!   `cached_prefix` member ([`CachedPrefix`], [`check_cached_prefix`]): how
+//!   many of the prompt's leading tokens an engine holds in its prefix cache
+//!   under the request's key, and how many more the prompt may run to. It is
+//!   what the request is priced by (`crate::pricing`), so a node refuses a
+//!   request whose declaration does not hold before computing anything
+//!   ([`declared_prefix_refusal`]). [`declared_prompt`] is the rule a client
+//!   derives a declaration from, and the node's tests hold its engine to
+//!   accepting what that rule produces.
 //! - **The shape of a node's response** ([`STREAM_CADENCE`]): a streamed one
 //!   is written as frames of one size on a fixed tick, through
 //!   `stream_shape`'s framer, and read back by its reader; every other one
@@ -449,6 +458,10 @@ pub mod error_type {
     pub const OVERLOADED: &str = "overloaded";
     pub const ENGINE_UNAVAILABLE: &str = "engine_unavailable";
     pub const INTERNAL_ERROR: &str = "internal_error";
+    /// A declared cached prefix the engine's cache does not hold.
+    pub const CACHED_PREFIX_MISSING: &str = "cached_prefix_missing";
+    /// A prompt longer than its declaration allows.
+    pub const PROMPT_BUDGET_EXCEEDED: &str = "prompt_budget_exceeded";
 }
 
 /// A node refusal made before the request was admitted: nothing of it was
@@ -478,6 +491,200 @@ pub fn refused_before_admission(status: u16, kind: &str) -> Option<PreAdmission>
         (503, t::OVERLOADED) => Some(PreAdmission::Overloaded),
         _ => None,
     }
+}
+
+/// The request body member a declared cached prefix travels in.
+pub const CACHED_PREFIX_MEMBER: &str = "cached_prefix";
+
+/// The step a client rounds a declared prefix down to
+/// ([`declarable_cached_tokens`]). An engine's cache resumes only at block
+/// boundaries, so a deployment's KV block size must divide this
+/// ([`quantum_covers_block_size`]) for the rule's result to be one.
+pub const CACHED_PREFIX_QUANTUM: u32 = 256;
+
+/// A request's declaration of its cached prefix: the `cached_prefix` member,
+/// `{"cached_tokens": <n>, "new_tokens": <n>}`.
+///
+/// It says two things about the prompt as the node will tokenize it: its first
+/// `cached_tokens` tokens are held in the prefix cache under the request's
+/// `cache_key`, and it has at most `new_tokens` after them. The request is
+/// priced by exactly these two numbers (`crate::pricing::Prompt::Declared`),
+/// so a node runs it only if both hold and refuses it otherwise before
+/// computing anything ([`DeclaredPrefixRefusal`]). The declaration is the
+/// client's own statement about its own earlier requests; nothing a server
+/// remembered sets the price.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CachedPrefix {
+    /// Leading prompt tokens served from the prefix cache. At least 1.
+    pub cached_tokens: u32,
+    /// The most prompt tokens the request may have after them.
+    pub new_tokens: u32,
+}
+
+impl CachedPrefix {
+    /// The longest prompt, in tokens, the declaration covers.
+    pub const fn prompt_limit(self) -> u64 {
+        self.cached_tokens as u64 + self.new_tokens as u64
+    }
+
+    /// The member's value as a client writes it.
+    pub fn to_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "cached_tokens": self.cached_tokens,
+            "new_tokens": self.new_tokens,
+        })
+    }
+
+    /// Writes the member into a request body built by
+    /// [`crate::chat_completion_request_body`].
+    pub fn insert_into(self, body: &mut serde_json::Value) {
+        body[CACHED_PREFIX_MEMBER] = self.to_value();
+    }
+
+    /// Reads the member's value: an object with exactly the two members, each
+    /// an integer that fits `u32`. `None` for any other shape. Whether the
+    /// declaration is admissible is [`check_cached_prefix`]'s to say.
+    pub fn from_value(value: &serde_json::Value) -> Option<Self> {
+        let object = value.as_object()?;
+        if object.len() != 2 {
+            return None;
+        }
+        let member = |name: &str| u32::try_from(object.get(name)?.as_u64()?).ok();
+        Some(Self {
+            cached_tokens: member("cached_tokens")?,
+            new_tokens: member("new_tokens")?,
+        })
+    }
+}
+
+/// The node's rule for a declared cached prefix: it needs the cache key whose
+/// entries it names, and it declares at least one cached token (a request with
+/// nothing cached sends no declaration).
+pub fn check_cached_prefix(
+    prefix: Option<CachedPrefix>,
+    has_cache_key: bool,
+) -> Result<(), SubsetError> {
+    match prefix {
+        None => Ok(()),
+        Some(_) if !has_cache_key => Err(SubsetError::CachedPrefixWithoutKey),
+        Some(p) if p.cached_tokens == 0 => Err(SubsetError::EmptyCachedPrefix),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Why a node refused a request for its declared cached prefix. Either way the
+/// node rendered and tokenized the request and computed nothing: no prefill,
+/// and no cached block mapped, promoted or decrypted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeclaredPrefixRefusal {
+    /// The cache holds fewer of the prompt's leading tokens than declared: the
+    /// entry expired, was evicted, never existed on this node, or belongs to a
+    /// prompt this one does not extend.
+    Missing,
+    /// The prompt has more tokens than `cached_tokens + new_tokens`.
+    OverBudget,
+}
+
+impl DeclaredPrefixRefusal {
+    /// The status a node, and the gateway relaying it, answers with.
+    pub const STATUS: u16 = 409;
+
+    /// The `error.type` a node, and the gateway relaying it, answers with.
+    pub const fn error_type(self) -> &'static str {
+        match self {
+            DeclaredPrefixRefusal::Missing => error_type::CACHED_PREFIX_MISSING,
+            DeclaredPrefixRefusal::OverBudget => error_type::PROMPT_BUDGET_EXCEEDED,
+        }
+    }
+}
+
+/// Whether a refusal, by its status and `error.type` exactly, is one of the
+/// two a declared cached prefix can draw. A gateway returns it to its client
+/// without trying another node (the cache a declaration names is on the node
+/// its key routes to), and a client reads it to send the request again
+/// without a declaration.
+pub fn declared_prefix_refusal(status: u16, kind: &str) -> Option<DeclaredPrefixRefusal> {
+    if status != DeclaredPrefixRefusal::STATUS {
+        return None;
+    }
+    [
+        DeclaredPrefixRefusal::Missing,
+        DeclaredPrefixRefusal::OverBudget,
+    ]
+    .into_iter()
+    .find(|r| r.error_type() == kind)
+}
+
+/// The cached prefix a client may declare for a request whose prompt begins
+/// with the whole prompt, `anchor_prompt_tokens` long, of an earlier request
+/// under the same cache key: one that asked for a new assistant turn, so that
+/// its prompt ended at the template's generation prompt.
+///
+/// An engine keeps a resumable point at the last block boundary before a
+/// prompt's final token (the final token is recomputed to produce the first
+/// output), so the rule is the largest multiple of [`CACHED_PREFIX_QUANTUM`]
+/// strictly below `anchor_prompt_tokens`. `0` means there is nothing to
+/// declare.
+///
+/// **Only such a prompt is an anchor.** A request that extends it (a new turn,
+/// a tool round, a regeneration, a continuation of its answer) renders to a
+/// token sequence that begins with the anchor's, because the template's
+/// markers are single tokens that text cannot merge across. Nothing after the
+/// anchor is declared, the answer it drew included: a continuation sends that
+/// answer back as text, the cache is keyed by tokens, and text does not always
+/// encode to the tokens a model sampled, nor does a longer text always begin
+/// with the tokens of a shorter one. So a continuation's own prompt, which
+/// ends inside a message, is never an anchor either.
+pub const fn declarable_cached_tokens(anchor_prompt_tokens: u64) -> u32 {
+    let quantum = CACHED_PREFIX_QUANTUM as u64;
+    let declarable = (anchor_prompt_tokens.saturating_sub(1) / quantum) * quantum;
+    if declarable > u32::MAX as u64 {
+        // The largest multiple of the quantum a `u32` holds.
+        u32::MAX - (u32::MAX % CACHED_PREFIX_QUANTUM)
+    } else {
+        declarable as u32
+    }
+}
+
+/// The declaration for a request whose prompt is an anchor's
+/// ([`declarable_cached_tokens`]) followed by `added_content_bytes` of priced
+/// content in `added_messages` messages: the new turn's messages, a tool
+/// round's call and results, or, for a continuation, the partial assistant
+/// message holding the answer so far. Both are zero for a regeneration.
+///
+/// The cached part is the rule's. The budget for the rest is the anchor's
+/// tokens past the declared boundary, which the client knows exactly, and the
+/// byte contract's count for what was added ([`crate::chargeable_prompt_tokens`],
+/// whose constants cover the added messages' template tokens). `None` when
+/// there is nothing to declare, or the budget does not fit the member.
+///
+/// A prompt whose added part is denser than the byte contract assumes can
+/// exceed the budget; the node then refuses it
+/// ([`DeclaredPrefixRefusal::OverBudget`]) and the request is sent again
+/// without a declaration.
+pub fn declared_prompt(
+    anchor_prompt_tokens: u64,
+    added_content_bytes: u64,
+    added_messages: u64,
+) -> Option<CachedPrefix> {
+    let cached_tokens = declarable_cached_tokens(anchor_prompt_tokens);
+    if cached_tokens == 0 {
+        return None;
+    }
+    let carried = anchor_prompt_tokens - cached_tokens as u64;
+    let added = crate::chargeable_prompt_tokens(added_content_bytes, added_messages);
+    let new_tokens = u32::try_from(carried.checked_add(added)?).ok()?;
+    Some(CachedPrefix {
+        cached_tokens,
+        new_tokens,
+    })
+}
+
+/// Whether [`declarable_cached_tokens`] lands on a block boundary of an engine
+/// with this KV block size: the block size is non-zero and divides the
+/// quantum. A node that serves a prefix cache refuses to boot otherwise.
+pub const fn quantum_covers_block_size(block_size: u32) -> bool {
+    block_size != 0 && CACHED_PREFIX_QUANTUM.is_multiple_of(block_size)
 }
 
 /// Most stop sequences a node accepts on one request (OpenAI's limit).
@@ -526,6 +733,10 @@ pub enum SubsetError {
     /// A continuation whose final message cannot be continued
     /// ([`check_continuation`]).
     UncontinuableFinalMessage,
+    /// A `cached_prefix` on a request with no `cache_key`.
+    CachedPrefixWithoutKey,
+    /// A `cached_prefix` declaring no cached token.
+    EmptyCachedPrefix,
 }
 
 impl core::fmt::Display for SubsetError {
@@ -559,6 +770,12 @@ impl core::fmt::Display for SubsetError {
                  with string content to continue the content, or with string \
                  reasoning_content and no content to continue the reasoning",
             ),
+            SubsetError::CachedPrefixWithoutKey => {
+                f.write_str("cached_prefix needs the cache_key its entries are under")
+            }
+            SubsetError::EmptyCachedPrefix => {
+                f.write_str("cached_prefix.cached_tokens must be at least 1")
+            }
         }
     }
 }
@@ -1130,5 +1347,167 @@ mod tests {
         b[31] = 0x02;
         assert_ne!(encoded(&a), encoded(&b));
         assert_ne!(encoded(&a), ZERO_KEY);
+    }
+    #[test]
+    fn a_cached_prefix_has_one_shape() {
+        use serde_json::json;
+        let prefix = CachedPrefix {
+            cached_tokens: 4_096,
+            new_tokens: 300,
+        };
+        assert_eq!(CachedPrefix::from_value(&prefix.to_value()), Some(prefix));
+        assert_eq!(prefix.prompt_limit(), 4_396);
+        assert_eq!(
+            CachedPrefix {
+                cached_tokens: u32::MAX,
+                new_tokens: u32::MAX
+            }
+            .prompt_limit(),
+            2 * u32::MAX as u64
+        );
+        for bad in [
+            json!(null),
+            json!(4096),
+            json!([4096, 300]),
+            json!({}),
+            json!({"cached_tokens": 4096}),
+            json!({"new_tokens": 300}),
+            json!({"cached_tokens": 4096, "new_tokens": 300, "extra": 1}),
+            json!({"cached_tokens": "4096", "new_tokens": 300}),
+            json!({"cached_tokens": 4096.5, "new_tokens": 300}),
+            json!({"cached_tokens": -1, "new_tokens": 300}),
+            json!({"cached_tokens": 4_294_967_296_u64, "new_tokens": 300}),
+            json!({"cached_tokens": 4096, "new_tokens": null}),
+        ] {
+            assert_eq!(CachedPrefix::from_value(&bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_cached_prefix_needs_a_key_and_a_cached_token() {
+        let prefix = |cached_tokens| {
+            Some(CachedPrefix {
+                cached_tokens,
+                new_tokens: 0,
+            })
+        };
+        assert_eq!(check_cached_prefix(None, false), Ok(()));
+        assert_eq!(check_cached_prefix(None, true), Ok(()));
+        assert_eq!(check_cached_prefix(prefix(1), true), Ok(()));
+        assert_eq!(
+            check_cached_prefix(prefix(1), false),
+            Err(SubsetError::CachedPrefixWithoutKey)
+        );
+        assert_eq!(
+            check_cached_prefix(prefix(0), true),
+            Err(SubsetError::EmptyCachedPrefix)
+        );
+    }
+
+    #[test]
+    fn only_the_two_declared_prefix_refusals_read_as_one() {
+        use error_type as t;
+        assert_eq!(
+            declared_prefix_refusal(409, t::CACHED_PREFIX_MISSING),
+            Some(DeclaredPrefixRefusal::Missing)
+        );
+        assert_eq!(
+            declared_prefix_refusal(409, t::PROMPT_BUDGET_EXCEEDED),
+            Some(DeclaredPrefixRefusal::OverBudget)
+        );
+        for (status, ty) in [
+            (400, t::CACHED_PREFIX_MISSING),
+            (503, t::PROMPT_BUDGET_EXCEEDED),
+            (409, t::INVALID_REQUEST),
+            (409, "conflict"),
+            (409, ""),
+        ] {
+            assert_eq!(declared_prefix_refusal(status, ty), None, "{status} {ty}");
+        }
+        // Neither is a refusal another node may be sent.
+        for refusal in [
+            DeclaredPrefixRefusal::Missing,
+            DeclaredPrefixRefusal::OverBudget,
+        ] {
+            assert_eq!(
+                refused_before_admission(DeclaredPrefixRefusal::STATUS, refusal.error_type()),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn a_declarable_prefix_is_the_last_quantum_boundary_before_the_final_token() {
+        let q = CACHED_PREFIX_QUANTUM as u64;
+        assert_eq!(declarable_cached_tokens(0), 0);
+        assert_eq!(declarable_cached_tokens(1), 0);
+        assert_eq!(declarable_cached_tokens(q), 0);
+        assert_eq!(declarable_cached_tokens(q + 1), q as u32);
+        assert_eq!(declarable_cached_tokens(2 * q), q as u32);
+        assert_eq!(declarable_cached_tokens(2 * q + 1), 2 * q as u32);
+        for anchor in [1, 255, 256, 257, 1_000, 65_537, 1_048_576] {
+            let declared = declarable_cached_tokens(anchor) as u64;
+            assert_eq!(declared % q, 0);
+            assert!(declared < anchor);
+            assert!(anchor - declared <= q);
+        }
+        let most = declarable_cached_tokens(u64::MAX);
+        assert_eq!(most % CACHED_PREFIX_QUANTUM, 0);
+        assert!(u32::MAX - most < CACHED_PREFIX_QUANTUM);
+    }
+
+    #[test]
+    fn a_declared_prompt_budgets_the_carried_tokens_and_the_added_bytes() {
+        // Nothing to declare below one quantum.
+        assert_eq!(declared_prompt(256, 10_000, 2), None);
+        // A regeneration: an anchor of 10,000 tokens, nothing added. 9,984
+        // cached, 16 carried, and the per-request allowance.
+        assert_eq!(
+            declared_prompt(10_000, 0, 0),
+            Some(CachedPrefix {
+                cached_tokens: 9_984,
+                new_tokens: 16 + crate::PER_REQUEST_TOKENS as u32,
+            })
+        );
+        // A new turn: 3,000 bytes in two messages added.
+        let turn = declared_prompt(10_000, 3_000, 2).unwrap();
+        assert_eq!(turn.cached_tokens, 9_984);
+        assert_eq!(
+            turn.new_tokens as u64,
+            16 + crate::chargeable_prompt_tokens(3_000, 2)
+        );
+        // The budget always covers the anchor's own tokens.
+        for anchor in [257, 1_000, 65_536, 1_048_576] {
+            let p = declared_prompt(anchor, 0, 0).unwrap();
+            assert!(p.prompt_limit() >= anchor);
+        }
+        // A budget past the member's range is not declared.
+        assert_eq!(declared_prompt(10_000, u64::MAX, 0), None);
+        assert_eq!(declared_prompt(10_000, 9_000_000_000, 0), None);
+    }
+
+    #[test]
+    fn a_cached_prefix_is_written_into_a_built_body() {
+        let mut body =
+            crate::chat_completion_request_body("m", &[], 1, &[], false, false, None, None);
+        let prefix = CachedPrefix {
+            cached_tokens: 512,
+            new_tokens: 40,
+        };
+        prefix.insert_into(&mut body);
+        assert_eq!(
+            CachedPrefix::from_value(&body[CACHED_PREFIX_MEMBER]),
+            Some(prefix)
+        );
+    }
+
+    #[test]
+    fn the_quantum_covers_power_of_two_block_sizes_up_to_itself() {
+        for block in [1, 2, 16, 32, 64, 128, 256] {
+            assert!(quantum_covers_block_size(block), "{block}");
+        }
+        for block in [0, 3, 24, 48, 100, 512] {
+            assert!(!quantum_covers_block_size(block), "{block}");
+        }
     }
 }

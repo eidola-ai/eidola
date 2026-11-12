@@ -1040,6 +1040,16 @@ pub fn parse_measured(
             env::CACHE_MAX_AGE_SECS
         )));
     }
+    // A client declares a cached prefix in multiples of a quantum, which must
+    // land on the block boundaries the prefix cache resumes at.
+    if cache.enabled && !crate::engine_protocol::quantum_covers_block_size(sizing.kv_block_size) {
+        return Err(ConfigError(format!(
+            "{} must divide {} when {} is true",
+            env::KV_BLOCK_SIZE,
+            crate::engine_protocol::CACHED_PREFIX_QUANTUM,
+            env::PREFIX_CACHE
+        )));
+    }
     let kv_host_bytes = get(env::KV_HOST_BYTES)?.parse::<u64>().map_err(|_| {
         ConfigError(format!(
             "{} must be a non-negative number of bytes",
@@ -2304,6 +2314,33 @@ mod tests {
         .into_iter()
         .map(|(k, v)| (k, v.to_string()))
         .collect()
+    }
+
+    /// With the prefix cache on, the block size divides the declared-prefix
+    /// quantum (every divisor of 256 is accepted, nothing else); with it off,
+    /// any block size within its cap is.
+    #[cfg(feature = "argon2")]
+    #[test]
+    fn a_cached_block_size_divides_the_declared_prefix_quantum() {
+        let base = cuda_env();
+        for block in 1..=caps::KV_BLOCK_SIZE {
+            let mut map = base.clone();
+            map.insert(env::KV_BLOCK_SIZE, block.to_string());
+            let parsed = parse_map(&map);
+            if 256 % block == 0 {
+                assert!(parsed.is_ok(), "{block}: {parsed:?}");
+            } else {
+                assert!(
+                    parsed.as_ref().unwrap_err().contains(env::KV_BLOCK_SIZE),
+                    "{block}: {parsed:?}"
+                );
+            }
+        }
+        let mut map = base.clone();
+        map.insert(env::PREFIX_CACHE, "false".into());
+        map.insert(env::KV_HOST_BYTES, "0".into());
+        map.insert(env::KV_BLOCK_SIZE, "24".into());
+        assert!(parse_map(&map).is_ok());
     }
 
     /// The host tier's size is required, a number of bytes up to its cap,

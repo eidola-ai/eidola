@@ -3,6 +3,7 @@
 //! This crate holds the small pieces of pure logic that MUST be bit-identical
 //! on both sides of a contract boundary — the anonymous-credit pricing
 //! contract for chat-completion prompt holds ([`chargeable_prompt_tokens`]),
+//! the credit arithmetic of a request's hold and charge ([`pricing`]),
 //! outer chat-request construction ([`chat_completion_request_body`]), the
 //! wire contract shared by clients, the gateway and the inference nodes
 //! ([`engine_protocol`]: the prefix-cache key's shape and the weights
@@ -134,6 +135,7 @@ pub mod issuer_calendar;
 #[cfg(feature = "catalog")]
 pub mod model_catalog;
 pub mod model_reference;
+pub mod pricing;
 pub mod refund_key;
 #[cfg(feature = "spend-credentials")]
 pub mod spend_credentials;
