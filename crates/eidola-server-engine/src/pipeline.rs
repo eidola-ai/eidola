@@ -252,9 +252,13 @@ impl Decoder {
             }
         }
         if let Some(f) = finish {
+            // Out of KV memory reads as `length` on the wire, never continuable: a
+            // continuation's prompt is these same tokens and needs at least the memory
+            // this one ran out of.
+            let memory_bound = f == EngineFinish::KvExhausted;
             let cause = match f {
                 EngineFinish::Stop => StopCause::EndOfSequence,
-                EngineFinish::Length => StopCause::MaxTokens,
+                EngineFinish::Length | EngineFinish::KvExhausted => StopCause::MaxTokens,
                 EngineFinish::Cancelled => {
                     return Err(ApiError::Internal("the request was cancelled"));
                 }
@@ -282,13 +286,14 @@ impl Decoder {
             append(&mut step.delta, tail);
             if reason == FinishReason::Length {
                 // Continuable only where a continuation would be exact and could
-                // run: not at the context window (no room is left for one), not
-                // inside a held stop sequence, not after a sampled token the text
+                // run: not at the context window (no room is left for one), not out
+                // of KV memory, not inside a held stop sequence, not after a sampled token the text
                 // does not show, and only where the chat layer says what it gave
                 // out renders the generated text, encodes to the added tokens the
                 // model sampled, and resumes its parse.
                 step.continuable = Some(
                     !self.window_bound
+                        && !memory_bound
                         && !stop_held
                         && !self.dropped_token
                         && self.parser.resumes_exactly_as_tokens(&self.added),

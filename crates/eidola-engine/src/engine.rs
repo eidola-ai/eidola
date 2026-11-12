@@ -12,7 +12,8 @@
 //!    allocated; when the pools (after evicting unreferenced cache entries) cannot supply
 //!    it, the **newest-arrived** running sequence is preempted — its blocks released (its
 //!    sealed prefix stays cached) and it returns to the waiting queue — until the
-//!    allocation fits or the sequence itself was the one preempted.
+//!    allocation fits or the sequence itself was the one preempted. A sequence that does
+//!    not fit alone ends with [`FinishReason::KvExhausted`].
 //! 3. **Waiting sequences**, oldest arrival first, if nothing was preempted this step:
 //!    admitted while a slot, budget, and KV for their first chunk are available. Admission
 //!    is strictly first-come-first-served: the first request that does not fit blocks those
@@ -81,6 +82,11 @@ pub enum FinishReason {
     Stop,
     /// `max_tokens` or the model length was reached.
     Length,
+    /// KV memory ran out: not even the sequence's minimum progress fits with every
+    /// reclaimable block reclaimed and nothing else holding memory to wait for. A request
+    /// continuing it has a prompt of the same tokens, so it would need at least as much
+    /// memory and end the same way.
+    KvExhausted,
     /// Cancelled by the caller.
     Cancelled,
 }
@@ -497,7 +503,7 @@ impl<E: Executor> Engine<E> {
                 if self.running.len() == 1 {
                     // Alone, with every unreferenced cache entry already evicted, and not
                     // even plain decoding fits: this sequence can never grow further.
-                    events.push(self.finish_now(id, FinishReason::Length, now));
+                    events.push(self.finish_now(id, FinishReason::KvExhausted, now));
                     scheduled = false;
                     break;
                 }
@@ -549,7 +555,7 @@ impl<E: Executor> Engine<E> {
                         events.push(Event {
                             id,
                             tokens: Vec::new(),
-                            finish: Some(FinishReason::Length),
+                            finish: Some(FinishReason::KvExhausted),
                             cached_prompt_tokens: seq.cached_prompt_tokens.unwrap_or(0),
                         });
                     }
@@ -607,9 +613,9 @@ impl<E: Executor> Engine<E> {
     ///
     /// Only when the minimum progress unit still does not fit does this return false;
     /// the caller then preempts the newest peer and retries, and a sequence that is
-    /// alone ends with `Length`. So `Length` means exactly "cannot make minimum progress
-    /// even holding every reclaimable block" (evictable cache entries are reclaimed by
-    /// [`KvManager::allocate`] itself).
+    /// alone ends with [`FinishReason::KvExhausted`], which therefore means exactly
+    /// "cannot make minimum progress even holding every reclaimable block" (evictable
+    /// cache entries are reclaimed by [`KvManager::allocate`] itself).
     fn allocate_row(
         &mut self,
         id: RequestId,
