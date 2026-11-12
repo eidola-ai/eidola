@@ -3,7 +3,7 @@
 # are on and three tokens are drafted a step, the production settings, so the
 # KV budget here is checked with the pad block each pool keeps for graph
 # replay and with the drafter pool.
-cvm-version: 0.15.3-rc.1+gpu@sha256:1111111111111111111111111111111111111111111111111111111111111111
+cvm-version: 0.15.3-rc.1+gpu@sha256:1421cbb45dc428f6270d106d8eb68faab3ce7ca02ff2fbb2dc0968605004579f
 cpus: 16
 memory: 65536
 gpus: 8

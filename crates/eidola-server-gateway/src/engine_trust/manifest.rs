@@ -45,9 +45,17 @@
 //!   ([`require_every_deployment_pinned`]), so the file is a function of the
 //!   tree in both directions.
 //!
-//! What is **not** recomputed here: a TDX pin's MRTD and a SEV-SNP launch
+//! - **A TDX pin's MRTD is the platform release's statement of it**: the
+//!   release manifest `cvm-version` pins, vendored under
+//!   `releases/trust/cvm-releases/` (`deployment::release_manifest_file`), must
+//!   hash to that pin, describe that release, state a launch in the measured
+//!   model, and state the pin's MRTD (`deployment::check_release_manifest`,
+//!   the rule `measure-enclave` reads the manifest by).
+//!
+//! What is **not** recomputed here: MRTD from the image, and a SEV-SNP launch
 //! digest. Both need the platform provider's release images, so they are
-//! release-time work (`measure-enclave`'s `measure-engine-enclaves`).
+//! release-time work (`measure-enclave`'s `measure-engine-enclaves`), and the
+//! artifacts chain reruns the first.
 
 use std::collections::BTreeMap;
 
@@ -408,7 +416,13 @@ fn check_deployment(
                 &[],
                 &format!("{at}: pin.platform.tdx"),
             )?;
-            hex_string(&tdx["mrtd"], 48, &format!("{at}: pin.platform.tdx.mrtd"))?;
+            let mrtd = hex_string(&tdx["mrtd"], 48, &format!("{at}: pin.platform.tdx.mrtd"))?;
+            check_mrtd(
+                mrtd,
+                &checked.cvm_version,
+                &format!("{at} ({config_path})"),
+                read,
+            )?;
             let mrconfigid = hex_string(
                 &tdx["mrconfigid"],
                 48,
@@ -490,6 +504,36 @@ fn check_deployment(
         checked.architecture,
         checked.measured.sizing.max_model_len,
     ))
+}
+
+/// A TDX pin's MRTD is the one the platform release states for the image
+/// the config launches: the release's manifest, vendored under
+/// `releases/trust/cvm-releases/`, must be the one `cvm-version` pins, and
+/// its `igvm.tdx_launch.mrtd` must be the pin's. `measure-enclave` reads the
+/// same manifest by the same rule, and checks the image reproduces it.
+fn check_mrtd(
+    mrtd: &str,
+    cvm_version: &str,
+    at: &str,
+    read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
+) -> Result<(), String> {
+    let path = deployment::release_manifest_file(cvm_version).map_err(|e| format!("{at}: {e}"))?;
+    let manifest = read(&path).map_err(|e| {
+        format!(
+            "{at}: {e}: the release manifest cvm-version {cvm_version:?} pins is not vendored \
+             (deploy/engine/README.md, Platform release manifests)"
+        )
+    })?;
+    let release = deployment::check_release_manifest(cvm_version, &manifest)
+        .map_err(|e| format!("{at}: {path}: {e}"))?;
+    if mrtd != release.mrtd {
+        return Err(format!(
+            "{at}: pin.platform.tdx.mrtd is {mrtd}, but {path} states {} for the image \
+             {cvm_version:?} launches (re-measure with measure-enclave's measure-engine-enclaves)",
+            release.mrtd
+        ));
+    }
+    Ok(())
 }
 
 /// The machine policy `machines` names, from the committed platform

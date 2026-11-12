@@ -60,7 +60,9 @@ COPY crates/ ./crates/
 # every pin against the committed deployment configs under `deploy/engine/`,
 # re-deriving each TDX pin's machine policy from the vendored platform
 # endorsements (`platform-endorsements/`), verified offline against the
-# committed Sigstore trusted root, and compiles in the model catalog
+# committed Sigstore trusted root, and holding each TDX pin's MRTD to the
+# vendored platform release manifest its config pins (`cvm-releases/`), and
+# compiles in the model catalog
 # (`models/`), checked and bound to those pins by weights hash. Only these
 # paths are copied, never `releases/` wholesale: other files in
 # `releases/trust/` (notably `server-enclave.json`) are functions of the
@@ -68,7 +70,7 @@ COPY crates/ ./crates/
 # pulled in here, and none of these depends on that digest. Globs rather than
 # directory names so a tree without one of the directories still builds; the
 # build script then sees no deployments or no rows.
-COPY --parents releases/trust/engine-enclaves.json releases/trust/sigstore-trusted-root.json releases/trust/platform-endorsements* deploy/engine* models* ./
+COPY --parents releases/trust/engine-enclaves.json releases/trust/sigstore-trusted-root.json releases/trust/platform-endorsements* releases/trust/cvm-releases* deploy/engine* models* ./
 
 # Ensure Cargo detects source changes over the fetch-stage stubs.
 # SOURCE_DATE_EPOCH=0 clamps COPY timestamps to epoch 0, matching the

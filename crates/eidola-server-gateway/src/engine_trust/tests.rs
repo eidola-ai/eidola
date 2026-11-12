@@ -19,12 +19,22 @@ const MODEL: &str = "33333333333333333333333333333333333333333333333333333333333
 const FLASH: &engine_deployment::Shape = &eidola_common::architecture::MIMO_V26_FLASH;
 const CONFIG: &str = "deploy/engine/fixture-model/tdx-a/tinfoil-config.yml";
 const SIDECAR: &str = "deploy/engine/fixture-model/tdx-a/deployment.json";
-/// The platform endorsements the fixture sidecar names, as vendored.
+/// The platform endorsements the fixture sidecar names, where the fixture
+/// tree vendors them: a verbatim copy of that release.
 const ENDORSEMENTS: &str =
     "releases/trust/platform-endorsements/platform-v0.1.11/platform-endorsements.json";
 const ENDORSEMENTS_BUNDLE: &str =
     "releases/trust/platform-endorsements/platform-v0.1.11/attestation.sigstore.json";
 const TRUSTED_ROOT: &str = "releases/trust/sigstore-trusted-root.json";
+/// The platform release manifest the fixture config pins, vendored: a copy of
+/// the real `v0.15.3-rc.1+gpu` manifest, so the fixture's MRTD is that
+/// release's.
+const RELEASE_MANIFEST: &str =
+    "releases/trust/cvm-releases/v0.15.3-rc.1/tinfoil-inference-v0.15.3-rc.1+gpu-manifest.json";
+/// That manifest's SHA-256, the fixture config's inline pin.
+const RELEASE_SHA256: &str = "1421cbb45dc428f6270d106d8eb68faab3ce7ca02ff2fbb2dc0968605004579f";
+/// The MRTD it states, the fixture pin's.
+const RELEASE_MRTD: &str = "bf582997bf2145f275db3bc2542d703fdd889c85927b3ee199138298f863631711f41b37d8d347d5aee18036ff02c16c";
 
 /// The weights pack's data size in the fixture's `mpk` (`_17419419648_`).
 const FIXTURE_PACK_BYTES: u64 = 17_419_419_648;
@@ -62,19 +72,21 @@ impl Tree {
     fn fixture() -> Self {
         let root = fixture_root();
         let read = |p: &str| std::fs::read(root.join(p)).unwrap();
-        let mut files: BTreeMap<String, Vec<u8>> = [CONFIG, SIDECAR]
+        let mut files: BTreeMap<String, Vec<u8>> = [CONFIG, SIDECAR, RELEASE_MANIFEST]
             .into_iter()
             .map(|p| (p.to_string(), read(p)))
             .collect();
-        // The vendored endorsements and the trusted root are the committed
-        // ones: the fixture deployment's machine policy is re-derived from
-        // the real signed release.
-        for path in [ENDORSEMENTS, ENDORSEMENTS_BUNDLE, TRUSTED_ROOT] {
-            files.insert(
-                path.to_string(),
-                std::fs::read(workspace_root().join(path)).unwrap(),
-            );
+        // The endorsements are a fixture copy of a real signed release, so
+        // the vendored tree can rotate; the trusted root is the committed
+        // one. The fixture deployment's machine policy is re-derived from
+        // both.
+        for path in [ENDORSEMENTS, ENDORSEMENTS_BUNDLE] {
+            files.insert(path.to_string(), read(path));
         }
+        files.insert(
+            TRUSTED_ROOT.to_string(),
+            std::fs::read(workspace_root().join(TRUSTED_ROOT)).unwrap(),
+        );
         Self {
             json: serde_json::from_slice(&read("engine-enclaves.json")).unwrap(),
             files,
@@ -127,6 +139,29 @@ impl Tree {
         let text = self.config_text();
         assert!(text.contains(from), "the fixture config has no {from:?}");
         self.set_config(text.replacen(from, to, 1));
+    }
+
+    /// Vendor `manifest` as the release manifest, and pin it in the config
+    /// and the pin alike, so only what the manifest states can object.
+    fn vendor_manifest(&mut self, manifest: &serde_json::Value) {
+        use sha2::Digest as _;
+        let bytes = serde_json::to_vec_pretty(manifest).unwrap();
+        let hash: String = sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let pinned = self.deployment()["cvm_version"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let moved = format!("{}@sha256:{hash}", pinned.split_once('@').unwrap().0);
+        self.edit_config(&pinned, &moved);
+        self.deployment()["cvm_version"] = moved.into();
+        self.files.insert(RELEASE_MANIFEST.to_string(), bytes);
+    }
+
+    fn release_manifest(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.files[RELEASE_MANIFEST]).unwrap()
     }
 
     fn sidecar(&self) -> serde_json::Value {
@@ -395,10 +430,84 @@ fn the_release_is_the_configs_and_pinned_inline() {
     refused(&tree, "but the config selects");
 
     let mut tree = Tree::fixture();
-    let pinned = format!("0.15.3-rc.1+gpu@sha256:{}", "1".repeat(64));
+    let pinned = format!("0.15.3-rc.1+gpu@sha256:{RELEASE_SHA256}");
     tree.edit_config(&pinned, "0.15.3-rc.1+gpu");
     tree.deployment()["cvm_version"] = "0.15.3-rc.1+gpu".into();
     refused(&tree, "must pin its release manifest inline");
+}
+
+/// A TDX pin's MRTD is the one its platform release states: the vendored
+/// manifest the config pins, which must be there, be the pinned bytes,
+/// describe the release the config selects and state a launch in the
+/// measured model.
+#[test]
+fn a_tdx_pins_mrtd_is_the_one_its_release_states() {
+    let mut tree = Tree::fixture();
+    assert_eq!(
+        tree.deployment()["pin"]["platform"]["tdx"]["mrtd"],
+        RELEASE_MRTD
+    );
+    // Only the MRTD moved: every other value still re-derives.
+    tree.deployment()["pin"]["platform"]["tdx"]["mrtd"] = "6".repeat(96).into();
+    refused(
+        &tree,
+        &format!(
+            "pin.platform.tdx.mrtd is {}, but {RELEASE_MANIFEST} states {RELEASE_MRTD}",
+            "6".repeat(96)
+        ),
+    );
+
+    let mut tree = Tree::fixture();
+    tree.files.remove(RELEASE_MANIFEST);
+    refused(&tree, &format!("read {RELEASE_MANIFEST}: no such file"));
+    refused(&tree, "is not vendored");
+
+    // The vendored bytes edited, the config's pin left alone.
+    let mut tree = Tree::fixture();
+    let mut text = String::from_utf8(tree.files[RELEASE_MANIFEST].clone()).unwrap();
+    text.push('\n');
+    tree.files
+        .insert(RELEASE_MANIFEST.to_string(), text.into_bytes());
+    refused(&tree, &format!("not the pinned {RELEASE_SHA256}"));
+
+    // A manifest the config pins, whose statement disagrees: its MRTD, the
+    // release it describes, its layout, a measured boot.
+    for (name, edit, needle) in [
+        (
+            "another MRTD",
+            &(|m: &mut serde_json::Value| {
+                m["igvm"]["tdx_launch"]["mrtd"] = "6".repeat(96).into();
+            }) as &dyn Fn(&mut serde_json::Value),
+            "but releases/trust/cvm-releases/",
+        ),
+        (
+            "the CPU image's release",
+            &|m: &mut serde_json::Value| m["version"] = "v0.15.3-rc.1".into(),
+            "but the release manifest is v0.15.3-rc.1",
+        ),
+        (
+            "another layout",
+            &|m: &mut serde_json::Value| m["igvm"]["format_version"] = 2.into(),
+            "format_version 2 is not supported",
+        ),
+        (
+            "a measured boot",
+            &|m: &mut serde_json::Value| {
+                m["igvm"]["tdx_launch"]["rtmr1"] = "1".repeat(96).into();
+            },
+            "non-zero TDX rtmr1",
+        ),
+    ] {
+        let mut tree = Tree::fixture();
+        let mut manifest = tree.release_manifest();
+        tree.vendor_manifest(&manifest);
+        tree.check()
+            .unwrap_or_else(|e| panic!("{name}: re-vendored unchanged: {e}"));
+        edit(&mut manifest);
+        tree.vendor_manifest(&manifest);
+        let err = tree.check().expect_err(name);
+        assert!(err.contains(needle), "{name}: {err}");
+    }
 }
 
 /// The cuda executor runs on the release's GPU image (`X+gpu`), whose measured
@@ -406,9 +515,9 @@ fn the_release_is_the_configs_and_pinned_inline() {
 /// other build tag, is refused (`engine_deployment::check_cvm_image`).
 #[test]
 fn a_cuda_deployment_runs_on_the_gpu_image() {
-    let pinned = format!("0.15.3-rc.1+gpu@sha256:{}", "1".repeat(64));
+    let pinned = format!("0.15.3-rc.1+gpu@sha256:{RELEASE_SHA256}");
     for other in ["0.15.3-rc.1", "0.15.3-rc.1+GPU", "0.15.3-rc.1+gpu2"] {
-        let bad = format!("{other}@sha256:{}", "1".repeat(64));
+        let bad = format!("{other}@sha256:{RELEASE_SHA256}");
         let mut tree = Tree::fixture();
         tree.edit_config(&pinned, &bad);
         tree.deployment()["cvm_version"] = bad.clone().into();
@@ -587,10 +696,10 @@ fn the_prompt_cache_policy_is_one_the_node_boots_with() {
 /// bare version and exactly one inline manifest pin.
 #[test]
 fn the_release_grammar_is_the_measurers() {
-    let pinned = format!("0.15.3-rc.1+gpu@sha256:{}", "1".repeat(64));
+    let pinned = format!("0.15.3-rc.1+gpu@sha256:{RELEASE_SHA256}");
     for bad in [
         format!("v{pinned}"),
-        format!("{pinned}@sha256:{}", "1".repeat(64)),
+        format!("{pinned}@sha256:{RELEASE_SHA256}"),
         format!("0.15.3-rc.1+gpu@sha256:{}", "A".repeat(64)),
     ] {
         let mut tree = Tree::fixture();

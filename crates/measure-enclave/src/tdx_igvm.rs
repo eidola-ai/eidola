@@ -20,9 +20,10 @@
 //! disagreement anywhere is an error rather than a choice between values.
 
 use anyhow::{Context, Result, bail, ensure};
+use eidola_common::engine_deployment::deployment::read_release_manifest;
 use igvm::{IgvmDirectiveHeader, IgvmFile, IgvmPlatformHeader};
 use igvm_defs::{IgvmPageDataType, IgvmPlatformType};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256, Sha384};
 
 use crate::igvm_parameters::{ParameterAreas, Step};
@@ -167,32 +168,6 @@ pub fn mrconfigid(config: &[u8]) -> [u8; 48] {
     field
 }
 
-/// The fields of a cvmimage release manifest this tool reads.
-#[derive(Deserialize)]
-struct ReleaseManifest {
-    version: String,
-    igvm: ReleaseIgvm,
-}
-
-#[derive(Deserialize)]
-struct ReleaseIgvm {
-    /// Layout version of this `igvm` block. Only version 1 is understood.
-    format_version: u32,
-    /// SHA-256 of the TDX IGVM image.
-    tdx: String,
-    tdx_launch: TdxLaunch,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TdxLaunch {
-    mrtd: String,
-    rtmr0: String,
-    rtmr1: String,
-    rtmr2: String,
-    rtmr3: String,
-}
-
 /// The TDX launch identity of one deployment of one release.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct TdxLaunchPin {
@@ -257,20 +232,16 @@ pub fn release_pin(
         actual == manifest_sha256.to_ascii_lowercase(),
         "release manifest SHA-256 is {actual}, not the pinned {manifest_sha256}"
     );
-    let manifest: ReleaseManifest =
-        serde_json::from_slice(manifest).context("parsing release manifest")?;
-    ensure!(
-        manifest.igvm.format_version == 1,
-        "release manifest igvm.format_version {} is not supported",
-        manifest.igvm.format_version
-    );
+    // The manifest is read by the rule the gateway's build holds a vendored
+    // one to, so the two cannot disagree on what a release states.
+    let launch = read_release_manifest(manifest).map_err(anyhow::Error::msg)?;
 
     let selected = config_release(config)?;
     ensure!(
-        manifest.version == format!("v{}", selected.version),
+        launch.version == format!("v{}", selected.version),
         "config selects cvm-version {}, but the release manifest is {}",
         selected.version,
-        manifest.version
+        launch.version
     );
     if let Some(pinned) = &selected.manifest_sha256 {
         ensure!(
@@ -279,36 +250,22 @@ pub fn release_pin(
         );
     }
 
-    let launch = &manifest.igvm.tdx_launch;
-    let zero = "00".repeat(48);
-    for (name, value) in [
-        ("rtmr0", &launch.rtmr0),
-        ("rtmr1", &launch.rtmr1),
-        ("rtmr2", &launch.rtmr2),
-        ("rtmr3", &launch.rtmr3),
-    ] {
-        ensure!(
-            *value == zero,
-            "release states a non-zero TDX {name}; it is not an IGVM-model release"
-        );
-    }
-
     let igvm_sha256 = hex::encode(Sha256::digest(igvm));
     ensure!(
-        igvm_sha256 == manifest.igvm.tdx.to_ascii_lowercase(),
+        igvm_sha256 == launch.igvm_sha256,
         "IGVM image SHA-256 is {igvm_sha256}, but release {} records {}",
-        manifest.version,
-        manifest.igvm.tdx
+        launch.version,
+        launch.igvm_sha256
     );
     let mrtd = hex::encode(mrtd_from_igvm(igvm)?);
     ensure!(
-        mrtd == launch.mrtd.to_ascii_lowercase(),
+        mrtd == launch.mrtd,
         "recomputed MRTD {mrtd} disagrees with the MRTD release {} states, {}",
-        manifest.version,
+        launch.version,
         launch.mrtd
     );
     Ok(TdxLaunchPin {
-        cvm_version: manifest.version,
+        cvm_version: launch.version,
         igvm_sha256,
         mrtd,
         mrconfigid: hex::encode(mrconfigid(config)),

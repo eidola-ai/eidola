@@ -49,14 +49,16 @@ markdown=false
 oci=true' crates/eidola-apple/src/lib.rs
 # The gateway's build checks the engine pins against the committed engine
 # deployments, re-derives their machine policy from the vendored platform
-# endorsements, and compiles in the model catalog bound to those pins, so a
-# change to any of them must run the cargo gates (and, with them, the OCI
-# rehearsal).
+# endorsements, holds their MRTD to the vendored platform release manifests,
+# and compiles in the model catalog bound to those pins, so a change to any of
+# them must run the cargo gates (and, with them, the OCI rehearsal). The
+# release paths are placeholders: the classifier reads paths, not files.
 for engine_trust_path in \
   releases/trust/engine-enclaves.json \
   releases/trust/sigstore-trusted-root.json \
-  releases/trust/platform-endorsements/platform-v0.1.11/platform-endorsements.json \
-  releases/trust/platform-endorsements/platform-v0.1.11/attestation.sigstore.json \
+  releases/trust/platform-endorsements/platform-v9.9.9/platform-endorsements.json \
+  releases/trust/platform-endorsements/platform-v9.9.9/attestation.sigstore.json \
+  releases/trust/cvm-releases/v9.9.9/tinfoil-inference-v9.9.9+gpu-manifest.json \
   deploy/engine/some-model/some-variant/tinfoil-config.yml \
   deploy/engine/some-model/some-variant/deployment.json \
   models/some-family/some-model.toml; do
