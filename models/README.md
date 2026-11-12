@@ -28,7 +28,7 @@ tool_calling = true
 reasoning = true
 input_modalities = ["text"]
 output_modalities = ["text"]
-max_output_tokens = 32768              # optional; below context_length
+max_output_tokens = 32768              # below context_length; required for a token-priced row
 output_budget_class = "reasoning"      # or "standard"
 
 [price]                                # USD before PRICING_MARKUP
@@ -39,7 +39,7 @@ output_per_m = 5.75                    # or per_request = … alone
 status = "current"                     # or "deprecated" with retire_after = "YYYY-MM-DD", or "retired"
 ```
 
-The build refuses: a hash listed twice; a tag on two files; a tag outside `[A-Za-z0-9._-]+`; a `files` list that is not exactly the files the engine hashes (every `*.safetensors` shard, `config.json`, `tokenizer.json`, `chat_template.jinja`, `generation_config.json`, and `model.safetensors.index.json` when present) or whose aggregate is not `sha256`; an architecture that is not implemented; a served (current or deprecated) row without an engine pin for its hash, or a pin without one; a retired row that is still pinned.
+The build refuses: a hash listed twice; a tag on two files; a tag outside `[A-Za-z0-9._-]+`; a `files` list that is not exactly the files the engine hashes (every `*.safetensors` shard, `config.json`, `tokenizer.json`, `chat_template.jinja`, `generation_config.json`, and `model.safetensors.index.json` when present) or whose aggregate is not `sha256`; an architecture that is not implemented; a token-priced row without `max_output_tokens`; a served (current or deprecated) row without an engine pin for its hash, or a pin without one; a retired row that is still pinned.
 
 ## Lifecycle
 

@@ -198,6 +198,21 @@ fn display_capabilities_and_price_are_complete() {
     assert!(parse(&no_window).is_err());
     let ceiling = FIXTURE.replace("max_output_tokens = 32768", "max_output_tokens = 1048576");
     assert!(parse(&ceiling).unwrap_err().contains("max_output_tokens"));
+    // A token-priced row's completion is held at its declared ceiling, so it
+    // must declare one; a per-request row's price does not depend on it.
+    let undeclared = FIXTURE.replace("max_output_tokens = 32768\n", "");
+    assert_ne!(undeclared, FIXTURE);
+    assert!(
+        parse(&undeclared)
+            .unwrap_err()
+            .contains("token-priced row declares capabilities.max_output_tokens")
+    );
+    let flat_undeclared = undeclared.replace(
+        "input_per_m = 1.80\noutput_per_m = 5.75",
+        "per_request = 0.01",
+    );
+    assert_ne!(flat_undeclared, undeclared);
+    assert_eq!(parse(&flat_undeclared).unwrap().max_output_tokens, None);
     let no_text = FIXTURE.replace(
         "input_modalities = [\"text\"]",
         "input_modalities = [\"image\"]",
