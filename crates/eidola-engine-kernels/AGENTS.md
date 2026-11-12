@@ -13,7 +13,7 @@ The engine's GPU kernels, compiled ahead of time from open source on a GPU-less 
 | `nix/sources.nix` | Upstream pins (commit + NAR hash) |
 | `nix/build-kernels.sh` | Compiles, bundles, inspects, writes `manifest.json`; also runnable by hand inside `nix-shell nix` |
 | `nix/render-flashinfer-sink.sh` | Renders FlashInfer's FA2 config template + attention-sink variant without Python |
-| `scripts/build-in-docker.sh` | The builder: Nix in a pinned `nixos/nix` container; `--check`, `--verify`, `--update` |
+| `scripts/build-in-docker.sh` | The local builder: Nix, sandboxed, in a privileged pinned `nixos/nix` container; `--check`, `--verify`, `--update` |
 | `kernels.manifest.json` | The committed build manifest, compiled into the crate |
 | `src/lib.rs` | `Manifest` (parse/validate), `Cubin::entry` / `Cubin::entry_for_meta` (entry ↔ record lookups), `ArtifactDir` (verified loading), `KernelMeta` (launch contract decode) |
 
@@ -152,7 +152,7 @@ The first run downloads the toolkit into a named Docker volume (`eidola-kernels-
 - the rendered FlashInfer config,
 - `manifest.json`.
 
-Inside the container Nix runs with `sandbox = false` and `filter-syscalls = false`. The container is the isolation boundary, Nix's sandbox needs privileges it lacks, and the seccomp filter cannot load under amd64 emulation. Purity still holds: every input is fixed by hash, and the build script removes the build directory from the output.
+Inside the container Nix runs in its own sandbox (`sandbox = true`, `sandbox-fallback = false`): the build reaches no network and sees only its declared inputs. The sandbox needs namespaces a default container cannot create, so the script runs the container `--privileged`. Its seccomp filter cannot load under emulation, so `filter-syscalls` is on only when the container's platform is the Docker host's (an amd64 build on an arm64 host runs without it). Every input is fixed by hash either way, and the build script removes the build directory from the output: an arm64 build made with the sandbox off and a sandboxed `nix-build --check` rebuild of it were byte-identical.
 
 `cargo test -p eidola-engine-kernels` needs no toolkit. It checks that the committed manifest still describes the committed sources:
 
@@ -183,4 +183,4 @@ engineKernels = import ./crates/eidola-engine-kernels/nix {
 };
 ```
 
-It is `packages.x86_64-linux.eidola-engine-kernels`, and the inference node's image root (`eidola-server-engine-image-root`, `crates/eidola-server-engine/AGENTS.md` → The image) is built from it: that derivation fails unless the build's `manifest.json` equals `kernels.manifest.json` byte for byte, every cubin and fatbin the committed manifest lists has its recorded size and SHA-256, and the build produced no image the manifest does not list; it then copies exactly the listed images into the image at `/opt/eidola/kernels`. So every image build is also an x86_64 `--verify` of this crate, natively on CI's amd64 runner. Any import must pass the root's own nixpkgs revision, or the manifest's toolchain record changes.
+It is `packages.x86_64-linux.eidola-engine-kernels`, and the inference node's image root (`eidola-server-engine-image-root`, `crates/eidola-server-engine/AGENTS.md` → The image) is built from it: that derivation fails unless the build's `manifest.json` equals `kernels.manifest.json` byte for byte, every cubin and fatbin the committed manifest lists has its recorded size and SHA-256, and the build produced no image the manifest does not list; it then copies exactly the listed images into the image at `/opt/eidola/kernels`. So every image build is also an x86_64 `--verify` of this crate. CI's `oci-engine` job builds `.#eidola-engine-kernels` and the image root on its amd64 runner in Nix's sandbox (with the syscall filter, on four cores, one derivation at a time) and compares `manifest.json` to `kernels.manifest.json` as a step of its own, so a kernel mismatch is named before the image root fails on it; `oci-engine-container` builds them again inside the image's container with the sandbox off (`crates/eidola-server-engine/AGENTS.md` → The image). Any import must pass the root's own nixpkgs revision, or the manifest's toolchain record changes.
