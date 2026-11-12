@@ -180,6 +180,10 @@ onboarding-copy-label = Copy { $label }
 # that matters: say it without hedging.
 onboarding-new-account-note = This is used only to add and consume credits. If the account secret is lost, it cannot be recovered, and you will need to create a new account.
 onboarding-cta-saved = I've saved this somewhere.
+# Account creation succeeded on the server but this profile could not keep the
+# credential. The two rows below this line are the only copy of the secret.
+# $reason is the cause as the app reports it (English).
+onboarding-create-not-saved = Your account was created, but it could not be saved here ({ $reason }). This is the only copy of its secret: copy both now, then link them with “I already have an account.” once that is fixed.
 
 # -- Checking an existing account --------------------------------------------
 

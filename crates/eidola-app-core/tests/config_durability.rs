@@ -7,6 +7,7 @@
 
 use eidola_app_core::AppCore;
 use eidola_app_core::config::{AppearanceSetting, Config};
+use eidola_app_core::error::AppError;
 
 fn make_core() -> (AppCore, tempfile::TempDir) {
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
@@ -137,4 +138,107 @@ fn concurrent_setters_lose_no_update() {
     assert_eq!(saved.language_override.as_deref(), Some("lang-199"));
     assert_eq!(saved.font_scale_override, Some(1.49));
     assert_eq!(saved.account_secret.as_deref(), Some("s3cret-never-lost"));
+}
+
+/// `POST /v1/account` that changes the profile under the create before it
+/// answers — what a hand edit or a profile-sync write does while the request
+/// is in flight — and then creates the account. The server keeps only the
+/// secret's hash, so from its 201 on the response is the only copy.
+struct CreateAfter {
+    config: std::path::PathBuf,
+    rewrite_to: &'static str,
+}
+
+impl wiremock::Respond for CreateAfter {
+    fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+        std::fs::write(&self.config, self.rewrite_to).unwrap();
+        wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "account_id": "00000000-0000-0000-0000-00000000000c",
+            "secret": "only-copy-of-the-new-secret",
+            "created_at": "2025-01-01T00:00:00Z",
+        }))
+    }
+}
+
+/// Create an account against a server whose create rewrites `config.toml` to
+/// `rewrite_to` first; returns the create's outcome and the file after it.
+fn create_while_config_becomes(
+    rewrite_to: &'static str,
+) -> (
+    Result<eidola_app_core::AccountCreateResult, AppError>,
+    String,
+) {
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::builder().build().unwrap();
+    let core =
+        AppCore::with_test_http_client(dir.path().to_path_buf(), dir.path().join("data"), client)
+            .expect("open core");
+    let path = config_path(&dir);
+    let server = core.runtime().block_on(async {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/account"))
+            .respond_with(CreateAfter {
+                config: path.clone(),
+                rewrite_to,
+            })
+            .mount(&server)
+            .await;
+        server
+    });
+    core.runtime()
+        .block_on(core.set_base_url(server.uri()))
+        .expect("set base url");
+    let created = core.runtime().block_on(core.account_create(Vec::new()));
+    let after = std::fs::read_to_string(&path).unwrap();
+    (created, after)
+}
+
+/// The strict reload refuses a config that became unparseable while the
+/// create was in flight — rightly, it may hold another account — but the
+/// account already exists by then. The refusal must hand the credential back,
+/// not drop it with an ordinary config error.
+#[test]
+fn a_created_account_survives_a_config_that_broke_in_flight() {
+    let broken = "font_scale = big\n";
+    let (created, after) = create_while_config_becomes(broken);
+    match created {
+        Err(AppError::AccountNotSaved {
+            account_id, secret, ..
+        }) => {
+            assert_eq!(account_id, "00000000-0000-0000-0000-00000000000c");
+            assert_eq!(secret.expose(), "only-copy-of-the-new-secret");
+        }
+        other => panic!("the created credential was not handed back: {other:?}"),
+    }
+    assert_eq!(after, broken, "the unreadable config was written over");
+}
+
+/// The preflight's "no account yet" ran before the request. An account linked
+/// while it was in flight is seen only under the write lock, and is never
+/// overwritten: its secret would be the one lost. The new one comes back.
+#[test]
+fn an_account_linked_while_creating_is_never_overwritten() {
+    let linked = "account_id = \"acct-1\"\naccount_secret = \"s3cret-never-lost\"\n";
+    let (created, after) = create_while_config_becomes(linked);
+    let err = match created {
+        Err(e @ AppError::AccountNotSaved { .. }) => e,
+        other => panic!("the create wrote over a linked account: {other:?}"),
+    };
+    assert!(
+        after.contains("s3cret-never-lost") && !after.contains("only-copy-of-the-new-secret"),
+        "the linked account was replaced:\n{after}"
+    );
+    // The secret travels for the surface to show, never into a log line.
+    let AppError::AccountNotSaved { secret, .. } = &err else {
+        unreachable!()
+    };
+    assert_eq!(secret.expose(), "only-copy-of-the-new-secret");
+    for printed in [format!("{err}"), format!("{err:?}")] {
+        assert!(
+            !printed.contains("only-copy-of-the-new-secret"),
+            "the error prints its secret: {printed}"
+        );
+    }
 }

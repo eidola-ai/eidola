@@ -3327,11 +3327,28 @@ impl Inner {
                 message: format!("failed to parse response: {e}"),
             })?;
 
-        self.update_config(|cfg| {
+        // From here the server holds only the secret's hash: a failure to
+        // keep it must hand it back, never drop it with an ordinary error.
+        // The preflight above ran before the request; an account linked
+        // while it was in flight is seen only under the write lock, and is
+        // never overwritten (its secret would be the one lost).
+        let saved = self.update_config(|cfg| {
+            if cfg.account_id.is_some() || cfg.account_secret.is_some() {
+                return Err(AppError::Config {
+                    message: "an account was configured while this one was being created".into(),
+                });
+            }
             cfg.account_id = Some(created.account_id.to_string());
             cfg.account_secret = Some(created.secret.clone());
             Ok(())
-        })?;
+        });
+        if let Err(e) = saved {
+            return Err(AppError::AccountNotSaved {
+                account_id: created.account_id.to_string(),
+                secret: crate::error::AccountSecret::new(created.secret),
+                reason: e.to_string(),
+            });
+        }
         self.bus.emit(Change::Config);
 
         // Record the user's acceptance of exactly the documents the caller

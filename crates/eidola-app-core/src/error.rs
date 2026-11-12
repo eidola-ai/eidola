@@ -194,6 +194,24 @@ pub enum AppError {
     #[error("config error: {message}")]
     Config { message: String },
 
+    /// The server created an account, but this profile could not keep it: the
+    /// strict reload refused the config (a hand edit or a sync write made it
+    /// unparseable while the request was in flight), the save failed, or an
+    /// account was linked in the meantime, which is never overwritten.
+    ///
+    /// **This is the only copy of the secret.** The server keeps only its
+    /// hash, so an ordinary config error here would lose the account for
+    /// good. The variant carries the credential back so the surface that
+    /// asked can show it to be saved and linked once the profile is fixed.
+    /// `Display` names only the account id and the cause; the secret is in
+    /// [`AccountSecret`], which prints redacted, so a log line cannot copy it.
+    #[error("the account {account_id} was created but this profile could not save it: {reason}")]
+    AccountNotSaved {
+        account_id: String,
+        secret: AccountSecret,
+        reason: String,
+    },
+
     /// A model notice's action (switching to newer weights, dismissing a
     /// "model updated" notice) was asked of a participant that no longer has
     /// that notice: the catalog, its model or its answers moved since the
@@ -408,4 +426,34 @@ pub(crate) fn request_error_text(e: reqwest::Error) -> String {
         source = err.source();
     }
     chain
+}
+
+/// A freshly created account's secret, carried back in
+/// [`AppError::AccountNotSaved`] because nothing else holds it. Prints
+/// redacted under both `Debug` and `Display`; [`AccountSecret::expose`] is the
+/// one way to read it, for the surface that shows it to be saved.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccountSecret(String);
+
+impl AccountSecret {
+    pub fn new(secret: String) -> Self {
+        Self(secret)
+    }
+
+    /// The secret itself, for showing to the person who must save it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AccountSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AccountSecret(<redacted>)")
+    }
+}
+
+impl std::fmt::Display for AccountSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
 }

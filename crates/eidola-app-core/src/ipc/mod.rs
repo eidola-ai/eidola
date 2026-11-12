@@ -1122,6 +1122,16 @@ impl WireError {
                 ("DatabaseInUse", json!({ "pid": pid, "message": message }))
             }
             AppError::Config { message } => ("Config", json!({ "message": message })),
+            // The secret never goes on the wire: no IPC door creates an
+            // account, and a socket is not where the only copy of a
+            // credential should travel. The far side reads this as
+            // unrecognized and renders `message`, which names the account.
+            AppError::AccountNotSaved {
+                account_id, reason, ..
+            } => (
+                "AccountNotSaved",
+                json!({ "account_id": account_id, "reason": reason }),
+            ),
             AppError::Internal { message } => ("Internal", json!({ "message": message })),
             AppError::LocalModel { message } => ("LocalModel", json!({ "message": message })),
             AppError::LocalModelNotDownloaded { model } => {

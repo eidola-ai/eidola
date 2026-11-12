@@ -375,11 +375,12 @@ impl OnboardingView {
     }
 
     /// What the reader is told about a refused account creation, in the active
-    /// locale. The typed error's own English text — the recorded residual at
-    /// the app-core boundary, pinned here so it stays a decision.
+    /// locale — the same call the render makes. The typed error's own English
+    /// text for every variant but one: [`AppError::AccountNotSaved`] has a
+    /// sentence of its own, because it carries the only copy of a secret.
     #[doc(hidden)]
-    pub fn create_message_for_test(&self) -> Option<String> {
-        self.create_error.as_ref().map(|e| e.to_string())
+    pub fn create_message_for_test(&self, cx: &App) -> Option<String> {
+        self.create_error.as_ref().map(|e| create_error_copy(e, cx))
     }
 
     /// The prose a slide carries, in the active locale — the same call the
@@ -630,7 +631,9 @@ impl OnboardingView {
     /// from `consented_terms` — the same predicate that lit the button — so
     /// there is no path that submits documents the agreement did not cover.
     pub fn begin_create(&mut self, cx: &mut Context<Self>) {
-        if self.creating {
+        // An account created but not saved is on screen with the only copy of
+        // its secret; another attempt would replace that with its own result.
+        if self.creating || matches!(self.create_error, Some(AppError::AccountNotSaved { .. })) {
             return;
         }
         let Some(accepted_terms) = self.consented_terms(cx) else {
@@ -1229,6 +1232,20 @@ pub(crate) fn verify_error_copy(failure: &VerifyFailure, cx: &App) -> SharedStri
 /// residual: the one case this layer has words of its own for is the stale
 /// mint, which is a decision *this* surface made rather than a failure app-core
 /// reported.
+/// What a refused account creation says, in the reader's locale where this
+/// surface has the words. An account the server created but this profile could
+/// not keep gets its own sentence (the rows beneath it hold the credential);
+/// every other refusal is the typed error's own text, the recorded residual at
+/// the app-core boundary.
+pub(super) fn create_error_copy(error: &AppError, cx: &App) -> String {
+    match error {
+        AppError::AccountNotSaved { reason, .. } => {
+            crate::i18n::msg::onboarding_create_not_saved(cx, reason.as_str()).to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
 pub(crate) fn checkout_error_copy(failure: &CheckoutFailure, cx: &App) -> SharedString {
     match failure {
         CheckoutFailure::StaleMint => crate::i18n::msg::onboarding_checkout_stale_mint(cx),

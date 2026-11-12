@@ -98,6 +98,7 @@ onboarding-copy = 複製
 onboarding-copy-label = 複製{ $label }
 onboarding-new-account-note = 它只用於新增與消耗額度。帳戶金鑰一旦遺失便無法找回，你將需要建立一個新帳戶。
 onboarding-cta-saved = 我已經儲存好了。
+onboarding-create-not-saved = 你的帳戶已建立，但無法儲存在這裡（{ $reason }）。這是其金鑰的唯一副本：請立即複製兩項，問題解決後透過「我已經有帳戶了。」連結它們。
 
 onboarding-cta-verify = 查詢帳戶餘額。
 onboarding-cta-verify-pending = 正在查詢…

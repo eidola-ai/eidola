@@ -934,7 +934,29 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                     eprintln!("re-run with --accept-terms to agree and create the account");
                     std::process::exit(2);
                 }
-                let result = core.account_create(docs).await?;
+                let result = match core.account_create(docs).await {
+                    Ok(result) => result,
+                    // The server kept only the secret's hash: this is the one
+                    // chance to see it. Print it where the person is looking,
+                    // with the command that links it once the profile is fixed.
+                    Err(AppError::AccountNotSaved {
+                        account_id,
+                        secret,
+                        reason,
+                    }) => {
+                        eprintln!(
+                            "the account was created, but this profile could not save it: {reason}"
+                        );
+                        eprintln!("this is the only copy of its secret; save both lines now:");
+                        eprintln!("id: {account_id}");
+                        eprintln!("secret: {}", secret.expose());
+                        eprintln!(
+                            "once the profile is fixed, link it with: eidola account configure --id <id> --secret <secret>"
+                        );
+                        std::process::exit(1);
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 println!("account created");
                 println!("id: {}", result.id);
                 println!("created_at: {}", result.created_at);
