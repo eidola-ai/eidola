@@ -39,7 +39,7 @@ Its `id` is the model's first tag, or `sha256:<hex>` when it has none.
 
 ## The weights hash
 
-The engine's weights directory is flat: file names only, no subdirectories. The hash **covers** these files:
+The hash covers files at the top level of the engine's weights directory only. A published checkpoint may hold subdirectories (MiMo-V2.6-Flash's carries a drafter and an audio tokenizer in two); the engine reads nothing in them, and they are not hashed. The hash **covers** these files:
 
 - every file whose name ends in `.safetensors` (the shards);
 - `config.json`, `tokenizer.json`, `chat_template.jinja` and `generation_config.json`, all required;
@@ -76,10 +76,11 @@ It does **not** pin exact behaviour. The engine's code and version, its numerics
 ```sh
 # Download every file a catalog entry lists, from its repository at its
 # revision, checking each file's size and SHA-256, then the aggregate.
-python3 scripts/weights-hash.py download models/<family>/<label>.toml ./weights
+# MiMo-V2.6-Flash's entry lists 134 files, 173 GB.
+python3 scripts/weights-hash.py download models/mimo/mimo-v2.6-flash.toml ./weights
 
 # Check a directory you already have against an entry.
-python3 scripts/weights-hash.py verify models/<family>/<label>.toml ./weights
+python3 scripts/weights-hash.py verify models/mimo/mimo-v2.6-flash.toml ./weights
 
 # Print the weights hash of a directory, as the engine computes it.
 python3 scripts/weights-hash.py hash ./weights

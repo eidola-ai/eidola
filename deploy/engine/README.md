@@ -8,6 +8,8 @@ A deployment's one container is the node's release image, `ghcr.io/eidola-ai/eid
 
 A deployment runs the `cuda` executor on the platform release's GPU image (`cvm-version: X+gpu@sha256:<that image's release manifest>`; the CPU image refuses GPUs) with `EIDOLA_ENGINE_GPU_CC: "required"`, so the node checks its GPUs' confidential-computing mode before opening one; `not-required` is for unpinned development boots on a GPU without confidential computing, and the gateway's build refuses to pin it.
 
+One deployment is committed: `mimo-v2.6-flash/b300x1/`, MiMo-V2.6-Flash on one B300. It is pinned and has not been launched. Its weights pack is the modelwrap schema 1 pack of the catalog row's `repo@revision`, and its `GATEWAY_TOKEN_HASH` is the hash of a placeholder token that was discarded, so the release that deploys it replaces that hash with the hash of the gateway's real `ENGINE_TOKEN` and re-measures.
+
 Every deployment committed here must be pinned in `releases/trust/engine-enclaves.json`, and every pin there must match the files here: the gateway's build checks both directions and refuses to build otherwise. Layout, the pin's derivation, and the release-time measurement are in `crates/measure-enclave/AGENTS.md`.
 
 ## The machines: platform endorsements

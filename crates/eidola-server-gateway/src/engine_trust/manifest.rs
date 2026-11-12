@@ -72,6 +72,9 @@ pub struct CheckedModel {
     pub prompt_cache: CheckedCachePolicy,
     /// The config path of every accepted deployment, in file order.
     pub deployments: Vec<String>,
+    /// The longest sequence every one of its deployments serves: the
+    /// smallest `EIDOLA_ENGINE_MAX_MODEL_LEN` among them.
+    pub max_model_len: u32,
 }
 
 /// A model's weights: the engine's weights hash and where the bytes came
@@ -139,10 +142,12 @@ pub fn check(
             .ok_or_else(|| format!("{at}: must be a non-empty array of deployments"))?;
         let mut configs = Vec::new();
         let mut identities = Vec::new();
+        let mut max_model_len = u32::MAX;
         for (index, deployment) in deployments.iter().enumerate() {
             let at = format!("{at}, deployment {index}");
-            let (config, weights, prompt_cache, architecture) =
+            let (config, weights, prompt_cache, architecture, model_len) =
                 check_deployment(deployment, &at, read)?;
+            max_model_len = max_model_len.min(model_len);
             if let Some(previous) = seen_configs.insert(config.clone(), id.clone()) {
                 return Err(format!(
                     "{at}: {config} is already pinned under model {previous:?}"
@@ -183,9 +188,34 @@ pub fn check(
                 max_age_secs: identity.prompt_cache.max_age_secs,
             },
             deployments: configs,
+            max_model_len,
         });
     }
     Ok(checked)
+}
+
+/// A catalog row's context window is one its deployments serve: `windows` is
+/// each row's path, weights hash and `context_length`, and for every hash
+/// that is pinned the window must be at most the smallest
+/// `EIDOLA_ENGINE_MAX_MODEL_LEN` among its deployments. A wider window would
+/// publish a length clients size prompts to and the engine refuses. A row
+/// with no pin is the catalog binding's to refuse, not this check's.
+pub fn check_context_windows(
+    windows: &[(&str, &str, u64)],
+    checked: &[CheckedModel],
+) -> Result<(), String> {
+    for &(path, sha256, context_length) in windows {
+        if let Some(model) = checked.iter().find(|m| m.id == sha256)
+            && context_length > u64::from(model.max_model_len)
+        {
+            return Err(format!(
+                "{path}: context_length is {context_length}, but a deployment of {sha256} \
+                 serves at most {} positions (EIDOLA_ENGINE_MAX_MODEL_LEN)",
+                model.max_model_len
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Every committed deployment directory must be pinned: `committed` is the
@@ -211,7 +241,16 @@ fn check_deployment(
     deployment: &serde_json::Value,
     at: &str,
     read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
-) -> Result<(String, CheckedWeights, CheckedCachePolicy, Architecture), String> {
+) -> Result<
+    (
+        String,
+        CheckedWeights,
+        CheckedCachePolicy,
+        Architecture,
+        u32,
+    ),
+    String,
+> {
     let deployment = object(deployment, at)?;
     exact_keys(
         deployment,
@@ -449,6 +488,7 @@ fn check_deployment(
         weights,
         prompt_cache,
         checked.architecture,
+        checked.measured.sizing.max_model_len,
     ))
 }
 

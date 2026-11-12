@@ -31,6 +31,8 @@ services:
       STRIPE_API_KEY: ${STRIPE_API_KEY:-}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
+      # Development only: no deployed node verifies this token.
+      ENGINE_TOKEN: ${ENGINE_TOKEN:-dev-engine-token-not-a-secret}
       BIND_ADDR: 0.0.0.0:8080
     ports:
       - "8080:8080"

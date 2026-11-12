@@ -511,7 +511,8 @@ pub(crate) mod tests {
     // -----------------------------------------------------------------
     // Fixture rows and pins. Never shipped: the production catalog and
     // its pins are checked by the same functions below, and the fixtures
-    // keep every check exercised while the production catalog is empty.
+    // keep the deprecated, retired and per-request paths exercised, which
+    // the production catalog does not have.
     // -----------------------------------------------------------------
 
     pub(crate) const ENGINE_SHA: &str =
@@ -908,9 +909,65 @@ pub(crate) mod tests {
         );
     }
 
-    /// The shipped catalog publishes exactly its served rows, each pinned,
-    /// and with no pinned deployment that is nothing: `/v1/models` is empty
-    /// and every chat request is refused.
+    /// Every shipped row resolves by each reference form, and publishes the
+    /// deployments and the prompt-cache retention the committed pin file
+    /// records for its hash, read here from that file's bytes rather than
+    /// through the gateway's own parse of it.
+    #[test]
+    fn every_shipped_row_resolves_and_publishes_its_pinned_deployments() {
+        let committed: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../releases/trust/engine-enclaves.json"
+        )))
+        .unwrap();
+        let catalog = Catalog::new(Some(DEFAULT_PRICING_MARKUP), None).unwrap();
+        for row in served(MODEL_CATALOG) {
+            let sha = row.sha256;
+            for tag in row.tags {
+                let followed = catalog.resolve(tag).unwrap();
+                assert_eq!(followed.model.sha256, sha);
+                assert_eq!(followed.echo, format!("{tag}@sha256:{sha}"));
+                let pinned = catalog.resolve(&format!("{tag}@sha256:{sha}")).unwrap();
+                assert_eq!(pinned.model.sha256, sha);
+                assert_eq!(pinned.echo, format!("{tag}@sha256:{sha}"));
+            }
+            let bare = catalog.resolve(&format!("sha256:{sha}")).unwrap();
+            assert_eq!(bare.echo, format!("sha256:{sha}"));
+            let upper = format!("sha256:{}", sha.to_ascii_uppercase());
+            assert_eq!(
+                catalog.resolve(&upper).unwrap_err(),
+                ModelRefError::Malformed,
+                "only lowercase digests"
+            );
+
+            let pins = committed["models"][sha].as_array().expect("pinned");
+            let model = serde_json::to_value(&bare.model).unwrap();
+            let published = model["deployments"].as_array().unwrap();
+            assert_eq!(published.len(), pins.len(), "{sha} deployments");
+            for (wire, pin) in published.iter().zip(pins) {
+                assert_eq!(wire["config_sha256"], pin["config_sha256"]);
+                assert_eq!(wire["measurement"], pin["pin"]);
+                let cache = &model["capabilities"]["prompt_cache"];
+                if pin["prompt_cache"]["enabled"] == true {
+                    assert_eq!(cache["idle_ttl_secs"], pin["prompt_cache"]["idle_ttl_secs"]);
+                    assert_eq!(cache["max_age_secs"], pin["prompt_cache"]["max_age_secs"]);
+                } else {
+                    assert_eq!(cache, &serde_json::json!({"supported": false}));
+                }
+                assert_eq!(
+                    model["capabilities"]["pinned_weights"]["repo"],
+                    pin["weights"]["repo"]
+                );
+                assert_eq!(
+                    model["capabilities"]["pinned_weights"]["revision"],
+                    pin["weights"]["revision"]
+                );
+            }
+        }
+    }
+
+    /// The shipped catalog publishes exactly its served rows, each pinned
+    /// (a row is listed only with the deployments its build accepts).
     #[test]
     fn the_shipped_catalog_lists_only_its_pinned_rows() {
         let catalog = Catalog::new(Some(DEFAULT_PRICING_MARKUP), None).unwrap();
