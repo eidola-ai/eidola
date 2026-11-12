@@ -287,14 +287,13 @@ jobs:
 
       - name: Test billing transactions and recovery with PostgreSQL
         if: steps.scope.outputs.rust == 'true'
-        env:
-          BILLING_TEST_DATABASE_URL: postgres://billing_test@127.0.0.1:55442/billing_test?sslmode=disable
-          DATABASE_URL: postgres://billing_test@127.0.0.1:55442/billing_test?sslmode=disable
         run: |
           set -euo pipefail
           trap 'docker rm -f eidola-billing-tests >/dev/null 2>&1 || true' EXIT
+          # Docker picks a free host port: a fixed one can already be taken,
+          # by anything on the runner that was handed it as an ephemeral port.
           docker run --detach --name eidola-billing-tests \
-            --publish 127.0.0.1:55442:5432 \
+            --publish 127.0.0.1::5432 \
             --env POSTGRES_USER=billing_test --env POSTGRES_DB=billing_test \
             --env POSTGRES_HOST_AUTH_METHOD=trust \
             postgres:17@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f
@@ -305,6 +304,9 @@ jobs:
           done
           docker exec -i eidola-billing-tests psql -U billing_test -d billing_test -v ON_ERROR_STOP=1 \
             < crates/eidola-server-gateway/schema/schema.sql
+          published="$(docker port eidola-billing-tests 5432/tcp)"
+          export DATABASE_URL="postgres://billing_test@${published}/billing_test?sslmode=disable"
+          export BILLING_TEST_DATABASE_URL="${DATABASE_URL}"
           cargo test -p eidola-billing -- --ignored --test-threads=1
           cargo test -p eidola-billing-cli -- --ignored --test-threads=1
           cargo test -p eidola-server-gateway -- --ignored --test-threads=1
