@@ -37,10 +37,9 @@
 //! (`eidola_common::engine_protocol::refused_before_admission`: a
 //! misconfiguration, or `overloaded`). Any other answer, an error included,
 //! may come after the engine ran the request, and is returned.
-//! Every request is a stream to the engine, whatever its client asked for: it
-//! comes back as `BackendStreamEvent`s, which the handler forwards to a
-//! streaming client or assembles into one answer for a blocking one
-//! (`assemble`), and which billing settles: usage → charge.
+//! Every request is a stream to the engine, as every chat request to the
+//! gateway is: it comes back as `BackendStreamEvent`s, which the handler
+//! forwards to its client and billing settles: usage → charge.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -67,7 +66,6 @@ use crate::types::{ChatCompletionChunk, ErrorResponse};
 use eidola_common::engine_protocol::{PreAdmission, refused_before_admission};
 use eidola_common::stream_shape::{StreamEvent, StreamReader, Unreadable, unpadded};
 
-pub mod assemble;
 mod breaker;
 pub mod placement;
 mod rendezvous;
@@ -185,8 +183,7 @@ pub fn attesting_client_factory(roots: AttestationRoots) -> ClientFactory {
 /// node that has stopped answering reaches it; the cost of a lower value is a
 /// large prompt refused by every engine in turn. Nothing reached the client,
 /// so the request is refunded in full if no engine answers, as for any
-/// request no engine took. Every request is a stream to the engine, so this
-/// bounds a client's blocking request too.
+/// request no engine took.
 pub const STREAM_HEADERS_LIMIT: Duration = Duration::from_secs(60);
 
 /// How long an open stream from an engine may deliver nothing at all before
@@ -648,7 +645,7 @@ impl EngineRouter {
         let headers = engine_request_headers(&self.inner.token, &model.pinned);
         // The forwarded copy is an ordinary buffer the HTTP stack owns, as on
         // the node; the canonical body it is copied from is scrubbed.
-        let body = bytes::Bytes::copy_from_slice(&node_request_body(request));
+        let body = bytes::Bytes::copy_from_slice(&engine_request_body(request));
         Ok(Plan {
             model,
             upstreams: ranked,
@@ -751,9 +748,8 @@ impl EngineRouter {
     }
 
     /// A request, as a stream: chunks as the engine sends them, then `Done`
-    /// with the usage the engine reported. Every request is sent to the
-    /// engine as a stream ([`node_request_body`]); a client's blocking
-    /// request is assembled from it (`assemble`).
+    /// with the usage the engine reported. The body asks the engine for a
+    /// stream with its usage ([`engine_request_body`]).
     #[tracing::instrument(skip_all, name = "engine.chat_stream", err)]
     pub async fn send_stream(
         &self,
@@ -793,24 +789,6 @@ impl EngineRouter {
         }
         Err(no_engine())
     }
-}
-
-/// The body `request` is sent to a node with: [`engine_request_body`], always
-/// asking for a stream with its usage, whatever the client asked for. A node
-/// answers only streams, and the stream is what bounds how long a request
-/// waits on a silent engine and what a request ended early is charged by;
-/// the client's own choice of transport is the gateway's to answer.
-fn node_request_body(request: &ValidatedRequest) -> zeroize::Zeroizing<Vec<u8>> {
-    let mut body = engine_request_body(request);
-    if !request.request().stream {
-        // `engine_request_body` writes these two members for a streaming
-        // request and drops any the client sent, so the object lacks both
-        // here: they go in before its closing brace.
-        let close = body.pop();
-        debug_assert_eq!(close, Some(b'}'));
-        body.extend_from_slice(br#","stream":true,"stream_options":{"include_usage":true}}"#);
-    }
-    body
 }
 
 /// The refusal when no engine could take a request.

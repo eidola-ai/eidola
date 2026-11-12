@@ -4263,9 +4263,9 @@ pub(crate) mod tests {
     }
 
     /// **A chat spend's proof is verified at pre-flight and once more when
-    /// its refund is signed, and no more**, on the blocking path (the
-    /// handler's own `act`) and the streaming one (a clone moved into the
-    /// stream). Two is the floor the crate allows: it verifies only while
+    /// its refund is signed, and no more**, whether the refund is signed for
+    /// the spend itself or for a clone of it (the one moved into the stream's
+    /// task). Two is the floor the crate allows: it verifies only while
     /// signing a refund for a fixed amount, and a chat spend's amount is not
     /// known at pre-flight (`verify_and_refund`). Against an unreachable
     /// database: the key is cached, and storing the refund is best-effort.
@@ -4294,7 +4294,7 @@ pub(crate) mod tests {
         .unwrap();
         let mut keys = Cache::new();
         let hash = add_key(&mut keys, SystemTime::now() + DAY);
-        let (blocking, _) = spend(&keys[&hash], 100, 10);
+        let (own, _) = spend(&keys[&hash], 100, 10);
         let (streaming, _) = spend(&keys[&hash], 100, 10);
         let state = AppState::new(
             crate::backend::Catalog::new(None, None).unwrap(),
@@ -4305,14 +4305,14 @@ pub(crate) mod tests {
             Arc::new(RwLock::new(keys)),
         );
 
-        crate::handlers::check_presented_spends(&state, std::slice::from_ref(&blocking))
+        crate::handlers::check_presented_spends(&state, std::slice::from_ref(&own))
             .await
             .unwrap();
-        assert_eq!(verification_count::of(&blocking.spend_proof), 1);
-        crate::handlers::issue_refund_async(&state, &blocking, 4)
+        assert_eq!(verification_count::of(&own.spend_proof), 1);
+        crate::handlers::issue_refund_async(&state, &own, 4)
             .await
             .unwrap();
-        assert_eq!(verification_count::of(&blocking.spend_proof), 2);
+        assert_eq!(verification_count::of(&own.spend_proof), 2);
 
         crate::handlers::check_presented_spends(&state, std::slice::from_ref(&streaming))
             .await

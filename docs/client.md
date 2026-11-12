@@ -53,6 +53,7 @@ Some operations stay local even though a server could perform them:
 
 - **Conversation history** is stored in a local Turso database in the user's application support directory. It is never uploaded.
 - **Anonymous credentials** are held by the client. It generates each token's secrets, has the gateway sign a commitment to them, and spends the token on inference requests. The gateway never sees a token it can pair with the account that requested it ([anonymous-credits.md](anonymous-credits.md)).
+- **Assembling one whole answer.** The gateway serves every chat answer as a stream. Where the client wants one whole answer (a command-line chat, a background chore, a local tool asking the client's proxy without a stream), it asks for a stream and assembles the answer itself, so an answer cut short partway still reaches it, kept in its Record, and the spend settles on what was generated, from the refund the stream carried.
 - **Trust-chain verification** for self-update runs entirely in the client. The verifier fetches release artifacts, hashes them locally, and checks every signature locally against the embedded trust root. No server-side "is this release safe?" call exists.
 
 ## Prefix-cache keys

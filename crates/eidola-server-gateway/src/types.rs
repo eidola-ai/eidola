@@ -29,16 +29,20 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub top_p: Option<f32>,
 
-    /// Whether to stream partial responses.
+    /// Whether to stream the response. Must be `true`: every chat answer is
+    /// a stream, and a request without it is refused before anything is
+    /// spent. A client that reads one whole answer assembles it from the
+    /// stream.
     #[serde(default)]
     pub stream: bool,
 
     /// Streaming options. The OpenAI-compatible field; we accept it for
     /// API parity with clients that already set it (e.g. an SDK setting
     /// `include_usage: true` to capture token counts in the final chunk).
-    /// Note: the server overrides `include_usage` to `true` for any
-    /// streaming request before forwarding upstream — usage is required
-    /// for accurate per-token refunds and isn't a client choice.
+    /// Note: the server sets `include_usage` to `true` before forwarding
+    /// upstream, and the final usage chunk reaches the client whatever it
+    /// asked: usage is required for accurate per-token refunds and isn't a
+    /// client choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
 
@@ -421,90 +425,6 @@ pub struct ImageUrl {
     /// Optional detail level for the image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-}
-
-/// A chat completion response.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ChatCompletionResponse {
-    /// Unique identifier for the completion.
-    pub id: String,
-
-    /// The object type (always "chat.completion").
-    pub object: String,
-
-    /// Unix timestamp of when the completion was created.
-    pub created: u64,
-
-    /// The model used for completion.
-    pub model: String,
-
-    /// List of completion choices.
-    pub choices: Vec<Choice>,
-
-    /// Usage statistics for the request.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Usage>,
-}
-
-impl ChatCompletionResponse {
-    pub fn new(id: String, model: String, choices: Vec<Choice>, usage: Option<Usage>) -> Self {
-        Self {
-            id,
-            object: "chat.completion".to_string(),
-            created: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            model,
-            choices,
-            usage,
-        }
-    }
-}
-
-/// A completion choice.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct Choice {
-    /// The index of this choice.
-    pub index: u32,
-
-    /// The generated message.
-    pub message: AssistantMessage,
-
-    /// The reason the model stopped generating.
-    pub finish_reason: Option<FinishReason>,
-
-    /// On a `length` ending from an Eidola engine: whether the reasoning and
-    /// content given out can be sent back as a continued final message
-    /// (`continue_final_message`) that renders exactly the text the model
-    /// generated. A client offers continuation only where it is `true`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continuable: Option<bool>,
-}
-
-/// An assistant message in a response.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AssistantMessage {
-    pub role: Role,
-    pub content: Option<String>,
-
-    /// Reasoning ("thinking") output from models that emit it. Two
-    /// spellings are in the wild: OpenAI o-series and many compatible
-    /// gateways use `reasoning_content`; vLLM uses `reasoning`. We
-    /// faithfully round-trip whichever the upstream sent so clients can
-    /// pick. Both stay `None` for non-thinking models.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<String>,
-
-    /// Tool calls the model asked for. Relayed to the client **verbatim**
-    /// (raw `Value`s) so the ids and any provider extension fields survive —
-    /// the client replays these objects unchanged on its follow-up request,
-    /// and a narrower struct here would silently drop what it doesn't model,
-    /// exactly the defect the `reasoning*` fields above were added to fix.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 /// The reason the model stopped generating.
@@ -1091,38 +1011,6 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_response() {
-        let response = ChatCompletionResponse {
-            id: "chatcmpl-123".to_string(),
-            object: "chat.completion".to_string(),
-            created: 1234567890,
-            model: "gpt-4o".to_string(),
-            choices: vec![Choice {
-                index: 0,
-                message: AssistantMessage {
-                    role: Role::Assistant,
-                    content: Some("Hello!".to_string()),
-                    reasoning_content: None,
-                    reasoning: None,
-                    tool_calls: None,
-                },
-                finish_reason: Some(FinishReason::Stop),
-                continuable: None,
-            }],
-            usage: Some(Usage {
-                prompt_tokens: 10,
-                completion_tokens: 5,
-                total_tokens: 15,
-            }),
-        };
-
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"id\":\"chatcmpl-123\""));
-        assert!(json.contains("\"object\":\"chat.completion\""));
-        assert!(json.contains("\"finish_reason\":\"stop\""));
-    }
-
-    #[test]
     fn test_serialize_chunk() {
         let chunk = ChatCompletionChunk {
             id: "chatcmpl-123".to_string(),
@@ -1304,19 +1192,9 @@ mod tests {
     }
 
     /// An engine's `continuable` verdict on a `length` ending reaches the
-    /// client through the relay, in both shapes, and is absent where the engine
-    /// sent none.
+    /// client through the relay, and is absent where the engine sent none.
     #[test]
     fn a_length_endings_continuable_verdict_is_relayed() {
-        let blocking = serde_json::json!({
-            "id": "c", "object": "chat.completion", "created": 1, "model": "m",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi "},
-                         "finish_reason": "length", "continuable": false}],
-        });
-        let parsed: ChatCompletionResponse = serde_json::from_value(blocking).unwrap();
-        let back = serde_json::to_value(&parsed).unwrap();
-        assert_eq!(back["choices"][0]["continuable"], false);
-
         let chunk = serde_json::json!({
             "id": "c", "object": "chat.completion.chunk", "created": 1, "model": "m",
             "choices": [{"index": 0, "delta": {}, "finish_reason": "length", "continuable": true}],
@@ -1445,41 +1323,6 @@ mod tests {
         assert!(!out.contains("tool_choice"));
         assert!(!out.contains("tool_calls"));
         assert!(!out.contains("tool_call_id"));
-    }
-
-    #[test]
-    fn blocking_response_relays_tool_calls_verbatim() {
-        // The upstream's blocking answer: `finish_reason: "tool_calls"` plus
-        // call objects carrying a provider extension field.
-        let upstream = r#"{
-            "id": "chatcmpl-1", "object": "chat.completion", "created": 1,
-            "model": "gpt-4o",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": null, "tool_calls": [
-                    {"id": "call_1", "type": "function",
-                     "function": {"name": "calc", "arguments": "{\"expr\":\"2+2\"}"},
-                     "provider_extra": {"trace": "abc"}}
-                ]},
-                "finish_reason": "tool_calls"
-            }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
-        }"#;
-        let parsed: ChatCompletionResponse = serde_json::from_str(upstream).unwrap();
-        assert!(matches!(
-            parsed.choices[0].finish_reason,
-            Some(FinishReason::ToolCalls)
-        ));
-
-        let relayed: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
-        let original: serde_json::Value = serde_json::from_str(upstream).unwrap();
-        assert_eq!(
-            relayed["choices"][0]["message"]["tool_calls"],
-            original["choices"][0]["message"]["tool_calls"],
-            "the client replays these objects verbatim — nothing may be dropped"
-        );
-        assert_eq!(relayed["choices"][0]["finish_reason"], "tool_calls");
     }
 
     #[test]
