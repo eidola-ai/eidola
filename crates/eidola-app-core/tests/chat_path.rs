@@ -171,6 +171,35 @@ fn assert_shared_request_body(body: &serde_json::Value, expected_stream: bool) {
 // Happy path — blocking chat
 // ===========================================================================
 
+/// **A turn's recorded duration covers the answer's generation.** The gateway
+/// answers with a stream that opens before the model has produced anything,
+/// so the response is timed when the whole answer has been read, not when
+/// the stream opened.
+#[test]
+fn a_blocking_turns_duration_covers_its_generation() {
+    run(|| {
+        let answer_ms = 400;
+        let (_mock, core, _dir) = setup(MockConfig {
+            answer_ms,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("chat should succeed");
+        let requests = core
+            .runtime()
+            .block_on(core.list_requests(10, 0))
+            .expect("requests");
+        assert_eq!(requests.len(), 1);
+        let duration = requests[0].duration_ms.expect("a duration");
+        assert!(
+            duration >= answer_ms as i64,
+            "recorded {duration} ms for an answer that took {answer_ms} ms to arrive"
+        );
+    })
+}
+
 #[test]
 fn blocking_chat_persists_and_emits() {
     run(|| {
@@ -1166,7 +1195,8 @@ fn blocking_and_streaming_dispatch_use_the_shared_request_body() {
                 .expect("blocking chat succeeds");
 
             let body = mock.chat_bodies().pop().expect("blocking request");
-            assert_shared_request_body(&body, false);
+            // The Eidola gateway serves only streams: the blocking twin asks for one.
+            assert_shared_request_body(&body, true);
         }
 
         {
@@ -1207,7 +1237,8 @@ fn blocking_and_streaming_dispatch_use_the_shared_request_body() {
                 .chat_bodies()
                 .pop()
                 .expect("blocking tool follow-up request");
-            assert_shared_request_body(&body, false);
+            // The Eidola gateway serves only streams: the blocking twin asks for one.
+            assert_shared_request_body(&body, true);
         }
 
         {
@@ -3650,7 +3681,8 @@ fn a_rejected_tools_field_on_a_spending_backend_settles_both_holds() {
             .runtime()
             .block_on(core.chat("Tell me more.".into(), MODEL.into(), Some(space.clone())))
             .expect("the turn must survive a server that rejects the tools field");
-        assert_eq!(result.content, "Hello from the mock.");
+        // The Eidola backend answers a blocking turn from a stream.
+        assert_eq!(result.content, chat_harness::STREAM_CONTENT);
 
         // The rejected attempt is an emission point of its own (bus.rs's
         // degrade row): its request row lands, and the retry's fresh hold is a
@@ -3873,7 +3905,8 @@ fn a_declared_incapable_model_is_never_offered_tools() {
             .runtime()
             .block_on(core.chat("Tell me more.".into(), MODEL.into(), Some(space.clone())))
             .expect("a withheld tools field must leave an ordinary turn");
-        assert_eq!(result.content, "Hello from the mock.");
+        // The Eidola backend answers a blocking turn from a stream.
+        assert_eq!(result.content, chat_harness::STREAM_CONTENT);
 
         let bodies = mock.chat_bodies();
         assert_eq!(
@@ -3978,7 +4011,8 @@ fn a_declaration_from_an_override_reached_backend_is_only_a_hint() {
             .runtime()
             .block_on(core.chat("Tell me more.".into(), MODEL.into(), Some(space.clone())))
             .expect("the degrade still recovers the turn");
-        assert_eq!(result.content, "Hello from the mock.");
+        // The Eidola backend answers a blocking turn from a stream.
+        assert_eq!(result.content, chat_harness::STREAM_CONTENT);
 
         let bodies = mock.chat_bodies();
         assert_eq!(
@@ -4864,6 +4898,164 @@ fn a_stream_cut_short_settles_on_what_was_generated() {
             successor.credits,
             spent.credits - i64::try_from(CHARGED).unwrap(),
             "charged {CHARGED} of a {hold}-credit hold"
+        );
+        assert_settled(&core);
+    });
+}
+
+// ===========================================================================
+// The blocking twins against the Eidola backend read a stream
+//
+// The gateway serves chat only as a stream, so a blocking turn, a blocking
+// continuation, a chore and the proxy's non-streamed route each ask it for one
+// and assemble the answer (`whole_answer`). The mock refuses a spending request
+// that does not ask for a stream, as the gateway does, and counts it.
+// ===========================================================================
+
+/// **A blocking turn the gateway cut short is not an answer, and it settles on
+/// the refund the stream carried.** The stream ends with the metadata event
+/// (charged what was generated) and no `[DONE]`: the turn fails as its
+/// streaming twin does, writes no answer, settles from the in-band refund —
+/// the only copy, under `NotStored` — and the Record keeps the partial answer
+/// with the ending as its error.
+#[test]
+fn a_blocking_turn_cut_short_settles_in_band_and_keeps_what_arrived() {
+    run(|| {
+        const CHARGED: u128 = 31;
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingCutShortWithRefund,
+            refund: RefundMode::NotStored,
+            settled_charge: Some(CHARGED),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+        let err = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect_err("an interrupted answer is not an answer");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("ended without finishing")),
+            "{err:?}"
+        );
+        assert_eq!(
+            mock.blocking_asks(),
+            0,
+            "the blocking turn asked for a stream"
+        );
+        assert_eq!(mock.chat_bodies()[0]["stream"], true);
+
+        assert_eq!(mock.refund_hits(), 0, "settled from the refund in band");
+        assert_settled(&core);
+        let lifecycle = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("lifecycle");
+        let spent = lifecycle
+            .iter()
+            .find(|c| c.state == "spent")
+            .expect("the spent credential");
+        let successor = lifecycle
+            .iter()
+            .find(|c| c.state == "active")
+            .expect("its successor");
+        assert_eq!(
+            successor.credits,
+            spent.credits - i64::try_from(CHARGED).unwrap(),
+            "charged what was generated, once"
+        );
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Wallet), "got {changes:?}");
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(only_space(&core)))
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "only the user's turn: {messages:?}");
+        let rows = completion_rows(&core);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ended without finishing")),
+            "{:?}",
+            rows[0].error
+        );
+        let recorded = request_detail(&core, &rows[0].id)
+            .response_body
+            .expect("a recorded body");
+        assert!(
+            String::from_utf8_lossy(&recorded).contains(STREAM_CONTENT),
+            "the Record keeps what arrived"
+        );
+    });
+}
+
+/// **A blocking turn's answer from the Eidola backend is read from a stream**,
+/// every round of it: the tool round and the round after it each ask for a
+/// stream, the blocking reader sees the call, and each round's hold settles
+/// from its in-band refund.
+#[test]
+fn a_blocking_tool_turn_reads_each_round_from_a_stream() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+        let res = core
+            .runtime()
+            .block_on(core.chat("use the tool".into(), MODEL.into(), None))
+            .expect("a two-round turn");
+        assert_eq!(res.content, chat_harness::TOOL_FINAL_CONTENT);
+        assert_eq!(mock.blocking_asks(), 0);
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies.iter().all(|b| b["stream"] == true), "{bodies:?}");
+        assert_eq!(
+            bodies[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .nth(1)
+                .unwrap()["tool_calls"][0]["id"],
+            chat_harness::tool_call_id(1),
+            "the call the stream carried is replayed"
+        );
+        assert_eq!(mock.refund_hits(), 0, "each round settled in band");
+        assert_settled(&core);
+    });
+}
+
+/// **A blocking continuation reads a stream too**, and the continued answer
+/// is written whole.
+#[test]
+fn a_blocking_continuation_reads_a_stream() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Answer,
+                again: false,
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        let res = core
+            .runtime()
+            .block_on(core.continue_answer(cut.response_action_id.clone().unwrap()))
+            .expect("the continuation");
+        assert_eq!(res.content, format!("{STREAM_CONTENT}{CONTINUED_TAIL}"));
+        assert_eq!(mock.blocking_asks(), 0);
+        assert!(
+            mock.chat_bodies().iter().all(|b| b["stream"] == true),
+            "both blocking doors asked for a stream"
         );
         assert_settled(&core);
     });
@@ -9078,13 +9270,14 @@ fn a_pre_stream_failure_settles_from_the_refund_its_error_body_carried() {
 /// refund and all. Parsed as SSE it yields no events and ends without `[DONE]`,
 /// so the turn failed as a dropped connection and the body — the only copy of
 /// the token, where the server's persistence failed — was never read.
-/// `OkBlocking` answers JSON whatever transport asked, which is precisely the
-/// fixture.
+/// `OkBlocking` with `ignores_stream` answers JSON whatever transport asked,
+/// which is precisely the fixture.
 #[test]
 fn a_streamed_ask_answered_with_a_whole_completion_is_refused_and_settles_from_it() {
     run(|| {
         let (mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::OkBlocking,
+            ignores_stream: true,
             refund: RefundMode::NotStored,
             ..MockConfig::default()
         });
@@ -9360,7 +9553,8 @@ fn a_stream_past_the_read_ceiling_fails_the_turn() {
 /// ceiling stopped is refused whatever it parses as.** `resp.text()` buffered
 /// the whole answer before anything could cap it; the padded complete object
 /// is the case where a truncated read still parses, so the refusal has to be
-/// decided by the ceiling rather than inferred from the parse.
+/// decided by the ceiling rather than inferred from the parse. A backend
+/// that answers blocking requests is where that body arrives: an engine.
 #[test]
 fn a_blocking_answer_past_the_read_ceiling_is_refused_rather_than_parsed() {
     run(|| {
@@ -9368,21 +9562,16 @@ fn a_blocking_answer_past_the_read_ceiling_is_refused_rather_than_parsed() {
             chat: ChatBehavior::OkBlockingPaddedPastCeiling,
             ..MockConfig::default()
         });
-        with_account(&core);
+        core.test_register_loaded_local_model("local", "engine", mock.port());
         let mut rx = core.subscribe_changes();
         let err = core
             .runtime()
-            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .block_on(core.chat("hello".into(), "engine@local".into(), None))
             .expect_err("refused at the ceiling");
         assert!(
             matches!(&err, AppError::Network { message } if message.contains("ceiling")),
             "{err:?}"
         );
-        assert!(
-            mock.refund_hits() >= 1,
-            "nothing parsed, so recovery answers"
-        );
-        assert_settled(&core);
         let changes = drain(&mut rx);
         assert!(changes.contains(&Change::Record), "got {changes:?}");
 
@@ -9408,6 +9597,66 @@ fn a_blocking_answer_past_the_read_ceiling_is_refused_rather_than_parsed() {
         assert!(
             text.contains("the read stopped at the"),
             "the row says where reading stopped: {}",
+            &text[text.len().saturating_sub(300)..]
+        );
+    });
+}
+
+/// **The read ceiling bounds an answer assembled from a stream** as it bounds
+/// a blocking body: the Eidola backend's blocking turn reads a stream, and one
+/// whose deltas pass the ceiling is refused once it has been read to its end,
+/// the hold settled (by recovery, with no refund in band), and the Record
+/// keeps what its cap allows of what was read.
+#[test]
+fn an_assembled_answer_past_the_read_ceiling_is_refused() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingPaddedPastCeiling,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+        let err = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect_err("refused at the ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("ceiling")),
+            "{err:?}"
+        );
+        assert_eq!(mock.blocking_asks(), 0, "the turn asked for a stream");
+        assert!(
+            mock.refund_hits() >= 1,
+            "no refund in band, so recovery answers"
+        );
+        assert_settled(&core);
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+
+        let space_id = only_space(&core);
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id))
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "a refused read is not an answer");
+        let rows = completion_rows(&core);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ceiling")),
+            "{:?}",
+            rows[0].error
+        );
+        let recorded = request_detail(&core, &rows[0].id)
+            .response_body
+            .expect("a recorded body");
+        let text = String::from_utf8_lossy(&recorded);
+        // The stream was read to its end, where its refunds would be, so the
+        // Record states its whole size beside what it kept.
+        assert!(
+            text.contains("The rest was received and not retained"),
+            "the whole stream was read: {}",
             &text[text.len().saturating_sub(300)..]
         );
     });
@@ -9787,8 +10036,8 @@ fn a_model_whose_engine_caches_prefixes_is_sent_a_key_on_both_transports() {
             .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
             .expect("blocking turn");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
-        // The blocking mock answers a streamed ask with a whole completion,
-        // which the streaming transport refuses — only the request matters.
+        // Both transports ask the Eidola gateway for a stream; only the
+        // requests matter here.
         let _ = core.runtime().block_on(core.chat_stream(
             "And why two per day?".into(),
             MODEL.into(),
@@ -9799,7 +10048,7 @@ fn a_model_whose_engine_caches_prefixes_is_sent_a_key_on_both_transports() {
         let bodies = mock.chat_bodies();
         assert_eq!(bodies.len(), 2);
         let key = sent_key(&bodies[0]);
-        assert_shared_keyed_body(&bodies[0], false, &key);
+        assert_shared_keyed_body(&bodies[0], true, &key);
         assert_shared_keyed_body(&bodies[1], true, &key);
     });
 }
@@ -9831,11 +10080,11 @@ fn a_model_without_a_declared_prefix_cache_is_sent_the_body_it_always_was() {
                     MODEL.into(),
                     Some(first.space_id.clone()),
                 ))
-                .expect_err("the streaming mock does not answer a blocking ask");
+                .expect("the blocking twin asks for a stream and reads it whole");
 
             let raw = mock.chat_raw_bodies();
             assert_eq!(raw.len(), 3, "{leaf:?}");
-            for (sent, stream) in raw.iter().zip([true, true, false]) {
+            for (sent, stream) in raw.iter().zip([true, true, true]) {
                 let parsed: serde_json::Value = serde_json::from_slice(sent).unwrap();
                 assert!(parsed.get("cache_key").is_none(), "{leaf:?}: {parsed}");
                 let include_usage = parsed

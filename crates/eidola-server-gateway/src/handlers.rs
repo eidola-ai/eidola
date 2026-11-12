@@ -23,8 +23,7 @@ use crate::engine_trust::protocol::ValidatedRequest;
 use crate::error::ServerError;
 use crate::padding::{self, Cadence, StreamEvent};
 use crate::response::{
-    EidolaResponse, EidolaStreamMetadata, RefundInfo, build_privacy_metadata,
-    build_verification_metadata,
+    EidolaStreamMetadata, RefundInfo, build_privacy_metadata, build_verification_metadata,
 };
 use crate::types::{
     ChatCompletionChunk, ChatCompletionRequest, ErrorResponse, Model, ModelsResponse, Usage,
@@ -236,7 +235,7 @@ pub(crate) fn early_cost(
 
 /// What a completed request costs: its usage priced and clamped to the
 /// contract ([`actual_cost`]), or the whole charge when the upstream reported
-/// no usage. One rule for both transports.
+/// no usage.
 pub(crate) fn settled_cost(
     usage: Option<&Usage>,
     model: &Model,
@@ -249,15 +248,7 @@ pub(crate) fn settled_cost(
         .unwrap_or(charge_credits)
 }
 
-/// Send a non-streaming request to the engines that serve its model.
-async fn dispatch(
-    state: &AppState,
-    request: &ValidatedRequest,
-) -> Result<crate::backend::BackendResponse, ServerError> {
-    engines(state)?.send(request).await
-}
-
-/// Send a streaming request to the engines that serve its model.
+/// Send a request to the engines that serve its model, as a stream.
 async fn dispatch_stream(
     state: &AppState,
     request: &ValidatedRequest,
@@ -311,7 +302,7 @@ pub(crate) async fn issue_refund_async(
 }
 
 /// The longest this gateway lets a paid request run: a request still running
-/// then is ended, and settled as a stream that ended early. A resource bound
+/// then is ended, and settled as a request that ended early. A resource bound
 /// on the gateway's own work (an engine slot, a connection, a task), not part
 /// of the payment contract: whether a provisional refund is final is decided
 /// by whether a request is still being served (`credentials::LiveSpends`),
@@ -634,8 +625,8 @@ fn check_hold_equals_worst_case(
     tag = "Unlinked",
     request_body = ChatCompletionRequest,
     responses(
-        (status = 200, description = "Chat completion response with privacy and verification metadata", body = EidolaResponse),
-        (status = 400, description = "Invalid request; a malformed model reference (`invalid_model_reference`: not `tag`, `tag@sha256:<hex>` or `sha256:<hex>`), a malformed refund recovery key, more than two credentials, one credential presented twice, a share of zero, or a credential in a header (refused before any credential is spent); or a hold above the worst-case cost (refunded in full)", body = ErrorResponse),
+        (status = 200, description = "The answer, as server-sent events written in fixed-size frames on a fixed tick: `ChatCompletionChunk` events, then an `EidolaStreamMetadata` event carrying the privacy and verification metadata and the refunds, then `[DONE]`. A stream that ended early (its engine failed, its client stopped reading, or it reached the gateway's deadline) carries the metadata event, charged for what was generated, and no `[DONE]`", content_type = "text/event-stream", body = ChatCompletionChunk),
+        (status = 400, description = "Invalid request; a request that does not set `stream` to true (every chat answer is a stream), a malformed model reference (`invalid_model_reference`: not `tag`, `tag@sha256:<hex>` or `sha256:<hex>`), a malformed refund recovery key, more than two credentials, one credential presented twice, a share of zero, or a credential in a header (refused before any credential is spent); or a hold above the worst-case cost (refunded in full)", body = ErrorResponse),
         (status = 401, description = "Authentication failed", body = ErrorResponse),
         (status = 402, description = "A hold below the worst-case cost (refunded in full)", body = ErrorResponse),
         (status = 404, description = "The model reference names no model (`model_not_found`); refunded in full", body = ErrorResponse),
@@ -674,7 +665,8 @@ pub async fn chat_completions(
         .unwrap_or_else(|_| "other".to_string());
     let stream = validated.request().stream;
 
-    let presented = crate::auth::refuse_header_credentials(&headers)
+    let presented = refuse_unstreamed(validated.request())
+        .and_then(|()| crate::auth::refuse_header_credentials(&headers))
         .and_then(|()| crate::auth::presented_spends(&validated.request().credentials.0));
     let result = match presented {
         Ok(acts) => chat_completions_phases(&state, acts, validated, resolution, reading).await,
@@ -703,6 +695,23 @@ pub async fn chat_completions(
     );
 
     result
+}
+
+/// Refuse a chat request that does not ask for a stream, before anything is
+/// spent. A chat answer is served only as a stream: a stream hands its client
+/// what it paid for whatever ends the request, which one answer written at
+/// the end cannot (`docs/anonymous-credits.md` → Ending a request early). A
+/// client that reads one whole answer asks for a stream and assembles it.
+/// `stream_options` is the gateway's to decide: every request reaches the
+/// engine asking for its usage, and the final usage chunk reaches the client
+/// whatever it asked.
+fn refuse_unstreamed(request: &ChatCompletionRequest) -> Result<(), ServerError> {
+    if request.stream {
+        return Ok(());
+    }
+    Err(ServerError::BadRequest {
+        message: "a chat completion is served only as a stream: set `stream` to true".to_string(),
+    })
 }
 
 async fn chat_completions_phases(
@@ -778,22 +787,20 @@ async fn record_inputs(
 /// it awaited there, the nullifiers could be recorded with nothing left to
 /// settle them, and recovery would declare each provisional refund final: the
 /// whole hold charged for nothing. So recording, the validation refusal, the
-/// dispatch and every settlement run here for both transports, and a request
+/// dispatch and every settlement run here, and a request
 /// whose handler has gone still ends with its final refunds stored for
-/// recovery. A stream whose handler went away before it opened is dispatched
-/// to its answer like any other: a refusal settles as a full refund, and an
-/// opened stream finds its client gone at once, releases the engine and
-/// settles as that early ending ([`forward_stream`]). A blocking request runs
-/// to its end and is billed by its reported usage (a blocking engine request
-/// reports what it generated only when it completes, so a cut would leave
-/// nothing trustworthy to charge). The deadline bounds both.
+/// recovery. A request whose handler went away before its engine answered is
+/// dispatched to its answer like any other: a refusal settles as a full
+/// refund, and an opened stream finds its client gone at once, releases the
+/// engine and settles as that early ending ([`forward_stream`]). The deadline
+/// bounds it.
 pub(crate) async fn run_paid_request(
     state: AppState,
     validated: ValidatedRequest,
     resolution: Result<ResolvedModel, crate::models::ModelRefError>,
     recording: impl Future<Output = Result<PaidInputs, ServerError>> + Send + 'static,
 ) -> Result<axum::response::Response, ServerError> {
-    tokio::spawn(async move {
+    let answer = tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + MAX_REQUEST_DURATION;
         let inputs = recording.await?;
 
@@ -820,99 +827,49 @@ pub(crate) async fn run_paid_request(
         };
 
         // Phase 4: Handle the request.
-        if request.stream {
-            handle_streaming_request(state.clone(), &validated, inputs, &resolved, deadline).await
-        } else {
-            handle_non_streaming_request(&state, &validated, &inputs, &resolved, deadline).await
-        }
+        handle_streaming_request(state.clone(), &validated, inputs, &resolved, deadline).await
     })
-    .await
-    .map_err(|_| ServerError::Internal("the request's task failed".to_string()))?
+    .await;
+    answer.map_err(|_| ServerError::Internal("the request's task failed".to_string()))?
 }
 
-/// Handle a non-streaming chat completion request.
-async fn handle_non_streaming_request(
+/// Open the engine's stream for a paid request. A refusal, or no engine
+/// answering, is settled here as a full refund; not opened by the deadline,
+/// the engine may have begun, and the whole hold is charged. Either way the
+/// error is the request's answer, its refunds in it.
+async fn open_upstream(
     state: &AppState,
     validated: &ValidatedRequest,
     inputs: &PaidInputs,
-    resolved: &ResolvedModel,
     deadline: tokio::time::Instant,
-) -> Result<axum::response::Response, ServerError> {
-    let request = validated.request();
-    let model = &resolved.model;
-    let charge_credits = inputs.hold();
-    let auth_context = AuthContext {
-        method: AuthMethod::AnonymousCredential,
-    };
-
-    // Make the backend request. On error, issue full refunds.
-    let dispatched_at = Instant::now();
-    let backend_response = match tokio::time::timeout_at(deadline, dispatch(state, validated)).await
-    {
-        Ok(Ok(resp)) => resp,
+) -> Opened {
+    match tokio::time::timeout_at(deadline, dispatch_stream(state, validated)).await {
+        Ok(Ok(rx)) => Opened::Stream(rx),
         Ok(Err(e)) => {
-            // The engine refused the request or never took it. Full refunds.
-            warn!("Engine error, issuing full refund: {}", e);
+            // Nothing was generated: the engine refused it or never took it.
+            warn!(
+                "Engine error before the answer opened, issuing full refund: {}",
+                e
+            );
             let refunds = settle_inputs(state, inputs, 0).await;
-            return Ok(error_response_with_refunds(&e, refunds));
+            Opened::Answered(error_response_with_refunds(&e, refunds))
         }
         Err(_) => {
-            // The request outlived `MAX_REQUEST_DURATION`. The engine may have
-            // done the work, and how much is unknown: charged the whole hold
-            // (each input's blind remaining value `c - s` comes back).
-            warn!("Request reached its deadline, issuing zero refund");
-            let refunds = settle_inputs(state, inputs, charge_credits).await;
-            return Ok(error_response_with_refunds(
+            warn!("Request reached its deadline before its answer opened, issuing zero refund");
+            let refunds = settle_inputs(state, inputs, inputs.hold()).await;
+            Opened::Answered(error_response_with_refunds(
                 &request_deadline_error(),
                 refunds,
-            ));
+            ))
         }
-    };
-    crate::telemetry::metrics::CHAT_DURATION.record(
-        dispatched_at.elapsed().as_secs_f64(),
-        &[KeyValue::new("model", model.sha256.clone())],
-    );
-
-    // Record token usage metrics (safe for unlinked layer: only model + counts).
-    if let Some(usage) = &backend_response.meta.usage {
-        let model_attr = KeyValue::new("model", model.sha256.clone());
-        crate::telemetry::metrics::CHAT_TOKENS.add(
-            usage.prompt_tokens as u64,
-            &[model_attr.clone(), KeyValue::new("type", "prompt")],
-        );
-        crate::telemetry::metrics::CHAT_TOKENS.add(
-            usage.completion_tokens as u64,
-            &[model_attr, KeyValue::new("type", "completion")],
-        );
     }
+}
 
-    // Compute actual cost (clamped to the pricing contract) and refund.
-    let chargeable_prompt = chargeable_prompt_tokens_for(request);
-    let max_completion = effective_max_completion(request, model);
-    // No usage → charge worst case.
-    let cost = settled_cost(
-        backend_response.meta.usage.as_ref(),
-        model,
-        chargeable_prompt,
-        max_completion,
-        charge_credits,
-    );
-    let refunds = settle_inputs(state, inputs, cost).await;
-
-    let meta = &backend_response.meta;
-    let is_tee = meta.tee_type.is_some();
-
-    let privacy = build_privacy_metadata(&auth_context, is_tee, &meta.provider);
-    let verification = build_verification_metadata(None);
-
-    // The response names the model as the client's reference resolved:
-    // `tag@sha256:<hex>`, or `sha256:<hex>` for a hash named alone.
-    let mut completion = backend_response.response;
-    completion.model.clone_from(&resolved.echo);
-    let eidola_response =
-        EidolaResponse::from_completion(completion, privacy, verification, refunds);
-
-    Ok(Json(eidola_response).into_response())
+/// What opening a paid request's engine stream came to.
+enum Opened {
+    Stream(mpsc::Receiver<Result<BackendStreamEvent, ServerError>>),
+    /// Settled without a stream; this is the request's answer.
+    Answered(axum::response::Response),
 }
 
 /// Per-stream timing accumulator behind the streaming instruments.
@@ -1118,25 +1075,10 @@ async fn handle_streaming_request(
     // arrival: everything before this point is our own verification work,
     // which the HTTP-level histogram already covers.
     let dispatched_at = Instant::now();
-    let upstream_rx =
-        match tokio::time::timeout_at(deadline, dispatch_stream(&state, validated)).await {
-            Ok(Ok(rx)) => rx,
-            Ok(Err(e)) => {
-                // Known error — upstream didn't process any tokens. Full refunds.
-                warn!("Stream start error, issuing full refund: {}", e);
-                let refunds = settle_inputs(&state, &inputs, 0).await;
-                return Ok(error_response_with_refunds(&e, refunds));
-            }
-            Err(_) => {
-                // Not even opened by the deadline; the engine may have started.
-                warn!("Stream reached its deadline before opening, issuing zero refund");
-                let refunds = settle_inputs(&state, &inputs, charge_credits).await;
-                return Ok(error_response_with_refunds(
-                    &request_deadline_error(),
-                    refunds,
-                ));
-            }
-        };
+    let upstream_rx = match open_upstream(&state, validated, &inputs, deadline).await {
+        Opened::Stream(rx) => rx,
+        Opened::Answered(answer) => return Ok(answer),
+    };
 
     // Events for the client, framed by `padding` into fixed-size writes on a
     // fixed tick, the waiting bytes bounded (see `padding::EventSender::send`).
@@ -1186,7 +1128,7 @@ async fn handle_streaming_request(
                 let verification = build_verification_metadata(None);
 
                 // Compute the refund from usage, with the charge clamped
-                // to the pricing contract (same as the blocking path).
+                // to the pricing contract.
                 let cost = settled_cost(
                     final_usage.as_ref(),
                     &task_model,
@@ -1283,9 +1225,9 @@ async fn send_metadata_event(
     .await;
 }
 
-/// Why a stream ended before the engine said it was done.
+/// Why a request ended before the engine said it was done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EarlyEnding {
+pub(crate) enum EarlyEnding {
     /// The client went away (its stream was dropped).
     ClientGone,
     /// The client stopped reading ([`CLIENT_STALL_LIMIT`]).
@@ -1888,6 +1830,62 @@ pub(crate) mod tests {
 
     /// A token-priced model with easy integer math at `PRICING_SCALE_FACTOR`:
     /// 1 credit per prompt token, 2 credits per completion token.
+    /// **A chat request that does not ask for a stream is refused before
+    /// anything is spent**, ahead of every check of its credentials: here a
+    /// credential that would itself be refused, which a request asking for a
+    /// stream is refused for instead. The refusal names what to change.
+    #[tokio::test]
+    async fn a_request_that_does_not_ask_for_a_stream_is_refused_before_any_spend() {
+        let state = crate::AppState::new(
+            crate::backend::Catalog::new(None, None).unwrap(),
+            None,
+            crate::db::create_pool(
+                "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
+                None,
+                None,
+            )
+            .unwrap(),
+            None,
+            [0u8; 32],
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        );
+        let ask = |stream: &str| {
+            let body = format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}]{stream},"credentials":[{{"token":"not-a-token","refund_key":"{}"}}]}}"#,
+                "0".repeat(64)
+            );
+            ChatRequest(
+                ValidatedRequest::from_bytes(axum::body::Bytes::from(body)).unwrap(),
+                BodyPermit(None),
+            )
+        };
+        for blocking in ["", r#","stream":false"#] {
+            let refused = chat_completions(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                ask(blocking),
+            )
+            .await
+            .unwrap_err();
+            let ServerError::BadRequest { message } = &refused else {
+                panic!("refused as a bad request: {refused:?}");
+            };
+            assert!(message.contains("`stream` to true"), "{message}");
+            assert_eq!(refused.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        }
+        let streamed = chat_completions(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            ask(r#","stream":true"#),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(streamed, ServerError::Unauthorized { .. }),
+            "a request asking for a stream reaches its credential's checks: {streamed:?}"
+        );
+    }
+
     pub(crate) fn test_model() -> Model {
         Model {
             id: "test-model".to_string(),

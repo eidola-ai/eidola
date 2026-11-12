@@ -121,6 +121,34 @@ fn armed(core: &AppCore) -> String {
     })
 }
 
+/// A key for an external OpenAI-compatible backend, `acme`, served by `mock`
+/// and exposed to the proxy: a route that answers blocking requests with the
+/// completion itself and spends nothing.
+fn external_key(core: &AppCore, mock: &chat_harness::MockServer) -> String {
+    core.runtime().block_on(async {
+        core.add_backend(eidola_app_core::NewBackend {
+            id: "acme".into(),
+            kind: eidola_app_core::BackendKind::OpenAi,
+            display_name: "Acme".into(),
+            base_url: Some(mock.base_url.clone()),
+            api_key: None,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+        })
+        .await
+        .expect("add");
+        core.set_proxy_backend_exposed("acme".to_string(), true)
+            .await
+            .expect("expose");
+        core.create_proxy_key("a tool".to_string())
+            .await
+            .expect("mint")
+            .key
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Authentication
 // ---------------------------------------------------------------------------
@@ -567,9 +595,15 @@ fn a_proxied_completion_pays_records_and_creates_no_conversation() {
 
         // **The credential artifact never reaches downstream.**
         assert!(
-            answer.get("refund").is_none(),
-            "a `refund` is wallet material, not part of any OpenAI response: {body}"
+            answer.get("refund").is_none() && answer.get("refunds").is_none(),
+            "a refund is wallet material, not part of any OpenAI response: {body}"
         );
+        // **The gateway serves only streams**: the blocking ask went upstream
+        // as a stream, and the answer is the one this app assembled from it,
+        // its refund read in band.
+        assert_eq!(mock.blocking_asks(), 0, "no blocking ask reached it");
+        assert_eq!(mock.chat_bodies()[0]["stream"], true);
+        assert_eq!(mock.refund_hits(), 0, "settled from the refund in band");
         // The model is named as the caller named it.
         assert_eq!(answer["model"], MODEL);
 
@@ -620,6 +654,93 @@ fn a_proxied_completion_pays_records_and_creates_no_conversation() {
                 .len(),
             spaces_before,
             "a proxied request creates no conversation"
+        );
+    });
+}
+
+/// **A non-streamed completion the gateway cut short is the failure it is,
+/// and its spend settles on the refund the stream carried.** The proxy asks
+/// the Eidola gateway for a stream; one that ends without finishing (its
+/// metadata event and no `[DONE]`) is answered to the caller as an upstream
+/// failure, in the OpenAI error shape, while the hold settles from the
+/// in-band refund (the only copy, under `NotStored`), charged what was
+/// generated, and the Record keeps the partial answer that arrived.
+#[test]
+fn a_non_streamed_answer_cut_short_fails_and_settles_in_band() {
+    run(|| {
+        const CHARGED: u128 = 23;
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::StreamingCutShortWithRefund,
+            refund: RefundMode::NotStored,
+            settled_charge: Some(CHARGED),
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}]}}"#),
+            ),
+        ));
+        assert_eq!(status, 502, "an upstream failure, not an answer: {body}");
+        let error: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("ended without finishing")),
+            "{body}"
+        );
+        assert_eq!(mock.blocking_asks(), 0);
+
+        assert_eq!(mock.refund_hits(), 0, "settled from the refund in band");
+        let wallet = runtime.block_on(core.wallet_lifecycle()).expect("wallet");
+        assert!(
+            !wallet.iter().any(|c| c.state == "spending"),
+            "nothing is stranded: {wallet:?}"
+        );
+        let spent = wallet
+            .iter()
+            .find(|c| c.state == "spent")
+            .expect("the spent credential");
+        let successor = wallet
+            .iter()
+            .find(|c| c.state == "active")
+            .expect("its successor");
+        assert_eq!(
+            successor.credits,
+            spent.credits - i64::try_from(CHARGED).unwrap(),
+            "charged what was generated"
+        );
+
+        let recorded = runtime
+            .block_on(core.list_requests(20, 0))
+            .expect("record")
+            .into_iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("the exchange is recorded");
+        assert!(
+            recorded
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ended without finishing")),
+            "{:?}",
+            recorded.error
+        );
+        let detail = runtime
+            .block_on(core.request_detail(recorded.id.clone()))
+            .expect("detail")
+            .expect("the row");
+        let kept = String::from_utf8_lossy(detail.response_body.as_deref().unwrap_or_default())
+            .to_string();
+        assert!(
+            kept.contains(chat_harness::STREAM_CONTENT),
+            "the Record keeps what arrived: {kept}"
         );
     });
 }
@@ -875,18 +996,19 @@ fn a_stream_that_carries_no_refund_still_falls_back_to_recovery() {
     });
 }
 
+/// A blocking body arrives from a backend that answers blocking requests: an
+/// external one here.
 #[test]
 fn a_successful_answer_that_is_not_json_is_a_gateway_failure() {
     run(|| {
         // A truncated response or an intermediary's HTML page arriving with a
         // `2xx` must not reach a tool as an apparent success carrying a
         // fabricated body.
-        let (_mock, core, _dir) = core_for(MockConfig {
+        let (mock, core, _dir) = core_for(MockConfig {
             chat: ChatBehavior::OkNonJsonBody,
             ..Default::default()
         });
-        with_account(&core);
-        let key = armed(&core);
+        let key = external_key(&core, &mock);
         let core = Arc::new(core);
         let runtime = core.runtime();
 
@@ -895,7 +1017,7 @@ fn a_successful_answer_that_is_not_json_is_a_gateway_failure() {
             &post(
                 "/v1/chat/completions",
                 &key,
-                &format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}]}}"#),
+                r#"{"model":"m@acme","messages":[{"role":"user","content":"hi"}]}"#,
             ),
         ));
         assert_eq!(status, 502, "{body}");
@@ -1458,6 +1580,7 @@ fn a_streamed_ask_answered_with_json_is_a_gateway_failure() {
         // never asked.
         let (mock, core, _dir) = core_for(MockConfig {
             chat: ChatBehavior::OkBlocking,
+            ignores_stream: true,
             ..Default::default()
         });
         with_account(&core);
@@ -3607,16 +3730,18 @@ fn a_revived_backend_is_not_exposed_by_the_permission_its_predecessor_held() {
 ///
 /// Which is exactly the `whole_text` rule (`peer_read`) reaching the one
 /// surface that *keeps* what it read: the exchange is still recorded, the hold
-/// still settles, and only the answer becomes the gateway failure it is.
+/// still settles, and only the answer becomes the gateway failure it is. A
+/// blocking body arrives from a backend that answers blocking requests (an
+/// external one here); the Eidola route's answer is a stream, held to the same
+/// ceiling in `an_assembled_answer_past_the_read_ceiling_is_refused`.
 #[test]
 fn an_answer_past_the_read_ceiling_is_refused_rather_than_parsed() {
     run(|| {
-        let (_mock, core, _dir) = core_for(MockConfig {
+        let (mock, core, _dir) = core_for(MockConfig {
             chat: ChatBehavior::OkBlockingPaddedPastCeiling,
             ..Default::default()
         });
-        with_account(&core);
-        let key = armed(&core);
+        let key = external_key(&core, &mock);
         let core = Arc::new(core);
         let runtime = core.runtime();
 
@@ -3625,7 +3750,7 @@ fn an_answer_past_the_read_ceiling_is_refused_rather_than_parsed() {
             &post(
                 "/v1/chat/completions",
                 &key,
-                &format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}]}}"#),
+                r#"{"model":"m@acme","messages":[{"role":"user","content":"hi"}]}"#,
             ),
         ));
         assert_ne!(
@@ -3713,21 +3838,20 @@ fn a_non_2xx_answer_past_the_read_ceiling_is_refused_too() {
 /// completion than the raw body did. The floor is the turn path's own: a body
 /// with no `choices` array carries nothing this app's chat would call an answer.
 ///
-/// The refund half is the other assertion, and it is why the settlement runs
-/// before the refusal: the credential was spent upstream either way, so a body
-/// too shapeless to answer with can still hold the only copy of its successor.
-/// `RefundMode::Fail` makes that the *only* copy — recovery cannot answer — so a
-/// cure that refused before reading the token would strand the credential.
+/// A blocking body is what a backend that answers blocking requests sends, so
+/// the rule is held on one (an external backend). The settlement still runs
+/// before the refusal on every route: a body too shapeless to answer with can
+/// hold the only copy of a spent credential's successor, which
+/// `a_streamed_ask_answered_with_json_is_a_gateway_failure` holds for the
+/// Eidola route.
 #[test]
 fn a_success_that_is_not_a_completion_is_refused_rather_than_forwarded() {
     run(|| {
         let (mock, core, _dir) = core_for(MockConfig {
             chat: ChatBehavior::OkBlockingNotACompletion,
-            refund: RefundMode::Fail,
             ..Default::default()
         });
-        with_account(&core);
-        let key = armed(&core);
+        let key = external_key(&core, &mock);
         let core = Arc::new(core);
         let runtime = core.runtime();
 
@@ -3736,7 +3860,7 @@ fn a_success_that_is_not_a_completion_is_refused_rather_than_forwarded() {
             &post(
                 "/v1/chat/completions",
                 &key,
-                &format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}]}}"#),
+                r#"{"model":"m@acme","messages":[{"role":"user","content":"hi"}]}"#,
             ),
         ));
         assert_ne!(
@@ -3762,22 +3886,6 @@ fn a_success_that_is_not_a_completion_is_refused_rather_than_forwarded() {
                 .is_some_and(|e| e.contains("not a chat completion")),
             "the row carries this app's own refusal: {:?}",
             recorded.error
-        );
-
-        // The hold settled from the token the refused body carried.
-        let wallet = runtime.block_on(core.wallet_lifecycle()).expect("wallet");
-        assert!(
-            wallet.iter().any(|c| c.state == "spent"),
-            "the refund rode the body this app refused: {wallet:?}"
-        );
-        assert!(
-            !wallet.iter().any(|c| c.state == "spending"),
-            "a refusal must not strand a spent credential: {wallet:?}"
-        );
-        assert_eq!(
-            mock.refund_hits(),
-            0,
-            "recovery is the fallback for an absent token, not the first move"
         );
     });
 }

@@ -499,37 +499,14 @@ pub mod metrics {
     /// Total chat completion requests reaching the handler (by model,
     /// stream, status). `status` is `ok` (2xx response opened), `error` (a
     /// refund-bearing error response built after the credential was
-    /// spent), or `rejected` (pre-flight refusal: invalid or duplicate
-    /// credential, unknown model, insufficient charge). The `model` label
+    /// spent), or `rejected` (pre-flight refusal: a request not asking for
+    /// a stream, an invalid or duplicate credential). The `model` label
     /// is always the catalog resolution of the requested id, with `other`
     /// for anything unrecognized — never the caller's string.
     pub static CHAT_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         meter()
             .u64_counter("chat.completion.requests")
             .with_description("Chat completion requests")
-            .build()
-    });
-
-    /// Wall time of a non-streaming chat completion, by model: the full
-    /// upstream call, since a blocking request returns nothing until the
-    /// generation finishes.
-    ///
-    /// Deliberately success-only: failed upstream calls land in
-    /// `operation.duration{operation="upstream.chat", outcome="error"}`
-    /// (the `err`-instrumented span) and in the HTTP histogram by status —
-    /// folding them in here would mix "how long does a completion take"
-    /// with "how long until an error", which alert thresholds want apart.
-    ///
-    /// Kept separate from the streaming instruments on purpose. Folding both
-    /// into one latency series would blend two unrelated quantities (a
-    /// blocking request's duration is dominated by output length, a streaming
-    /// request's by prefill) and the blend is not useful.
-    pub static CHAT_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
-        meter()
-            .f64_histogram("chat.completion.duration")
-            .with_description("Wall time of a non-streaming chat completion")
-            .with_unit("s")
-            .with_boundaries(LATENCY_BUCKETS.to_vec())
             .build()
     });
 

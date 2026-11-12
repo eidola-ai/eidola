@@ -8,62 +8,6 @@ use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::auth::AuthMethod;
-use crate::types::{Choice, Usage};
-
-/// An Eidola chat completion response.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct EidolaResponse {
-    /// Unique identifier for the completion.
-    pub id: String,
-
-    /// The object type.
-    pub object: String,
-
-    /// Unix timestamp of when the completion was created.
-    pub created: u64,
-
-    /// The model that produced the completion.
-    pub model: String,
-
-    /// Completion choices.
-    pub choices: Vec<Choice>,
-
-    /// Token usage statistics.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Usage>,
-
-    /// Privacy metadata describing data exposure and authorization.
-    pub privacy: PrivacyMetadata,
-
-    /// Verification metadata with cryptographic attestations.
-    pub verification: VerificationMetadata,
-
-    /// One refund per spend, in the order the request presented them.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub refunds: Vec<RefundInfo>,
-}
-
-impl EidolaResponse {
-    /// Build from an OpenAI-format completion response plus privacy/verification data.
-    pub fn from_completion(
-        response: crate::types::ChatCompletionResponse,
-        privacy: PrivacyMetadata,
-        verification: VerificationMetadata,
-        refunds: Vec<RefundInfo>,
-    ) -> Self {
-        Self {
-            id: response.id,
-            object: "eidola.chat.completion".to_string(),
-            created: response.created,
-            model: response.model,
-            choices: response.choices,
-            usage: response.usage,
-            privacy,
-            verification,
-            refunds,
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Privacy metadata
@@ -301,39 +245,6 @@ pub fn build_verification_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_eidola_response_serialization() {
-        let response = EidolaResponse {
-            id: "eid-123".to_string(),
-            object: "eidola.chat.completion".to_string(),
-            created: 1234567890,
-            model: "phala/deepseek-v3".to_string(),
-            choices: vec![],
-            usage: None,
-            privacy: PrivacyMetadata {
-                authorization: AuthorizationInfo {
-                    method: AuthMethod::AnonymousCredential,
-                    linkable: false,
-                },
-                data_exposure: vec![],
-                transport: TransportInfo {
-                    client_to_proxy: "tls-1.3".to_string(),
-                    proxy_to_backend: "tls-1.3".to_string(),
-                },
-            },
-            verification: VerificationMetadata {
-                proxy: None,
-                backend: None,
-            },
-            refunds: Vec::new(),
-        };
-
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"object\":\"eidola.chat.completion\""));
-        assert!(json.contains("\"method\":\"anonymous_credential\""));
-        assert!(json.contains("\"linkable\":false"));
-    }
 
     #[test]
     fn test_stream_metadata_serialization() {

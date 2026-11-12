@@ -14,10 +14,9 @@ use utoipa::ToSchema;
 use crate::engine_trust::{self, PinnedModel};
 use crate::models::{self, CatalogRow, Lifecycle, MODEL_CATALOG, ModelRefError, RowPrice};
 use crate::types::{
-    Capability, ChatCompletionChunk, ChatCompletionResponse, EngineDeploymentPin, LifecycleStatus,
-    Model, ModelCapabilities, ModelLifecycle, ModelPricing, ModelsResponse,
-    PinnedWeightsCapability, PromptCacheCapability, ScaledPrice, WeightsFileEntry,
-    WeightsProvenance,
+    Capability, ChatCompletionChunk, EngineDeploymentPin, LifecycleStatus, Model,
+    ModelCapabilities, ModelLifecycle, ModelPricing, ModelsResponse, PinnedWeightsCapability,
+    PromptCacheCapability, ScaledPrice, WeightsFileEntry, WeightsProvenance,
 };
 
 // ---------------------------------------------------------------------------
@@ -50,15 +49,6 @@ pub struct BackendMeta {
 
     /// Token usage statistics (from the response or final streaming chunk).
     pub usage: Option<crate::types::Usage>,
-}
-
-/// A completed (non-streaming) backend response.
-pub struct BackendResponse {
-    /// The OpenAI-format completion response.
-    pub response: ChatCompletionResponse,
-
-    /// Metadata about this execution.
-    pub meta: BackendMeta,
 }
 
 /// Events emitted by a streaming backend.

@@ -2,7 +2,9 @@
 //!
 //! The request is the gateway's strict chat-completions subset (`eidola-server-gateway`'s
 //! `types.rs`: the same fields, nullability and `deny_unknown_fields`), plus one field the
-//! gateway adds, `cache_key`. Anything else is refused, so the engine's own parameter
+//! gateway adds, `cache_key`. Every request asks for a stream with
+//! `stream_options.include_usage`, the only answer this node gives. Anything else is
+//! refused, so the engine's own parameter
 //! surface is not reachable from outside. A continuation (`continue_final_message`, with
 //! `add_generation_prompt: false`) is part of the subset: its prompt ends inside the
 //! final assistant message, at the field it continues.
@@ -194,8 +196,6 @@ pub struct ValidRequest {
     pub max_completion_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
-    pub stream: bool,
-    pub include_usage: bool,
     pub stop: Vec<String>,
     pub cache_key: Option<CacheKey>,
     /// The final message's field the prompt continues, or `None` for a new assistant
@@ -224,6 +224,12 @@ pub fn parse_request(body: &[u8], model_id: &str) -> Result<ValidRequest, ApiErr
 
     if req.model != model_id {
         return Err(ApiError::ModelNotFound);
+    }
+    // Every answer is a stream carrying its usage, which is what the gateway bills by
+    // and what bounds how long it waits on this node; it asks for one whatever its
+    // own client asked for, so a request that does not is not the gateway's.
+    if !req.stream || !req.stream_options.as_ref().is_some_and(|o| o.include_usage) {
+        return Err(ApiError::invalid(STREAM_REQUIRED));
     }
     // The subset's rules, by the functions the gateway refuses with before routing.
     let invalid = |e: SubsetError| ApiError::invalid(e.to_string());
@@ -290,8 +296,6 @@ pub fn parse_request(body: &[u8], model_id: &str) -> Result<ValidRequest, ApiErr
         max_completion_tokens: req.max_completion_tokens,
         temperature: req.temperature,
         top_p: req.top_p,
-        stream: req.stream,
-        include_usage: req.stream_options.is_some_and(|o| o.include_usage),
         stop,
         cache_key,
         continuation,
@@ -323,6 +327,9 @@ fn decode_cache_key(text: CacheKeyText) -> Result<CacheKey, ApiError> {
     buf.zeroize();
     result
 }
+
+const STREAM_REQUIRED: &str =
+    "this node answers only a stream: stream must be true, with stream_options.include_usage";
 
 const CACHE_KEY_SHAPE: &str = "cache_key must be 32 bytes, base64url without padding";
 
@@ -392,7 +399,7 @@ mod tests {
     fn a_decoded_cache_key_is_scrubbed() {
         take_scrubs();
         let body = format!(
-            r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"cache_key":"{KEY}"}}"#
+            r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"stream":true,"stream_options":{{"include_usage":true}},"cache_key":"{KEY}"}}"#
         );
         let req = parse_request(body.as_bytes(), "m").unwrap();
         assert!(req.cache_key.is_some());

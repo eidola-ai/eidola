@@ -168,19 +168,34 @@ impl TestNode {
         self.engine.stats()
     }
 
-    /// A chat request with valid gateway headers.
+    /// A chat request with valid gateway headers, asking for a stream with its usage as
+    /// the gateway always does: `stream` and `stream_options` are added where `body`
+    /// does not name them itself.
     pub fn chat(&self, body: &Value) -> reqwest::RequestBuilder {
+        let mut body = body.clone();
+        if let Some(fields) = body.as_object_mut() {
+            fields.entry("stream").or_insert(true.into());
+            fields
+                .entry("stream_options")
+                .or_insert(json!({"include_usage": true}));
+        }
         self.client
             .post(format!("{}/v1/chat/completions", self.base))
             .bearer_auth(TOKEN)
             .header("x-eidola-weights-sha256", weights_hash())
-            .json(body)
+            .json(&body)
     }
 
+    /// The status and the answer as one completion: a refusal's body as it is, and a
+    /// streamed answer joined the way a client's accumulator joins it ([`completion`]).
     pub async fn chat_json(&self, body: &Value) -> (u16, Value) {
         let r = self.chat(body).send().await.unwrap();
         let status = r.status().as_u16();
-        (status, r.json().await.unwrap())
+        if status != 200 {
+            return (status, r.json().await.unwrap());
+        }
+        let wire = r.bytes().await.unwrap();
+        (status, completion(&events_of(&wire)))
     }
 
     /// Streams a request and returns every SSE `data:` payload, read out of its frames
@@ -188,7 +203,6 @@ impl TestNode {
     /// the trailing whitespace a frame may pad a JSON payload with removed. Every
     /// frame is checked to be the cadence's size.
     pub async fn chat_stream(&self, body: &Value) -> Vec<String> {
-        use eidola_common::stream_shape::{StreamEvent, StreamReader};
         use futures_util::StreamExt;
         let r = self.chat(body).send().await.unwrap();
         assert_eq!(r.status().as_u16(), 200);
@@ -196,24 +210,12 @@ impl TestNode {
             r.headers()["content-type"].to_str().unwrap(),
             "text/event-stream"
         );
-        let frame = eidola_common::engine_protocol::STREAM_CADENCE.frame_bytes();
         let mut wire = Vec::new();
         let mut body = r.bytes_stream();
         while let Some(bytes) = body.next().await {
             wire.extend_from_slice(&bytes.unwrap());
         }
-        assert_eq!(wire.len() % frame, 0, "the stream is whole frames");
-        let mut reader = StreamReader::new();
-        reader.push(&wire);
-        let mut out = Vec::new();
-        while let Some(event) = reader.next_event().unwrap() {
-            out.push(match event {
-                StreamEvent::Json(data) => data.trim_end().to_string(),
-                StreamEvent::Error(data) => format!("error: {}", data.trim_end()),
-                StreamEvent::Done => "[DONE]".to_string(),
-            });
-        }
-        out
+        events_of(&wire)
     }
 
     /// Waits until `pred` holds for the stats (or panics after `timeout`).
@@ -237,5 +239,85 @@ pub fn request(text: &str, max_tokens: u32) -> Value {
         "messages": [{"role": "user", "content": text}],
         "max_completion_tokens": max_tokens,
         "temperature": 0.0,
+    })
+}
+
+/// A stream's events read out of its frames as the gateway reads them
+/// (`eidola_common::stream_shape::StreamReader`), with the trailing whitespace a frame
+/// may pad a JSON payload with removed: each JSON payload, `error: <payload>`, or
+/// `[DONE]`. The stream is checked to be whole frames of the cadence's size.
+pub fn events_of(wire: &[u8]) -> Vec<String> {
+    use eidola_common::stream_shape::{StreamEvent, StreamReader};
+    let frame = eidola_common::engine_protocol::STREAM_CADENCE.frame_bytes();
+    assert_eq!(wire.len() % frame, 0, "the stream is whole frames");
+    let mut reader = StreamReader::new();
+    reader.push(wire);
+    let mut out = Vec::new();
+    while let Some(event) = reader.next_event().unwrap() {
+        out.push(match event {
+            StreamEvent::Json(data) => data.trim_end().to_string(),
+            StreamEvent::Error(data) => format!("error: {}", data.trim_end()),
+            StreamEvent::Done => "[DONE]".to_string(),
+        });
+    }
+    out
+}
+
+/// A finished stream as one `chat.completion`: its deltas joined (`content` null when
+/// empty, `reasoning_content` only when there was some, each tool call without its
+/// `index`), its finish choice's `finish_reason` and `continuable`, and the final usage.
+/// A stream that ended in an error is that error's body.
+pub fn completion(events: &[String]) -> Value {
+    if let Some(error) = events.iter().find_map(|e| e.strip_prefix("error: ")) {
+        return serde_json::from_str(error).unwrap();
+    }
+    assert_eq!(
+        events.last().map(String::as_str),
+        Some("[DONE]"),
+        "{events:?}"
+    );
+    let chunks: Vec<Value> = events[..events.len() - 1]
+        .iter()
+        .map(|e| serde_json::from_str(e).unwrap())
+        .collect();
+    let (mut content, mut reasoning, mut calls) = (String::new(), String::new(), Vec::new());
+    let mut choice = json!({"index": 0});
+    for chunk in &chunks {
+        for c in chunk["choices"].as_array().unwrap() {
+            let delta = &c["delta"];
+            content.push_str(delta["content"].as_str().unwrap_or(""));
+            reasoning.push_str(delta["reasoning_content"].as_str().unwrap_or(""));
+            for call in delta["tool_calls"].as_array().into_iter().flatten() {
+                let mut call = call.clone();
+                call.as_object_mut().unwrap().remove("index");
+                calls.push(call);
+            }
+            if !c["finish_reason"].is_null() {
+                choice["finish_reason"] = c["finish_reason"].clone();
+                if let Some(v) = c.get("continuable") {
+                    choice["continuable"] = v.clone();
+                }
+            }
+        }
+    }
+    let mut message = json!({"role": "assistant", "content": null});
+    if !content.is_empty() {
+        message["content"] = content.into();
+    }
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = reasoning.into();
+    }
+    if !calls.is_empty() {
+        message["tool_calls"] = calls.into();
+    }
+    choice["message"] = message;
+    let last = chunks.last().unwrap();
+    json!({
+        "id": chunks[0]["id"],
+        "object": "chat.completion",
+        "created": chunks[0]["created"],
+        "model": chunks[0]["model"],
+        "choices": [choice],
+        "usage": last["usage"],
     })
 }

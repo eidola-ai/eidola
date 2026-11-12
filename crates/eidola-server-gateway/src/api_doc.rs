@@ -4,7 +4,7 @@ use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use crate::response::EidolaStreamMetadata;
-use crate::types::{ChatCompletionChunk, ChatCompletionResponse, ChunkChoice, ChunkDelta};
+use crate::types::{ChatCompletionChunk, ChunkChoice, ChunkDelta};
 
 /// OpenAPI documentation for the Eidola API.
 ///
@@ -31,7 +31,6 @@ use crate::types::{ChatCompletionChunk, ChatCompletionResponse, ChunkChoice, Chu
     components(schemas(
         // SSE streaming types — not referenced from #[utoipa::path] response
         // bodies so they must be registered explicitly.
-        ChatCompletionResponse,
         ChatCompletionChunk,
         ChunkChoice,
         ChunkDelta,

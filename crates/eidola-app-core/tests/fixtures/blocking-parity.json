@@ -1,0 +1,911 @@
+[
+  {
+    "blocking": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": null,
+            "reasoning_content": "The answer is four.",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 0,
+      "id": "chatcmpl-replay",
+      "model": "mimo-test",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 6,
+        "prompt_tokens": 13,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 19
+      }
+    },
+    "name": "plain_answer",
+    "request": {
+      "max_completion_tokens": 16,
+      "messages": [
+        {
+          "content": "What is two and two?",
+          "role": "user"
+        }
+      ],
+      "model": "mimo-test",
+      "temperature": 0.0
+    },
+    "source": "scripted",
+    "stream": [
+      "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":13}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"The answer is\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":16}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\" four.\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":6,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":19}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\"}",
+      "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":6,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":19}}",
+      "[DONE]"
+    ]
+  },
+  {
+    "blocking": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": "Four.",
+            "reasoning_content": "Two and two",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 0,
+      "id": "chatcmpl-replay",
+      "model": "mimo-test",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 8,
+        "prompt_tokens": 13,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 21
+      }
+    },
+    "name": "reasoning_and_answer",
+    "request": {
+      "max_completion_tokens": 16,
+      "messages": [
+        {
+          "content": "What is two and two?",
+          "role": "user"
+        }
+      ],
+      "model": "mimo-test",
+      "temperature": 0.0
+    },
+    "source": "scripted",
+    "stream": [
+      "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":13}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"Two and\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":16}}",
+      "{\"choices\":[{\"delta\":{\"content\":\"Four\",\"reasoning_content\":\" two\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":6,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":19}}",
+      "{\"choices\":[{\"delta\":{\"content\":\".\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":8,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":21}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\"}",
+      "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":8,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":21}}",
+      "[DONE]"
+    ]
+  },
+  {
+    "blocking": {
+      "choices": [
+        {
+          "finish_reason": "tool_calls",
+          "index": 0,
+          "message": {
+            "content": "Let me check.",
+            "reasoning_content": "Need weather",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "{\"city\": \"Oslo\", \"days\": 3}",
+                  "name": "get_weather"
+                },
+                "id": "call_replay0",
+                "type": "function"
+              }
+            ]
+          }
+        }
+      ],
+      "created": 0,
+      "id": "chatcmpl-replay",
+      "model": "mimo-test",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 38,
+        "prompt_tokens": 124,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 162
+      }
+    },
+    "name": "one_tool_call",
+    "request": {
+      "max_completion_tokens": 16,
+      "messages": [
+        {
+          "content": "What is two and two?",
+          "role": "user"
+        }
+      ],
+      "model": "mimo-test",
+      "temperature": 0.0,
+      "tools": [
+        {
+          "function": {
+            "name": "get_weather",
+            "parameters": {
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "days": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "name": "get_time",
+            "parameters": {
+              "properties": {
+                "zone": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "source": "scripted",
+    "stream": [
+      "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":124}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"Need weather\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":127}}",
+      "{\"choices\":[{\"delta\":{\"content\":\"Let me\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":6,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":130}}",
+      "{\"choices\":[{\"delta\":{\"content\":\" check.\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":9,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":133}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":12,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":136}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":15,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":139}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":18,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":142}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":21,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":145}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":24,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":148}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":27,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":151}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":30,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":154}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":33,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":157}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":36,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":160}}",
+      "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"city\\\": \\\"Oslo\\\", \\\"days\\\": 3}\",\"name\":\"get_weather\"},\"id\":\"call_replay0\",\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":38,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":162}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\",\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\"}",
+      "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":38,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":162}}",
+      "[DONE]"
+    ]
+  },
+  {
+    "blocking": {
+      "choices": [
+        {
+          "finish_reason": "tool_calls",
+          "index": 0,
+          "message": {
+            "content": null,
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "{\"city\": \"Oslo\"}",
+                  "name": "get_weather"
+                },
+                "id": "call_replay0",
+                "type": "function"
+              },
+              {
+                "function": {
+                  "arguments": "{\"zone\": \"Europe/Oslo\"}",
+                  "name": "get_time"
+                },
+                "id": "call_replay1",
+                "type": "function"
+              },
+              {
+                "function": {
+                  "arguments": "{\"city\": \"Bergen \\\"west\\\"\"}",
+                  "name": "get_weather"
+                },
+                "id": "call_replay2",
+                "type": "function"
+              }
+            ]
+          }
+        }
+      ],
+      "created": 0,
+      "id": "chatcmpl-replay",
+      "model": "mimo-test",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 67,
+        "prompt_tokens": 124,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 191
+      }
+    },
+    "name": "several_tool_calls",
+    "request": {
+      "max_completion_tokens": 16,
+      "messages": [
+        {
+          "content": "What is two and two?",
+          "role": "user"
+        }
+      ],
+      "model": "mimo-test",
+      "temperature": 0.0,
+      "tools": [
+        {
+          "function": {
+            "name": "get_weather",
+            "parameters": {
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "days": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        },
+        {
+          "function": {
+            "name": "get_time",
+            "parameters": {
+              "properties": {
+                "zone": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "source": "scripted",
+    "stream": [
+      "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":124}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":127}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":6,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":130}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":9,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":133}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":12,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":136}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":15,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":139}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":18,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":142}}",
+      "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"city\\\": \\\"Oslo\\\"}\",\"name\":\"get_weather\"},\"id\":\"call_replay0\",\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":21,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":145}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":24,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":148}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":27,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":151}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":30,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":154}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":33,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":157}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":36,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":160}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":39,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":163}}",
+      "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"zone\\\": \\\"Europe/Oslo\\\"}\",\"name\":\"get_time\"},\"id\":\"call_replay1\",\"index\":1,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":42,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":166}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":45,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":169}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":48,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":172}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":51,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":175}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":54,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":178}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":57,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":181}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":60,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":184}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":63,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":187}}",
+      "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"city\\\": \\\"Bergen \\\\\\\"west\\\\\\\"\\\"}\",\"name\":\"get_weather\"},\"id\":\"call_replay2\",\"index\":2,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":66,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":190}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\",\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\"}",
+      "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":67,\"prompt_tokens\":124,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":191}}",
+      "[DONE]"
+    ]
+  },
+  {
+    "blocking": {
+      "choices": [
+        {
+          "continuable": true,
+          "finish_reason": "length",
+          "index": 0,
+          "message": {
+            "content": null,
+            "reasoning_content": "weighing",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 0,
+      "id": "chatcmpl-replay",
+      "model": "mimo-test",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 3,
+        "prompt_tokens": 13,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 16
+      }
+    },
+    "name": "length_continuable",
+    "request": {
+      "max_completion_tokens": 16,
+      "messages": [
+        {
+          "content": "What is two and two?",
+          "role": "user"
+        }
+      ],
+      "model": "mimo-test",
+      "temperature": 0.0
+    },
+    "source": "scripted",
+    "stream": [
+      "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":13}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"weighing\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":16}}",
+      "{\"choices\":[{\"continuable\":true,\"delta\":{},\"finish_reason\":\"length\",\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\"}",
+      "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":16}}",
+      "[DONE]"
+    ]
+  },
+  {
+    "blocking": {
+      "choices": [
+        {
+          "continuable": false,
+          "finish_reason": "length",
+          "index": 0,
+          "message": {
+            "content": "The",
+            "reasoning_content": "weighed",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 0,
+      "id": "chatcmpl-replay",
+      "model": "mimo-test",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 8,
+        "prompt_tokens": 13,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 21
+      }
+    },
+    "name": "length_not_continuable",
+    "request": {
+      "max_completion_tokens": 16,
+      "messages": [
+        {
+          "content": "What is two and two?",
+          "role": "user"
+        }
+      ],
+      "model": "mimo-test",
+      "temperature": 0.0
+    },
+    "source": "scripted",
+    "stream": [
+      "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":13}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"weighed\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":16}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":6,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":19}}",
+      "{\"choices\":[{\"delta\":{\"content\":\"The\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":8,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":21}}",
+      "{\"choices\":[{\"continuable\":false,\"delta\":{},\"finish_reason\":\"length\",\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\"}",
+      "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":8,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":21}}",
+      "[DONE]"
+    ]
+  },
+  {
+    "blocking": {
+      "choices": [
+        {
+          "continuable": false,
+          "finish_reason": "length",
+          "index": 0,
+          "message": {
+            "content": null,
+            "reasoning_content": "weighing",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 0,
+      "id": "chatcmpl-replay",
+      "model": "mimo-test",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 3,
+        "prompt_tokens": 13,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 16
+      }
+    },
+    "name": "length_at_the_window",
+    "request": {
+      "messages": [
+        {
+          "content": "What is two and two?",
+          "role": "user"
+        }
+      ],
+      "model": "mimo-test",
+      "temperature": 0.0
+    },
+    "source": "scripted",
+    "stream": [
+      "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":13}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"weighing\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":16}}",
+      "{\"choices\":[{\"continuable\":false,\"delta\":{},\"finish_reason\":\"length\",\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\"}",
+      "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":16}}",
+      "[DONE]"
+    ]
+  },
+  {
+    "blocking": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": null,
+            "reasoning_content": "The end is here ",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 0,
+      "id": "chatcmpl-replay",
+      "model": "mimo-test",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 6,
+        "prompt_tokens": 13,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 19
+      }
+    },
+    "name": "stop_sequence",
+    "request": {
+      "max_completion_tokens": 16,
+      "messages": [
+        {
+          "content": "What is two and two?",
+          "role": "user"
+        }
+      ],
+      "model": "mimo-test",
+      "stop": [
+        "END"
+      ],
+      "temperature": 0.0
+    },
+    "source": "scripted",
+    "stream": [
+      "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":13}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"The end is\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":16}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\" here \"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":6,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":19}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\"}",
+      "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":6,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":19}}",
+      "[DONE]"
+    ]
+  },
+  {
+    "blocking": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": null,
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 0,
+      "id": "chatcmpl-replay",
+      "model": "mimo-test",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 1,
+        "prompt_tokens": 13,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 14
+      }
+    },
+    "name": "empty_content",
+    "request": {
+      "max_completion_tokens": 16,
+      "messages": [
+        {
+          "content": "What is two and two?",
+          "role": "user"
+        }
+      ],
+      "model": "mimo-test",
+      "temperature": 0.0
+    },
+    "source": "scripted",
+    "stream": [
+      "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":13}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\"}",
+      "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":14}}",
+      "[DONE]"
+    ]
+  },
+  {
+    "blocking": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": " is four.",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 0,
+      "id": "chatcmpl-replay",
+      "model": "mimo-test",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 4,
+        "prompt_tokens": 15,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 19
+      }
+    },
+    "name": "content_only",
+    "request": {
+      "add_generation_prompt": false,
+      "continue_final_message": true,
+      "max_completion_tokens": 16,
+      "messages": [
+        {
+          "content": "Finish the sentence.",
+          "role": "user"
+        },
+        {
+          "content": "The answer",
+          "role": "assistant"
+        }
+      ],
+      "model": "mimo-test",
+      "temperature": 0.0
+    },
+    "source": "scripted",
+    "stream": [
+      "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":15}}",
+      "{\"choices\":[{\"delta\":{\"content\":\" is four.\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":18}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\"}",
+      "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":4,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":19}}",
+      "[DONE]"
+    ]
+  },
+  {
+    "blocking": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": null,
+            "reasoning_content": "Say \"hi\"\\n\n\t héllo wörld 🌍日本",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 0,
+      "id": "chatcmpl-replay",
+      "model": "mimo-test",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 18,
+        "prompt_tokens": 13,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 31
+      }
+    },
+    "name": "escapes_and_multibyte",
+    "request": {
+      "max_completion_tokens": 16,
+      "messages": [
+        {
+          "content": "What is two and two?",
+          "role": "user"
+        }
+      ],
+      "model": "mimo-test",
+      "temperature": 0.0
+    },
+    "source": "scripted",
+    "stream": [
+      "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":13}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"Say \\\"hi\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":16}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"\\\"\\\\n\\n\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":6,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":19}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"\\t hél\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":9,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":22}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"lo wör\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":12,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":25}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"ld \"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":15,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":28}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"🌍日本\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":18,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":31}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\"}",
+      "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-replay\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":18,\"prompt_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":31}}",
+      "[DONE]"
+    ]
+  },
+  {
+    "blocking": {
+      "choices": [
+        {
+          "continuable": false,
+          "finish_reason": "length",
+          "index": 0,
+          "message": {
+            "content": null,
+            "reasoning_content": " lender Ryzenחוז R압 tarn mLBEL`);\n\n.yang撐 guide",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 1794443318,
+      "id": "chatcmpl-1ab73f96b6880bbde80e54a9",
+      "model": "mimo-test",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 12,
+        "prompt_tokens": 15,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 27
+      }
+    },
+    "name": "engine_length",
+    "request": {
+      "max_completion_tokens": 12,
+      "messages": [
+        {
+          "content": "Hello there, how are you today?",
+          "role": "user"
+        }
+      ],
+      "model": "mimo-test",
+      "temperature": 0.0
+    },
+    "source": "engine",
+    "stream": [
+      "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-e841622cc91a41cad2191113\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":15}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\" lender\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-e841622cc91a41cad2191113\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":16}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\" Ryzen\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-e841622cc91a41cad2191113\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":2,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":17}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"חוז\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-e841622cc91a41cad2191113\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":18}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\" R\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-e841622cc91a41cad2191113\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":4,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":19}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"압\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-e841622cc91a41cad2191113\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":5,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":20}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\" tarn\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-e841622cc91a41cad2191113\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":6,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":21}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\" mL\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-e841622cc91a41cad2191113\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":7,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":22}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"BEL\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-e841622cc91a41cad2191113\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":8,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":23}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"`);\\n\\n\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-e841622cc91a41cad2191113\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":9,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":24}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\".yang\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-e841622cc91a41cad2191113\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":10,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":25}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"撐\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-e841622cc91a41cad2191113\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":11,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":26}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\" guide\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-e841622cc91a41cad2191113\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":12,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":27}}",
+      "{\"choices\":[{\"continuable\":false,\"delta\":{},\"finish_reason\":\"length\",\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-e841622cc91a41cad2191113\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\"}",
+      "{\"choices\":[],\"created\":1794443318,\"id\":\"chatcmpl-e841622cc91a41cad2191113\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":12,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":27}}",
+      "[DONE]"
+    ]
+  },
+  {
+    "blocking": {
+      "choices": [
+        {
+          "continuable": false,
+          "finish_reason": "length",
+          "index": 0,
+          "message": {
+            "content": null,
+            "reasoning_content": "经销商",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 1794443318,
+      "id": "chatcmpl-ff8f0cafe4437ac694dd5dde",
+      "model": "mimo-test",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 1,
+        "prompt_tokens": 8,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 9
+      }
+    },
+    "name": "engine_one_token",
+    "request": {
+      "max_completion_tokens": 1,
+      "messages": [
+        {
+          "content": "Hi",
+          "role": "user"
+        }
+      ],
+      "model": "mimo-test",
+      "temperature": 0.0
+    },
+    "source": "engine",
+    "stream": [
+      "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-c5da3a5faf08824448ee8bb8\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":8,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":8}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"经销商\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-c5da3a5faf08824448ee8bb8\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":8,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":9}}",
+      "{\"choices\":[{\"continuable\":false,\"delta\":{},\"finish_reason\":\"length\",\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-c5da3a5faf08824448ee8bb8\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\"}",
+      "{\"choices\":[],\"created\":1794443318,\"id\":\"chatcmpl-c5da3a5faf08824448ee8bb8\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":8,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":9}}",
+      "[DONE]"
+    ]
+  },
+  {
+    "blocking": {
+      "choices": [
+        {
+          "continuable": true,
+          "finish_reason": "length",
+          "index": 0,
+          "message": {
+            "content": " NAT            \r\n admit CoupleTurkey忿!=\"ירושלים",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 1794443318,
+      "id": "chatcmpl-7a9c149339c21d7d407721bc",
+      "model": "mimo-test",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 8,
+        "prompt_tokens": 15,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 23
+      }
+    },
+    "name": "engine_continuation",
+    "request": {
+      "add_generation_prompt": false,
+      "continue_final_message": true,
+      "max_completion_tokens": 8,
+      "messages": [
+        {
+          "content": "Finish the sentence.",
+          "role": "user"
+        },
+        {
+          "content": "The answer",
+          "role": "assistant"
+        }
+      ],
+      "model": "mimo-test",
+      "temperature": 0.0
+    },
+    "source": "engine",
+    "stream": [
+      "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-5b12e5f022064ea78820f26d\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":15}}",
+      "{\"choices\":[{\"delta\":{\"content\":\" NAT\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-5b12e5f022064ea78820f26d\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":16}}",
+      "{\"choices\":[{\"delta\":{\"content\":\"            \\r\\n\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-5b12e5f022064ea78820f26d\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":2,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":17}}",
+      "{\"choices\":[{\"delta\":{\"content\":\" admit\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-5b12e5f022064ea78820f26d\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":18}}",
+      "{\"choices\":[{\"delta\":{\"content\":\" Couple\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-5b12e5f022064ea78820f26d\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":4,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":19}}",
+      "{\"choices\":[{\"delta\":{\"content\":\"Turkey\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-5b12e5f022064ea78820f26d\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":5,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":20}}",
+      "{\"choices\":[{\"delta\":{\"content\":\"忿\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-5b12e5f022064ea78820f26d\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":6,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":21}}",
+      "{\"choices\":[{\"delta\":{\"content\":\"!=\\\"\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-5b12e5f022064ea78820f26d\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":7,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":22}}",
+      "{\"choices\":[{\"delta\":{\"content\":\"ירושלים\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-5b12e5f022064ea78820f26d\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":8,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":23}}",
+      "{\"choices\":[{\"continuable\":true,\"delta\":{},\"finish_reason\":\"length\",\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-5b12e5f022064ea78820f26d\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\"}",
+      "{\"choices\":[],\"created\":1794443318,\"id\":\"chatcmpl-5b12e5f022064ea78820f26d\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":8,\"prompt_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":23}}",
+      "[DONE]"
+    ]
+  },
+  {
+    "blocking": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": null,
+            "reasoning_content": " 가지Ś vampires grayscale pancakes陨CircleДата瑬строен睛女性 MOUSESegoeürUnauthorized\tLabel",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 1794443318,
+      "id": "chatcmpl-08ee20561568a2acc7543d90",
+      "model": "mimo-test",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 18,
+        "prompt_tokens": 12,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 30
+      }
+    },
+    "name": "engine_stop_sequence",
+    "request": {
+      "max_completion_tokens": 24,
+      "messages": [
+        {
+          "content": "Tell me a story.",
+          "role": "user"
+        }
+      ],
+      "model": "mimo-test",
+      "stop": [
+        "Emb"
+      ],
+      "temperature": 0.0
+    },
+    "source": "engine",
+    "stream": [
+      "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":12}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\" 가지\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":13}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"Ś\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":2,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":14}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\" vampires\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":3,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":15}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\" grayscale\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":4,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":16}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\" pancakes\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":5,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":17}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"陨\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":6,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":18}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"Circle\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":7,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":19}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"Дата\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":8,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":20}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"瑬\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":9,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":21}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"строен\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":10,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":22}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"睛\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":11,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":23}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"女性\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":12,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":24}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\" MOUS\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":13,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":25}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"ESegoe\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":14,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":26}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"ür\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":15,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":27}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"Unauthorized\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":16,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":28}}",
+      "{\"choices\":[{\"delta\":{\"reasoning_content\":\"\\tLabel\"},\"finish_reason\":null,\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":17,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":29}}",
+      "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\"}",
+      "{\"choices\":[],\"created\":1794443318,\"id\":\"chatcmpl-b26d07a4bd3e8134dde7dfec\",\"model\":\"mimo-test\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":18,\"prompt_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":30}}",
+      "[DONE]"
+    ]
+  }
+]

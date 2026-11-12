@@ -56,13 +56,15 @@ static ALLOC: Counting = Counting;
 /// A request whose one tool's `parameters` is `payload` (opaque to the strict types).
 fn in_tool_schema(payload: &str) -> String {
     format!(
-        r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"tools":[{{"type":"function","function":{{"name":"f","parameters":{payload}}}}}]}}"#
+        r#"{{"model":"m","stream":true,"stream_options":{{"include_usage":true}},"messages":[{{"role":"user","content":"hi"}}],"tools":[{{"type":"function","function":{{"name":"f","parameters":{payload}}}}}]}}"#
     )
 }
 
 /// A request whose `messages` are `items`.
 fn as_messages(items: &str) -> String {
-    format!(r#"{{"model":"m","messages":[{items}]}}"#)
+    format!(
+        r#"{{"model":"m","stream":true,"stream_options":{{"include_usage":true}},"messages":[{items}]}}"#
+    )
 }
 
 /// `n` copies of `item`, comma-separated.

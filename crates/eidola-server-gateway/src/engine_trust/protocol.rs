@@ -150,9 +150,11 @@ impl ValidatedRequest {
 ///
 /// Three top-level members are the gateway's to decide, and are written last:
 ///
-/// - `stream` / `stream_options`: for a streaming request, `"stream":true`
-///   and `"stream_options":{"include_usage":true}` (usage is what the refund
-///   is computed from); otherwise neither;
+/// - `stream` / `stream_options`: `"stream":true` and
+///   `"stream_options":{"include_usage":true}`, whatever the client sent: a
+///   node answers only streams, every chat request reaching the router is one
+///   (`handlers::chat_completions` refuses any other), and usage is what the
+///   refund is computed from;
 /// - `cache_key`: re-encoded from the validated key, when there is one.
 ///
 /// `model` is written from the typed request, in its place: the weights hash
@@ -222,12 +224,10 @@ pub fn engine_request_body(request: &ValidatedRequest) -> Zeroizing<Vec<u8>> {
             serde_json::to_writer(&mut *out, &ceiling).expect("a scalar serializes")
         });
     }
-    if parsed.stream {
-        member(&mut body, "stream", &|out| out.extend_from_slice(b"true"));
-        member(&mut body, "stream_options", &|out| {
-            out.extend_from_slice(br#"{"include_usage":true}"#)
-        });
-    }
+    member(&mut body, "stream", &|out| out.extend_from_slice(b"true"));
+    member(&mut body, "stream_options", &|out| {
+        out.extend_from_slice(br#"{"include_usage":true}"#)
+    });
     if let Some(key) = &parsed.cache_key {
         let text =
             Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.as_bytes()));
@@ -506,13 +506,13 @@ mod tests {
         assert_eq!(body["model"], "fixture-model");
 
         let without = ValidatedRequest::from_bytes(bytes::Bytes::from_static(
-            br#"{"model":"fixture-model","messages":[{"role":"user","content":"hi"}]}"#,
+            br#"{"model":"fixture-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
         ))
         .unwrap();
         let body = engine_request_body(&without);
         assert_eq!(
             body.as_slice(),
-            br#"{"model":"fixture-model","messages":[{"role":"user","content":"hi"}]}"#
+            br#"{"model":"fixture-model","messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}"#
         );
     }
 

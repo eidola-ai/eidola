@@ -140,7 +140,16 @@ enum Mode {
     /// Stream the role chunk's frame, then write nothing at all, the
     /// connection left open: a node that has stopped.
     Wedge,
+    /// [`Mode::StreamError`], the role chunk carrying a running count of
+    /// [`GENERATED`] completion tokens.
+    CountThenError,
+    /// [`Mode::Wedge`], the role chunk carrying a running count of
+    /// [`GENERATED`] completion tokens.
+    CountThenWedge,
 }
+
+/// The completion tokens a counting mode's engine reports before it fails.
+const GENERATED: u32 = 3;
 
 /// One chat request as an engine received it.
 #[derive(Clone)]
@@ -388,34 +397,29 @@ async fn chat(
         _ => {}
     }
     let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    if request["stream"] != serde_json::json!(true) {
-        return padded_json(
-            StatusCode::OK,
-            serde_json::json!({
-                "id": "chatcmpl-fake",
-                "object": "chat.completion",
-                "created": 0,
-                "model": state.model,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "hello"},
-                    "finish_reason": "stop",
-                }],
-                "usage": usage(),
-            }),
-        );
+    // The node answers only streams that report their usage.
+    if request["stream"] != true || request["stream_options"]["include_usage"] != true {
+        return error(StatusCode::BAD_REQUEST, kind::INVALID_REQUEST);
     }
+    let counted = matches!(mode, Mode::CountThenError | Mode::CountThenWedge);
     let role = chunk(
         &state,
         serde_json::json!([{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]),
-        None,
+        counted.then(|| {
+            serde_json::json!({
+                "prompt_tokens": PROMPT_TOKENS,
+                "completion_tokens": GENERATED,
+                "total_tokens": PROMPT_TOKENS + GENERATED,
+                "prompt_tokens_details": {"cached_tokens": 0},
+            })
+        }),
     );
     let rest: Vec<Written> = match mode {
-        Mode::StreamError => vec![Written::Event(StreamEvent::Error(
+        Mode::StreamError | Mode::CountThenError => vec![Written::Event(StreamEvent::Error(
             serde_json::json!({"error": {"message": "the engine stopped", "type": "engine_unavailable", "code": null}})
                 .to_string(),
         ))],
-        Mode::StreamTruncated | Mode::Wedge => vec![],
+        Mode::StreamTruncated | Mode::Wedge | Mode::CountThenWedge => vec![],
         Mode::MalformedChunk | Mode::UnknownEvent => {
             let odd = if mode == Mode::MalformedChunk {
                 Written::Event(StreamEvent::Json(
@@ -460,7 +464,8 @@ async fn chat(
         ],
     };
     let hold = mode == Mode::Hold;
-    shaped_stream(role, hold, mode == Mode::Wedge, state, rest)
+    let wedge = matches!(mode, Mode::Wedge | Mode::CountThenWedge);
+    shaped_stream(role, hold, wedge, state, rest)
 }
 
 const WEIGHTS_HEADER_NAME: &str = eidola_common::engine_protocol::WEIGHTS_HEADER;
@@ -648,13 +653,45 @@ fn upstream(router: &EngineRouter, model: &str, base_url: &str) -> Arc<Upstream>
         .clone()
 }
 
-fn is_unavailable(result: &Result<BackendResponse, ServerError>) -> bool {
+/// A request's whole answer as the router streams it: the content of its
+/// chunks, and the `Done` that ends it.
+struct Answered {
+    content: String,
+    meta: crate::backend::BackendMeta,
+}
+
+trait SendWhole {
+    async fn send(&self, request: &ValidatedRequest) -> Result<Answered, ServerError>;
+}
+
+impl SendWhole for EngineRouter {
+    async fn send(&self, request: &ValidatedRequest) -> Result<Answered, ServerError> {
+        let mut rx = self.send_stream(request).await?;
+        let mut content = String::new();
+        while let Some(event) = rx.recv().await {
+            match event? {
+                BackendStreamEvent::Chunk(chunk, _) => {
+                    for choice in &chunk.choices {
+                        content.push_str(choice.delta.content.as_deref().unwrap_or(""));
+                    }
+                }
+                BackendStreamEvent::Done(meta, _) => return Ok(Answered { content, meta }),
+            }
+        }
+        Err(ServerError::Network(
+            "the stream ended before it completed".to_string(),
+        ))
+    }
+}
+
+fn is_unavailable(result: &Result<Answered, ServerError>) -> bool {
     matches!(result, Err(ServerError::ServiceUnavailable(_)))
 }
 
 /// A new upstream takes nothing until a probe has verified it; then a
 /// request reaches it with the gateway's token, the compiled-in weights hash,
-/// and exactly the body `engine_request_body` builds.
+/// and exactly the body `engine_request_body` builds, asking for a stream
+/// with its usage whatever stream options the client sent.
 #[tokio::test]
 async fn traffic_waits_for_a_probe_and_carries_the_pinned_headers() {
     let a = engine(Identity::of(MODEL_A)).await;
@@ -663,23 +700,20 @@ async fn traffic_waits_for_a_probe_and_carries_the_pinned_headers() {
         .apply_placement(&[a.row(MODEL_A, DEPLOYMENT_A)])
         .await;
     assert!(is_unavailable(
-        &router.send(&request(MODEL_A, None, false)).await
+        &router.send(&request(MODEL_A, None, true)).await
     ));
     assert!(a.chats().is_empty());
 
     router.probe_due().await;
     let key = key_text(1);
-    let sent = request(MODEL_A, Some(&key), false);
+    let sent = request(MODEL_A, Some(&key), true);
     let response = router.send(&sent).await.unwrap();
     assert_eq!(response.meta.provider, PROVIDER);
     assert!(matches!(
         response.meta.tee_type,
         Some(TeeType::EidolaEngine)
     ));
-    assert_eq!(
-        response.response.choices[0].message.content.as_deref(),
-        Some("hello")
-    );
+    assert_eq!(response.content, "hello");
 
     let chats = a.chats();
     assert_eq!(chats.len(), 1);
@@ -690,6 +724,11 @@ async fn traffic_waits_for_a_probe_and_carries_the_pinned_headers() {
     assert_eq!(chats[0].weights.as_deref(), Some(WEIGHTS_A));
     assert_eq!(chats[0].body, engine_request_body(&sent).to_vec());
     let body: serde_json::Value = serde_json::from_slice(&chats[0].body).unwrap();
+    assert_eq!(body["stream"], true);
+    assert_eq!(
+        body["stream_options"],
+        serde_json::json!({"include_usage": true})
+    );
     assert_eq!(body["cache_key"], key.as_str());
 }
 
@@ -725,7 +764,7 @@ async fn a_conversation_stays_on_its_engine() {
                 while rx.recv().await.is_some() {}
             } else {
                 router
-                    .send(&request(MODEL_A, Some(&key), false))
+                    .send(&request(MODEL_A, Some(&key), true))
                     .await
                     .unwrap();
             }
@@ -770,7 +809,7 @@ async fn without_a_key_the_least_loaded_engine_is_chosen() {
     engines[idle].set_mode(Mode::Serve);
     for _ in 0..4 {
         let before = counts(&refs);
-        router.send(&request(MODEL_A, None, false)).await.unwrap();
+        router.send(&request(MODEL_A, None, true)).await.unwrap();
         assert_eq!(served_by(&refs, &before), idle);
     }
 
@@ -781,7 +820,7 @@ async fn without_a_key_the_least_loaded_engine_is_chosen() {
     let mut seen = std::collections::BTreeSet::new();
     for _ in 0..4 {
         let before = counts(&refs);
-        router.send(&request(MODEL_A, None, false)).await.unwrap();
+        router.send(&request(MODEL_A, None, true)).await.unwrap();
         seen.insert(served_by(&refs, &before));
     }
     assert_eq!(seen.len(), 2);
@@ -939,7 +978,7 @@ async fn only_pinned_enabled_placement_is_routed() {
     router.apply_placement(&rows).await;
     router.probe_due().await;
     assert!(is_unavailable(
-        &router.send(&request(MODEL_A, None, false)).await
+        &router.send(&request(MODEL_A, None, true)).await
     ));
     assert_eq!(a.state.health_checks.load(Ordering::Relaxed), 0);
     assert!(a.chats().is_empty());
@@ -948,7 +987,7 @@ async fn only_pinned_enabled_placement_is_routed() {
         .apply_placement(&[a.row(MODEL_A, DEPLOYMENT_A)])
         .await;
     router.probe_due().await;
-    router.send(&request(MODEL_A, None, false)).await.unwrap();
+    router.send(&request(MODEL_A, None, true)).await.unwrap();
     assert_eq!(a.chats().len(), 1);
 }
 
@@ -966,7 +1005,7 @@ async fn an_engine_is_attested_against_its_models_pins() {
     router.probe_due().await;
     assert!(!upstream(&router, MODEL_A, &b.base_url).routable());
     assert!(is_unavailable(
-        &router.send(&request(MODEL_A, None, false)).await
+        &router.send(&request(MODEL_A, None, true)).await
     ));
     assert_eq!(b.state.health_checks.load(Ordering::Relaxed), 0);
     assert!(b.chats().is_empty());
@@ -975,7 +1014,7 @@ async fn an_engine_is_attested_against_its_models_pins() {
         .apply_placement(&[b.row(MODEL_B, DEPLOYMENT_B)])
         .await;
     router.probe_due().await;
-    router.send(&request(MODEL_B, None, false)).await.unwrap();
+    router.send(&request(MODEL_B, None, true)).await.unwrap();
     assert_eq!(b.chats().len(), 1);
 }
 
@@ -1007,7 +1046,7 @@ async fn gpu_evidence_must_match_the_pin() {
     assert!(!upstream(&router, MODEL_A, &one.base_url).routable());
     assert!(!upstream(&router, MODEL_A, &three.base_url).routable());
     for _ in 0..4 {
-        router.send(&request(MODEL_A, None, false)).await.unwrap();
+        router.send(&request(MODEL_A, None, true)).await.unwrap();
     }
     assert_eq!(two.chats().len(), 4);
 }
@@ -1061,7 +1100,7 @@ async fn a_misregistered_engine_never_takes_traffic() {
     let first = key_ranking_first(&router, MODEL_A, &refuses.base_url, &[&good.base_url]);
     for i in first..first + 8 {
         router
-            .send(&request(MODEL_A, Some(&key_text(i)), false))
+            .send(&request(MODEL_A, Some(&key_text(i)), true))
             .await
             .unwrap();
     }
@@ -1093,7 +1132,7 @@ async fn failures_open_an_engine_and_a_probe_restores_it() {
     let key = key_text(42);
     let before = counts(&refs);
     router
-        .send(&request(MODEL_A, Some(&key), false))
+        .send(&request(MODEL_A, Some(&key), true))
         .await
         .unwrap();
     let home = served_by(&refs, &before);
@@ -1102,7 +1141,7 @@ async fn failures_open_an_engine_and_a_probe_restores_it() {
     // A server error is the engine's answer: returned, not retried, counted.
     engines[home].set_mode(Mode::Fail500);
     for _ in 0..2 {
-        let result = router.send(&request(MODEL_A, Some(&key), false)).await;
+        let result = router.send(&request(MODEL_A, Some(&key), true)).await;
         assert!(matches!(
             result,
             Err(ServerError::Backend { status: 500, .. })
@@ -1110,7 +1149,7 @@ async fn failures_open_an_engine_and_a_probe_restores_it() {
     }
     let before = counts(&refs);
     router
-        .send(&request(MODEL_A, Some(&key), false))
+        .send(&request(MODEL_A, Some(&key), true))
         .await
         .unwrap();
     assert_eq!(
@@ -1126,7 +1165,7 @@ async fn failures_open_an_engine_and_a_probe_restores_it() {
     router.probe_due().await;
     let before = counts(&refs);
     router
-        .send(&request(MODEL_A, Some(&key), false))
+        .send(&request(MODEL_A, Some(&key), true))
         .await
         .unwrap();
     assert_eq!(served_by(&refs, &before), other);
@@ -1137,7 +1176,7 @@ async fn failures_open_an_engine_and_a_probe_restores_it() {
     router.probe_due().await;
     let before = counts(&refs);
     router
-        .send(&request(MODEL_A, Some(&key), false))
+        .send(&request(MODEL_A, Some(&key), true))
         .await
         .unwrap();
     assert_eq!(served_by(&refs, &before), home);
@@ -1163,7 +1202,7 @@ async fn an_overloaded_or_vanished_engine_passes_the_request_on() {
     let key = key_text(7);
     let before = counts(&refs);
     router
-        .send(&request(MODEL_A, Some(&key), false))
+        .send(&request(MODEL_A, Some(&key), true))
         .await
         .unwrap();
     let home = served_by(&refs, &before);
@@ -1173,7 +1212,7 @@ async fn an_overloaded_or_vanished_engine_passes_the_request_on() {
     for _ in 0..3 {
         let before = counts(&refs);
         router
-            .send(&request(MODEL_A, Some(&key), false))
+            .send(&request(MODEL_A, Some(&key), true))
             .await
             .unwrap();
         assert_eq!(engines[other].chats().len(), before[other] + 1);
@@ -1186,7 +1225,7 @@ async fn an_overloaded_or_vanished_engine_passes_the_request_on() {
     engines[home].shim = None;
     let before_other = engines[other].chats().len();
     router
-        .send(&request(MODEL_A, Some(&key), false))
+        .send(&request(MODEL_A, Some(&key), true))
         .await
         .unwrap();
     assert_eq!(engines[other].chats().len(), before_other + 1);
@@ -1250,7 +1289,7 @@ async fn the_engines_usage_settles_the_charge() {
     router.probe_due().await;
 
     let model = catalog_model();
-    let sent = request(MODEL_A, None, false);
+    let sent = request(MODEL_A, None, true);
     let charge = 1_000_000u128;
     let settle = |usage: Option<&crate::types::Usage>| {
         crate::handlers::settled_cost(
@@ -1335,7 +1374,7 @@ async fn pooled_connections_are_attested_once() {
         .await;
     router.probe_due().await;
     for _ in 0..5 {
-        router.send(&request(MODEL_A, None, false)).await.unwrap();
+        router.send(&request(MODEL_A, None, true)).await.unwrap();
     }
     assert_eq!(a.chats().len(), 5);
     assert_eq!(a.shim.as_ref().unwrap().attestations(), 1);
@@ -1496,7 +1535,7 @@ async fn an_answer_after_admission_is_returned_not_retried() {
     let key = key_text(9);
     let before = counts(&refs);
     router
-        .send(&request(MODEL_A, Some(&key), false))
+        .send(&request(MODEL_A, Some(&key), true))
         .await
         .unwrap();
     let home = served_by(&refs, &before);
@@ -1512,7 +1551,7 @@ async fn an_answer_after_admission_is_returned_not_retried() {
                 .map(|_| ())
         } else {
             router
-                .send(&request(MODEL_A, Some(&key), false))
+                .send(&request(MODEL_A, Some(&key), true))
                 .await
                 .map(|_| ())
         };
@@ -1674,6 +1713,262 @@ async fn a_silent_engine_is_given_up_on_within_its_bounds() {
         !upstream(&only_other, MODEL_A, &other.base_url).routable(),
         "counted as failures"
     );
+}
+
+/// A paid request ended early is settled on what was generated, through the
+/// chat handler's own settlement: an engine that fails partway or falls
+/// silent is charged the prompt and the output it reported by its last chunk,
+/// the rest of the hold refunded in the stream's metadata event, and the
+/// stream ends without `[DONE]`; an engine that sends no response headers is
+/// no engine, and with none other to try the request is refused and refunded
+/// in full.
+#[test]
+fn a_request_ended_early_is_settled_on_what_was_generated() {
+    // Signing a refund needs more stack than a test thread has.
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(a_request_ended_early_is_settled())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn a_request_ended_early_is_settled() {
+    let model = catalog_model();
+    let hold = crate::handlers::worst_case_cost(request(MODEL_A, None, true).request(), &model);
+    // 1 credit a prompt token, 2 a completion token.
+    let generated = PROMPT_TOKENS as u128 + 2 * GENERATED as u128;
+    for (mode, status, charged) in [
+        (Mode::CountThenError, 200, generated),
+        (Mode::CountThenWedge, 200, generated),
+        (Mode::Stall, 503, 0),
+    ] {
+        // An engine and router of its own, so no ending opens the breaker
+        // for the next.
+        let a = engine(Identity::of(MODEL_A)).await;
+        let config = RouterConfig {
+            stream_headers_limit: Duration::from_millis(500),
+            stream_idle_limit: Duration::from_millis(500),
+            ..fast_config()
+        };
+        let router = router_with(&[&a], models(), config);
+        router
+            .apply_placement(&[a.row(MODEL_A, DEPLOYMENT_A)])
+            .await;
+        router.probe_due().await;
+        a.set_mode(mode);
+        let started = std::time::Instant::now();
+        let (answered, finished, credits) = paid_request(&router, hold).await;
+        assert_eq!(answered, status, "{mode:?}");
+        assert!(!finished, "{mode:?}: an early ending is no finished answer");
+        assert_eq!(credits, CREDITS - charged, "{mode:?}");
+        assert_eq!(a.chats().len(), 1, "{mode:?}: the engine was asked");
+        if mode != Mode::CountThenError {
+            // Given up on at its bound, not sooner.
+            assert!(started.elapsed() >= Duration::from_millis(500), "{mode:?}");
+        }
+        a.state.release.notify_waiters();
+    }
+}
+
+const CREDITS: u128 = 1_000_000;
+
+/// What a client completes its refund with.
+struct Completion {
+    pre_refund: anonymous_credit_tokens::PreRefund,
+    params: anonymous_credit_tokens::Params,
+    spend_proof: anonymous_credit_tokens::SpendProof<{ eidola_common::spend_credentials::ACT_L }>,
+    public: anonymous_credit_tokens::PublicKey,
+}
+
+type Handler = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<axum::response::Response, ServerError>>>,
+>;
+
+/// A request through `router`, paid with a hold of `hold`, as the chat
+/// handler runs it: the handler's future, what completes its refund, the
+/// state it runs on, and its spend's key id and nullifier.
+async fn paid_handler(
+    router: &EngineRouter,
+    hold: u128,
+) -> (Handler, Completion, crate::AppState, String, Vec<u8>) {
+    use crate::credentials::tests::{Cache, DAY, add_key, spend};
+
+    let validated = request(MODEL_A, None, true);
+    let model = catalog_model();
+    let mut keys = Cache::new();
+    let hash = add_key(&mut keys, std::time::SystemTime::now() + DAY);
+    let (act, pre_refund) = spend(&keys[&hash], CREDITS, hold);
+    let completion = Completion {
+        pre_refund,
+        params: keys[&hash].params.clone(),
+        spend_proof: act.spend_proof.clone(),
+        public: keys[&hash].secret_key.public().clone(),
+    };
+    let nullifier = act.spend_proof.nullifier().as_bytes().to_vec();
+    let state = crate::AppState::new(
+        crate::backend::Catalog::new(None, None).unwrap(),
+        Some(router.clone()),
+        crate::db::create_pool(
+            "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
+            None,
+            None,
+        )
+        .unwrap(),
+        None,
+        [0u8; 32],
+        Arc::new(tokio::sync::RwLock::new(keys)),
+    );
+    crate::handlers::check_presented_spends(&state, std::slice::from_ref(&act))
+        .await
+        .unwrap();
+    let live = Arc::new(state.live_spends.serve(&act));
+    let recording = async move {
+        Ok(crate::handlers::tests::paid_inputs(
+            vec![crate::auth::ActSpend {
+                live: Some(live),
+                ..act
+            }],
+            vec![hold],
+        ))
+    };
+    let handler = Box::pin(crate::handlers::run_paid_request(
+        state.clone(),
+        validated,
+        Ok(crate::backend::ResolvedModel {
+            model,
+            echo: MODEL_A.to_string(),
+        }),
+        recording,
+    ));
+    (handler, completion, state, hex::encode(hash), nullifier)
+}
+
+/// Pay for and answer one request through `router`, as the chat handler
+/// does, and return the answer's status, whether its stream ended with
+/// `[DONE]`, and the credits the client holds after completing its refund:
+/// the one the stream's metadata event carried, or a refusal's.
+async fn paid_request(router: &EngineRouter, hold: u128) -> (u16, bool, u128) {
+    use base64::Engine as _;
+    let (handler, c, _, _, _) = paid_handler(router, hold).await;
+    let (status, finished, body) = tokio::time::timeout(Duration::from_secs(10), async {
+        let response = handler.await.unwrap();
+        let status = response.status().as_u16();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        if status != 200 {
+            return (
+                status,
+                false,
+                serde_json::from_slice(unpadded(&bytes)).unwrap(),
+            );
+        }
+        let mut reader = eidola_common::stream_shape::StreamReader::new();
+        reader.push(&bytes);
+        let (mut finished, mut metadata) = (false, serde_json::Value::Null);
+        while let Some(event) = reader.next_event().unwrap() {
+            match event {
+                StreamEvent::Done => finished = true,
+                StreamEvent::Json(json) => {
+                    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+                    if value["object"] == "eidola.chat.completion.metadata" {
+                        metadata = value;
+                    }
+                }
+                StreamEvent::Error(_) => {}
+            }
+        }
+        (status, finished, metadata)
+    })
+    .await
+    .expect("answered within the bounds");
+    let refund = body["refunds"][0]["refund"].as_str().unwrap();
+    let refund = anonymous_credit_tokens::Refund::from_cbor(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(refund)
+            .unwrap(),
+    )
+    .unwrap();
+    let token = c
+        .pre_refund
+        .to_credit_token::<{ eidola_common::spend_credentials::ACT_L }>(
+            &c.params,
+            &c.spend_proof,
+            &refund,
+            &c.public,
+        )
+        .unwrap();
+    let credits = anonymous_credit_tokens::scalar_to_credit::<
+        { eidola_common::spend_credentials::ACT_L },
+    >(&token.credits())
+    .unwrap();
+    (status, finished, credits)
+}
+
+/// A request whose client goes away while its engine works releases the
+/// engine at once (its stream, dropped with the handler, finds its client
+/// gone) and is still settled: the spend leaves the live set once its final
+/// refund is written.
+#[test]
+fn a_request_whose_client_leaves_releases_its_engine() {
+    // Signing a refund needs more stack than a test thread has.
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(a_client_leaves())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn a_client_leaves() {
+    let a = engine(Identity::of(MODEL_A)).await;
+    let router = router_for(&[&a], models());
+    router
+        .apply_placement(&[a.row(MODEL_A, DEPLOYMENT_A)])
+        .await;
+    router.probe_due().await;
+    a.set_mode(Mode::Hold);
+    let hold =
+        crate::handlers::worst_case_cost(request(MODEL_A, None, true).request(), &catalog_model());
+    let (handler, _, state, key_id, nullifier) = paid_handler(&router, hold).await;
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    // The stream opens; the engine holds its answer open.
+    let stream = tokio::time::timeout(Duration::from_secs(10), handler)
+        .await
+        .expect("the stream opened")
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    while a.chats().is_empty() {
+        assert!(
+            std::time::Instant::now() < until,
+            "the engine was never asked"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The client leaves, and its stream with it.
+    drop(stream);
+    while a.state.abandoned.load(Ordering::SeqCst) == 0
+        || state.live_spends.is_live(&key_id, &nullifier)
+    {
+        assert!(
+            std::time::Instant::now() < until,
+            "the engine was never released, or the request never settled"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// A cache key whose ranking over the upstreams at `order` is exactly that
