@@ -20,7 +20,8 @@
 //! | `max_tokens` or the context window reached | `length` | `length` |
 //!
 //! A response cut off by `length` keeps the calls already completed; a call
-//! whose closing tag never arrived is dropped (see [`crate::tool_call`]).
+//! whose closing tag never arrived is given out as content (see
+//! [`crate::tool_call`]).
 
 use std::ops::Range;
 
@@ -208,8 +209,8 @@ impl OutputParser {
     /// emitted, sent back as a continued final message (the answer once there
     /// is any, the reasoning before), make the template render precisely the
     /// text the model generated after the prompt — nothing dropped, nothing
-    /// added. A tool call, an unfinished tool-call block the parser drops, a
-    /// lossy final character, a repeated or missing `<think>`, reasoning ended
+    /// added. A tool call, a tool-call block begun (past one the parser no
+    /// longer reads as a resumed one would), a lossy final character, a repeated or missing `<think>`, reasoning ended
     /// by `<tool_call>` instead of `</think>`, a `</think>` with no answer after
     /// it, an ending inside a possible delimiter (`</thi`, `<tool_`: text
     /// byte-exact, but a resumed parser would not know it is mid-delimiter), or
@@ -440,8 +441,28 @@ mod tests {
             &["Hi <tool_call><function=get_weather>"],
             StopCause::MaxTokens,
         );
-        assert_eq!((d.content.as_str(), reason), ("Hi ", FinishReason::Length));
+        assert_eq!(
+            (d.content.as_str(), reason),
+            ("Hi <tool_call><function=get_weather>", FinishReason::Length)
+        );
         assert!(d.reasoning_content.is_empty());
+    }
+
+    /// With tools offered, an answer that mentions `<tool_call>` and never
+    /// closes it keeps every word, streamed or not.
+    #[test]
+    fn prose_mentioning_the_tag_reaches_the_answer() {
+        let text = "Emit <tool_call> followed by the function, and the rest of the answer.";
+        let mut p = parser(Some(false), true);
+        let chunks: Vec<String> = text.chars().map(String::from).collect();
+        let chunks: Vec<&str> = chunks.iter().map(String::as_str).collect();
+        let (d, reason) = run(&mut p, &chunks, StopCause::EndOfSequence);
+        assert_eq!((d.content.as_str(), reason), (text, FinishReason::Stop));
+        assert!(d.tool_calls.is_empty());
+        // Past a block, a cut is not resumed exactly.
+        let mut p = parser(Some(false), true);
+        run(&mut p, &[text], StopCause::MaxTokens);
+        assert!(!p.resumes_exactly());
     }
 
     /// Which length endings can be continued from what the parser gave out —
@@ -460,7 +481,8 @@ mod tests {
         assert!(ends(Some(false), true, &["The sky is"]));
         // Markup the parser keeps as text is still exact.
         assert!(ends(Some(false), false, &["Hi <tool_call><function=x>"]));
-        // The reported case: an unfinished tool call is dropped.
+        // An unfinished tool call is given out as text, but the parser is past a
+        // block.
         assert!(!ends(
             Some(false),
             true,

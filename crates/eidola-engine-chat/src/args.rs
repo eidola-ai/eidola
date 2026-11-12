@@ -71,12 +71,14 @@
 
 use crate::json::{self, BigInt, Json, ObjectBuilder, PY_MAX_STR_DIGITS};
 use crate::pysem::{self, PyLit};
+use crate::tool_call::UnparsedText;
 
 /// The tools of a request, indexed for parameter typing.
 #[derive(Clone, Debug, Default)]
 pub struct ToolSchemas {
     tools: Vec<ToolEntry>,
     typing: ArgumentTyping,
+    unparsed: UnparsedText,
 }
 
 /// How parameter text becomes a JSON value.
@@ -120,6 +122,7 @@ impl ToolSchemas {
         ToolSchemas {
             tools: out,
             typing: ArgumentTyping::default(),
+            unparsed: UnparsedText::default(),
         }
     }
 
@@ -131,6 +134,16 @@ impl ToolSchemas {
 
     pub fn typing(&self) -> ArgumentTyping {
         self.typing
+    }
+
+    /// Selects what becomes of output text that is not a call.
+    pub fn with_unparsed_text(mut self, unparsed: UnparsedText) -> ToolSchemas {
+        self.unparsed = unparsed;
+        self
+    }
+
+    pub fn unparsed_text(&self) -> UnparsedText {
+        self.unparsed
     }
 
     /// Converts the raw text of `param` in a call to `function`.

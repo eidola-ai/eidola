@@ -37,4 +37,4 @@ pub use error::ChatError;
 pub use output::{ChatDelta, FinishReason, OutputConfig, OutputParser, StopCause};
 pub use template::{ChatInput, ChatTemplate, Prompt, RenderOptions};
 pub use tokenizer::{Detokenizer, MimoTokenizer};
-pub use tool_call::{CallIdSource, PrefixedCallIds, ToolCall};
+pub use tool_call::{CallIdSource, PrefixedCallIds, ToolCall, UnparsedText};
