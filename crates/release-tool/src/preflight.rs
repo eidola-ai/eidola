@@ -173,9 +173,9 @@ mod tests {
 
     #[test]
     fn a_tag_must_name_the_version_its_binaries_report() {
-        // v0.0.2 through v0.0.8 were all cut from a workspace at 0.1.0:
-        // every client they shipped reports 0.1.0 and is told it is up to
-        // date with each of them.
+        // A tag below the workspace version ships clients that report the
+        // workspace version, newer than the tag says, and are told they are up
+        // to date with every release until that version is passed.
         let err = check_tag_version("v0.0.8", "0.1.0")
             .unwrap_err()
             .to_string();
