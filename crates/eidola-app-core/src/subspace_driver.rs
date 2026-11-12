@@ -345,6 +345,8 @@ impl DelegationFailure {
             AppError::NoAccount
             | AppError::InsufficientBalance { .. }
             | AppError::ProvisioningTimeout { .. }
+            // A refused cached prefix the held credits could not resend.
+            | AppError::UncachedRetryUnfunded
             | AppError::TermsAcceptanceRequired { .. }
             // No credential could be issued under the server's key.
             | AppError::IssuerKeyRefused { .. } => Self::Funding,

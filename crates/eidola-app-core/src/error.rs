@@ -137,6 +137,19 @@ pub enum AppError {
     #[error("provisioning timed out: {message}")]
     ProvisioningTimeout { message: String },
 
+    /// An Eidola engine refused a request's declared cached prefix (it no
+    /// longer held what the conversation's earlier requests left in it), and
+    /// the credits already held could not pay for sending it again without
+    /// the declaration. That resend is never paid by converting account
+    /// credit: whoever can empty an engine's cache could otherwise choose
+    /// when this client converts. Nothing was converted; the refused request
+    /// was charged its request fee. Retrying is an ordinary request, which
+    /// converts as any other does.
+    #[error(
+        "the engine no longer held this conversation's cached prompt, and the credits held cannot pay to send it again in full; try again"
+    )]
+    UncachedRetryUnfunded,
+
     /// The server requires acceptance of the current terms-of-service /
     /// privacy-policy versions before purchases or credential issuance can
     /// proceed (HTTP 428). UIs route to a review-and-accept step:

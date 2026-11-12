@@ -1035,6 +1035,19 @@ CREATE INDEX idx_request_credential
 -- `generation` counts the lineage's keys, so a reuse stamps the
 -- key it judged and never a successor that replaced it.
 --
+-- The `resume_*` columns are the key's **resume point**: the
+-- lineage's most recent answered request under this key that asked
+-- for a new assistant turn (its anchor), which is what lets its next
+-- requests declare a cached prefix (`prefix_cache::ResumePoint`):
+-- the SHA-256 of that request's `tools` and `messages` as sent, how
+-- many messages it sent, and the prompt tokens the engine reported.
+-- A request that continued an answer is never an anchor and leaves
+-- it as it is. Written only against the key
+-- that carried that request (`generation` and `created_at` both
+-- match), all NULL until then, and cleared by every write that
+-- replaces the key, so a rotated or re-minted key has nothing to
+-- declare; deleted with the row. Emits nothing: no surface reads it.
+--
 -- No cascade. A row exists only after a turn ran in the space,
 -- and a turn needs a post there, so a space the pristine reaper
 -- may delete never has one; the reaper deletes any anyway
@@ -1066,8 +1079,14 @@ CREATE TABLE prefix_cache_key (
     key_bytes       BLOB NOT NULL CHECK (length(key_bytes) = 32),
     created_at      INTEGER NOT NULL,
     last_used_at    INTEGER NOT NULL,
+    resume_prompt_digest     BLOB CHECK (resume_prompt_digest IS NULL
+                             OR length(resume_prompt_digest) = 32),
+    resume_message_count     INTEGER,
+    resume_prompt_tokens     INTEGER,
 
-    PRIMARY KEY (space_id, participant_id)
+    PRIMARY KEY (space_id, participant_id),
+    CHECK ((resume_prompt_digest IS NULL) = (resume_message_count IS NULL)
+       AND (resume_prompt_digest IS NULL) = (resume_prompt_tokens IS NULL))
 );
 
 -- **A model change forgets the lineage's key at the write.** A

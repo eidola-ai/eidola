@@ -139,3 +139,12 @@ space-error-issuer-key-second-for-epoch = Eidola’s server offered a different 
 # across weeks would let the server swap another key in unnoticed later, so
 # the app refuses it.
 space-error-issuer-key-reused = Eidola’s server offered the same payment key for two different weeks, which an honest server never does, so this app didn’t use it. Nothing was sent and nothing was charged, and the credits you already hold still work.
+
+# Shown when Eidola's engine no longer held what this conversation's earlier
+# replies left in it, and the credits this app already holds cannot pay to
+# send the request again in full. The app deliberately converts no account
+# credit for that resend (someone able to empty the engine's cache could
+# otherwise choose when it converts), so it stops and says so. The refused
+# request cost only its small request fee; trying again is an ordinary send,
+# which converts credit as any other does.
+space-error-uncached-retry-unfunded = Eidola’s engine no longer had this conversation’s earlier context ready, and the credits this app holds can’t cover sending it again in full. Nothing more was converted from your account. Try again to send it as a new request.

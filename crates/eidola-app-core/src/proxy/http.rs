@@ -574,7 +574,10 @@ pub(crate) fn app_error_response(error: &AppError) -> Response<ProxyBody> {
         | AppError::InsufficientBalance { .. }
         | AppError::Credential { .. }
         | AppError::IssuerKeyRefused { .. }
-        | AppError::ProvisioningTimeout { .. } => (
+        | AppError::ProvisioningTimeout { .. }
+        // Unreachable from the proxy (it never declares a cached prefix);
+        // placed with the funding failures it is one of.
+        | AppError::UncachedRetryUnfunded => (
             StatusCode::PAYMENT_REQUIRED,
             "insufficient_quota",
             Some("insufficient_quota"),

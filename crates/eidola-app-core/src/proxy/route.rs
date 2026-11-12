@@ -1294,7 +1294,10 @@ impl Inner {
                         message: "computed charge is zero — model pricing may be missing".into(),
                     });
                 }
-                spend = Some(self.acquire_spend(&cfg, &db_conn, charge, now).await?);
+                spend = Some(
+                    self.acquire_spend(&cfg, &db_conn, charge, now, crate::Funding::MayConvert)
+                        .await?,
+                );
                 None
             }
         };

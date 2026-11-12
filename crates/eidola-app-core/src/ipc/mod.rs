@@ -1107,6 +1107,7 @@ impl WireError {
             AppError::ProvisioningTimeout { message } => {
                 ("ProvisioningTimeout", json!({ "message": message }))
             }
+            AppError::UncachedRetryUnfunded => ("UncachedRetryUnfunded", json!({})),
             AppError::TermsAcceptanceRequired { message } => {
                 ("TermsAcceptanceRequired", json!({ "message": message }))
             }
@@ -1215,6 +1216,7 @@ impl WireError {
                 refusal: serde_json::from_value(f.get("refusal")?.clone()).ok()?,
             },
             "NoAccount" => AppError::NoAccount,
+            "UncachedRetryUnfunded" => AppError::UncachedRetryUnfunded,
             "InsufficientBalance" => AppError::InsufficientBalance {
                 available: i("available")?,
                 required: i("required")?,
@@ -1946,6 +1948,7 @@ mod tests {
     fn a_typed_app_error_survives_the_round_trip_with_its_fields() {
         let cases = [
             AppError::NoAccount,
+            AppError::UncachedRetryUnfunded,
             AppError::InsufficientBalance {
                 available: 12,
                 required: 34,

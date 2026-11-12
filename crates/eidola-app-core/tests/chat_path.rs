@@ -366,8 +366,9 @@ fn a_first_message_into_a_pre_created_space_instantiates_nothing() {
 /// The turn path copied the catalog's token rates into its pricing tuple and
 /// dropped `per_request`, so a model the server prices per request — zero
 /// token rates — was refused as a zero charge before it was asked anything.
-/// The hold is the server's `worst_case_cost` for that model: the flat price,
-/// whatever the request holds. Read off the spend proof the turn presented.
+/// The hold is the server's `worst_case_cost` for that model: the request fee
+/// and the flat price, whatever the request holds. Read off the spend proof
+/// the turn presented.
 #[test]
 fn a_turn_on_a_flat_priced_model_is_held_at_its_flat_price() {
     run(|| {
@@ -383,8 +384,8 @@ fn a_turn_on_a_flat_priced_model_is_held_at_its_flat_price() {
         let charges = mock.chat_charges();
         assert_eq!(
             charges.first().copied().flatten(),
-            Some(FLAT_PRICE as u128),
-            "the turn's hold is the flat price: {charges:?}"
+            Some(chat_harness::REQUEST_FEE + FLAT_PRICE as u128),
+            "the turn's hold is the request fee and the flat price: {charges:?}"
         );
     });
 }
@@ -735,10 +736,12 @@ fn a_new_credential_fills_what_the_wallet_cannot() {
 
 /// **Every exit of a two-input round settles every input**: a completed
 /// answer and a stream ending in its metadata event (one refund per input, in
-/// band), a refusal after recording (full refunds in its error body), and a
-/// connection dropped before any answer (each input recovered by its own
-/// nullifier). Charged nothing here, each input comes back whole, and no
-/// credential is left `spending`.
+/// band), a refusal after recording (refunds of all but the request fee in its
+/// error body), and a connection dropped before any answer (each input
+/// recovered by its own nullifier). A completed answer is charged nothing
+/// here and each input comes back whole; a refused or lost one is charged the
+/// fee, which the first input (the drain, holding exactly the fee) bears
+/// whole, in input order. No credential is left `spending`.
 #[test]
 fn every_exit_of_a_two_input_round_settles_every_input() {
     for (chat, streaming) in [
@@ -776,7 +779,12 @@ fn every_exit_of_a_two_input_round_settles_every_input() {
                 "{chat:?}: a drain and a fill"
             );
             assert!(spending_credentials(&core).is_empty(), "{chat:?}");
-            assert_eq!(active_balances(&core), vec![1_000, 1_000_000], "{chat:?}");
+            let drained = if streaming || matches!(chat, ChatBehavior::OkBlocking) {
+                1_000
+            } else {
+                0
+            };
+            assert_eq!(active_balances(&core), vec![drained, 1_000_000], "{chat:?}");
         });
     }
 }
@@ -3654,8 +3662,8 @@ fn branched_eidola_space(core: &AppCore) -> String {
 ///   is actually going to send, which is *smaller* because the withdrawn tool
 ///   schemas are no longer being charged for;
 /// * nothing is stranded (no credential left `spending`) and nothing is lost —
-///   with the mock refunding each charge in full, the wallet's spendable total
-///   is exactly what it was before the turn;
+///   with the mock charging each recovered hold its request fee alone, the
+///   wallet's spendable total is what it was before the turn less two fees;
 /// * one answer is persisted, not two.
 #[test]
 fn a_rejected_tools_field_on_a_spending_backend_settles_both_holds() {
@@ -3787,9 +3795,11 @@ fn a_rejected_tools_field_on_a_spending_backend_settles_both_holds() {
             lifecycle.iter().all(|c| c.state != "spending"),
             "no hold outlives the turn; got {lifecycle:?}"
         );
-        // Nothing lost: the mock refunds each charge in full, so a settled pair
-        // of holds leaves the spendable total exactly where it was. A leaked
-        // hold or a double-charge would show up here as a shortfall.
+        // Nothing lost: neither request's answer carries its refund in band,
+        // and the mock charges a recovered spend the request fee and returns
+        // the rest, so a settled pair of holds leaves the spendable total short
+        // by exactly two fees. A leaked hold or a double-charge would show up
+        // here as a larger shortfall.
         let credits_after: i64 = core
             .runtime()
             .block_on(core.wallet_credentials())
@@ -3798,8 +3808,9 @@ fn a_rejected_tools_field_on_a_spending_backend_settles_both_holds() {
             .map(|c| c.credits)
             .sum();
         assert_eq!(
-            credits_after, credits_before,
-            "both holds came back — the failed attempt cost the wallet nothing"
+            credits_after,
+            credits_before - 2 * chat_harness::REQUEST_FEE as i64,
+            "both holds came back, each less its request fee"
         );
 
         // One answer, not two: the rejected attempt wrote no inference, so the
@@ -5808,7 +5819,9 @@ fn a_tool_rounds_hold_covers_the_tool_bytes_it_sends() {
         let expected: u64 = bodies
             .iter()
             .map(|b| {
-                contract_prompt_tokens(b) + b["max_completion_tokens"].as_u64().expect("ceiling")
+                chat_harness::REQUEST_FEE as u64
+                    + contract_prompt_tokens(b)
+                    + b["max_completion_tokens"].as_u64().expect("ceiling")
             })
             .sum();
         assert_eq!(
@@ -6006,7 +6019,9 @@ fn a_later_turns_hold_covers_the_traces_it_replays() {
 
         assert_eq!(
             second.credits_charged as u64,
-            contract_prompt_tokens(last) + last["max_completion_tokens"].as_u64().expect("ceiling"),
+            chat_harness::REQUEST_FEE as u64
+                + contract_prompt_tokens(last)
+                + last["max_completion_tokens"].as_u64().expect("ceiling"),
             "the hold equals the contract over the bytes actually sent"
         );
 
@@ -8197,7 +8212,11 @@ fn a_continuation_is_held_over_what_it_sends() {
             let messages = body["messages"].as_array().unwrap();
             let prompt = eidola_common::prompt_charge(messages, None).chargeable_prompt_tokens();
             let ceiling = body["max_completion_tokens"].as_u64().unwrap();
-            assert_eq!(*charge, Some(u128::from(prompt + ceiling)), "{body}");
+            assert_eq!(
+                *charge,
+                Some(chat_harness::REQUEST_FEE + u128::from(prompt + ceiling)),
+                "{body}"
+            );
         }
         let partial = bodies[1]["messages"]
             .as_array()
@@ -8259,6 +8278,528 @@ fn the_ceiling_is_the_models_declared_output_limit() {
         assert_eq!(
             mock.chat_bodies().pop().unwrap()["max_completion_tokens"],
             CEILING_TOKENS
+        );
+    });
+}
+
+// ===========================================================================
+// The ceiling ladder and automatic continuation
+//
+// An Eidola turn asks for a rung of a public ladder (8,192 doubling up to the
+// model's declared limit), chosen from the request and the model's published
+// prices; an answer that stops at its ceiling, exactly continuable, is
+// continued at once with the request that began it plus the answer so far,
+// until it ends or reaches the declared limit, and written as one generation.
+// The mock refuses any hold but its own worst case, so every test here also
+// checks each request's hold is the one its rung prices.
+// ===========================================================================
+
+/// A catalog whose model declares `limit` output tokens inside a window wide
+/// enough for every rung.
+fn ladder_config(chat: ChatBehavior, limit: u64) -> MockConfig {
+    MockConfig {
+        chat,
+        declared_max_output: Some(limit),
+        context_length: Some(262_144),
+        ..MockConfig::default()
+    }
+}
+
+fn ladder_setup(chat: ChatBehavior, limit: u64) -> (MockServer, AppCore, tempfile::TempDir) {
+    let (mock, core, dir) = setup(ladder_config(chat, limit));
+    with_account(&core);
+    (mock, core, dir)
+}
+
+/// A turn on either transport, with what a streaming caller accumulated
+/// (empty for a blocking one).
+fn ladder_turn(
+    core: &AppCore,
+    prompt: &str,
+    streaming: bool,
+) -> (
+    Result<eidola_app_core::ChatResult, AppError>,
+    String,
+    String,
+) {
+    if !streaming {
+        let result = core
+            .runtime()
+            .block_on(core.chat(prompt.to_string(), MODEL.into(), None));
+        return (result, String::new(), String::new());
+    }
+    let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+    core.runtime().block_on(async {
+        let ask = core.chat_stream_reply(prompt.to_string(), MODEL.into(), None, None, tx);
+        let (res, (content, reasoning)) = tokio::join!(ask, collect_deltas(events_rx));
+        (res, content, reasoning)
+    })
+}
+
+fn ceilings(bodies: &[serde_json::Value]) -> Vec<u64> {
+    bodies
+        .iter()
+        .map(|b| b["max_completion_tokens"].as_u64().expect("a ceiling"))
+        .collect()
+}
+
+/// The first `n` parts of a [`ChatBehavior::LongAnswer`], joined.
+fn long_answer(n: u64) -> String {
+    (1..=n).map(chat_harness::long_part).collect()
+}
+
+/// `continued` is `first` — the request that began the answer — with the
+/// answer so far as its final partial message, continued in its content.
+fn assert_continues_the_answer(
+    first: &serde_json::Value,
+    continued: &serde_json::Value,
+    so_far: &str,
+) {
+    let sent = first["messages"].as_array().expect("messages");
+    let messages = continued["messages"].as_array().expect("messages");
+    assert_eq!(&messages[..messages.len() - 1], sent.as_slice());
+    let partial = messages.last().expect("a partial message");
+    assert_eq!(partial["role"], "assistant");
+    assert_eq!(partial["content"], so_far);
+    assert_eq!(partial["reasoning_content"], chat_harness::LONG_REASONING);
+    assert_eq!(continued["continue_final_message"], true);
+    assert_eq!(continued["add_generation_prompt"], false);
+    assert_eq!(continued["tools"], first["tools"]);
+}
+
+/// The inference generations of a space, oldest first.
+fn inferences(core: &AppCore, space_id: &str) -> Vec<eidola_app_core::PostNode> {
+    core.runtime()
+        .block_on(core.get_space_tree(space_id.to_string()))
+        .expect("tree")
+        .into_iter()
+        .filter(|n| n.action_type == "inference")
+        .collect()
+}
+
+/// **An answer longer than its ceiling is continued to its end and written
+/// once**, on both transports: four requests, the rungs doubling with what the
+/// answer has generated, each continuation the request that began the answer
+/// plus the answer so far, one generation holding the whole answer with every
+/// request attached to it, and a streaming caller holding exactly that text.
+#[test]
+fn an_answer_longer_than_its_ceiling_is_continued_to_its_end_and_written_once() {
+    for streaming in [false, true] {
+        run(move || {
+            let (mock, core, _dir) = ladder_setup(
+                ChatBehavior::LongAnswer {
+                    requests: 4,
+                    fail_at: None,
+                },
+                131_072,
+            );
+            let (result, content, reasoning) = ladder_turn(&core, "Tell me everything.", streaming);
+            let result = result.expect("the turn");
+            let whole = long_answer(4);
+            assert_eq!(result.content, whole);
+            assert!(!result.truncated, "the answer ended");
+            if streaming {
+                assert_eq!(content, whole, "the caller's stream is seamless");
+                assert_eq!(reasoning, chat_harness::LONG_REASONING);
+            }
+
+            let bodies = mock.chat_bodies();
+            assert_eq!(
+                ceilings(&bodies),
+                [8_192, 8_192, 16_384, 32_768],
+                "the rungs double with what was generated"
+            );
+            assert!(bodies[0].get("continue_final_message").is_none());
+            for (k, body) in bodies.iter().enumerate().skip(1) {
+                assert_continues_the_answer(&bodies[0], body, &long_answer(k as u64));
+            }
+            assert_eq!(mock.hold_mismatches(), 0, "each hold is its rung's");
+            assert_eq!(
+                result.output_tokens,
+                Some(8_192 + 8_192 + 16_384 + 5),
+                "the answer's output is every request's"
+            );
+
+            let written = inferences(&core, &result.space_id);
+            assert_eq!(written.len(), 1, "one generation");
+            assert_eq!(block_text(&written[0]), whole);
+            assert_eq!(block_thinking(&written[0]), chat_harness::LONG_REASONING);
+            assert!(!written[0].truncated);
+            let rows = completion_rows(&core);
+            assert_eq!(rows.len(), 4);
+            for row in &rows {
+                assert_eq!(
+                    request_detail(&core, &row.id).action_id,
+                    result.response_action_id,
+                    "every request of the answer is attached to it"
+                );
+            }
+            let actions = core
+                .runtime()
+                .block_on(core.test_space_actions(result.space_id.clone()))
+                .expect("actions");
+            let inference = actions
+                .iter()
+                .find(|a| a.action_type == "inference")
+                .expect("the inference");
+            let charges: u128 = mock.chat_charges().iter().map(|c| c.expect("a hold")).sum();
+            assert_eq!(
+                inference.credits_consumed,
+                Some(charges as i64),
+                "the generation carries every request's hold"
+            );
+            assert!(spending_credentials(&core).is_empty());
+        });
+    }
+}
+
+/// **A deep context starts on a higher rung**: the first rung whose price at
+/// the completion rate covers reading the prompt again — at the prompt rate
+/// for a model that sells no cached rate, at the cached rate for one that does.
+#[test]
+fn a_deep_context_starts_on_a_higher_rung() {
+    let prompt = "the tide rises and falls twice a day. ".repeat(1_000);
+    let rung_for = |read: u64| {
+        [8_192u64, 16_384, 32_768, 65_536, 131_072]
+            .into_iter()
+            .find(|&r| r >= read)
+            .unwrap_or(131_072)
+    };
+    let p = prompt.clone();
+    run(move || {
+        let (mock, core, _dir) = ladder_setup(ChatBehavior::OkEitherTransport, 131_072);
+        core.runtime()
+            .block_on(core.chat(p, MODEL.into(), None))
+            .expect("the turn");
+        let body = mock.chat_bodies().pop().unwrap();
+        let read = contract_prompt_tokens(&body);
+        assert!(read > 16_384, "a deep context: {read}");
+        assert_eq!(body["max_completion_tokens"].as_u64(), Some(rung_for(read)));
+        assert!(body["max_completion_tokens"].as_u64().unwrap() > 16_384);
+        assert_eq!(mock.hold_mismatches(), 0);
+    });
+    run(move || {
+        let (mock, core, _dir) = setup(MockConfig {
+            cached_prompt_price: Some(CACHED_RATE),
+            ..ladder_config(ChatBehavior::OkEitherTransport, 131_072)
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat(prompt, MODEL.into(), None))
+            .expect("the turn");
+        let body = mock.chat_bodies().pop().unwrap();
+        let read = contract_prompt_tokens(&body);
+        // A quarter of a credit a token: the same prompt reads for a quarter.
+        assert_eq!(
+            body["max_completion_tokens"].as_u64(),
+            Some(rung_for(read.div_ceil(4)))
+        );
+        assert_eq!(mock.hold_mismatches(), 0);
+    });
+}
+
+/// **An answer never runs past the model's declared limit**: the last
+/// continuation asks for what remains, the requests' ceilings sum to the
+/// limit, and an answer that reaches it is written truncated and left for the
+/// reader to continue, as an answer that reached its ceiling always was.
+#[test]
+fn an_answer_never_runs_past_the_declared_limit() {
+    run(|| {
+        let (mock, core, _dir) = ladder_setup(
+            ChatBehavior::LongAnswer {
+                requests: 100,
+                fail_at: None,
+            },
+            40_000,
+        );
+        let (result, _, _) = ladder_turn(&core, "Never stop.", false);
+        let result = result.expect("the turn");
+        let bodies = mock.chat_bodies();
+        assert_eq!(ceilings(&bodies), [8_192, 8_192, 16_384, 7_232]);
+        assert_eq!(ceilings(&bodies).iter().sum::<u64>(), 40_000);
+        assert!(result.truncated, "it stopped at the limit");
+        assert!(result.continuable, "and the reader may continue it");
+        assert_eq!(result.content, long_answer(4));
+        assert_eq!(inferences(&core, &result.space_id).len(), 1);
+        assert_eq!(mock.hold_mismatches(), 0);
+    });
+}
+
+/// **A continuation that fails loses nothing**, on both transports: the answer
+/// so far is written as it stood, at its ceiling and continuable by the
+/// reader; every hold settles; the failed request's row is attached to
+/// nothing. Continuing it then picks up where it stopped.
+#[test]
+fn a_continuation_that_fails_leaves_the_answer_written_and_continuable() {
+    for streaming in [false, true] {
+        run(move || {
+            let (mock, core, _dir) = ladder_setup(
+                ChatBehavior::LongAnswer {
+                    requests: 3,
+                    fail_at: Some(2),
+                },
+                131_072,
+            );
+            let (result, content, _) = ladder_turn(&core, "Tell me everything.", streaming);
+            let result = result.expect("the turn ends as a ceiling ending does");
+            assert_eq!(result.content, long_answer(1));
+            if streaming {
+                assert_eq!(content, long_answer(1));
+            }
+            assert!(result.truncated && result.continuable);
+            assert_eq!(mock.chat_bodies().len(), 2);
+            let written = inferences(&core, &result.space_id);
+            assert_eq!(written.len(), 1);
+            assert!(written[0].truncated && written[0].continuable);
+            let rows = completion_rows(&core);
+            let attached: Vec<Option<String>> = rows
+                .iter()
+                .map(|r| request_detail(&core, &r.id).action_id)
+                .collect();
+            assert_eq!(
+                attached.iter().filter(|a| a.is_some()).count(),
+                1,
+                "the answered request is the generation's, the failed one nobody's: {attached:?}"
+            );
+            assert!(spending_credentials(&core).is_empty(), "nothing held");
+            assert_eq!(mock.hold_mismatches(), 0);
+
+            let (res, _, _) = continue_streaming(&core, &result.response_action_id.unwrap());
+            let continued = res.expect("the reader continues it");
+            assert_eq!(continued.content, long_answer(3));
+            assert!(!continued.truncated);
+        });
+    }
+}
+
+/// **A continuation that cannot be paid loses nothing**: a per-turn budget
+/// the first request fits and its continuation (a longer prompt at the same
+/// rung) does not ends the turn with the answer written as it stood.
+#[test]
+fn a_continuation_the_budget_cannot_pay_leaves_the_answer_written() {
+    run(|| {
+        let config = || {
+            ladder_config(
+                ChatBehavior::LongAnswer {
+                    requests: 2,
+                    fail_at: None,
+                },
+                131_072,
+            )
+        };
+        // Learn the first request's hold.
+        let (mock, core, _dir) = setup(config());
+        with_account(&core);
+        core.runtime()
+            .block_on(core.test_chat_with_budget("budget me".into(), MODEL.into(), None, i64::MAX))
+            .expect("probe");
+        let first_hold = mock.chat_charges()[0].expect("a hold") as i64;
+        assert!(mock.chat_charges()[1].expect("a hold") as i64 > first_hold);
+
+        let (mock, core, _dir) = setup(config());
+        with_account(&core);
+        let result = core
+            .runtime()
+            .block_on(core.test_chat_with_budget(
+                "budget me".into(),
+                MODEL.into(),
+                None,
+                first_hold,
+            ))
+            .expect("the turn ends as a ceiling ending does");
+        assert_eq!(
+            mock.chat_bodies().len(),
+            1,
+            "the continuation was never sent"
+        );
+        assert_eq!(result.content, long_answer(1));
+        assert!(result.truncated && result.continuable);
+        assert_eq!(inferences(&core, &result.space_id).len(), 1);
+        assert!(spending_credentials(&core).is_empty());
+    });
+}
+
+/// **A continuation may end in tool calls**: the continued text is the tool
+/// round's narration, and the request after the tool round is an ordinary
+/// one, a new answer on the first rung, declaring the anchor that began the
+/// round.
+#[test]
+fn an_automatic_continuation_may_end_in_a_tool_round() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            cached_prompt_price: Some(CACHED_RATE),
+            engine_prompt_tokens: Some(0),
+            ..ladder_config(ChatBehavior::ContinueIntoToolRound, 131_072)
+        });
+        with_account(&core);
+        core.register_tool(std::sync::Arc::new(EchoTool))
+            .expect("echo is not reserved");
+        let result = turn(&core, &long_prompt("use the tool"), None, None);
+        assert_eq!(result.content, chat_harness::TOOL_FINAL_CONTENT);
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(bodies[1]["continue_final_message"], "reasoning_content");
+        assert!(bodies[2].get("continue_final_message").is_none());
+        assert_eq!(ceilings(&bodies), [8_192, 8_192, 8_192]);
+        let anchor = declared_prefix(&bodies[1]).expect("the continuation declares");
+        let after = declared_prefix(&bodies[2]).expect("the tool round's follow-up declares");
+        assert_eq!(anchor.0, after.0, "the anchor that began the round");
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(result.space_id.clone()))
+            .expect("actions");
+        let call = actions
+            .iter()
+            .find(|a| a.action_type == "tool_call")
+            .expect("the tool round");
+        assert!(
+            call.blocks.iter().any(|b| b.block_type == "thinking"
+                && b.text_content.as_deref() == Some(chat_harness::TRUNCATED_REASONING)),
+            "the answer it continued narrates the round: {:?}",
+            call.blocks
+        );
+        assert_declarations_exact(&mock);
+    });
+}
+
+/// An automatic continuation declares the anchor that began its answer, every
+/// continuation the same one, and so does the next turn.
+#[test]
+fn an_automatic_continuation_declares_its_anchor() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            cached_prompt_price: Some(CACHED_RATE),
+            engine_prompt_tokens: Some(0),
+            ..ladder_config(
+                ChatBehavior::LongAnswer {
+                    requests: 3,
+                    fail_at: None,
+                },
+                131_072,
+            )
+        });
+        with_account(&core);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        assert_eq!(first.content, long_answer(3));
+        turn(&core, "And then?", Some(first.space_id), None);
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 4);
+        assert_eq!(declared_prefix(&bodies[0]), None);
+        let anchor = declared_prefix(&bodies[1]).expect("a declaration").0;
+        for body in &bodies[2..] {
+            assert_eq!(declared_prefix(body).expect("a declaration").0, anchor);
+        }
+        assert_declarations_exact(&mock);
+        assert_eq!(mock.declared_refusals(), 0);
+    });
+}
+
+/// A refused declaration on a continuation is sent once more undeclared, as
+/// any request's is, and the answer goes on.
+#[test]
+fn a_refused_continuation_is_sent_once_more_undeclared() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            cached_prompt_price: Some(CACHED_RATE),
+            engine_prompt_tokens: Some(0),
+            ..ladder_config(
+                ChatBehavior::LongAnswer {
+                    requests: 2,
+                    fail_at: None,
+                },
+                131_072,
+            )
+        });
+        with_account(&core);
+        // The first request has nothing to declare; the next declared one is
+        // the continuation.
+        mock.refuse_next_declared("cached_prefix_missing");
+        let result = turn(&core, &long_prompt("one"), None, None);
+        assert_eq!(result.content, long_answer(2));
+        assert!(!result.truncated);
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        assert!(declared_prefix(&bodies[1]).is_some());
+        assert_eq!(declared_prefix(&bodies[2]), None, "resent undeclared");
+        assert_eq!(bodies[1]["messages"], bodies[2]["messages"]);
+        assert_eq!(mock.declared_refusals(), 1);
+        assert_eq!(inferences(&core, &result.space_id).len(), 1);
+        assert!(spending_credentials(&core).is_empty());
+        assert_eq!(mock.hold_mismatches(), 0);
+    });
+}
+
+/// **A delegated room's turns are continued the same way**: the door the
+/// sub-space driver drives turns through (`respond_stream_as`) continues an
+/// answer that stops at its ceiling, under the same bound.
+#[test]
+fn a_driven_turns_answer_is_continued_too() {
+    run(|| {
+        let (mock, core, _dir) = ladder_setup(
+            ChatBehavior::LongAnswer {
+                requests: 2,
+                fail_at: None,
+            },
+            131_072,
+        );
+        let space = core
+            .runtime()
+            .block_on(core.post_reply("A question.".into(), None, None))
+            .expect("post");
+        let ada = core
+            .runtime()
+            .block_on(core.add_space_participant(
+                space.space_id.clone(),
+                eidola_app_core::NewParticipant {
+                    label: "Ada".into(),
+                    model_ref: Some(MODEL.into()),
+                    system_prompt: None,
+                    notify_policy: "explicit".into(),
+                },
+            ))
+            .expect("add agent");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let result = core
+            .runtime()
+            .block_on(core.respond_stream_as(space.space_id.clone(), ada.id, space.action_id, tx))
+            .expect("Ada answers");
+        assert_eq!(result.content, long_answer(2));
+        assert_eq!(ceilings(&mock.chat_bodies()), [8_192, 8_192]);
+    });
+}
+
+/// **Every other backend keeps its ceiling**: an answer from an external
+/// backend that stops at its ceiling is written truncated after one request
+/// asking for the whole limit, and is not continued.
+#[test]
+fn a_turn_on_another_backend_is_neither_laddered_nor_continued() {
+    run(|| {
+        let (mock, core, _dir) = setup(ladder_config(
+            ChatBehavior::LongAnswer {
+                requests: 3,
+                fail_at: None,
+            },
+            131_072,
+        ));
+        external_backend(&core, &mock.base_url);
+        let result = core
+            .runtime()
+            .block_on(core.chat("hi".into(), "qwen3-8b@ext".into(), None))
+            .expect("the turn completes");
+        assert!(result.truncated);
+        assert!(
+            !result.continuable,
+            "only an Eidola answer can be continued"
+        );
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 1, "not continued");
+        assert_eq!(
+            bodies[0]["max_completion_tokens"].as_u64(),
+            Some(chat_harness::CEILING_TOKENS as u64),
+            "the fallback ceiling, as before"
         );
     });
 }
@@ -13074,4 +13615,592 @@ fn a_failed_generation_does_not_move_the_last_answers_weights() {
             "the first successful answer from the new weights announces the roster"
         );
     });
+}
+
+// ===========================================================================
+// Declared cached prefixes
+//
+// A request carrying its lineage's key, to a model that sells a cached rate,
+// declares how much of its prompt the engine already holds when the client
+// knows it: its prompt begins with exactly what the lineage's most recent
+// answered request left. It is priced by that declaration. The harness's
+// caching engine (`MockConfig::engine_prompt_tokens`) serves a declaration
+// only if its own arithmetic derives exactly the same numbers from a request
+// it served under the same key, and refuses it `409` otherwise; the mock
+// computes every hold, declared or not, independently of the shared rule.
+// ===========================================================================
+
+/// The cached-prompt rate the harness sells: a quarter of a credit a token.
+const CACHED_RATE: (u64, u64) = (1, 4);
+
+/// A user prompt long enough that its conversation's prompt passes a few
+/// quanta of the declared prefix, so a declaration has something to claim.
+fn long_prompt(tag: &str) -> String {
+    format!(
+        "{tag}: {}",
+        "the tide rises and falls twice a day. ".repeat(120)
+    )
+}
+
+/// A core over a catalog that declares MODEL's prefix cache and sells its
+/// cached rate, answered by the harness's caching engine.
+fn declaring_setup(chat: ChatBehavior) -> (MockServer, AppCore, tempfile::TempDir) {
+    let (mock, core, dir) = setup(declaring_config(chat));
+    with_account(&core);
+    (mock, core, dir)
+}
+
+fn declaring_config(chat: ChatBehavior) -> MockConfig {
+    MockConfig {
+        chat,
+        declared_prompt_cache: Some(supported_prompt_cache()),
+        cached_prompt_price: Some(CACHED_RATE),
+        engine_prompt_tokens: Some(0),
+        ..MockConfig::default()
+    }
+}
+
+/// The `cached_prefix` member a captured body carried, as `(cached, new)`.
+fn declared_prefix(body: &serde_json::Value) -> Option<(u64, u64)> {
+    let member = body.get("cached_prefix")?;
+    Some((
+        member["cached_tokens"].as_u64().expect("cached_tokens"),
+        member["new_tokens"].as_u64().expect("new_tokens"),
+    ))
+}
+
+/// The hold the byte contract gives `body` at the harness's rates (one credit
+/// a prompt and a completion token): the fee, the chargeable prompt, the
+/// ceiling.
+fn undeclared_hold(body: &serde_json::Value) -> u128 {
+    chat_harness::REQUEST_FEE
+        + u128::from(contract_prompt_tokens(body))
+        + u128::from(body["max_completion_tokens"].as_u64().expect("ceiling"))
+}
+
+/// Every declaration the client sent was one the engine derives exactly, and
+/// every hold was the mock's own worst case.
+fn assert_declarations_exact(mock: &MockServer) {
+    assert_eq!(mock.declaration_mismatches(), 0, "every declaration exact");
+    assert_eq!(mock.hold_mismatches(), 0, "every hold the worst case");
+}
+
+/// **A second turn declares what the first left**, on both transports: the
+/// first request of a lineage declares nothing, the next ones declare the
+/// previous request's prompt — rounded down to the quantum — and are held by
+/// the declaration, well under what the same body holds undeclared.
+#[test]
+fn a_later_turn_declares_what_the_last_one_left() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        let space = first.space_id.clone();
+        core.runtime()
+            .block_on(core.chat("And why twice?".into(), MODEL.into(), Some(space.clone())))
+            .expect("a blocking turn");
+        turn(&core, "And at the poles?", Some(space), None);
+
+        let bodies = mock.chat_bodies();
+        let charges = mock.chat_charges();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(declared_prefix(&bodies[0]), None, "nothing to declare yet");
+        for (body, charge) in bodies.iter().zip(&charges).skip(1) {
+            let (cached, _) = declared_prefix(body).expect("a declaration");
+            assert!(cached > 0 && cached % 256 == 0, "{cached}");
+            let held = charge.expect("a hold");
+            assert!(held < undeclared_hold(body), "{held} vs undeclared");
+        }
+        assert_declarations_exact(&mock);
+        assert_eq!(mock.declared_refusals(), 0);
+        assert!(spending_credentials(&core).is_empty());
+    });
+}
+
+/// Each tool round of a turn extends the round before it, so it declares
+/// that round's prompt.
+#[test]
+fn a_tool_round_declares_the_round_before_it() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::ToolRoundsBlocking(2));
+        core.register_tool(std::sync::Arc::new(EchoTool))
+            .expect("echo is not reserved");
+        core.runtime()
+            .block_on(core.chat(long_prompt("use the tool"), MODEL.into(), None))
+            .expect("a three-round turn");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(declared_prefix(&bodies[0]), None);
+        assert!(declared_prefix(&bodies[1]).is_some(), "round 2 declares");
+        assert!(declared_prefix(&bodies[2]).is_some(), "round 3 declares");
+        assert_declarations_exact(&mock);
+    });
+}
+
+/// A regeneration sends the request its answer was written to, so it
+/// declares that request's whole prompt and adds nothing past it.
+#[test]
+fn a_regeneration_declares_the_request_it_repeats() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.regenerate_stream(
+                first.response_action_id.clone().expect("an answer"),
+                MODEL.into(),
+                tx,
+            ))
+            .expect("regenerate");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies[0]["messages"], bodies[1]["messages"]);
+        let (cached, new) = declared_prefix(&bodies[1]).expect("a declaration");
+        // Nothing added: the budget is the earlier prompt past the boundary,
+        // and the byte contract's per-request allowance.
+        assert!(new <= 256 + 32, "{cached} + {new}");
+        assert_declarations_exact(&mock);
+    });
+}
+
+/// A continuation of an answer that stopped at its ceiling declares **the
+/// request that began the answer** (its anchor), and nothing of the answer:
+/// the answer goes back as text, which need not encode to the tokens the
+/// model sampled, so the engine is not relied on to hold it. The partial
+/// message is priced as added. The harness's engine refuses a declaration
+/// reaching past an anchor, so an exact one here is the anchor's.
+#[test]
+fn a_continuation_declares_its_anchor() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::ContinueAfterLength {
+            cut: chat_harness::Cut::Answer,
+            again: false,
+        });
+        let cut = turn(&core, &long_prompt("one"), None, None);
+        assert!(cut.continuable);
+        let (res, _, _) = continue_streaming(&core, &cut.response_action_id.unwrap());
+        res.expect("the continuation");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        let (cached, new) = declared_prefix(&bodies[1]).expect("a declaration");
+        let anchor_prompt = cut.input_tokens.expect("the anchor's prompt") as u64;
+        assert!(
+            cached < anchor_prompt,
+            "the anchor's prompt and nothing past it: {cached} of {anchor_prompt}"
+        );
+        // What follows the anchor — the partial message — is the budget's.
+        let partial = bodies[1]["messages"].as_array().unwrap().last().unwrap();
+        assert!(
+            new >= eidola_common::prompt_charge(std::slice::from_ref(partial), None)
+                .chargeable_prompt_tokens(),
+            "the answer so far is priced as added: {new}"
+        );
+        assert_declarations_exact(&mock);
+        assert_eq!(mock.declared_refusals(), 0);
+    });
+}
+
+/// A second continuation of the same answer declares the same anchor: a
+/// continuation's own prompt is never one.
+#[test]
+fn a_second_continuation_of_an_answer_declares_the_same_anchor() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::ContinueAfterLength {
+            cut: chat_harness::Cut::Answer,
+            again: true,
+        });
+        let cut = turn(&core, &long_prompt("one"), None, None);
+        let (again, _, _) = continue_streaming(&core, &cut.response_action_id.unwrap());
+        let again = again.expect("the first continuation");
+        assert!(again.truncated && again.continuable, "it stopped again");
+        let (res, _, _) = continue_streaming(&core, &again.response_action_id.unwrap());
+        res.expect("the second continuation");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        let first = declared_prefix(&bodies[1]).expect("a declaration");
+        let second = declared_prefix(&bodies[2]).expect("a declaration");
+        assert_eq!(first.0, second.0, "one anchor for both");
+        assert!(second.1 > first.1, "the longer answer is the larger budget");
+        assert_declarations_exact(&mock);
+        assert_eq!(mock.declared_refusals(), 0);
+    });
+}
+
+/// The turn after a continued answer declares the anchor that answer began
+/// from: it repeats that request's messages, and the continuation left the
+/// lineage's resume point where it was.
+#[test]
+fn a_new_turn_after_a_continued_answer_declares_its_anchor() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::ContinueAfterLength {
+            cut: chat_harness::Cut::Answer,
+            again: false,
+        });
+        let cut = turn(&core, &long_prompt("one"), None, None);
+        let (res, _, _) = continue_streaming(&core, &cut.response_action_id.clone().unwrap());
+        res.expect("the continuation");
+        turn(&core, "And then?", Some(cut.space_id), None);
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        let continued = declared_prefix(&bodies[1]).expect("a declaration");
+        let next = declared_prefix(&bodies[2]).expect("a declaration");
+        assert_eq!(continued.0, next.0, "the same anchor");
+        assert_declarations_exact(&mock);
+        assert_eq!(mock.declared_refusals(), 0);
+    });
+}
+
+/// A tool round after a continued round declares the anchor too: the
+/// request that follows the tool round extends the request that began the
+/// answer, with the call and its result.
+#[test]
+fn a_tool_round_after_a_continued_round_declares_the_anchor() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::ContinueIntoToolRound);
+        core.register_tool(std::sync::Arc::new(EchoTool))
+            .expect("echo is not reserved");
+        let cut = turn(&core, &long_prompt("one"), None, None);
+        let (res, _, _) = continue_streaming(&core, &cut.response_action_id.unwrap());
+        res.expect("the continuation and its tool round");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies[1].get("continue_final_message").is_some());
+        assert!(bodies[2].get("continue_final_message").is_none());
+        let continued = declared_prefix(&bodies[1]).expect("a declaration");
+        let after = declared_prefix(&bodies[2]).expect("a declaration");
+        assert_eq!(continued.0, after.0, "the same anchor");
+        assert_declarations_exact(&mock);
+        assert_eq!(mock.declared_refusals(), 0);
+    });
+}
+
+/// **Anything short of an exact prefix declares nothing**: an earlier post
+/// edited (the context changes ahead of what was cached), or the turn's tools
+/// changed (they render before every message).
+#[test]
+fn a_changed_prefix_declares_nothing() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        let space = first.space_id.clone();
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        core.runtime()
+            .block_on(core.edit_post(tree[0].action_id.clone(), long_prompt("edited")))
+            .expect("edit");
+        turn(&core, "And why?", Some(space), None);
+        let bodies = mock.chat_bodies();
+        assert_ne!(bodies[0]["messages"][1], bodies[1]["messages"][1]);
+        assert_eq!(declared_prefix(&bodies[1]), None, "an edited earlier post");
+        assert_declarations_exact(&mock);
+    });
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        core.register_tool(std::sync::Arc::new(EchoTool))
+            .expect("echo is not reserved");
+        core.runtime()
+            .block_on(core.chat("Use a tool?".into(), MODEL.into(), Some(first.space_id)))
+            .expect("a turn");
+        let bodies = mock.chat_bodies();
+        assert!(bodies[0].get("tools").is_none() && bodies[1].get("tools").is_some());
+        assert_eq!(declared_prefix(&bodies[1]), None, "the tools changed");
+        assert_declarations_exact(&mock);
+    });
+}
+
+/// **A trailing block ends what a later turn can claim.** A space with more
+/// than two members, or with branches, closes each request with a message
+/// about the room as it stands (the roster, the map), which the next turn
+/// does not repeat: its prompt shares everything before that message, and the
+/// client cannot know how many tokens that is, so it declares nothing. Within
+/// a turn the trailing message stays put, so a regeneration still declares.
+#[test]
+fn a_trailing_block_leaves_a_later_turn_nothing_to_declare() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        let space = first.space_id.clone();
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        // A branch beside the first answer: from here on every request ends
+        // with the trailing block.
+        turn(
+            &core,
+            "What about neap tides?",
+            Some(space.clone()),
+            Some(tree[0].action_id.clone()),
+        );
+        let last = turn(&core, "And why?", Some(space), None);
+        let bodies = mock.chat_bodies();
+        let trailing = |b: &serde_json::Value| {
+            b["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("Participants in this conversation")
+        };
+        assert!(trailing(&bodies[1]) && trailing(&bodies[2]));
+        assert_eq!(declared_prefix(&bodies[2]), None, "the next turn");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.regenerate_stream(
+                last.response_action_id.expect("an answer"),
+                MODEL.into(),
+                tx,
+            ))
+            .expect("regenerate");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies[2]["messages"], bodies[3]["messages"]);
+        assert!(declared_prefix(&bodies[3]).is_some(), "the regeneration");
+        assert_declarations_exact(&mock);
+    });
+}
+
+/// A key that rotated has nothing to declare: its engine never saw the
+/// earlier request under it.
+#[test]
+fn a_rotated_key_declares_nothing() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        core.test_advance_cache_clock(CACHE_IDLE_TTL_SECS * 1000);
+        turn(&core, "And why?", Some(first.space_id), None);
+        let sent = keys(&mock);
+        assert_ne!(sent[0], sent[1], "the idle key rotated");
+        assert_eq!(declared_prefix(&mock.chat_bodies()[1]), None);
+        assert_eq!(mock.declared_refusals(), 0);
+    });
+}
+
+/// **A replaced key starts with nothing to declare**, even when no request
+/// answered under it yet: the key the first turn left a resume point on
+/// rotates under a request that then fails, and the next request — under the
+/// new key, which the rotation rule keeps — declares nothing, rather than
+/// claiming what the old key's engine held.
+#[test]
+fn a_replaced_key_keeps_nothing_of_its_predecessor() {
+    run(|| {
+        let config = declaring_config(ChatBehavior::OkStreaming);
+        let fail = config.fail_next_chat.clone();
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        let space = first.space_id.clone();
+        core.test_advance_cache_clock(CACHE_IDLE_TTL_SECS * 1000);
+        *fail.lock().unwrap() = Some(503);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.chat_stream_reply(
+                "And why?".into(),
+                MODEL.into(),
+                Some(space.clone()),
+                None,
+                tx,
+            ))
+            .expect_err("the upstream refused");
+        turn(&core, "And at the poles?", Some(space), None);
+
+        let sent = keys(&mock);
+        assert_ne!(sent[0], sent[1], "the idle key rotated");
+        assert_eq!(sent[1], sent[2], "and its successor was kept");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(declared_prefix(&bodies[2]), None);
+        assert_eq!(mock.declared_refusals(), 0);
+    });
+}
+
+/// **A model that sells no cached rate is sent exactly what it was sent
+/// before declarations existed**: a keyed body, byte for byte the shared
+/// construction, with no `cached_prefix` member.
+#[test]
+fn a_model_without_a_cached_rate_is_sent_the_body_it_always_was() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            cached_prompt_price: None,
+            ..declaring_config(ChatBehavior::OkStreaming)
+        });
+        with_account(&core);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        turn(&core, "And why?", Some(first.space_id.clone()), None);
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        let key = sent_key(&bodies[0]);
+        for body in &bodies {
+            assert_shared_keyed_body(body, true, &key);
+        }
+        assert_eq!(mock.hold_mismatches(), 0);
+    });
+}
+
+/// **A refused declaration is sent once more without it**, for each refusal
+/// and on both transports: the refused request is charged the request fee and
+/// nothing else, both holds settle, the turn writes one answer, and the
+/// lineage declares again from what the resend left.
+#[test]
+fn a_refused_declaration_is_sent_once_more_undeclared() {
+    for kind in ["cached_prefix_missing", "prompt_budget_exceeded"] {
+        for streaming in [true, false] {
+            run(move || {
+                let (mock, core, _dir) = declaring_setup(ChatBehavior::StreamingWithMetadataRefund);
+                let first = turn(&core, &long_prompt("one"), None, None);
+                let space = first.space_id.clone();
+                let before: i64 = core
+                    .runtime()
+                    .block_on(core.wallet_credentials())
+                    .expect("wallet")
+                    .iter()
+                    .map(|c| c.credits)
+                    .sum();
+                let issuances = mock.issuance_requests();
+                mock.refuse_next_declared(kind);
+                let mut rx = core.subscribe_changes();
+                let result = if streaming {
+                    Ok(turn(&core, "And why?", Some(space.clone()), None))
+                } else {
+                    core.runtime().block_on(core.chat(
+                        "And why?".into(),
+                        MODEL.into(),
+                        Some(space.clone()),
+                    ))
+                };
+                let result = result.expect("the resend answers");
+                assert!(result.response_action_id.is_some());
+
+                let bodies = mock.chat_bodies();
+                assert_eq!(
+                    bodies.len(),
+                    3,
+                    "{kind}: the refused request and its resend"
+                );
+                assert!(declared_prefix(&bodies[1]).is_some(), "{kind}");
+                assert_eq!(
+                    declared_prefix(&bodies[2]),
+                    None,
+                    "{kind}: resent undeclared"
+                );
+                assert_eq!(bodies[1]["messages"], bodies[2]["messages"]);
+                assert_eq!(mock.declared_refusals(), 1);
+                assert_eq!(mock.issuance_requests(), issuances, "nothing converted");
+
+                // Both holds settled: the refused one was charged the fee, the
+                // answered one nothing (the harness's completed charge, settled
+                // in band).
+                assert!(spending_credentials(&core).is_empty(), "{kind}");
+                let after: i64 = core
+                    .runtime()
+                    .block_on(core.wallet_credentials())
+                    .expect("wallet")
+                    .iter()
+                    .map(|c| c.credits)
+                    .sum();
+                assert_eq!(after, before - chat_harness::REQUEST_FEE as i64, "{kind}");
+                // One answer, and the refused exchange in the Record beside it.
+                let tree = core
+                    .runtime()
+                    .block_on(core.get_space_tree(space.clone()))
+                    .expect("tree");
+                assert_eq!(tree.len(), 4, "{kind}: two exchanges, one answer each");
+                let changes = drain(&mut rx);
+                for expected in [Change::Space(space.clone()), Change::Wallet, Change::Record] {
+                    assert!(changes.contains(&expected), "{expected:?} in {changes:?}");
+                }
+
+                // The resend's answer is the lineage's new resume point.
+                turn(&core, "And at the poles?", Some(space), None);
+                assert!(declared_prefix(&mock.chat_bodies()[3]).is_some(), "{kind}");
+                assert_declarations_exact(&mock);
+            });
+        }
+    }
+}
+
+/// An engine that lost what the lineage left (here: every entry evicted) is
+/// refused as missing, and the resend is undeclared.
+#[test]
+fn an_evicted_prefix_is_refused_and_resent_undeclared() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        mock.evict_engine_cache();
+        turn(&core, "And why?", Some(first.space_id), None);
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        assert!(declared_prefix(&bodies[1]).is_some());
+        assert_eq!(declared_prefix(&bodies[2]), None);
+        assert_eq!(mock.declared_refusals(), 1);
+        assert_declarations_exact(&mock);
+    });
+}
+
+/// **The resend never converts account credit.** A wallet that covers the
+/// declared hold but not the undeclared one, beside an account with plenty
+/// of credit: the refused request is charged its fee, the resend cannot be
+/// paid from what is held, and the turn fails with the typed, retryable
+/// `UncachedRetryUnfunded` — with no issuance asked for and no request sent.
+#[test]
+fn the_undeclared_resend_never_converts() {
+    for streaming in [true, false] {
+        run(move || {
+            // The first turn's hold, measured on a core of its own: the same
+            // prompt in a fresh space sends bodies of the same length.
+            let first_hold = {
+                let (mock, core, _dir) = declaring_setup(ChatBehavior::StreamingWithMetadataRefund);
+                turn(&core, &long_prompt("one"), None, None);
+                mock.chat_charges()[0].expect("a hold")
+            };
+            let (mock, core, _dir) = declaring_setup(ChatBehavior::StreamingWithMetadataRefund);
+            core.runtime()
+                .block_on(core.account_allocate(first_hold as i64))
+                .expect("exactly the first turn's hold");
+            let first = turn(&core, &long_prompt("one"), None, None);
+            assert_eq!(mock.chat_charges()[0], Some(first_hold));
+            let issuances = mock.issuance_requests();
+            mock.refuse_next_declared("cached_prefix_missing");
+            let space = first.space_id.clone();
+            let err = if streaming {
+                let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+                core.runtime().block_on(core.chat_stream_reply(
+                    "And why?".into(),
+                    MODEL.into(),
+                    Some(space.clone()),
+                    None,
+                    tx,
+                ))
+            } else {
+                core.runtime().block_on(core.chat(
+                    "And why?".into(),
+                    MODEL.into(),
+                    Some(space.clone()),
+                ))
+            }
+            .expect_err("the resend cannot be paid without converting");
+            assert!(
+                matches!(err, AppError::UncachedRetryUnfunded),
+                "typed: {err:?}"
+            );
+            let bodies = mock.chat_bodies();
+            assert_eq!(bodies.len(), 2, "no undeclared request was sent");
+            assert!(
+                undeclared_hold(&bodies[1]) > first_hold - chat_harness::REQUEST_FEE,
+                "the resend's hold is past what the wallet holds"
+            );
+            assert_eq!(
+                mock.issuance_requests(),
+                issuances,
+                "nothing was asked of the account"
+            );
+            assert!(spending_credentials(&core).is_empty());
+            assert_eq!(
+                active_balances(&core),
+                vec![first_hold as i64 - chat_harness::REQUEST_FEE as i64],
+                "the refused request cost its fee and nothing else"
+            );
+            // A fresh attempt is an ordinary request, and converts as any does.
+            turn(&core, "And why, again?", Some(space), None);
+            assert!(mock.issuance_requests() > issuances);
+        });
+    }
 }

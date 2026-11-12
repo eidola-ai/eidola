@@ -26,3 +26,4 @@ space-continuing = 正在继续…
 space-error-issuer-key-off-calendar = Eidola 服务器提供的支付密钥不符合公开的密钥日程，因此本应用没有使用它。没有发送任何请求，也没有产生任何费用；你已持有的额度仍可正常使用。
 space-error-issuer-key-second-for-epoch = Eidola 服务器本周提供的支付密钥与本应用已有的不同。诚实的服务器每周只使用一个密钥，因此在下周的密钥生效之前，本应用不会用它领取新的额度。没有发送任何请求，也没有产生任何费用；你已持有的额度仍可正常使用。
 space-error-issuer-key-reused = Eidola 服务器为两个不同的周提供了同一个支付密钥，诚实的服务器绝不会这样做，因此本应用没有使用它。没有发送任何请求，也没有产生任何费用；你已持有的额度仍可正常使用。
+space-error-uncached-retry-unfunded = Eidola 引擎已不再保留此对话之前的上下文，而本应用持有的额度不足以完整地重新发送。没有再从你的账户转换任何额度。请重试，以新请求的方式发送。

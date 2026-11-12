@@ -294,7 +294,10 @@ impl Inner {
                         ),
                     });
                 }
-                spend = Some(self.acquire_spend(&cfg, db_conn, charge, now).await?);
+                spend = Some(
+                    self.acquire_spend(&cfg, db_conn, charge, now, crate::Funding::MayConvert)
+                        .await?,
+                );
                 None
             }
         };

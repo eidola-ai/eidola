@@ -525,6 +525,46 @@ fn a_completion_refused_before_sending_is_still_recorded() {
     });
 }
 
+/// **The proxy keeps its ceiling and does not continue.** A proxied
+/// completion that names no ceiling asks for the model's whole declared
+/// limit, not a rung of the ladder turns use, and an answer that stops there
+/// is the caller's to continue: one request, answered as the upstream
+/// answered it.
+#[test]
+fn a_proxied_completion_is_neither_laddered_nor_continued() {
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::LongAnswer {
+                requests: 3,
+                fail_at: None,
+            },
+            declared_max_output: Some(65_536),
+            context_length: Some(262_144),
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+        let (status, body) = runtime.block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(
+                    r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hello"}}]}}"#
+                ),
+            ),
+        ));
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(r#""finish_reason":"length""#), "{body}");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 1, "not continued");
+        assert_eq!(bodies[0]["max_completion_tokens"], 65_536);
+        assert_eq!(mock.hold_mismatches(), 0);
+    });
+}
+
 #[test]
 fn a_flat_priced_model_is_held_at_its_flat_price() {
     run(|| {
@@ -551,8 +591,8 @@ fn a_flat_priced_model_is_held_at_its_flat_price() {
         assert_eq!(status, 200, "a flat price is not a zero charge: {body}");
         assert_eq!(
             mock.chat_charges(),
-            vec![Some(FLAT_PRICE as u128)],
-            "the hold is the flat price, whatever the request holds"
+            vec![Some(chat_harness::REQUEST_FEE + FLAT_PRICE as u128)],
+            "the hold is the request fee and the flat price, whatever the request holds"
         );
     });
 }
@@ -4009,5 +4049,55 @@ fn a_proxied_completion_carries_no_cache_key_even_when_its_caller_sends_one() {
             let text = String::from_utf8(raw).unwrap();
             assert!(!text.contains(caller_key), "{text}");
         }
+    });
+}
+
+/// **A proxied completion holds the request fee and never declares a cached
+/// prefix** — not one of this app's (it has no lineage, so it carries no key
+/// and has nothing to claim), and not one its caller wrote (`cached_prefix`
+/// is outside the body allowlist: a declaration is priced, and only this app
+/// may say what its own earlier requests left). Even for a model that sells
+/// a cached rate, every hold is the byte contract's, fee included, which the
+/// mock recomputes and would refuse otherwise.
+#[test]
+fn a_proxied_completion_holds_the_fee_and_never_declares() {
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig {
+            chat: ChatBehavior::OkBlocking,
+            declared_prompt_cache: Some(chat_harness::supported_prompt_cache()),
+            cached_prompt_price: Some((1, 4)),
+            engine_prompt_tokens: Some(0),
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let runtime = core.runtime();
+        let long = "the tide rises and falls twice a day. ".repeat(120);
+        for body in [
+            format!(r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"{long}"}}]}}"#),
+            format!(
+                r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"{long}"}}],"cached_prefix":{{"cached_tokens":256,"new_tokens":10}}}}"#
+            ),
+        ] {
+            let (status, answer) =
+                runtime.block_on(exchange(&core, &post("/v1/chat/completions", &key, &body)));
+            assert_eq!(status, 200, "{answer}");
+        }
+        let sent = mock.chat_bodies();
+        assert_eq!(sent.len(), 2);
+        for (body, charge) in sent.iter().zip(mock.chat_charges()) {
+            assert!(body.get("cached_prefix").is_none(), "{body}");
+            assert!(body.get("cache_key").is_none(), "{body}");
+            let messages = body["messages"].as_array().unwrap();
+            let prompt = eidola_common::prompt_charge(messages, None).chargeable_prompt_tokens();
+            let ceiling = body["max_completion_tokens"].as_u64().unwrap();
+            assert_eq!(
+                charge,
+                Some(chat_harness::REQUEST_FEE + u128::from(prompt + ceiling)),
+                "{body}"
+            );
+        }
+        assert_eq!(mock.hold_mismatches(), 0);
     });
 }

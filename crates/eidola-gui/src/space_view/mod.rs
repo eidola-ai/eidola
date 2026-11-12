@@ -2928,6 +2928,9 @@ fn error_copy(e: &AppError, cx: &gpui::App) -> String {
             "Not enough credits to send. Add credits to continue.".to_string()
         }
         AppError::SpaceArchived { .. } => crate::i18n::msg::space_error_archived(cx).to_string(),
+        AppError::UncachedRetryUnfunded => {
+            crate::i18n::msg::space_error_uncached_retry_unfunded(cx).to_string()
+        }
         AppError::NotJoined { .. } => crate::i18n::msg::space_error_not_joined(cx).to_string(),
         // The model this turn would have used has left its backend's catalog.
         // The variant carries the selection and no sentence, so the copy is
