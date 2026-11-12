@@ -283,6 +283,102 @@ async fn receiver_checks_signatures_identifiers_and_body_size_before_inserting()
 
 #[tokio::test]
 #[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn receiver_ignores_unsupported_no_id_events_but_requires_ids_for_supported_events() {
+    let db = TestDb::new().await;
+    let receiver = Receiver::start(db.pool.clone()).await;
+    let upcoming = serde_json::to_vec(&json!({
+        "id":"evt_upcoming", "type":"invoice.upcoming",
+        "data":{"object":{"object":"invoice", "customer":"cus_test"}}
+    }))
+    .unwrap();
+    assert_eq!(
+        receiver
+            .post(upcoming.clone(), signature(&upcoming, "whsec_wrong"))
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        receiver
+            .post(upcoming.clone(), signature(&upcoming, SECRET))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    for invalid in [
+        json!({"id":"evt_paid", "type":"invoice.paid", "data":{"object":{"object":"invoice"}}}),
+        json!({"type":"invoice.paid", "data":{"object":{"id":"in_paid"}}}),
+    ] {
+        let body = serde_json::to_vec(&invalid).unwrap();
+        assert_eq!(
+            receiver
+                .post(body.clone(), signature(&body, SECRET))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let count: i64 = db
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT count(*) FROM billing_event", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0);
+    receiver.finish().await;
+    db.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn receiver_allows_bounded_clock_skew_but_rejects_ancient_and_far_future_signatures() {
+    let db = TestDb::new().await;
+    let receiver = Receiver::start(db.pool.clone()).await;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Exact +/-300s boundaries are covered with a deterministic clock in the
+    // verifier tests; leave room for HTTP/database scheduling at this boundary.
+    for (name, timestamp, expected) in [
+        ("recent", now - 240, StatusCode::OK),
+        ("slightly_ahead", now + 1, StatusCode::OK),
+        ("ahead", now + 240, StatusCode::OK),
+        ("ancient", now - 360, StatusCode::BAD_REQUEST),
+        ("far_future", now + 360, StatusCode::BAD_REQUEST),
+    ] {
+        let body = event(
+            &format!("evt_{name}"),
+            "refund.created",
+            &format!("re_{name}"),
+        );
+        assert_eq!(
+            receiver
+                .post(body.clone(), signature_at(&body, SECRET, timestamp))
+                .await
+                .status(),
+            expected
+        );
+    }
+    let count: i64 = db
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT count(*) FROM billing_event", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 3);
+    receiver.finish().await;
+    db.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
 async fn receiver_accepts_rotating_signatures_and_reports_incompatible_ingress() {
     let db = TestDb::new().await;
     let receiver = Receiver::start(db.pool.clone()).await;

@@ -716,9 +716,9 @@ pub async fn list_prices(
         (status = 200, description = "Checkout session created", body = CheckoutUrlResponse),
         (status = 400, description = "Invalid request", body = crate::types::ErrorResponse),
         (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
-        (status = 409, description = "Already subscribed", body = crate::types::ErrorResponse),
+        (status = 409, description = "Already subscribed, or account is closing or closed", body = crate::types::ErrorResponse),
         (status = 428, description = "Terms acceptance required", body = crate::types::ErrorResponse),
-        (status = 503, description = "Stripe not configured", body = crate::types::ErrorResponse)
+        (status = 503, description = "Billing is busy or unavailable, or Stripe is not configured", body = crate::types::ErrorResponse)
     )
 )]
 pub async fn create_checkout(
@@ -732,7 +732,16 @@ pub async fn create_checkout(
     // The external session can outlive this call; a later payment on a closed
     // account is reconciled into its closure refund workflow.
     let store = eidola_billing::store::Store::new(state.db_pool.clone());
-    let _guard = store.lock_checkout(account_id).await?;
+    let _guard = store.lock_checkout(account_id).await.map_err(|error| {
+        match error {
+            // Account work is transient admission contention. A checkout 409
+            // means a persistent account state, such as an active subscription.
+            eidola_billing::BillingError::Conflict(_) => {
+                ServerError::ServiceUnavailable("account billing is busy; retry checkout".into())
+            }
+            error => error.into(),
+        }
+    })?;
     if db::get_account_by_id(&state.db_pool, account_id)
         .await?
         .billing_state

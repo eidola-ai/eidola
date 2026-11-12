@@ -10,6 +10,8 @@ Build with `cargo build -p eidola-billing-cli`. The binary is `eidola-billing`. 
 
 The database records its authenticated `current_user` for billing operations. Use distinct database and Stripe credentials for different operators/workloads; a typed operator name is not an authorization mechanism. Access control and deployment of this private tool are outside the public gateway.
 
+Configure the Stripe billing portal for cancellation and payment-method management, without plan switching or prorations. Automatic grants support the fixed-price subscription periods and one-time purchases created by our checkout. A changed price, proration, or unsupported payment requires investigation; the CLI cannot refund or grant credits for a payment without a verified purchase record. Establish its provenance before an audited correction or separately recorded payment remedy, and reconcile any provider refund. Do not invent a credit amount to make an unsupported payment fit.
+
 Commands return JSON. Account and payment references in that output are private support data. Keep case references concise; do not copy customer messages or payment details into reasons. No command inspects, identifies, redeems, or revokes ACTs.
 
 ## Receiver and worker processes
@@ -21,7 +23,7 @@ eidola-billing serve-webhooks --bind 0.0.0.0:8080
 eidola-billing work --batch-size 32 --retry-interval-secs 5
 ```
 
-The receiver needs the database settings above and `STRIPE_WEBHOOK_SECRET`. It does **not** need `STRIPE_API_KEY`, and does not execute reconciliation or start workers. Direct Stripe webhooks to `POST /v1/webhooks/stripe` on this stable deployment. It serves plain HTTP behind the deployment's HTTPS termination, including a Tinfoil shim if desired. `GET /healthz` checks database connectivity and the ingress protocol. The receiver limits request bodies to 2 MiB, authenticates the exact raw bytes, and stores only the supported event's ID, type, and object ID. It acknowledges a supported event only after the database commits it; a failed write returns a non-success response for Stripe to retry. Unsupported event types are acknowledged without storing them.
+The receiver needs the database settings above and `STRIPE_WEBHOOK_SECRET`. It does **not** need `STRIPE_API_KEY`, and does not execute reconciliation or start workers. Direct Stripe webhooks to `POST /v1/webhooks/stripe` on this stable deployment. It serves plain HTTP behind the deployment's HTTPS termination, including a Tinfoil shim if desired. `GET /healthz` checks database connectivity and the ingress protocol. The receiver limits request bodies to 2 MiB, authenticates the exact raw bytes with at most five minutes of clock skew in either direction, and stores only the supported event's ID, type, and object ID. Keep the host clock synchronized. It acknowledges a supported event only after the database commits it; a failed write returns a non-success response for Stripe to retry. Unsupported event types are acknowledged without storing them, including events whose objects have no ID.
 
 The worker needs the database settings and `STRIPE_API_KEY`, but no webhook secret. It opens no HTTP listener. Its timer retries pending database work, including webhook observations, account repair requests, and interrupted refunds/closures; it never periodically scans Stripe accounts. Each process handles one batch at a time. Scale worker containers for parallel accounts. Database locks coordinate duplicate deliveries, multiple workers, and direct support commands; durable operation identities and Stripe idempotency remain necessary when a process loses a provider response.
 
@@ -38,7 +40,7 @@ docker run --rm --env-file /path/to/worker.env \
   eidola-billing work --batch-size 32 --retry-interval-secs 5
 ```
 
-The same non-root, static image runs either role or an operator command; no role starts implicitly. Keep secret files outside the repository. Production hostname, TLS, credentials, replication, monitoring, and deployment manifests belong to the operator's deployment configuration, which may live in a private repository. Monitor pending-work age and repeated failures in `billing_event`; a healthy receiver confirms durable delivery, not that the worker has completed the financial effect.
+The same non-root, static image runs either role or an operator command; no role starts implicitly. Keep secret files outside the repository. Production hostname, TLS, credentials, replication, monitoring, and deployment manifests belong to the operator's deployment configuration, which may live in a private repository. Monitor pending-work age and repeated failures in `billing_event`, and alert on aging `submitting` refunds well before their 23-hour safe retry window closes; a healthy receiver confirms durable delivery, not that the worker has completed the financial effect.
 
 Ingress and financial execution have separate database protocol versions. A receiver or gateway may continue recording v1 requests while compatible workers evolve. Workers and direct operator commands refuse incompatible execution versions before performing financial work. An incompatible change requires stopping and draining old workers/operator processes before changing the execution version/schema and starting the new build; do not change that version underneath an admitted operation. Unsupported job kinds or versions remain pending for review rather than being silently marked complete.
 
@@ -98,6 +100,10 @@ eidola-billing resume-refund --operation "$BILLING_OPERATION_ID"
 
 Use the same operation after a timeout, lost response, process crash, or uncertain provider error. Reconciliation first searches for the refund under its durable operation metadata. A safe retry uses the same Stripe idempotency key. An uncertain attempt older than the conservative retry window is refused for review; generating a new UUID is not a remedy for uncertainty.
 
+A rejected retry does not prove that the original request failed. For example, a changed API key may allow reads but refuse refund creation while Stripe is still recovering the first request. The operation stays `submitting`; do not release its credits, replace the attempt, or arrange an alternate payout until the original outcome is established.
+
+If the retry window expires with no refund object, preserve the hold and escalate to Stripe using the operation's idempotency key (`eidola/refund/v1/<operation UUID>`) and request records. An empty refund list is not proof that an earlier request cannot still complete. A crash before the POST, or a database failure after receiving a rejection, can also leave this conservative state. There is deliberately no force-fail command: resolve the provider outcome first, then arrange a reviewed, audited repair under the account's normal locks if no provider object can resolve it. Never bypass the hold merely to finish closure.
+
 | State | Operator action |
 | --- | --- |
 | `prepared` | Resume to send the authorized refund, or release it if it should not proceed. |
@@ -124,6 +130,8 @@ eidola-billing confirm-external-refund --operation "$BILLING_OPERATION_ID" \
 ```
 
 This command records money already returned; it does not send money. It is refused for an ambiguous in-flight Stripe attempt. Establish that there is no competing payout before paying by another route. The external return remains part of the payment's refund accounting.
+
+Later observations of the failed Stripe refund cannot undo the alternate settlement. An unexpected additional Stripe return is recorded as separate cash and flagged for review. Releasing a hold or recording an alternate payout on a closing account also queues another closure pass, so no webhook or repeated close command is needed.
 
 ## Subscriptions and account closure
 

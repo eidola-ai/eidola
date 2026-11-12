@@ -194,7 +194,7 @@
             }
           },
           "409": {
-            "description": "Already subscribed",
+            "description": "Already subscribed, or account is closing or closed",
             "content": {
               "application/json": {
                 "schema": {
@@ -214,7 +214,7 @@
             }
           },
           "503": {
-            "description": "Stripe not configured",
+            "description": "Billing is busy or unavailable, or Stripe is not configured",
             "content": {
               "application/json": {
                 "schema": {

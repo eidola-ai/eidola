@@ -8,8 +8,8 @@ use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Maximum age for a webhook signature (5 minutes).
-const MAX_SIGNATURE_AGE: Duration = Duration::from_secs(300);
+/// Maximum signature age or clock skew in either direction (5 minutes).
+const MAX_SIGNATURE_SKEW: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // Signature verification
@@ -51,7 +51,10 @@ fn verify_signature_at(
     let event_time = UNIX_EPOCH
         .checked_add(Duration::from_secs(ts_secs))
         .ok_or("invalid timestamp")?;
-    if now.duration_since(event_time).unwrap_or(Duration::MAX) > MAX_SIGNATURE_AGE {
+    let skew = now
+        .duration_since(event_time)
+        .unwrap_or_else(|difference| difference.duration());
+    if skew > MAX_SIGNATURE_SKEW {
         return Err("stale timestamp");
     }
 
@@ -80,10 +83,14 @@ fn verify_signature_at(
 }
 
 #[derive(serde::Deserialize)]
-struct StripeEvent {
-    id: String,
+struct EventType {
     #[serde(rename = "type")]
     kind: String,
+}
+
+#[derive(serde::Deserialize)]
+struct StripeEvent {
+    id: String,
     data: EventData,
 }
 
@@ -118,16 +125,20 @@ pub struct WebhookEvent {
 /// Parse a previously authenticated payload. Unsupported types are ignored.
 /// The caller must verify the signature against these exact bytes first.
 pub fn parse_event(body: &[u8]) -> Result<Option<WebhookEvent>, &'static str> {
-    let event: StripeEvent = serde_json::from_slice(body).map_err(|_| "invalid webhook event")?;
-    if event_type_label(&event.kind) == "other" {
+    // Unsupported events need not have the object shape our billing events do.
+    // For example, invoice.upcoming can describe an invoice without an ID.
+    let event_type: EventType =
+        serde_json::from_slice(body).map_err(|_| "invalid webhook event")?;
+    if event_type_label(&event_type.kind) == "other" {
         return Ok(None);
     }
+    let event: StripeEvent = serde_json::from_slice(body).map_err(|_| "invalid webhook event")?;
     if !valid_object_id(&event.id) || !valid_object_id(&event.data.object.id) {
         return Err("invalid webhook object identifier");
     }
     Ok(Some(WebhookEvent {
         id: event.id,
-        kind: event.kind,
+        kind: event_type.kind,
         object_id: event.data.object.id,
     }))
 }
@@ -255,7 +266,7 @@ mod tests {
                 ),
                 Err("signature mismatch")
             );
-            for now in [ts - 1, ts + 301] {
+            for now in [ts - 301, ts + 301] {
                 assert_eq!(
                     verify_signature_at(
                         &header,
@@ -318,6 +329,64 @@ mod tests {
         assert_eq!(
             verify_signature_at(&header, TEST_BODY, TEST_SECRET, now),
             Err("stale timestamp")
+        );
+    }
+
+    #[test]
+    fn signature_clock_skew_is_bounded_in_both_directions() {
+        let ts = 1_700_000_000;
+        let event_time = UNIX_EPOCH + Duration::from_secs(ts);
+        let header = make_signature(ts, TEST_BODY, TEST_SECRET);
+        for offset in [
+            Duration::ZERO,
+            Duration::from_secs(1),
+            Duration::from_secs(300),
+        ] {
+            for now in [event_time - offset, event_time + offset] {
+                assert_eq!(
+                    verify_signature_at(&header, TEST_BODY, TEST_SECRET, now),
+                    Ok(())
+                );
+            }
+        }
+        for offset in [
+            Duration::from_secs(300) + Duration::from_nanos(1),
+            Duration::from_secs(301),
+            Duration::from_secs(86_400),
+        ] {
+            for now in [event_time - offset, event_time + offset] {
+                assert_eq!(
+                    verify_signature_at(&header, TEST_BODY, TEST_SECRET, now),
+                    Err("stale timestamp")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_events_are_ignored_without_requiring_a_billing_object_id() {
+        let body = br#"{"id":"evt_upcoming","type":"invoice.upcoming","data":{"object":{"object":"invoice","customer":"cus_test"}}}"#;
+        assert_eq!(parse_event(body), Ok(None));
+    }
+
+    #[test]
+    fn supported_events_still_require_valid_event_and_object_ids() {
+        for body in [
+            serde_json::json!({"type":"invoice.paid","data":{"object":{"id":"in_test"}}}),
+            serde_json::json!({"id":"evt_test","type":"invoice.paid","data":{"object":{}}}),
+            serde_json::json!({"id":"evt/test","type":"invoice.paid","data":{"object":{"id":"in_test"}}}),
+            serde_json::json!({"id":"evt_test","type":"invoice.paid","data":{"object":{"id":"in/test"}}}),
+        ] {
+            assert!(parse_event(&serde_json::to_vec(&body).unwrap()).is_err());
+        }
+        let body = br#"{"id":"evt_test","type":"invoice.paid","data":{"object":{"id":"in_test"}}}"#;
+        assert_eq!(
+            parse_event(body),
+            Ok(Some(WebhookEvent {
+                id: "evt_test".into(),
+                kind: "invoice.paid".into(),
+                object_id: "in_test".into(),
+            }))
         );
     }
 

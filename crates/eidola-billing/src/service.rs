@@ -261,6 +261,7 @@ impl BillingService {
                 "uncertain refund is outside the safe idempotency retry window".into(),
             ));
         }
+        let first_submission = operation.submitted_at.is_none();
         operation = self.store.mark_submitted(operation.id).await?;
         let key = refund_idempotency_key(operation.id);
         // Capture the monotonic anchor before reading the database clock: a
@@ -304,9 +305,18 @@ impl BillingService {
                 self.store.get_refund(operation.id).await
             }
             Err(error @ BillingError::ProviderRejected(_)) => {
-                // A definitive rejection is distinct from a timeout or a 5xx.
-                // Failed holds remain reserved until the operator chooses a
-                // remedy; no network error automatically restores credits.
+                // A rejection of this HTTP attempt does not resolve an earlier
+                // timeout/5xx. Authentication and validation may reject a retry
+                // before Stripe reaches the original idempotency result, while
+                // incident recovery can still materialize the first refund.
+                if !first_submission {
+                    return Err(BillingError::RequiresReview(
+                        "refund retry rejected while an earlier submission remains uncertain"
+                            .into(),
+                    ));
+                }
+                // A rejected first submission has no earlier uncertain call.
+                // Its hold still remains until the operator chooses a remedy.
                 guard.mark_refund_rejected(operation.id).await?;
                 Err(error)
             }

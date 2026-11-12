@@ -343,6 +343,59 @@ async fn failed_durable_repair_write_is_not_accepted() {
     db.finish().await;
 }
 
+fn checkout_request(account: Uuid) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/account/checkout")
+        .header("authorization", auth(account))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"price_id":"price_1","success_url":"https://example.test/paid",
+                "cancel_url":"https://example.test/canceled"})
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+fn checkout_provider() -> HashMap<String, Value> {
+    let mut responses = empty_provider();
+    responses.insert("/prices/price_1".into(), json!({"id":"price_1","active":true,"currency":"usd",
+        "unit_amount":1500,"type":"one_time","recurring":null,"lookup_key":null,
+        "product":{"id":"prod_1","name":"Credits","description":null,"metadata":{"credits":"20000000"}}}));
+    responses.insert(
+        "/checkout/sessions".into(),
+        json!({"url":"https://checkout.stripe.test/session"}),
+    );
+    responses
+}
+
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn checkout_reports_active_account_work_as_retryable_without_calling_stripe() {
+    let db = TestDb::new().await;
+    let own = db.account("cus_own", "open").await;
+    let (stripe, provider) = stripe(checkout_provider()).await;
+    let app = router(db.state(Some(stripe)));
+    let guard = eidola_billing::store::Store::new(db.pool.clone())
+        .lock_reconciliation(own)
+        .await
+        .unwrap();
+
+    let response = app.clone().oneshot(checkout_request(own)).await.unwrap();
+    let error = response_json(response, StatusCode::SERVICE_UNAVAILABLE).await;
+    assert_eq!(error["error"]["type"], "service_unavailable");
+    assert!(provider.requests.lock().unwrap().is_empty());
+
+    guard.release().await.unwrap();
+    let response = app.oneshot(checkout_request(own)).await.unwrap();
+    let checkout = response_json(response, StatusCode::OK).await;
+    assert_eq!(
+        checkout["checkout_url"],
+        "https://checkout.stripe.test/session"
+    );
+    db.finish().await;
+}
+
 #[tokio::test]
 #[ignore = "requires BILLING_TEST_DATABASE_URL"]
 async fn checkout_snapshots_the_selected_grant_and_closure_refuses_new_checkout() {
@@ -355,30 +408,9 @@ async fn checkout_snapshots_the_selected_grant_and_closure_refuses_new_checkout(
         .await
         .unwrap();
     let own = db.account("cus_own", "open").await;
-    let mut responses = empty_provider();
-    responses.insert("/prices/price_1".into(), json!({"id":"price_1","active":true,"currency":"usd",
-        "unit_amount":1500,"type":"one_time","recurring":null,"lookup_key":null,
-        "product":{"id":"prod_1","name":"Credits","description":null,"metadata":{"credits":"20000000"}}}));
-    responses.insert(
-        "/checkout/sessions".into(),
-        json!({"url":"https://checkout.stripe.test/session"}),
-    );
-    let (stripe, provider) = stripe(responses).await;
+    let (stripe, provider) = stripe(checkout_provider()).await;
     let app = router(db.state(Some(stripe)));
-    let checkout = || {
-        Request::builder()
-            .method("POST")
-            .uri("/v1/account/checkout")
-            .header("authorization", auth(own))
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({"price_id":"price_1","success_url":"https://example.test/paid",
-            "cancel_url":"https://example.test/canceled"})
-                .to_string(),
-            ))
-            .unwrap()
-    };
-    let response = app.clone().oneshot(checkout()).await.unwrap();
+    let response = app.clone().oneshot(checkout_request(own)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let requests = provider.requests.lock().unwrap().clone();
     let create = requests
@@ -412,7 +444,7 @@ async fn checkout_snapshots_the_selected_grant_and_closure_refuses_new_checkout(
         )
         .await
         .unwrap();
-    let response = app.oneshot(checkout()).await.unwrap();
+    let response = app.oneshot(checkout_request(own)).await.unwrap();
     assert_eq!(response.status(), StatusCode::CONFLICT);
     assert_eq!(provider.requests.lock().unwrap().len(), calls);
     db.finish().await;

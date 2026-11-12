@@ -229,6 +229,36 @@ async fn lock_account(c: &impl GenericClient, account: Uuid) -> Result<(), Billi
     Ok(())
 }
 
+/// Called under the account row lock, in the same transaction as an operator
+/// settlement. A new generation survives completion of an older claimed job.
+async fn wake_closure(c: &impl GenericClient, account: Uuid) -> Result<(), BillingError> {
+    let state: String = c
+        .query_one("SELECT billing_state FROM account WHERE id=$1", &[&account])
+        .await
+        .map_err(db)?
+        .get(0);
+    if state == "open" {
+        return Ok(());
+    }
+    let changed = c
+        .execute(
+            "INSERT INTO billing_event(id,kind,object_id) VALUES($1,'billing.close.resume',$2) \
+         ON CONFLICT(id) DO UPDATE SET generation=billing_event.generation+1,completed_at=NULL, \
+         next_attempt_at=clock_timestamp(),attempts=0,last_error=NULL \
+         WHERE billing_event.kind='billing.close.resume' AND billing_event.object_id=$2 \
+         AND billing_event.protocol_version=1",
+            &[&format!("local:close:{account}"), &account.to_string()],
+        )
+        .await
+        .map_err(db)?;
+    if changed != 1 {
+        return Err(BillingError::RequiresReview(
+            "closure job is incompatible".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn get_purchase(c: &impl GenericClient, id: &str) -> Result<Purchase, BillingError> {
     c.query_opt("SELECT * FROM billing_purchase WHERE id = $1", &[&id])
         .await
@@ -434,7 +464,11 @@ async fn observe_refund(
                 .await?;
             } else {
                 binding = Some(id);
-                if !matches!(op.state.as_str(), "released" | "superseded") {
+                let paid_externally: bool = c.query_one(
+                    "SELECT EXISTS(SELECT 1 FROM billing_external_refund WHERE operation_id=$1)",
+                    &[&id],
+                ).await.map_err(db)?.get(0);
+                if !paid_externally && !matches!(op.state.as_str(), "released" | "superseded") {
                     c.execute(
                         "UPDATE billing_refund_operation SET refund_id=$2,state=$3 WHERE id=$1",
                         &[&id, &r.id, &r.status],
@@ -442,6 +476,12 @@ async fn observe_refund(
                     .await
                     .map_err(db)?;
                 } else if !matches!(r.status.as_str(), "failed" | "canceled") {
+                    // The operator's payout already consumed this operation's
+                    // cash allocation. A conflicting provider return is extra
+                    // money, not another observation of that same payout.
+                    if paid_externally {
+                        binding = None;
+                    }
                     unmatched(
                         c,
                         p.account_id,
@@ -452,7 +492,11 @@ async fn observe_refund(
                         &r.currency,
                         &r.status,
                         r.operation_id,
-                        "released_refund_returned_money",
+                        if paid_externally {
+                            "externally_settled_refund_returned_money"
+                        } else {
+                            "released_refund_returned_money"
+                        },
                     )
                     .await?;
                 }
@@ -886,6 +930,7 @@ impl Store {
                 .await
                 .map_err(db)?;
         }
+        wake_closure(&tx, op.account_id).await?;
         tx.commit().await.map_err(db)
     }
 
@@ -1013,6 +1058,7 @@ impl Store {
         tx.query_one("SELECT billing_refresh_charge($1)", &[&op.purchase_id])
             .await
             .map_err(db)?;
+        wake_closure(&tx, op.account_id).await?;
         tx.commit().await.map_err(db)
     }
 

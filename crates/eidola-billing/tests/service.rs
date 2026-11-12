@@ -26,6 +26,7 @@ struct Provider {
     refunds: Vec<Value>,
     posts: Vec<(String, String)>,
     lose_next_response: bool,
+    reject_refund_posts: bool,
     subscription_active: bool,
     cancellations: usize,
     refund_pending: bool,
@@ -93,6 +94,9 @@ async fn serve(State(state): State<Arc<Mutex<Provider>>>, request: Request) -> R
         ("POST", "/refunds") => {
             let operation = form["metadata[eidola_operation]"].clone();
             provider.posts.push((key, operation.clone()));
+            if provider.reject_refund_posts {
+                return (StatusCode::FORBIDDEN, Json(json!({"error":{"type":"invalid_request_error"}}))).into_response();
+            }
             let refund = json!({"id":format!("re_{}",provider.posts.len()),"charge":form["charge"],
                 "amount":form["amount"].parse::<i64>().unwrap(),"currency":"usd","status":if provider.refund_pending {"pending"} else {"succeeded"},
                 "metadata":{"eidola_operation":operation}});
@@ -249,6 +253,85 @@ async fn a_lost_refund_response_is_recovered_without_a_second_payment() {
     assert_eq!(operation.state, "succeeded");
     assert_eq!(f.provider.lock().unwrap().posts.len(), 1);
     assert_eq!(f.balance().await, 1_000_000);
+    f.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated BILLING_TEST_DATABASE_URL"]
+async fn a_rejected_retry_cannot_resolve_an_earlier_unknown_refund() {
+    let f = Fixture::new().await;
+    let request = f.request();
+    f.provider.lock().unwrap().lose_next_response = true;
+    assert!(f.service.submit_refund(&request).await.is_err());
+    // An indeterminate provider request may materialize its object only during
+    // incident recovery. Meanwhile a restricted key can still read objects but
+    // refuse a later POST; that refusal says nothing about the first request.
+    let delayed = {
+        let mut provider = f.provider.lock().unwrap();
+        provider.reject_refund_posts = true;
+        std::mem::take(&mut provider.refunds)
+    };
+    assert!(f.service.resume_refund(request.id).await.is_err());
+    assert_eq!(
+        f.service
+            .store()
+            .get_refund(request.id)
+            .await
+            .unwrap()
+            .state,
+        "submitting"
+    );
+    assert!(f.service.release_refund(request.id).await.is_err());
+    assert!(
+        f.service
+            .retry_refund(request.id, Uuid::new_v4(), "retry")
+            .await
+            .is_err()
+    );
+    assert!(
+        f.service
+            .confirm_external_refund(request.id, "alternate")
+            .await
+            .is_err()
+    );
+    assert_eq!(f.balance().await, 1_000_000);
+    assert_eq!(f.provider.lock().unwrap().posts.len(), 2);
+    f.provider.lock().unwrap().refunds = delayed;
+    assert_eq!(
+        f.service.resume_refund(request.id).await.unwrap().state,
+        "succeeded"
+    );
+    assert_eq!(f.provider.lock().unwrap().posts.len(), 2);
+    assert_eq!(f.balance().await, 1_000_000);
+    f.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated BILLING_TEST_DATABASE_URL"]
+async fn a_rejected_first_submission_can_release_its_refund_hold() {
+    let f = Fixture::new().await;
+    let request = f.request();
+    f.provider.lock().unwrap().reject_refund_posts = true;
+    assert!(matches!(
+        f.service.submit_refund(&request).await,
+        Err(BillingError::ProviderRejected(_))
+    ));
+    assert_eq!(
+        f.service
+            .store()
+            .get_refund(request.id)
+            .await
+            .unwrap()
+            .state,
+        "failed"
+    );
+    assert_eq!(f.balance().await, 1_000_000);
+    assert_eq!(
+        f.service.release_refund(request.id).await.unwrap().state,
+        "released"
+    );
+    assert_eq!(f.balance().await, 2_000_000);
+    assert!(f.provider.lock().unwrap().refunds.is_empty());
     f.close().await;
 }
 
@@ -428,6 +511,108 @@ async fn recording_an_alternate_payout_never_creates_a_stripe_refund() {
     f.service.reconcile_account(f.account).await.unwrap();
     assert_eq!(f.provider.lock().unwrap().posts.len(), 0);
     assert_eq!(f.balance().await, 1_000_000);
+    f.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated BILLING_TEST_DATABASE_URL"]
+async fn an_alternate_payout_survives_reconciliation_and_resumes_closure() {
+    let f = Fixture::new().await;
+    let mut request = f.request();
+    request.credits = 2_000_000;
+    f.provider.lock().unwrap().refund_pending = true;
+    f.service.submit_refund(&request).await.unwrap();
+    f.provider.lock().unwrap().refunds[0]["status"] = json!("failed");
+    f.service.close_account(f.account, "closure").await.unwrap();
+    let close_id = format!("local:close:{}", f.account);
+    let old_job = f
+        .service
+        .store()
+        .claim_event(&close_id)
+        .await
+        .unwrap()
+        .unwrap();
+    f.service
+        .confirm_external_refund(request.id, "bank-transfer")
+        .await
+        .unwrap();
+    // A worker finishing its earlier generation must not acknowledge the new
+    // work recorded by the operator's settlement transaction.
+    old_job.complete(None).await.unwrap();
+    assert!(
+        f.service
+            .store()
+            .pending_events(100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.id == close_id)
+    );
+    assert_eq!(f.service.drain_events(100).await.unwrap().failed, 0);
+    assert_eq!(
+        f.service.store().account_state(f.account).await.unwrap(),
+        "closed"
+    );
+    f.service.reconcile_account(f.account).await.unwrap();
+    assert_eq!(
+        f.service
+            .store()
+            .get_refund(request.id)
+            .await
+            .unwrap()
+            .state,
+        "succeeded"
+    );
+    assert!(f.service.release_refund(request.id).await.is_err());
+    assert!(
+        f.service
+            .retry_refund(request.id, Uuid::new_v4(), "duplicate")
+            .await
+            .is_err()
+    );
+    assert_eq!(f.provider.lock().unwrap().posts.len(), 1);
+    assert_eq!(f.balance().await, 0);
+    f.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated BILLING_TEST_DATABASE_URL"]
+async fn releasing_a_hold_reopens_a_completed_closure_job() {
+    let f = Fixture::new().await;
+    let mut request = f.request();
+    request.credits = 2_000_000;
+    f.provider.lock().unwrap().refund_pending = true;
+    f.service.submit_refund(&request).await.unwrap();
+    f.provider.lock().unwrap().refunds[0]["status"] = json!("failed");
+    f.service.close_account(f.account, "closure").await.unwrap();
+    f.service.drain_events(100).await.unwrap();
+    assert!(
+        f.service
+            .store()
+            .pending_events(100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    f.service.release_refund(request.id).await.unwrap();
+    assert_eq!(f.balance().await, 2_000_000);
+    f.provider.lock().unwrap().refund_pending = false;
+    assert_eq!(f.service.drain_events(100).await.unwrap().failed, 0);
+    assert_eq!(
+        f.service.store().account_state(f.account).await.unwrap(),
+        "closed"
+    );
+    assert_eq!(
+        f.service
+            .store()
+            .get_refund(request.id)
+            .await
+            .unwrap()
+            .state,
+        "released"
+    );
+    assert_eq!(f.provider.lock().unwrap().posts.len(), 2);
+    assert_eq!(f.balance().await, 0);
     f.close().await;
 }
 

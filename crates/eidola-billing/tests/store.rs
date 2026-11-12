@@ -255,6 +255,63 @@ async fn failed_refunds_keep_holds_and_expired_entitlements_can_retry() {
 
 #[tokio::test]
 #[ignore = "requires BILLING_TEST_DATABASE_URL"]
+async fn alternate_payouts_preserve_settlement_and_count_unexpected_provider_returns() {
+    let f = fixture().await;
+    let p = purchase(&f, "purchase", 1000, 100);
+    f.store.record_purchase(&p).await.unwrap();
+    let r = refund(&f, &p, 500, None);
+    f.store.prepare_refund(&r).await.unwrap();
+    let mut observation = RefundObservation {
+        id: "re_failed".into(),
+        charge_id: p.charge_id.clone().unwrap(),
+        amount_minor: 50,
+        currency: "usd".into(),
+        status: "failed".into(),
+        operation_id: Some(r.id),
+    };
+    f.store.observe_refund(&observation).await.unwrap();
+    f.store
+        .confirm_external_refund(r.id, "bank-transfer")
+        .await
+        .unwrap();
+    for status in ["failed", "canceled"] {
+        observation.status = status.into();
+        f.store.observe_refund(&observation).await.unwrap();
+        assert_eq!(f.store.get_refund(r.id).await.unwrap().state, "succeeded");
+        assert!(f.store.release_refund(r.id).await.is_err());
+        assert!(
+            f.store
+                .retry_refund(r.id, Uuid::new_v4(), "duplicate")
+                .await
+                .is_err()
+        );
+    }
+    for status in ["pending", "succeeded"] {
+        observation.status = status.into();
+        f.store.observe_refund(&observation).await.unwrap();
+        assert_eq!(f.store.get_refund(r.id).await.unwrap().state, "succeeded");
+        assert!(
+            f.store
+                .review_issues(f.account)
+                .await
+                .unwrap()
+                .iter()
+                .any(|i| i.reason == "externally_settled_refund_returned_money")
+        );
+        // The alternate payout and the unexpected provider return consume the
+        // whole original payment, despite naming the same operation.
+        assert!(
+            f.store
+                .prepare_refund(&refund(&f, &p, 0, Some(1)))
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(balance(&f).await, 500);
+}
+
+#[tokio::test]
+#[ignore = "requires BILLING_TEST_DATABASE_URL"]
 async fn outside_refunds_are_cash_observations_without_credit_clawback() {
     let f = fixture().await;
     let p = purchase(&f, "purchase", 1000, 100);

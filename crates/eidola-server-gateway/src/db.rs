@@ -898,6 +898,7 @@ pub async fn prune_expired_issuances(
 }
 
 /// Current balance, including the shared billing ledger's outstanding debt.
+#[tracing::instrument(skip_all, name = "db.get_available_balance", err)]
 pub async fn get_available_balance(pool: &Pool, account_id: Uuid) -> Result<i64, ServerError> {
     let client = pool
         .get()

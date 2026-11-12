@@ -32,11 +32,13 @@ use crate::{BillingError as ServerError, error::parse_error_summary, tls_config}
 /// intervening changelogs against every shape this file parses:
 /// [`Subscription`] (+ [`SubscriptionItem`]), [`StripePrice`],
 /// [`StripeProduct`], [`CheckoutSession`], [`CheckoutLineItem`],
-/// [`Customer`], [`PortalSession`]. Note that this header pins **only what
-/// this client reads**: webhook payloads are rendered at the version
-/// configured on the webhook endpoint in Stripe's dashboard, so
-/// `webhook.rs`'s `serde_json::Value` lookups are versioned separately and
-/// are not covered by this constant.
+/// [`Customer`], [`PortalSession`], [`PaidCheckout`], [`PaidInvoice`],
+/// [`InvoiceLine`], [`InvoicePayment`], [`StripeCharge`], [`StripePaymentIntent`],
+/// [`StripeRefund`] and [`StripeDispute`] (including their status enums).
+/// Unknown financial states fail closed rather than guessing their cash effect.
+/// This header pins **only what this client reads**: webhook payloads are
+/// rendered at the version configured on the endpoint in Stripe's dashboard.
+/// The receiver's event/object identity envelope is versioned separately.
 pub const STRIPE_API_VERSION: &str = "2025-03-31.basil";
 
 /// Minimal Stripe subscription representation.
