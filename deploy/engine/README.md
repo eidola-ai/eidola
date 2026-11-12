@@ -12,6 +12,21 @@ One deployment is committed: `mimo-v2.6-flash/b300x1/`, MiMo-V2.6-Flash on one B
 
 Every deployment committed here must be pinned in `releases/trust/engine-enclaves.json`, and every pin there must match the files here: the gateway's build checks both directions and refuses to build otherwise. Layout, the pin's derivation, and the release-time measurement are in `crates/measure-enclave/AGENTS.md`.
 
+## The image: platform release manifests
+
+A pin's MRTD is the measurement of the platform image its config's `cvm-version` names. The release manifest that `cvm-version` pins by hash is vendored verbatim at `releases/trust/cvm-releases/v<tag>/tinfoil-inference-v<version>-manifest.json`, where `<version>` is the config's (`0.15.3-rc.1+gpu`) and `<tag>` the release it belongs to (`0.15.3-rc.1`). Every gateway build requires the manifest to be there, to hash to the config's pin, to describe that release, to state a launch with no measured boot (format 1, zero RTMRs), and to state exactly the pin's MRTD; anything else fails the build, naming the deployment. `measure-engine-enclaves` reads the same file by the same rule and checks that the image it names measures to it, and the `main` branch's artifacts workflow reruns that measurement from the published image on every run.
+
+Choosing a release for a deployment (a new `cvm-version`) therefore vendors its manifest. It is a release asset of `tinfoilsh/cvmimage`; download it into an empty directory and compare its hash with the pin before copying it in (the build compares it again):
+
+```bash
+V=0.15.3-rc.1 F="tinfoil-inference-v$V+gpu-manifest.json"
+curl -sfL -A curl/8 -o "$F" "https://github.com/tinfoilsh/cvmimage/releases/download/v$V/tinfoil-inference-v$V%2Bgpu-manifest.json"
+shasum -a 256 "$F"   # must equal the @sha256: in cvm-version
+mkdir -p releases/trust/cvm-releases/v$V && cp "$F" releases/trust/cvm-releases/v$V/
+```
+
+Then fetch the image the manifest names (`tinfoil-tdx-v<version>.igvm` from `https://images.tinfoil.sh/cvm/`, `+` written `%2B`) and re-measure. Remove a vendored manifest once no deployment names it. Rebuilding the release from source is a separate check, in `docs/contributing/rebuilding-platform-images.md`.
+
 ## The machines: platform endorsements
 
 A deployment's Intel TDX machine policy (TDX module, TD attributes, XFAM, TCB floors, QE vendor) and the hosts it may run on (by PPID) are never written by hand. The platform provider publishes them as signed platform endorsements, `platform-vX.Y.Z` releases of `tinfoilsh/cvmimage`, and `deployment.json` names one policy of one release, with the hash of that release's file, plus the three PCK platform flags the endorsements do not carry:
