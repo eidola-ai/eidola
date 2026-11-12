@@ -404,6 +404,66 @@ mod tests {
         }
     }
 
+    /// `load` asks the host's global before it starts anything: under
+    /// `EmbeddedOnly` a path the markdown names is refused on the first
+    /// frame, where `Any` would have begun reading it.
+    #[gpui::test]
+    fn load_consults_the_hosts_image_sources(cx: &mut gpui::TestAppContext) {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("gpui-md-image-policy-{}.png", std::process::id()));
+        let url = path.display().to_string();
+        let cx = cx.add_empty_window();
+        let refused = |policy: ImageSources, cx: &mut gpui::VisualTestContext| {
+            let out = std::rc::Rc::new(std::cell::Cell::new(None));
+            let probe = ImageProbe {
+                url: url.clone(),
+                policy,
+                refused: out.clone(),
+            };
+            cx.draw(
+                gpui::point(gpui::px(0.), gpui::px(0.)),
+                gpui::size(gpui::px(10.), gpui::px(10.)),
+                |_, cx| {
+                    use gpui::{AppContext as _, ParentElement as _};
+                    gpui::div().child(cx.new(|_| probe))
+                },
+            );
+            out.get().expect("the probe rendered")
+        };
+
+        assert!(
+            refused(ImageSources::EmbeddedOnly, cx),
+            "an absolute path resolved under EmbeddedOnly"
+        );
+        assert!(
+            !refused(ImageSources::Any, cx),
+            "an absolute path was refused under Any"
+        );
+    }
+
+    /// A view that asks `load` for one image on its first frame — the asset
+    /// cache answers only inside a rendering view — and records whether the
+    /// answer was a refusal.
+    struct ImageProbe {
+        url: String,
+        policy: ImageSources,
+        refused: std::rc::Rc<std::cell::Cell<Option<bool>>>,
+    }
+
+    impl gpui::Render for ImageProbe {
+        fn render(
+            &mut self,
+            window: &mut Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            cx.set_global(self.policy);
+            let loaded = load(&self.url, None, window, cx);
+            self.refused
+                .set(Some(matches!(loaded, LoadedImage::Failed)));
+            gpui::div()
+        }
+    }
+
     #[test]
     fn unset_policy_is_any() {
         assert_eq!(ImageSources::default(), ImageSources::Any);

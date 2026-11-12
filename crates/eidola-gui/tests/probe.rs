@@ -10901,4 +10901,57 @@ fn an_unsaved_account_shows_its_credential_to_copy(cx: &mut TestAppContext) {
             "unsaved-account probe {expected:?} missing; recorded: {names:?}"
         );
     }
+    // No file was written, so none is named.
+    assert!(
+        !names.contains(&"onboarding/create/recovery-file"),
+        "a recovery file is named that does not exist; recorded: {names:?}"
+    );
+}
+
+/// When the credential was also written beside the profile, the create slide
+/// names that file under the credential rows, as the CLI does — the reader
+/// is the one who removes it.
+#[gpui::test]
+fn an_unsaved_account_names_the_file_it_was_also_written_to(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    let path = "/profile/account-recovery-00000000-0000-0000-0000-00000000000c.toml";
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::CreateAccount, cx);
+        v.set_create_error_for_test(
+            AppError::AccountNotSaved {
+                account: Box::new(eidola_app_core::error::UnsavedAccount {
+                    account_id: "00000000-0000-0000-0000-00000000000c".into(),
+                    secret: eidola_app_core::error::AccountSecret::new("only-copy".into()),
+                    terms: eidola_app_core::TermsAcceptance::Complete,
+                    recovery_file: Some(path.into()),
+                }),
+                reason: "config error: unreadable".into(),
+            },
+            cx,
+        );
+    });
+    draw(cx, window);
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let line = entries
+        .iter()
+        .find(|(n, _)| n == "onboarding/create/recovery-file")
+        .map(|(_, e)| e.label.to_string())
+        .unwrap_or_else(|| {
+            let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+            panic!("the recovery file is not named; recorded: {names:?}")
+        });
+    assert!(
+        line.contains(path),
+        "the line does not name the file: {line}"
+    );
 }

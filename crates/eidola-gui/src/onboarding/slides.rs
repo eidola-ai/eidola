@@ -340,6 +340,7 @@ impl RenderOnce for CreateAccount {
             )
             .when_some(self.error, |el, err| {
                 let el = el.child(error_line("create", super::create_error_copy(&err, cx), cx));
+                let recovery_file = super::create_recovery_file_copy(&err, cx);
                 // The server holds only the secret's hash: if this profile
                 // could not keep the account, these rows are the only copy.
                 match err {
@@ -355,7 +356,21 @@ impl RenderOnce for CreateAccount {
                             crate::i18n::msg::onboarding_account_secret(cx),
                             account.secret.expose().to_string().into(),
                             cx,
-                        )),
+                        ))
+                        .when_some(recovery_file, |el, line| {
+                            el.child(
+                                div()
+                                    .id("onboarding-create-recovery-file")
+                                    .probe(
+                                        "onboarding/create/recovery-file",
+                                        Role::Label,
+                                        line.clone(),
+                                    )
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child(line),
+                            )
+                        }),
                     _ => el,
                 }
             });

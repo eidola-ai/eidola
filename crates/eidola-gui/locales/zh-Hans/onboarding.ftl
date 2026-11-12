@@ -99,6 +99,7 @@ onboarding-copy-label = 复制{ $label }
 onboarding-new-account-note = 它只用于添加和消耗额度。账户密钥一旦丢失便无法找回，你将需要创建一个新账户。
 onboarding-cta-saved = 我已经保存好了。
 onboarding-create-not-saved = 你的账户已创建，但无法保存在这里（{ $reason }）。这是其密钥的唯一副本：请立即复制两项，问题解决后通过“我已经有账户了。”关联它们。
+onboarding-create-recovery-file = 另有一份副本已保存到 { $path }。账户关联后，请删除该文件。
 
 onboarding-cta-verify = 查询账户余额。
 onboarding-cta-verify-pending = 正在查询…
