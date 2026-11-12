@@ -24,9 +24,10 @@ Options:
                                Requires a docker-container driver (--ensure-builder or
                                setup-buildx-action).
   --targets GROUP              For `build`: bake group to build (default: full manifest).
-                               Recognized values: `all` (default), `server`, `cli`. Both push
-                               and non-push modes accept the split selectors so CI's
-                               two-phase build can push each phase independently.
+                               Recognized values: `all` (default), `server`, `cli`,
+                               `server-engine` (the inference node's image). Both push
+                               and non-push modes accept the split selectors so CI can
+                               build and push each phase independently.
                                For `print`/`verify`: space-separated list of target names
                                whose digests to read from the preceding --metadata-file
                                (e.g. "server postgres" or "cli"). Pairs are matched
@@ -37,14 +38,15 @@ Options:
                                read from that file.
   --server-enclave PATH        Path to server-enclave.json (default:
                                releases/trust/server-enclave.json). Valid for `verify-full`.
-  --server-enclave-output PATH Write the computed enclave block (with `schema_version: 1`
+  --server-enclave-output PATH Write the computed enclave block (with `schema_version: 2`
                                envelope) to PATH. Valid for `measure` and `verify-full`.
   --artifact-dir DIR           Copy the files a release publishes (the Nix installable's
                                `.tar.gz`, each `.deb`) into DIR, named after the manifest
                                key that records each one. Valid for `build-macos`,
                                `build-linux-gui` and `build-linux-deb`.
-  --verify-attestations        Verify CVM manifest provenance via Sigstore (requires gh CLI).
-                               Fails the command if attestation verification fails.
+  --verify-attestations        Verify the provenance of the CVM release manifest and SEV-SNP
+                               IGVM image via Sigstore (requires gh CLI). Fails the command
+                               if attestation verification fails.
 EOF
 }
 
@@ -85,6 +87,14 @@ MANIFEST_SCHEMA_VERSION=2
 # compares against.
 ARTIFACT_SET_SCHEMA=3
 
+# The schema at which the inference node's image (`eidola-server-engine`,
+# built by the `server-engine` bake target) is recorded. Below it the image
+# is still built — CI builds it on every run, so the build is exercised long
+# before the release that first records it — but no row is emitted for it:
+# a row the declared schema does not have is a claims change to every
+# installed client, exactly like a missing one.
+ENGINE_IMAGE_SCHEMA=4
+
 # Every artifact key the emitted schema requires — the emitter's half of the
 # contract `crates/eidola-app-core/src/updates.rs` states for clients. A
 # manifest that omits one of these is not merely incomplete: an installed
@@ -104,6 +114,9 @@ required_artifact_keys() {
     eidola-postgres
     eidola-server
   )
+  if records_engine_image; then
+    keys+=(eidola-server-engine)
+  fi
   if records_current_linux_shape; then
     keys+=(
       eidola-gui-linux-deb-amd64
@@ -150,32 +163,14 @@ assert_manifest_complete() {
   return 1
 }
 
-# CVM image artifacts for enclave measurement computation.
-# The OVMF firmware version is pinned to match tinfoilsh/measure-image-action.
+# CVM image artifacts for enclave measurement computation. The gateway runs on
+# the platform provider's IGVM launch model: one SEV-SNP image per release,
+# named by the release manifest the config's `cvm-version` pins inline
+# (`cvm-version: X@sha256:HEX`). That pin is the only one: the manifest is
+# downloaded from a mutable release tag and must hash to it, and the image
+# must hash to the manifest's `igvm.snp`. Cache hits are re-hashed, not
+# trusted.
 CVM_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/eidola/cvm"
-OVMF_VERSION="v0.0.3"
-OVMF_URL="https://github.com/tinfoilsh/edk2/releases/download/${OVMF_VERSION}/OVMF.fd"
-
-# SHA-256 of the OVMF.fd release asset at ${OVMF_VERSION}. GitHub release tags
-# are mutable, so the download (and any cache hit) is verified against this
-# committed hash. Cross-checked against the Sigstore-signed attestation for
-# the asset:
-#   gh attestation verify OVMF.fd -R tinfoilsh/edk2 \
-#     --predicate-type "https://tinfoil.sh/predicate/component-artifact/v1" \
-#     --deny-self-hosted-runners
-OVMF_SHA256="3a38d062226a2369b1bd85b5408ed597eec793dad71c466f82f5765e4e7b1c9f"
-
-# SHA-256 of the CVM release manifest for the cvm-version below. The manifest
-# is fetched from a mutable release tag, and it carries the kernel/initrd
-# hashes and the dm-verity roothash — so pinning it transitively pins the
-# whole CVM artifact set. Must be updated together with `cvm-version` in
-# tinfoil-config.yml; the version match is enforced at fetch time. An inline
-# `cvm-version: X@sha256:HEX` pin in tinfoil-config.yml (the
-# tinfoilsh/measure-image-action syntax) takes precedence over these
-# constants. Cross-checked against the Sigstore attestation:
-#   gh attestation verify <manifest> -R tinfoilsh/cvmimage --deny-self-hosted-runners
-CVM_MANIFEST_VERSION="0.7.3"
-CVM_MANIFEST_SHA256="515585830b6df4e737f01aa041dcc40e926df0af306cd9d7a8037651befa1aa5"
 
 COMMAND="${1:-}"
 if [[ "$COMMAND" = "-h" || "$COMMAND" = "--help" ]]; then
@@ -296,37 +291,27 @@ compute_sha256() {
   fi
 }
 
-# Read the cvm-version field from tinfoil-config.yml into CVM_VERSION and,
-# when the field carries an inline `@sha256:HEX` pin (the
-# tinfoilsh/measure-image-action digest-pinning syntax), CVM_MANIFEST_PIN.
+# Read the cvm-version field from tinfoil-config.yml into CVM_VERSION and its
+# inline release-manifest pin into CVM_MANIFEST_PIN. The pin is required:
+# it is what names the image the config launches. measure-enclave applies the
+# same grammar (`eidola_common::engine_deployment::parse_cvm_version`) to the
+# same bytes; this read only locates the downloads.
 parse_cvm_version() {
   local raw digest
   raw="$(grep -E '^cvm-version:' "$CONFIG_FILE" | sed 's/^cvm-version:[[:space:]]*//')"
   CVM_VERSION="${raw%%@*}"
-  CVM_MANIFEST_PIN=""
-  if [[ "$raw" == *@* ]]; then
-    digest="${raw#*@}"
-    if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-      echo "error: malformed cvm-version pin in $CONFIG_FILE: $raw" >&2
-      echo "  expected: VERSION@sha256:<64 lowercase hex chars>" >&2
-      exit 1
-    fi
-    CVM_MANIFEST_PIN="${digest#sha256:}"
+  digest="${raw#*@}"
+  if [[ "$raw" != *@* || ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "error: cvm-version in $CONFIG_FILE must pin its release manifest inline: $raw" >&2
+    echo "  expected: VERSION@sha256:<64 lowercase hex chars>" >&2
+    exit 1
   fi
-}
-
-# Download a URL to a local cache path, skipping if already present.
-# Only for artifacts that are hash-verified downstream (kernel/initrd, which
-# are checked against the pinned CVM manifest after fetch); everything else
-# must use verified_download.
-cached_download() {
-  local url="$1" dest="$2"
-  if [[ -f "$dest" ]]; then
-    return 0
+  if [[ ! "$CVM_VERSION" =~ ^[0-9][0-9A-Za-z.-]*$ ]]; then
+    echo "error: cvm-version in $CONFIG_FILE is not a plain release version: $CVM_VERSION" >&2
+    echo "  the gateway runs on a release's CPU image (no +build tag)" >&2
+    exit 1
   fi
-  mkdir -p "$(dirname "$dest")"
-  echo "Downloading $(basename "$dest")..." >&2
-  curl -fsSL --retry 3 -o "$dest" "$url"
+  CVM_MANIFEST_PIN="${digest#sha256:}"
 }
 
 # Download a URL to a local cache path, verifying it against an expected
@@ -359,138 +344,100 @@ verified_download() {
   fi
 }
 
-# Fetch CVM image artifacts (OVMF, kernel, initrd, manifest) and verify
-# kernel/initrd hashes against the CVM manifest.
+# Fetch the CVM release manifest and the release's SEV-SNP IGVM image, each
+# verified against its pin: the manifest against the config's inline pin, the
+# image against the manifest's `igvm.snp`. measure-enclave checks both again
+# over the same bytes.
 fetch_cvm_artifacts() {
-  local cache_dir manifest_url manifest_file manifest_expected
-  local kernel_url kernel_file kernel_hash
-  local initrd_url initrd_file initrd_hash
-  local ovmf_file
+  local cache_dir manifest_url manifest_file igvm_url igvm_file igvm_hash file
 
   parse_cvm_version
   cache_dir="${CVM_CACHE_DIR}/${CVM_VERSION}"
 
-  # Resolve the expected manifest hash: an inline pin in tinfoil-config.yml
-  # wins; otherwise the committed constants above apply and must agree with
-  # the config's cvm-version, so a version bump cannot silently outrun the pin.
-  if [[ -n "$CVM_MANIFEST_PIN" ]]; then
-    manifest_expected="$CVM_MANIFEST_PIN"
-  elif [[ "$CVM_VERSION" == "$CVM_MANIFEST_VERSION" ]]; then
-    manifest_expected="$CVM_MANIFEST_SHA256"
-  else
-    echo "error: cvm-version ${CVM_VERSION} has no committed manifest pin" >&2
-    echo "  Update CVM_MANIFEST_VERSION / CVM_MANIFEST_SHA256 in scripts/artifact-manifest.sh" >&2
-    echo "  (or pin inline in tinfoil-config.yml as: cvm-version: ${CVM_VERSION}@sha256:<hex>)." >&2
-    exit 1
-  fi
-
-  # Fetch CVM manifest (hash-pinned; release tags are mutable)
   manifest_url="https://github.com/tinfoilsh/cvmimage/releases/download/v${CVM_VERSION}/tinfoil-inference-v${CVM_VERSION}-manifest.json"
-  manifest_file="${cache_dir}/manifest.json"
-  verified_download "$manifest_url" "$manifest_file" "$manifest_expected"
+  manifest_file="${cache_dir}/tinfoil-inference-v${CVM_VERSION}-manifest.json"
+  verified_download "$manifest_url" "$manifest_file" "$CVM_MANIFEST_PIN"
 
-  # Extract expected hashes
-  kernel_hash="$(jq -er '.kernel' "$manifest_file")"
-  initrd_hash="$(jq -er '.initrd' "$manifest_file")"
-
-  # Fetch kernel
-  kernel_url="https://images.tinfoil.sh/cvm/tinfoil-inference-v${CVM_VERSION}.vmlinuz"
-  kernel_file="${cache_dir}/vmlinuz"
-  cached_download "$kernel_url" "$kernel_file"
-
-  # Fetch initrd
-  initrd_url="https://images.tinfoil.sh/cvm/tinfoil-inference-v${CVM_VERSION}.initrd"
-  initrd_file="${cache_dir}/initrd"
-  cached_download "$initrd_url" "$initrd_file"
-
-  # Fetch OVMF (hash-pinned; version-independent, cached by OVMF version)
-  ovmf_file="${CVM_CACHE_DIR}/OVMF-${OVMF_VERSION}.fd"
-  verified_download "$OVMF_URL" "$ovmf_file" "$OVMF_SHA256"
-
-  # Verify kernel and initrd against manifest hashes
-  local actual_kernel_hash actual_initrd_hash
-
-  actual_kernel_hash="$(compute_sha256 "$kernel_file")"
-  actual_initrd_hash="$(compute_sha256 "$initrd_file")"
-
-  if [[ "$actual_kernel_hash" != "$kernel_hash" ]]; then
-    echo "error: kernel hash mismatch" >&2
-    echo "  expected: $kernel_hash" >&2
-    echo "  actual:   $actual_kernel_hash" >&2
-    rm -f "$kernel_file"
+  if [[ "$(jq -er '.igvm.format_version' "$manifest_file")" != "1" ]]; then
+    echo "error: CVM release manifest for ${CVM_VERSION} is not an IGVM release (igvm.format_version 1)" >&2
     exit 1
   fi
-
-  if [[ "$actual_initrd_hash" != "$initrd_hash" ]]; then
-    echo "error: initrd hash mismatch" >&2
-    echo "  expected: $initrd_hash" >&2
-    echo "  actual:   $actual_initrd_hash" >&2
-    rm -f "$initrd_file"
+  igvm_hash="$(jq -er '.igvm.snp' "$manifest_file")"
+  if [[ ! "$igvm_hash" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "error: CVM release manifest records no SEV-SNP image hash (igvm.snp)" >&2
     exit 1
   fi
+  igvm_url="https://images.tinfoil.sh/cvm/tinfoil-snp-v${CVM_VERSION}.igvm"
+  igvm_file="${cache_dir}/tinfoil-snp-v${CVM_VERSION}.igvm"
+  verified_download "$igvm_url" "$igvm_file" "$igvm_hash"
 
-  # When --verify-attestations is set, verify CVM manifest provenance via
-  # Sigstore. The manifest is already hash-pinned above; this additionally
-  # checks that the pinned content was built on GitHub-hosted runners in the
-  # tinfoilsh/cvmimage repo. Fails hard if verification fails.
+  # When --verify-attestations is set, verify the provenance of both files
+  # via Sigstore: built by the provider's release workflow, at this release's
+  # tag, on GitHub-hosted runners. The hashes are already pinned above; this
+  # additionally checks who built the pinned bytes. Fails hard.
   if [[ "$VERIFY_ATTESTATIONS" -eq 1 ]]; then
-    echo "Verifying CVM manifest attestation..." >&2
-    if ! gh attestation verify "$manifest_file" -R tinfoilsh/cvmimage --deny-self-hosted-runners; then
-      echo "error: CVM manifest attestation verification failed" >&2
-      echo "  The manifest hash checks passed, but Sigstore provenance could not be verified." >&2
-      echo "  This may indicate the release was not built on GitHub-hosted runners." >&2
-      exit 1
-    fi
-    echo "CVM manifest attestation verified." >&2
+    for file in "$manifest_file" "$igvm_file"; do
+      echo "Verifying the provenance of $(basename "$file")..." >&2
+      if ! gh attestation verify "$file" -R tinfoilsh/cvmimage \
+        --signer-workflow tinfoilsh/cvmimage/.github/workflows/release.yml \
+        --source-ref "refs/tags/v${CVM_VERSION}" \
+        --deny-self-hosted-runners >&2; then
+        echo "error: provenance of $(basename "$file") could not be verified" >&2
+        echo "  The hash checks passed, but no Sigstore attestation from the provider's" >&2
+        echo "  release workflow at v${CVM_VERSION} covers these bytes." >&2
+        exit 1
+      fi
+    done
+    echo "CVM release provenance verified." >&2
   fi
 
-  # Export paths for use by compute_measurements
-  CVM_OVMF="$ovmf_file"
-  CVM_KERNEL="$kernel_file"
-  CVM_INITRD="$initrd_file"
-  CVM_ROOTHASH="$(jq -er '.root' "$manifest_file")"
+  CVM_MANIFEST="$manifest_file"
+  CVM_SNP_IGVM="$igvm_file"
 }
 
 # ── Enclave measurement ──────────────────────────────────────────────────────
 
-# Update the eidola-server image digest in tinfoil-config.yml from build
-# metadata. (Only the server runs inside the enclave; the database is
-# hosted externally, so eidola-postgres's digest doesn't feed the
-# measurement.)
+# Update the gateway image digest in tinfoil-config.yml from build metadata.
+# (Only the gateway runs inside the enclave; the database is hosted
+# externally, so eidola-postgres's digest doesn't feed the measurement.)
+# The gateway is built by the `server` bake target — see
+# print_oci_partial_for_targets for why that name stays.
 stamp_config_digests() {
   local server_digest
 
   server_digest="$(metadata_digest "$METADATA_FILE" "$(target_key server)")"
 
+  if ! grep -q 'ghcr.io/eidola-ai/eidola-server-gateway@sha256:' "$CONFIG_FILE"; then
+    echo "error: $CONFIG_FILE has no ghcr.io/eidola-ai/eidola-server-gateway@sha256: image to stamp" >&2
+    exit 1
+  fi
   sed -i.bak \
-    -e "s|ghcr.io/eidola-ai/eidola-server@sha256:[a-f0-9]*|ghcr.io/eidola-ai/eidola-server@${server_digest}|" \
+    -e "s|ghcr.io/eidola-ai/eidola-server-gateway@sha256:[a-f0-9]*|ghcr.io/eidola-ai/eidola-server-gateway@${server_digest}|" \
     "$CONFIG_FILE"
   rm -f "${CONFIG_FILE}.bak"
 }
 
-# Compute enclave measurements using the measure-enclave binary.
-# Requires CVM artifacts to be fetched first (sets CVM_* variables).
+# Compute the gateway's SEV-SNP launch identity with the measure-enclave
+# binary: `{cvm_version, igvm_sha256, sev_snp: {measurement, host_data,
+# guest_policy}}`.
 compute_measurements() {
   fetch_cvm_artifacts
 
-  cargo run -q -p measure-enclave -- \
+  cargo run -q -p measure-enclave --bin measure-enclave -- \
     --config "$CONFIG_FILE" \
-    --ovmf "$CVM_OVMF" \
-    --kernel "$CVM_KERNEL" \
-    --initrd "$CVM_INITRD" \
-    --roothash "$CVM_ROOTHASH"
+    --release-manifest "$CVM_MANIFEST" \
+    --igvm "$CVM_SNP_IGVM"
 }
 
-# Wrap a bare enclave-measurement JSON (as emitted by measure-enclave) in the
-# `{schema_version, snp_measurement, tdx_measurement, cmdline}` envelope used
-# by `releases/trust/server-enclave.json`. Writes to PATH if given, else
-# stdout. The schema_version is the same integer-versioned scheme used by
-# the rest of the trust-root JSON files.
+# Wrap the enclave block (as emitted by measure-enclave) in the
+# `schema_version` envelope `releases/trust/server-enclave.json` carries.
+# Writes to PATH if given, else stdout. The schema_version is the same
+# integer-versioned scheme used by the rest of the trust-root JSON files.
 write_server_enclave_envelope() {
   local enclave="$1" out_path="$2"
   local enveloped
 
-  enveloped="$(printf '%s\n' "$enclave" | jq -S '{schema_version: 1} + .')"
+  enveloped="$(printf '%s\n' "$enclave" | jq -S '{schema_version: 2} + .')"
 
   if [[ -n "$out_path" ]]; then
     mkdir -p "$(dirname "$out_path")"
@@ -565,21 +512,23 @@ build_metadata() {
   # --push.
   if [[ "$PUSH_MODE" -eq 1 ]]; then
     case "$TARGETS" in
-      all)    bake_targets=(ci-server ci-cli ci-postgres) ;;
+      all)    bake_targets=(ci-server ci-cli ci-postgres ci-server-engine) ;;
       server) bake_targets=(ci-server ci-postgres) ;;
       cli)    bake_targets=(ci-cli) ;;
+      server-engine) bake_targets=(ci-server-engine) ;;
       *)
-        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli)" >&2
+        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli, server-engine)" >&2
         exit 1
         ;;
     esac
   else
     case "$TARGETS" in
-      all)    bake_targets=(server cli postgres) ;;
+      all)    bake_targets=(server cli postgres server-engine) ;;
       server) bake_targets=(server postgres) ;;
       cli)    bake_targets=(cli) ;;
+      server-engine) bake_targets=(server-engine) ;;
       *)
-        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli)" >&2
+        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli, server-engine)" >&2
         exit 1
         ;;
     esac
@@ -604,12 +553,21 @@ metadata_digest() {
 
 # Build a partial artifact-manifest from a list of target names.
 # Each target is read from $METADATA_FILE using its push-aware key.
+#
+# The manifest key is `eidola-<bake target>`, so a bake target's name is a
+# manifest key in disguise: renaming one is a manifest artifact-set rotation
+# (`releases/README.md`), not a build tweak. That is why the gateway image is
+# built by the `server` target and recorded as `eidola-server` although the
+# image it pushes is `eidola-server-gateway` — the OCI digest the row records
+# does not depend on the repository name, and installed clients expect the
+# key they were built against.
 print_oci_partial_for_targets() {
   local -a targets=("$@")
   local target digest jq_filter
 
   jq_filter="{ schema_version: ${MANIFEST_SCHEMA_VERSION}, artifacts: {} }"
   for target in "${targets[@]}"; do
+    records_oci_target "$target" || continue
     digest="$(metadata_digest "$METADATA_FILE" "$(target_key "$target")")"
     jq_filter+=" | .artifacts[\"eidola-${target}\"] = { type: \"oci\", platform: \"linux/amd64\", digest: \"${digest}\" }"
   done
@@ -675,6 +633,20 @@ manifest_arch() {
 # Does the emitted schema record the current Linux artifact shape?
 records_current_linux_shape() {
   ((MANIFEST_SCHEMA_VERSION >= ARTIFACT_SET_SCHEMA))
+}
+
+# Does the emitted schema record the inference node's image?
+records_engine_image() {
+  ((MANIFEST_SCHEMA_VERSION >= ENGINE_IMAGE_SCHEMA))
+}
+
+# Does the emitted schema record this OCI bake target's image? Every target
+# but the engine's is recorded by every schema this script emits.
+records_oci_target() {
+  case "$1" in
+    server-engine) records_engine_image ;;
+    *) return 0 ;;
+  esac
 }
 
 # The manifest key for the Nix Linux installable, per emitted schema.
@@ -1240,22 +1212,45 @@ verify_full_manifest() {
   return "$rc"
 }
 
+# The manifest keys the given OCI targets are recorded under by the emitted
+# schema, as a JSON array (the targets `print_oci_partial_for_targets` would
+# emit a row for).
+oci_target_keys() {
+  local target
+  for target in "$@"; do
+    if records_oci_target "$target"; then
+      printf 'eidola-%s\n' "$target"
+    fi
+  done | jq -R . | jq -cs .
+}
+
 verify_oci_manifest() {
-  local actual_norm committed_subset
+  local actual_norm committed_subset keys
   local tmp_partial
 
   tmp_partial="$(write_temp_file "$(print_oci_manifest)")"
   PARTIAL_FILES=("$tmp_partial")
 
+  # The committed rows for exactly the targets this run built: every
+  # (metadata-file, targets) pair, or the legacy default set.
+  local -a requested=()
+  if [[ "${#PRINT_TARGETS_LIST[@]}" -eq 0 ]]; then
+    requested=(server cli postgres)
+  else
+    local entry
+    local -a tgts
+    for entry in "${PRINT_TARGETS_LIST[@]}"; do
+      read -ra tgts <<<"$entry"
+      requested+=("${tgts[@]}")
+    done
+  fi
+  keys="$(oci_target_keys "${requested[@]}")"
+
   actual_norm="$(merge_partials | jq -cS .)"
-  committed_subset="$(jq -cS --argjson schema "$MANIFEST_SCHEMA_VERSION" '
-    {
+  committed_subset="$(jq -cS --argjson schema "$MANIFEST_SCHEMA_VERSION" --argjson keys "$keys" '
+    . as $m | {
       schema_version: $schema,
-      artifacts: {
-        "eidola-server": .artifacts["eidola-server"],
-        "eidola-cli": .artifacts["eidola-cli"],
-        "eidola-postgres": .artifacts["eidola-postgres"]
-      }
+      artifacts: (reduce $keys[] as $k ({}; .[$k] = $m.artifacts[$k]))
     }
   ' "$MANIFEST_FILE")"
 
@@ -1281,7 +1276,7 @@ verify_oci_manifest() {
 #
 #   Phase 1: build {server, postgres}. Neither image consumes the enclave
 #            measurement, so they can be built first.
-#   Phase 2: stamp the new server digest into `tinfoil-config.yml`, recompute
+#   Phase 2: stamp the new gateway digest into `tinfoil-config.yml`, recompute
 #            the enclave block, and write `releases/trust/server-enclave.json`.
 #   Phase 3: build the cli OCI image plus the current host's native desktop
 #            artifacts — the macOS universal CLI + GUI .app on Darwin, the
@@ -1291,7 +1286,10 @@ verify_oci_manifest() {
 #            entries are carried over from the committed manifest (no single
 #            host can build both; CI's linux-gui + apple jobs are the
 #            cross-platform authority and verify the full set).
-#   Phase 4: compose `artifact-manifest.json` from all of the above.
+#   Phase 4: from the schema that records it, build the inference node's
+#            image. It consumes no enclave measurement and nothing above
+#            consumes its digest, so its place in the order is free.
+#   Phase 5: compose `artifact-manifest.json` from all of the above.
 #
 # This breaks the previous self-reference (the cli build's OCI digest is
 # recorded in the very file the cli build was COPYing into its build context),
@@ -1299,7 +1297,7 @@ verify_oci_manifest() {
 update_manifest() {
   local server_oci_partial cli_oci_partial macos_partial linux_gui_partial actual_manifest
   local server_oci_partial_file cli_oci_partial_file macos_partial_file linux_gui_partial_file
-  local server_metadata cli_metadata original_metadata original_targets host_os
+  local server_metadata cli_metadata engine_metadata original_metadata original_targets host_os
 
   if [[ -z "$OUTPUT_FILE" ]]; then
     OUTPUT_FILE="$REPO_ROOT/artifact-manifest.json"
@@ -1361,7 +1359,18 @@ update_manifest() {
     echo "note: darwin narHash/archiveSha256 and the ${other_arch} .deb carried over from committed manifest (not buildable on this host); CI verifies them" >&2
   fi
 
-  # ── Phase 4: compose final artifact-manifest.json ───────────────────────
+  # ── Phase 4: the inference node's image, once a schema records it ──────
+  local engine_oci_partial engine_oci_partial_file
+  engine_oci_partial="$(jq -n --argjson schema "$MANIFEST_SCHEMA_VERSION" '{ schema_version: $schema, artifacts: {} }')"
+  if records_engine_image; then
+    engine_metadata="${TMPDIR:-/tmp}/bake-metadata-server-engine.json"
+    METADATA_FILE="$engine_metadata"
+    TARGETS="server-engine"
+    build_metadata
+    engine_oci_partial="$(print_oci_partial_for_targets server-engine)"
+  fi
+
+  # ── Phase 5: compose final artifact-manifest.json ───────────────────────
   METADATA_FILE="$server_metadata"
   server_oci_partial="$(print_oci_partial_for_targets server postgres)"
   METADATA_FILE="$cli_metadata"
@@ -1369,12 +1378,13 @@ update_manifest() {
 
   server_oci_partial_file="$(write_temp_file "$server_oci_partial")"
   cli_oci_partial_file="$(write_temp_file "$cli_oci_partial")"
+  engine_oci_partial_file="$(write_temp_file "$engine_oci_partial")"
   macos_partial_file="$(write_temp_file "$macos_partial")"
   linux_gui_partial_file="$(write_temp_file "$linux_gui_partial")"
-  PARTIAL_FILES=("$server_oci_partial_file" "$cli_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file")
+  PARTIAL_FILES=("$server_oci_partial_file" "$cli_oci_partial_file" "$engine_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file")
 
   actual_manifest="$(merge_partials)"
-  rm -f "$server_oci_partial_file" "$cli_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file"
+  rm -f "$server_oci_partial_file" "$cli_oci_partial_file" "$engine_oci_partial_file" "$macos_partial_file" "$linux_gui_partial_file"
 
   # Nothing is written until the composition is whole. A short manifest is
   # not a smaller version of a good one — every installed client reads the
@@ -1422,8 +1432,8 @@ case "$COMMAND" in
     fi
     ;;
   stamp-config)
-    # Stamp the freshly-built server digest from --metadata-file into
-    # tinfoil-config.yml. Used by CI's two-phase oci job after the server
+    # Stamp the freshly-built gateway digest from --metadata-file into
+    # tinfoil-config.yml. Used by CI's two-phase oci job after the gateway
     # bake completes and before the enclave is recomputed.
     stamp_config_digests
     echo "Stamped $CONFIG_FILE with server digest from $METADATA_FILE"

@@ -16,9 +16,14 @@
 //!
 //! [`Executor::execute`] runs exactly this sequence, with no host interaction in between:
 //!
-//! 1. `maintenance`, in order ([`Maintenance::Copy`], [`Maintenance::Zero`],
-//!    [`Maintenance::ResetSlot`]). Every zero completes before any later write to that
-//!    block, including writes by this step's forward.
+//! 1. `maintenance`, in the order given ([`Maintenance::Copy`], [`Maintenance::Zero`],
+//!    [`Maintenance::ResetSlot`], [`Maintenance::Encrypt`], [`Maintenance::Decrypt`],
+//!    and the host tier's [`Maintenance::Demote`], [`Maintenance::Promote`] and
+//!    [`Maintenance::ZeroHost`]). Every operation on a block takes effect after the
+//!    operations listed before it that touch the same block (device or host) and before
+//!    those after it: every zero before any later write to that block, every demote's read
+//!    before the zero that follows it, every promote before the decrypt that follows it,
+//!    and every decrypt before any read of the block, including this step's forward.
 //! 2. `table_updates`, in order: `table[slot][group][index] = block`.
 //! 3. The forward: for each [`SeqEntry`], its host tokens occupy positions
 //!    `context_len .. context_len + num_tokens`. KV for every query position is written
@@ -50,6 +55,52 @@
 //! directed to by the tables. Blocks the host shares between sequences (prefix-cache hits)
 //! are never written: the host never schedules a query position inside a shared block.
 //!
+//! # Idle encryption
+//!
+//! A prefix-cache block that no sequence maps (an *idle* entry's block) is held encrypted
+//! ([`crate::kv_cipher`]: ChaCha20 under the lineage's [`KvKey`], with the nonce the host
+//! derived from the block's hash and group). The host issues [`Maintenance::Encrypt`]
+//! when the last sequence mapping a cached block lets go of it and the cache keeps it,
+//! and [`Maintenance::Decrypt`] before a sequence maps an encrypted block again; the keys
+//! those operations name travel in [`StepInput::kv_keys`] for that step only. The
+//! executor encrypts every byte of the block that [`Maintenance::Zero`] would zero (all
+//! of the group's layers, and a drafter block's boundary tap), as the ranges of an image
+//! whose order it documents. Encrypting is an XOR with the keystream, so decrypting is
+//! the same operation; they are distinct operations so that each can be checked.
+//!
+//! Between two steps the host names a block in at most one encrypt or decrypt, and never
+//! lists a zero, copy or demote of a block after its encrypt or decrypt, so an executor
+//! may run a run of consecutive encryptions and decryptions together (one launch); it must
+//! still finish them before the forward reads. (A block may be zeroed, promoted into, and
+//! then decrypted in one step: a demoted block's id reused for a promoted one.)
+//! An executor keeps no key past the step: whatever device or host copy it makes of
+//! [`StepInput::kv_keys`] is zeroed before `execute` returns or by stream-ordered work
+//! queued before the forward.
+//!
+//! # Host tier
+//!
+//! An executor may keep a second, larger pool per group in host memory
+//! ([`crate::spec::KvGroupSpec::host_blocks`]: the confidential VM's own memory, never
+//! durable media), where the host parks idle prefix-cache blocks evicted from the device
+//! pools under pressure instead of dropping them. Host blocks have their own ids
+//! (`1..host_blocks`, 0 reserved), and the host owns their allocation exactly as it owns
+//! the device pools'. Only ciphertext ever moves there:
+//!
+//! * [`Maintenance::Demote`] copies a device block's whole image (every byte
+//!   [`Maintenance::Zero`] would zero) into a host block. The host demotes only a block
+//!   that is encrypted when the step begins, and queues the device block's zero after it.
+//! * [`Maintenance::Promote`] copies a host block's image back into a device block the
+//!   host just allocated (and whose zero, if any, is listed before it). The block is still
+//!   ciphertext; a [`Maintenance::Decrypt`] after it is what a hit then maps.
+//! * [`Maintenance::ZeroHost`] overwrites a host block with zeros. The host issues it for
+//!   every host block that stops holding an entry, after any promote that reads it, and
+//!   never names that block in a demote before the next step. Unlike device work it may
+//!   run after the forward, but it completes before `execute` returns.
+//!
+//! The executor never decrypts, encrypts or reads a host block for any other purpose, and
+//! holds no key for one. Host-tier memory must be locked into RAM (page-locked, never
+//! swapped); the node refuses to boot on a guest with active swap.
+//!
 //! # Graph capture
 //!
 //! Everything a step varies is data, not shape: the batch is padded to [`StepInput::bucket`]
@@ -59,11 +110,11 @@
 //! and acceptance run inside the step, so a speculative decode step needs no host round
 //! trip. Steps with `num_drafts` uniform across rows and one host token per row (pure
 //! decode) are the ones expected to replay a captured graph; mixed prefill steps may
-//! run piecewise. The host gives every row either the full draft width `k` or none
-//! (none at position 0, and none for every row of a step that ran short of KV),
-//! trimming only near the model length, so non-uniform decode steps are rare and need
-//! no graph of their own. `maintenance` and `table_updates` are applied by small
-//! kernels or copies before the graph replays.
+//! run piecewise. The host gives every drafting row of a step the same width: the full
+//! `k`, or none for every row of a step that ran short of KV (and none at position 0),
+//! trimming only near the model length, so non-uniform decode steps are rare and need no
+//! graph of their own. `maintenance` and `table_updates` are applied by small kernels or
+//! copies before the graph replays.
 //!
 //! # Determinism contract
 //!
@@ -80,34 +131,46 @@
 //!
 //! # Drafter rows
 //!
-//! A drafter that consumes a token together with a hidden state from the previous
-//! position must index its row by the **token it consumes**. For MTP depth `d` (level 0 is
-//! the target's hidden state, level `d + 1` is depth `d`'s output):
+//! A drafter that consumes a token together with a hidden state from an earlier position
+//! must index its row by the **token it consumes**. For MTP depth `d`, every depth
+//! conditioned on the **target's** hidden state (as the model vendor serves its MTP
+//! layers: layer `d` combines `h_x` with the token `d + 1` past `x`, never another MTP
+//! layer's output):
 //!
-//! * the row at position `s` consumes the token at `s` and level `d` at `s - 1`, uses
-//!   RoPE position `s - 1`, writes its KV at `s`, and predicts the token at `s + 1`; rows
-//!   exist for `s >= d + 1`;
+//! * the row at position `s` consumes the token at `s` and the target's hidden state at
+//!   the anchor `a = s - 1 - d`, uses RoPE position `a`, writes its KV at `s`, and
+//!   predicts the token at `s + 1`; rows exist for `s >= d + 1`;
 //! * the draft for position `p + 1 + i` (after the last host token `p`) is depth `i`'s
-//!   prediction at `p + i`; depth `i`'s speculative rows occupy `p + 1 ..= p + i`, inside
-//!   the positions the host reserved for drafts.
+//!   prediction at `p + i`, anchored at `p - 1` like every depth's; depth `i`'s
+//!   speculative rows occupy `p + 1 ..= p + i`, inside the positions the host reserved
+//!   for drafts.
+//!
+//! A depth's output feeds only its own logits and KV. Level `l` at position `x` names the
+//! target's state at `x - l` (zeros before position 0), so depth `d`'s row at `s` reads
+//! level `d` at `s - 1`.
 //!
 //! Indexing a row by the hidden state it continues from instead (`(h_p, t_{p+1})` at `p`)
 //! would make a block's last drafter row depend on the next block's first token, which
 //! the block's cache key does not cover.
 //!
 //! A sequence resuming at a block boundary `c` (prefix hit or preemption resume) needs the
-//! drafter's levels at `c - 1`, which no KV holds. The executor therefore stores a
-//! **boundary tap** in each drafter block: the levels at the block's last position. Taps
+//! drafter's levels at `c - 1` (the target's states at `c - 1 ..= c - D` for `D` depths),
+//! which no KV holds. The executor therefore stores a **boundary tap** in each drafter
+//! block: the levels at the block's last position. Taps
 //! are part of the block (a function of the tokens it covers), are zeroed and copied with
 //! it, and a fresh slot loads its drafter state from the tap of the block ending at
 //! `c - 1`; a running sequence carries it in per-slot state.
 //!
 //! A block drafter (DFlash shape) satisfies the same invariant: its per-position context
 //! KV at `s` is projected from target hidden states at `s`, which depend only on tokens
-//! `<= s`; the target taps it continues from at a resume point are stored the same way. A GPU executor that cannot make attention or GEMMs
-//! batch-invariant must document its tolerance; the CPU reference executor meets it exactly.
+//! `<= s`; the target taps it continues from at a resume point are stored the same way.
+//! Every executor meets this exactly, bit for bit: the CPU reference executor by
+//! construction, the CUDA executor by a batch-invariant forward (one reduction order per
+//! row, whatever the step holds: `eidola-engine-cuda/AGENTS.md` → Batch invariance).
 
+use crate::kv_cipher::KvNonce;
 use crate::sampling::SamplingParams;
+use crate::secret::KvKey;
 use crate::spec::{Bucket, ModelSpec};
 
 /// A state slot: one row of the executor's per-sequence device tables.
@@ -140,6 +203,61 @@ pub enum Maintenance {
     ResetSlot {
         /// Slot to reset.
         slot: Slot,
+    },
+    /// Encrypt `block` of `group` in place: XOR every byte [`Maintenance::Zero`] would
+    /// zero with the ChaCha20 keystream of `kv_keys[key]` and `nonce`
+    /// ([`crate::kv_cipher`]). Issued when a cached block becomes idle.
+    Encrypt {
+        /// KV group index.
+        group: u32,
+        /// Block to encrypt.
+        block: u32,
+        /// Index into [`StepInput::kv_keys`].
+        key: u32,
+        /// The block's nonce.
+        nonce: KvNonce,
+    },
+    /// Decrypt `block` of `group` in place (the same keystream XOR as
+    /// [`Maintenance::Encrypt`]). Issued before an idle block is mapped again.
+    Decrypt {
+        /// KV group index.
+        group: u32,
+        /// Block to decrypt.
+        block: u32,
+        /// Index into [`StepInput::kv_keys`].
+        key: u32,
+        /// The block's nonce.
+        nonce: KvNonce,
+    },
+    /// Copy every byte of device `block` that [`Maintenance::Zero`] would zero into host
+    /// block `host` of `group`'s host tier. The block is ciphertext. Issued when an idle
+    /// entry is demoted under device pressure; its zero follows.
+    Demote {
+        /// KV group index.
+        group: u32,
+        /// Device block to copy from.
+        block: u32,
+        /// Host block to copy into.
+        host: u32,
+    },
+    /// Copy host block `host` of `group` back into device `block` (still ciphertext).
+    /// Issued when a prefix-cache hit needs a demoted block; a decrypt follows if a
+    /// sequence maps it.
+    Promote {
+        /// KV group index.
+        group: u32,
+        /// Host block to copy from.
+        host: u32,
+        /// Device block to copy into.
+        block: u32,
+    },
+    /// Overwrite every byte of host block `host` of `group` with zeros. Issued for every
+    /// host block that stops holding an entry (promoted, evicted or expired).
+    ZeroHost {
+        /// KV group index.
+        group: u32,
+        /// Host block to scrub.
+        host: u32,
     },
 }
 
@@ -186,6 +304,9 @@ pub struct StepInput {
     pub bucket: Bucket,
     /// Executed first, in order.
     pub maintenance: Vec<Maintenance>,
+    /// The keys this step's [`Maintenance::Encrypt`] and [`Maintenance::Decrypt`] name,
+    /// by index; each zeroed when the step is dropped.
+    pub kv_keys: Vec<KvKey>,
     /// Executed second, in order.
     pub table_updates: Vec<TableUpdate>,
     /// Sequence rows (at most `bucket.max_seqs`).

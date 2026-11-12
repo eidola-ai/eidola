@@ -292,12 +292,12 @@ enclave = manifest.get("enclave")
 if not isinstance(enclave, dict):
     violations.append("manifest.enclave: not an object")
 else:
-    keyset("enclave", enclave, ["cmdline", "snp_measurement", "tdx_measurement"])
-    tdx = enclave.get("tdx_measurement")
-    if not isinstance(tdx, dict):
-        violations.append("enclave.tdx_measurement: not an object")
+    keyset("enclave", enclave, ["cvm_version", "igvm_sha256", "sev_snp"])
+    snp = enclave.get("sev_snp")
+    if not isinstance(snp, dict):
+        violations.append("enclave.sev_snp: not an object")
     else:
-        keyset("enclave.tdx_measurement", tdx, ["rtmr1", "rtmr2"])
+        keyset("enclave.sev_snp", snp, ["guest_policy", "host_data", "measurement"])
 
 # Field allow-list per artifact type. `oci` records the image digest; `nix`
 # records the store-path checkpoint plus the archive hash a user can check

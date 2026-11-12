@@ -21,8 +21,10 @@ pages = [
 title = "Design pieces"
 pages = [
     ["client.md", "The client"],
-    ["server.md", "The server"],
-    ["upstream.md", "Inference upstream"],
+    ["gateway.md", "The gateway"],
+    ["engine.md", "Inference engine"],
+    ["model-identity.md", "Model identity"],
+    ["anonymous-credits.md", "Anonymous credits"],
 ]
 
 [[sections]]
@@ -48,4 +50,5 @@ pages = [
     ["contributing/README.md", "Runbooks"],
     ["contributing/release-attestant-yubikey.md", "Attestant YubiKey"],
     ["contributing/release-apple-signing-yubikey.md", "Apple CI YubiKey"],
+    ["contributing/rebuilding-platform-images.md", "Platform image rebuild"],
 ]

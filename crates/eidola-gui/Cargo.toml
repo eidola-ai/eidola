@@ -102,6 +102,10 @@ fluent-syntax = "0.12"
 unic-langid = "0.9"
 
 [dev-dependencies]
+# app-core's test seams for behavior tests over a real core (a fixture model
+# catalog, `AppCore::test_set_model_catalog`). Dev-only, so no release build
+# of the GUI links them.
+eidola-app-core = { path = "../eidola-app-core", features = ["test-support"] }
 # The same parser the build script uses: `tests/i18n.rs` includes
 # `build_support/codegen.rs` directly, so the build-error contract is asserted
 # by tests rather than by committing deliberately-broken FTL.

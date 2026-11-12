@@ -82,7 +82,10 @@ fn yes() -> bool {
     true
 }
 
+/// Every key of `quantization_config` is read: an unknown one is refused, so
+/// no quantization setting is dropped unseen.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RawQuantConfig {
     pub quant_method: String,
     pub fmt: Option<String>,
@@ -178,6 +181,11 @@ pub struct MoeSpec {
     pub intermediate_size: usize,
     pub norm_topk_prob: bool,
     pub routed_scaling_factor: f32,
+    /// The dtype the checkpoint declares for router scoring
+    /// (`moe_router_dtype`: `bfloat16`, `float32`, or unset). The reference
+    /// scores in f32 from the stored weights and does not read it; an
+    /// executor whose router reads a fixed dtype pins it.
+    pub router_dtype: Option<String>,
 }
 
 /// The multi-token-prediction draft layers shipped inside the checkpoint
@@ -201,6 +209,10 @@ pub struct QuantSpec {
     pub mxfp4_block: Option<usize>,
     /// Modules stored unquantized (BF16) despite the FP8 method.
     pub ignored_layers: Vec<String>,
+    /// How activations are quantized for the FP8 GEMMs, as the checkpoint
+    /// declares it (`dynamic`: per-token scales computed at run time). The
+    /// reference forward runs activations unquantized and does not read it.
+    pub activation_scheme: Option<String>,
 }
 
 /// A validated MiMo-V2 text model.
@@ -223,6 +235,10 @@ pub struct ModelConfig {
     pub max_position_embeddings: usize,
     /// Layer count of the full checkpoint (before any truncation).
     pub source_num_layers: usize,
+    /// `attention_chunk_size` as declared. Neither the reference nor the HF
+    /// remote code reads it; kept so an executor can pin it rather than have
+    /// it dropped unseen.
+    pub attention_chunk_size: Option<usize>,
     /// The top-level `num_key_value_heads`. Checkpoints that do not record
     /// the rank-major chunk count of their fused QKV were saved with this
     /// many chunks.
@@ -412,6 +428,7 @@ impl ModelConfig {
                     "routed_scaling_factor",
                     raw.routed_scaling_factor.unwrap_or(1.0),
                 )?,
+                router_dtype: raw.moe_router_dtype.clone(),
             })
         } else {
             None
@@ -472,6 +489,7 @@ impl ModelConfig {
             max_position_embeddings: raw.max_position_embeddings,
             source_num_layers: n,
             num_key_value_heads: raw.num_key_value_heads,
+            attention_chunk_size: raw.attention_chunk_size,
         })
     }
 
@@ -623,5 +641,6 @@ fn quant_spec(q: &RawQuantConfig) -> Result<QuantSpec> {
         fp8_block,
         mxfp4_block,
         ignored_layers: q.ignored_layers.clone(),
+        activation_scheme: q.activation_scheme.clone(),
     })
 }

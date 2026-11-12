@@ -3177,6 +3177,7 @@ mod tests {
             blocks: Vec::new(),
             regenerable: false,
             truncated: false,
+            continuable: false,
         };
         let posts = vec![row(Some("a1")), row(None), row(Some("a3")), row(None)];
         let index = post_index(&posts);

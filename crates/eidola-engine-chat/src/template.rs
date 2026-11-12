@@ -14,11 +14,14 @@
 //! (a non-string `role`, a content part that is neither a string nor an
 //! object, …) are rejected rather than rendered differently from Python.
 
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
 use minijinja::value::{Kwargs, Object, ObjectRepr, Value, ValueKind};
-use minijinja::{AutoEscape, Environment, Error as JinjaError, ErrorKind, UndefinedBehavior};
+use minijinja::{
+    AutoEscape, Environment, Error as JinjaError, ErrorKind, State, UndefinedBehavior,
+};
 use sha2::{Digest, Sha256};
 
 use crate::error::ChatError;
@@ -46,6 +49,58 @@ pub struct RenderOptions {
     /// `enable_thinking`; `None` leaves it undefined in the template, which
     /// for MiMo means thinking is on. Only `Some(false)` changes the prompt.
     pub enable_thinking: Option<bool>,
+    /// `continue_final_message`, normalized the way `transformers` normalizes
+    /// it: the name of the final message's field the prompt ends inside
+    /// (`True` there is `"content"`), or `None` to end after the conversation.
+    /// See [`ChatTemplate::render`].
+    pub continue_final_message: Option<&'static str>,
+}
+
+/// The sentinel `transformers` appends to the field being continued and then
+/// cuts the rendered prompt at (`render_jinja_template`'s
+/// `continue_final_message_tag`).
+const CONTINUE_FINAL_MESSAGE_TAG: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
+
+/// Context variable through which a render tells `tojson` the pair of marks to
+/// put around its output. The template never reads it.
+const DATA_MARKS_VAR: &str = "eidola_data_marks";
+
+/// A rendered prompt: its text, and which parts of it the request supplied.
+///
+/// Everything the template writes from the request (a role, message content,
+/// reasoning, a tool call's name, argument names and values, tool definitions)
+/// is data; the rest is the template's own text, which alone may spell the
+/// model's added tokens ([`crate::MimoTokenizer::encode_prompt`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Prompt {
+    text: String,
+    data: Vec<Range<usize>>,
+}
+
+impl Prompt {
+    /// The prompt text, byte-identical to `apply_chat_template`'s.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The byte ranges of [`Self::text`] that are request data: ascending,
+    /// disjoint, non-empty, on character boundaries.
+    pub fn data_spans(&self) -> &[Range<usize>] {
+        &self.data
+    }
+
+    pub fn into_text(self) -> String {
+        self.text
+    }
+
+    /// Cuts the prompt to its first `len` bytes.
+    fn truncate(&mut self, len: usize) {
+        self.text.truncate(len);
+        self.data.retain_mut(|span| {
+            span.end = span.end.min(len);
+            span.start < span.end
+        });
+    }
 }
 
 /// OpenAI-shaped chat input: the `messages` array and the optional `tools`
@@ -146,6 +201,9 @@ impl ChatInput {
 pub struct ChatTemplate {
     env: Environment<'static>,
     sha256: String,
+    /// The template's source, which `transformers` searches for the name of
+    /// the field a continuation extends.
+    source: String,
 }
 
 impl std::fmt::Debug for ChatTemplate {
@@ -186,9 +244,13 @@ impl ChatTemplate {
         env.add_filter("tojson", tojson_filter);
         env.add_test("iterable", is_iterable);
         env.add_function("raise_exception", raise_exception);
-        env.add_template_owned(TEMPLATE_NAME, source)
+        env.add_template_owned(TEMPLATE_NAME, source.clone())
             .map_err(|e| ChatError::Template(e.to_string()))?;
-        Ok(ChatTemplate { env, sha256 })
+        Ok(ChatTemplate {
+            env,
+            sha256,
+            source,
+        })
     }
 
     /// Hex SHA-256 of the template source.
@@ -196,15 +258,111 @@ impl ChatTemplate {
         &self.sha256
     }
 
-    /// Renders the prompt text.
+    /// Renders the prompt text ([`Self::render_prompt`] without the data spans).
     pub fn render(&self, input: &ChatInput, options: RenderOptions) -> Result<String, ChatError> {
+        self.render_prompt(input, options).map(Prompt::into_text)
+    }
+
+    /// Renders the prompt, with the parts of it that are request data marked.
+    ///
+    /// With [`RenderOptions::continue_final_message`] set, the prompt ends
+    /// inside the final message's field rather than after the conversation,
+    /// exactly where `transformers` 5.19's `render_jinja_template` ends it: the
+    /// sentinel [`CONTINUE_FINAL_MESSAGE_TAG`] is appended to the field (to the
+    /// last content part with a `text` when the field is a list), the
+    /// conversation is rendered, and the result is cut at the last occurrence
+    /// of the sentinel, keeping trailing whitespace when the template wrote the
+    /// sentinel whole and `rstrip`ping it otherwise. The reference's refusals
+    /// stay refusals: a generation prompt asked for as well (refused by
+    /// `apply_chat_template` itself), a field that is absent or `null`, a field name the
+    /// template never mentions, a list with no `text` part, a value that
+    /// cannot be concatenated with a string, and a render in which the field's
+    /// text or the sentinel does not appear.
+    ///
+    /// For the pinned template, continuing `content` ends the prompt after the
+    /// partial answer (`…<think>R</think>C`), and continuing
+    /// `reasoning_content` ends it inside an open reasoning block
+    /// (`…<think>R`). Either is the original request's prompt followed by the
+    /// text the model generated for it, so a continuation resumes exactly
+    /// where generation stopped.
+    pub fn render_prompt(
+        &self,
+        input: &ChatInput,
+        options: RenderOptions,
+    ) -> Result<Prompt, ChatError> {
         validate(input)?;
+        let Some(field) = options.continue_final_message else {
+            return self.render_marked(&input.messages, input, options);
+        };
+        if options.add_generation_prompt {
+            return Err(ChatError::InvalidInput(
+                "continue_final_message and add_generation_prompt are not compatible".into(),
+            ));
+        }
+        let (messages, final_text) = continued_messages(&input.messages, field, &self.source)?;
+        let mut prompt = self.render_marked(&messages, input, options)?;
+        let rendered = prompt.text();
+        let tag = CONTINUE_FINAL_MESSAGE_TAG.trim_end();
+        if !rendered.contains(crate::pysem::py_strip(&final_text)) || !rendered.contains(tag) {
+            return Err(ChatError::InvalidInput(
+                "continue_final_message is set but the final message does not appear in the \
+                 chat after applying the chat template"
+                    .into(),
+            ));
+        }
+        let at = rendered.rfind(tag).expect("checked above");
+        let len = if rendered[at..].starts_with(CONTINUE_FINAL_MESSAGE_TAG) {
+            at
+        } else {
+            rendered[..at]
+                .trim_end_matches(crate::pysem::is_py_space)
+                .len()
+        };
+        prompt.truncate(len);
+        Ok(prompt)
+    }
+
+    /// Renders `messages` twice: as they are, which is the prompt text, and
+    /// with every string the template prints from the request wrapped in a pair
+    /// of marks, which shows where in that text the data lies. The marks are
+    /// two characters the text does not contain, and the marked render with its
+    /// marks removed must be the text itself, so marking can never change what
+    /// the prompt says.
+    fn render_marked(
+        &self,
+        messages: &Json,
+        input: &ChatInput,
+        options: RenderOptions,
+    ) -> Result<Prompt, ChatError> {
+        let text = self.render_messages(messages, input, options, None)?;
+        let marks = unused_marks(&text)?;
+        let marked = self.render_messages(
+            &marked_messages(messages, marks),
+            input,
+            options,
+            Some(marks),
+        )?;
+        match strip_marks(&marked, marks) {
+            Some((stripped, data)) if stripped == text => Ok(Prompt { text, data }),
+            _ => Err(ChatError::Template(
+                "the prompt's request data could not be told from the template's text".into(),
+            )),
+        }
+    }
+
+    fn render_messages(
+        &self,
+        messages: &Json,
+        input: &ChatInput,
+        options: RenderOptions,
+        marks: Option<(char, char)>,
+    ) -> Result<String, ChatError> {
         let template = self
             .env
             .get_template(TEMPLATE_NAME)
             .map_err(|e| ChatError::Template(e.to_string()))?;
         let mut context: Vec<(&str, Value)> = vec![
-            ("messages", to_value(&input.messages)),
+            ("messages", to_value(messages)),
             (
                 "tools",
                 input
@@ -223,11 +381,220 @@ impl ChatTemplate {
         if let Some(enable_thinking) = options.enable_thinking {
             context.push(("enable_thinking", Value::from(enable_thinking)));
         }
+        if let Some((open, close)) = marks {
+            context.push((
+                DATA_MARKS_VAR,
+                Value::from(String::from_iter([open, close])),
+            ));
+        }
         let context: Value = context.into_iter().collect();
         template
             .render(context)
             .map_err(|e| ChatError::Template(format!("{e:#}")))
     }
+}
+
+/// Two private-use characters `text` does not contain.
+fn unused_marks(text: &str) -> Result<(char, char), ChatError> {
+    let private_use = |c: &char| matches!(*c as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD);
+    let used: std::collections::HashSet<char> = text.chars().filter(private_use).collect();
+    let mut free = ('\u{E000}'..='\u{F8FF}')
+        .chain('\u{F0000}'..='\u{FFFFD}')
+        .filter(|c| !used.contains(c));
+    match (free.next(), free.next()) {
+        (Some(open), Some(close)) => Ok((open, close)),
+        _ => Err(ChatError::InvalidInput(
+            "the conversation uses every private-use character".into(),
+        )),
+    }
+}
+
+/// `text` between the marks, or unchanged when empty (an empty string must stay
+/// false to the template).
+fn mark(text: &str, (open, close): (char, char)) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(text.len() + open.len_utf8() + close.len_utf8());
+    out.push(open);
+    out.push_str(text);
+    out.push(close);
+    out
+}
+
+fn mark_in_place(value: &mut Json, marks: (char, char)) {
+    if let Json::Str(text) = value {
+        *text = mark(text, marks);
+    }
+}
+
+/// The conversation with every string the template prints verbatim marked: a
+/// role other than `assistant` (which the template only compares), content
+/// strings and text parts, `reasoning_content`, and a tool call's name, string
+/// `input` or `arguments`, argument names and string argument values. What the
+/// template prints through `tojson` (tool definitions, other argument values)
+/// is marked by the filter.
+fn marked_messages(messages: &Json, marks: (char, char)) -> Json {
+    let mut messages = messages.clone();
+    let Json::Array(items) = &mut messages else {
+        return messages;
+    };
+    for message in items {
+        let Json::Object(fields) = message else {
+            continue;
+        };
+        for (key, value) in fields {
+            match (key.as_str(), value) {
+                ("role", Json::Str(role)) if role != "assistant" => *role = mark(role, marks),
+                ("reasoning_content", value) => mark_in_place(value, marks),
+                ("content", Json::Array(parts)) => {
+                    for part in parts {
+                        match part {
+                            Json::Object(members) => {
+                                for (key, value) in members {
+                                    if key == "text" {
+                                        mark_in_place(value, marks);
+                                    }
+                                }
+                            }
+                            part => mark_in_place(part, marks),
+                        }
+                    }
+                }
+                ("content", value) => mark_in_place(value, marks),
+                ("tool_calls", Json::Array(calls)) => {
+                    for call in calls {
+                        mark_tool_call(call, marks);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    messages
+}
+
+fn mark_tool_call(call: &mut Json, marks: (char, char)) {
+    let key = tool_call_body_key(call);
+    let Json::Object(call_fields) = call else {
+        return;
+    };
+    let body = match key {
+        Some(key) => match call_fields.iter_mut().find(|(k, _)| k == key) {
+            Some((_, Json::Object(body))) => body,
+            _ => return,
+        },
+        None => call_fields,
+    };
+    for (key, value) in body {
+        match (key.as_str(), value) {
+            ("name" | "input", value) => mark_in_place(value, marks),
+            ("arguments", Json::Object(arguments)) => {
+                for (name, value) in arguments {
+                    *name = mark(name, marks);
+                    mark_in_place(value, marks);
+                }
+            }
+            ("arguments", value) => mark_in_place(value, marks),
+            _ => {}
+        }
+    }
+}
+
+/// A marked render without its marks, and the byte ranges of the result that
+/// lay between them. `None` if the marks do not pair up.
+fn strip_marks(marked: &str, (open, close): (char, char)) -> Option<(String, Vec<Range<usize>>)> {
+    let mut text = String::with_capacity(marked.len());
+    let mut data = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for c in marked.chars() {
+        if c == open {
+            if depth == 0 {
+                start = text.len();
+            }
+            depth += 1;
+        } else if c == close {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 && text.len() > start {
+                data.push(start..text.len());
+            }
+        } else {
+            text.push(c);
+        }
+    }
+    (depth == 0).then_some((text, data))
+}
+
+/// The conversation with the sentinel appended to the final message's
+/// `field`, and the text the reference looks for afterwards (the field's value
+/// before the sentinel, or the chosen part's `text`).
+fn continued_messages(
+    messages: &Json,
+    field: &str,
+    source: &str,
+) -> Result<(Json, String), ChatError> {
+    let invalid = |m: String| Err(ChatError::InvalidInput(m));
+    let mut messages = messages.clone();
+    let Json::Array(items) = &mut messages else {
+        return invalid("messages must be an array".into());
+    };
+    let Some(Json::Object(last)) = items.last_mut() else {
+        return invalid("messages must not be empty".into());
+    };
+    let value = match last.iter_mut().find(|(k, _)| k == field) {
+        Some((_, v)) if !matches!(v, Json::Null) => v,
+        _ => {
+            return invalid(format!(
+                "continue_final_message is set but the final message has no \"{field}\" to \
+                 continue"
+            ));
+        }
+    };
+    if !source.contains(field) {
+        return invalid(format!(
+            "continue_final_message is set to \"{field}\" but this is not an accepted field in \
+             the chat_template"
+        ));
+    }
+    let text = match value {
+        Json::Str(text) => text,
+        Json::Array(parts) => {
+            // Python's `"text" in block` over the parts in reverse: a key test
+            // on an object, a substring test on a string (whose `block["text"]`
+            // then raises).
+            let mut chosen = None;
+            for part in parts.iter_mut().rev() {
+                match part {
+                    Json::Object(members) => {
+                        if let Some((_, text)) = members.iter_mut().find(|(k, _)| k == "text") {
+                            chosen = Some(text);
+                            break;
+                        }
+                    }
+                    Json::Str(s) if s.contains("text") => {
+                        return invalid("a string content part cannot be continued".into());
+                    }
+                    _ => {}
+                }
+            }
+            match chosen {
+                Some(Json::Str(text)) => text,
+                Some(_) => return invalid("a content part's text must be a string".into()),
+                None => {
+                    return invalid(
+                        "continue_final_message is set but we could not find any text to \
+                         continue in the final message"
+                            .into(),
+                    );
+                }
+            }
+        }
+        _ => return invalid(format!("the final message's \"{field}\" is not a string")),
+    };
+    let original = text.clone();
+    text.push_str(CONTINUE_FINAL_MESSAGE_TAG);
+    Ok((messages, original))
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
@@ -441,7 +808,9 @@ fn from_value(value: &Value) -> Result<Json, JinjaError> {
 
 /// `tojson`, as `transformers` defines it:
 /// `json.dumps(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False)`.
-fn tojson_filter(value: &Value, kwargs: Kwargs) -> Result<String, JinjaError> {
+///
+/// In a marked render the output is request data, and goes between the marks.
+fn tojson_filter(state: &State, value: &Value, kwargs: Kwargs) -> Result<String, JinjaError> {
     let mut options = DumpOptions::default();
     if let Some(v) = kwargs.get::<Option<Value>>("ensure_ascii")? {
         options.ensure_ascii = v.is_true();
@@ -488,7 +857,13 @@ fn tojson_filter(value: &Value, kwargs: Kwargs) -> Result<String, JinjaError> {
         }
     }
     kwargs.assert_all_used()?;
-    Ok(json::dumps(&from_value(value)?, &options))
+    let dumped = json::dumps(&from_value(value)?, &options);
+    let marks = state.lookup(DATA_MARKS_VAR);
+    let mut marks = marks.as_ref().and_then(Value::as_str).unwrap_or("").chars();
+    Ok(match (marks.next(), marks.next()) {
+        (Some(open), Some(close)) => mark(&dumped, (open, close)),
+        _ => dumped,
+    })
 }
 
 /// Jinja2's `iterable` test is Python's `iter(value)`: `None`, booleans and

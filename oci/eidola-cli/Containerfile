@@ -63,6 +63,10 @@ COPY crates/ ./crates/
 # these (build scripts aren't compiled with stub sources), so they're only
 # required here at the real build.
 COPY releases/ ./releases/
+# The model catalog, which `eidola-app-core/build.rs` also compiles in (the
+# same files the gateway serves from). A glob, so a tree without the
+# directory still builds; the build script then sees no rows.
+COPY --parents models* ./
 
 # Ensure Cargo detects source changes over the fetch-stage stubs.
 # SOURCE_DATE_EPOCH=0 clamps COPY timestamps to epoch 0, matching the

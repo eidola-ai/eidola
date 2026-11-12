@@ -352,6 +352,13 @@ impl ToolCallParser {
         }
     }
 
+    /// Whether no `<tool_call>` block has begun: the state a parser starts in,
+    /// and so the only one a parser resumed from the content given out so far
+    /// would be in.
+    pub fn before_any_block(&self) -> bool {
+        matches!(self.state, State::Content { .. })
+    }
+
     /// Ends the stream. A held-back partial tag before any block is content;
     /// an unfinished block and trailing text after blocks are dropped.
     pub fn finish(&mut self) -> ToolCallDelta {

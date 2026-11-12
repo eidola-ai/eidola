@@ -9,8 +9,39 @@ CREATE TABLE issuer_key (
     params_hash     TEXT NOT NULL,
     public_key_data BLOB NOT NULL,
     params_data     BLOB NOT NULL,
-    expires_at      INTEGER NOT NULL,         -- ms since epoch
-    created_at      INTEGER NOT NULL
+    -- Two deadlines, both ms since epoch, both derived from the server's
+    -- `accept_until` (the instant it stops accepting this key's credentials;
+    -- one epoch after the key stops *issuing* at `issue_until`, which is why
+    -- neither deadline is read from `issue_until`).
+    --   spend_until:  the last instant a new spend may begin —
+    --                 `accept_until` minus `CREDENTIAL_SPEND_MARGIN`, so a
+    --                 spend started at the deadline still reaches the server
+    --                 inside its acceptance window.
+    --   accept_until: the server's deadline itself. A spend already in flight
+    --                 stays recoverable until here.
+    spend_until     INTEGER NOT NULL,
+    accept_until    INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL,
+
+    CHECK (spend_until <= accept_until)
+);
+
+-- The issuer key this client has seen for each epoch of the public issuer
+-- calendar, per server (`scope`: the eidola backend's base URL). The first
+-- key seen for an epoch is the only one this client will issue under for
+-- it: an honest server has exactly one key per epoch and never rotates
+-- within one, so a second key for an epoch already recorded is refused
+-- (`AppError::IssuerKeyRefused`). Written from every `GET /v1/keys` listing
+-- the client acts on, which includes the next epoch's key a whole epoch
+-- before it issues. Rows whose epoch can no longer be listed are pruned.
+CREATE TABLE issuer_key_epoch (
+    scope         TEXT NOT NULL,
+    epoch         INTEGER NOT NULL,
+    issuer_key_id TEXT NOT NULL,
+    -- ms since epoch; for the reader, nothing decides on it.
+    first_seen    INTEGER NOT NULL,
+
+    PRIMARY KEY (scope, epoch)
 );
 
 CREATE TABLE pre_credential (
@@ -22,6 +53,27 @@ CREATE TABLE pre_credential (
     credits          INTEGER,
     spend_amount     INTEGER,
     spend_proof_data BLOB,
+    -- Spend only: the request this spend is an input of. A request presents
+    -- one input or two (a drain and a fill), each its own row, written in one
+    -- transaction; every input of one request shares this id, so the
+    -- request's Record finds all of them. Recovery and settlement stay per
+    -- row: each input is final when its own refund is.
+    spend_group      TEXT,
+    -- Issuance only, all written before the request is first sent, so a
+    -- retry after a lost response or a crash sends the same request under the
+    -- same idempotency key and the server answers it from what it stored:
+    --   idempotency_key:  32 random bytes naming this issuance to the server.
+    --   issuance_request: the CBOR IssuanceRequest exactly as sent (its proof
+    --                     is randomized, so it cannot be rebuilt).
+    --   account_id:       the account it was sent for; a retry is only ever
+    --                     sent for that account.
+    --   abandoned_at:     set when the server answered in a way that means
+    --                     nothing was or will be debited for it, so nothing
+    --                     is left to recover.
+    idempotency_key  BLOB,
+    issuance_request BLOB,
+    account_id       TEXT,
+    abandoned_at     INTEGER,
     created_at       INTEGER NOT NULL,
 
     CHECK (
@@ -29,18 +81,31 @@ CREATE TABLE pre_credential (
             AND credential_nonce IS NULL
             AND spend_amount IS NULL
             AND spend_proof_data IS NULL
-            AND credits IS NOT NULL)
+            AND spend_group IS NULL
+            AND credits IS NOT NULL
+            AND length(idempotency_key) = 32
+            AND issuance_request IS NOT NULL
+            AND account_id IS NOT NULL)
         OR
         (type = 'refund'
             AND credential_nonce IS NOT NULL
             AND spend_amount IS NOT NULL
             AND spend_proof_data IS NOT NULL
-            AND credits IS NULL)
+            AND spend_group IS NOT NULL
+            AND credits IS NULL
+            AND idempotency_key IS NULL
+            AND issuance_request IS NULL
+            AND account_id IS NULL
+            AND abandoned_at IS NULL)
     )
 );
 
 CREATE UNIQUE INDEX idx_one_spend_per_credential
     ON pre_credential (credential_nonce)
+    WHERE type = 'refund';
+
+CREATE INDEX idx_spend_group
+    ON pre_credential (spend_group)
     WHERE type = 'refund';
 
 CREATE TABLE credential (
@@ -99,8 +164,8 @@ CREATE TABLE credential (
 -- (0). The 'local' backend always auto-starts (it's ours).
 --
 -- trusted_measurements: for the 'eidola' backend only, a JSON
--- array of enclave-measurement overrides ({snp_measurement,
--- tdx_measurement:{rtmr1,rtmr2}}). NULL/absent = the single build
+-- array of SEV-SNP launch-identity overrides ({measurement,
+-- host_data, guest_policy}). NULL/absent = the single build
 -- measurement pinned in the trust root.
 --
 -- hardware_root_ca / hardware_intermediate_ca: for the 'eidola'
@@ -582,8 +647,23 @@ CREATE TABLE action (
     -- inference may carry the flag.
     truncated       INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
 
+    -- A truncated generation whose text is exactly what the model generated
+    -- after its prompt, so it can be continued: sent back as a continued final
+    -- message, it renders that very text. The serving engine says so on the
+    -- ending (`continuable`); a parser that dropped an unfinished construct,
+    -- a lossy final character, or this app's own header strip makes it 0. Only
+    -- a truncated generation can carry it.
+    resumable       INTEGER NOT NULL DEFAULT 0 CHECK (resumable IN (0, 1)),
+
     intent          TEXT,
     model           TEXT,
+    -- The weights hash an Eidola model reference resolved to for this
+    -- action (docs/model-identity.md): what the answer came from, whichever
+    -- way the model was named. NULL for every other backend, and for a
+    -- catalog that publishes no hashes. A followed tag's "model updated"
+    -- notice compares the latest one with what the tag names now.
+    model_sha256    TEXT CHECK (model_sha256 IS NULL OR (length(model_sha256) = 64
+                    AND model_sha256 NOT GLOB '*[^0-9a-f]*')),
 
     -- usage / cost
     input_tokens    INTEGER,
@@ -596,6 +676,7 @@ CREATE TABLE action (
     -- is this row's own, and the referenced (action, item) pair must
     -- really exist — so a generation chain cannot hop items.
     CHECK (truncated = 0 OR action_type = 'inference'),
+    CHECK (resumable = 0 OR truncated = 1),
     CHECK ((supersedes_action_id IS NULL) = (supersedes_item_id IS NULL)),
     CHECK (supersedes_item_id IS NULL OR supersedes_item_id = item_id),
     FOREIGN KEY (supersedes_action_id, supersedes_item_id)
@@ -917,6 +998,109 @@ CREATE INDEX idx_request_credential
     ON request (credential_nonce)
     WHERE credential_nonce IS NOT NULL;
 
+-- ============================================================
+-- Prefix-cache keys: one secret per conversation lineage.
+--
+-- A lineage is one participant answering in one space: every
+-- turn that participant takes there — on any branch, and every
+-- regeneration — reads a context that shares the space's trunk,
+-- so its requests share a prompt prefix. An Eidola-hosted
+-- engine reuses cached computation only between requests that
+-- carry the same key, so the key is what makes reuse possible
+-- and also exactly what links those requests to one another.
+--
+-- `key_bytes` is 32 bytes from the OS CSPRNG, sent as
+-- unpadded base64url (`eidola_common::engine_protocol`). It is
+-- secret: it is never logged, never shown, never recorded in a
+-- request row (the Record withholds it) and no control-protocol
+-- verb reads it. Minted and rotated only by
+-- `db::claim_prefix_cache_key`, which replaces it with a fresh
+-- value when the catalog's retention says the engine can no
+-- longer hold the lineage's cache — idle past `idle_ttl_secs`,
+-- older than `max_age_secs` — or when it would cross a boundary:
+-- a different `model` (the weights hash the turn resolved to,
+-- `sha256:<hex>`, or the selection where the catalog publishes
+-- none), a different `trust_domain` (the digest of the eidola
+-- endpoint and trust bundle it was minted under), or a clock
+-- that ran backwards. So no key outlives the cache it
+-- unlocks, and none reaches two trust domains.
+--
+-- A key is overwritten in place before it is replaced or
+-- deleted, and deleted as soon as its lineage can no longer send
+-- (`db::forget_unsendable_cache_keys`).
+--
+-- Both timestamps are this client's clock: `created_at` is the
+-- key's birth, `last_used_at` the latest instant a request's
+-- body was written with it (the claim, `db::claim_prefix_cache_key`).
+-- `generation` counts the lineage's keys, so a reuse stamps the
+-- key it judged and never a successor that replaced it.
+--
+-- No cascade. A row exists only after a turn ran in the space,
+-- and a turn needs a post there, so a space the pristine reaper
+-- may delete never has one; the reaper deletes any anyway
+-- (see `db::discard_space_if_pristine`).
+-- ============================================================
+-- A user's acknowledgement of a "model updated" notice: the participant
+-- `participant_id`, answering in `space_id` under the followed selection
+-- `model` (canonical), was told its tag now names the weights `sha256`, and
+-- dismissed it. The notice stays dismissed while the tag names those
+-- weights; the next move of the tag shows it again. One row per lineage
+-- and selection, overwritten by the next dismissal.
+CREATE TABLE model_update_ack (
+    space_id        TEXT NOT NULL REFERENCES space(id),
+    participant_id  TEXT NOT NULL REFERENCES participant(id),
+    model           TEXT NOT NULL,
+    sha256          TEXT NOT NULL CHECK (length(sha256) = 64
+                    AND sha256 NOT GLOB '*[^0-9a-f]*'),
+    acknowledged_at INTEGER NOT NULL,
+
+    PRIMARY KEY (space_id, participant_id, model)
+);
+
+CREATE TABLE prefix_cache_key (
+    space_id        TEXT NOT NULL REFERENCES space(id),
+    participant_id  TEXT NOT NULL REFERENCES participant(id),
+    model           TEXT NOT NULL,
+    trust_domain    TEXT NOT NULL,
+    generation      INTEGER NOT NULL,
+    key_bytes       BLOB NOT NULL CHECK (length(key_bytes) = 32),
+    created_at      INTEGER NOT NULL,
+    last_used_at    INTEGER NOT NULL,
+
+    PRIMARY KEY (space_id, participant_id)
+);
+
+-- **A model change forgets the lineage's key at the write.** A
+-- key belongs to the model it was minted for; checking only at
+-- the next keyed claim would miss a change made through a model
+-- that sends no key (A, then an unkeyed B, then A again would
+-- find A's key still standing). So the write that changes a
+-- participant's model, or its per-space override, deletes the
+-- affected keys in the same statement — a trigger, so no door
+-- can change a model and keep the key — each overwritten in
+-- place first, like every other forgotten key. A participant's
+-- own model change forgets its keys in every space, including
+-- spaces whose override shadows it: a spurious rotation costs a
+-- cache miss, a missed one a key past its model.
+CREATE TRIGGER prefix_cache_key_forget_on_model
+AFTER UPDATE OF model_ref ON participant
+WHEN OLD.model_ref IS NOT NEW.model_ref
+BEGIN
+    UPDATE prefix_cache_key SET key_bytes = zeroblob(32)
+     WHERE participant_id = NEW.id;
+    DELETE FROM prefix_cache_key WHERE participant_id = NEW.id;
+END;
+
+CREATE TRIGGER prefix_cache_key_forget_on_model_override
+AFTER UPDATE OF override_model_ref ON space_participant
+WHEN OLD.override_model_ref IS NOT NEW.override_model_ref
+BEGIN
+    UPDATE prefix_cache_key SET key_bytes = zeroblob(32)
+     WHERE space_id = NEW.space_id AND participant_id = NEW.participant_id;
+    DELETE FROM prefix_cache_key
+     WHERE space_id = NEW.space_id AND participant_id = NEW.participant_id;
+END;
+
 
 -- ############################################################
 -- #  LAYER 4 — THE LOCAL INFERENCE PROXY                     #
@@ -1025,9 +1209,16 @@ SELECT
     c.generation,
     c.created_at,
     c.issuer_key_id,
+    -- `expired` is reached two ways. A credential with no spend begun lapses
+    -- at its key's `spend_until`: no new spend may start under it. One with a
+    -- spend in flight (or settled) lapses only at `accept_until`, so recovery
+    -- of an interrupted spend is still attempted while the server would honour
+    -- it.
     CASE
-        WHEN ik.expires_at IS NOT NULL
-             AND ik.expires_at < (strftime('%s', 'now') * 1000)
+        WHEN ik.accept_until <= (strftime('%s', 'now') * 1000)
+                                                    THEN 'expired'
+        WHEN pc_spend.id IS NULL
+             AND ik.spend_until <= (strftime('%s', 'now') * 1000)
                                                     THEN 'expired'
         WHEN pc_spend.id IS NULL                    THEN 'active'
         WHEN c_next.nonce IS NULL                   THEN 'spending'
@@ -1173,6 +1364,10 @@ WHERE d.depth > 0;
 
 -- ============================================================
 -- Spend trail: credential -> request -> action -> space
+--
+-- A request row names its first input's credential; a request
+-- with two inputs reaches the second through their shared
+-- `spend_group`, so every input of a request shows its request.
 -- ============================================================
 CREATE VIEW spend_trail AS
 SELECT
@@ -1194,7 +1389,10 @@ SELECT
     s.title             AS space_title,
     s.linkability
 FROM credential_lifecycle cl
-JOIN request r        ON r.credential_nonce = cl.nonce
+JOIN pre_credential pc_input ON pc_input.id = cl.pending_spend_id
+JOIN pre_credential pc_group ON pc_group.spend_group = pc_input.spend_group
+                            AND pc_group.type = 'refund'
+JOIN request r        ON r.credential_nonce = pc_group.credential_nonce
 LEFT JOIN action a    ON a.id = r.action_id
 LEFT JOIN space s     ON s.id = a.space_id
 WHERE cl.state IN ('spending', 'spent');

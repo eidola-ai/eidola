@@ -26,7 +26,7 @@
 //!
 //! * **Real issuance crypto.** The mock holds a freshly generated ACT issuer
 //!   `PrivateKey` and reuses the *same* `anonymous-credit-tokens` primitives
-//!   the production server (`crates/eidola-server/src/credentials.rs`) uses —
+//!   the production server (`crates/eidola-server-gateway/src/credentials.rs`) uses —
 //!   `issue` for `/v1/account/credentials`, `refund` for the inline chat refund
 //!   and `/v1/credentials/refund`. The server's issuance handler is glued to
 //!   postgres and can't be called as a library, so this reimplements only the
@@ -50,6 +50,8 @@ use anonymous_credit_tokens::{
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use eidola_app_core::AppCore;
+use eidola_common::issuer_calendar::{ISSUER_CALENDAR, IssuerCalendar};
+use eidola_common::spend_credentials::ACT_L;
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -147,6 +149,28 @@ pub enum ChatBehavior {
     /// and silently skips them — the deltas, the model rewrite, and the refund in
     /// the metadata event all go missing without anything failing.
     StreamingSplitDataFields,
+    /// [`ChatBehavior::StreamingWithMetadataRefund`] framed the way the Eidola
+    /// server frames every stream it answers: through its own
+    /// `eidola_server_gateway::padding::Framer`, as writes of exactly
+    /// `FRAME_BYTES`, each the events waiting plus padding (a comment event,
+    /// trailing whitespace on a JSON line, or blank lines after `[DONE]`), an
+    /// event larger than a frame carried across frames, and frames of nothing
+    /// but padding between the content deltas.
+    StreamingPadded,
+    /// [`ChatBehavior::StreamingPadded`] with **more padding than the read
+    /// ceiling** between its content deltas — what a slow answer looks like
+    /// when the frames keep coming at the frame rate. Ten megabytes of padding,
+    /// spelled here rather than imported: the mock must not learn this app's
+    /// ceilings.
+    StreamingPaddedPastReadCeiling,
+    /// A padded stream whose **answer is just under the read ceiling** —
+    /// eight megabytes less four kilobytes of events that carry data — and
+    /// whose last frames (several of nothing but padding, then the tail)
+    /// arrive coalesced into one transport chunk, as an intermediary that
+    /// buffers may deliver them. A reader that counts a transport chunk
+    /// before telling its padding from its data crosses the ceiling here;
+    /// one that counts only data does not.
+    StreamingPaddedNearReadCeiling,
     /// A plain success in **whichever transport asked** — SSE for a streaming
     /// request, JSON for a blocking one. One behaviour for a test that must
     /// exercise both twins against one upstream, which is otherwise impossible:
@@ -191,6 +215,11 @@ pub enum ChatBehavior {
     /// used to persist as a completed answer: the only thing wrong with it is
     /// that the upstream never claimed it was finished.
     StreamingEndsWithoutDone,
+    /// **The gateway cut the stream short** (its client left, its deadline,
+    /// an engine failure): content deltas, no terminal `finish_reason`, then
+    /// the metadata event carrying the refund the gateway settled on, and no
+    /// `[DONE]`. The answer did not finish; its refund is in band.
+    StreamingCutShortWithRefund,
     /// The first chat request answers ordinarily; every later one is
     /// [`ChatBehavior::StreamingEndsWithoutDone`]. Whichever transport asked.
     ///
@@ -204,7 +233,7 @@ pub enum ChatBehavior {
     /// A **refund-bearing** non-2xx, the shape the server answers with when a
     /// streaming request fails after the nullifier is recorded but before the
     /// SSE opens — request validation, `send_stream`, a spend-proof re-encode
-    /// (`eidola-server/src/handlers.rs`: `error_response_with_refund`). The
+    /// (`eidola-server-gateway/src/handlers.rs`: `error_response_with_refund`). The
     /// credential is spent and the only copy of its refund may be in this body,
     /// because the server's own persistence of the token is best-effort.
     Non2xxWithRefund(u16),
@@ -298,7 +327,7 @@ pub enum ChatBehavior {
     /// This is the deployed shape, not an invented one. The server's request
     /// type is `deny_unknown_fields`, so an unknown member fails in the
     /// `LoggedJson` extractor, whose `Rejection` is axum's `JsonRejection`
-    /// (`crates/eidola-server/src/handlers.rs`). Axum renders `JsonDataError`
+    /// (`crates/eidola-server-gateway/src/handlers.rs`). Axum renders `JsonDataError`
     /// as `(422, String)` — **`text/plain`, not JSON** — and the handler body
     /// never runs, so no `refund` rides the response and the ACT nullifier is
     /// never recorded.
@@ -346,10 +375,50 @@ pub enum ChatBehavior {
     /// [`ChatBehavior::ReasoningOnlyLength`]. Whichever transport asked.
     ///
     /// This is how a test gets a *readable answer already in the transcript*
-    /// and then a regeneration that hits the ceiling — the reported case, and
-    /// the one where the classification decides whether a real answer survives.
+    /// and then a regeneration that hits the ceiling — the case where the
+    /// generation switcher is what keeps the readable answer.
     OkThenReasoningOnlyLength,
+    /// **An answer cut off at the ceiling, and its continuation**, in whichever
+    /// transport asked. A request without `continue_final_message` stops at
+    /// the ceiling as `cut` says ([`Cut`]); one with it is answered from inside
+    /// the field it continues: the rest of the reasoning
+    /// ([`CONTINUED_REASONING`]) and then the answer ([`CONTINUED_ANSWER`]) for
+    /// `"reasoning_content"`, the rest of the answer ([`CONTINUED_TAIL`]) for
+    /// `true`. With `again`, the first continuation (the turn's second chat
+    /// request) stops at the ceiling too, before any answer when it continued
+    /// the reasoning — so a continuation is continued.
+    ContinueAfterLength { cut: Cut, again: bool },
+    /// A reasoning-only cut whose continuation calls the harness's tool (one
+    /// round, [`TOOL_NAME`]), after which the ordinary request that follows
+    /// the tool round answers [`TOOL_FINAL_CONTENT`]. Whichever transport
+    /// asked.
+    ContinueIntoToolRound,
+    /// An answer opening with a mimicked header line ([`MIMICKED_HEADER`]) and
+    /// then cut off at the ceiling, which the engine reports `continuable` —
+    /// the strip this app applies is what makes the stored text differ.
+    /// Whichever transport asked.
+    HeaderThenLength,
 }
+
+/// Where a [`ChatBehavior::ContinueAfterLength`] answer stops the first time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cut {
+    /// Reasoning only: [`TRUNCATED_REASONING`], no answer.
+    Reasoning,
+    /// Mid-answer: [`TRUNCATED_REASONING`], then [`STREAM_CONTENT`].
+    Answer,
+    /// Mid-answer, where the engine's parser dropped what it was cut inside of
+    /// (an unfinished tool call): the same text as [`Cut::Answer`], reported
+    /// `continuable: false`.
+    Dropped,
+}
+
+/// The rest of a continued reasoning.
+pub const CONTINUED_REASONING: &str = " and so: the moon.";
+/// The answer a continued reasoning reaches.
+pub const CONTINUED_ANSWER: &str = "The tides follow the moon.";
+/// The rest of a continued answer.
+pub const CONTINUED_TAIL: &str = " Then it carries on.";
 
 /// The reason the decline behaviours state; asserted on the persisted
 /// `decision` action's text block.
@@ -383,6 +452,22 @@ pub const ROUTER_REMOTE_MODEL: &str = "router-remote";
 pub const FLAT_MODEL: &str = "flat-priced";
 /// The flat price, in credits, [`FLAT_MODEL`] costs per request.
 pub const FLAT_PRICE: u64 = 7;
+
+/// The idle TTL [`supported_prompt_cache`] declares, in seconds.
+pub const CACHE_IDLE_TTL_SECS: i64 = 900;
+/// The maximum key age [`supported_prompt_cache`] declares, in seconds.
+pub const CACHE_MAX_AGE_SECS: i64 = 7200;
+
+/// The `prompt_cache` leaf an Eidola-hosted catalog row carries: its engine
+/// reuses a prompt prefix between requests sharing a `cache_key`, under the
+/// engine core's own default retention.
+pub fn supported_prompt_cache() -> serde_json::Value {
+    serde_json::json!({
+        "supported": true,
+        "idle_ttl_secs": CACHE_IDLE_TTL_SECS,
+        "max_age_secs": CACHE_MAX_AGE_SECS,
+    })
+}
 
 /// The head of `eidola_app_core::summaries::SUMMARY_SYSTEM_PROMPT`. Branch
 /// summaries share the router's *model*, so the mock tells the two chores apart
@@ -480,7 +565,35 @@ pub enum RefundMode {
     /// in `spending` for good, which `Fail` cannot model (it omits the in-band
     /// token too) and `Succeed` cannot detect (recovery would answer).
     NotStored,
+    /// **The request is still being served, then its gateway crashed.** The
+    /// first `n` calls to `/v1/credentials/refund` answer with the gateway's
+    /// provisional refund: a refund of nothing (`t = 0`), marked
+    /// `"provisional": true`, as the real endpoint does for a spend whose
+    /// request may still end. Every later call answers the same refund marked
+    /// `"provisional": false`, as the real endpoint does once no request is
+    /// serving the spend any more and the provisional refund is its last
+    /// word. Inline refunds are omitted, as for `Fail`.
+    ProvisionalFirst(u64),
+    /// The first `n` calls to `/v1/credentials/refund` succeed and every
+    /// later one never answers: a recovery that stalls part-way through a
+    /// request's inputs. Inline refunds are omitted.
+    StallAfter(u64),
+    /// **The gateway settled a stream it cut short on what was generated.**
+    /// `/v1/credentials/refund` answers a final refund returning the hold less
+    /// `n` credits (the prompt and the output generated before the cut), as
+    /// the real endpoint does for a stream that ended early (its client went
+    /// away, it reached its deadline, or its engine failed). Inline refunds
+    /// are omitted, as for `Fail`.
+    ChargedEarly(u128),
 }
+
+/// The weights hash the mock catalog publishes for [`MODEL`] (see
+/// [`MockConfig::published_sha256`]).
+pub type PublishedSha = Arc<std::sync::Mutex<Option<String>>>;
+
+/// A one-shot non-2xx for the next chat request (see
+/// [`MockConfig::fail_next_chat`]).
+pub type FailNextChat = Arc<std::sync::Mutex<Option<u16>>>;
 
 /// Mock upstream configuration.
 #[derive(Clone)]
@@ -521,6 +634,36 @@ pub struct MockConfig {
     /// reaches this mock through a base-URL override and an override is a
     /// hint, never a declaration.
     pub declared_tool_calling: Option<bool>,
+    /// The `capabilities.prompt_cache` leaf `GET /v1/models` publishes for
+    /// [`MODEL`], verbatim. `None` — the default — publishes none, which is
+    /// every model the server sells today; [`supported_prompt_cache`] is the
+    /// leaf an Eidola-hosted row carries.
+    pub declared_prompt_cache: Option<serde_json::Value>,
+    /// The `max_output_tokens` `GET /v1/models` declares for [`MODEL`].
+    /// `None` — the default — declares none (unless `declared_tool_calling`
+    /// publishes its standard row), which leaves a turn on the fallback
+    /// ceiling every test written before declarations were read expects.
+    pub declared_max_output: Option<u64>,
+    /// The weights hash `GET /v1/models` publishes for [`MODEL`], with
+    /// [`MODEL`] as its tag. Shared and interior-mutable so a test can move
+    /// the tag onto other weights between turns, as a release does. `None` —
+    /// the default — publishes none, the shape of a gateway older than
+    /// hash-keyed models.
+    pub published_sha256: PublishedSha,
+    /// Weights `GET /v1/models` also lists, under no tag: the row a release
+    /// leaves behind when it moves [`MODEL`]'s tag to other weights while the
+    /// earlier ones are still served. Otherwise [`MODEL`]'s row. `None` — the
+    /// default — lists none.
+    pub untagged_sha256: PublishedSha,
+    /// When set, the **next** chat request is answered with this non-2xx
+    /// status (an error document) and the setting clears, whatever `chat`
+    /// says — so a test can fail one turn between ordinary ones.
+    pub fail_next_chat: FailNextChat,
+    /// Armed by a test to make the mock **stop listening** once it has served
+    /// the next `GET /v1/models` — so the turn that fetched the catalog then
+    /// meets a refused connection for its completion, the one failure that
+    /// provably sends nothing.
+    pub close_switch: CloseSwitch,
     /// List [`FLAT_MODEL`], the flat-priced entry, in the catalog. Opt-in so
     /// the listings every other test pins are unchanged.
     pub list_flat_model: bool,
@@ -531,6 +674,216 @@ pub struct MockConfig {
     /// answers instantly, which makes an in-flight turn unobservable, so a test
     /// about *concurrency* asks for a window it can act inside.
     pub chat_delay_ms: u64,
+    /// When set, the issuance response names this issuer key id instead of the
+    /// key that actually signed it. `None` — the default — names the real key.
+    pub issued_key_id: Option<String>,
+    /// When set, every refund (in band and recovered) names this issuer key id
+    /// instead of the key that actually signed it. `None` names the real key.
+    pub refund_key_id: Option<String>,
+    /// The charge a completed request is settled at, consumed from its inputs
+    /// in input order as the gateway consumes it (clamped to the hold).
+    /// `None` — the default — charges nothing: every input's share returns
+    /// whole. Applies to the in-band refunds of a completed request; a
+    /// refusal or a recovery returns every share whole as before.
+    pub settled_charge: Option<u128>,
+    /// When set, issuance signs under this request context instead of the one
+    /// every credential under the key shares. `None` uses the shared one.
+    pub issuance_context: Option<Scalar>,
+    /// Credits added to what the client asked for at issuance. Zero issues
+    /// exactly the requested amount.
+    pub issuance_extra_credits: i64,
+    /// The current issuer key's `(issue_from, issue_until, accept_until)` as
+    /// `GET /v1/keys` advertises them. `None` — the default — is the current
+    /// epoch's windows on [`MockConfig::issuer_calendar`], so no test written
+    /// before key deadlines mattered can meet one. A test about a key's
+    /// deadlines sets them relative to now ([`KeyWindow::epoch_ending_at`]),
+    /// with the calendar that puts them on one.
+    pub key_window: Option<KeyWindow>,
+    /// The issuer calendar the mock lists windows on and the client checks
+    /// them against (`AppCore::test_set_issuer_calendar`, applied by
+    /// [`core_for`]). `None` is the production calendar.
+    pub issuer_calendar: Option<IssuerCalendar>,
+    /// Switch the mock to a second, real issuer key: listed as current and
+    /// signing issuances, in the same epoch as the first. What a server
+    /// rotating within an epoch (or singling a client out) looks like.
+    pub key_swap: KeySwap,
+    /// Stop listing the previous epoch's key: a listing that leaves out the
+    /// one entry a key reused from it would otherwise collide with.
+    pub omit_previous_key: Arc<std::sync::atomic::AtomicBool>,
+    /// How `POST /v1/account/credentials` misbehaves, switchable mid-test
+    /// (see [`IssuanceKnobs`]). The default answers every request.
+    pub issuance: IssuanceKnobs,
+}
+
+/// See [`MockConfig::key_swap`].
+#[derive(Clone, Default)]
+pub struct KeySwap(Arc<KeySwapState>);
+
+#[derive(Default)]
+struct KeySwapState {
+    on: std::sync::atomic::AtomicBool,
+    second: std::sync::OnceLock<Issuer>,
+}
+
+impl KeySwap {
+    /// From now on, list and issue under the second key.
+    pub fn swap(&self) {
+        self.0.on.store(true, Ordering::SeqCst);
+    }
+
+    /// The second key's id.
+    pub fn second_key_id(&self) -> String {
+        self.second().key_id_hex.clone()
+    }
+
+    fn second(&self) -> &Issuer {
+        self.0.second.get_or_init(Issuer::new)
+    }
+
+    /// The issuer whose key has id `key_id`: the first, or the second if it
+    /// was ever made. A refund is signed under the key its input names.
+    fn issuer_for<'a>(&'a self, first: &'a Issuer, key_id: &str) -> Option<&'a Issuer> {
+        if first.key_id_hex == key_id {
+            return Some(first);
+        }
+        self.0
+            .second
+            .get()
+            .filter(|second| second.key_id_hex == key_id)
+    }
+
+    /// The issuer that lists and issues: the second one once swapped.
+    fn active<'a>(&'a self, first: &'a Issuer) -> &'a Issuer {
+        if self.0.on.load(Ordering::SeqCst) {
+            self.second()
+        } else {
+            first
+        }
+    }
+}
+
+/// Switches on the mock's issuance endpoint, shared with the running server so
+/// a test can flip one between two requests.
+#[derive(Clone, Default)]
+pub struct IssuanceKnobs(Arc<IssuanceKnobState>);
+
+#[derive(Default)]
+struct IssuanceKnobState {
+    /// How many upcoming issuances are recorded (debited and stored, as the
+    /// real server does) and then answered with nothing: the connection is
+    /// closed before a response is written — a lost response.
+    lose: std::sync::atomic::AtomicU32,
+    /// How many upcoming issuances are signed and then held, neither debited
+    /// nor stored, and answered with nothing: an original attempt that
+    /// stalled before its debit, which lands only when a test calls
+    /// [`MockServer::land_held_issuances`].
+    hold: std::sync::atomic::AtomicU32,
+    /// When non-zero, every issuance not already stored is refused with this
+    /// status before anything is debited.
+    refuse_with: std::sync::atomic::AtomicU32,
+    /// Answer every retry — a request whose idempotency key is already
+    /// stored — with `503`, while fresh issuances still go through: a lost
+    /// response whose recovery keeps failing.
+    fail_retries: std::sync::atomic::AtomicBool,
+    /// Accept every issuance request and never answer it.
+    stall: std::sync::atomic::AtomicBool,
+    /// Refuse every issuance request with `401` before anything else, as the
+    /// gateway's `BasicAuth` does for a wrong secret.
+    unauthorized: std::sync::atomic::AtomicBool,
+}
+
+impl IssuanceKnobs {
+    /// Lose the responses of the next `n` issuances (see [`IssuanceKnobState`]).
+    pub fn lose_next(&self, n: u32) {
+        self.0.lose.store(n, Ordering::SeqCst);
+    }
+    /// Hold the next `n` issuances before their debit (see
+    /// [`IssuanceKnobState`]).
+    pub fn hold_next(&self, n: u32) {
+        self.0.hold.store(n, Ordering::SeqCst);
+    }
+    /// Refuse every fresh issuance with `status`; `None` answers again.
+    pub fn refuse_with(&self, status: Option<u16>) {
+        self.0
+            .refuse_with
+            .store(status.map(u32::from).unwrap_or(0), Ordering::SeqCst);
+    }
+    /// Fail every retry (see [`IssuanceKnobState`]); `false` answers again.
+    pub fn fail_retries(&self, on: bool) {
+        self.0.fail_retries.store(on, Ordering::SeqCst);
+    }
+    /// Refuse every issuance as unauthenticated (see [`IssuanceKnobState`]).
+    pub fn unauthorized(&self, on: bool) {
+        self.0.unauthorized.store(on, Ordering::SeqCst);
+    }
+    /// Stall every issuance request (see [`IssuanceKnobState`]).
+    pub fn stall(&self, on: bool) {
+        self.0.stall.store(on, Ordering::SeqCst);
+    }
+    fn take_hold(&self) -> bool {
+        self.0
+            .hold
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    }
+    fn take_loss(&self) -> bool {
+        self.0
+            .lose
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    }
+    fn refusal(&self) -> Option<u16> {
+        match self.0.refuse_with.load(Ordering::SeqCst) {
+            0 => None,
+            status => Some(status as u16),
+        }
+    }
+}
+
+/// An issuer key's advertised window, as the ISO 8601 strings `/v1/keys`
+/// carries (see [`MockConfig::key_window`]).
+#[derive(Clone, Debug)]
+pub struct KeyWindow {
+    pub issue_from: String,
+    pub issue_until: String,
+    pub accept_until: String,
+}
+
+impl KeyWindow {
+    /// The windows of the epoch that ends issuing at `issue_until`, on a
+    /// calendar of `epoch_secs`-long epochs aligned to it: the pair a test
+    /// about a key's deadlines needs, since the client refuses any key whose
+    /// windows are not on its calendar.
+    pub fn epoch_ending_at(issue_until: i64, epoch_secs: u64) -> (Self, IssuerCalendar) {
+        let until = u64::try_from(issue_until).expect("a deadline after 1970");
+        let calendar = IssuerCalendar {
+            anchor_unix_secs: until % epoch_secs,
+            epoch_secs,
+        };
+        let epoch = calendar.epoch_at(until).expect("on the calendar") - 1;
+        (Self::of_epoch(&calendar, epoch), calendar)
+    }
+
+    /// Epoch `epoch`'s windows on `calendar`.
+    pub fn of_epoch(calendar: &IssuerCalendar, epoch: u64) -> Self {
+        let w = calendar.windows(epoch).expect("epoch in range");
+        let secs = |s: u64| i64::try_from(s).expect("in range");
+        Self::from_unix_secs(
+            secs(w.issue_from),
+            secs(w.issue_until),
+            secs(w.accept_until),
+        )
+    }
+
+    /// A window given as unix seconds.
+    pub fn from_unix_secs(issue_from: i64, issue_until: i64, accept_until: i64) -> Self {
+        use eidola_server_gateway::helpers::unix_to_iso;
+        Self {
+            issue_from: unix_to_iso(issue_from),
+            issue_until: unix_to_iso(issue_until),
+            accept_until: unix_to_iso(accept_until),
+        }
+    }
 }
 
 impl Default for MockConfig {
@@ -545,8 +898,73 @@ impl Default for MockConfig {
             catalog_omits: catalog_omissions(),
             tool_script: tool_script(),
             declared_tool_calling: None,
+            declared_prompt_cache: None,
+            declared_max_output: None,
+            published_sha256: PublishedSha::default(),
+            untagged_sha256: PublishedSha::default(),
+            fail_next_chat: FailNextChat::default(),
+            close_switch: CloseSwitch::default(),
             list_flat_model: false,
             chat_delay_ms: 0,
+            issued_key_id: None,
+            refund_key_id: None,
+            settled_charge: None,
+            issuance_context: None,
+            issuance_extra_credits: 0,
+            key_window: None,
+            issuance: IssuanceKnobs::default(),
+            issuer_calendar: None,
+            key_swap: KeySwap::default(),
+            omit_previous_key: Arc::default(),
+        }
+    }
+}
+
+/// The issuer key id a refund names: the real one unless the test asked for
+/// another ([`MockConfig::refund_key_id`]).
+fn refund_key_id(issuer: &Issuer, config: &MockConfig) -> String {
+    config
+        .refund_key_id
+        .clone()
+        .unwrap_or_else(|| issuer.key_id_hex.clone())
+}
+
+/// See [`MockConfig::close_switch`].
+#[derive(Clone, Default)]
+pub struct CloseSwitch(Arc<CloseSwitchState>);
+
+#[derive(Default)]
+struct CloseSwitchState {
+    armed: std::sync::atomic::AtomicBool,
+    tx: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>,
+    >,
+}
+
+impl CloseSwitch {
+    /// Close the listener after the next catalog fetch.
+    pub fn arm(&self) {
+        self.0.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn install(&self, tx: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>) {
+        *self.0.tx.lock().unwrap() = Some(tx);
+    }
+
+    async fn trip_if_armed(&self) {
+        if !self.0.armed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let (ack, closed) = tokio::sync::oneshot::channel();
+        let sent = self
+            .0
+            .tx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|tx| tx.send(ack).is_ok());
+        if sent == Some(true) {
+            let _ = closed.await;
         }
     }
 }
@@ -562,21 +980,33 @@ pub struct MockServer {
     /// order — lets tests assert exactly what context the client sent
     /// upstream (e.g. regenerate's upstream-only thread).
     chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    /// The exact bytes of every `POST /v1/chat/completions` body, in arrival
+    /// order — for the assertions that are about bytes rather than JSON
+    /// values (a body that must be byte-for-byte what it was before).
+    chat_raw_bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     /// Whether each `POST /v1/chat/completions` carried an `Authorization`
     /// header, in arrival order — local turns must send none (no spend).
     chat_auths: Arc<std::sync::Mutex<Vec<bool>>>,
     /// The raw `Authorization` header of each `POST /v1/chat/completions`,
-    /// in arrival order — lets tests distinguish a spend's `PrivateToken`
-    /// from an external backend's `Bearer` key.
+    /// in arrival order — an external backend's `Bearer` key; a spend never
+    /// travels in a header.
     chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    /// The `token` of each `POST /v1/chat/completions` body's `credentials`
+    /// elements, in input order, per request in arrival order — empty for a
+    /// request that spent nothing (a local or external turn).
+    chat_spends: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
     /// Number of `POST /v1/credentials/refund` requests received.
     refund_hits: Arc<AtomicU64>,
+    /// The mock issuer, for what it remembers about spends.
+    issuer: Arc<Issuer>,
     /// Number of `GET /v1/models` requests received — the catalogue fetch a
     /// turn's *setup* makes, and so the earliest thing on the wire that says
     /// preparation got as far as building a client. Tests that assert a turn
     /// was refused before it did any work read this rather than `chat_hits`,
     /// which only notices once the turn is fully prepared.
     models_hits: Arc<AtomicU64>,
+    /// The issuance switches the server was started with.
+    issuance: IssuanceKnobs,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -587,6 +1017,41 @@ impl MockServer {
     pub fn refund_hits(&self) -> u64 {
         self.refund_hits.load(Ordering::SeqCst)
     }
+    /// How many distinct spends arrived carrying a refund recovery key (a
+    /// spend without one is refused, as the real server refuses it).
+    pub fn keyed_spends(&self) -> usize {
+        self.issuer.keyed_spends()
+    }
+    /// Spends whose hold was not exactly the request's worst-case cost (each
+    /// refused, as the gateway refuses it).
+    pub fn hold_mismatches(&self) -> u64 {
+        self.issuer.hold_mismatches.load(Ordering::SeqCst)
+    }
+    /// The issuance endpoint's switches (see [`MockConfig::issuance`]).
+    pub fn issuance_knobs(&self) -> IssuanceKnobs {
+        self.issuance.clone()
+    }
+    /// Issuance requests received, retries included.
+    pub fn issuance_requests(&self) -> u64 {
+        self.issuer.issuance_requests.load(Ordering::SeqCst)
+    }
+    /// Issuances that debited the account: a retry answered from what was
+    /// stored is not one.
+    pub fn issuance_debits(&self) -> u64 {
+        self.issuer.issuance_debits.load(Ordering::SeqCst)
+    }
+    /// The credits converted by every debiting issuance.
+    pub fn issuance_debited_credits(&self) -> i64 {
+        self.issuer.issuance_debited_credits.load(Ordering::SeqCst) as i64
+    }
+    /// Debit and store every issuance [`IssuanceKnobs::hold_next`] held, as
+    /// a stalled original reaching its debit late would.
+    pub fn land_held_issuances(&self) {
+        let held: Vec<_> = std::mem::take(&mut *self.issuer.held.lock().unwrap());
+        for held in held {
+            self.issuer.record_issuance(held);
+        }
+    }
     /// Catalogue fetches (see `models_hits`).
     pub fn models_hits(&self) -> u64 {
         self.models_hits.load(Ordering::SeqCst)
@@ -594,6 +1059,21 @@ impl MockServer {
     /// The recorded chat request bodies (see `chat_bodies`).
     pub fn chat_bodies(&self) -> Vec<serde_json::Value> {
         self.chat_bodies.lock().unwrap().clone()
+    }
+    /// The recorded chat request bodies as sent (see `chat_raw_bodies`).
+    pub fn chat_raw_bodies(&self) -> Vec<Vec<u8>> {
+        self.chat_raw_bodies.lock().unwrap().clone()
+    }
+    /// The `cache_key` each chat request carried, in arrival order.
+    pub fn chat_cache_keys(&self) -> Vec<Option<String>> {
+        self.chat_bodies()
+            .iter()
+            .map(|b| {
+                b.get("cache_key")
+                    .and_then(|k| k.as_str())
+                    .map(str::to_owned)
+            })
+            .collect()
     }
     /// Per-chat-request `Authorization` presence (see `chat_auths`).
     pub fn chat_auths(&self) -> Vec<bool> {
@@ -603,17 +1083,67 @@ impl MockServer {
     pub fn chat_auth_values(&self) -> Vec<Option<String>> {
         self.chat_auth_values.lock().unwrap().clone()
     }
-    /// The charge each `POST /v1/chat/completions` spend proof carried, in
-    /// arrival order — `None` for a request that spent nothing. This is the
-    /// hold the client sized, read off the wire the way the server reads it.
-    pub fn chat_charges(&self) -> Vec<Option<u128>> {
-        self.chat_auth_values()
+    /// Per-chat-request first-input spend tokens (see `chat_spends`).
+    pub fn chat_spends(&self) -> Vec<Option<String>> {
+        self.chat_inputs()
+            .into_iter()
+            .map(|tokens| tokens.into_iter().next())
+            .collect()
+    }
+    /// Per-chat-request spend tokens, every input in input order (see
+    /// `chat_spends`).
+    pub fn chat_inputs(&self) -> Vec<Vec<String>> {
+        self.chat_spends.lock().unwrap().clone()
+    }
+    /// Per-chat-request shares, every input in input order: what each spend
+    /// proof revealed, read off the wire the way the server reads it.
+    pub fn chat_shares(&self) -> Vec<Vec<u128>> {
+        self.chat_inputs()
             .iter()
-            .map(|auth| {
-                auth.as_deref()
-                    .and_then(Issuer::spend_proof_from_auth)
-                    .and_then(|proof| scalar_to_credit::<128>(&proof.charge()).ok())
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .filter_map(|token| Presented::from_token(token))
+                    .filter_map(|input| scalar_to_credit::<ACT_L>(&input.proof.charge()).ok())
+                    .collect()
             })
+            .collect()
+    }
+    /// Per-chat-request nullifiers (hex), every input in input order: what
+    /// the gateway records, so no two inputs anywhere may share one.
+    pub fn chat_nullifiers(&self) -> Vec<Vec<String>> {
+        self.chat_inputs()
+            .iter()
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .filter_map(|token| Presented::from_token(token))
+                    .map(|input| hex::encode(input.proof.nullifier().as_bytes()))
+                    .collect()
+            })
+            .collect()
+    }
+    /// Per-chat-request issuer key ids, every input in input order.
+    pub fn chat_input_keys(&self) -> Vec<Vec<String>> {
+        self.chat_inputs()
+            .iter()
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .filter_map(|token| Presented::from_token(token))
+                    .map(|input| input.key_id)
+                    .collect()
+            })
+            .collect()
+    }
+    /// The hold each `POST /v1/chat/completions` presented (the sum of its
+    /// inputs' shares), in arrival order — `None` for a request that spent
+    /// nothing. This is the hold the client sized, read off the wire the way
+    /// the server reads it.
+    pub fn chat_charges(&self) -> Vec<Option<u128>> {
+        self.chat_shares()
+            .into_iter()
+            .map(|shares| (!shares.is_empty()).then(|| shares.iter().sum()))
             .collect()
     }
     /// The loopback port the mock listens on — used by local-model tests to
@@ -631,8 +1161,8 @@ impl MockServer {
 // Participant-aware upstream rendering (roles + headers)
 // ===========================================================================
 
-/// The label of the seeded default agent — `db::default_agent_label` over the
-/// compiled-in `DEFAULT_MODEL`, which the harness's [`MODEL`] matches.
+/// The label of the harness profile's default agent — `db::default_agent_label`
+/// over [`MODEL`], the model [`core_for`] seats it on.
 pub const DEFAULT_AGENT_LABEL: &str = "Gemma4 31b";
 
 /// The shared human participant's label. Viewpoint-neutral on the wire since
@@ -893,15 +1423,60 @@ pub fn flat_messages(body: &serde_json::Value) -> Vec<(String, String)> {
         .collect()
 }
 
+/// An issuance signed and ready to debit: its idempotency key, the digest a
+/// retry must match, the response body, and the credits it converts.
+struct SignedIssuance {
+    idem: String,
+    request_digest: String,
+    body: String,
+    credits: i64,
+}
+
 /// The mock issuer: an ACT keypair plus the params/context the server derives.
 struct Issuer {
     key: PrivateKey,
     params: Params,
     key_id_hex: String,
     request_context_scalar: Scalar,
+    /// The refund recovery key each spend arrived with, by nullifier: the
+    /// key the real server seals that spend's stored refund under, and so
+    /// the only one its recovery endpoint opens it for.
+    spend_keys: std::sync::Mutex<std::collections::HashMap<Vec<u8>, [u8; 32]>>,
+    /// Idempotent issuance, as the real server keeps it: idempotency key →
+    /// (the request it answered, the response body it was given).
+    issuances: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+    /// Issuances signed but not yet debited (see [`IssuanceKnobs::hold_next`]).
+    held: std::sync::Mutex<Vec<SignedIssuance>>,
+    /// Every `POST /v1/account/credentials` received.
+    issuance_requests: AtomicU64,
+    /// Every issuance that debited (a fresh one, not a stored answer).
+    issuance_debits: AtomicU64,
+    /// The credits all those debits converted.
+    issuance_debited_credits: AtomicU64,
+    /// A public key listed as the previous epoch's, for an epoch the mock
+    /// never listed a current key for: stable for the mock's life.
+    decoy_public_key: Vec<u8>,
+    /// The key (id, base64 public key) the mock listed as current for each
+    /// epoch, first listing wins — what it lists as that epoch's key later.
+    listed: std::sync::Mutex<std::collections::HashMap<u64, (String, String)>>,
+    /// Spends whose hold was not exactly the request's worst-case cost.
+    hold_mismatches: AtomicU64,
 }
 
 impl Issuer {
+    /// Debit for a signed issuance and store its response, once per
+    /// idempotency key, as the real server's `record_credential_issuance`.
+    fn record_issuance(&self, signed: SignedIssuance) {
+        let mut issuances = self.issuances.lock().unwrap();
+        if issuances.contains_key(&signed.idem) {
+            return;
+        }
+        self.issuance_debits.fetch_add(1, Ordering::SeqCst);
+        self.issuance_debited_credits
+            .fetch_add(signed.credits.max(0) as u64, Ordering::SeqCst);
+        issuances.insert(signed.idem, (signed.request_digest, signed.body));
+    }
+
     fn new() -> Self {
         let key = PrivateKey::random(OsRng);
         let public_key_cbor = key.public().to_cbor().expect("encode public key");
@@ -921,7 +1496,33 @@ impl Issuer {
             params,
             key_id_hex,
             request_context_scalar,
+            spend_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
+            issuances: std::sync::Mutex::new(std::collections::HashMap::new()),
+            held: std::sync::Mutex::new(Vec::new()),
+            issuance_requests: AtomicU64::new(0),
+            issuance_debits: AtomicU64::new(0),
+            issuance_debited_credits: AtomicU64::new(0),
+            decoy_public_key: PrivateKey::random(OsRng)
+                .public()
+                .to_cbor()
+                .expect("encode decoy public key"),
+            listed: std::sync::Mutex::new(std::collections::HashMap::new()),
+            hold_mismatches: AtomicU64::new(0),
         }
+    }
+
+    /// Remember the refund recovery key a spend (or a recovery that found no
+    /// spend) arrived with, and say whether `key` is the one on record: what
+    /// decides whether the real server's stored copy opens.
+    fn spend_key_matches(&self, proof: &SpendProof<ACT_L>, key: [u8; 32]) -> bool {
+        let nullifier = proof.nullifier().as_bytes().to_vec();
+        let mut keys = self.spend_keys.lock().unwrap();
+        *keys.entry(nullifier).or_insert(key) == key
+    }
+
+    /// How many distinct spends arrived with a refund recovery key.
+    fn keyed_spends(&self) -> usize {
+        self.spend_keys.lock().unwrap().len()
     }
 
     fn public_key_b64(&self) -> String {
@@ -930,56 +1531,113 @@ impl Issuer {
 
     /// Issue a credential for a base64url CBOR `IssuanceRequest` and credit
     /// amount. Returns the base64url CBOR `IssuanceResponse`.
-    fn issue(&self, issuance_request_b64: &str, credits: i64) -> Option<String> {
+    fn issue(
+        &self,
+        issuance_request_b64: &str,
+        credits: i64,
+        context: Option<Scalar>,
+    ) -> Option<String> {
         let req_cbor = URL_SAFE_NO_PAD.decode(issuance_request_b64).ok()?;
         let req = IssuanceRequest::from_cbor(&req_cbor).ok()?;
-        let credit_scalar = credit_to_scalar::<128>(credits as u128).ok()?;
+        let credit_scalar = credit_to_scalar::<ACT_L>(credits as u128).ok()?;
         let resp = self
             .key
-            .issue::<128>(
+            .issue::<ACT_L>(
                 &self.params,
                 &req,
                 credit_scalar,
-                self.request_context_scalar,
+                context.unwrap_or(self.request_context_scalar),
                 OsRng,
             )
             .ok()?;
         Some(URL_SAFE_NO_PAD.encode(resp.to_cbor().ok()?))
     }
 
-    /// Produce a refund for a parsed spend proof, refunding the full charge
-    /// (no work performed). Returns the base64url CBOR `Refund`.
-    fn refund_for(&self, spend_proof: &SpendProof<128>) -> Option<String> {
+    /// Produce a refund returning `t` credits of a parsed spend proof's
+    /// charge. Returns the base64url CBOR `Refund`.
+    fn refund_of(&self, spend_proof: &SpendProof<ACT_L>, t: u128) -> Option<String> {
         if spend_proof.context() != self.request_context_scalar {
             return None;
         }
-        let charge = scalar_to_credit::<128>(&spend_proof.charge()).ok()?;
-        let t = credit_to_scalar::<128>(charge).ok()?;
+        let t = credit_to_scalar::<ACT_L>(t).ok()?;
         let refund = self
             .key
-            .refund::<128>(&self.params, spend_proof, t, OsRng)
+            .refund::<ACT_L>(&self.params, spend_proof, t, OsRng)
             .ok()?;
         Some(URL_SAFE_NO_PAD.encode(refund.to_cbor().ok()?))
     }
+}
 
-    /// Parse a `PrivateToken token="..."` header into its embedded spend proof
-    /// (mirrors the server's `TokenAuth` extractor).
-    fn spend_proof_from_auth(auth: &str) -> Option<SpendProof<128>> {
-        let payload = auth
-            .strip_prefix("PrivateToken token=\"")
-            .and_then(|s| s.strip_suffix('"'))?;
-        let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+/// One input a request presented: its spend proof and the issuer key id its
+/// Token names.
+struct Presented {
+    proof: SpendProof<ACT_L>,
+    key_id: String,
+}
+
+impl Presented {
+    /// Parse a `credentials` element's `token` (mirrors the server's
+    /// `auth::presented_spends`). Like the server, it reads only the one
+    /// spelling, padded base64url, decoded here with the `base64` crate's
+    /// canonical padded engine and a re-encoding check rather than the shared
+    /// `eidola_common::spend_credentials` rule the client writes with, so the
+    /// client's spelling is checked against an independent reading.
+    fn from_token(token: &str) -> Option<Self> {
+        let bytes = base64::engine::general_purpose::URL_SAFE
+            .decode(token)
+            .ok()
+            .filter(|bytes| base64::engine::general_purpose::URL_SAFE.encode(bytes) == token)?;
         if bytes.len() < 67 {
             return None;
         }
         // [token_type(2)][challenge_digest(32)][issuer_key_id(32)][spend_proof(..)]
-        SpendProof::<128>::from_cbor(&bytes[66..]).ok()
+        Some(Self {
+            proof: SpendProof::<ACT_L>::from_cbor(&bytes[66..]).ok()?,
+            key_id: hex::encode(&bytes[34..66]),
+        })
     }
+
+    fn share(&self) -> Option<u128> {
+        scalar_to_credit::<ACT_L>(&self.proof.charge()).ok()
+    }
+}
+
+/// One refund per input, in input order, each signed under the key its input
+/// names and returning that input's partial return when the request is
+/// charged `charge`, consumed in input order as the gateway consumes it
+/// (clamped to the hold). A charge of nothing returns every share whole.
+/// `None` if any input's refund could not be signed.
+fn refunds_value(
+    issuer: &Issuer,
+    config: &MockConfig,
+    inputs: &[Presented],
+    charge: u128,
+) -> Option<serde_json::Value> {
+    let shares: Vec<u128> = inputs.iter().map(Presented::share).collect::<Option<_>>()?;
+    let hold = eidola_common::spend_credentials::hold(&shares)?;
+    let returns = eidola_common::spend_credentials::partial_returns(&shares, charge.min(hold))?;
+    let refunds = inputs
+        .iter()
+        .zip(returns)
+        .map(|(input, t)| {
+            let signer = config.key_swap.issuer_for(issuer, &input.key_id)?;
+            let refund = signer.refund_of(&input.proof, t)?;
+            Some(serde_json::json!({
+                "refund": refund,
+                "issuer_key_id": refund_key_id(signer, config),
+            }))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!refunds.is_empty()).then_some(serde_json::Value::Array(refunds))
 }
 
 /// Start the mock upstream on an ephemeral loopback port.
 pub async fn start(config: MockConfig) -> MockServer {
+    let (close_tx, mut close_rx) =
+        tokio::sync::mpsc::unbounded_channel::<tokio::sync::oneshot::Sender<()>>();
+    config.close_switch.install(close_tx);
     let issuer = Arc::new(Issuer::new());
+    let issuance = config.issuance.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
     let base_url = format!("http://{addr}");
@@ -987,8 +1645,12 @@ pub async fn start(config: MockConfig) -> MockServer {
     let chat_hits = Arc::new(AtomicU64::new(0));
     let chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
+    let chat_raw_bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let chat_auths: Arc<std::sync::Mutex<Vec<bool>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let chat_spends: Arc<std::sync::Mutex<Vec<Vec<String>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let refund_hits = Arc::new(AtomicU64::new(0));
     let models_hits = Arc::new(AtomicU64::new(0));
@@ -997,21 +1659,35 @@ pub async fn start(config: MockConfig) -> MockServer {
         let issuer = issuer.clone();
         let chat_hits = chat_hits.clone();
         let chat_bodies = chat_bodies.clone();
+        let chat_raw_bodies = chat_raw_bodies.clone();
         let chat_auths = chat_auths.clone();
         let chat_auth_values = chat_auth_values.clone();
+        let chat_spends = chat_spends.clone();
         let refund_hits = refund_hits.clone();
         let models_hits = models_hits.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    Some(ack) = close_rx.recv() => {
+                        // Stop listening *before* acknowledging, so the next
+                        // connection attempt is refused rather than queued.
+                        drop(listener);
+                        let _ = ack.send(());
+                        break;
+                    }
+                };
+                let Ok((stream, _)) = accepted else {
                     break;
                 };
                 let issuer = issuer.clone();
                 let config = config.clone();
                 let chat_hits = chat_hits.clone();
                 let chat_bodies = chat_bodies.clone();
+                let chat_raw_bodies = chat_raw_bodies.clone();
                 let chat_auths = chat_auths.clone();
                 let chat_auth_values = chat_auth_values.clone();
+                let chat_spends = chat_spends.clone();
                 let refund_hits = refund_hits.clone();
                 let models_hits = models_hits.clone();
                 tokio::spawn(async move {
@@ -1021,8 +1697,10 @@ pub async fn start(config: MockConfig) -> MockServer {
                         config,
                         chat_hits,
                         chat_bodies,
+                        chat_raw_bodies,
                         chat_auths,
                         chat_auth_values,
+                        chat_spends,
                         refund_hits,
                         models_hits,
                     )
@@ -1036,10 +1714,14 @@ pub async fn start(config: MockConfig) -> MockServer {
         base_url,
         chat_hits,
         chat_bodies,
+        chat_raw_bodies,
         chat_auths,
         chat_auth_values,
+        chat_spends,
         refund_hits,
+        issuer,
         models_hits,
+        issuance,
         _task: task,
     }
 }
@@ -1048,8 +1730,78 @@ pub async fn start(config: MockConfig) -> MockServer {
 struct Req {
     method: String,
     path: String,
+    /// The `Authorization` header (an external backend's key; never a spend).
     auth: Option<String>,
+    /// Whether the request carried the refund-key header the gateway refuses.
+    refund_key_header: bool,
+    /// The body's inputs, in input order: each `credentials` element's
+    /// `token` text and its refund recovery key, decoded (`None` when absent
+    /// or not exactly the wire form — the real server refuses both alike).
+    /// Empty when the member is not an array of one or two
+    /// `{token, refund_key}` elements.
+    spends: Vec<WireSpend>,
+    /// Whether the body carried a `credentials` member at all.
+    has_credentials: bool,
     body: Vec<u8>,
+}
+
+/// The body's inputs, read independently of the client's writer: the
+/// `credentials` member must be an array of one or two objects, each with
+/// exactly the members `token` and `refund_key`, as the gateway reads it.
+/// One `credentials` element as read: its `token` text and its refund
+/// recovery key, decoded (`None` when absent or not exactly the wire form).
+type WireSpend = (String, Option<[u8; 32]>);
+
+fn body_spend(body: &[u8]) -> (bool, Vec<WireSpend>) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return (false, Vec::new());
+    };
+    let Some(member) = value.get("credentials") else {
+        return (false, Vec::new());
+    };
+    let elements = match member.as_array() {
+        Some(elements) if (1..=2).contains(&elements.len()) => elements,
+        _ => return (true, Vec::new()),
+    };
+    let mut spends = Vec::new();
+    for element in elements {
+        let Some(object) = element.as_object().filter(|o| o.len() == 2) else {
+            return (true, Vec::new());
+        };
+        let Some(token) = object.get("token").and_then(|t| t.as_str()) else {
+            return (true, Vec::new());
+        };
+        let key = object
+            .get("refund_key")
+            .and_then(|k| k.as_str())
+            .and_then(|k| eidola_common::refund_key::decode_refund_key(k.as_bytes()));
+        spends.push((token.to_owned(), key));
+    }
+    (true, spends)
+}
+
+/// `raw` without its `credentials` member: what a test asserting bytes
+/// compares, since the member is the spend's and changes every request. The
+/// member's values (padded base64url, hex) hold no `]`, so the array ends at
+/// the first one.
+fn without_credentials(raw: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(raw) else {
+        return raw.to_vec();
+    };
+    let Some(start) = text.find("\"credentials\":[") else {
+        return raw.to_vec();
+    };
+    let Some(close) = text[start..].find(']') else {
+        return raw.to_vec();
+    };
+    let mut end = start + close + 1;
+    let mut start = start;
+    if text[end..].starts_with(',') {
+        end += 1;
+    } else if text[..start].ends_with(',') {
+        start -= 1;
+    }
+    format!("{}{}", &text[..start], &text[end..]).into_bytes()
 }
 
 async fn read_request(stream: &mut TcpStream) -> Option<Req> {
@@ -1079,6 +1831,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
 
     let mut content_length = 0usize;
     let mut auth = None;
+    let mut refund_key_header = false;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim().to_ascii_lowercase();
@@ -1087,6 +1840,8 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
                 content_length = value.parse().unwrap_or(0);
             } else if name == "authorization" {
                 auth = Some(value.to_string());
+            } else if name == "x-eidola-refund-key" {
+                refund_key_header = true;
             }
         }
     }
@@ -1100,10 +1855,14 @@ async fn read_request(stream: &mut TcpStream) -> Option<Req> {
         body.extend_from_slice(&tmp[..n]);
     }
 
+    let (has_credentials, spends) = body_spend(&body);
     Some(Req {
         method,
         path,
         auth,
+        refund_key_header,
+        spends,
+        has_credentials,
         body,
     })
 }
@@ -1115,8 +1874,10 @@ async fn handle_conn(
     config: MockConfig,
     chat_hits: Arc<AtomicU64>,
     chat_bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    chat_raw_bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     chat_auths: Arc<std::sync::Mutex<Vec<bool>>>,
     chat_auth_values: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    chat_spends: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
     refund_hits: Arc<AtomicU64>,
     models_hits: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
@@ -1133,6 +1894,7 @@ async fn handle_conn(
     match (req.method.as_str(), path) {
         ("GET", "/v1/models") => {
             models_hits.fetch_add(1, Ordering::SeqCst);
+            config.close_switch.trip_if_armed().await;
             match config.models_status {
                 Some(status) => {
                     write_json(&mut stream, status, r#"{"error":"models unavailable"}"#).await?;
@@ -1143,7 +1905,7 @@ async fn handle_conn(
             }
         }
         ("GET", "/v1/keys") => {
-            write_json(&mut stream, 200, &keys_body(&issuer)).await?;
+            write_json(&mut stream, 200, &keys_body(&issuer, &config)).await?;
         }
         ("GET", "/v1/account/balances") => {
             let body = serde_json::json!({
@@ -1153,28 +1915,34 @@ async fn handle_conn(
             write_json(&mut stream, 200, &body.to_string()).await?;
         }
         ("POST", "/v1/account/credentials") => {
-            let parsed: serde_json::Value =
-                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
-            let ir = parsed.get("issuance_request").and_then(|v| v.as_str());
-            let credits = parsed.get("credits").and_then(|v| v.as_i64()).unwrap_or(0);
-            match ir.and_then(|ir| issuer.issue(ir, credits)) {
-                Some(issuance_response) => {
-                    let body = serde_json::json!({
-                        "issuance_response": issuance_response,
-                        "issuer_key_id": issuer.key_id_hex,
-                        "credits": credits,
-                        "ledger_entry_id": uuid_like(),
-                    });
-                    write_json(&mut stream, 200, &body.to_string()).await?;
-                }
-                None => {
-                    write_json(&mut stream, 400, &error_body("issuance failed")).await?;
-                }
-            }
+            // Its own boxed future: every route's locals share this one, which
+            // runs on the core's worker threads beside the turn it answers.
+            Box::pin(handle_issuance(&mut stream, &issuer, &config, &req.body)).await?;
         }
         ("POST", "/v1/credentials/refund") => {
             let attempt = refund_hits.fetch_add(1, Ordering::SeqCst) + 1;
-            handle_refund(&mut stream, &issuer, &config, req.auth.as_deref(), attempt).await?;
+            // The real endpoint refuses a credential in a header, and a
+            // recovery without its key, and opens a stored refund only for the
+            // key the spend arrived with.
+            if req.auth.is_some() || req.refund_key_header {
+                return write_json(&mut stream, 400, &error_body("credential in a header")).await;
+            }
+            // Exactly one input: each is recovered by its own nullifier.
+            let [(token, key)] = req.spends.as_slice() else {
+                return write_json(&mut stream, 400, &error_body("exactly one credential")).await;
+            };
+            let input = Presented::from_token(token);
+            match (&input, key) {
+                (_, None) => {
+                    return write_json(&mut stream, 400, &error_body("refund key required")).await;
+                }
+                (Some(input), Some(key)) if !issuer.spend_key_matches(&input.proof, *key) => {
+                    return write_json(&mut stream, 404, &error_body("refund token not found"))
+                        .await;
+                }
+                _ => {}
+            }
+            handle_refund(&mut stream, &issuer, &config, input, attempt).await?;
         }
         ("POST", "/v1/chat/completions") => {
             // 1-based index of this chat request — the tool-calling
@@ -1186,13 +1954,88 @@ async fn handle_conn(
                 .and_then(|b| b.get("model"))
                 .and_then(|m| m.as_str())
                 .is_some_and(|m| m == ROUTER_MODEL || m == ROUTER_REMOTE_MODEL);
-            if let Some(body) = parsed {
+            if let Some(mut body) = parsed {
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("credentials");
+                }
                 chat_bodies.lock().unwrap().push(body);
             }
+            chat_raw_bodies
+                .lock()
+                .unwrap()
+                .push(without_credentials(&req.body));
             chat_auths.lock().unwrap().push(req.auth.is_some());
             chat_auth_values.lock().unwrap().push(req.auth.clone());
+            chat_spends
+                .lock()
+                .unwrap()
+                .push(req.spends.iter().map(|(token, _)| token.clone()).collect());
+            // A spend travels in the body and nowhere else: one in a header,
+            // or a `credentials` member that is not one or two well-formed
+            // spends, is refused before anything is taken, as the gateway
+            // refuses it.
+            if req.has_credentials && (req.auth.is_some() || req.refund_key_header) {
+                return write_json(&mut stream, 400, &error_body("credential in a header")).await;
+            }
+            let inputs: Option<Vec<Presented>> = req
+                .spends
+                .iter()
+                .map(|(token, _)| Presented::from_token(token))
+                .collect();
+            let inputs = inputs.unwrap_or_default();
+            if req.has_credentials && (inputs.is_empty() || inputs.len() != req.spends.len()) {
+                return write_json(&mut stream, 401, &error_body("malformed credentials")).await;
+            }
+            // A spend without its refund recovery key, a share of zero, and
+            // one credential presented twice are refused before anything is
+            // taken, as the real server refuses them.
+            for (input, (_, key)) in inputs.iter().zip(&req.spends) {
+                match key {
+                    Some(key) => {
+                        issuer.spend_key_matches(&input.proof, *key);
+                    }
+                    None => {
+                        return write_json(&mut stream, 400, &error_body("refund key required"))
+                            .await;
+                    }
+                }
+                if input.share().is_none_or(|share| share == 0) {
+                    return write_json(&mut stream, 400, &error_body("a share of zero")).await;
+                }
+            }
+            if inputs.len() == 2
+                && inputs[0].key_id == inputs[1].key_id
+                && inputs[0].proof.nullifier().as_bytes() == inputs[1].proof.nullifier().as_bytes()
+            {
+                return write_json(&mut stream, 400, &error_body("one credential twice")).await;
+            }
             let parsed: serde_json::Value =
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            // **The hold is exactly the worst case**, as the gateway requires:
+            // computed here from the body as it arrived and the catalog row it
+            // names, through the shared contract, against the sum of the
+            // inputs' shares. A spend holding anything else is refused after
+            // it is taken, with full refunds, as the gateway refuses it (and
+            // counted, so a test can say none was).
+            let hold = eidola_common::spend_credentials::hold(
+                &inputs
+                    .iter()
+                    .filter_map(Presented::share)
+                    .collect::<Vec<_>>(),
+            );
+            if !inputs.is_empty()
+                && let Some(worst) = worst_case_cost(&config, &parsed)
+                && hold != Some(worst)
+            {
+                issuer.hold_mismatches.fetch_add(1, Ordering::SeqCst);
+                let mut body: serde_json::Value =
+                    serde_json::from_str(&error_body("the hold must equal the worst-case cost"))
+                        .expect("error body");
+                if let Some(refunds) = refunds_value(&issuer, &config, &inputs, 0) {
+                    body["refunds"] = refunds;
+                }
+                return write_json(&mut stream, 400, &body.to_string()).await;
+            }
             // A branch-summary request is recognized by its system prompt (it
             // shares the router's model) and answered first, so a test can
             // script the summarizer, the router, and the turns independently.
@@ -1254,15 +2097,7 @@ async fn handle_conn(
                     stream.flush().await?;
                 }
                 _ => {
-                    handle_chat(
-                        &mut stream,
-                        &issuer,
-                        &config,
-                        req.auth.as_deref(),
-                        hit,
-                        &parsed,
-                    )
-                    .await?;
+                    handle_chat(&mut stream, &issuer, &config, &inputs, hit, &parsed).await?;
                 }
             }
         }
@@ -1273,18 +2108,116 @@ async fn handle_conn(
     Ok(())
 }
 
+/// `POST /v1/account/credentials`: idempotent issuance, as the real server
+/// answers it (see [`IssuanceKnobs`] for the misbehaviours a test can ask for).
+async fn handle_issuance(
+    stream: &mut TcpStream,
+    issuer: &Issuer,
+    config: &MockConfig,
+    body: &[u8],
+) -> std::io::Result<()> {
+    issuer.issuance_requests.fetch_add(1, Ordering::SeqCst);
+    if config.issuance.0.unauthorized.load(Ordering::SeqCst) {
+        return write_json(stream, 401, &error_body("invalid credentials")).await;
+    }
+    if config.issuance.0.stall.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        return Ok(());
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+    let ir = parsed.get("issuance_request").and_then(|v| v.as_str());
+    let credits = parsed.get("credits").and_then(|v| v.as_i64()).unwrap_or(0);
+    let named_key = parsed.get("issuer_key_id").and_then(|v| v.as_str());
+    let Some(idem) = parsed
+        .get("idempotency_key")
+        .and_then(|v| v.as_str())
+        .filter(|k| k.len() == 64)
+        .map(str::to_string)
+    else {
+        return write_json(stream, 400, &error_body("idempotency_key required")).await;
+    };
+    // What a retry must agree on to be answered from the store.
+    let request_digest = format!("{}|{credits}|{}", ir.unwrap_or(""), named_key.unwrap_or(""));
+    let stored = issuer.issuances.lock().unwrap().get(&idem).cloned();
+    if stored.is_some() && config.issuance.0.fail_retries.load(Ordering::SeqCst) {
+        return write_json(stream, 503, &error_body("issuance unavailable")).await;
+    }
+    if let Some((digest, body)) = stored {
+        if digest != request_digest {
+            return write_json(stream, 409, &error_body("idempotency key reused")).await;
+        }
+        return write_json(stream, 200, &body).await;
+    }
+    if let Some(status) = config.issuance.refusal() {
+        return write_json(stream, status, &error_body("issuance refused")).await;
+    }
+    // The key listed as current — the second one once a test swapped it.
+    let issuing = config.key_swap.active(issuer);
+    if named_key != Some(issuing.key_id_hex.as_str()) {
+        return write_json(stream, 409, &error_body("issuer key is not current")).await;
+    }
+    match ir.and_then(|ir| {
+        issuing.issue(
+            ir,
+            credits + config.issuance_extra_credits,
+            config.issuance_context,
+        )
+    }) {
+        Some(issuance_response) => {
+            let body = serde_json::json!({
+                "issuance_response": issuance_response,
+                "issuer_key_id": config
+                    .issued_key_id
+                    .clone()
+                    .unwrap_or_else(|| issuing.key_id_hex.clone()),
+                "credits": credits,
+                "ledger_entry_id": uuid_like(),
+            })
+            .to_string();
+            let signed = SignedIssuance {
+                idem,
+                request_digest,
+                body: body.clone(),
+                credits,
+            };
+            if config.issuance.take_hold() {
+                // Signed, not yet debited; the client hears nothing.
+                issuer.held.lock().unwrap().push(signed);
+                return Ok(());
+            }
+            issuer.record_issuance(signed);
+            if config.issuance.take_loss() {
+                // Debited and stored; the client hears nothing.
+                return Ok(());
+            }
+            write_json(stream, 200, &body).await?;
+        }
+        None => {
+            write_json(stream, 400, &error_body("issuance failed")).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn handle_refund(
     stream: &mut TcpStream,
     issuer: &Issuer,
     config: &MockConfig,
-    auth: Option<&str>,
+    input: Option<Presented>,
     // 1-based index of this recovery call.
     attempt: u64,
 ) -> std::io::Result<()> {
     let failing = match config.refund {
         RefundMode::Fail => true,
         RefundMode::FailFirst(n) => attempt <= n,
-        RefundMode::Succeed => false,
+        RefundMode::Succeed | RefundMode::ProvisionalFirst(_) | RefundMode::ChargedEarly(_) => {
+            false
+        }
+        RefundMode::StallAfter(n) if attempt > n => {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+        RefundMode::StallAfter(_) => false,
         RefundMode::NotStored => {
             return write_json(stream, 404, &error_body("refund token not found")).await;
         }
@@ -1292,13 +2225,26 @@ async fn handle_refund(
     if failing {
         return write_json(stream, 500, &error_body("refund unavailable")).await;
     }
-    let refund = auth
-        .and_then(Issuer::spend_proof_from_auth)
-        .and_then(|sp| issuer.refund_for(&sp));
-    match refund {
-        Some(refund_b64) => {
+    let stored_provisional = matches!(config.refund, RefundMode::ProvisionalFirst(_));
+    let provisional = matches!(config.refund, RefundMode::ProvisionalFirst(n) if attempt <= n);
+    // The stored provisional refund returns nothing; a stream cut short is
+    // charged what it generated; any other returns the share whole. Signed
+    // under the key the input names.
+    let refunds = input.and_then(|input| {
+        let charge = if stored_provisional {
+            input.share()?
+        } else if let RefundMode::ChargedEarly(charged) = config.refund {
+            charged
+        } else {
+            0
+        };
+        refunds_value(issuer, config, std::slice::from_ref(&input), charge)
+    });
+    match refunds {
+        Some(refunds) => {
             let body = serde_json::json!({
-                "refund": { "refund": refund_b64, "issuer_key_id": issuer.key_id_hex },
+                "refunds": refunds,
+                "provisional": provisional,
             });
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1310,23 +2256,34 @@ async fn handle_chat(
     stream: &mut TcpStream,
     issuer: &Issuer,
     config: &MockConfig,
-    auth: Option<&str>,
+    inputs: &[Presented],
     hit: u64,
     request: &serde_json::Value,
 ) -> std::io::Result<()> {
     if config.chat_delay_ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(config.chat_delay_ms)).await;
     }
-    // Compute an inline refund object once (shared by the blocking happy path).
+    let fail = config
+        .fail_next_chat
+        .lock()
+        .expect("fail-next lock poisoned")
+        .take();
+    if let Some(status) = fail {
+        return write_json(stream, status, &error_body("upstream model error")).await;
+    }
+    // The inline refunds of a completed request, computed once (shared by
+    // the blocking happy path): one per input, settled at the configured
+    // charge.
     let inline_refund = if matches!(config.refund, RefundMode::Succeed | RefundMode::NotStored) {
-        auth.and_then(Issuer::spend_proof_from_auth)
-            .and_then(|sp| issuer.refund_for(&sp))
-            .map(|refund_b64| {
-                serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex })
-            })
+        refunds_value(issuer, config, inputs, config.settled_charge.unwrap_or(0))
     } else {
         None
     };
+    // Every share whole: what a refusal carries.
+    let full_refunds = || refunds_value(issuer, config, inputs, 0);
+    // What a completed stream's metadata carries, whatever the refund mode.
+    let completed_refunds =
+        || refunds_value(issuer, config, inputs, config.settled_charge.unwrap_or(0));
 
     match config.chat {
         ChatBehavior::OkBlocking | ChatBehavior::OkBlockingNoInlineRefund => {
@@ -1345,7 +2302,7 @@ async fn handle_chat(
             if matches!(config.chat, ChatBehavior::OkBlocking)
                 && let Some(refund) = inline_refund
             {
-                body["refund"] = refund;
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1374,12 +2331,8 @@ async fn handle_chat(
         ChatBehavior::OkBlockingNotACompletion => {
             let mut body: serde_json::Value =
                 serde_json::from_str(&error_body("upstream model error")).expect("error body");
-            if let Some(refund_b64) = auth
-                .and_then(Issuer::spend_proof_from_auth)
-                .and_then(|sp| issuer.refund_for(&sp))
-            {
-                body["refund"] =
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex });
+            if let Some(refunds) = full_refunds() {
+                body["refunds"] = refunds;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1389,12 +2342,8 @@ async fn handle_chat(
         ChatBehavior::Non2xxWithRefund(status) => {
             let mut body: serde_json::Value =
                 serde_json::from_str(&error_body("stream start failed")).expect("error body");
-            if let Some(refund_b64) = auth
-                .and_then(Issuer::spend_proof_from_auth)
-                .and_then(|sp| issuer.refund_for(&sp))
-            {
-                body["refund"] =
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex });
+            if let Some(refunds) = full_refunds() {
+                body["refunds"] = refunds;
             }
             write_json(stream, status, &body.to_string()).await
         }
@@ -1440,21 +2389,23 @@ async fn handle_chat(
             write_sse_stream_with_terminator(stream, &[STREAM_CONTENT], "\r").await
         }
         ChatBehavior::StreamingWithMetadataRefund => {
-            let refund = auth
-                .and_then(Issuer::spend_proof_from_auth)
-                .and_then(|sp| issuer.refund_for(&sp))
-                .map(|refund_b64| {
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex })
-                });
+            let refund = completed_refunds();
             write_sse_stream_with_metadata(stream, &[STREAM_CONTENT], refund).await
         }
+        ChatBehavior::StreamingPadded | ChatBehavior::StreamingPaddedPastReadCeiling => {
+            let refund = completed_refunds();
+            let idle_frames = if matches!(config.chat, ChatBehavior::StreamingPaddedPastReadCeiling)
+            {
+                // Ten megabytes of padding frames across the deltas below.
+                10 * 1024 * 1024 / eidola_server_gateway::padding::FRAME_BYTES / 3
+            } else {
+                2
+            };
+            write_padded_sse_stream(stream, &PADDED_CONTENT, refund, idle_frames).await
+        }
+        ChatBehavior::StreamingPaddedNearReadCeiling => write_padded_near_ceiling(stream).await,
         ChatBehavior::StreamingSplitDataFields => {
-            let refund = auth
-                .and_then(Issuer::spend_proof_from_auth)
-                .and_then(|sp| issuer.refund_for(&sp))
-                .map(|refund_b64| {
-                    serde_json::json!({ "refund": refund_b64, "issuer_key_id": issuer.key_id_hex })
-                });
+            let refund = completed_refunds();
             write_sse_stream_split_data(stream, &[STREAM_CONTENT], refund).await
         }
         ChatBehavior::OkStreamingWithHeader => {
@@ -1502,6 +2453,10 @@ async fn handle_chat(
         ChatBehavior::StreamingEndsWithoutDone => {
             write_sse_unterminated_stream(stream, &[STREAM_CONTENT]).await
         }
+        ChatBehavior::StreamingCutShortWithRefund => {
+            let refund = full_refunds();
+            write_sse_cut_short(stream, &[STREAM_CONTENT], refund).await
+        }
         ChatBehavior::OkThenStreamEndsWithoutDone if hit == 1 => {
             if request.get("stream").and_then(|s| s.as_bool()) == Some(true) {
                 return write_sse_stream(stream, true, &[STREAM_CONTENT]).await;
@@ -1514,7 +2469,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1525,7 +2480,7 @@ async fn handle_chat(
             if hit <= rounds {
                 let mut body = tool_call_body(&tool_call_object(hit, &tool_arguments(hit)));
                 if let Some(refund) = inline_refund {
-                    body["refund"] = refund;
+                    body["refunds"] = refund;
                 }
                 write_json(stream, 200, &body.to_string()).await
             } else {
@@ -1537,7 +2492,7 @@ async fn handle_chat(
                     "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
                 });
                 if let Some(refund) = inline_refund {
-                    body["refund"] = refund;
+                    body["refunds"] = refund;
                 }
                 write_json(stream, 200, &body.to_string()).await
             }
@@ -1550,7 +2505,7 @@ async fn handle_chat(
             });
             let mut body = tool_call_body(&call);
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1567,7 +2522,7 @@ async fn handle_chat(
                 })
             };
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1597,7 +2552,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1611,7 +2566,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1619,7 +2574,7 @@ async fn handle_chat(
         ChatBehavior::DeclineBlocking => {
             let mut body = tool_call_body(&decline_call_object());
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1661,7 +2616,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1677,7 +2632,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1693,11 +2648,12 @@ async fn handle_chat(
                         "reasoning_content": TRUNCATED_REASONING,
                     },
                     "finish_reason": "length",
+                    "continuable": true,
                 }],
                 "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1713,13 +2669,85 @@ async fn handle_chat(
                         "reasoning_content": TRUNCATED_REASONING,
                     },
                     "finish_reason": "length",
+                    "continuable": true,
                 }],
                 "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
+        }
+        ChatBehavior::ContinueAfterLength { cut, again } => {
+            let (reasoning, content, finish) = match request.get("continue_final_message") {
+                None => match cut {
+                    Cut::Reasoning => (TRUNCATED_REASONING, "", "length"),
+                    Cut::Answer | Cut::Dropped => (TRUNCATED_REASONING, STREAM_CONTENT, "length"),
+                },
+                Some(serde_json::Value::String(field)) if field == "reasoning_content" => {
+                    if again && hit == 2 {
+                        (CONTINUED_REASONING, "", "length")
+                    } else {
+                        (CONTINUED_REASONING, CONTINUED_ANSWER, "stop")
+                    }
+                }
+                Some(_) => (
+                    "",
+                    CONTINUED_TAIL,
+                    if again && hit == 2 { "length" } else { "stop" },
+                ),
+            };
+            let exact = !(cut == Cut::Dropped && request.get("continue_final_message").is_none());
+            write_ending(
+                stream,
+                request,
+                inline_refund,
+                reasoning,
+                content,
+                finish,
+                exact,
+            )
+            .await
+        }
+        ChatBehavior::HeaderThenLength => {
+            let content = format!("{MIMICKED_HEADER}\n\nThe tides are");
+            write_ending(stream, request, inline_refund, "", &content, "length", true).await
+        }
+        ChatBehavior::ContinueIntoToolRound => {
+            let streamed = request.get("stream").and_then(|s| s.as_bool()) == Some(true);
+            if request.get("continue_final_message").is_some() {
+                if streamed {
+                    return write_sse_tool_stream(stream, 1, false).await;
+                }
+                let mut body = tool_call_body(&tool_call_object(1, &tool_arguments(1)));
+                if let Some(refund) = inline_refund {
+                    body["refunds"] = refund;
+                }
+                return write_json(stream, 200, &body.to_string()).await;
+            }
+            if hit == 1 {
+                write_ending(
+                    stream,
+                    request,
+                    inline_refund,
+                    TRUNCATED_REASONING,
+                    "",
+                    "length",
+                    true,
+                )
+                .await
+            } else {
+                write_ending(
+                    stream,
+                    request,
+                    inline_refund,
+                    "",
+                    TOOL_FINAL_CONTENT,
+                    "stop",
+                    true,
+                )
+                .await
+            }
         }
         ChatBehavior::OkEitherTransport => {
             if request.get("stream").and_then(|s| s.as_bool()) == Some(true) {
@@ -1733,7 +2761,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1757,7 +2785,7 @@ async fn handle_chat(
                 "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
             });
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1780,7 +2808,7 @@ async fn handle_chat(
             }
             let mut body = tool_call_body(&tool_call_object(hit, &tool_arguments(hit)));
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -1828,7 +2856,7 @@ async fn handle_chat(
                 })
             };
             if let Some(refund) = inline_refund {
-                body["refund"] = refund;
+                body["refunds"] = refund;
             }
             write_json(stream, 200, &body.to_string()).await
         }
@@ -2116,9 +3144,78 @@ async fn write_sse_length_stream(
     }
 
     let terminal = serde_json::json!({
-        "choices": [{ "delta": {}, "finish_reason": "length" }],
+        "choices": [{ "delta": {}, "finish_reason": "length", "continuable": true }],
         "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS }
     });
+    stream.write_all(&sse_event(&terminal.to_string())).await?;
+    stream.write_all(&sse_event("[DONE]")).await?;
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Answer in whichever transport asked: `reasoning`, then `content`, ending
+/// with `finish`. A `length` ending reports the whole ceiling spent, as the
+/// truncating behaviours do, with the engine's `continuable` verdict (`exact`).
+/// A stream carries the reasoning as one delta and the content as two, so the
+/// client's accumulation is exercised.
+async fn write_ending(
+    stream: &mut TcpStream,
+    request: &serde_json::Value,
+    inline_refund: Option<serde_json::Value>,
+    reasoning: &str,
+    content: &str,
+    finish: &str,
+    exact: bool,
+) -> std::io::Result<()> {
+    let completion_tokens = if finish == "length" {
+        CEILING_TOKENS
+    } else {
+        5
+    };
+    if request.get("stream").and_then(|s| s.as_bool()) != Some(true) {
+        let mut body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "reasoning_content": reasoning,
+                },
+                "finish_reason": finish,
+            }],
+            "usage": { "prompt_tokens": 11, "completion_tokens": completion_tokens },
+        });
+        if finish == "length" {
+            body["choices"][0]["continuable"] = serde_json::json!(exact);
+        }
+        if let Some(refund) = inline_refund {
+            body["refunds"] = refund;
+        }
+        return write_json(stream, 200, &body.to_string()).await;
+    }
+    stream.write_all(sse_head().as_bytes()).await?;
+    let mut deltas = Vec::new();
+    if !reasoning.is_empty() {
+        deltas.push(serde_json::json!({"reasoning_content": reasoning}));
+    }
+    if !content.is_empty() {
+        let half = content.floor_char_boundary(content.len() / 2);
+        let (a, b) = content.split_at(half);
+        for piece in [a, b].into_iter().filter(|p| !p.is_empty()) {
+            deltas.push(serde_json::json!({"content": piece}));
+        }
+    }
+    for delta in deltas {
+        let chunk = serde_json::json!({"choices": [{"delta": delta, "finish_reason": null}]});
+        stream.write_all(&sse_event(&chunk.to_string())).await?;
+    }
+    let mut terminal = serde_json::json!({
+        "choices": [{ "delta": {}, "finish_reason": finish }],
+        "usage": { "prompt_tokens": 11, "completion_tokens": completion_tokens }
+    });
+    if finish == "length" {
+        terminal["choices"][0]["continuable"] = serde_json::json!(exact);
+    }
     stream.write_all(&sse_event(&terminal.to_string())).await?;
     stream.write_all(&sse_event("[DONE]")).await?;
     stream.write_all(b"0\r\n\r\n").await?;
@@ -2242,13 +3339,201 @@ async fn write_sse_stream_with_metadata(
         "id": "chatcmpl-mock",
     });
     if let Some(refund) = refund {
-        metadata["refund"] = refund;
+        metadata["refunds"] = refund;
     }
     stream.write_all(&send_event(metadata.to_string())).await?;
     stream.write_all(&send_event("[DONE]".to_string())).await?;
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// [`ChatBehavior::StreamingCutShortWithRefund`]: deltas, the metadata event
+/// with its refund, and no `[DONE]`.
+async fn write_sse_cut_short(
+    stream: &mut TcpStream,
+    content_chunks: &[&str],
+    refund: Option<serde_json::Value>,
+) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    let send_event = |payload: String| -> Vec<u8> {
+        let event = format!("data: {payload}\n\n");
+        let mut out = format!("{:x}\r\n", event.len()).into_bytes();
+        out.extend_from_slice(event.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out
+    };
+    for chunk in content_chunks {
+        let content = serde_json::json!({ "choices": [{ "delta": { "content": chunk } }] });
+        stream.write_all(&send_event(content.to_string())).await?;
+    }
+    let mut metadata = serde_json::json!({
+        "object": "eidola.chat.completion.metadata",
+        "id": "",
+    });
+    if let Some(refund) = refund {
+        metadata["refunds"] = refund;
+    }
+    stream.write_all(&send_event(metadata.to_string())).await?;
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await
+}
+
+/// The content [`ChatBehavior::StreamingPadded`] streams, one delta each;
+/// joined, [`STREAM_CONTENT`].
+pub const PADDED_CONTENT: [&str; 3] = ["Hello ", "from the ", "stream."];
+
+/// The metadata stream framed by the Eidola server's own framer, with
+/// `idle_frames` frames of nothing but padding after each content delta. See
+/// [`ChatBehavior::StreamingPadded`].
+async fn write_padded_sse_stream(
+    stream: &mut TcpStream,
+    content_chunks: &[&str],
+    refund: Option<serde_json::Value>,
+    idle_frames: usize,
+) -> std::io::Result<()> {
+    use eidola_server_gateway::padding::{FRAME_BYTES, Framer, StreamEvent};
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut framer = Framer::new(FRAME_BYTES);
+    // One write per frame, as the server's ticks write them.
+    async fn tick(stream: &mut TcpStream, framer: &mut Framer) -> std::io::Result<()> {
+        let frame = framer.frame();
+        let mut out = format!("{:x}\r\n", frame.len()).into_bytes();
+        out.extend_from_slice(&frame);
+        out.extend_from_slice(b"\r\n");
+        stream.write_all(&out).await?;
+        stream.flush().await
+    }
+
+    tick(stream, &mut framer).await?;
+    for chunk in content_chunks {
+        let content = serde_json::json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "model": STREAM_WIRE_MODEL,
+            "choices": [{ "index": 0, "delta": { "content": chunk }, "finish_reason": null }]
+        });
+        framer.push(&StreamEvent::Json(content.to_string()));
+        tick(stream, &mut framer).await?;
+        for _ in 0..idle_frames {
+            tick(stream, &mut framer).await?;
+        }
+    }
+    let finish = serde_json::json!({
+        "id": "chatcmpl-mock",
+        "object": "chat.completion.chunk",
+        "model": STREAM_WIRE_MODEL,
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+    });
+    framer.push(&StreamEvent::Json(finish.to_string()));
+    let usage = serde_json::json!({
+        "id": "chatcmpl-mock",
+        "object": "chat.completion.chunk",
+        "model": STREAM_WIRE_MODEL,
+        "choices": [],
+        "usage": { "prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16 }
+    });
+    framer.push(&StreamEvent::Json(usage.to_string()));
+    let mut metadata = serde_json::json!({
+        "object": "eidola.chat.completion.metadata",
+        "id": "chatcmpl-mock",
+        // Larger than a frame, as the server's privacy and verification
+        // metadata is, so the event crosses frames.
+        "privacy": { "note": "m".repeat(eidola_server_gateway::padding::FRAME_BYTES) },
+    });
+    if let Some(refund) = refund {
+        metadata["refunds"] = refund;
+    }
+    framer.push(&StreamEvent::Json(metadata.to_string()));
+    framer.push(&StreamEvent::Done);
+    while framer.backlog() > 0 {
+        tick(stream, &mut framer).await?;
+    }
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// See [`ChatBehavior::StreamingPaddedNearReadCeiling`]. The sizes are the
+/// server's own encoding (`data: ` + JSON + a blank line), summed here.
+async fn write_padded_near_ceiling(stream: &mut TcpStream) -> std::io::Result<()> {
+    use eidola_server_gateway::padding::{FRAME_BYTES, Framer, StreamEvent};
+    // Spelled here rather than imported: the mock is the peer.
+    const TARGET: usize = 8 * 1024 * 1024 - 4096;
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+
+    let chunk = |content: &str| {
+        serde_json::json!({
+            "choices": [{ "index": 0, "delta": { "content": content }, "finish_reason": null }]
+        })
+        .to_string()
+    };
+    let encoded = |json: &str| json.len() + "data: ".len() + 2;
+    let tail = vec![
+        serde_json::json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] })
+            .to_string(),
+        serde_json::json!({
+            "choices": [],
+            "usage": { "prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16 }
+        })
+        .to_string(),
+        serde_json::json!({ "object": "eidola.chat.completion.metadata", "id": "chatcmpl-mock" })
+            .to_string(),
+    ];
+    let tail_bytes: usize =
+        tail.iter().map(|j| encoded(j)).sum::<usize>() + "data: [DONE]\n\n".len();
+    let overhead = encoded(&chunk(""));
+    let piece = 64 * 1024;
+    let mut contents = Vec::new();
+    let mut total = tail_bytes;
+    while total + overhead + piece <= TARGET {
+        contents.push("y".repeat(piece));
+        total += overhead + piece;
+    }
+    contents.push("y".repeat(TARGET - total - overhead));
+
+    let mut framer = Framer::new(FRAME_BYTES);
+    let chunked = |frames: &[u8]| {
+        let mut out = format!("{:x}\r\n", frames.len()).into_bytes();
+        out.extend_from_slice(frames);
+        out.extend_from_slice(b"\r\n");
+        out
+    };
+    for content in &contents {
+        framer.push(&StreamEvent::Json(chunk(content)));
+        while framer.backlog() > 0 {
+            stream.write_all(&chunked(&framer.frame())).await?;
+        }
+    }
+    // The last frames, coalesced: padding, then the tail.
+    let mut last = Vec::new();
+    for _ in 0..8 {
+        last.extend_from_slice(&framer.frame());
+    }
+    for json in tail {
+        framer.push(&StreamEvent::Json(json));
+    }
+    framer.push(&StreamEvent::Done);
+    while framer.backlog() > 0 {
+        last.extend_from_slice(&framer.frame());
+    }
+    stream.write_all(&chunked(&last)).await?;
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await
 }
 
 /// The metadata stream with each JSON payload split across one `data:` field
@@ -2300,7 +3585,7 @@ async fn write_sse_stream_split_data(
         "id": "chatcmpl-mock",
     });
     if let Some(refund) = refund {
-        metadata["refund"] = refund;
+        metadata["refunds"] = refund;
     }
     stream.write_all(&send_event(&metadata)).await?;
     let done = "data: [DONE]\n\n";
@@ -2463,6 +3748,49 @@ async fn write_sse_stream_with_terminator(
     Ok(())
 }
 
+/// The worst-case cost of `request` under the catalog row it names, as the
+/// gateway computes it: the flat per-request price, or the prompt priced by
+/// the shared contract plus the completion ceiling (the request's own, or the
+/// row's declared one) at the completion rate, each rounded up. `None` for a
+/// model the catalog does not list.
+fn worst_case_cost(config: &MockConfig, request: &serde_json::Value) -> Option<u128> {
+    let catalog: serde_json::Value = serde_json::from_str(&models_body(config)).ok()?;
+    let model = request.get("model")?.as_str()?;
+    let row = catalog
+        .get("data")?
+        .as_array()?
+        .iter()
+        .find(|row| row.get("id").and_then(|id| id.as_str()) == Some(model))?;
+    let price = |key: &str| -> Option<(u128, u128)> {
+        let p = row.get("pricing")?.get(key)?;
+        Some((
+            u128::from(p.get("value")?.as_u64()?),
+            u128::from(p.get("scale_factor")?.as_u64()?),
+        ))
+    };
+    if let Some((value, scale)) = price("per_request") {
+        return Some(value.div_ceil(scale));
+    }
+    let (prompt_rate, scale) = price("per_prompt_token")?;
+    let (completion_rate, _) = price("per_completion_token")?;
+    let messages = request.get("messages")?.as_array()?;
+    let tools = request
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(Vec::as_slice);
+    let prompt =
+        u128::from(eidola_common::prompt_charge(messages, tools).chargeable_prompt_tokens());
+    let completion = request
+        .get("max_completion_tokens")
+        .and_then(|m| m.as_u64())
+        .or_else(|| row.get("max_output_tokens").and_then(|m| m.as_u64()))
+        .or_else(|| row.get("context_length").and_then(|m| m.as_u64()))?;
+    Some(
+        (prompt * prompt_rate).div_ceil(scale)
+            + (u128::from(completion) * completion_rate).div_ceil(scale),
+    )
+}
+
 fn models_body(config: &MockConfig) -> String {
     let mut primary = serde_json::json!({
         "id": MODEL,
@@ -2482,6 +3810,36 @@ fn models_body(config: &MockConfig) -> String {
         primary["max_output_tokens"] = serde_json::json!(4096u64);
         primary["output_budget_class"] = serde_json::json!("standard");
     }
+    if let Some(leaf) = &config.declared_prompt_cache {
+        if primary.get("capabilities").is_none() {
+            primary["capabilities"] = serde_json::json!({});
+        }
+        primary["capabilities"]["prompt_cache"] = leaf.clone();
+    }
+    if let Some(ceiling) = config.declared_max_output {
+        primary["max_output_tokens"] = serde_json::json!(ceiling);
+    }
+    if let Some(sha256) = config
+        .published_sha256
+        .lock()
+        .expect("published hash lock poisoned")
+        .clone()
+    {
+        primary["sha256"] = serde_json::json!(sha256);
+        primary["tags"] = serde_json::json!([MODEL]);
+    }
+    let untagged = config
+        .untagged_sha256
+        .lock()
+        .expect("untagged hash lock poisoned")
+        .clone()
+        .map(|sha256| {
+            let mut row = primary.clone();
+            row["id"] = serde_json::json!(format!("sha256:{sha256}"));
+            row["sha256"] = serde_json::json!(sha256);
+            row["tags"] = serde_json::json!([]);
+            row
+        });
     let router = serde_json::json!({
         "id": ROUTER_REMOTE_MODEL,
         "context_length": 8192u64,
@@ -2510,6 +3868,7 @@ fn models_body(config: &MockConfig) -> String {
     let listed: Vec<serde_json::Value> = [primary, router]
         .into_iter()
         .chain(config.list_flat_model.then_some(flat))
+        .chain(untagged)
         .filter(|entry| {
             let id = entry["id"].as_str().unwrap_or_default();
             !omitted.iter().any(|o| o == id)
@@ -2518,41 +3877,73 @@ fn models_body(config: &MockConfig) -> String {
     serde_json::json!({ "data": listed }).to_string()
 }
 
-fn keys_body(issuer: &Issuer) -> String {
+fn keys_body(issuer: &Issuer, config: &MockConfig) -> String {
     let ds = format!("ACT-v1:{DS_ORG}:{DS_SERVICE}:{DS_DEPLOYMENT}:{DS_VERSION}");
-    // Reproduce the production `/v1/keys` shape during a rotation grace
-    // window: a just-retired key (out of its `issue_from..issue_until` issuing
-    // window but still within `accept_until`) sorts *ahead* of the current
-    // key. It carries a different public key, so a client that selected by
-    // domain separator alone — every key shares one — would pick the decoy and
-    // fail proof verification against the current issuer (the original bug).
-    // The client must skip the out-of-window decoy and choose the current key.
-    let decoy_pk = PrivateKey::random(OsRng)
-        .public()
-        .to_cbor()
-        .expect("encode decoy public key");
-    let decoy_key_hash: [u8; 32] = Sha256::digest(&decoy_pk).into();
-    serde_json::json!({
-        "data": [
-            {
-                "id": hex::encode(decoy_key_hash),
-                "public_key": URL_SAFE_NO_PAD.encode(&decoy_pk),
-                "domain_separator": ds,
-                "issue_from": "2026-01-01T00:00:00Z",
-                "issue_until": "2026-02-01T00:00:00Z",
-                "accept_until": "2030-01-01T00:00:00Z",
-            },
-            {
-                "id": issuer.key_id_hex,
-                "public_key": issuer.public_key_b64(),
-                "domain_separator": ds,
-                "issue_from": "2026-02-01T00:00:00Z",
-                "issue_until": "2030-01-01T00:00:00Z",
-                "accept_until": "2030-01-01T00:00:00Z",
-            }
-        ]
-    })
-    .to_string()
+    // Reproduce the production `/v1/keys` shape: the previous epoch's key
+    // (out of its issuing window but still within `accept_until`) sorts
+    // *ahead* of the current key. It carries a different public key, so a
+    // client that selected by domain separator alone — every key shares one
+    // — would pick the decoy and fail proof verification against the current
+    // issuer (the original bug). The client must skip the out-of-window
+    // decoy and choose the current key.
+    //
+    // Like an honest server, the mock remembers which key it listed for each
+    // epoch: the previous epoch's entry is the key it listed as current then
+    // (the decoy only for an epoch it never listed). So a mock that keeps one
+    // key across a boundary lists that key for two epochs, as a dishonest
+    // server would; a test wanting the next epoch accepted gives it a new key
+    // ([`KeySwap`]).
+    let calendar = config.issuer_calendar.unwrap_or(ISSUER_CALENDAR);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs();
+    let window = config.key_window.clone().unwrap_or_else(|| {
+        KeyWindow::of_epoch(&calendar, calendar.epoch_at(now).expect("on the calendar"))
+    });
+    let current_epoch = eidola_app_core::iso_to_ms(&window.issue_from)
+        .ok()
+        .and_then(|ms| u64::try_from(ms.div_euclid(1000)).ok())
+        .and_then(|secs| calendar.epoch_at(secs))
+        .unwrap_or(0);
+    let current = config.key_swap.active(issuer);
+    let previous = {
+        let mut listed = issuer.listed.lock().unwrap();
+        listed
+            .entry(current_epoch)
+            .or_insert_with(|| (current.key_id_hex.clone(), current.public_key_b64()));
+        listed.get(&current_epoch.wrapping_sub(1)).cloned()
+    };
+    let (previous_id, previous_pk) = previous.unwrap_or_else(|| {
+        let hash: [u8; 32] = Sha256::digest(&issuer.decoy_public_key).into();
+        (
+            hex::encode(hash),
+            URL_SAFE_NO_PAD.encode(&issuer.decoy_public_key),
+        )
+    });
+    let decoy = KeyWindow::of_epoch(&calendar, current_epoch.saturating_sub(1));
+    let previous_entry = serde_json::json!({
+        "id": previous_id,
+        "public_key": previous_pk,
+        "domain_separator": ds,
+        "issue_from": decoy.issue_from,
+        "issue_until": decoy.issue_until,
+        "accept_until": decoy.accept_until,
+    });
+    let current_entry = serde_json::json!({
+        "id": current.key_id_hex,
+        "public_key": current.public_key_b64(),
+        "domain_separator": ds,
+        "issue_from": window.issue_from,
+        "issue_until": window.issue_until,
+        "accept_until": window.accept_until,
+    });
+    let data = if config.omit_previous_key.load(Ordering::SeqCst) {
+        vec![current_entry]
+    } else {
+        vec![previous_entry, current_entry]
+    };
+    serde_json::json!({ "data": data }).to_string()
 }
 
 fn error_body(message: &str) -> String {
@@ -2568,7 +3959,10 @@ async fn write_json(stream: &mut TcpStream, status: u16, body: &str) -> std::io:
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        402 => "Payment Required",
         404 => "Not Found",
+        409 => "Conflict",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Status",
@@ -2706,12 +4100,42 @@ pub fn core_for(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) 
         .build()
         .expect("plain http client");
     let core = AppCore::with_test_http_client(config_dir, data_dir, client).expect("open core");
+    if let Some(calendar) = config.issuer_calendar {
+        core.test_set_issuer_calendar(calendar);
+    }
     let mock = core.runtime().block_on(async { start(config).await });
     core.runtime()
         .block_on(core.set_base_url(mock.base_url.clone()))
         .expect("set base url");
+    seat_default_agent_on_mock(&core);
     (mock, core, dir)
 }
+
+/// Re-seat the Default template's one agent on the mock's [`MODEL`], labelled
+/// [`DEFAULT_AGENT_LABEL`], so a space created from it is answered over the
+/// mock. The compiled default is a local model, which a harness profile has no
+/// file or engine for; `tests/template_seed.rs` and `tests/bus.rs` hold the
+/// real seed.
+fn seat_default_agent_on_mock(core: &AppCore) {
+    core.runtime()
+        .block_on(core.update_template(
+            eidola_app_core::DEFAULT_TEMPLATE_ID.into(),
+            None,
+            None,
+            Some(vec![eidola_app_core::NewTemplateParticipant {
+                label: DEFAULT_AGENT_LABEL.into(),
+                model_ref: Some(MODEL.into()),
+                system_prompt: Some(SEEDED_AGENT_SYSTEM_PROMPT.into()),
+                notify_policy: "human".into(),
+            }]),
+        ))
+        .expect("seat the default agent on the mock's model");
+}
+
+/// The generic prompt the seeded default agent carries
+/// (`db::DEFAULT_AGENT_SYSTEM_PROMPT`), kept on the re-seated agent.
+const SEEDED_AGENT_SYSTEM_PROMPT: &str =
+    "You are a helpful assistant. Answer clearly and concisely.";
 
 /// Re-open an `AppCore` over a directory a previous one used — the **restart**
 /// seam.
@@ -2737,6 +4161,13 @@ pub fn reopen_core(dir: &tempfile::TempDir, base_url: &str) -> AppCore {
 /// Configure account credentials so auto-provisioning can reach the balance /
 /// allocate endpoints. The actual basic-auth password is never verified by the
 /// mock, so any non-empty values work.
+/// A request context no other credential shares, for
+/// [`MockConfig::issuance_context`].
+#[allow(dead_code)]
+pub fn distinct_context() -> Scalar {
+    Scalar::from(7u64)
+}
+
 pub fn with_account(core: &AppCore) {
     core.set_account_credentials(uuid_account_id(), "mock-secret".into())
         .expect("set account credentials");

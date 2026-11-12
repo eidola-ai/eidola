@@ -1,2 +1,2 @@
 # Server OpenAPI spec
-crates/eidola-server/openapi.json linguist-generated=true
+crates/eidola-server-gateway/openapi.json linguist-generated=true

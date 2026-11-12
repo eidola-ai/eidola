@@ -15,6 +15,13 @@
 use super::{PyError, is_py_space};
 use crate::json::{BigInt, PY_MAX_STR_DIGITS};
 
+/// Bits past which an integer has more than [`PY_MAX_STR_DIGITS`] decimal
+/// digits whatever its value: 2^(4 × 4300) = 16^4300 > 10^4300. A literal in
+/// a power-of-two base is converted to decimal only up to this size, which
+/// bounds that conversion's work; a longer one becomes [`PyLit::OversizeInt`]
+/// in time linear in its length.
+const OVERSIZE_BITS: usize = 4 * PY_MAX_STR_DIGITS;
+
 /// CPython's tokenizer refuses more than 200 nested brackets.
 const MAX_NESTING: usize = 200;
 
@@ -24,6 +31,15 @@ pub enum PyLit {
     None,
     Bool(bool),
     Int(BigInt),
+    /// An integer of more than [`OVERSIZE_BITS`] bits, so of more decimal
+    /// digits than `json.dumps` writes ([`PY_MAX_STR_DIGITS`]). CPython reads
+    /// a hexadecimal, octal or binary literal of any length, and the value
+    /// still counts for dict-key equality, so it is kept exactly: the
+    /// magnitude as little-endian base-2^64 limbs, the last one non-zero.
+    OversizeInt {
+        negative: bool,
+        magnitude: Vec<u64>,
+    },
     Float(f64),
     Str(String),
     List(Vec<PyLit>),
@@ -53,6 +69,8 @@ pub fn literal_eval(s: &str) -> Result<PyLit, PyError> {
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
     Int(BigInt),
+    /// [`PyLit::OversizeInt`]'s magnitude.
+    OversizeInt(Vec<u64>),
     Float(f64),
     /// Imaginary literal: valid syntax, but `json.dumps` rejects the result.
     Imaginary,
@@ -249,9 +267,20 @@ fn number(chars: &[char], mut i: usize, tokens: &mut Vec<Tok>) -> Result<usize, 
             .iter()
             .filter(|c| **c != '_')
             .map(|c| c.to_digit(radix).expect("validated digit"))
+            .skip_while(|d| *d == 0)
             .collect();
-        let value = BigInt::from_radix_digits(false, radix, &digits);
-        tokens.push(Tok::Int(value));
+        let bits_per_digit = radix.trailing_zeros() as usize;
+        let bits = match digits.first() {
+            Some(first) => {
+                (digits.len() - 1) * bits_per_digit + (u32::BITS - first.leading_zeros()) as usize
+            }
+            None => 0,
+        };
+        tokens.push(if bits > OVERSIZE_BITS {
+            Tok::OversizeInt(limbs(&digits, bits_per_digit))
+        } else {
+            Tok::Int(BigInt::from_radix_digits(false, radix, &digits))
+        });
         return Ok(i);
     }
     let decimal = |c: char| c.is_ascii_digit();
@@ -302,6 +331,24 @@ fn number(chars: &[char], mut i: usize, tokens: &mut Vec<Tok>) -> Result<usize, 
         tokens.push(Tok::Int(BigInt::from_digits(false, &text)));
     }
     Ok(i)
+}
+
+/// The value of big-endian `digits` of `bits_per_digit` bits each (the first
+/// non-zero), as little-endian base-2^64 limbs.
+fn limbs(digits: &[u32], bits_per_digit: usize) -> Vec<u64> {
+    let mut out = vec![0u64; (digits.len() * bits_per_digit).div_ceil(64)];
+    for (i, &d) in digits.iter().rev().enumerate() {
+        let bit = i * bits_per_digit;
+        let (limb, shift) = (bit / 64, bit % 64);
+        out[limb] |= u64::from(d) << shift;
+        if shift + bits_per_digit > 64 {
+            out[limb + 1] |= u64::from(d) >> (64 - shift);
+        }
+    }
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    out
 }
 
 /// A number may not run straight into an identifier character.
@@ -498,6 +545,10 @@ impl Parser {
                     negative: negative != i.negative && i.digits != "0",
                     digits: i.digits.clone(),
                 }),
+                Some(Tok::OversizeInt(magnitude)) => PyLit::OversizeInt {
+                    negative,
+                    magnitude: magnitude.clone(),
+                },
                 Some(Tok::Float(f)) => PyLit::Float(if negative { -f } else { *f }),
                 Some(Tok::Imaginary) => return Err(PyError::Uncaught),
                 _ => return Err(PyError::Invalid),
@@ -530,6 +581,10 @@ impl Parser {
         self.pos += 1;
         let value = match token {
             Tok::Int(i) => PyLit::Int(i),
+            Tok::OversizeInt(magnitude) => PyLit::OversizeInt {
+                negative: false,
+                magnitude,
+            },
             Tok::Float(f) => PyLit::Float(f),
             Tok::Imaginary | Tok::Bytes => {
                 self.skip_string_run();
@@ -720,6 +775,17 @@ fn py_eq(a: &PyLit, b: &PyLit) -> bool {
     }
     match (a, b) {
         (PyLit::None, PyLit::None) => true,
+        // Never equal to a `Num`: each of those is within `OVERSIZE_BITS`.
+        (
+            PyLit::OversizeInt {
+                negative: x_negative,
+                magnitude: x,
+            },
+            PyLit::OversizeInt {
+                negative: y_negative,
+                magnitude: y,
+            },
+        ) => x_negative == y_negative && x == y,
         (PyLit::Str(x), PyLit::Str(y)) => x == y,
         (PyLit::Tuple(x), PyLit::Tuple(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| py_eq(p, q))
@@ -755,6 +821,87 @@ mod tests {
             PyLit::Dict(vec![(ok("1"), ok("'c'")), (ok("'1'"), ok("'d'"))])
         );
         assert_eq!(ok("\n\n00"), PyLit::Int(BigInt::from_digits(false, "0")));
+    }
+
+    /// A power-of-two-base literal is converted to decimal only while it
+    /// can still have few enough digits to print; past that it is kept as
+    /// its bits, in every base the same value.
+    #[test]
+    fn an_oversize_integer_is_kept_without_converting_it() {
+        // 16^4300 - 1 is the widest value still converted: 5,178 digits.
+        let PyLit::Int(widest) = ok(&format!("0x{}", "f".repeat(4300))) else {
+            panic!("converted");
+        };
+        assert_eq!(widest.digits.len(), 5178);
+        assert!(widest.digits.ends_with("5"));
+        // Leading zeros and underscores do not count towards the size.
+        assert_eq!(
+            ok(&format!("0x{}_{}", "0".repeat(100_000), "f".repeat(4300))),
+            PyLit::Int(widest)
+        );
+        assert_eq!(ok(&format!("0b{}", "0".repeat(100_000))), ok("0"));
+        // 16^4300 is one bit more.
+        let oversize = ok(&format!("0x1{}", "0".repeat(4300)));
+        let mut magnitude = vec![0u64; 4300 * 4 / 64 + 1];
+        *magnitude.last_mut().unwrap() = 1 << (4300 * 4 % 64);
+        assert_eq!(
+            oversize,
+            PyLit::OversizeInt {
+                negative: false,
+                magnitude
+            }
+        );
+        assert_eq!(ok(&format!("0b1{}", "0".repeat(17_200))), oversize);
+        assert_eq!(ok(&format!("0o2{}", "0".repeat(5733))), oversize);
+        assert_eq!(ok(&format!("0X_0001{}", "0".repeat(4300))), oversize);
+        assert_ne!(ok(&format!("0x1{}1", "0".repeat(4299))), oversize);
+        // Every digit counts, across limb boundaries, in each base.
+        let ones = PyLit::OversizeInt {
+            negative: false,
+            magnitude: vec![u64::MAX; 300],
+        };
+        assert_eq!(ok(&format!("0x{}", "f".repeat(4800))), ones);
+        assert_eq!(ok(&format!("0o{}", "7".repeat(6400))), ones);
+        assert_eq!(ok(&format!("0b{}", "1".repeat(19_200))), ones);
+        let octal = "1234567".repeat(900);
+        let binary: String = octal
+            .chars()
+            .map(|c| format!("{:03b}", c.to_digit(8).unwrap()))
+            .collect();
+        let padded = format!("{}{binary}", "0".repeat((4 - binary.len() % 4) % 4));
+        let hex: String = padded
+            .as_bytes()
+            .chunks(4)
+            .map(|c| {
+                let nibble = u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap();
+                format!("{nibble:x}")
+            })
+            .collect();
+        let value = ok(&format!("0o{octal}"));
+        assert!(matches!(value, PyLit::OversizeInt { .. }));
+        assert_eq!(ok(&format!("0b{binary}")), value);
+        assert_eq!(ok(&format!("0x{hex}")), value);
+
+        // A sign applies, and the value is a dict key like any integer.
+        let negative = ok(&format!("-0x1{}", "0".repeat(4300)));
+        assert!(matches!(
+            negative,
+            PyLit::OversizeInt { negative: true, .. }
+        ));
+        let big = format!("0x1{}", "0".repeat(4300));
+        let same = format!("0b1{}", "0".repeat(17_200));
+        assert_eq!(
+            ok(&format!("{{{big}: 1, -{big}: 2, {same}: 3, 1: 4, 1.0: 5}}")),
+            PyLit::Dict(vec![
+                (oversize, ok("3")),
+                (negative, ok("2")),
+                (ok("1"), ok("5")),
+            ])
+        );
+        assert_eq!(
+            ok(&format!("{{1: {big}, True: 2}}")),
+            PyLit::Dict(vec![(ok("1"), ok("2"))])
+        );
     }
 
     #[test]

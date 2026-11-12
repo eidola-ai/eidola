@@ -65,6 +65,7 @@ impl BigInt {
     }
 
     /// Builds a value from base-2^k or arbitrary-radix digits (each `< radix`).
+    /// Quadratic in the digit count: callers bound it.
     pub fn from_radix_digits(negative: bool, radix: u32, digits: &[u32]) -> BigInt {
         // Little-endian limbs in base 1e9.
         const BASE: u64 = 1_000_000_000;

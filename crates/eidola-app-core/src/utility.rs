@@ -25,8 +25,8 @@
 
 use crate::error::AppError;
 use crate::{
-    Change, ChargePricing, EidolaResolved, Inner, backends, db, estimate_charge_credits,
-    fetch_models, local_models, now_ms, process_refund, recover_refund,
+    ChargePricing, EidolaResolved, Inner, backends, db, estimate_charge_credits, fetch_models,
+    local_models, now_ms,
 };
 
 /// Where a chore call would go, and what it would cost — resolved without
@@ -233,12 +233,13 @@ impl Inner {
                 // with it is its own doctrine — the router degrades and lets
                 // the post through, unrefined, rather than routing through
                 // some other model.
-                let entry = models
-                    .data
-                    .iter()
-                    .find(|m| m.id == target.model)
-                    .ok_or_else(|| AppError::ModelUnavailable {
-                        model: target.canonical.clone(),
+                // Matched as the gateway resolves the reference: a digest
+                // by hash, a tag by the row it names.
+                let entry =
+                    crate::find_catalog_entry(&models.data, &target.model).ok_or_else(|| {
+                        AppError::ModelUnavailable {
+                            model: target.canonical.clone(),
+                        }
                     })?;
                 Ok(UtilityRoute {
                     client,
@@ -290,9 +291,8 @@ impl Inner {
                         ),
                     });
                 }
-                let (prep, auth) = self.acquire_spend(&cfg, db_conn, charge, now).await?;
-                spend = Some(prep);
-                Some(auth)
+                spend = Some(self.acquire_spend(&cfg, db_conn, charge, now).await?);
+                None
             }
         };
 
@@ -305,17 +305,15 @@ impl Inner {
         let mut request = route
             .client
             .post(format!("{}/v1/chat/completions", route.base_url))
-            .json(&body);
-        if let Some(auth) = &auth_value {
-            request = request.header("Authorization", auth);
-        }
+            .json(&*crate::body_with_spend(&body, spend.as_ref()));
+        request = crate::with_authorization(request, auth_value.as_deref());
 
         let response = match request.send().await {
             Ok(resp) => resp,
             Err(e) => {
                 // The server may have received the request: recover the refund
                 // rather than abandoning the credential.
-                self.settle_utility_refund(db_conn, &spend, &auth_value, &route, None, now)
+                self.settle_utility_refund(db_conn, &mut spend, &route, None, now)
                     .await;
                 return Err(AppError::from_request(e));
             }
@@ -348,7 +346,7 @@ impl Inner {
             {
                 Ok(text) => text,
                 Err(e) => {
-                    self.settle_utility_refund(db_conn, &spend, &auth_value, &route, None, now)
+                    self.settle_utility_refund(db_conn, &mut spend, &route, None, now)
                         .await;
                     return Err(AppError::Network {
                         message: format!("failed to read the {} response: {e}", target.chore),
@@ -360,10 +358,9 @@ impl Inner {
 
         self.settle_utility_refund(
             db_conn,
-            &spend,
-            &auth_value,
+            &mut spend,
             &route,
-            parsed.get("refund"),
+            crate::inline_refund(&parsed),
             now,
         )
         .await;
@@ -386,48 +383,31 @@ impl Inner {
             .to_string())
     }
 
-    /// Settle a remote chore call's credential: apply the inline refund when
-    /// the response carried one, otherwise try the recovery endpoint. A no-op
-    /// for the zero-spend backends. Best-effort throughout — a chore must never
-    /// turn a wallet hiccup into a failed post.
+    /// Settle a remote chore call's inputs: apply the inline refunds when
+    /// the response carried them, otherwise try the recovery endpoint, input
+    /// by input. A no-op for the zero-spend backends. Best-effort throughout
+    /// — a chore must never turn a wallet hiccup into a failed post.
     async fn settle_utility_refund(
         &self,
         db_conn: &turso::Connection,
-        spend: &Option<crate::SpendPrep>,
-        auth_value: &Option<String>,
+        spend: &mut Option<crate::SpendPrep>,
         route: &UtilityRoute,
         inline: Option<&serde_json::Value>,
         now: i64,
     ) {
         let Some(spend) = spend else { return };
-        let refund_obj = match inline {
-            Some(obj) => Some(obj.clone()),
-            None => match auth_value {
-                Some(auth) => recover_refund(&route.client, &route.base_url, auth)
-                    .await
-                    .ok(),
-                None => None,
-            },
-        };
-        let Some(refund_obj) = refund_obj else {
-            eprintln!("warning: a utility call's credential refund could not be recovered");
-            return;
-        };
-        let applied = process_refund(
-            &refund_obj,
-            &spend.params,
-            &spend.spend_proof,
-            &spend.pre_refund,
-            &spend.public_key,
-            db_conn,
-            &spend.pre_cred_id,
-            spend.cred.generation + 1,
-            now,
-        )
-        .await;
-        match applied {
-            Ok(()) => self.bus.emit(Change::Wallet),
-            Err(e) => eprintln!("warning: a utility call's refund failed to apply: {e}"),
+        let (_, error) = spend
+            .settle(
+                &route.client,
+                &route.base_url,
+                db_conn,
+                &self.bus,
+                inline,
+                now,
+            )
+            .await;
+        if let Some(e) = error {
+            eprintln!("warning: a utility call's credential refund was not applied: {e}");
         }
     }
 }

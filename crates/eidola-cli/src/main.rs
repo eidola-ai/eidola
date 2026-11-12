@@ -37,10 +37,12 @@ enum Command {
         /// Path to PEM-encoded SEV-SNP ASK (Intermediate CA) certificate
         #[arg(long)]
         hardware_intermediate_ca: Option<String>,
-        /// Add a trusted enclave release: `<snp>:<rtmr1>:<rtmr2>`
+        /// Add a trusted server launch identity:
+        /// `<measurement>:<host_data>:<guest_policy>` (the SEV-SNP launch
+        /// digest, the config hash it is launched with, the guest policy)
         #[arg(long)]
         trust_measurement: Option<String>,
-        /// Remove a trusted enclave release by SNP measurement
+        /// Remove a trusted server launch identity: `<measurement>:<host_data>`
         #[arg(long)]
         untrust_measurement: Option<String>,
         /// Drop every trusted-measurement override (revert to the pin)
@@ -73,7 +75,17 @@ enum Command {
     /// Send a chat message
     Chat {
         /// The prompt to send
-        prompt: String,
+        #[arg(required_unless_present = "continue_post")]
+        prompt: Option<String>,
+        /// Continue an answer that stopped at its length limit, by its post id
+        /// (the one the length-limit warning names), from where it stopped —
+        /// by the model that wrote it, as a new version of that answer
+        #[arg(
+            long = "continue",
+            value_name = "POST",
+            conflicts_with_all = ["prompt", "model", "space"]
+        )]
+        continue_post: Option<String>,
         /// Model to use (defaults to the default template's agent model —
         /// transitional until wave 2 makes turns participant-aware)
         #[arg(long, short)]
@@ -263,6 +275,16 @@ enum ModelCommand {
         /// Model id (`<slug>@<backend>`) or bare slug (the local store)
         id: String,
     },
+    /// Show an Eidola model's identity: the weights hash it resolves to,
+    /// where the weights come from and every file the hash covers, so you
+    /// can check them yourself — and anything you should know about it (a
+    /// newer model for a pin, an announced or passed retirement). Read from
+    /// the catalog compiled into this build.
+    Show {
+        /// `tag`, `tag@sha256:<hex>` or `sha256:<hex>` (with or without
+        /// `@eidola`)
+        reference: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -404,6 +426,77 @@ fn read_ca_pem(path: Option<&str>, field_name: &str) -> Result<Option<String>, A
 }
 
 /// Print a failure plus, for the ones a user can act on, a hint.
+/// What `eidola model show <reference>` prints for `reference` against
+/// `catalog`: the weights it resolves to, their tags, source, lifecycle and
+/// per-file manifest, how to check them, and the notices a choice of it
+/// deserves (`model_catalog::notices`; with no answer history here, a
+/// followed tag's "updated" notice does not arise). `None` when the catalog
+/// does not know it, or it is not an Eidola reference.
+fn model_show_lines(
+    catalog: &[eidola_app_core::model_catalog::CatalogRow],
+    reference: &str,
+    today: &str,
+) -> Option<Vec<String>> {
+    use eidola_app_core::model_catalog::{self as mc, ModelNotice};
+    let mref = eidola_app_core::parse_model_ref(reference);
+    if mref.backend_id != "eidola" {
+        return None;
+    }
+    let id = mc::identity(catalog, &mref.model)?;
+    let total: u64 = id.files.iter().map(|f| f.size).sum();
+    let mut out = vec![
+        format!("{}  {}", mref.model, id.name),
+        format!("  sha256:      {}", id.sha256),
+        format!(
+            "  tags:        {}",
+            if id.tags.is_empty() {
+                "(none)".to_string()
+            } else {
+                id.tags.join(", ")
+            }
+        ),
+        format!(
+            "  source:      https://huggingface.co/{}/tree/{}",
+            id.repo, id.revision
+        ),
+        format!(
+            "  status:      {}",
+            match (id.lifecycle.as_str(), &id.retire_after) {
+                ("deprecated", Some(date)) => format!("deprecated, retires after {date}"),
+                ("retired", _) => "retired".to_string(),
+                (other, _) => other.to_string(),
+            }
+        ),
+        format!("  files:       {} ({})", id.files.len(), fmt_size(total)),
+    ];
+    // Each file's exact size, which is what a download is checked against
+    // (a rounded one reads a 4 KB template as "0 MB").
+    for f in &id.files {
+        out.push(format!("    {}  {}  {} bytes", f.sha256, f.path, f.size));
+    }
+    out.push(format!("  check them:  {}", id.doc_url));
+    for notice in mc::notices(catalog, &mref.model, None, None, today) {
+        out.push(match notice {
+            ModelNotice::Updated { tag, .. } => format!("note: {tag} now names newer weights"),
+            ModelNotice::NewerAvailable { tag, newer_sha256 } => format!(
+                "note: {tag} now names newer weights, sha256:{newer_sha256}; this pin keeps \
+                 the ones above"
+            ),
+            ModelNotice::Retiring { retire_after, past } => {
+                if past {
+                    format!("note: these weights were due to retire on {retire_after}")
+                } else {
+                    format!("note: these weights retire after {retire_after}")
+                }
+            }
+            ModelNotice::Retired => {
+                "note: these weights are retired; requests naming them are refused".to_string()
+            }
+        });
+    }
+    Some(out)
+}
+
 fn report(e: &Failure) {
     eprintln!("error: {e}");
     failure_hint(e);
@@ -526,7 +619,25 @@ fn app_hint(e: &AppError) {
                  command) and run this again"
             );
         }
+        AppError::LocalModelNotDownloaded { model } => {
+            eprintln!("{}", not_downloaded_hint(model));
+        }
         _ => {}
+    }
+}
+
+/// How to get an on-device model a turn named but this machine lacks: the
+/// download command for a curated one, else where to find the command.
+fn not_downloaded_hint(model: &str) -> String {
+    match eidola_app_core::catalog_entry_for_model_ref(model) {
+        Some(entry) => format!(
+            "hint: run `eidola model download {}` ({}), or pick another model with `--model`",
+            entry.id,
+            fmt_size(entry.size_bytes)
+        ),
+        None => "hint: download it with `eidola model download <url>`, or pick another \
+                 model with `--model`"
+            .to_string(),
     }
 }
 
@@ -550,6 +661,35 @@ fn main() {
             std::process::exit(1);
         }
         return;
+    }
+
+    // `model show` reads only the catalog compiled into this binary, so it
+    // needs neither the profile nor the app, and works whoever holds them.
+    if let Some(Command::Model {
+        command: ModelCommand::Show { reference },
+    }) = &cli.command
+    {
+        let today = eidola_app_core::post_stamp(eidola_app_core::now_ms());
+        match model_show_lines(
+            eidola_app_core::model_catalog::CATALOG,
+            reference,
+            &today[..10],
+        ) {
+            Some(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
+                return;
+            }
+            None => {
+                report(&Failure::App(
+                    eidola_app_core::error::AppError::ModelUnavailable {
+                        model: reference.clone(),
+                    },
+                ));
+                std::process::exit(1);
+            }
+        }
     }
 
     // Decide who answers — the running Eidola, or this process. Either way the
@@ -623,9 +763,9 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                 }
             );
             for m in &trust.trusted_measurements {
-                println!("  - snp = {}", m.snp);
-                println!("    tdx.rtmr1 = {}", m.tdx_rtmr1);
-                println!("    tdx.rtmr2 = {}", m.tdx_rtmr2);
+                println!("  - sev_snp.measurement = {}", m.measurement);
+                println!("    sev_snp.host_data = {}", m.host_data);
+                println!("    sev_snp.guest_policy = {}", m.guest_policy);
             }
             println!(
                 "hardware_root_ca: {}",
@@ -728,18 +868,21 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
             if let Some(m) = trust_entry {
                 let added = core
                     .trust_measurement(
-                        m.snp_measurement.clone(),
-                        m.tdx_measurement.rtmr1.clone(),
-                        m.tdx_measurement.rtmr2.clone(),
+                        m.measurement.clone(),
+                        m.host_data.clone(),
+                        m.guest_policy.clone(),
                     )
                     .await?;
                 if added {
                     println!(
-                        "added trusted measurement: snp={}, tdx.rtmr1={}, tdx.rtmr2={}",
-                        m.snp_measurement, m.tdx_measurement.rtmr1, m.tdx_measurement.rtmr2,
+                        "added trusted measurement: measurement={}, host_data={}, guest_policy={}",
+                        m.measurement, m.host_data, m.guest_policy,
                     );
                 } else {
-                    println!("measurement already trusted (snp={})", m.snp_measurement);
+                    println!(
+                        "measurement already trusted (measurement={}, host_data={})",
+                        m.measurement, m.host_data
+                    );
                 }
             }
             if clear_trusted_measurements {
@@ -749,9 +892,9 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
             if let Some(key) = untrust_key {
                 let removed = core.untrust_measurement(key.clone()).await?;
                 if removed {
-                    println!("removed trusted measurement (snp={key})");
+                    println!("removed trusted measurement ({key})");
                 } else {
-                    println!("measurement not found (snp={key})");
+                    println!("measurement not found ({key})");
                 }
             }
             Ok(())
@@ -957,20 +1100,13 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                     Ok(())
                 }
                 CredentialsCommand::Recover => {
-                    let spending = session.wallet_spending_credentials().await?;
-                    if spending.is_empty() {
-                        println!("no in-flight credentials");
-                        return Ok(());
-                    }
-                    println!("attempting to recover {} credential(s)...", spending.len());
-                    let recovered = session.recover_spending_credentials().await?;
-                    if recovered.is_empty() {
-                        println!("no credentials could be recovered");
-                    } else {
-                        println!("recovered {} credential(s):", recovered.len());
-                        for nonce in &recovered {
-                            println!("  {nonce}");
-                        }
+                    // Both doors, always: a conversion whose answer was lost
+                    // leaves nothing in flight to announce it.
+                    let spends = session.recover_spending_credentials().await?;
+                    let still_spending = session.wallet_spending_credentials().await?.len();
+                    let issuances = session.recover_pending_issuances().await?;
+                    for line in recovery_report(&spends, still_spending, issuances.as_ref()) {
+                        println!("{line}");
                     }
                     Ok(())
                 }
@@ -980,6 +1116,7 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
             prompt,
             model,
             space,
+            continue_post,
         }) => {
             // No --model flag → the default template's agent model, resolved
             // by **whichever process takes the turn**, at the moment it takes
@@ -991,9 +1128,12 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
             // the wire from a model the reader named, so sending one would
             // leave the app unable to apply its own current answer. It
             // therefore travels unnamed.
+            //
+            // A continuation names no model: the answer it continues names its
+            // own participant and model, and is continued by exactly those.
             let model = match model {
                 Some(m) => Some(m),
-                None if session.is_client() => None,
+                None if session.is_client() || continue_post.is_some() => None,
                 None => Some(session.default_model().await?),
             };
 
@@ -1019,7 +1159,17 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
             // (dim, prefixed with "thinking: ") so a piped stdout still
             // captures only the final answer text.
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
-            let chat_fut = session.chat_stream(prompt, model, space, tx);
+            let chat_fut = async {
+                match continue_post {
+                    // The stream opens with the text being continued, so
+                    // stdout ends holding the whole answer, as for any turn.
+                    Some(post) => session.continue_stream(post, tx).await,
+                    None => {
+                        let prompt = prompt.expect("clap requires a prompt without --continue");
+                        session.chat_stream(prompt, model, space, tx).await
+                    }
+                }
+            };
 
             // Pump events while chat_fut runs. We `tokio::join!` the two
             // halves so events drain in real time rather than only after
@@ -1296,6 +1446,8 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                 println!("unpinned {id}");
                 Ok(())
             }
+            // Answered in `main`, before a session is opened.
+            ModelCommand::Show { .. } => unreachable!("`model show` is answered in main"),
         },
         Some(Command::Backend { command }) => match command {
             BackendCommand::List => {
@@ -1418,6 +1570,14 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                         println!("{:<48} {}-token context", m.id, m.context_length);
                     } else {
                         println!("{}", m.id);
+                    }
+                    // An Eidola model's identity: its weights hash and every
+                    // tag naming it (`eidola model show <tag>` for the rest).
+                    if let Some(sha256) = &m.sha256 {
+                        println!("    sha256:{sha256}");
+                        if !m.tags.is_empty() {
+                            println!("    tags: {}", m.tags.join(", "));
+                        }
                     }
                 }
                 Ok(())
@@ -1556,6 +1716,64 @@ fn in_flight_line(c: &eidola_app_core::CredentialLifecycleInfo) -> String {
         Some(amount) => format!("{}: {} credits, {} charged", c.nonce, c.credits, amount),
         None => format!("{}: {} credits, charge not recorded", c.nonce, c.credits),
     }
+}
+
+/// What `eidola wallet credentials recover` prints: the holds it settled and
+/// those still in flight, then the conversions whose lost answer arrived and
+/// those still unanswered. `issuances` is `None` when another process answers
+/// for the profile and asks for those itself.
+fn recovery_report(
+    spends: &[String],
+    still_spending: usize,
+    issuances: Option<&eidola_app_core::IssuanceRecovery>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if spends.is_empty() && still_spending == 0 {
+        lines.push("no in-flight credentials".to_string());
+    }
+    if !spends.is_empty() {
+        lines.push(format!(
+            "recovered {} in-flight credential(s):",
+            spends.len()
+        ));
+        lines.extend(spends.iter().map(|nonce| format!("  {nonce}")));
+    }
+    if still_spending > 0 {
+        lines.push(format!(
+            "{still_spending} credential(s) still in flight: the request may still be running, \
+             or the server could not be reached; try again later"
+        ));
+    }
+    match issuances {
+        None => lines.push(
+            "conversions awaiting an answer are asked for again by the running Eidola".to_string(),
+        ),
+        Some(issuances) => {
+            if !issuances.recovered.is_empty() {
+                lines.push(format!(
+                    "recovered {} converted credential(s) whose answer had been lost:",
+                    issuances.recovered.len()
+                ));
+                lines.extend(issuances.recovered.iter().map(|nonce| format!("  {nonce}")));
+            }
+            if issuances.waiting > 0 {
+                lines.push(format!(
+                    "{} conversion(s) too recent to ask for again; try again in ten minutes",
+                    issuances.waiting
+                ));
+            }
+            if issuances.unresolved > 0 {
+                lines.push(format!(
+                    "{} conversion(s) still unanswered; try again later",
+                    issuances.unresolved
+                ));
+            }
+            if issuances.recovered.is_empty() && issuances.waiting + issuances.unresolved == 0 {
+                lines.push("no conversions awaiting an answer".to_string());
+            }
+        }
+    }
+    lines
 }
 
 /// Human-readable relative expiry for balance pools (`expires_at` is epoch
@@ -2008,11 +2226,25 @@ fn chat_summary(result: &eidola_app_core::ChatResult) -> String {
         }
     }
     if result.truncated {
-        out.push_str(
-            "warning: this answer stopped at the model's length limit, not because the model \
-             was done — ask for a shorter answer, or ask it to carry on from where this one \
-             stops\n",
-        );
+        // Where the answer can be continued the warning names the command that
+        // does it, with the post it acts on — the one id this run has that the
+        // reader could not otherwise find. `continuable` is the door's own
+        // verdict, so the command named is never one that would be refused.
+        match result
+            .response_action_id
+            .as_deref()
+            .filter(|_| result.continuable)
+        {
+            Some(post) => out.push_str(&format!(
+                "warning: this answer stopped at the model's length limit, not because the \
+                 model was done — continue it from where it stopped with `eidola chat \
+                 --continue {post}`\n"
+            )),
+            None => out.push_str(
+                "warning: this answer stopped at the model's length limit, not because the \
+                 model was done — ask for a shorter answer\n",
+            ),
+        }
     }
     out.push_str(&format!(
         "---\nspace: {}  model: {}  tokens: {}/{}  credits: {}",
@@ -2101,6 +2333,180 @@ impl CreateConsent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default model on a fresh profile is not downloaded; the hint
+    /// names the command that downloads it.
+    #[test]
+    fn a_curated_model_that_is_not_downloaded_hints_its_download_command() {
+        let hint = not_downloaded_hint(eidola_app_core::config::DEFAULT_MODEL);
+        assert!(
+            hint.contains("`eidola model download gemma-4-e4b`"),
+            "{hint}"
+        );
+        let other = not_downloaded_hint("mine@local");
+        assert!(other.contains("`eidola model download <url>`"), "{other}");
+    }
+
+    /// A conversion whose answer was lost leaves nothing in flight, so the
+    /// report must reach it with no in-flight credential to announce it, and
+    /// say plainly what is still unanswered.
+    #[test]
+    fn the_recovery_report_covers_lost_conversions_with_nothing_in_flight() {
+        let issuances = eidola_app_core::IssuanceRecovery {
+            recovered: vec!["abc".into()],
+            waiting: 1,
+            unresolved: 2,
+        };
+        let lines = recovery_report(&[], 0, Some(&issuances));
+        assert_eq!(lines[0], "no in-flight credentials");
+        assert!(lines.iter().any(|l| l.contains("recovered 1 converted")));
+        assert!(lines.contains(&"  abc".to_string()));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("1 conversion(s) too recent"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("2 conversion(s) still unanswered"))
+        );
+
+        let nothing = recovery_report(&[], 0, Some(&Default::default()));
+        assert_eq!(
+            nothing,
+            [
+                "no in-flight credentials",
+                "no conversions awaiting an answer"
+            ]
+        );
+
+        let held = recovery_report(&["n1".into()], 1, None);
+        assert!(held[0].starts_with("recovered 1 in-flight"));
+        assert!(
+            held.iter()
+                .any(|l| l.starts_with("1 credential(s) still in flight"))
+        );
+        assert!(held.last().unwrap().contains("the running Eidola"));
+    }
+
+    mod model_show {
+        use eidola_app_core::model_catalog::{CatalogRow, Lifecycle, WeightsFile};
+
+        const NEW: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+        const OLD: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        const FILES: &[WeightsFile] = &[WeightsFile {
+            path: "model.safetensors",
+            size: 2048,
+            sha256: "5555555555555555555555555555555555555555555555555555555555555555",
+        }];
+        const ROWS: &[CatalogRow] = &[
+            CatalogRow {
+                sha256: NEW,
+                tags: &["flash"],
+                name: "Flash",
+                repo: "example/flash",
+                revision: "6666666666666666666666666666666666666666",
+                files: FILES,
+                lifecycle: Lifecycle::Current,
+            },
+            CatalogRow {
+                sha256: OLD,
+                tags: &[],
+                name: "Flash (previous)",
+                repo: "example/flash",
+                revision: "7777777777777777777777777777777777777777",
+                files: FILES,
+                lifecycle: Lifecycle::Deprecated {
+                    retire_after: "2027-06-01",
+                },
+            },
+        ];
+
+        #[test]
+        fn a_followed_tag_shows_its_hash_source_and_manifest() {
+            let lines = super::super::model_show_lines(ROWS, "flash", "2026-11-09").unwrap();
+            let text = lines.join("\n");
+            assert!(text.contains(&format!("sha256:      {NEW}")), "{text}");
+            assert!(text.contains("tags:        flash"), "{text}");
+            assert!(
+                text.contains(
+                    "source:      https://huggingface.co/example/flash/tree/\
+                     6666666666666666666666666666666666666666"
+                ),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "{}  model.safetensors  2048 bytes",
+                    "5".repeat(64)
+                )),
+                "each file with its exact size: {text}"
+            );
+            assert!(
+                text.contains(eidola_app_core::model_catalog::MODEL_IDENTITY_DOC),
+                "{text}"
+            );
+            assert!(!text.contains("note:"), "nothing to say: {text}");
+        }
+
+        #[test]
+        fn a_pin_whose_tag_moved_says_so_and_names_its_retirement() {
+            let pin = format!("flash@sha256:{OLD}@eidola");
+            let text = super::super::model_show_lines(ROWS, &pin, "2026-11-09")
+                .unwrap()
+                .join("\n");
+            assert!(text.contains(&format!("sha256:      {OLD}")), "{text}");
+            assert!(
+                text.contains(&format!("flash now names newer weights, sha256:{NEW}")),
+                "{text}"
+            );
+            assert!(
+                text.contains("deprecated, retires after 2027-06-01"),
+                "{text}"
+            );
+            assert!(
+                text.contains("these weights retire after 2027-06-01"),
+                "{text}"
+            );
+        }
+
+        /// Every tag of the catalog compiled into this binary shows its
+        /// weights, with every file the hash covers.
+        #[test]
+        fn the_shipped_catalog_shows_every_tag() {
+            use eidola_app_core::model_catalog::CATALOG;
+            for row in CATALOG {
+                for tag in row.tags {
+                    let text = super::super::model_show_lines(CATALOG, tag, "2026-11-09")
+                        .unwrap()
+                        .join("\n");
+                    assert!(
+                        text.contains(&format!("sha256:      {}", row.sha256)),
+                        "{text}"
+                    );
+                    for file in row.files {
+                        assert!(
+                            text.contains(&format!(
+                                "{}  {}  {} bytes",
+                                file.sha256, file.path, file.size
+                            )),
+                            "{tag}: {}",
+                            file.path
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn an_unknown_or_non_eidola_model_shows_nothing() {
+            assert!(super::super::model_show_lines(ROWS, "nothing", "2026-11-09").is_none());
+            assert!(
+                super::super::model_show_lines(ROWS, "gemma-4-e2b@local", "2026-11-09").is_none()
+            );
+        }
+    }
     use eidola_app_core::{
         ExternalEngineBackend, LocalModelInfo, LocalModelStatus, LocalModelsState, RunningEngine,
     };
@@ -2116,6 +2522,8 @@ mod tests {
             response_action_id: Some("a2".into()),
             declined: None,
             truncated,
+            // As the core reports it for a truncated answer it could continue.
+            continuable: truncated,
         }
     }
 
@@ -2134,6 +2542,54 @@ mod tests {
             cut_off.contains("---\nspace: s1  model: kimi-k2  tokens: 11/4096  credits: 320"),
             "and the footer is unchanged beneath it: {cut_off:?}"
         );
+    }
+
+    #[test]
+    fn a_cut_off_answer_names_the_command_that_continues_it() {
+        // The warning is not a dead end where the answer can be continued: it
+        // names the command and the post it acts on, which this run is the
+        // only place to learn.
+        let cut_off = chat_summary(&finished_turn(true));
+        assert!(
+            cut_off.contains("`eidola chat --continue a2`"),
+            "{cut_off:?}"
+        );
+        // An answer the core says cannot be continued (a local model's, one
+        // whose author left, one whose request the Record cut) gets no command
+        // that would be refused.
+        let local = chat_summary(&eidola_app_core::ChatResult {
+            continuable: false,
+            ..finished_turn(true)
+        });
+        assert!(
+            local.starts_with("warning: this answer stopped at the model's length limit"),
+            "{local:?}"
+        );
+        assert!(!local.contains("--continue"), "{local:?}");
+    }
+
+    #[test]
+    fn chat_takes_a_prompt_or_a_post_to_continue_but_not_both() {
+        use clap::Parser;
+        let continued = Cli::try_parse_from(["eidola", "chat", "--continue", "a2"])
+            .expect("a continuation needs no prompt");
+        assert!(matches!(
+            continued.command,
+            Some(Command::Chat {
+                prompt: None,
+                continue_post: Some(ref post),
+                ..
+            }) if post == "a2"
+        ));
+        for refused in [
+            vec!["eidola", "chat"],
+            vec!["eidola", "chat", "--continue", "a2", "more please"],
+            vec!["eidola", "chat", "--continue", "a2", "--model", "m"],
+            vec!["eidola", "chat", "--continue", "a2", "--space", "s"],
+        ] {
+            assert!(Cli::try_parse_from(&refused).is_err(), "{refused:?}");
+        }
+        assert!(Cli::try_parse_from(["eidola", "chat", "hello"]).is_ok());
     }
 
     fn declined_turn(reason: &str) -> eidola_app_core::ChatResult {
@@ -2993,6 +3449,7 @@ mod tests {
                 response_action_id: None,
                 declined: None,
                 truncated: false,
+                continuable: false,
             },
         )]
     }

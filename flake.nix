@@ -168,6 +168,120 @@
             [ pname ] ++ getAllDeps pname ++ builtins.concatMap (d: [ d ] ++ getAllDeps d) devDeps
           );
 
+        # Which workspace crate (if any) a path belongs to; `relPath` is
+        # relative to the repository root, with a leading `/`.
+        getCrateForPath =
+          relPath:
+          pkgs.lib.findFirst (
+            name:
+            let
+              p = cratePaths.${name};
+            in
+            relPath == "/${p}" || pkgs.lib.hasPrefix "/${p}/" relPath
+          ) null workspaceCrates;
+
+        # The non-Cargo inputs a build or its tests read, which
+        # `craneLib.filterCargoSources` would drop because they are not Rust
+        # or Cargo files. One predicate for both source filters
+        # (`mkFilteredSrc`, scoped to a crate set, and `fullSrc`, the whole
+        # workspace), so they cannot diverge: a new input is added here once.
+        # `crateInSet name` says whether crate `name` is being built;
+        # `wholeWorkspace` is set for the workspace-wide checks only.
+        keepNonCargoInput =
+          { crateInSet, wholeWorkspace }:
+          relPath: path: type:
+          let
+            matchingCrate = getCrateForPath relPath;
+            # Both `eidola-app-core/build.rs` and `eidola-server-gateway/build.rs`
+            # consume pinned trust data from `releases/`:
+            #   * eidola-app-core → all of `releases/trust/*.json` +
+            #     `releases/schema/*.json` (client trust root)
+            #   * eidola-server-gateway → `releases/trust/engine-enclaves.json`
+            #     (the engine pins), and the platform endorsements and Sigstore
+            #     trusted root their machine policy is re-derived from
+            # Included only when either crate is built, so unrelated crates
+            # do not cache-bust on every manifest regeneration.
+            # `artifact-manifest.json` (at the root, not under `releases/`)
+            # is deliberately excluded — it records the eidola-cli narHash
+            # itself, so including it would create a self-reference that
+            # prevents the build from reaching a fixed point.
+            isTrustRootPath = relPath == "/releases" || pkgs.lib.hasPrefix "/releases/" relPath;
+            # The vendored platform endorsements, from which the gateway's
+            # build re-derives each engine pin's machine policy. Only the
+            # gateway reads them, so app-core-only packages leave them out
+            # and do not rebuild when a new release is vendored.
+            isPlatformEndorsementsPath =
+              relPath == "/releases/trust/platform-endorsements"
+              || pkgs.lib.hasPrefix "/releases/trust/platform-endorsements/" relPath;
+            # `eidola-server-gateway/build.rs` also checks every engine pin in
+            # `releases/trust/engine-enclaves.json` against the committed
+            # deployment configs it names.
+            isEngineDeployPath =
+              relPath == "/deploy"
+              || relPath == "/deploy/engine"
+              || pkgs.lib.hasPrefix "/deploy/engine/" relPath;
+            # ... and compiles in the model catalog, one file per set of
+            # weights under `models/`, bound to those pins by weights hash.
+            isModelCatalogPath = relPath == "/models" || pkgs.lib.hasPrefix "/models/" relPath;
+          in
+          (crateInSet "eidola-app-core" && isTrustRootPath && !isPlatformEndorsementsPath)
+          || (crateInSet "eidola-server-gateway" && isTrustRootPath)
+          || (crateInSet "eidola-server-gateway" && isEngineDeployPath)
+          || (crateInSet "eidola-server-gateway" && isModelCatalogPath)
+          # app-core compiles the same catalog in, to tell a user what a model
+          # choice resolves to, when a tag has moved and when weights retire.
+          || (crateInSet "eidola-app-core" && isModelCatalogPath)
+          # Test fixtures and data of a crate being built: a package build
+          # runs that crate's tests (`doCheck`), and the workspace checks run
+          # every crate's; fixtures are rarely Rust source (the gateway's
+          # engine-trust fixtures are YAML and JSON, the engine crates' test
+          # data JSON).
+          || (
+            matchingCrate != null
+            && crateInSet matchingCrate
+            && (
+              pkgs.lib.hasInfix "/tests/fixtures/" relPath || pkgs.lib.hasInfix "/tests/data/" relPath
+            )
+          )
+          # The kernel crate whole: its library embeds the committed
+          # `kernels.manifest.json`, and its tests hash every input of the
+          # kernel build the manifest lists (CUDA sources, Nix expressions,
+          # scripts) against it.
+          || (matchingCrate == "eidola-engine-kernels" && crateInSet matchingCrate)
+          # eidola-apple's tests read the synthetic universal app the
+          # round-trip checks use. Only the workspace checks run those tests
+          # (the desktop packages compile eidola-apple but test only
+          # themselves), so the desktop sources stay as they are.
+          || (
+            wholeWorkspace
+            && (
+              relPath == "/scripts"
+              || relPath == "/scripts/fixtures"
+              || relPath == "/scripts/fixtures/apple-roundtrip"
+              || pkgs.lib.hasPrefix "/scripts/fixtures/apple-roundtrip/" relPath
+            )
+          )
+          # The committed `artifact-manifest.json`, which app-core's tests
+          # hold to the claim set this build expects. Only the workspace
+          # checks take it: a package source that included it would be an
+          # input to the very hashes the manifest records (see above).
+          || (wholeWorkspace && relPath == "/artifact-manifest.json")
+          # .sql files (include_str! in the CLI), .ttf font files
+          # (include_bytes! in the GUI), .ftl localization files (read by the
+          # GUI's build.rs, which emits them as string literals — every
+          # shipped string is a build input inside the measured artifact,
+          # never loaded at runtime), and .der certificates (tinfoil-verifier's
+          # pinned Intel SGX root, include_bytes!).
+          || (
+            type == "regular"
+            && (
+              pkgs.lib.hasSuffix ".sql" path
+              || pkgs.lib.hasSuffix ".ttf" path
+              || pkgs.lib.hasSuffix ".ftl" path
+              || pkgs.lib.hasSuffix ".der" path
+            )
+          );
+
         # Create filtered source that only includes specific crates
         mkFilteredSrc =
           crates:
@@ -182,16 +296,6 @@
                 value = true;
               }) crates
             );
-            # Find which crate (if any) a path belongs to
-            getCrateForPath =
-              relPath:
-              pkgs.lib.findFirst (
-                name:
-                let
-                  p = cratePaths.${name};
-                in
-                relPath == "/${p}" || pkgs.lib.hasPrefix "/${p}/" relPath
-              ) null workspaceCrates;
             # Check if path is a parent directory of any workspace crate
             isParentOfCrate =
               relPath: pkgs.lib.any (path: pkgs.lib.hasPrefix "${relPath}/" "/${path}") workspaceMemberPaths;
@@ -208,32 +312,16 @@
                   matchingCrate = getCrateForPath relPath;
                   # Is this an irrelevant crate? (in a crate dir but not in our set)
                   isIrrelevantCrate = matchingCrate != null && !(crateSet ? ${matchingCrate});
-                  # Both `eidola-app-core/build.rs` and `eidola-server/build.rs`
-                  # consume pinned trust data from `releases/`:
-                  #   * eidola-app-core → all of `releases/trust/*.json` +
-                  #     `releases/schema/*.json` (client trust root)
-                  #   * eidola-server → just `releases/trust/sigstore-trusted-root.json`
-                  #     (pinned Sigstore root; the runtime measurement resolver
-                  #     verifies Tinfoil release attestations against it)
-                  # Include `releases/` when either crate is in the set, but
-                  # only for those crates — unrelated crates shouldn't
-                  # cache-bust on every manifest regeneration.
-                  # `artifact-manifest.json` is deliberately excluded — it
-                  # records the eidola-cli narHash itself, so including it
-                  # would create a self-reference that prevents the build
-                  # from reaching a fixed point.
-                  trustRootFiles =
-                    crateSet ? "eidola-app-core"
-                    || crateSet ? "eidola-server";
-                  isTrustRootPath =
-                    relPath == "/releases"
-                    || pkgs.lib.hasPrefix "/releases/" relPath;
                 in
                 # Exclude irrelevant crate directories entirely
                 if isIrrelevantCrate then
                   false
-                # Trust-root build inputs for `eidola-app-core/build.rs`.
-                else if trustRootFiles && isTrustRootPath then
+                else if
+                  keepNonCargoInput {
+                    crateInSet = name: crateSet ? ${name};
+                    wholeWorkspace = false;
+                  } relPath path type
+                then
                   true
                 # Keep only root-level files that affect Cargo resolution/builds.
                 # This avoids generated files like artifact-manifest.json from
@@ -242,19 +330,6 @@
                   builtins.hasAttr baseName rootBuildFiles
                 # Keep directories that are parents of crate paths
                 else if type == "directory" && isParentOfCrate relPath then
-                  true
-                # Include .sql files (used by include_str! in the CLI), .ttf
-                # font files (used by include_bytes! in the GUI), and .ftl
-                # localization files (read by the GUI's build.rs, which emits
-                # them as string literals — every shipped string is a build
-                # input inside the measured artifact, never loaded at runtime).
-                # All three feed compile-time inputs; craneLib.filterCargoSources
-                # discards them by default because they aren't Rust source.
-                else if type == "regular" && (
-                  pkgs.lib.hasSuffix ".sql" path
-                  || pkgs.lib.hasSuffix ".ttf" path
-                  || pkgs.lib.hasSuffix ".ftl" path
-                ) then
                   true
                 # For everything else, use crane's filter (which handles .rs, Cargo.toml, etc.)
                 else
@@ -328,22 +403,19 @@
         # Full repo source for checks that compare committed vs generated files
         repoSrc = craneLib.path ./.;
 
-        # Full source for workspace-wide operations. Carries the same `.ftl`
-        # exception as `filteredSrc`: craneLib's filter keeps only Rust and
-        # Cargo files, and the GUI's build script reads `locales/` to generate
-        # its typed accessors, so the workspace-wide clippy/test derivations
-        # cannot compile it without them.
+        # Full source for workspace-wide operations (`checks.clippy`,
+        # `checks.tests`, `checks.rust-formatting`): every crate is built, so
+        # every crate's non-Cargo inputs are kept, by the same predicate the
+        # per-package sources use.
         fullSrc = pkgs.lib.cleanSourceWith {
           src = ./.;
           filter =
             path: type:
             craneLib.filterCargoSources path type
-            || (type == "regular" && pkgs.lib.hasSuffix ".ftl" path)
-            # .ttf and .sql feed include_bytes!/include_str! the same way .ftl
-            # feeds the localization build script; without them the workspace
-            # check derivations cannot compile eidola-gui or eidola-app-core.
-            || (type == "regular" && pkgs.lib.hasSuffix ".ttf" path)
-            || (type == "regular" && pkgs.lib.hasSuffix ".sql" path);
+            || keepNonCargoInput {
+              crateInSet = _: true;
+              wholeWorkspace = true;
+            } (pkgs.lib.removePrefix (toString ./.) (toString path)) path type;
         };
 
         # Base RUSTFLAGS for deterministic builds (extended per-target in mkTargetConfig)
@@ -566,8 +638,8 @@
           nixCrossSystem = null;
         };
 
-        # Generate OpenAPI specification from the server code
-        serverOpenApiSpec =
+        # Generate OpenAPI specification from the gateway code
+        gatewayOpenApiSpec =
           pkgs.runCommand "eidola-openapi-spec"
             {
               nativeBuildInputs = [ generateOpenapiBin ];
@@ -1712,15 +1784,190 @@ with open(path, "wb") as f:
                 dpkg-deb --contents "$out"
               '';
 
+        # ── The inference node's image root (eidola-server-engine) ──────────
+        #
+        # The tree `oci/eidola-server-engine/Containerfile` copies into a
+        # `FROM scratch` image, built for the one platform a node runs on
+        # (x86_64 Linux, Blackwell GPUs). Three things go in, and nothing else:
+        # the node binary, the C runtime it and the NVIDIA driver need, and the
+        # GPU kernel images. Weights are not in the image: a deployment mounts
+        # them read-only from a model pack, under /tinfoil/models.
+        #
+        # Why glibc and not the static musl every other image is. The CUDA
+        # executor reaches the driver through `cudarc`'s dynamic loading, and
+        # the confidential-computing check reaches NVML through `libloading`:
+        # both `dlopen` `libcuda.so.1` and `libnvidia-ml.so.1` at run time, and
+        # nothing of CUDA is linked at build time. Static musl cannot `dlopen`
+        # at all, and a dynamic musl process cannot host NVIDIA's libraries,
+        # which are built against glibc. So the node is a dynamic glibc binary.
+        # StageX's Rust targets musl only, so this one image is built here,
+        # with the workspace's Rust toolchain (`rust-toolchain.toml`, through
+        # fenix) and nixpkgs' glibc, like the Linux GUI.
+        #
+        # Where the driver comes from. The image carries none of it. On the
+        # platform the GPU image's measured root holds the driver's user space
+        # under /usr/lib/x86_64-linux-gnu, and the NVIDIA container runtime's
+        # CDI spec bind-mounts those files into the container at the same
+        # paths; its hooks add the soname links. The binary therefore carries a
+        # DT_RPATH, not a RUNPATH: a RUNPATH covers only the executable's own
+        # lookups, while an RPATH on the executable is also consulted for every
+        # library without a search path of its own, which is how the driver's
+        # libraries find each other and theirs. nixpkgs' glibc never reads
+        # /etc/ld.so.cache (it is patched to look under its own prefix), so the
+        # ld.so.cache the runtime's hook writes is not what finds them; the
+        # RPATH is.
+        #
+        # What the driver needs from the image. libcuda, NVML and every library
+        # libcuda loads need only glibc (libc, libm, libdl, libpthread, librt,
+        # the loader) — except one: in confidential-computing mode libcuda
+        # loads `libnvidia-pkcs11-openssl3.so.<driver>` (mounted with the
+        # driver), which needs OpenSSL 3's `libcrypto.so.3`. The container must
+        # supply that, so it ships here. The Rust binary adds `libgcc_s.so.1`.
+        #
+        # Every shipped file is copied out of the store, never referenced
+        # (docs/verification.md): the loader is installed at the path the
+        # filesystem hierarchy standard gives it, the libraries beside it in
+        # /lib64. What still names a store path is compiled-in defaults no
+        # lookup depends on (glibc's default library directory and cache
+        # file, OpenSSL's configuration directory), none of which exists in
+        # the image.
+        engineImagePlatform = system == "x86_64-linux";
+
+        # The kernel build, imported unchanged and given this flake's nixpkgs,
+        # so the toolchain record it writes into its manifest is the one
+        # `kernels.manifest.json` holds.
+        engineKernels =
+          if !engineImagePlatform then
+            null
+          else
+            import ./crates/eidola-engine-kernels/nix {
+              nixpkgsSrc = nixpkgs;
+              nixpkgsRev = nixpkgs.rev;
+              inherit system;
+            };
+
+        # The node built with the CUDA executor, against glibc. Its tests run
+        # in the workspace gates (`cargo test -p eidola-server-engine
+        # --features cuda`); a release-profile test build here would compile
+        # the whole graph a second time for nothing the gates do not check.
+        eidolaServerEngineCuda =
+          if !engineImagePlatform then
+            null
+          else
+            mkPackage {
+              pname = "eidola-server-engine";
+              rustTarget = "x86_64-unknown-linux-gnu";
+              nixCrossSystem = null;
+              extraCargoArgs = "--features cuda";
+              doCheck = false;
+            };
+
+        engineGlibc = pkgs.stdenv.cc.libc;
+        engineLoader = "ld-linux-x86-64.so.2";
+        # Where the platform's runtime mounts the driver (the Debian layout of
+        # the GPU image's root), then the other common layout, after the
+        # image's own libraries.
+        engineRpath = "/lib64:/usr/lib/x86_64-linux-gnu:/usr/lib64";
+        # Where the kernel images live in the image. A deployment's
+        # EIDOLA_ENGINE_KERNELS_DIR names this directory.
+        engineKernelsDir = "/opt/eidola/kernels";
+
+        eidolaServerEngineImageRoot =
+          if !engineImagePlatform then
+            null
+          else
+            pkgs.runCommand "eidola-server-engine-image-root"
+              {
+                nativeBuildInputs = [
+                  pkgs.patchelf
+                  pkgs.jq
+                ];
+                committedManifest = ./crates/eidola-engine-kernels/kernels.manifest.json;
+              }
+              ''
+                set -euo pipefail
+                export LC_ALL=C
+                fail() { echo "error: $*" >&2; exit 1; }
+
+                bin=${eidolaServerEngineCuda}/bin/eidola-server-engine
+                glibc=${engineGlibc}/lib
+                gcclib=${pkgs.stdenv.cc.cc.lib}/lib
+                crypto=${pkgs.openssl.out}/lib
+
+                # The binary was linked against exactly the glibc shipped
+                # below: its loader is that glibc's, and every library it
+                # names resolves there or in the compiler's runtime.
+                [ "$(patchelf --print-interpreter "$bin")" = "$glibc/${engineLoader}" ] \
+                  || fail "the node's loader is not $glibc/${engineLoader}"
+                for dir in $(patchelf --print-rpath "$bin" | tr ':' ' '); do
+                  case "$dir" in
+                    "$glibc" | "$gcclib") ;;
+                    *) fail "the node's RUNPATH names $dir, which the image does not ship" ;;
+                  esac
+                done
+
+                mkdir -p $out/lib64
+                install -m 0555 "$bin" $out/eidola-server-engine
+                chmod u+w $out/eidola-server-engine
+                patchelf --set-interpreter /lib64/${engineLoader} $out/eidola-server-engine
+                patchelf --force-rpath --set-rpath ${engineRpath} $out/eidola-server-engine
+                chmod a-w $out/eidola-server-engine
+
+                for lib in ${engineLoader} libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1; do
+                  install -m 0555 "$glibc/$lib" $out/lib64/$lib
+                done
+                install -m 0555 "$gcclib/libgcc_s.so.1" $out/lib64/libgcc_s.so.1
+                install -m 0555 "$crypto/libcrypto.so.3" $out/lib64/libcrypto.so.3
+                # Their own search paths name the store; inside the image
+                # every library they need is already loaded by soname or found
+                # through the node's RPATH.
+                for lib in libgcc_s.so.1 libcrypto.so.3; do
+                  chmod u+w $out/lib64/$lib
+                  patchelf --remove-rpath $out/lib64/$lib
+                  chmod a-w $out/lib64/$lib
+                done
+
+                # Every library any shipped ELF names is shipped.
+                for elf in $out/eidola-server-engine $out/lib64/*; do
+                  for needed in $(patchelf --print-needed "$elf"); do
+                    [ -e "$out/lib64/$needed" ] \
+                      || fail "$(basename "$elf") needs $needed, which the image does not ship"
+                  done
+                done
+
+                # The kernel images: this build's output must be the committed
+                # manifest's, byte for byte, and every image it lists must
+                # hash to its record. The node checks each image against the
+                # same manifest (compiled in) before it loads it, so a
+                # mismatch here is a node that could not boot.
+                kernels=${engineKernels}
+                cmp -s "$kernels/manifest.json" "$committedManifest" || {
+                  diff -u "$committedManifest" "$kernels/manifest.json" >&2 || true
+                  fail "the kernel build does not reproduce kernels.manifest.json"
+                }
+                dest=$out${engineKernelsDir}
+                listed=0
+                while IFS=$'\t' read -r file size sha256; do
+                  src="$kernels/$file"
+                  [ "$(stat -c %s "$src")" = "$size" ] || fail "$file: size is not $size"
+                  [ "$(sha256sum "$src" | cut -d' ' -f1)" = "$sha256" ] || fail "$file: sha256 is not $sha256"
+                  install -D -m 0444 "$src" "$dest/$file"
+                  listed=$((listed + 1))
+                done < <(jq -r '(.kernels[], .fatbins[]) | [.file, (.size | tostring), .sha256] | @tsv' "$committedManifest")
+                built=$(find "$kernels/cubin" "$kernels/fatbin" -type f | wc -l)
+                [ "$built" -eq "$listed" ] \
+                  || fail "the kernel build has $built images, the manifest lists $listed"
+              '';
+
       in
       {
         packages = {
-          server = mkPackage {
-            pname = "eidola-server";
+          gateway = mkPackage {
+            pname = "eidola-server-gateway";
             rustTarget = nativeRustTarget;
             nixCrossSystem = null;
           };
-          server-openapi-spec = serverOpenApiSpec;
+          gateway-openapi-spec = gatewayOpenApiSpec;
           # Static llama.cpp `llama-server` — the bundled on-device inference
           # engine sidecar. Buildable on its own (`nix build .#llama-server`)
           # for the dev-path `just engine` recipe.
@@ -1760,6 +2007,14 @@ with open(path, "wb") as f:
           eidola-gui-linux-fdo = eidolaGuiLinuxFdo;
           eidola-linux-deb-tree = eidolaLinuxDebTree;
           eidola-linux-deb = eidolaLinuxDeb;
+        }
+        // pkgs.lib.optionalAttrs engineImagePlatform {
+          # The inference node's image: the kernel build, the CUDA node
+          # binary, and the root tree `oci/eidola-server-engine/Containerfile`
+          # copies into the image.
+          eidola-engine-kernels = engineKernels;
+          eidola-server-engine-cuda = eidolaServerEngineCuda;
+          eidola-server-engine-image-root = eidolaServerEngineImageRoot;
         };
 
         # Development shell (lightweight — daily Rust dev uses rustup)
@@ -1825,12 +2080,12 @@ with open(path, "wb") as f:
               ''
                 echo "Checking if committed OpenAPI spec matches generated one..."
 
-                GENERATED="${self.packages.${system}.server-openapi-spec}/openapi.json"
-                COMMITTED="${repoSrc}/crates/eidola-server/openapi.json"
+                GENERATED="${self.packages.${system}.gateway-openapi-spec}/openapi.json"
+                COMMITTED="${repoSrc}/crates/eidola-server-gateway/openapi.json"
 
                 if [ ! -f "$COMMITTED" ]; then
-                  echo "ERROR: No committed OpenAPI spec found at crates/eidola-server/openapi.json"
-                  echo "Run: nix run '.#update-server-openapi'"
+                  echo "ERROR: No committed OpenAPI spec found at crates/eidola-server-gateway/openapi.json"
+                  echo "Run: nix run '.#update-gateway-openapi'"
                   echo "Then commit the generated file."
                   exit 1
                 fi
@@ -1840,7 +2095,7 @@ with open(path, "wb") as f:
                   echo "ERROR: Committed OpenAPI spec doesn't match generated one!"
                   echo ""
                   echo "To fix this:"
-                  echo "  1. Run: nix run '.#update-server-openapi'"
+                  echo "  1. Run: nix run '.#update-gateway-openapi'"
                   echo "  2. Review the changes"
                   echo "  3. Commit the updated spec"
                   echo ""
@@ -1854,22 +2109,22 @@ with open(path, "wb") as f:
         };
 
         apps = {
-          update-server-openapi = {
+          update-gateway-openapi = {
             type = "app";
             meta.description = "Update committed OpenAPI spec from generated sources";
             program = "${
               pkgs.writeShellApplication {
-                name = "update-server-openapi";
+                name = "update-gateway-openapi";
                 runtimeInputs = [
                   pkgs.coreutils
                   pkgs.git
                 ];
 
                 text = ''
-                  ${./scripts/update-server-openapi.sh} "${self.packages.${system}.server-openapi-spec}/openapi.json"
+                  ${./scripts/update-gateway-openapi.sh} "${self.packages.${system}.gateway-openapi-spec}/openapi.json"
                 '';
               }
-            }/bin/update-server-openapi";
+            }/bin/update-gateway-openapi";
           };
 
           format-rust = {

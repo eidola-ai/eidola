@@ -46,7 +46,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use eidola_app_core::error::AppError;
+use eidola_app_core::error::{AppError, IssuerKeyRefusal};
 use gpui::{
     AnyElement, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
     FontWeight, InteractiveElement, IntoElement, IsZero, Overflow, ParentElement, Pixels, Render,
@@ -873,6 +873,14 @@ pub struct SpaceView {
     /// once and both writes it and reports it — so they cannot say different
     /// things about the same generation.
     pub(crate) truncated_posts: HashSet<SharedString>,
+    /// The keyboard handle each cut-off mark's **Continue** tracks, by post
+    /// node — one per verb, since a space can hold several marks and two
+    /// elements claiming one handle report focus twice. Interior-mutable for
+    /// the height cache's reason: minted where the verb renders. An accepted
+    /// press takes the verb away (the space stops accepting mutations), so the
+    /// handler asks its handle for containment first and hands the keyboard
+    /// back ([`SpaceView::continue_answer`]).
+    pub(crate) continue_focus: std::cell::RefCell<HashMap<SharedString, FocusHandle>>,
     /// The generations this window asked to regenerate and was told were
     /// already being regenerated elsewhere (see
     /// `SpaceEvent::RegenerationCollided`).
@@ -966,6 +974,11 @@ pub struct SpaceView {
     /// *is* the editor (live inputs plus an explicit Save). See
     /// [`inspector_participants`].
     pub(crate) inspector_participant_edit: Option<inspector_participants::ParticipantEdit>,
+    /// Switches to newer weights sent and not yet seen in the roster, by
+    /// participant id: the open editor follows one only once the roster shows
+    /// it landed (`sync_inspector_participant_edit`), never on the click, so a
+    /// refused switch leaves the editor as it was.
+    pub(crate) inspector_pending_switches: HashMap<String, inspector_participants::PendingSwitch>,
     /// The open add-a-participant form, if any.
     pub(crate) inspector_participant_add: Option<inspector_participants::ParticipantAdd>,
     /// The open "save these participants as a template" form, if any.
@@ -1216,6 +1229,7 @@ impl SpaceView {
             error: None,
             reference_notice: None,
             truncated_posts: HashSet::new(),
+            continue_focus: std::cell::RefCell::new(HashMap::new()),
             regenerating_elsewhere: HashSet::new(),
             marks_seen: HashSet::new(),
             find: None,
@@ -1230,6 +1244,7 @@ impl SpaceView {
             inspector_router_picker: false,
             inspector_picker_scroll: ScrollHandle::new(),
             inspector_participant_edit: None,
+            inspector_pending_switches: HashMap::new(),
             inspector_participant_add: None,
             inspector_template_form: None,
             inspector_invite: None,
@@ -2423,6 +2438,11 @@ impl SpaceView {
             .chain(local.external().iter().flat_map(|b| b.models.iter()))
             .find(|m| m.id == selection)
             .map(|m| m.display_name.clone())
+            // A curated model not yet downloaded still has its catalog name.
+            .or_else(|| {
+                eidola_app_core::catalog_entry_for_model_ref(selection)
+                    .map(|entry| entry.display_name.to_string())
+            })
             .unwrap_or_else(|| mref.model.clone());
         (model_name.into(), backend_name.into())
     }
@@ -2866,6 +2886,7 @@ fn post_data_from(
         blocks: m.blocks.clone(),
         regenerable: m.regenerable,
         truncated: m.truncated,
+        continuable: m.continuable,
     }
 }
 
@@ -2908,9 +2929,6 @@ fn error_copy(e: &AppError, cx: &gpui::App) -> String {
         }
         AppError::SpaceArchived { .. } => crate::i18n::msg::space_error_archived(cx).to_string(),
         AppError::NotJoined { .. } => crate::i18n::msg::space_error_not_joined(cx).to_string(),
-        AppError::ResponseTruncated { .. } => {
-            crate::i18n::msg::space_error_response_truncated(cx).to_string()
-        }
         // The model this turn would have used has left its backend's catalog.
         // The variant carries the selection and no sentence, so the copy is
         // built here — and it names the model, because the reader's only way
@@ -2919,6 +2937,30 @@ fn error_copy(e: &AppError, cx: &gpui::App) -> String {
         AppError::ModelUnavailable { model } => {
             crate::i18n::msg::space_error_model_unavailable(cx, model.clone()).to_string()
         }
+        // An on-device model with no file yet — a fresh profile's default.
+        // Named by the curated catalog's display name where it has one, since
+        // that is the name Settings lists it under.
+        AppError::LocalModelNotDownloaded { model } => {
+            let name = eidola_app_core::catalog_entry_for_model_ref(model)
+                .map(|entry| entry.display_name.to_string())
+                .unwrap_or_else(|| model.clone());
+            crate::i18n::msg::space_error_local_model_not_downloaded(cx, name).to_string()
+        }
+        // The server's issuer key failed a check this client makes for
+        // itself. Worded as what the reader needs: they were protected,
+        // nothing was charged, held credits still work, and (for a second
+        // key) waiting for the next epoch is what clears it.
+        AppError::IssuerKeyRefused { refusal } => match refusal {
+            IssuerKeyRefusal::NotOnCalendar => {
+                crate::i18n::msg::space_error_issuer_key_off_calendar(cx).to_string()
+            }
+            IssuerKeyRefusal::SecondKeyForEpoch { .. } => {
+                crate::i18n::msg::space_error_issuer_key_second_for_epoch(cx).to_string()
+            }
+            IssuerKeyRefusal::OneKeyForSeveralEpochs { .. } => {
+                crate::i18n::msg::space_error_issuer_key_reused(cx).to_string()
+            }
+        },
         other => other.to_string(),
     }
 }
@@ -4282,7 +4324,7 @@ impl SpaceView {
     /// reader's place in the conversation if they have one, else the view root
     /// ([`Self::keyboard_home`]) — and only from a surface that was holding it,
     /// so a reader typing beside a notice keeps their caret.
-    fn hand_back_focus(&self, held: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn hand_back_focus(&self, held: bool, window: &mut Window, cx: &mut Context<Self>) {
         if held {
             let back = self.keyboard_home(cx);
             window.focus(&back, cx);
