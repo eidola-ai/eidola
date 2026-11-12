@@ -31,14 +31,16 @@
 //!
 //! A request is tried on at most [`RouterConfig::request_attempts`] engines,
 //! in rank order, moving on only when the engine gave no response (no
-//! attested connection, a connection that closed under the request, or a
-//! stream's headers not within [`STREAM_HEADERS_LIMIT`]) or
+//! attested connection, a connection that closed under the request, or
+//! response headers not within [`STREAM_HEADERS_LIMIT`]) or
 //! refused it before admission, by the node's exact status and error type
 //! (`eidola_common::engine_protocol::refused_before_admission`: a
 //! misconfiguration, or `overloaded`). Any other answer, an error included,
 //! may come after the engine ran the request, and is returned.
-//! The response comes back as a `BackendResponse` or a stream of
-//! `BackendStreamEvent`s, which billing settles: usage → charge.
+//! Every request is a stream to the engine, whatever its client asked for: it
+//! comes back as `BackendStreamEvent`s, which the handler forwards to a
+//! streaming client or assembles into one answer for a blocking one
+//! (`assemble`), and which billing settles: usage → charge.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -54,17 +56,18 @@ use tinfoil_verifier::AllowedMeasurement;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::backend::{BackendMeta, BackendResponse, BackendStreamEvent, TeeType};
+use crate::backend::{BackendMeta, BackendStreamEvent, TeeType};
 use crate::db::EnginePlacementRow;
 use crate::engine_trust::protocol::{
     EngineToken, ValidatedRequest, engine_request_body, engine_request_headers,
 };
 use crate::engine_trust::{self, PinnedModel};
 use crate::error::ServerError;
-use crate::types::{ChatCompletionChunk, ChatCompletionResponse, ErrorResponse};
+use crate::types::{ChatCompletionChunk, ErrorResponse};
 use eidola_common::engine_protocol::{PreAdmission, refused_before_admission};
 use eidola_common::stream_shape::{StreamEvent, StreamReader, Unreadable, unpadded};
 
+pub mod assemble;
 mod breaker;
 pub mod placement;
 mod rendezvous;
@@ -170,9 +173,9 @@ pub fn attesting_client_factory(roots: AttestationRoots) -> ClientFactory {
     })
 }
 
-/// How long a streamed request waits for an engine's response headers before
-/// it counts as no response (the next engine is tried, and the breaker counts
-/// a failure).
+/// How long a request waits for an engine's response headers before it
+/// counts as no response (the next engine is tried, and the breaker counts a
+/// failure).
 ///
 /// A node answers a stream once its engine has accepted the request, before
 /// prefill: what comes first is a new connection (its connect timeout and
@@ -182,8 +185,8 @@ pub fn attesting_client_factory(roots: AttestationRoots) -> ClientFactory {
 /// node that has stopped answering reaches it; the cost of a lower value is a
 /// large prompt refused by every engine in turn. Nothing reached the client,
 /// so the request is refunded in full if no engine answers, as for any
-/// request no engine took. A blocking request is not bounded this way: its
-/// node answers only when the completion is done.
+/// request no engine took. Every request is a stream to the engine, so this
+/// bounds a client's blocking request too.
 pub const STREAM_HEADERS_LIMIT: Duration = Duration::from_secs(60);
 
 /// How long an open stream from an engine may deliver nothing at all before
@@ -645,7 +648,7 @@ impl EngineRouter {
         let headers = engine_request_headers(&self.inner.token, &model.pinned);
         // The forwarded copy is an ordinary buffer the HTTP stack owns, as on
         // the node; the canonical body it is copied from is scrubbed.
-        let body = bytes::Bytes::copy_from_slice(&engine_request_body(request));
+        let body = bytes::Bytes::copy_from_slice(&node_request_body(request));
         Ok(Plan {
             model,
             upstreams: ranked,
@@ -655,15 +658,15 @@ impl EngineRouter {
     }
 
     /// Send `request` to one upstream and classify the outcome, recording it
-    /// on the upstream's breaker. With `headers_limit`, response headers that
-    /// take longer are no response.
+    /// on the upstream's breaker. Response headers that take longer than
+    /// `headers_limit` are no response.
     async fn attempt(
         &self,
         upstream: &Upstream,
         in_flight: &InFlight,
         headers: &HeaderMap,
         body: &bytes::Bytes,
-        headers_limit: Option<Duration>,
+        headers_limit: Duration,
     ) -> Attempt {
         let config = &self.inner.config.breaker;
         let sent = upstream
@@ -673,21 +676,18 @@ impl EngineRouter {
             .header(CONTENT_TYPE, "application/json")
             .body(body.clone())
             .send();
-        let sent = match headers_limit {
-            Some(limit) => match tokio::time::timeout(limit, sent).await {
-                Ok(sent) => sent,
-                // Dropping the request closes its connection, which ends
-                // whatever the node had begun; nothing reached the client.
-                Err(_) => {
-                    in_flight.failed(config);
-                    warn!(
-                        upstream = %upstream.base_url,
-                        "engine upstream sent no response headers in time"
-                    );
-                    return Attempt::Next;
-                }
-            },
-            None => sent.await,
+        let sent = match tokio::time::timeout(headers_limit, sent).await {
+            Ok(sent) => sent,
+            // Dropping the request closes its connection, which ends
+            // whatever the node had begun; nothing reached the client.
+            Err(_) => {
+                in_flight.failed(config);
+                warn!(
+                    upstream = %upstream.base_url,
+                    "engine upstream sent no response headers in time"
+                );
+                return Attempt::Next;
+            }
         };
         let response = match sent {
             Ok(response) => response,
@@ -750,62 +750,10 @@ impl EngineRouter {
         }
     }
 
-    /// A non-streaming request.
-    #[tracing::instrument(skip_all, name = "engine.chat", err)]
-    pub async fn send(&self, request: &ValidatedRequest) -> Result<BackendResponse, ServerError> {
-        let Plan {
-            upstreams,
-            headers,
-            body,
-            ..
-        } = self.plan(request)?;
-        for upstream in upstreams {
-            // The plan's ranking is from before any attempt; whether this
-            // upstream takes the request is decided now.
-            let Some(in_flight) = upstream.admit() else {
-                continue;
-            };
-            let response = match self
-                .attempt(&upstream, &in_flight, &headers, &body, None)
-                .await
-            {
-                Attempt::Response(response) => response,
-                Attempt::Next => continue,
-                Attempt::Fail(e) => return Err(e),
-            };
-            let config = &self.inner.config.breaker;
-            let bytes = match response.bytes().await {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    in_flight.failed(config);
-                    return Err(ServerError::Network(e.without_url().to_string()));
-                }
-            };
-            let completion: ChatCompletionResponse = match serde_json::from_slice(&bytes) {
-                Ok(completion) => completion,
-                Err(e) => {
-                    in_flight.failed(config);
-                    return Err(ServerError::Parse(crate::error::parse_error_summary(&e)));
-                }
-            };
-            in_flight.served();
-            let meta = BackendMeta {
-                provider: PROVIDER.to_string(),
-                chat_id: Some(completion.id.clone()),
-                backend_model: completion.model.clone(),
-                tee_type: Some(TeeType::EidolaEngine),
-                usage: completion.usage.clone(),
-            };
-            return Ok(BackendResponse {
-                response: completion,
-                meta,
-            });
-        }
-        Err(no_engine())
-    }
-
-    /// A streaming request: chunks as the engine sends them, then `Done` with
-    /// the usage the engine reported.
+    /// A request, as a stream: chunks as the engine sends them, then `Done`
+    /// with the usage the engine reported. Every request is sent to the
+    /// engine as a stream ([`node_request_body`]); a client's blocking
+    /// request is assembled from it (`assemble`).
     #[tracing::instrument(skip_all, name = "engine.chat_stream", err)]
     pub async fn send_stream(
         &self,
@@ -818,10 +766,12 @@ impl EngineRouter {
             body,
         } = self.plan(request)?;
         for upstream in upstreams {
+            // The plan's ranking is from before any attempt; whether this
+            // upstream takes the request is decided now.
             let Some(in_flight) = upstream.admit() else {
                 continue;
             };
-            let limit = Some(self.inner.config.stream_headers_limit);
+            let limit = self.inner.config.stream_headers_limit;
             let response = match self
                 .attempt(&upstream, &in_flight, &headers, &body, limit)
                 .await
@@ -843,6 +793,24 @@ impl EngineRouter {
         }
         Err(no_engine())
     }
+}
+
+/// The body `request` is sent to a node with: [`engine_request_body`], always
+/// asking for a stream with its usage, whatever the client asked for. A node
+/// answers only streams, and the stream is what bounds how long a request
+/// waits on a silent engine and what a request ended early is charged by;
+/// the client's own choice of transport is the gateway's to answer.
+fn node_request_body(request: &ValidatedRequest) -> zeroize::Zeroizing<Vec<u8>> {
+    let mut body = engine_request_body(request);
+    if !request.request().stream {
+        // `engine_request_body` writes these two members for a streaming
+        // request and drops any the client sent, so the object lacks both
+        // here: they go in before its closing brace.
+        let close = body.pop();
+        debug_assert_eq!(close, Some(b'}'));
+        body.extend_from_slice(br#","stream":true,"stream_options":{"include_usage":true}}"#);
+    }
+    body
 }
 
 /// The refusal when no engine could take a request.
@@ -960,7 +928,19 @@ async fn relay_stream(
                     return;
                 }
                 StreamEvent::Done => {
+                    let ended_at = Instant::now();
+                    // Finished: no longer counted against the upstream's load.
                     in_flight.served();
+                    drop(in_flight);
+                    // The body read to its end (the frame carrying `[DONE]`
+                    // is its last) before the handler hears of it, so the
+                    // attested connection is back in the pool for whatever
+                    // the handler sends next; one dropped unread is closed,
+                    // and the next request pays a new handshake.
+                    let _ = tokio::time::timeout(idle_limit, async {
+                        while let Some(Ok(_)) = stream.next().await {}
+                    })
+                    .await;
                     let meta = BackendMeta {
                         provider: PROVIDER.to_string(),
                         chat_id,
@@ -968,9 +948,7 @@ async fn relay_stream(
                         tee_type: Some(TeeType::EidolaEngine),
                         usage,
                     };
-                    let _ = tx
-                        .send(Ok(BackendStreamEvent::Done(meta, Instant::now())))
-                        .await;
+                    let _ = tx.send(Ok(BackendStreamEvent::Done(meta, ended_at))).await;
                     return;
                 }
             };

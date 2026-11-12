@@ -19,6 +19,7 @@ use crate::AppState;
 use crate::auth::{ActSpend, AuthContext, AuthMethod};
 use crate::backend::{BackendStreamEvent, PRICING_SCALE_FACTOR, ResolvedModel};
 use crate::credentials::{self, KeyUse, RefundStage, SignedRefund};
+use crate::engine_router::assemble::Assembler;
 use crate::engine_trust::protocol::ValidatedRequest;
 use crate::error::ServerError;
 use crate::padding::{self, Cadence, StreamEvent};
@@ -249,15 +250,9 @@ pub(crate) fn settled_cost(
         .unwrap_or(charge_credits)
 }
 
-/// Send a non-streaming request to the engines that serve its model.
-async fn dispatch(
-    state: &AppState,
-    request: &ValidatedRequest,
-) -> Result<crate::backend::BackendResponse, ServerError> {
-    engines(state)?.send(request).await
-}
-
-/// Send a streaming request to the engines that serve its model.
+/// Send a request to the engines that serve its model. Every request is a
+/// stream to the engine, whatever its client asked for: a blocking answer is
+/// assembled here from the stream (`engine_router::assemble`).
 async fn dispatch_stream(
     state: &AppState,
     request: &ValidatedRequest,
@@ -311,7 +306,7 @@ pub(crate) async fn issue_refund_async(
 }
 
 /// The longest this gateway lets a paid request run: a request still running
-/// then is ended, and settled as a stream that ended early. A resource bound
+/// then is ended, and settled as a request that ended early. A resource bound
 /// on the gateway's own work (an engine slot, a connection, a task), not part
 /// of the payment contract: whether a provisional refund is final is decided
 /// by whether a request is still being served (`credentials::LiveSpends`),
@@ -780,20 +775,21 @@ async fn record_inputs(
 /// whole hold charged for nothing. So recording, the validation refusal, the
 /// dispatch and every settlement run here for both transports, and a request
 /// whose handler has gone still ends with its final refunds stored for
-/// recovery. A stream whose handler went away before it opened is dispatched
-/// to its answer like any other: a refusal settles as a full refund, and an
-/// opened stream finds its client gone at once, releases the engine and
-/// settles as that early ending ([`forward_stream`]). A blocking request runs
-/// to its end and is billed by its reported usage (a blocking engine request
-/// reports what it generated only when it completes, so a cut would leave
-/// nothing trustworthy to charge). The deadline bounds both.
+/// recovery. A request whose handler went away before its engine answered is
+/// dispatched to its answer like any other: a refusal settles as a full
+/// refund, and an opened stream finds its client gone at once, releases the
+/// engine and settles as that early ending ([`forward_stream`], and for a
+/// blocking request [`collect_answer`], which learns its client has gone from
+/// this handler's [`ClientWatch`]). The deadline bounds both.
 pub(crate) async fn run_paid_request(
     state: AppState,
     validated: ValidatedRequest,
     resolution: Result<ResolvedModel, crate::models::ModelRefError>,
     recording: impl Future<Output = Result<PaidInputs, ServerError>> + Send + 'static,
 ) -> Result<axum::response::Response, ServerError> {
-    tokio::spawn(async move {
+    let (client, present) = tokio::sync::oneshot::channel();
+    let client = ClientWatch(client);
+    let answer = tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + MAX_REQUEST_DURATION;
         let inputs = recording.await?;
 
@@ -823,20 +819,80 @@ pub(crate) async fn run_paid_request(
         if request.stream {
             handle_streaming_request(state.clone(), &validated, inputs, &resolved, deadline).await
         } else {
-            handle_non_streaming_request(&state, &validated, &inputs, &resolved, deadline).await
+            handle_non_streaming_request(&state, &validated, &inputs, &resolved, deadline, client)
+                .await
         }
     })
-    .await
-    .map_err(|_| ServerError::Internal("the request's task failed".to_string()))?
+    .await;
+    // Held until the task has answered: dropped earlier only with this
+    // handler, when its client went away.
+    drop(present);
+    answer.map_err(|_| ServerError::Internal("the request's task failed".to_string()))?
 }
 
-/// Handle a non-streaming chat completion request.
+/// What a blocking request's task watches to learn that its client has gone:
+/// the handler holds the other end until the task answers, and a client that
+/// goes away drops the handler, and that end with it.
+pub(crate) struct ClientWatch(tokio::sync::oneshot::Sender<std::convert::Infallible>);
+
+impl ClientWatch {
+    /// Resolves once the handler, and with it the client, has gone.
+    async fn gone(&mut self) {
+        self.0.closed().await
+    }
+}
+
+/// Open the engine's stream for a paid request. A refusal, or no engine
+/// answering, is settled here as a full refund; not opened by the deadline,
+/// the engine may have begun, and the whole hold is charged. Either way the
+/// error is the request's answer, its refunds in it.
+async fn open_upstream(
+    state: &AppState,
+    validated: &ValidatedRequest,
+    inputs: &PaidInputs,
+    deadline: tokio::time::Instant,
+) -> Opened {
+    match tokio::time::timeout_at(deadline, dispatch_stream(state, validated)).await {
+        Ok(Ok(rx)) => Opened::Stream(rx),
+        Ok(Err(e)) => {
+            // Nothing was generated: the engine refused it or never took it.
+            warn!(
+                "Engine error before the answer opened, issuing full refund: {}",
+                e
+            );
+            let refunds = settle_inputs(state, inputs, 0).await;
+            Opened::Answered(error_response_with_refunds(&e, refunds))
+        }
+        Err(_) => {
+            warn!("Request reached its deadline before its answer opened, issuing zero refund");
+            let refunds = settle_inputs(state, inputs, inputs.hold()).await;
+            Opened::Answered(error_response_with_refunds(
+                &request_deadline_error(),
+                refunds,
+            ))
+        }
+    }
+}
+
+/// What opening a paid request's engine stream came to.
+enum Opened {
+    Stream(mpsc::Receiver<Result<BackendStreamEvent, ServerError>>),
+    /// Settled without a stream; this is the request's answer.
+    Answered(axum::response::Response),
+}
+
+/// Handle a non-streaming chat completion request: the engine's stream,
+/// assembled into one answer ([`collect_answer`]) and settled on its usage. An
+/// answer that ends early is settled on what was generated
+/// ([`early_cost`]), by the rule a stream follows, and its error is the
+/// response, carrying the refunds.
 async fn handle_non_streaming_request(
     state: &AppState,
     validated: &ValidatedRequest,
     inputs: &PaidInputs,
     resolved: &ResolvedModel,
     deadline: tokio::time::Instant,
+    mut client: ClientWatch,
 ) -> Result<axum::response::Response, ServerError> {
     let request = validated.request();
     let model = &resolved.model;
@@ -844,28 +900,26 @@ async fn handle_non_streaming_request(
     let auth_context = AuthContext {
         method: AuthMethod::AnonymousCredential,
     };
+    let chargeable_prompt = chargeable_prompt_tokens_for(request);
+    let max_completion = effective_max_completion(request, model);
 
-    // Make the backend request. On error, issue full refunds.
     let dispatched_at = Instant::now();
-    let backend_response = match tokio::time::timeout_at(deadline, dispatch(state, validated)).await
-    {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => {
-            // The engine refused the request or never took it. Full refunds.
-            warn!("Engine error, issuing full refund: {}", e);
-            let refunds = settle_inputs(state, inputs, 0).await;
-            return Ok(error_response_with_refunds(&e, refunds));
-        }
-        Err(_) => {
-            // The request outlived `MAX_REQUEST_DURATION`. The engine may have
-            // done the work, and how much is unknown: charged the whole hold
-            // (each input's blind remaining value `c - s` comes back).
-            warn!("Request reached its deadline, issuing zero refund");
-            let refunds = settle_inputs(state, inputs, charge_credits).await;
-            return Ok(error_response_with_refunds(
-                &request_deadline_error(),
-                refunds,
-            ));
+    let upstream_rx = match open_upstream(state, validated, inputs, deadline).await {
+        Opened::Stream(rx) => rx,
+        Opened::Answered(answer) => return Ok(answer),
+    };
+    let mut assembler = Assembler::new();
+    let meta = match collect_answer(upstream_rx, &mut client, deadline, &mut assembler).await {
+        Ok(meta) => meta,
+        Err((reason, error)) => {
+            // The engine was released before this.
+            warn!(
+                "blocking request ended early ({}), settling on what was generated",
+                reason.label()
+            );
+            let cost = early_cost(assembler.usage(), model, chargeable_prompt, max_completion);
+            let refunds = settle_inputs(state, inputs, cost).await;
+            return Ok(error_response_with_refunds(&error, refunds));
         }
     };
     crate::telemetry::metrics::CHAT_DURATION.record(
@@ -874,7 +928,7 @@ async fn handle_non_streaming_request(
     );
 
     // Record token usage metrics (safe for unlinked layer: only model + counts).
-    if let Some(usage) = &backend_response.meta.usage {
+    if let Some(usage) = assembler.usage() {
         let model_attr = KeyValue::new("model", model.sha256.clone());
         crate::telemetry::metrics::CHAT_TOKENS.add(
             usage.prompt_tokens as u64,
@@ -887,11 +941,9 @@ async fn handle_non_streaming_request(
     }
 
     // Compute actual cost (clamped to the pricing contract) and refund.
-    let chargeable_prompt = chargeable_prompt_tokens_for(request);
-    let max_completion = effective_max_completion(request, model);
     // No usage → charge worst case.
     let cost = settled_cost(
-        backend_response.meta.usage.as_ref(),
+        assembler.usage(),
         model,
         chargeable_prompt,
         max_completion,
@@ -899,6 +951,7 @@ async fn handle_non_streaming_request(
     );
     let refunds = settle_inputs(state, inputs, cost).await;
 
+    let backend_response = assembler.finish(meta);
     let meta = &backend_response.meta;
     let is_tee = meta.tee_type.is_some();
 
@@ -913,6 +966,67 @@ async fn handle_non_streaming_request(
         EidolaResponse::from_completion(completion, privacy, verification, refunds);
 
     Ok(Json(eidola_response).into_response())
+}
+
+/// Read the engine's stream for a blocking request into `assembler` until it
+/// ends, and say how: the engine's `Done`, or an early ending with the error
+/// that answers it. Every chunk is kept, the engine's running count among
+/// them, so [`Assembler::usage`] is what was generated by the last chunk
+/// received whichever way it ended.
+///
+/// The client going away ([`ClientWatch`]) and the deadline are watched while
+/// the engine works, and on any early ending the upstream receiver is dropped
+/// before this returns, which ends the engine's work at once (the relay
+/// closes its connection, and the node cancels the request). A blocking
+/// client has no stream to stop reading: its answer is written once, after
+/// settlement, so nothing it does after asking holds the engine.
+pub(crate) async fn collect_answer(
+    mut upstream_rx: mpsc::Receiver<Result<BackendStreamEvent, ServerError>>,
+    client: &mut ClientWatch,
+    deadline: tokio::time::Instant,
+    assembler: &mut Assembler,
+) -> Result<crate::backend::BackendMeta, (EarlyEnding, ServerError)> {
+    loop {
+        let next = tokio::select! {
+            biased;
+            () = client.gone() => Err(EarlyEnding::ClientGone),
+            () = tokio::time::sleep_until(deadline) => Err(EarlyEnding::Deadline),
+            event = upstream_rx.recv() => Ok(event),
+        };
+        match next {
+            Err(EarlyEnding::Deadline) => {
+                return Err((EarlyEnding::Deadline, request_deadline_error()));
+            }
+            Err(early) => {
+                return Err((
+                    early,
+                    ServerError::Network("the client went away".to_string()),
+                ));
+            }
+            Ok(None) => {
+                return Err((
+                    EarlyEnding::ChannelClosed,
+                    ServerError::Network(
+                        "the engine's stream ended before it completed".to_string(),
+                    ),
+                ));
+            }
+            Ok(Some(Ok(BackendStreamEvent::Chunk(chunk, _)))) => {
+                if assembler.push(&chunk).is_err() {
+                    return Err((
+                        EarlyEnding::AnswerTooLarge,
+                        ServerError::Backend {
+                            status: 502,
+                            error_type: "response_too_large".to_string(),
+                            message: "the answer exceeded what the gateway assembles".to_string(),
+                        },
+                    ));
+                }
+            }
+            Ok(Some(Ok(BackendStreamEvent::Done(meta, _)))) => return Ok(meta),
+            Ok(Some(Err(e))) => return Err((EarlyEnding::UpstreamError, e)),
+        }
+    }
 }
 
 /// Per-stream timing accumulator behind the streaming instruments.
@@ -1118,25 +1232,10 @@ async fn handle_streaming_request(
     // arrival: everything before this point is our own verification work,
     // which the HTTP-level histogram already covers.
     let dispatched_at = Instant::now();
-    let upstream_rx =
-        match tokio::time::timeout_at(deadline, dispatch_stream(&state, validated)).await {
-            Ok(Ok(rx)) => rx,
-            Ok(Err(e)) => {
-                // Known error — upstream didn't process any tokens. Full refunds.
-                warn!("Stream start error, issuing full refund: {}", e);
-                let refunds = settle_inputs(&state, &inputs, 0).await;
-                return Ok(error_response_with_refunds(&e, refunds));
-            }
-            Err(_) => {
-                // Not even opened by the deadline; the engine may have started.
-                warn!("Stream reached its deadline before opening, issuing zero refund");
-                let refunds = settle_inputs(&state, &inputs, charge_credits).await;
-                return Ok(error_response_with_refunds(
-                    &request_deadline_error(),
-                    refunds,
-                ));
-            }
-        };
+    let upstream_rx = match open_upstream(&state, validated, &inputs, deadline).await {
+        Opened::Stream(rx) => rx,
+        Opened::Answered(answer) => return Ok(answer),
+    };
 
     // Events for the client, framed by `padding` into fixed-size writes on a
     // fixed tick, the waiting bytes bounded (see `padding::EventSender::send`).
@@ -1283,9 +1382,9 @@ async fn send_metadata_event(
     .await;
 }
 
-/// Why a stream ended before the engine said it was done.
+/// Why a request ended before the engine said it was done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EarlyEnding {
+pub(crate) enum EarlyEnding {
     /// The client went away (its stream was dropped).
     ClientGone,
     /// The client stopped reading ([`CLIENT_STALL_LIMIT`]).
@@ -1296,6 +1395,9 @@ enum EarlyEnding {
     UpstreamError,
     /// The engine's channel closed without a `Done`.
     ChannelClosed,
+    /// A blocking answer grew past what the gateway assembles
+    /// (`engine_router::assemble::MAX_ASSEMBLED_BYTES`).
+    AnswerTooLarge,
 }
 
 impl EarlyEnding {
@@ -1307,6 +1409,7 @@ impl EarlyEnding {
             EarlyEnding::Deadline => "deadline",
             EarlyEnding::UpstreamError => "upstream_error",
             EarlyEnding::ChannelClosed => "channel_closed",
+            EarlyEnding::AnswerTooLarge => "answer_too_large",
         }
     }
 }
@@ -1662,6 +1765,15 @@ impl<S: Send + Sync> FromRequest<S> for ChatRequest {
 #[cfg(test)]
 pub(crate) mod tests {
     /// A request's inputs as a test builds them, without recording anything.
+    /// A [`ClientWatch`] and the end its handler holds.
+    pub(crate) fn client_watch() -> (
+        super::ClientWatch,
+        tokio::sync::oneshot::Receiver<std::convert::Infallible>,
+    ) {
+        let (watch, present) = tokio::sync::oneshot::channel();
+        (super::ClientWatch(watch), present)
+    }
+
     pub(crate) fn paid_inputs(acts: Vec<super::ActSpend>, shares: Vec<u128>) -> super::PaidInputs {
         super::PaidInputs { acts, shares }
     }
@@ -2273,6 +2385,74 @@ pub(crate) mod tests {
             .expect("the deadline ends it");
             assert!(matches!(ending, StreamEnding::Early(EarlyEnding::Deadline)));
             assert_eq!(usage.map(|u| u.completion_tokens), Some(4));
+            assert!(up_tx.is_closed());
+        }
+
+        /// **A blocking client that leaves releases the engine at once and
+        /// keeps the count**: its handler dropped (here, the end it holds),
+        /// the collection returns with the engine sending nothing, its
+        /// receiver dropped, and the engine's last running count kept for the
+        /// early charge.
+        #[tokio::test]
+        async fn a_blocking_client_that_leaves_releases_the_engine_and_keeps_the_count() {
+            let (up_tx, up_rx) = mpsc::channel(8);
+            up_tx.send(Ok(delta("a", Some((30, 3))))).await.unwrap();
+            up_tx.send(Ok(delta("b", Some((30, 9))))).await.unwrap();
+            let (mut client, present) = client_watch();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            let mut assembler = Assembler::new();
+            let ended = {
+                let collect = collect_answer(up_rx, &mut client, deadline, &mut assembler);
+                tokio::pin!(collect);
+                let early = tokio::select! {
+                    ended = &mut collect => Some(ended.is_ok()),
+                    () = tokio::time::sleep(Duration::from_millis(100)) => None,
+                };
+                assert!(early.is_none(), "nothing ended yet");
+                drop(present);
+                tokio::time::timeout(Duration::from_secs(5), collect)
+                    .await
+                    .expect("the departure is noticed without waiting for the engine")
+            };
+            assert!(matches!(ended, Err((EarlyEnding::ClientGone, _))));
+            assert_eq!(assembler.usage().map(|u| u.completion_tokens), Some(9));
+            assert!(up_tx.is_closed(), "the engine's receiver was dropped");
+        }
+
+        /// **A blocking request at its deadline releases the engine and keeps
+        /// the count**, answered as the deadline.
+        #[tokio::test(start_paused = true)]
+        async fn a_blocking_request_at_its_deadline_releases_the_engine_and_keeps_the_count() {
+            let (up_tx, up_rx) = mpsc::channel(8);
+            up_tx.send(Ok(delta("a", Some((30, 4))))).await.unwrap();
+            let (mut client, _present) = client_watch();
+            let deadline = tokio::time::Instant::now() + MAX_REQUEST_DURATION;
+            let mut assembler = Assembler::new();
+            let ended = collect_answer(up_rx, &mut client, deadline, &mut assembler).await;
+            assert_eq!(tokio::time::Instant::now(), deadline);
+            let Err((EarlyEnding::Deadline, error)) = ended else {
+                panic!("not ended by the deadline");
+            };
+            assert_eq!(error.status_code(), axum::http::StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(assembler.usage().map(|u| u.completion_tokens), Some(4));
+            assert!(up_tx.is_closed());
+        }
+
+        /// **A blocking answer is bounded**: the chunk that takes it past
+        /// `MAX_ASSEMBLED_BYTES` ends it, the engine released and the count
+        /// before it kept.
+        #[tokio::test]
+        async fn a_blocking_answer_past_its_bound_releases_the_engine() {
+            use crate::engine_router::assemble::MAX_ASSEMBLED_BYTES;
+            let (up_tx, up_rx) = mpsc::channel(8);
+            let half = "x".repeat(MAX_ASSEMBLED_BYTES / 2 + 1);
+            up_tx.send(Ok(delta(&half, Some((30, 5))))).await.unwrap();
+            up_tx.send(Ok(delta(&half, Some((30, 6))))).await.unwrap();
+            let (mut client, _present) = client_watch();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            let mut assembler = Assembler::new();
+            let ended = collect_answer(up_rx, &mut client, deadline, &mut assembler).await;
+            assert!(matches!(ended, Err((EarlyEnding::AnswerTooLarge, _))));
             assert!(up_tx.is_closed());
         }
 

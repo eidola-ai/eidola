@@ -18,6 +18,7 @@ use tinfoil_shim_mock::{RunningShim, ShimConfig};
 use tinfoil_verifier::AllowedMeasurement;
 
 use super::*;
+use crate::backend::BackendResponse;
 use crate::engine_trust::{PinnedWeights, PromptCachePolicy};
 use crate::types::{
     CacheKey, Capability, Model, ModelCapabilities, ModelPricing, OutputBudgetClass,
@@ -140,7 +141,16 @@ enum Mode {
     /// Stream the role chunk's frame, then write nothing at all, the
     /// connection left open: a node that has stopped.
     Wedge,
+    /// [`Mode::StreamError`], the role chunk carrying a running count of
+    /// [`GENERATED`] completion tokens.
+    CountThenError,
+    /// [`Mode::Wedge`], the role chunk carrying a running count of
+    /// [`GENERATED`] completion tokens.
+    CountThenWedge,
 }
+
+/// The completion tokens a counting mode's engine reports before it fails.
+const GENERATED: u32 = 3;
 
 /// One chat request as an engine received it.
 #[derive(Clone)]
@@ -162,6 +172,8 @@ struct EngineState {
     release: tokio::sync::Notify,
     /// Held streams whose connection went away before they were released.
     abandoned: AtomicUsize,
+    /// A stream to answer with, event by event, in place of the mode's.
+    replay: Mutex<Option<Vec<String>>>,
 }
 
 /// A fake engine behind its shim.
@@ -231,6 +243,7 @@ async fn engine(identity: Identity) -> Engine {
         health_checks: AtomicUsize::new(0),
         release: tokio::sync::Notify::new(),
         abandoned: AtomicUsize::new(0),
+        replay: Mutex::new(None),
     });
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -388,34 +401,39 @@ async fn chat(
         _ => {}
     }
     let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    if request["stream"] != serde_json::json!(true) {
-        return padded_json(
-            StatusCode::OK,
-            serde_json::json!({
-                "id": "chatcmpl-fake",
-                "object": "chat.completion",
-                "created": 0,
-                "model": state.model,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "hello"},
-                    "finish_reason": "stop",
-                }],
-                "usage": usage(),
-            }),
-        );
+    // The node answers only streams that report their usage.
+    if request["stream"] != true || request["stream_options"]["include_usage"] != true {
+        return error(StatusCode::BAD_REQUEST, kind::INVALID_REQUEST);
     }
+    if let Some(events) = state.replay.lock().unwrap().clone() {
+        let mut events = events.into_iter().map(|e| {
+            Written::Event(match e.as_str() {
+                "[DONE]" => StreamEvent::Done,
+                _ => StreamEvent::Json(e),
+            })
+        });
+        let role = events.next().unwrap();
+        return shaped_stream(role, false, false, state.clone(), events.collect());
+    }
+    let counted = matches!(mode, Mode::CountThenError | Mode::CountThenWedge);
     let role = chunk(
         &state,
         serde_json::json!([{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]),
-        None,
+        counted.then(|| {
+            serde_json::json!({
+                "prompt_tokens": PROMPT_TOKENS,
+                "completion_tokens": GENERATED,
+                "total_tokens": PROMPT_TOKENS + GENERATED,
+                "prompt_tokens_details": {"cached_tokens": 0},
+            })
+        }),
     );
     let rest: Vec<Written> = match mode {
-        Mode::StreamError => vec![Written::Event(StreamEvent::Error(
+        Mode::StreamError | Mode::CountThenError => vec![Written::Event(StreamEvent::Error(
             serde_json::json!({"error": {"message": "the engine stopped", "type": "engine_unavailable", "code": null}})
                 .to_string(),
         ))],
-        Mode::StreamTruncated | Mode::Wedge => vec![],
+        Mode::StreamTruncated | Mode::Wedge | Mode::CountThenWedge => vec![],
         Mode::MalformedChunk | Mode::UnknownEvent => {
             let odd = if mode == Mode::MalformedChunk {
                 Written::Event(StreamEvent::Json(
@@ -460,7 +478,8 @@ async fn chat(
         ],
     };
     let hold = mode == Mode::Hold;
-    shaped_stream(role, hold, mode == Mode::Wedge, state, rest)
+    let wedge = matches!(mode, Mode::Wedge | Mode::CountThenWedge);
+    shaped_stream(role, hold, wedge, state, rest)
 }
 
 const WEIGHTS_HEADER_NAME: &str = eidola_common::engine_protocol::WEIGHTS_HEADER;
@@ -648,13 +667,33 @@ fn upstream(router: &EngineRouter, model: &str, base_url: &str) -> Arc<Upstream>
         .clone()
 }
 
+/// A client's blocking request, as the handler answers it: the engine's
+/// stream, assembled (`handlers::collect_answer`).
+trait SendBlocking {
+    async fn send(&self, request: &ValidatedRequest) -> Result<BackendResponse, ServerError>;
+}
+
+impl SendBlocking for EngineRouter {
+    async fn send(&self, request: &ValidatedRequest) -> Result<BackendResponse, ServerError> {
+        let rx = self.send_stream(request).await?;
+        let (mut client, _present) = crate::handlers::tests::client_watch();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3600);
+        let mut assembler = assemble::Assembler::new();
+        match crate::handlers::collect_answer(rx, &mut client, deadline, &mut assembler).await {
+            Ok(meta) => Ok(assembler.finish(meta)),
+            Err((_, e)) => Err(e),
+        }
+    }
+}
+
 fn is_unavailable(result: &Result<BackendResponse, ServerError>) -> bool {
     matches!(result, Err(ServerError::ServiceUnavailable(_)))
 }
 
 /// A new upstream takes nothing until a probe has verified it; then a
 /// request reaches it with the gateway's token, the compiled-in weights hash,
-/// and exactly the body `engine_request_body` builds.
+/// and exactly the body `engine_request_body` builds, asking for a stream
+/// with its usage though the client asked for one answer.
 #[tokio::test]
 async fn traffic_waits_for_a_probe_and_carries_the_pinned_headers() {
     let a = engine(Identity::of(MODEL_A)).await;
@@ -688,9 +727,19 @@ async fn traffic_waits_for_a_probe_and_carries_the_pinned_headers() {
         Some(format!("Bearer {TOKEN}").as_str())
     );
     assert_eq!(chats[0].weights.as_deref(), Some(WEIGHTS_A));
-    assert_eq!(chats[0].body, engine_request_body(&sent).to_vec());
+    assert_eq!(chats[0].body, node_request_body(&sent).to_vec());
     let body: serde_json::Value = serde_json::from_slice(&chats[0].body).unwrap();
+    let mut built: serde_json::Value = serde_json::from_slice(&engine_request_body(&sent)).unwrap();
+    built["stream"] = true.into();
+    built["stream_options"] = serde_json::json!({"include_usage": true});
+    assert_eq!(body, built);
     assert_eq!(body["cache_key"], key.as_str());
+    // A streaming request's body is `engine_request_body`'s own.
+    let streamed = request(MODEL_A, Some(&key), true);
+    assert_eq!(
+        node_request_body(&streamed).to_vec(),
+        engine_request_body(&streamed).to_vec()
+    );
 }
 
 /// Every request carrying one cache key lands on one engine, and keys spread
@@ -1674,6 +1723,267 @@ async fn a_silent_engine_is_given_up_on_within_its_bounds() {
         !upstream(&only_other, MODEL_A, &other.base_url).routable(),
         "counted as failures"
     );
+}
+
+/// A blocking request's answer, assembled by the handler from the stream an
+/// engine sends, is the answer the node's own blocking path gave for the same
+/// request, for every case the parity fixture holds (`assemble::tests`): the
+/// stream goes through the engine's frames, the relay and the handler's
+/// collection, and is held to the node's answer as the gateway reads it.
+#[tokio::test]
+async fn a_blocking_answer_is_assembled_from_the_engines_stream() {
+    let a = engine(Identity::of(MODEL_A)).await;
+    let router = router_for(&[&a], models());
+    router
+        .apply_placement(&[a.row(MODEL_A, DEPLOYMENT_A)])
+        .await;
+    router.probe_due().await;
+    for case in assemble::tests::parity_cases() {
+        *a.state.replay.lock().unwrap() = Some(case.stream.clone());
+        let response = router.send(&request(MODEL_A, None, false)).await.unwrap();
+        let node: crate::types::ChatCompletionResponse =
+            serde_json::from_value(case.blocking.clone()).unwrap();
+        let mut node = assemble::tests::normalised(&node);
+        // The fake engine names its own model; the fixture's node named the
+        // dev model's id.
+        node["model"] = MODEL_A.into();
+        let mut assembled = assemble::tests::normalised(&response.response);
+        assembled["model"] = MODEL_A.into();
+        assert_eq!(assembled, node, "{}", case.name);
+        assert_eq!(
+            serde_json::to_value(response.meta.usage).unwrap(),
+            serde_json::to_value(&node["usage"]).unwrap(),
+            "{}",
+            case.name
+        );
+    }
+}
+
+/// A client's blocking request is held to the stream's bounds, and one ended
+/// early is settled on what was generated, by the rule a stream follows: an
+/// engine that fails partway or falls silent is charged the prompt and the
+/// output it reported by its last chunk, the rest of the hold refunded; an
+/// engine that sends no response headers is no engine, and with none other to
+/// try the request is refunded in full.
+#[test]
+fn a_blocking_request_ended_early_is_settled_on_what_was_generated() {
+    // Signing a refund needs more stack than a test thread has.
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(a_blocking_request_ended_early_is_settled())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn a_blocking_request_ended_early_is_settled() {
+    let model = catalog_model();
+    let hold = crate::handlers::worst_case_cost(request(MODEL_A, None, false).request(), &model);
+    // 1 credit a prompt token, 2 a completion token.
+    let generated = PROMPT_TOKENS as u128 + 2 * GENERATED as u128;
+    for (mode, status, charged) in [
+        (Mode::CountThenError, 502, generated),
+        (Mode::CountThenWedge, 502, generated),
+        (Mode::Stall, 503, 0),
+    ] {
+        // An engine and router of its own, so no ending opens the breaker
+        // for the next.
+        let a = engine(Identity::of(MODEL_A)).await;
+        let config = RouterConfig {
+            stream_headers_limit: Duration::from_millis(500),
+            stream_idle_limit: Duration::from_millis(500),
+            ..fast_config()
+        };
+        let router = router_with(&[&a], models(), config);
+        router
+            .apply_placement(&[a.row(MODEL_A, DEPLOYMENT_A)])
+            .await;
+        router.probe_due().await;
+        a.set_mode(mode);
+        let started = std::time::Instant::now();
+        let (answered, credits) = paid_blocking_request(&router, hold).await;
+        assert_eq!(answered, status, "{mode:?}");
+        assert_eq!(credits, CREDITS - charged, "{mode:?}");
+        assert_eq!(a.chats().len(), 1, "{mode:?}: the engine was asked");
+        if mode != Mode::CountThenError {
+            // Given up on at its bound, not sooner.
+            assert!(started.elapsed() >= Duration::from_millis(500), "{mode:?}");
+        }
+        a.state.release.notify_waiters();
+    }
+}
+
+const CREDITS: u128 = 1_000_000;
+
+/// What a client completes its refund with.
+struct Completion {
+    pre_refund: anonymous_credit_tokens::PreRefund,
+    params: anonymous_credit_tokens::Params,
+    spend_proof: anonymous_credit_tokens::SpendProof<{ eidola_common::spend_credentials::ACT_L }>,
+    public: anonymous_credit_tokens::PublicKey,
+}
+
+type Handler = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<axum::response::Response, ServerError>>>,
+>;
+
+/// A blocking request through `router`, paid with a hold of `hold`, as the
+/// chat handler runs it: the handler's future, what completes its refund, the
+/// state it runs on, and its spend's key id and nullifier.
+async fn paid_blocking_handler(
+    router: &EngineRouter,
+    hold: u128,
+) -> (Handler, Completion, crate::AppState, String, Vec<u8>) {
+    use crate::credentials::tests::{Cache, DAY, add_key, spend};
+
+    let validated = request(MODEL_A, None, false);
+    let model = catalog_model();
+    let mut keys = Cache::new();
+    let hash = add_key(&mut keys, std::time::SystemTime::now() + DAY);
+    let (act, pre_refund) = spend(&keys[&hash], CREDITS, hold);
+    let completion = Completion {
+        pre_refund,
+        params: keys[&hash].params.clone(),
+        spend_proof: act.spend_proof.clone(),
+        public: keys[&hash].secret_key.public().clone(),
+    };
+    let nullifier = act.spend_proof.nullifier().as_bytes().to_vec();
+    let state = crate::AppState::new(
+        crate::backend::Catalog::new(None, None).unwrap(),
+        Some(router.clone()),
+        crate::db::create_pool(
+            "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
+            None,
+            None,
+        )
+        .unwrap(),
+        None,
+        [0u8; 32],
+        Arc::new(tokio::sync::RwLock::new(keys)),
+    );
+    crate::handlers::check_presented_spends(&state, std::slice::from_ref(&act))
+        .await
+        .unwrap();
+    let live = Arc::new(state.live_spends.serve(&act));
+    let recording = async move {
+        Ok(crate::handlers::tests::paid_inputs(
+            vec![crate::auth::ActSpend {
+                live: Some(live),
+                ..act
+            }],
+            vec![hold],
+        ))
+    };
+    let handler = Box::pin(crate::handlers::run_paid_request(
+        state.clone(),
+        validated,
+        Ok(crate::backend::ResolvedModel {
+            model,
+            echo: MODEL_A.to_string(),
+        }),
+        recording,
+    ));
+    (handler, completion, state, hex::encode(hash), nullifier)
+}
+
+/// Pay for and answer one blocking request through `router`, as the chat
+/// handler does, and return the answer's status and the credits the client
+/// holds after completing its refund.
+async fn paid_blocking_request(router: &EngineRouter, hold: u128) -> (u16, u128) {
+    use base64::Engine as _;
+    let (handler, c, _, _, _) = paid_blocking_handler(router, hold).await;
+    let response = tokio::time::timeout(Duration::from_secs(10), handler)
+        .await
+        .expect("answered within the bounds")
+        .unwrap();
+    let status = response.status().as_u16();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let refund = body["refunds"][0]["refund"].as_str().unwrap();
+    let refund = anonymous_credit_tokens::Refund::from_cbor(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(refund)
+            .unwrap(),
+    )
+    .unwrap();
+    let token = c
+        .pre_refund
+        .to_credit_token::<{ eidola_common::spend_credentials::ACT_L }>(
+            &c.params,
+            &c.spend_proof,
+            &refund,
+            &c.public,
+        )
+        .unwrap();
+    let credits = anonymous_credit_tokens::scalar_to_credit::<
+        { eidola_common::spend_credentials::ACT_L },
+    >(&token.credits())
+    .unwrap();
+    (status, credits)
+}
+
+/// A blocking request whose client goes away while its engine works releases
+/// the engine at once (the handler's end of the request's `ClientWatch` goes
+/// with it) and is still settled: the spend leaves the live set once its final
+/// refund is written.
+#[test]
+fn a_blocking_request_whose_client_leaves_releases_its_engine() {
+    // Signing a refund needs more stack than a test thread has.
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(a_blocking_client_leaves())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn a_blocking_client_leaves() {
+    let a = engine(Identity::of(MODEL_A)).await;
+    let router = router_for(&[&a], models());
+    router
+        .apply_placement(&[a.row(MODEL_A, DEPLOYMENT_A)])
+        .await;
+    router.probe_due().await;
+    a.set_mode(Mode::Hold);
+    let hold =
+        crate::handlers::worst_case_cost(request(MODEL_A, None, false).request(), &catalog_model());
+    let (mut handler, _, state, key_id, nullifier) = paid_blocking_handler(&router, hold).await;
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while a.chats().is_empty() {
+        assert!(
+            std::time::Instant::now() < until,
+            "the engine was never asked"
+        );
+        tokio::select! {
+            _ = &mut handler => panic!("answered before the engine did"),
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    // The engine holds its answer open; the client leaves.
+    drop(handler);
+    while a.state.abandoned.load(Ordering::SeqCst) == 0
+        || state.live_spends.is_live(&key_id, &nullifier)
+    {
+        assert!(
+            std::time::Instant::now() < until,
+            "the engine was never released, or the request never settled"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// A cache key whose ranking over the upstreams at `order` is exactly that
