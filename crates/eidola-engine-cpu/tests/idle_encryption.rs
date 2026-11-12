@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 
 use common::*;
 use eidola_engine::engine::CacheScope;
+use eidola_engine::kv::CachePolicy;
 use eidola_engine::sampling::SamplingParams;
 
 type Images = BTreeMap<(u32, u32), Vec<u32>>;
@@ -127,5 +128,85 @@ fn a_hit_after_idle_is_bit_exact_and_idle_kv_is_ciphertext() {
         cold.run();
         assert_eq!(cold.outputs[&1], h.outputs[&3]);
         assert!(cold.eng.executor().crypt_log().is_empty());
+    }
+}
+
+/// Every cached block's ciphertext, per group, in a canonical order: what the pools hold
+/// for a lineage, independent of which physical blocks hold it.
+fn sealed_ciphertexts(h: &Harness) -> BTreeMap<u32, Vec<Vec<u32>>> {
+    let mut out: BTreeMap<u32, Vec<Vec<u32>>> = BTreeMap::new();
+    for (g, b) in h.eng.kv().cache_blocks() {
+        assert!(h.eng.executor().block_is_encrypted(g, b));
+        out.entry(g)
+            .or_default()
+            .push(h.eng.executor().block_image(g, b));
+    }
+    for images in out.values_mut() {
+        images.sort();
+    }
+    out
+}
+
+/// A sealed block's nonce is its salted hash and group, so it is safe only if the block's
+/// bytes are the same every time it is sealed. One lineage's request runs alone and its
+/// idle entries are captured as ciphertext; then they expire and the same request is
+/// recomputed beside another sequence (in the same engine, and in one prefilling in
+/// chunks that straddle block boundaries), and every block is sealed to the same
+/// ciphertext, word for word, in every group.
+#[test]
+fn a_recomputed_block_seals_to_the_same_ciphertext() {
+    for spec_on in [false, true] {
+        let prompt = TestRng(41).tokens(30, VOCAB);
+        let other = TestRng(42).tokens(45, VOCAB);
+        let g = SamplingParams::greedy();
+        let mine = |id| request(id, prompt.clone(), g, 6, CacheScope::Keyed(salt(1)));
+        let beside = |id| request(id, other.clone(), g, 9, CacheScope::Private);
+
+        let mut h = Harness::fixture(512, vec![0, 1], sched(spec_on));
+        h.submit(mine(1));
+        h.run();
+        h.flush();
+        let first = sealed_ciphertexts(&h);
+        assert_eq!(
+            first.len(),
+            h.spec.kv_groups.len(),
+            "every group is retained"
+        );
+        assert!(first.values().all(|v| !v.is_empty()));
+
+        // Expired and zeroed, then recomputed beside a private request that started first.
+        h.now += CachePolicy::default().max_age_ms + 1;
+        h.eng.sweep(h.now).unwrap();
+        h.check();
+        assert!(h.eng.kv().cache_blocks().is_empty());
+        h.submit(beside(2));
+        h.step();
+        h.now += 1;
+        h.submit(mine(3));
+        h.run();
+        h.flush();
+        assert_eq!(h.cached[&3], 0, "a recompute, not a hit");
+        assert_eq!(h.outputs[&3], h.outputs[&1]);
+        assert!(
+            sealed_ciphertexts(&h) == first,
+            "speculative {spec_on}: a block recomputed beside another sequence sealed to \
+             other ciphertext"
+        );
+
+        // Another engine, prefilling 3 tokens a step (blocks of 4), the other request
+        // arriving with it.
+        let mut cfg = sched(spec_on);
+        cfg.max_prefill_chunk = 3;
+        let mut c = Harness::fixture(512, vec![0, 1], cfg);
+        c.submit(mine(1));
+        c.submit(beside(2));
+        c.run();
+        c.flush();
+        assert_eq!(c.outputs[&1], h.outputs[&1]);
+        assert!(
+            sealed_ciphertexts(&c) == first,
+            "speculative {spec_on}: a block recomputed in other chunks sealed to other \
+             ciphertext"
+        );
     }
 }
