@@ -33,6 +33,23 @@ updates:
         update-types:
           - "minor"
           - "patch"
+    # The attestation and TLS path shares RustCrypto types (der, spki,
+    # x509-cert, rsa, ed25519) across crate boundaries, so these move together
+    # in one deliberate change rather than one major at a time. `sev` 8 (its
+    # `crypto_nossl` backend) still requires x509-cert 0.2 / rsa 0.9 / p384
+    # 0.13, and `rustls-rustcrypto` has no stable release on the der 0.8
+    # generation; a new `sev` major still arrives as its own update.
+    ignore:
+      - dependency-name: "der"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "spki"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "x509-cert"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "rsa"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "ed25519-dalek"
+        update-types: ["version-update:semver-major"]
 
   # Maintain dependencies for Rust/Toolchain.
   - package-ecosystem: "rust-toolchain"
