@@ -386,13 +386,15 @@ async fn live_self_contained_document() {
     assert!(resolved.crl_der.is_some());
     let report = tinfoil_verifier::sevsnp::parse_report(&resolved.report_bytes).unwrap();
     assert_eq!(resolved.report_data, report.report_data);
+    let generation = tinfoil_verifier::SevSnpGeneration::of_report(&report).unwrap();
     let (trusted_ark, trusted_ask) =
-        tinfoil_verifier::sevsnp::resolve_chain_certs_der(None, None).unwrap();
+        tinfoil_verifier::sevsnp::resolve_chain_certs_der(generation, None, None).unwrap();
     assert_eq!(resolved.ark_der.as_deref(), Some(trusted_ark.as_slice()));
     assert_eq!(resolved.ask_der.as_deref(), Some(trusted_ask.as_slice()));
     tinfoil_verifier::sevsnp::verify_report(
         resolved.vcek_der.as_deref().unwrap(),
         &report,
+        generation,
         resolved.ark_der.as_deref(),
         resolved.ask_der.as_deref(),
     )

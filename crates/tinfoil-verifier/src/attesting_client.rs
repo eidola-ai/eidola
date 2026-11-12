@@ -112,7 +112,7 @@ pub(crate) struct BuildParams {
     pub trusted_ark_der: Option<Vec<u8>>,
     pub trusted_ask_der: Option<Vec<u8>>,
     pub allowed_measurements: Vec<CompiledPin>,
-    pub snp_policy: sevsnp::SevSnpTcbPolicy,
+    pub snp_policy: sevsnp::SevSnpTcbFloors,
     pub snp_observer: Option<sevsnp::SevSnpObserver>,
     pub attestation_observer: Option<crate::AttestationObserver>,
     pub tls_roots: Arc<rustls::RootCertStore>,
@@ -261,10 +261,10 @@ struct AttestationCheck {
     attestation_host: String,
     trusted_ark_der: Option<Vec<u8>>,
     trusted_ask_der: Option<Vec<u8>>,
-    /// Per-component minimum SVNs the SEV-SNP `reported_tcb` must satisfy.
+    /// Per-generation minimum SVNs the SEV-SNP `reported_tcb` must satisfy.
     /// Also drives the rollback check (`reported_tcb >= committed_tcb`),
     /// which is structural and not configurable. Unused on TDX backends.
-    snp_policy: sevsnp::SevSnpTcbPolicy,
+    snp_policy: sevsnp::SevSnpTcbFloors,
     /// Optional consumer-provided observer fired for every SEV-SNP
     /// attestation that completes signature verification (including ones
     /// the policy then rejects). Unused on TDX backends.
@@ -456,6 +456,9 @@ impl AttestationCheck {
         // of the pinned image with DEBUG=1 keeps the same measurement but
         // lets the hypervisor decrypt guest memory).
         sevsnp::check_report_hygiene(&report)?;
+        // The report's own signed CPUID names its generation, which picks the
+        // one AMD chain it must verify under; no other chain is tried.
+        let generation = sevsnp::SevSnpGeneration::of_report(&report)?;
 
         let vcek_der = resolved.vcek_der.as_deref().ok_or_else(|| {
             Error::Bundle("SEV-SNP document carries no VCEK collateral".to_string())
@@ -472,9 +475,11 @@ impl AttestationCheck {
 
         // The document carries ASK + ARK so verification is network-free, but
         // they remain untrusted transport. Require byte identity with the
-        // caller's explicit mock chain or the built-in AMD Genoa chain before
-        // using them for VCEK/report and CRL verification.
+        // caller's explicit override chain or the built-in AMD chain of the
+        // report's generation before using them for VCEK/report and CRL
+        // verification.
         let (trusted_ark_der, trusted_ask_der) = sevsnp::resolve_chain_certs_der(
+            generation,
             self.trusted_ark_der.as_deref(),
             self.trusted_ask_der.as_deref(),
         )?;
@@ -492,6 +497,7 @@ impl AttestationCheck {
         sevsnp::verify_report(
             vcek_der,
             &report,
+            generation,
             Some(carried_ark_der),
             Some(carried_ask_der),
         )?;
@@ -511,7 +517,7 @@ impl AttestationCheck {
         // *before* we propagate the policy result so consumers see the
         // full population of observed TCB levels — including ones we
         // will reject — for metrics and alerting.
-        let (snp_observation, policy_result) = self.snp_policy.evaluate(&report);
+        let (snp_observation, policy_result) = self.snp_policy.evaluate(&report, generation);
         if let Some(observer) = &self.snp_observer {
             observer(&snp_observation);
         }
@@ -537,6 +543,7 @@ impl AttestationCheck {
         tracing::info!(
             measurement = %matched,
             tls_fingerprint = hex::encode(peer_spki),
+            generation = %generation,
             reported_tcb = %snp_observation.reported_tcb,
             committed_tcb = %snp_observation.committed_tcb,
             tcb_bucket = snp_observation.as_metric_label(),
@@ -931,7 +938,7 @@ mod tests {
             attestation_host: "enclave.example".to_string(),
             trusted_ark_der: None,
             trusted_ask_der: None,
-            snp_policy: sevsnp::SevSnpTcbPolicy::default(),
+            snp_policy: sevsnp::SevSnpTcbFloors::default(),
             snp_observer: None,
             attestation_observer: None,
         }
@@ -1054,6 +1061,54 @@ mod tests {
             .verify(&resolved(Platform::Tdx, vec![]), &[0; 32], &NONCE)
             .unwrap_err();
         assert!(matches!(err, Error::FingerprintMismatch { .. }), "{err}");
+    }
+
+    /// The report's CPUID picks the one AMD chain the document's carried ASK
+    /// and ARK must equal: a Turin report carrying the Genoa chain is
+    /// refused at the chain, and the reverse, while each carrying its own
+    /// passes on to the VCEK (junk here, so it fails there). An override
+    /// chain replaces that choice for every generation, and AMD's own chain
+    /// is then refused. The reports are constructed; see `sevsnp::tests`.
+    #[test]
+    fn sev_snp_chain_is_the_one_the_reports_generation_names() {
+        use sevsnp::SevSnpGeneration::{Genoa, Turin};
+        let genoa = sevsnp::resolve_chain_certs_der(Genoa, None, None).unwrap();
+        let turin = sevsnp::resolve_chain_certs_der(Turin, None, None).unwrap();
+        let genoa_report = sevsnp::tests::v3_report_bytes(|_| {});
+        let turin_report = sevsnp::tests::turin_v3_report_bytes(|_| {});
+        let doc = |report: &[u8], (ark, ask): &(Vec<u8>, Vec<u8>)| bundle::ResolvedAttestation {
+            vcek_der: Some(b"not a vcek".to_vec()),
+            crl_der: Some(b"not a crl".to_vec()),
+            ark_der: Some(ark.clone()),
+            ask_der: Some(ask.clone()),
+            ..resolved(Platform::SevSnp, report.to_vec())
+        };
+        let past_the_chain = |err: Error| {
+            let err = err.to_string();
+            assert!(err.contains("VCEK"), "{err}");
+            assert!(!err.contains("does not match the trusted"), "{err}");
+        };
+        let at_the_chain = |err: Error| {
+            let err = err.to_string();
+            assert!(err.contains("does not match the trusted AMD root"), "{err}");
+        };
+
+        let builtin = check(&[server_pin()]);
+        let verify = |check: &AttestationCheck, report: &[u8], chain| {
+            check
+                .verify(&doc(report, chain), &PEER_SPKI, &NONCE)
+                .unwrap_err()
+        };
+        at_the_chain(verify(&builtin, &turin_report, &genoa));
+        at_the_chain(verify(&builtin, &genoa_report, &turin));
+        past_the_chain(verify(&builtin, &turin_report, &turin));
+        past_the_chain(verify(&builtin, &genoa_report, &genoa));
+
+        let mut overridden = check(&[server_pin()]);
+        overridden.trusted_ark_der = Some(genoa.0.clone());
+        overridden.trusted_ask_der = Some(genoa.1.clone());
+        past_the_chain(verify(&overridden, &turin_report, &genoa));
+        at_the_chain(verify(&overridden, &turin_report, &turin));
     }
 
     fn snp_candidates(pins: &[AllowedMeasurement]) -> Vec<CompiledPin> {

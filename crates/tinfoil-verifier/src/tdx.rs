@@ -1063,7 +1063,12 @@ pub(crate) mod tests {
 
     #[test]
     fn a_chain_to_any_other_root_is_refused() {
-        let (ark, _) = crate::sevsnp::resolve_chain_certs_der(None, None).unwrap();
+        let (ark, _) = crate::sevsnp::resolve_chain_certs_der(
+            crate::sevsnp::SevSnpGeneration::Genoa,
+            None,
+            None,
+        )
+        .unwrap();
         let err = authenticate(FIXTURE_QUOTE, &fixture_responses(), &ark, FIXTURE_NOW)
             .unwrap_err()
             .to_string();

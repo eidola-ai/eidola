@@ -85,7 +85,10 @@ pub use measurement::{
     AllowedMeasurement, MatchedMeasurement, PckFlag, PlatformMeasurement, SevSnpLaunchMeasurement,
     SevSnpPin, TdxLaunchMeasurement, TdxPin, TdxPolicy,
 };
-pub use sevsnp::{SevSnpObserver, SevSnpTcbObservation, SevSnpTcbPolicy, SevSnpTcbSvns};
+pub use sevsnp::{
+    SevSnpGeneration, SevSnpObserver, SevSnpTcbFloors, SevSnpTcbObservation, SevSnpTcbPolicy,
+    SevSnpTcbSvns,
+};
 
 /// Details of a verified TEE attestation, emitted after each successful
 /// new-connection attestation check.
@@ -133,8 +136,10 @@ pub struct AttestingClientConfig<'a> {
     /// are deliberately *not* added here; they only feed the SEV-SNP chain
     /// verifier.
     pub tls_roots: rustls::RootCertStore,
-    /// Optional custom trusted ARK (Root CA) DER bytes. Overrides the
-    /// built-in AMD Genoa ARK in the SEV-SNP attestation chain verifier.
+    /// Optional custom trusted ARK (Root CA) DER bytes. Replaces the
+    /// built-in AMD ARK in the SEV-SNP attestation chain verifier for every
+    /// report, whatever processor generation it names: an override is the
+    /// one root, never a root added beside AMD's Genoa and Turin roots.
     /// **Not** added to any TLS root store; if you need TLS to trust a
     /// custom CA (e.g. for the tinfoil shim mock), install the cert in your
     /// system trust store.
@@ -143,12 +148,12 @@ pub struct AttestingClientConfig<'a> {
     /// [`Self::trusted_ark_der`].
     pub trusted_ask_der: Option<&'a [u8]>,
     /// Operator-supplied minimum TCB SVNs the SEV-SNP `reported_tcb`
-    /// must satisfy. When `None`, defaults to
-    /// [`SevSnpTcbPolicy::amd_recommended`] (`bootloader >= 0x07`,
-    /// `snp >= 0x0E`, `microcode >= 0x48`, no `tee` floor). The rollback
-    /// check (`reported_tcb >= committed_tcb`) is structural and always
-    /// applied regardless of this setting.
-    pub snp_min_tcb: Option<SevSnpTcbPolicy>,
+    /// must satisfy, one floor per processor generation. When `None`,
+    /// defaults to [`SevSnpTcbFloors::default`] ([`SevSnpTcbPolicy::genoa`]
+    /// and [`SevSnpTcbPolicy::turin`]). The rollback check
+    /// (`reported_tcb >= committed_tcb`) is structural and always applied
+    /// regardless of this setting.
+    pub snp_min_tcb: Option<SevSnpTcbFloors>,
     /// Optional observer fired for every SEV-SNP attestation that
     /// completes signature verification, **including ones the policy
     /// rejects**. The callback runs synchronously on the TLS handshake hot

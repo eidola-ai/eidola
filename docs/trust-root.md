@@ -25,7 +25,7 @@ Generated into the client at compile time by `crates/eidola-app-core/build.rs`, 
 | `ATTESTATION_TEMPLATES_JSON` | `releases/schema/attestation-templates.json` | Pinned claim templates the verifier re-renders during equality checks |
 | `SIGSTORE_TRUSTED_ROOT_JSON` | `releases/trust/sigstore-trusted-root.json` | Pinned Sigstore tlog / Fulcio / CT log keys with validity windows |
 
-The `eidola` backend row's overrides (`base_url`, `trusted_measurements`, and the hardware ARK/ASK CAs — set via `eidola configure` or Settings → Backends → Eidola) take precedence at runtime — use them to point a build at a local server or alternate enclave. With a column left NULL, the pinned value above is what gets used.
+The `eidola` backend row's overrides (`base_url`, `trusted_measurements`, and the hardware ARK/ASK CAs — set via `eidola configure` or Settings → Backends → Eidola) take precedence at runtime — use them to point a build at a local server or alternate enclave. With a column left NULL, the pinned value above is what gets used. The AMD ARK and ASK are not in the table: they are built into the verifier, one pair for each AMD processor generation it accepts (Genoa and Turin), and each attestation is checked against the pair of the generation its own signed report names. An ARK or ASK override replaces that pair for every attestation, whatever generation it names; it never adds a chain beside AMD's.
 
 ## Why the enclave block lives in its own file
 
