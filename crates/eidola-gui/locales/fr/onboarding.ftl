@@ -99,6 +99,7 @@ onboarding-copy-label = Copier { $label }
 onboarding-new-account-note = Il sert uniquement à ajouter et à consommer des crédits. Si le secret du compte est perdu, il ne peut pas être récupéré et vous devrez créer un nouveau compte.
 onboarding-cta-saved = Je l'ai enregistré quelque part.
 onboarding-create-not-saved = Votre compte a été créé, mais il n'a pas pu être enregistré ici ({ $reason }). C'est la seule copie de son secret : copiez les deux maintenant, puis associez-les avec « J'ai déjà un compte. » une fois le problème résolu.
+onboarding-create-recovery-file = Une copie a aussi été enregistrée dans { $path }. Supprimez ce fichier une fois le compte associé.
 
 onboarding-cta-verify = Vérifier le solde du compte.
 onboarding-cta-verify-pending = Vérification…

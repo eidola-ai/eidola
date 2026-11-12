@@ -8332,6 +8332,56 @@ fn onboarding_an_unsaved_account_is_told_in_the_readers_language(cx: &mut TestAp
     );
 }
 
+/// **An unsaved account says where its credential was also written.** The
+/// file beside the profile outlives the window, and nothing removes it but
+/// the reader, so the line naming it — and saying when to delete it — reads
+/// in their language, with the path intact in every one.
+#[gpui::test]
+fn onboarding_an_unsaved_account_names_its_recovery_file_in_the_readers_language(
+    cx: &mut TestAppContext,
+) {
+    let stores = stub_stores(cx, |_| {});
+    let (_window, view) = open_onboarding(cx, &stores);
+    let unsaved = |recovery_file: Option<std::path::PathBuf>| AppError::AccountNotSaved {
+        account: Box::new(eidola_app_core::error::UnsavedAccount {
+            account_id: "00000000-0000-0000-0000-00000000000c".into(),
+            secret: eidola_app_core::error::AccountSecret::new("only-copy".into()),
+            terms: eidola_app_core::TermsAcceptance::Complete,
+            recovery_file,
+        }),
+        reason: "config error: unreadable".into(),
+    };
+    let path = "/profile/account-recovery-00000000-0000-0000-0000-00000000000c.toml";
+    view.update(cx, |v, cx| {
+        v.set_create_error_for_test(unsaved(Some(path.into())), cx)
+    });
+    let mut seen = Vec::new();
+    for tag in ["en", "es", "fr", "zh-Hans", "zh-Hant"] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let line = view
+            .read_with(cx, |v, cx| v.create_recovery_file_for_test(cx))
+            .expect("the recovery file is named")
+            .to_string();
+        assert!(
+            line.contains(path) && !line.contains("only-copy"),
+            "{tag}: names the file and never the secret: {line}"
+        );
+        assert!(
+            !seen.contains(&line),
+            "{tag} repeats another locale: {line}"
+        );
+        seen.push(line);
+    }
+
+    // When that write failed too there is no file to name: the rows on screen
+    // are the only copy, and the line says nothing rather than a wrong thing.
+    view.update(cx, |v, cx| v.set_create_error_for_test(unsaved(None), cx));
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.create_recovery_file_for_test(cx)),
+        None
+    );
+}
+
 /// **The slide prose is chosen at render, not seeded once.**
 ///
 /// Each slide's editor is element-owned state initialised on its first frame,

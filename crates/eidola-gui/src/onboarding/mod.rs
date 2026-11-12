@@ -383,6 +383,15 @@ impl OnboardingView {
         self.create_error.as_ref().map(|e| create_error_copy(e, cx))
     }
 
+    /// Where an unsaved account's credential was also written, in the active
+    /// locale — the same call the render makes.
+    #[doc(hidden)]
+    pub fn create_recovery_file_for_test(&self, cx: &App) -> Option<SharedString> {
+        self.create_error
+            .as_ref()
+            .and_then(|e| create_recovery_file_copy(e, cx))
+    }
+
     /// The prose a slide carries, in the active locale — the same call the
     /// render makes, so the two cannot disagree about which message a slide
     /// shows.
@@ -1228,10 +1237,6 @@ pub(crate) fn verify_error_copy(failure: &VerifyFailure, cx: &App) -> SharedStri
     }
 }
 
-/// Turn a refused checkout into the sentence a reader sees. Same shape, same
-/// residual: the one case this layer has words of its own for is the stale
-/// mint, which is a decision *this* surface made rather than a failure app-core
-/// reported.
 /// What a refused account creation says, in the reader's locale where this
 /// surface has the words. An account the server created but this profile could
 /// not keep gets its own sentence (the rows beneath it hold the credential);
@@ -1246,6 +1251,24 @@ pub(super) fn create_error_copy(error: &AppError, cx: &App) -> String {
     }
 }
 
+/// Where an unsaved account's credential was also written, said in the
+/// reader's locale — `None` when the error is another refusal, or when that
+/// write failed too (the rows on screen are then the only copy).
+pub(super) fn create_recovery_file_copy(error: &AppError, cx: &App) -> Option<SharedString> {
+    let AppError::AccountNotSaved { account, .. } = error else {
+        return None;
+    };
+    let path = account.recovery_file.as_ref()?;
+    Some(crate::i18n::msg::onboarding_create_recovery_file(
+        cx,
+        path.display().to_string(),
+    ))
+}
+
+/// Turn a refused checkout into the sentence a reader sees. Same shape, same
+/// residual as [`verify_error_copy`]: the one case this layer has words of its
+/// own for is the stale mint, which is a decision *this* surface made rather
+/// than a failure app-core reported.
 pub(crate) fn checkout_error_copy(failure: &CheckoutFailure, cx: &App) -> SharedString {
     match failure {
         CheckoutFailure::StaleMint => crate::i18n::msg::onboarding_checkout_stale_mint(cx),

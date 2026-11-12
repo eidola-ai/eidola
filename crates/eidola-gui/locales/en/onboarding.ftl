@@ -184,6 +184,10 @@ onboarding-cta-saved = I've saved this somewhere.
 # credential. The two rows below this line are the only copy of the secret.
 # $reason is the cause as the app reports it (English).
 onboarding-create-not-saved = Your account was created, but it could not be saved here ({ $reason }). This is the only copy of its secret: copy both now, then link them with “I already have an account.” once that is fixed.
+# Beneath the credential rows when the credential was also written to a file
+# beside the profile. $path is that file's location; nothing removes it but the
+# reader, so the sentence says when to.
+onboarding-create-recovery-file = A copy was also saved to { $path }. Delete that file once the account is linked.
 
 # -- Checking an existing account --------------------------------------------
 

@@ -998,6 +998,19 @@ fn some(s: &'static str) -> Option<SharedString> {
 mod tests {
     use super::*;
 
+    /// Every post body is a `MarkdownEditor` rendering text the reader did
+    /// not write, so the theme every context installs must leave only the
+    /// app's own assets resolvable as images.
+    #[gpui::test]
+    fn install_admits_only_the_apps_own_images(cx: &mut gpui::TestAppContext) {
+        use gpui_markdown_editor::image::ImageSources;
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            install(cx);
+            assert_eq!(*cx.global::<ImageSources>(), ImageSources::EmbeddedOnly);
+        });
+    }
+
     #[test]
     fn character_schedule_covers_the_six_slots() {
         // Dawn 04–06 and sunrise 06–08 are bluish (sunrise ±2h).

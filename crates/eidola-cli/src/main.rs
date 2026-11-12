@@ -950,7 +950,10 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                             "once the profile is fixed, link it with: eidola account configure --id <id> --secret <secret>"
                         );
                         if let Some(file) = &account.recovery_file {
-                            eprintln!("a copy is also in {} (owner-only)", file.display());
+                            eprintln!(
+                                "a copy is also in {} (owner-only); delete it once the account is linked",
+                                file.display()
+                            );
                         }
                         report_terms_standing(&account.terms);
                         std::process::exit(1);

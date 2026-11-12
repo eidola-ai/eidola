@@ -397,6 +397,10 @@ fn every_message_formats_in_every_shipped_locale(cx: &mut TestAppContext) {
                 args.set("hash", "a13d92b1d4bd…");
                 args.set("source", "example/fixture@4444444");
                 args.set("url", "https://www.eidola.ai/docs/model-identity/");
+                args.set(
+                    "path",
+                    "/home/reader/.config/eidola/account-recovery-1.toml",
+                );
                 let formatted = i18n::format(cx, id, Some(&args));
                 assert!(
                     !formatted.is_empty() && !formatted.contains('{'),
