@@ -581,7 +581,8 @@ async fn real_flash_serves_what_the_executor_computes() {
         }
         let cause = match finish {
             FinishReason::Stop => StopCause::EndOfSequence,
-            _ => StopCause::MaxTokens,
+            FinishReason::Length | FinishReason::KvExhausted => StopCause::MaxTokens,
+            FinishReason::Cancelled => unreachable!("the direct run cancels nothing"),
         };
         let (d, reason) = parser.finish(cause);
         all.reasoning_content.push_str(&d.reasoning_content);

@@ -136,7 +136,8 @@ fn expected_output_in(
     }
     let cause = match finish {
         FinishReason::Stop => StopCause::EndOfSequence,
-        _ => StopCause::MaxTokens,
+        FinishReason::Length | FinishReason::KvExhausted => StopCause::MaxTokens,
+        FinishReason::Cancelled => unreachable!("the direct run cancels nothing"),
     };
     let (d, reason) = parser.finish(cause);
     all.reasoning_content.push_str(&d.reasoning_content);
@@ -1014,6 +1015,57 @@ async fn a_length_ending_at_the_context_window_is_not_continuable() {
         v["choices"][0]["continuable"],
         parser_verdict(&below, Some("content")),
         "{v}"
+    );
+}
+
+/// A generation that KV memory cannot grow ends `length` like one cut by its limit, but
+/// is never continuable: a continuation's prompt is the same tokens and needs at least
+/// the memory this one ran out of. On a pool holding the prompt and a few blocks more,
+/// the same tokens cut by `max_completion_tokens` instead are continuable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_length_ending_out_of_kv_memory_is_not_continuable() {
+    let base = continued("The answer so far", "a thought", json!(true));
+    let prompt = continued_prompt_tokens(&base, "content");
+    // The null block, the prompt's blocks, and two more.
+    let blocks = (1 + prompt.len().div_ceil(16) + 2).to_string();
+    let node = TestNode::start(&[(env::KV_BLOCKS, blocks.as_str())]).await;
+    let finishing = |events: &[String]| {
+        let (chunks, done) = parse_chunks(events);
+        assert!(done, "{events:?}");
+        let choice = chunks
+            .iter()
+            .filter_map(|c| c["choices"].get(0))
+            .find(|c| !c["finish_reason"].is_null())
+            .expect("a finishing chunk")
+            .clone();
+        let usage = chunks.last().unwrap()["usage"].clone();
+        (choice, usage["completion_tokens"].as_u64().unwrap() as u32)
+    };
+    let mut body = base.clone();
+    body["stream"] = true.into();
+    body["stream_options"] = json!({"include_usage": true});
+    body["max_completion_tokens"] = 200.into();
+    let (choice, generated) = finishing(&node.chat_stream(&body).await);
+    assert_eq!(choice["finish_reason"], "length", "{choice}");
+    assert_eq!(choice["continuable"], false, "{choice}");
+    assert!(
+        (1..200).contains(&generated),
+        "memory, not the limit, ended it after {generated} tokens"
+    );
+    let (tokens, finish) = direct_greedy(prompt, generated);
+    assert_eq!(finish, FinishReason::Length);
+    assert!(
+        parser_verdict(&tokens, Some("content")),
+        "the chat layer alone would call this cut exact, so only memory can refuse it"
+    );
+
+    body["max_completion_tokens"] = generated.into();
+    let (choice, cut) = finishing(&node.chat_stream(&body).await);
+    assert_eq!(cut, generated);
+    assert_eq!(choice["finish_reason"], "length", "{choice}");
+    assert_eq!(
+        choice["continuable"], true,
+        "the same tokens, cut by the limit: {choice}"
     );
 }
 

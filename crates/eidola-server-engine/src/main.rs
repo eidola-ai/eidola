@@ -7,6 +7,9 @@
 //! way could turn on a dependency's debug logging, which this crate's content-free
 //! discipline does not cover. Nothing request-derived is ever logged: no prompt, output,
 //! cache key, salt or per-request size.
+//!
+//! Exit status: 0 after a graceful shutdown; 1 when boot refuses or the engine thread
+//! stops; `worker::STALL_EXIT_STATUS` when the step watchdog finds the engine wedged.
 
 use std::process::ExitCode;
 

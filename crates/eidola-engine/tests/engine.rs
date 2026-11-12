@@ -744,7 +744,7 @@ fn headed(rng: &mut TestRng, head: &[u32]) -> Vec<u32> {
 /// KV memory and was ended early), length-only otherwise.
 fn check_output(h: &Harness, id: u64, prompt: &[u32], p: &SamplingParams, max: u32, spec_on: bool) {
     let out = &h.outputs[&id];
-    let early = h.finished.get(&id) == Some(&FinishReason::Length) && (out.len() as u32) < max;
+    let early = h.finished.get(&id) == Some(&FinishReason::KvExhausted);
     if !spec_on || p.is_greedy() {
         let exp = h.expected(prompt, p, max, &[]);
         if early {
@@ -1217,14 +1217,50 @@ fn kv_pressure_drops_drafts_before_finishing() {
         assert_eq!(h.eng.stats().drafted, 0);
         assert_eq!(h.eng.stats().preemptions, 0);
     }
-    // Where even plain decoding cannot grow, the documented `Length` still applies.
+    // Where even plain decoding cannot grow, the sequence ends for lack of memory.
     let spec = mimo_like_spec(32, 1, 6, 10, 3, 4, 3);
     let mut h = Harness::new(spec, sched(true), MockConfig::default());
     h.submit(request(1, vec![7], greedy, 5, CacheScope::Private));
     h.run();
     assert_eq!(h.outputs[&1].len(), 2);
     assert_eq!(h.outputs[&1], h.expected(&[7], &greedy, 2, &[]));
-    assert_eq!(h.finished[&1], FinishReason::Length);
+    assert_eq!(h.finished[&1], FinishReason::KvExhausted);
+}
+
+/// An ending names its cause: `max_tokens` and the model length end with `Length`, and
+/// a sequence alone that KV memory cannot grow ends with `KvExhausted`, with the tokens
+/// it did produce and no others.
+#[test]
+fn an_ending_names_its_cause() {
+    use eidola_engine::mock::mimo_like_spec;
+
+    let greedy = SamplingParams::greedy();
+    for spec_on in [false, true] {
+        // `max_tokens`.
+        let mut h = Harness::new(small_spec(256), sched(spec_on), MockConfig::default());
+        h.submit(request(1, vec![1, 2, 3], greedy, 4, CacheScope::Private));
+        h.run();
+        assert_eq!(h.outputs[&1], h.expected(&[1, 2, 3], &greedy, 4, &[]));
+        assert_eq!(h.finished[&1], FinishReason::Length);
+
+        // The model length: five prompt tokens leave room for three.
+        let mut spec = small_spec(256);
+        spec.max_model_len = 8;
+        let mut h = Harness::new(spec, sched(spec_on), MockConfig::default());
+        let prompt = vec![1u32, 2, 3, 4, 5];
+        h.submit(request(1, prompt.clone(), greedy, 100, CacheScope::Private));
+        h.run();
+        assert_eq!(h.outputs[&1], h.expected(&prompt, &greedy, 3, &[]));
+        assert_eq!(h.finished[&1], FinishReason::Length);
+
+        // KV memory: block size 1 and two allocatable blocks hold two positions.
+        let spec = mimo_like_spec(32, 1, 6, 10, 3, 4, 3);
+        let mut h = Harness::new(spec, sched(spec_on), MockConfig::default());
+        h.submit(request(1, vec![7], greedy, 5, CacheScope::Private));
+        h.run();
+        assert_eq!(h.outputs[&1], h.expected(&[7], &greedy, 2, &[]));
+        assert_eq!(h.finished[&1], FinishReason::KvExhausted);
+    }
 }
 
 /// Draft reservations are the first thing given up across the whole step: when the
@@ -1276,7 +1312,7 @@ fn tight_sliding_spec() -> eidola_engine::spec::ModelSpec {
 
 /// With caching off, no regeneration window is retained: nothing could ever hit it, and
 /// holding the prompt's window would stop the sliding groups recycling (retaining it
-/// makes a five-token prompt end with `Length` once decoding needs a fourth block).
+/// makes a five-token prompt end with `KvExhausted` once decoding needs a fourth block).
 #[test]
 fn no_regeneration_retention_without_caching() {
     let mut cfg = sched(false);
@@ -1290,14 +1326,15 @@ fn no_regeneration_retention_without_caching() {
     assert_eq!(h.outputs[&1].len(), 8);
 }
 
-/// `Length` means the sequence cannot make its minimum progress even holding every
+/// `KvExhausted` means the sequence cannot make its minimum progress even holding every
 /// reclaimable block. Under the tight sliding geometry, before concluding that the
 /// scheduler sheds drafts, then the prefill chunk (down to one block), then the
 /// sequence's own branch and regeneration retention (the windows it attached to cache
 /// entries, which only its own release would otherwise give back). Skipping any of these
-/// steps ends the case with `Length` early (the 8-token prompt with no output at all).
+/// steps ends the case with `KvExhausted` early (the 8-token prompt with no output at
+/// all).
 #[test]
-fn optional_reservations_are_shed_before_length() {
+fn optional_reservations_are_shed_before_kv_runs_out() {
     let greedy = SamplingParams::greedy();
     for spec_on in [false, true] {
         for (prompt, chunk) in [
@@ -1325,6 +1362,7 @@ fn optional_reservations_are_shed_before_length() {
                 "speculative {spec_on}, prompt {prompt:?}"
             );
             assert_eq!(h.outputs[&1].len(), 8);
+            assert_eq!(h.finished[&1], FinishReason::Length);
             assert_eq!(h.eng.stats().preemptions, 0);
         }
     }
