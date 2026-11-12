@@ -18,6 +18,7 @@ space-footnote-delegation-failed = 已中止：{ $reason ->
 
 space-regenerating = 正在重新生成…
 space-error-model-unavailable = { $model } 所在的后端已不再提供该模型，也不会由其他模型代为作答。没有发送任何请求，也没有产生任何费用——请改选一个模型后重试。
+space-error-hold-exceeds-denomination = 这条回复的费用可能超出单个请求允许预留的额度，因此没有发送任何请求，也没有产生任何费用。充值无法解决这个问题——请缩短对话或改用其他模型。
 space-regenerating-elsewhere = 这条回复正在重新生成。
 space-answer-cut-off = 这条回复在长度上限处停下。
 space-continue-answer = 继续

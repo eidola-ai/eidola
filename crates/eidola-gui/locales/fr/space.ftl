@@ -18,6 +18,7 @@ space-footnote-delegation-failed = s’est arrêtée : { $reason ->
 
 space-regenerating = Régénération…
 space-error-model-unavailable = { $model } n’est plus proposé par son backend, et aucun autre modèle ne répondra à sa place. Rien n’a été envoyé ni facturé : choisissez un autre modèle, puis réessayez.
+space-error-hold-exceeds-denomination = Cette réponse pourrait coûter plus qu’une seule requête n’est autorisée à retenir : rien n’a donc été envoyé ni facturé. Ajouter du crédit n’y changera rien — essayez une conversation plus courte ou un autre modèle.
 space-regenerating-elsewhere = Cette réponse est déjà en cours de régénération.
 space-answer-cut-off = Cette réponse s’est arrêtée à sa limite de longueur.
 space-continue-answer = Continuer
