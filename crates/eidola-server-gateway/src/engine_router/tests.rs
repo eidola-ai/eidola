@@ -1675,3 +1675,134 @@ async fn a_silent_engine_is_given_up_on_within_its_bounds() {
         "counted as failures"
     );
 }
+
+/// A cache key whose ranking over the upstreams at `order` is exactly that
+/// order.
+fn key_ranking(router: &EngineRouter, model: &str, order: &[&str]) -> u64 {
+    let ups: Vec<Arc<Upstream>> = order
+        .iter()
+        .map(|url| upstream(router, model, url))
+        .collect();
+    (0..)
+        .find(|&i| {
+            let ranked = rendezvous::rank_by_key(&CacheKey::from_bytes(key_bytes(i)), ups.clone());
+            ranked
+                .iter()
+                .map(|u| u.base_url.as_str())
+                .eq(order.iter().copied())
+        })
+        .unwrap()
+}
+
+/// Three engines a key ranks stalled first, `second` next and `third` last,
+/// with headers given up on quickly.
+async fn ranked_behind_a_stall() -> ([Engine; 3], EngineRouter, String) {
+    let engines = [
+        engine(Identity::of(MODEL_A)).await,
+        engine(Identity::of(MODEL_A)).await,
+        engine(Identity::of(MODEL_A)).await,
+    ];
+    let refs: Vec<&Engine> = engines.iter().collect();
+    let config = RouterConfig {
+        stream_headers_limit: Duration::from_millis(500),
+        ..fast_config()
+    };
+    let router = router_with(&refs, models(), config);
+    let rows: Vec<EnginePlacementRow> = engines
+        .iter()
+        .map(|e| e.row(MODEL_A, DEPLOYMENT_A))
+        .collect();
+    router.apply_placement(&rows).await;
+    router.probe_due().await;
+    let order: Vec<&str> = engines.iter().map(|e| e.base_url.as_str()).collect();
+    let key = key_text(key_ranking(&router, MODEL_A, &order));
+    engines[0].set_mode(Mode::Stall);
+    (engines, router, key)
+}
+
+/// **A half-open engine takes one request at a time, decided at the
+/// attempt.** Requests planned while its slot was free, all reaching it at
+/// once (each having waited on an engine ranked ahead that never answers),
+/// send it exactly one; the rest go on to the next engine. Once the one it
+/// took is served, it is healthy and takes every request.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_open_engine_takes_one_request_however_many_arrive() {
+    let ([stalled, recovering, next], router, key) = ranked_behind_a_stall().await;
+    let config = fast_config().breaker;
+    {
+        let up = upstream(&router, MODEL_A, &recovering.base_url);
+        up.breaker().trip(Instant::now(), &config);
+        up.breaker().on_probe(true, Instant::now(), &config);
+        assert!(up.routable(), "half-open, its slot free");
+    }
+    recovering.set_mode(Mode::Hold);
+    let requests: Vec<_> = (0..4)
+        .map(|_| {
+            let router = router.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                router
+                    .send_stream(&request(MODEL_A, Some(&key), true))
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect();
+    let mut streams = Vec::new();
+    for r in requests {
+        streams.push(r.await.unwrap());
+    }
+    assert_eq!(
+        stalled.chats().len(),
+        4,
+        "each tried the stalled engine first"
+    );
+    assert_eq!(recovering.chats().len(), 1, "one request at a time");
+    assert_eq!(next.chats().len(), 3, "the rest went on");
+    let up = upstream(&router, MODEL_A, &recovering.base_url);
+    assert!(!up.routable(), "its slot is taken");
+
+    // The one it took is served: healthy, every request admitted.
+    recovering.state.release.notify_waiters();
+    for mut rx in streams {
+        while rx.recv().await.is_some() {}
+    }
+    stalled.state.release.notify_waiters();
+    assert!(up.routable());
+    let guards: Vec<_> = (0..3).map(|_| up.admit().expect("healthy")).collect();
+    drop(guards);
+}
+
+/// **A planned fallback is rechecked when its turn comes.** A request whose
+/// plan held a healthy engine behind one that never answers does not reach
+/// it once it has opened in the meantime: with nothing else to try, it is
+/// the answer no engine could take.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fallback_that_opened_while_the_request_waited_is_skipped() {
+    let ([stalled, fallback, last], router, key) = ranked_behind_a_stall().await;
+    last.set_mode(Mode::Stall);
+    let pending = {
+        let router = router.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            router
+                .send_stream(&request(MODEL_A, Some(&key), true))
+                .await
+                .map(|_| ())
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(stalled.chats().len(), 1, "waiting on the first engine");
+    upstream(&router, MODEL_A, &fallback.base_url)
+        .breaker()
+        .trip(Instant::now(), &fast_config().breaker);
+    let outcome = pending.await.unwrap();
+    assert!(
+        matches!(outcome, Err(ServerError::ServiceUnavailable(_))),
+        "no engine took it"
+    );
+    assert_eq!(fallback.chats().len(), 0, "the opened engine was skipped");
+    assert_eq!(last.chats().len(), 1, "the one after it was still tried");
+    stalled.state.release.notify_waiters();
+    last.state.release.notify_waiters();
+}

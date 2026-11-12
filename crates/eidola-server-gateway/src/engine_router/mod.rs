@@ -287,18 +287,39 @@ impl Upstream {
         self.in_flight.load(Ordering::Relaxed)
     }
 
-    /// Count a request in flight until the returned guard drops.
+    /// Admit a request to this upstream now, and count it in flight until
+    /// the returned guard drops; `None` when its breaker admits nothing now
+    /// (it opened, or its half-open slot is taken). Admission and the count
+    /// are one step under the breaker's lock, taken at each attempt.
+    pub(crate) fn admit(self: &Arc<Self>) -> Option<InFlight> {
+        let mut breaker = self.breaker();
+        let admitted = breaker.admit()?;
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        drop(breaker);
+        Some(InFlight {
+            upstream: self.clone(),
+            admitted: Some(admitted),
+        })
+    }
+
+    /// Count a request in flight, admitted or not: for tests of ranking.
+    #[cfg(test)]
     pub(crate) fn begin(self: &Arc<Self>) -> InFlight {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
-        InFlight(self.clone())
+        InFlight {
+            upstream: self.clone(),
+            admitted: None,
+        }
     }
 
     fn breaker(&self) -> std::sync::MutexGuard<'_, Breaker> {
         self.breaker.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Whether a request could be admitted now (ranking's filter, not the
+    /// gate: [`Upstream::admit`] is).
     fn routable(&self) -> bool {
-        self.breaker().routable(self.in_flight())
+        self.breaker().routable()
     }
 
     fn url(&self, path: &str) -> String {
@@ -306,12 +327,20 @@ impl Upstream {
     }
 }
 
-/// A request in flight on an upstream.
-pub(crate) struct InFlight(Arc<Upstream>);
+/// A request in flight on an upstream: its admission is given back when it
+/// drops, however the request ended.
+pub(crate) struct InFlight {
+    upstream: Arc<Upstream>,
+    admitted: Option<breaker::Admitted>,
+}
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+        let mut breaker = self.upstream.breaker();
+        self.upstream.in_flight.fetch_sub(1, Ordering::Relaxed);
+        if let Some(admitted) = self.admitted {
+            breaker.release(admitted);
+        }
     }
 }
 
@@ -712,7 +741,11 @@ impl EngineRouter {
             ..
         } = self.plan(request)?;
         for upstream in upstreams {
-            let _in_flight = upstream.begin();
+            // The plan's ranking is from before any attempt; whether this
+            // upstream takes the request is decided now.
+            let Some(_in_flight) = upstream.admit() else {
+                continue;
+            };
             let response = match self.attempt(&upstream, &headers, &body, None).await {
                 Attempt::Response(response) => response,
                 Attempt::Next => continue,
@@ -763,7 +796,9 @@ impl EngineRouter {
             body,
         } = self.plan(request)?;
         for upstream in upstreams {
-            let in_flight = upstream.begin();
+            let Some(in_flight) = upstream.admit() else {
+                continue;
+            };
             let limit = Some(self.inner.config.stream_headers_limit);
             let response = match self.attempt(&upstream, &headers, &body, limit).await {
                 Attempt::Response(response) => response,

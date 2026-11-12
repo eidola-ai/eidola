@@ -17,6 +17,13 @@
 //! which takes one request at a time and keeps the backoff: the first request
 //! it serves closes it, and the first it fails opens it again with the
 //! backoff doubled.
+//!
+//! **Admission is decided here, under the breaker's lock, at each attempt.**
+//! [`Breaker::admit`] answers whether this request may go to the upstream now
+//! and, for a half-open one, takes its single slot in the same step, so two
+//! requests cannot both see the slot free; the slot is given back
+//! ([`Breaker::release`]) when its request ends, whichever way. A slot taken
+//! in one half-open spell is never given back to a later one.
 
 use std::time::{Duration, Instant};
 
@@ -39,14 +46,31 @@ enum State {
     Healthy { failures: u32 },
     /// Taking no traffic until `until`, then probed.
     Open { until: Instant, backoff: Duration },
-    /// A probe passed after it was open: one request at a time, until one is
-    /// served (healthy) or fails (open again, `backoff` doubled).
-    HalfOpen { backoff: Duration },
+    /// A probe passed after it was open: one request at a time (`taken`),
+    /// until one is served (healthy) or fails (open again, `backoff`
+    /// doubled). `spell` tells this half-open period from later ones.
+    HalfOpen {
+        backoff: Duration,
+        spell: u64,
+        taken: bool,
+    },
+}
+
+/// What [`Breaker::admit`] let through: handed back to [`Breaker::release`]
+/// when the request ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admitted {
+    /// A healthy upstream's request.
+    Healthy,
+    /// A half-open upstream's single request, in the spell it was taken in.
+    Trial { spell: u64 },
 }
 
 #[derive(Debug, Clone)]
 pub struct Breaker {
     state: State,
+    /// Half-open spells begun so far.
+    spells: u64,
 }
 
 impl Default for Breaker {
@@ -60,16 +84,43 @@ impl Breaker {
     pub fn new() -> Self {
         Self {
             state: State::Unverified,
+            spells: 0,
         }
     }
 
-    /// Whether a request may be routed to the upstream, which has
-    /// `in_flight` requests running.
-    pub fn routable(&self, in_flight: usize) -> bool {
+    /// Whether a request could be admitted now: what ranking filters on. It
+    /// is a hint, not the gate; [`Breaker::admit`] is.
+    pub fn routable(&self) -> bool {
         match self.state {
             State::Healthy { .. } => true,
-            State::HalfOpen { .. } => in_flight == 0,
+            State::HalfOpen { taken, .. } => !taken,
             State::Unverified | State::Open { .. } => false,
+        }
+    }
+
+    /// Admit one request now, or refuse it: every request to a healthy
+    /// upstream, and to a half-open one only while its slot is free, which
+    /// this takes.
+    pub fn admit(&mut self) -> Option<Admitted> {
+        match &mut self.state {
+            State::Healthy { .. } => Some(Admitted::Healthy),
+            State::HalfOpen { spell, taken, .. } if !*taken => {
+                *taken = true;
+                Some(Admitted::Trial { spell: *spell })
+            }
+            _ => None,
+        }
+    }
+
+    /// An admitted request has ended. A half-open slot taken in the current
+    /// spell is free again; nothing else changes (its verdict, if it had one,
+    /// was already recorded).
+    pub fn release(&mut self, admitted: Admitted) {
+        if let (Admitted::Trial { spell: ended }, State::HalfOpen { spell, taken, .. }) =
+            (admitted, &mut self.state)
+            && ended == *spell
+        {
+            *taken = false;
         }
     }
 
@@ -99,7 +150,7 @@ impl Breaker {
                     self.open(now, config.initial_backoff);
                 }
             }
-            State::HalfOpen { backoff } => {
+            State::HalfOpen { backoff, .. } => {
                 let backoff = (*backoff * 2).min(config.max_backoff);
                 self.open(now, backoff);
             }
@@ -113,7 +164,9 @@ impl Breaker {
     pub fn trip(&mut self, now: Instant, config: &BreakerConfig) {
         match self.state {
             State::Open { .. } => {}
-            State::HalfOpen { backoff } => self.open(now, (backoff * 2).min(config.max_backoff)),
+            State::HalfOpen { backoff, .. } => {
+                self.open(now, (backoff * 2).min(config.max_backoff))
+            }
             State::Unverified | State::Healthy { .. } => self.open(now, config.initial_backoff),
         }
     }
@@ -126,12 +179,19 @@ impl Breaker {
                 // A periodic probe does not reset the count of failed
                 // requests, nor the backoff: only a served request does.
                 kept @ (State::Healthy { .. } | State::HalfOpen { .. }) => kept,
-                State::Open { backoff, .. } => State::HalfOpen { backoff },
+                State::Open { backoff, .. } => {
+                    self.spells += 1;
+                    State::HalfOpen {
+                        backoff,
+                        spell: self.spells,
+                        taken: false,
+                    }
+                }
             };
             return;
         }
         let backoff = match self.state {
-            State::Open { backoff, .. } | State::HalfOpen { backoff } => {
+            State::Open { backoff, .. } | State::HalfOpen { backoff, .. } => {
                 (backoff * 2).min(config.max_backoff)
             }
             State::Unverified | State::Healthy { .. } => config.initial_backoff,
@@ -161,14 +221,14 @@ mod tests {
     fn a_new_upstream_takes_no_traffic_until_a_probe_passes() {
         let now = Instant::now();
         let mut b = Breaker::new();
-        assert!(!b.routable(0));
+        assert!(!b.routable());
         assert!(b.probe_due(now));
         b.on_probe(true, now, &CONFIG);
-        assert!(b.routable(0));
+        assert!(b.routable());
 
         let mut failed = Breaker::new();
         failed.on_probe(false, now, &CONFIG);
-        assert!(!failed.routable(0));
+        assert!(!failed.routable());
         assert!(!failed.probe_due(now));
         assert!(failed.probe_due(now + CONFIG.initial_backoff));
     }
@@ -183,9 +243,9 @@ mod tests {
         b.on_success();
         b.on_failure(now, &CONFIG);
         b.on_failure(now, &CONFIG);
-        assert!(b.routable(0), "two consecutive failures stay below three");
+        assert!(b.routable(), "two consecutive failures stay below three");
         b.on_failure(now, &CONFIG);
-        assert!(!b.routable(0));
+        assert!(!b.routable());
         assert!(!b.probe_due(now + CONFIG.initial_backoff / 2));
         assert!(b.probe_due(now + CONFIG.initial_backoff));
     }
@@ -199,7 +259,7 @@ mod tests {
         b.on_failure(now, &CONFIG);
         b.on_probe(true, now, &CONFIG);
         b.on_failure(now, &CONFIG);
-        assert!(!b.routable(0));
+        assert!(!b.routable());
     }
 
     #[test]
@@ -219,7 +279,7 @@ mod tests {
         assert_eq!(expected, CONFIG.max_backoff);
         now += expected;
         b.on_probe(true, now, &CONFIG);
-        assert!(b.routable(0));
+        assert!(b.routable());
     }
 
     /// An upstream that passes its probes and fails its requests: each
@@ -238,27 +298,65 @@ mod tests {
             now += expected;
             assert!(b.probe_due(now));
             b.on_probe(true, now, &CONFIG);
-            assert!(b.routable(0), "half-open takes a request");
-            assert!(!b.routable(1), "one at a time");
+            let trial = b.admit().expect("half-open takes a request");
+            assert_eq!(b.admit(), None, "one at a time");
             // A periodic probe passing again changes nothing.
             b.on_probe(true, now, &CONFIG);
-            assert!(b.routable(0));
+            assert_eq!(b.admit(), None);
             b.on_failure(now, &CONFIG);
-            assert!(!b.routable(0), "one failure opens it again");
+            b.release(trial);
+            assert!(!b.routable(), "one failure opens it again");
+            assert_eq!(b.admit(), None);
             expected = (expected * 2).min(CONFIG.max_backoff);
         }
         assert_eq!(expected, CONFIG.max_backoff);
         now += expected;
         b.on_probe(true, now, &CONFIG);
+        let trial = b.admit().unwrap();
         b.on_success();
-        assert!(b.routable(5), "a served request closes it");
+        b.release(trial);
+        assert!(
+            (0..5).all(|_| b.admit() == Some(Admitted::Healthy)),
+            "a served request closes it"
+        );
         // Healthy again: back to the threshold and the initial backoff.
         b.on_failure(now, &CONFIG);
         b.on_failure(now, &CONFIG);
-        assert!(b.routable(0));
+        assert!(b.routable());
         b.on_failure(now, &CONFIG);
-        assert!(!b.routable(0));
+        assert!(!b.routable());
         assert!(b.probe_due(now + CONFIG.initial_backoff));
+    }
+
+    /// A half-open slot is taken by admission itself and given back when its
+    /// request ends without a verdict; a slot taken in an earlier spell is
+    /// never given back to a later one.
+    #[test]
+    fn a_half_open_slot_is_taken_at_admission_and_given_back_once() {
+        let now = Instant::now();
+        let later = now + CONFIG.initial_backoff;
+        let mut b = Breaker::new();
+        b.on_probe(true, now, &CONFIG);
+        assert_eq!(b.admit(), Some(Admitted::Healthy));
+        b.trip(now, &CONFIG);
+        assert_eq!(b.admit(), None, "open admits nothing");
+        b.on_probe(true, later, &CONFIG);
+        let first = b.admit().unwrap();
+        assert!(!b.routable());
+        assert_eq!(b.admit(), None);
+        // Ended with no verdict (its client left): the slot is free again.
+        b.release(first);
+        let second = b.admit().unwrap();
+        // It fails; a new spell begins after the backoff, and the first
+        // spell's slot given back now frees nothing in it.
+        b.on_failure(later, &CONFIG);
+        let again = later + CONFIG.initial_backoff * 2;
+        b.on_probe(true, again, &CONFIG);
+        let third = b.admit().unwrap();
+        b.release(second);
+        assert_eq!(b.admit(), None, "the stale release freed nothing");
+        b.release(third);
+        assert!(b.admit().is_some());
     }
 
     /// A failing probe of a half-open upstream doubles the backoff too.
@@ -281,11 +379,11 @@ mod tests {
         let mut b = Breaker::new();
         b.on_probe(true, now, &CONFIG);
         b.trip(now, &CONFIG);
-        assert!(!b.routable(0));
+        assert!(!b.routable());
 
         let mut c = Breaker::new();
         c.on_probe(true, now, &CONFIG);
         c.on_probe(false, now, &CONFIG);
-        assert!(!c.routable(0));
+        assert!(!c.routable());
     }
 }
