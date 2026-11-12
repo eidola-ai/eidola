@@ -45,7 +45,9 @@
 //! does: health turns unhealthy, every in-flight request gets an error, and then, after
 //! [`Watchdog::grace`] for the streams to write it, [`Watchdog::on_stall`] runs (for the
 //! node, [`exit_stalled`]). The engine thread never holds that map's lock across an
-//! executor call, so the watchdog can take it while the thread is stuck.
+//! executor call, so the watchdog can take it while the thread is stuck. The exit waits
+//! on no output either: the log line saying why is written by a thread of its own, since
+//! standard output may be full or held by a stuck thread.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -113,8 +115,6 @@ impl Watchdog {
 /// runs `atexit` handlers and library destructors (the GPU driver's among them), which
 /// may wait on what the stuck thread holds; nothing here waits on that thread.
 pub fn exit_stalled() -> ! {
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
     // SAFETY: `_exit` takes no arguments but the status and does not return; it ends the
     // process without running any Rust or C code after it, so no destructor that soundness
     // depends on is skipped while the process lives on.
@@ -519,13 +519,25 @@ fn watch(
     shared.busy.tripped.store(true, Ordering::Release);
     healthy.store(false, Ordering::Release);
     let failed = fail_in_flight(&shared.live);
-    tracing::error!(
-        limit_secs = watchdog.limit.as_secs_f64(),
-        requests_failed = failed,
-        "an engine step outlived its limit; the engine is wedged and the node is exiting"
-    );
+    report_stall(watchdog.limit, failed);
     std::thread::sleep(watchdog.grace);
     (watchdog.on_stall)();
+}
+
+/// Logs why the node is exiting, from a thread of its own that nothing waits for: the
+/// log's writer blocks while standard output is full or locked, and the exit must not.
+fn report_stall(limit: Duration, requests_failed: bool) {
+    let _ = std::thread::Builder::new()
+        .name("engine-stall-report".to_string())
+        .spawn(move || {
+            use std::io::Write;
+            tracing::error!(
+                limit_secs = limit.as_secs_f64(),
+                requests_failed,
+                "an engine step outlived its limit; the engine is wedged and the node is exiting"
+            );
+            let _ = std::io::stdout().flush();
+        });
 }
 
 /// Ends every in-flight request with [`Output::Failed`] (its channel closing after it

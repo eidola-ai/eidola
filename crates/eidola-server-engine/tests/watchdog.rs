@@ -281,6 +281,8 @@ fn an_idle_engine_does_not_trip_it() {
 }
 
 const CHILD_ENV: &str = "EIDOLA_WATCHDOG_TEST_CHILD";
+/// Set for a child that logs to standard output and holds it locked throughout.
+const CHILD_STDOUT_HELD_ENV: &str = "EIDOLA_WATCHDOG_TEST_CHILD_STDOUT_HELD";
 
 /// The child half of the test below (a no-op unless run as that child): an engine whose
 /// first step never returns, under a short limit and the node's own exit.
@@ -288,6 +290,20 @@ const CHILD_ENV: &str = "EIDOLA_WATCHDOG_TEST_CHILD";
 fn child_with_a_wedged_engine() {
     if std::env::var_os(CHILD_ENV).is_none() {
         return;
+    }
+    if std::env::var_os(CHILD_STDOUT_HELD_ENV).is_some() {
+        // The node's own logging, then standard output locked for good by a thread
+        // that never lets go: nothing can be written to it again.
+        tracing_subscriber::fmt().init();
+        let (held_tx, held_rx) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            let _lock = std::io::stdout().lock();
+            held_tx.send(()).unwrap();
+            loop {
+                std::thread::park();
+            }
+        });
+        held_rx.recv().unwrap();
     }
     let watchdog = Watchdog {
         limit: Duration::from_millis(300),
@@ -309,8 +325,21 @@ fn child_with_a_wedged_engine() {
 
 #[test]
 fn a_wedged_engine_ends_the_process_with_the_stall_status() {
+    assert_eq!(wedged_child_status(false), Some(worker::STALL_EXIT_STATUS));
+}
+
+/// The exit waits on no output: a node whose standard output can never be written to
+/// again (its log goes there) still ends, with the same status.
+#[test]
+fn a_wedged_engine_ends_the_process_though_its_log_cannot_be_written() {
+    assert_eq!(wedged_child_status(true), Some(worker::STALL_EXIT_STATUS));
+}
+
+/// Runs the child above and returns its exit status.
+fn wedged_child_status(stdout_held: bool) -> Option<i32> {
     use std::process::{Command, Stdio};
-    let mut child = Command::new(std::env::current_exe().unwrap())
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .args([
             "--exact",
             "child_with_a_wedged_engine",
@@ -319,9 +348,11 @@ fn a_wedged_engine_ends_the_process_with_the_stall_status() {
         ])
         .env(CHILD_ENV, "1")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::null());
+    if stdout_held {
+        command.env(CHILD_STDOUT_HELD_ENV, "1");
+    }
+    let mut child = command.spawn().unwrap();
     let start = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -333,5 +364,5 @@ fn a_wedged_engine_ends_the_process_with_the_stall_status() {
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert_eq!(status.code(), Some(worker::STALL_EXIT_STATUS));
+    status.code()
 }
