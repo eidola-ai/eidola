@@ -24,6 +24,12 @@
 //! requests cannot both see the slot free; the slot is given back
 //! ([`Breaker::release`]) when its request ends, whichever way. A slot taken
 //! in one half-open spell is never given back to a later one.
+//!
+//! **A half-open upstream's verdict is its own request's.** Every verdict
+//! names the admission it is for, and only the request holding the current
+//! spell's slot closes a half-open upstream or opens it again: one admitted
+//! earlier and still in flight says nothing about whether the engine serves
+//! requests now.
 
 use std::time::{Duration, Instant};
 
@@ -56,8 +62,8 @@ enum State {
     },
 }
 
-/// What [`Breaker::admit`] let through: handed back to [`Breaker::release`]
-/// when the request ends.
+/// What [`Breaker::admit`] let through: named by the request's verdict, and
+/// handed back to [`Breaker::release`] when the request ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admitted {
     /// A healthy upstream's request.
@@ -133,16 +139,31 @@ impl Breaker {
         }
     }
 
-    /// A request the upstream served: healthy, with no failures counted.
-    pub fn on_success(&mut self) {
-        if let State::Healthy { .. } | State::HalfOpen { .. } = self.state {
-            self.state = State::Healthy { failures: 0 };
+    /// Whether `admitted` holds the current half-open spell's slot.
+    fn is_trial(&self, admitted: Admitted) -> bool {
+        matches!(
+            (admitted, self.state),
+            (Admitted::Trial { spell: held }, State::HalfOpen { spell, .. }) if held == spell
+        )
+    }
+
+    /// A request the upstream served. A healthy upstream has no failures
+    /// counted; a half-open one is healthy if the request was its trial.
+    pub fn on_success(&mut self, admitted: Admitted) {
+        match self.state {
+            State::Healthy { .. } => self.state = State::Healthy { failures: 0 },
+            State::HalfOpen { .. } if self.is_trial(admitted) => {
+                self.state = State::Healthy { failures: 0 }
+            }
+            State::HalfOpen { .. } | State::Unverified | State::Open { .. } => {}
         }
     }
 
     /// A request the upstream failed. Opens a healthy one at the threshold,
-    /// and a half-open one at once, its backoff doubled.
-    pub fn on_failure(&mut self, now: Instant, config: &BreakerConfig) {
+    /// and a half-open one at once, its backoff doubled, if the request was
+    /// its trial.
+    pub fn on_failure(&mut self, admitted: Admitted, now: Instant, config: &BreakerConfig) {
+        let trial = self.is_trial(admitted);
         match &mut self.state {
             State::Healthy { failures } => {
                 *failures += 1;
@@ -150,11 +171,11 @@ impl Breaker {
                     self.open(now, config.initial_backoff);
                 }
             }
-            State::HalfOpen { backoff, .. } => {
+            State::HalfOpen { backoff, .. } if trial => {
                 let backoff = (*backoff * 2).min(config.max_backoff);
                 self.open(now, backoff);
             }
-            State::Unverified | State::Open { .. } => {}
+            State::HalfOpen { .. } | State::Unverified | State::Open { .. } => {}
         }
     }
 
@@ -238,13 +259,13 @@ mod tests {
         let now = Instant::now();
         let mut b = Breaker::new();
         b.on_probe(true, now, &CONFIG);
-        b.on_failure(now, &CONFIG);
-        b.on_failure(now, &CONFIG);
-        b.on_success();
-        b.on_failure(now, &CONFIG);
-        b.on_failure(now, &CONFIG);
+        b.on_failure(Admitted::Healthy, now, &CONFIG);
+        b.on_failure(Admitted::Healthy, now, &CONFIG);
+        b.on_success(Admitted::Healthy);
+        b.on_failure(Admitted::Healthy, now, &CONFIG);
+        b.on_failure(Admitted::Healthy, now, &CONFIG);
         assert!(b.routable(), "two consecutive failures stay below three");
-        b.on_failure(now, &CONFIG);
+        b.on_failure(Admitted::Healthy, now, &CONFIG);
         assert!(!b.routable());
         assert!(!b.probe_due(now + CONFIG.initial_backoff / 2));
         assert!(b.probe_due(now + CONFIG.initial_backoff));
@@ -255,10 +276,10 @@ mod tests {
         let now = Instant::now();
         let mut b = Breaker::new();
         b.on_probe(true, now, &CONFIG);
-        b.on_failure(now, &CONFIG);
-        b.on_failure(now, &CONFIG);
+        b.on_failure(Admitted::Healthy, now, &CONFIG);
+        b.on_failure(Admitted::Healthy, now, &CONFIG);
         b.on_probe(true, now, &CONFIG);
-        b.on_failure(now, &CONFIG);
+        b.on_failure(Admitted::Healthy, now, &CONFIG);
         assert!(!b.routable());
     }
 
@@ -303,7 +324,7 @@ mod tests {
             // A periodic probe passing again changes nothing.
             b.on_probe(true, now, &CONFIG);
             assert_eq!(b.admit(), None);
-            b.on_failure(now, &CONFIG);
+            b.on_failure(trial, now, &CONFIG);
             b.release(trial);
             assert!(!b.routable(), "one failure opens it again");
             assert_eq!(b.admit(), None);
@@ -313,17 +334,17 @@ mod tests {
         now += expected;
         b.on_probe(true, now, &CONFIG);
         let trial = b.admit().unwrap();
-        b.on_success();
+        b.on_success(trial);
         b.release(trial);
         assert!(
             (0..5).all(|_| b.admit() == Some(Admitted::Healthy)),
             "a served request closes it"
         );
         // Healthy again: back to the threshold and the initial backoff.
-        b.on_failure(now, &CONFIG);
-        b.on_failure(now, &CONFIG);
+        b.on_failure(Admitted::Healthy, now, &CONFIG);
+        b.on_failure(Admitted::Healthy, now, &CONFIG);
         assert!(b.routable());
-        b.on_failure(now, &CONFIG);
+        b.on_failure(Admitted::Healthy, now, &CONFIG);
         assert!(!b.routable());
         assert!(b.probe_due(now + CONFIG.initial_backoff));
     }
@@ -349,7 +370,7 @@ mod tests {
         let second = b.admit().unwrap();
         // It fails; a new spell begins after the backoff, and the first
         // spell's slot given back now frees nothing in it.
-        b.on_failure(later, &CONFIG);
+        b.on_failure(second, later, &CONFIG);
         let again = later + CONFIG.initial_backoff * 2;
         b.on_probe(true, again, &CONFIG);
         let third = b.admit().unwrap();
@@ -357,6 +378,46 @@ mod tests {
         assert_eq!(b.admit(), None, "the stale release freed nothing");
         b.release(third);
         assert!(b.admit().is_some());
+    }
+
+    /// A request admitted before the upstream opened, or in an earlier
+    /// half-open spell, and still in flight decides nothing for the current
+    /// spell: only the request holding its slot closes it or opens it again.
+    #[test]
+    fn only_the_current_trial_decides_a_half_open_upstream() {
+        let now = Instant::now();
+        let mut b = Breaker::new();
+        b.on_probe(true, now, &CONFIG);
+        let old = b.admit().unwrap();
+        b.trip(now, &CONFIG);
+        let second = now + CONFIG.initial_backoff;
+        b.on_probe(true, second, &CONFIG);
+        let trial = b.admit().unwrap();
+
+        b.on_success(old);
+        assert_eq!(
+            b.admit(),
+            None,
+            "an earlier request's success closes nothing"
+        );
+        b.on_failure(old, second, &CONFIG);
+        assert!(b.probe_due(second), "nor does its failure open it");
+
+        // The trial fails: open, the backoff doubled.
+        b.on_failure(trial, second, &CONFIG);
+        let third = second + CONFIG.initial_backoff * 2;
+        assert!(!b.probe_due(third - Duration::from_millis(1)));
+        b.on_probe(true, third, &CONFIG);
+        let next = b.admit().unwrap();
+
+        // The earlier spell's trial is as stale as the healthy request.
+        b.on_success(trial);
+        assert_eq!(b.admit(), None);
+        b.on_failure(trial, third, &CONFIG);
+        assert!(b.probe_due(third));
+
+        b.on_success(next);
+        assert_eq!(b.admit(), Some(Admitted::Healthy));
     }
 
     /// A failing probe of a half-open upstream doubles the backoff too.

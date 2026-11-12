@@ -334,6 +334,24 @@ pub(crate) struct InFlight {
     admitted: Option<breaker::Admitted>,
 }
 
+impl InFlight {
+    /// The upstream served this request.
+    fn served(&self) {
+        if let Some(admitted) = self.admitted {
+            self.upstream.breaker().on_success(admitted);
+        }
+    }
+
+    /// The upstream failed this request.
+    fn failed(&self, config: &BreakerConfig) {
+        if let Some(admitted) = self.admitted {
+            self.upstream
+                .breaker()
+                .on_failure(admitted, Instant::now(), config);
+        }
+    }
+}
+
 impl Drop for InFlight {
     fn drop(&mut self) {
         let mut breaker = self.upstream.breaker();
@@ -642,6 +660,7 @@ impl EngineRouter {
     async fn attempt(
         &self,
         upstream: &Upstream,
+        in_flight: &InFlight,
         headers: &HeaderMap,
         body: &bytes::Bytes,
         headers_limit: Option<Duration>,
@@ -660,7 +679,7 @@ impl EngineRouter {
                 // Dropping the request closes its connection, which ends
                 // whatever the node had begun; nothing reached the client.
                 Err(_) => {
-                    upstream.breaker().on_failure(Instant::now(), config);
+                    in_flight.failed(config);
                     warn!(
                         upstream = %upstream.base_url,
                         "engine upstream sent no response headers in time"
@@ -678,7 +697,7 @@ impl EngineRouter {
             // a charge, so whatever the engine did, another may run it; the
             // cost of a repeat is the engine's compute, never the client's.
             Err(e) => {
-                upstream.breaker().on_failure(Instant::now(), config);
+                in_flight.failed(config);
                 warn!(
                     upstream = %upstream.base_url,
                     "engine upstream gave no response: {}",
@@ -720,7 +739,7 @@ impl EngineRouter {
             Some(PreAdmission::Overloaded) => Attempt::Next,
             None => {
                 if status.is_server_error() {
-                    upstream.breaker().on_failure(Instant::now(), config);
+                    in_flight.failed(config);
                 }
                 Attempt::Fail(ServerError::Backend {
                     status: status.as_u16(),
@@ -743,10 +762,13 @@ impl EngineRouter {
         for upstream in upstreams {
             // The plan's ranking is from before any attempt; whether this
             // upstream takes the request is decided now.
-            let Some(_in_flight) = upstream.admit() else {
+            let Some(in_flight) = upstream.admit() else {
                 continue;
             };
-            let response = match self.attempt(&upstream, &headers, &body, None).await {
+            let response = match self
+                .attempt(&upstream, &in_flight, &headers, &body, None)
+                .await
+            {
                 Attempt::Response(response) => response,
                 Attempt::Next => continue,
                 Attempt::Fail(e) => return Err(e),
@@ -755,18 +777,18 @@ impl EngineRouter {
             let bytes = match response.bytes().await {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    upstream.breaker().on_failure(Instant::now(), config);
+                    in_flight.failed(config);
                     return Err(ServerError::Network(e.without_url().to_string()));
                 }
             };
             let completion: ChatCompletionResponse = match serde_json::from_slice(&bytes) {
                 Ok(completion) => completion,
                 Err(e) => {
-                    upstream.breaker().on_failure(Instant::now(), config);
+                    in_flight.failed(config);
                     return Err(ServerError::Parse(crate::error::parse_error_summary(&e)));
                 }
             };
-            upstream.breaker().on_success();
+            in_flight.served();
             let meta = BackendMeta {
                 provider: PROVIDER.to_string(),
                 chat_id: Some(completion.id.clone()),
@@ -800,7 +822,10 @@ impl EngineRouter {
                 continue;
             };
             let limit = Some(self.inner.config.stream_headers_limit);
-            let response = match self.attempt(&upstream, &headers, &body, limit).await {
+            let response = match self
+                .attempt(&upstream, &in_flight, &headers, &body, limit)
+                .await
+            {
                 Attempt::Response(response) => response,
                 Attempt::Next => continue,
                 Attempt::Fail(e) => return Err(e),
@@ -808,7 +833,6 @@ impl EngineRouter {
             let (tx, rx) = mpsc::channel(32);
             tokio::spawn(relay_stream(
                 response,
-                upstream,
                 in_flight,
                 model.pinned.id().to_string(),
                 self.inner.config.breaker,
@@ -849,8 +873,7 @@ fn error_chain(e: &reqwest::Error) -> String {
 /// is skipped. A stream that completes reports the engine's usage in `Done`.
 async fn relay_stream(
     response: reqwest::Response,
-    upstream: Arc<Upstream>,
-    _in_flight: InFlight,
+    in_flight: InFlight,
     model: String,
     breaker: BreakerConfig,
     idle_limit: Duration,
@@ -862,7 +885,7 @@ async fn relay_stream(
     let mut backend_model = model;
     let mut usage = None;
     let fail = |e: ServerError| -> Result<BackendStreamEvent, ServerError> {
-        upstream.breaker().on_failure(Instant::now(), &breaker);
+        in_flight.failed(&breaker);
         Err(e)
     };
     loop {
@@ -937,7 +960,7 @@ async fn relay_stream(
                     return;
                 }
                 StreamEvent::Done => {
-                    upstream.breaker().on_success();
+                    in_flight.served();
                     let meta = BackendMeta {
                         provider: PROVIDER.to_string(),
                         chat_id,
