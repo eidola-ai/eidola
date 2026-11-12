@@ -392,6 +392,11 @@ fn every_message_formats_in_every_shipped_locale(cx: &mut TestAppContext) {
                 args.set("value", "my-laptop.local");
                 args.set("subject", "Address");
                 args.set("message", "The proxy needs a port.");
+                args.set("tag", "mimo-v2.6-flash");
+                args.set("date", "2027-06-01");
+                args.set("hash", "a13d92b1d4bd…");
+                args.set("source", "example/fixture@4444444");
+                args.set("url", "https://www.eidola.ai/docs/model-identity/");
                 let formatted = i18n::format(cx, id, Some(&args));
                 assert!(
                     !formatted.is_empty() && !formatted.contains('{'),

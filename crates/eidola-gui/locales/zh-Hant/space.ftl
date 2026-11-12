@@ -17,7 +17,12 @@ space-footnote-delegation-failed = 已中止：{ $reason ->
     }
 
 space-regenerating = 正在重新產生…
-space-error-response-truncated = 模型把全部長度額度都用在思考上，始終沒有開始作答。沒有新增或取代任何回答——請重試，或換一個更簡短的問題。
 space-error-model-unavailable = { $model } 所在的後端已不再提供該模型，也不會由其他模型代為作答。沒有發送任何請求，也沒有產生任何費用——請改選一個模型後重試。
 space-regenerating-elsewhere = 這則回覆正在重新產生。
-space-answer-cut-off = 這則回覆達到了長度上限，在中途停下。
+space-answer-cut-off = 這則回覆在長度上限處停下。
+space-continue-answer = 繼續
+space-continue-answer-label = 從停下的地方繼續這則回覆
+space-continuing = 正在繼續…
+space-error-issuer-key-off-calendar = Eidola 伺服器提供的付款金鑰不符合公開的金鑰時程，因此本應用程式沒有使用它。沒有傳送任何請求，也沒有產生任何費用；你已持有的額度仍可正常使用。
+space-error-issuer-key-second-for-epoch = Eidola 伺服器本週提供的付款金鑰與本應用程式已有的不同。誠實的伺服器每週只使用一把金鑰，因此在下週的金鑰生效之前，本應用程式不會用它領取新的額度。沒有傳送任何請求，也沒有產生任何費用；你已持有的額度仍可正常使用。
+space-error-issuer-key-reused = Eidola 伺服器為兩個不同的週提供了同一把付款金鑰，誠實的伺服器絕不會這樣做，因此本應用程式沒有使用它。沒有傳送任何請求，也沒有產生任何費用；你已持有的額度仍可正常使用。

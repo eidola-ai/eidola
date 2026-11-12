@@ -3,8 +3,7 @@
 //! MiMo emits calls as compact XML after any visible content:
 //! `<tool_call><function=NAME><parameter=K>V</parameter>…</function></tool_call>`.
 //!
-//! The meaning of a complete output follows SGLang's MiMo detector
-//! (`detect_and_parse`):
+//! The block structure follows SGLang's MiMo detector (`detect_and_parse`):
 //!
 //! - **Content** is the text before the first `<tool_call>`.
 //! - Each `<tool_call>…</tool_call>` block (the first closing tag after the
@@ -16,18 +15,25 @@
 //!   the tool schema ([`crate::args`]).
 //! - A block naming an undeclared function is not a call: the block, and any
 //!   text between it and the previous block, is appended to the content.
-//! - A block with no complete `<function=…>…</function>` is dropped.
-//! - Text between or after blocks is otherwise dropped, as is an unclosed
-//!   trailing block (e.g. output cut off by `max_tokens`).
+//!
+//! What becomes of the rest of the text is [`UnparsedText`]. **Served output
+//! loses only its calls** ([`UnparsedText::Content`]): a block with no
+//! complete `<function=…>…</function>`, an unclosed trailing block (prose that
+//! mentions `<tool_call>`, or output cut off by `max_tokens`) and text between
+//! or after blocks are content, except text that is only whitespace next to a
+//! call. SGLang drops all three ([`UnparsedText::Sglang`], kept for the
+//! differential test).
 //!
 //! [`ToolCallParser`] produces exactly that result from any split of the text
-//! into chunks: content streams as it arrives (holding back only a possible
-//! partial `<tool_call>`), and each call is emitted whole, with its final
-//! typed arguments, when its closing tag arrives. Calls are emitted whole
-//! because typing a parameter needs its complete value and deciding whether
-//! a block is a call needs its complete structure.
+//! into chunks: content before the first block streams as it arrives (holding
+//! back only a possible partial `<tool_call>`), text after a block is held
+//! until the next block closes or the stream ends, and each call is emitted
+//! whole, with its final typed arguments, when its closing tag arrives. Calls
+//! are emitted whole because typing a parameter needs its complete value and
+//! deciding whether a block is a call needs its complete structure.
 //!
-//! All scanning is linear in the input; no input can make the parser panic.
+//! All scanning is linear in the input, however many blocks one chunk holds;
+//! no input can make the parser panic.
 
 use crate::args::{ToolSchemas, arguments_object};
 use crate::json;
@@ -39,6 +45,23 @@ const FUNCTION_START: &str = "<function=";
 const FUNCTION_END: &str = "</function>";
 const PARAM_START: &str = "<parameter=";
 const PARAM_END: &str = "</parameter>";
+
+/// What becomes of output text that is not a call (module docs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnparsedText {
+    /// Content, except whitespace-only text next to a call: the serving rule.
+    #[default]
+    Content,
+    /// SGLang's: dropped, but for undeclared functions' blocks and the text
+    /// before them. For differential tests against SGLang only.
+    Sglang,
+}
+
+/// Whether the text between two blocks (or between a block and the end) is
+/// content under [`UnparsedText::Content`].
+fn gap_is_content(gap: &str, after_call: bool, before_call: bool) -> bool {
+    !(py_strip(gap).is_empty() && (after_call || before_call))
+}
 
 /// A parsed call.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,7 +193,7 @@ pub struct ParsedToolCalls {
     pub calls: Vec<(String, String)>,
 }
 
-/// Parses a complete output in one go (SGLang's `detect_and_parse`).
+/// Parses a complete output in one go.
 pub fn parse_complete(text: &str, schemas: &ToolSchemas) -> ParsedToolCalls {
     let Some(first) = text.find(CALL_START) else {
         return ParsedToolCalls {
@@ -178,26 +201,49 @@ pub fn parse_complete(text: &str, schemas: &ToolSchemas) -> ParsedToolCalls {
             calls: Vec::new(),
         };
     };
+    let sglang = schemas.unparsed_text() == UnparsedText::Sglang;
     let mut out = ParsedToolCalls {
         content: text[..first].to_string(),
         calls: Vec::new(),
     };
     let mut last_end = first;
-    let mut search = first;
-    while let Some(p) = text[search..].find(CALL_START) {
-        let start = search + p;
+    let mut after_call = false;
+    let mut unclosed = None;
+    while let Some(p) = text[last_end..].find(CALL_START) {
+        let start = last_end + p;
         let body_start = start + CALL_START.len();
         let Some(e) = text[body_start..].find(CALL_END) else {
+            unclosed = Some(start);
             break;
         };
         let end = body_start + e + CALL_END.len();
+        let gap = &text[last_end..start];
         match parse_block(&text[body_start..body_start + e], schemas) {
-            Block::Call { name, arguments } => out.calls.push((name, arguments)),
-            Block::Unknown => out.content.push_str(&text[last_end..end]),
-            Block::Malformed => {}
+            Block::Call { name, arguments } => {
+                if !sglang && gap_is_content(gap, after_call, true) {
+                    out.content.push_str(gap);
+                }
+                out.calls.push((name, arguments));
+                after_call = true;
+            }
+            Block::Malformed if sglang => {}
+            Block::Unknown | Block::Malformed => {
+                if sglang || gap_is_content(gap, after_call, false) {
+                    out.content.push_str(gap);
+                }
+                out.content.push_str(&text[start..end]);
+                after_call = false;
+            }
         }
         last_end = end;
-        search = end;
+    }
+    if !sglang {
+        let gap_end = unclosed.unwrap_or(text.len());
+        let gap = &text[last_end..gap_end];
+        if gap_is_content(gap, after_call, false) {
+            out.content.push_str(gap);
+        }
+        out.content.push_str(&text[gap_end..]);
     }
     out
 }
@@ -209,18 +255,18 @@ pub struct ToolCallDelta {
     pub calls: Vec<ToolCall>,
 }
 
+/// Where the parser is. Positions index [`ToolCallParser::buf`], the text
+/// not yet given out or dropped.
 enum State {
-    /// No `<tool_call>` seen yet; `held` is a possible partial opening tag.
-    Content { held: String },
-    /// Inside a block; `buf` starts with `<tool_call>` and `gap` is the text
-    /// between the previous block and this one.
-    Block {
-        buf: String,
-        gap: String,
-        scanned: usize,
-    },
-    /// After a block, waiting for another.
-    Between { buf: String, scanned: usize },
+    /// No `<tool_call>` seen yet; `buf` is a possible partial opening tag.
+    Content,
+    /// Inside a block that starts at `start`; `buf[..start]` is the text
+    /// between the previous block and this one. No closing tag ends before
+    /// `scanned`.
+    Block { start: usize, scanned: usize },
+    /// After a block, waiting for another; `buf` is the text since it. No
+    /// opening tag ends before `scanned`.
+    Between { scanned: usize },
 }
 
 /// Streaming tool-call parser.
@@ -228,6 +274,9 @@ pub struct ToolCallParser {
     schemas: ToolSchemas,
     ids: Box<dyn CallIdSource>,
     state: State,
+    buf: String,
+    /// The last closed block was a call.
+    after_call: bool,
     emitted: usize,
 }
 
@@ -255,9 +304,9 @@ impl ToolCallParser {
         ToolCallParser {
             schemas,
             ids: Box::new(ids),
-            state: State::Content {
-                held: String::new(),
-            },
+            state: State::Content,
+            buf: String::new(),
+            after_call: false,
             emitted: 0,
         }
     }
@@ -270,46 +319,52 @@ impl ToolCallParser {
     /// Feeds a chunk of content text.
     pub fn push(&mut self, text: &str) -> ToolCallDelta {
         let mut delta = ToolCallDelta::default();
-        let mut input = text.to_string();
+        let sglang = self.schemas.unparsed_text() == UnparsedText::Sglang;
+        self.buf.push_str(text);
+        let buf = self.buf.as_str();
+        // `buf[pos..]` is the text still undecided.
+        let mut pos = 0;
         loop {
-            match &mut self.state {
-                State::Content { held } => {
-                    held.push_str(&input);
-                    if let Some(p) = held.find(CALL_START) {
-                        delta.content.push_str(&held[..p]);
-                        let buf = held[p..].to_string();
+            match self.state {
+                State::Content => {
+                    if let Some(p) = buf[pos..].find(CALL_START) {
+                        delta.content.push_str(&buf[pos..pos + p]);
+                        pos += p;
                         self.state = State::Block {
-                            buf,
-                            gap: String::new(),
-                            scanned: CALL_START.len(),
+                            start: pos,
+                            scanned: pos + CALL_START.len(),
                         };
-                        input = String::new();
                         continue;
                     }
-                    let keep = partial_suffix(held, CALL_START);
-                    delta.content.push_str(&held[..held.len() - keep]);
-                    *held = held[held.len() - keep..].to_string();
-                    return delta;
+                    let keep = partial_suffix(&buf[pos..], CALL_START);
+                    delta.content.push_str(&buf[pos..buf.len() - keep]);
+                    pos = buf.len() - keep;
+                    break;
                 }
-                State::Block { buf, gap, scanned } => {
-                    buf.push_str(&input);
-                    input = String::new();
-                    let from = (*scanned).max(CALL_START.len());
-                    let Some(e) = buf[from..].find(CALL_END) else {
+                State::Block { start, scanned } => {
+                    let Some(e) = buf[scanned..].find(CALL_END) else {
                         // Resume scanning where a closing tag could still start.
-                        *scanned = buf
+                        let mut resume = buf
                             .len()
                             .saturating_sub(CALL_END.len() - 1)
-                            .max(CALL_START.len());
-                        while !buf.is_char_boundary(*scanned) {
-                            *scanned -= 1;
+                            .max(start + CALL_START.len());
+                        while !buf.is_char_boundary(resume) {
+                            resume -= 1;
                         }
-                        return delta;
+                        self.state = State::Block {
+                            start,
+                            scanned: resume,
+                        };
+                        break;
                     };
-                    let body_end = from + e;
+                    let body_end = scanned + e;
                     let end = body_end + CALL_END.len();
-                    match parse_block(&buf[CALL_START.len()..body_end], &self.schemas) {
+                    let gap = &buf[pos..start];
+                    match parse_block(&buf[start + CALL_START.len()..body_end], &self.schemas) {
                         Block::Call { name, arguments } => {
+                            if !sglang && gap_is_content(gap, self.after_call, true) {
+                                delta.content.push_str(gap);
+                            }
                             let index = self.emitted;
                             self.emitted += 1;
                             delta.calls.push(ToolCall {
@@ -318,55 +373,80 @@ impl ToolCallParser {
                                 name,
                                 arguments,
                             });
+                            self.after_call = true;
                         }
-                        Block::Unknown => {
-                            delta.content.push_str(gap);
-                            delta.content.push_str(&buf[..end]);
+                        Block::Malformed if sglang => {}
+                        Block::Unknown | Block::Malformed => {
+                            if sglang || gap_is_content(gap, self.after_call, false) {
+                                delta.content.push_str(gap);
+                            }
+                            delta.content.push_str(&buf[start..end]);
+                            self.after_call = false;
                         }
-                        Block::Malformed => {}
                     }
-                    let rest = buf[end..].to_string();
-                    self.state = State::Between {
-                        buf: rest,
-                        scanned: 0,
-                    };
+                    pos = end;
+                    self.state = State::Between { scanned: end };
                 }
-                State::Between { buf, scanned } => {
-                    buf.push_str(&input);
-                    input = String::new();
-                    if let Some(p) = buf[*scanned..].find(CALL_START) {
-                        let start = *scanned + p;
-                        let gap = buf[..start].to_string();
-                        let block = buf[start..].to_string();
+                State::Between { scanned } => {
+                    if let Some(p) = buf[scanned..].find(CALL_START) {
+                        let start = scanned + p;
                         self.state = State::Block {
-                            buf: block,
-                            gap,
-                            scanned: CALL_START.len(),
+                            start,
+                            scanned: start + CALL_START.len(),
                         };
                         continue;
                     }
-                    *scanned = buf.len() - partial_suffix(buf, CALL_START);
-                    return delta;
+                    self.state = State::Between {
+                        scanned: buf.len() - partial_suffix(&buf[pos..], CALL_START),
+                    };
+                    break;
                 }
             }
         }
+        // Positions become relative to the text kept.
+        self.buf.drain(..pos);
+        match &mut self.state {
+            State::Content => {}
+            State::Block { start, scanned } => {
+                *start -= pos;
+                *scanned -= pos;
+            }
+            State::Between { scanned } => *scanned -= pos,
+        }
+        delta
     }
 
-    /// Ends the stream. A held-back partial tag before any block is content;
-    /// an unfinished block and trailing text after blocks are dropped.
+    /// Whether no `<tool_call>` block has begun: the state a parser starts in,
+    /// and so the only one a parser resumed from the content given out so far
+    /// would be in.
+    pub fn before_any_block(&self) -> bool {
+        matches!(self.state, State::Content)
+    }
+
+    /// Ends the stream, giving out the text held back ([`UnparsedText`]): a
+    /// possible partial tag before any block, and an unfinished block or the
+    /// text after the last block.
     pub fn finish(&mut self) -> ToolCallDelta {
-        let state = std::mem::replace(
-            &mut self.state,
-            State::Content {
-                held: String::new(),
-            },
-        );
-        match state {
-            State::Content { held } => ToolCallDelta {
-                content: held,
-                calls: Vec::new(),
-            },
-            State::Block { .. } | State::Between { .. } => ToolCallDelta::default(),
+        let state = std::mem::replace(&mut self.state, State::Content);
+        let buf = std::mem::take(&mut self.buf);
+        let sglang = self.schemas.unparsed_text() == UnparsedText::Sglang;
+        let content = match state {
+            State::Content => buf,
+            State::Block { .. } | State::Between { .. } if sglang => String::new(),
+            State::Block { start, .. } => {
+                let gap = &buf[..start];
+                if gap_is_content(gap, self.after_call, false) {
+                    buf
+                } else {
+                    buf[start..].to_string()
+                }
+            }
+            State::Between { .. } if gap_is_content(&buf, self.after_call, false) => buf,
+            State::Between { .. } => String::new(),
+        };
+        ToolCallDelta {
+            content,
+            calls: Vec::new(),
         }
     }
 }
@@ -430,8 +510,63 @@ mod tests {
         assert_eq!(parsed.calls, vec![("get_weather".into(), "{}".into())]);
         assert_eq!(
             parsed.content,
+            "agap<tool_call><function=nope><parameter=x>1</parameter></function></tool_call>tail<tool_call>no function</tool_call>end<tool_call><function=run>"
+        );
+        let sglang = parse_complete(text, &schemas().with_unparsed_text(UnparsedText::Sglang));
+        assert_eq!(sglang.calls, parsed.calls);
+        assert_eq!(
+            sglang.content,
             "agap<tool_call><function=nope><parameter=x>1</parameter></function></tool_call>"
         );
+    }
+
+    /// Prose that mentions the tag, a block that never closes, and text after
+    /// the last call all reach the content; whitespace next to a call does not.
+    #[test]
+    fn text_that_is_not_a_call_is_content() {
+        let cases: &[(&str, &str, usize)] = &[
+            (
+                "Write <tool_call> to call a tool, then the rest of the answer.",
+                "Write <tool_call> to call a tool, then the rest of the answer.",
+                0,
+            ),
+            (
+                "x<tool_call>no function</tool_call> and more",
+                "x<tool_call>no function</tool_call> and more",
+                0,
+            ),
+            (
+                "<tool_call><function=run></function></tool_call>\nDone; next <tool_call><function=run>",
+                "\nDone; next <tool_call><function=run>",
+                1,
+            ),
+            (
+                "<tool_call><function=run></function></tool_call> then <tool_call><function=run></function></tool_call>",
+                " then ",
+                2,
+            ),
+            (
+                "Ok.\n<tool_call><function=run></function></tool_call>\n<tool_call><function=run></function></tool_call>\n",
+                "Ok.\n",
+                2,
+            ),
+            (
+                "<tool_call><function=run></function></tool_call>\n<tool_call>bad</tool_call>",
+                "<tool_call>bad</tool_call>",
+                1,
+            ),
+        ];
+        for &(text, content, calls) in cases {
+            let parsed = parse_complete(text, &schemas());
+            assert_eq!(
+                (parsed.content.as_str(), parsed.calls.len()),
+                (content, calls),
+                "{text:?}"
+            );
+            // Streamed one character at a time, too.
+            let cuts: Vec<usize> = (0..text.len()).collect();
+            assert_eq!(stream(text, &cuts), parsed, "{text:?}");
+        }
     }
 
     #[test]

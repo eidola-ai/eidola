@@ -4,16 +4,17 @@
 //! `dev/gen_sglang_fixtures.py`), with the per-parameter failure containment
 //! documented in `src/args.rs` applied around them.
 //!
-//! The parser's own typing rule is the round-trip one; these tests select
-//! SGLang's rule so that the block structure and the Python-semantics pieces
-//! both rules share can be compared value for value with SGLang.
+//! The parser's own typing rule is the round-trip one, and it keeps text that
+//! is not a call as content; these tests select SGLang's rules for both, so
+//! that the block structure and the Python-semantics pieces both typing rules
+//! share can be compared value for value with SGLang.
 
 use std::path::PathBuf;
 
 use eidola_engine_chat::args::{ArgumentTyping, ToolSchemas, convert_parameter_sglang};
 use eidola_engine_chat::json::{self, Json};
 use eidola_engine_chat::tool_call::{
-    ParsedToolCalls, PrefixedCallIds, ToolCallParser, parse_complete,
+    ParsedToolCalls, PrefixedCallIds, ToolCallParser, UnparsedText, parse_complete,
 };
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -24,7 +25,9 @@ fn fixture(name: &str) -> serde_json::Value {
 }
 
 fn schemas(tools: &str) -> ToolSchemas {
-    ToolSchemas::from_tools(&json::parse(tools).unwrap()).with_typing(ArgumentTyping::Sglang)
+    ToolSchemas::from_tools(&json::parse(tools).unwrap())
+        .with_typing(ArgumentTyping::Sglang)
+        .with_unparsed_text(UnparsedText::Sglang)
 }
 
 #[test]

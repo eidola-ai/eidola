@@ -54,15 +54,8 @@ use crate::recorded::{RecordedBody, recorded_answer, recorded_cut_answer, record
 use crate::{
     ChargePricing, EidolaResolved, Inner, ModelInfo, backends, db, estimate_charge_credits,
     fetch_models, find_event_boundary, flush_attestations, is_event_stream, local_models, now_ms,
-    parse_server_error_message, process_refund, recover_refund,
+    parse_server_error_message,
 };
-
-/// The completion ceiling a request that named none gets.
-///
-/// The same number the app's own turns fall back to when a backend declares no
-/// context length — one rule, so a proxied request and an in-app one ask for
-/// the same budget from the same model.
-const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 4096;
 
 /// How long one backend has to answer `/v1/models` before it is treated as
 /// unavailable for this listing.
@@ -272,8 +265,9 @@ fn mint_traceparent() -> String {
 ///   the app's own streaming turns send), `application/json` otherwise. Stated
 ///   on both because reqwest inserts an `Accept: */*` of its own where the
 ///   request carries none: an unstated header is not an absent one.
-/// - **`Authorization`** — the ACT this app spends, or an external backend's
-///   own key. **Never the downstream's.** A downstream `Authorization`
+/// - **`Authorization`** — an external backend's own key. **Never the
+///   downstream's**, and never an Eidola spend, which travels in the body's
+///   `credentials` member ([`build_upstream_request`]). A downstream `Authorization`
 ///   authenticates the tool *to the proxy* and is consumed there; the two
 ///   credentials share a header name and nothing else.
 /// - **`traceparent`** — only when [`TraceUpstream::On`], and then freshly
@@ -291,7 +285,7 @@ fn mint_traceparent() -> String {
 /// (`Host`, `Content-Length`): the protocol, not a fact about this app.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpstreamHeaders {
-    /// `Some` iff the route carries a credential.
+    /// `Some` iff the route carries an external backend's key.
     pub authorization: Option<String>,
     pub streaming: bool,
     pub trace: TraceUpstream,
@@ -307,8 +301,44 @@ pub struct UpstreamHeaders {
 /// attempt's headers are therefore materialised into this, and both the request
 /// and the row read that one value; `for_record` lives here rather than on the
 /// description because redacting *a set* is what the Record actually needs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// **Its secret stays secret past materialization.** One value here is a
+/// secret ([`is_secret_header`]): an external backend's key. One predicate
+/// decides what the Record redacts, what `Debug` prints, and which header
+/// values the request marks sensitive (so the built request's own `Debug`
+/// hides it too), and the secret value is zeroed when the set is dropped.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SentHeaders(Vec<(&'static str, String)>);
+
+/// Whether a header this app sends upstream carries a secret: the
+/// credential (`Authorization`: an external backend's API key).
+fn is_secret_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("Authorization")
+}
+
+impl std::fmt::Debug for SentHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut list = f.debug_list();
+        for (name, value) in &self.0 {
+            if is_secret_header(name) {
+                list.entry(&(name, "<redacted>"));
+            } else {
+                list.entry(&(name, value));
+            }
+        }
+        list.finish()
+    }
+}
+
+impl Drop for SentHeaders {
+    fn drop(&mut self) {
+        for (name, value) in &mut self.0 {
+            if is_secret_header(name) {
+                zeroize::Zeroize::zeroize(value);
+            }
+        }
+    }
+}
 
 impl SentHeaders {
     /// The pairs, in the order they are set.
@@ -317,12 +347,13 @@ impl SentHeaders {
     }
 
     /// What the Record shows about this request's headers: every name, and
-    /// every value **except** the credential, which is replaced by its scheme.
+    /// every value **except** the secret: the credential, which is replaced
+    /// by its scheme.
     ///
     /// The names are the evidence that the allowlist did its job — a reader
     /// can see for themselves that nothing of their tool's travelled. The
-    /// value of `Authorization` is a spend proof or an API key and is the one
-    /// thing that must not land in a durable local log.
+    /// value of `Authorization` is an API key, which may not land in a durable
+    /// local log.
     pub fn for_record(&self) -> String {
         let redacted: Vec<Value> = self
             .0
@@ -333,6 +364,8 @@ impl SentHeaders {
                         .split_once(' ')
                         .map(|(scheme, _)| format!("{scheme} <redacted>"))
                         .unwrap_or_else(|| "<redacted>".to_string())
+                } else if is_secret_header(name) {
+                    "<redacted>".to_string()
                 } else {
                     value.clone()
                 };
@@ -402,6 +435,13 @@ pub struct ProxyChatRequest {
     /// object, because the outer shape expresses exactly this one option and
     /// the allowlist discipline says a key nobody decided to send is not sent.
     pub include_usage: bool,
+    /// `continue_final_message` and `add_generation_prompt`, as sent: the
+    /// OpenAI-compatible convention (vLLM's, SGLang's) for asking the model to
+    /// continue the final assistant message, which the Eidola server accepts.
+    /// Forwarded rather than judged here — the gateway and its engines hold
+    /// them to their rule, and an external backend to its own.
+    pub continue_final_message: Option<Value>,
+    pub add_generation_prompt: Option<Value>,
 }
 
 impl ProxyChatRequest {
@@ -458,6 +498,8 @@ impl ProxyChatRequest {
                 .and_then(|options| options.get("include_usage"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            continue_final_message: object.get("continue_final_message").cloned(),
+            add_generation_prompt: object.get("add_generation_prompt").cloned(),
         })
     }
 
@@ -952,7 +994,10 @@ impl Inner {
                         .push(tinfoil_verifier::VerifiedAttestation {
                             platform: tinfoil_verifier::Platform::SevSnp,
                             matched_measurement: tinfoil_verifier::MatchedMeasurement::SevSnp(
-                                "a".repeat(96),
+                                tinfoil_verifier::SevSnpLaunchMeasurement {
+                                    measurement: "a".repeat(96),
+                                    host_data: "d".repeat(64),
+                                },
                             ),
                             attestation_hash: hash,
                             attestation_doc: b"report".to_vec(),
@@ -960,12 +1005,13 @@ impl Inner {
                             peer_spki_hash: "c".repeat(64),
                         });
                 }
-                let entry = models
-                    .data
-                    .iter()
-                    .find(|m| m.id == target.model)
-                    .ok_or_else(|| AppError::ModelUnavailable {
-                        model: target.canonical.clone(),
+                // Matched as the gateway resolves the reference: a digest
+                // by hash, a tag by the row it names.
+                let entry =
+                    crate::find_catalog_entry(&models.data, &target.model).ok_or_else(|| {
+                        AppError::ModelUnavailable {
+                            model: target.canonical.clone(),
+                        }
                     })?;
                 Ok(ProxyRoute {
                     client,
@@ -1049,14 +1095,16 @@ impl Inner {
     /// otherwise computes a hold nothing in the wallet can cover, and fails as
     /// a funding error rather than as the arithmetic mistake it is. An
     /// undeclared ceiling is never read as a zero, so nothing is clamped where
-    /// nothing was declared.
+    /// nothing was declared. A request that named none asks for what the app's
+    /// own turns ask for ([`crate::completion_ceiling`]) — one rule, so a
+    /// proxied request and an in-app one ask the same model for the same budget.
     fn proxy_completion_budget(
         request: &ProxyChatRequest,
         declared_max_output: Option<u64>,
     ) -> u32 {
-        let asked = request
-            .max_completion_tokens
-            .unwrap_or(DEFAULT_MAX_COMPLETION_TOKENS);
+        let Some(asked) = request.max_completion_tokens else {
+            return crate::completion_ceiling(declared_max_output, 0);
+        };
         match declared_max_output {
             Some(declared) => asked.min(u32::try_from(declared).unwrap_or(u32::MAX)),
             None => asked,
@@ -1100,6 +1148,16 @@ impl Inner {
             // upstream for its own refunds — asking or not asking changes
             // nothing there.)
             stream && request.include_usage,
+            // **No prefix-cache key, ever.** A proxied request has no lineage
+            // — no space, no participant — for an app-minted key to be scoped
+            // to, and `cache_key` is not a body field this proxy reads from a
+            // caller: a value a downstream tool picks and never rotates would
+            // link every request it rides on, which is `traceparent`'s reason
+            // for being stripped too.
+            None,
+            // A caller's continuation is forwarded as it spelled it, below,
+            // like the other members it chose to send.
+            None,
         );
         if let Some(object) = body.as_object_mut() {
             for (key, value) in [
@@ -1107,6 +1165,8 @@ impl Inner {
                 ("top_p", &request.top_p),
                 ("stop", &request.stop),
                 ("tool_choice", &request.tool_choice),
+                ("add_generation_prompt", &request.add_generation_prompt),
+                ("continue_final_message", &request.continue_final_message),
             ] {
                 if let Some(value) = value {
                     object.insert(key.to_string(), value.clone());
@@ -1222,9 +1282,8 @@ impl Inner {
                         message: "computed charge is zero — model pricing may be missing".into(),
                     });
                 }
-                let (prep, auth) = self.acquire_spend(&cfg, &db_conn, charge, now).await?;
-                spend = Some(prep);
-                Some(auth)
+                spend = Some(self.acquire_spend(&cfg, &db_conn, charge, now).await?);
+                None
             }
         };
         Ok(ProxyPreflight {
@@ -1283,7 +1342,7 @@ impl Inner {
             &request.model,
             request
                 .max_completion_tokens
-                .unwrap_or(DEFAULT_MAX_COMPLETION_TOKENS),
+                .unwrap_or(crate::FALLBACK_MAX_COMPLETION_TOKENS),
             stream,
         );
         let refused_at = now_ms();
@@ -1320,10 +1379,10 @@ impl Inner {
             mut route,
             body,
             db_conn,
-            spend,
+            mut spend,
             auth_value,
         } = self.preflighted(&request, false).await?;
-        let nonce = spend.as_ref().map(|s| s.cred.nonce.clone());
+        let nonce = spend.as_ref().map(|s| s.first_nonce().to_string());
         // Materialised **once** for this attempt: the wire and the Record row
         // then carry the same `traceparent`, which is the whole point of the
         // set being a value rather than a recipe.
@@ -1339,10 +1398,10 @@ impl Inner {
         // one.** The build can refuse — an external backend's key is user-typed
         // and may not be a header value — and a `?` would have returned with a
         // credential left `spending` and nothing in the Record to say why.
-        let outbound = match build_upstream_request(&route, &body, &headers) {
+        let outbound = match build_upstream_request(&route, &body, spend.as_ref(), &headers) {
             Ok(outbound) => outbound,
             Err(error) => {
-                self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                self.settle_proxy_refund(&db_conn, &mut spend, &route, None)
                     .await;
                 self.record_proxy_request(
                     &route,
@@ -1378,7 +1437,7 @@ impl Inner {
                 if route.flush_new_attestations(&db_conn).await {
                     self.bus.emit(Change::Record);
                 }
-                self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                self.settle_proxy_refund(&db_conn, &mut spend, &route, None)
                     .await;
                 self.record_proxy_request(
                     &route,
@@ -1405,7 +1464,7 @@ impl Inner {
             Ok(answer) => answer,
             Err(failure) => {
                 let error = failure.error;
-                self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                self.settle_proxy_refund(&db_conn, &mut spend, &route, None)
                     .await;
                 self.record_proxy_request(
                     &route,
@@ -1480,10 +1539,9 @@ impl Inner {
         };
         self.settle_proxy_refund(
             &db_conn,
-            &spend,
-            &auth_value,
+            &mut spend,
             &route,
-            parsed.as_ref().and_then(|body| body.get("refund")),
+            parsed.as_ref().and_then(crate::inline_refund),
         )
         .await;
         self.record_proxy_request(
@@ -1531,7 +1589,7 @@ impl Inner {
             // credential's successor; it is wallet material, not part of any
             // OpenAI response, and a tool that saw it could do nothing with it
             // but keep a copy.
-            object.remove("refund");
+            object.remove(eidola_common::spend_credentials::REFUNDS_MEMBER);
             // The caller asked for a model by the name this app gave it; the
             // answer names it back. (Only an external OpenAI backend's wire id
             // differs from the canonical one — an engine's alias *is* the
@@ -1555,10 +1613,10 @@ impl Inner {
             mut route,
             body,
             db_conn,
-            spend,
+            mut spend,
             auth_value,
         } = self.preflighted(&request, true).await?;
-        let nonce = spend.as_ref().map(|s| s.cred.nonce.clone());
+        let nonce = spend.as_ref().map(|s| s.first_nonce().to_string());
         // Materialised **once** for this attempt: the wire and the Record row
         // then carry the same `traceparent`, which is the whole point of the
         // set being a value rather than a recipe.
@@ -1572,10 +1630,10 @@ impl Inner {
         let request_at = now_ms();
         // Past the hold, so a refusal settles it — the blocking transport's
         // arm, for the same reason.
-        let outbound = match build_upstream_request(&route, &body, &headers) {
+        let outbound = match build_upstream_request(&route, &body, spend.as_ref(), &headers) {
             Ok(outbound) => outbound,
             Err(error) => {
-                self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                self.settle_proxy_refund(&db_conn, &mut spend, &route, None)
                     .await;
                 self.record_proxy_request(
                     &route,
@@ -1611,7 +1669,7 @@ impl Inner {
                 if route.flush_new_attestations(&db_conn).await {
                     self.bus.emit(Change::Record);
                 }
-                self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                self.settle_proxy_refund(&db_conn, &mut spend, &route, None)
                     .await;
                 self.record_proxy_request(
                     &route,
@@ -1649,7 +1707,7 @@ impl Inner {
                 Ok(answer) => answer,
                 Err(failure) => {
                     let error = failure.error;
-                    self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                    self.settle_proxy_refund(&db_conn, &mut spend, &route, None)
                         .await;
                     self.record_proxy_request(
                         &route,
@@ -1672,7 +1730,7 @@ impl Inner {
             // failure after the nullifier is recorded — request validation,
             // `send_stream`, a spend-proof re-encode — answers with a
             // refund-bearing JSON error body rather than an SSE stream
-            // (`eidola-server/src/handlers.rs`: `error_response_with_refund`).
+            // (`eidola-server-gateway/src/handlers.rs`: `error_response_with_refund`).
             // Persisting that token for recovery is best-effort there, so the
             // in-band value is again the only one that can answer for the arm
             // where persistence failed. Third door, same rule: the refund the
@@ -1685,11 +1743,11 @@ impl Inner {
             let inline = (!answer.over_ceiling)
                 .then(|| serde_json::from_str::<Value>(&text).ok())
                 .flatten()
-                .and_then(|body| body.get("refund").cloned());
+                .and_then(|body| crate::inline_refund(&body).cloned());
             let refusal = answer
                 .over_ceiling
                 .then(|| crate::peer_read::answer_past_ceiling(&route.backend_id));
-            self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, inline.as_ref())
+            self.settle_proxy_refund(&db_conn, &mut spend, &route, inline.as_ref())
                 .await;
             self.record_proxy_request(
                 &route,
@@ -1741,7 +1799,7 @@ impl Inner {
                 Ok(answer) => answer,
                 Err(failure) => {
                     let error = failure.error;
-                    self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, None)
+                    self.settle_proxy_refund(&db_conn, &mut spend, &route, None)
                         .await;
                     self.record_proxy_request(
                         &route,
@@ -1762,7 +1820,7 @@ impl Inner {
             let inline = (!answer.over_ceiling)
                 .then(|| serde_json::from_str::<Value>(&text).ok())
                 .flatten()
-                .and_then(|body| body.get("refund").cloned());
+                .and_then(|body| crate::inline_refund(&body).cloned());
             // The refusal is this app's, so the row carries it: the upstream
             // said `200` and nothing was forwarded, which a row holding only
             // that status would present as an answered request. The ceiling,
@@ -1772,7 +1830,7 @@ impl Inner {
             } else {
                 malformed_stream_answer(&route.backend_id, status.as_u16())
             };
-            self.settle_proxy_refund(&db_conn, &spend, &auth_value, &route, inline.as_ref())
+            self.settle_proxy_refund(&db_conn, &mut spend, &route, inline.as_ref())
                 .await;
             self.record_proxy_request(
                 &route,
@@ -1837,7 +1895,6 @@ impl Inner {
                     break;
                 }
             };
-            raw.push(&bytes);
             buf.extend_from_slice(&bytes);
             let mut oversized = false;
             while let Some((pos, boundary_len)) = find_event_boundary(&buf) {
@@ -1849,6 +1906,12 @@ impl Inner {
                 }
                 let event: Vec<u8> = buf.drain(..pos).collect();
                 let terminator: Vec<u8> = buf.drain(..boundary_len).collect();
+                // Recorded event by event, so the server's stream padding is
+                // counted rather than kept (`RecordedBody::push_event`). It is
+                // still forwarded: the caller is on this machine, where there
+                // is no network observer for it to hide anything from, and
+                // every server-sent-events reader already ignores it.
+                raw.push_event(&event, &terminator);
                 let (mut out, refund) = forward_sse_event(&event, &route.canonical);
                 if refund.is_some() {
                     inline_refund = refund;
@@ -1893,6 +1956,8 @@ impl Inner {
                 // Refused, so not forwarded: the tail below exists to hand a
                 // downstream parser the bytes the upstream really sent, and
                 // these are the bytes this app has just declined to accept.
+                // They did arrive, so the Record keeps them.
+                raw.push_event(&buf, &[]);
                 buf.clear();
                 break;
             }
@@ -1907,6 +1972,7 @@ impl Inner {
         // is the same fact: an unterminated tail nobody received is not a
         // complete delivery, and discarding the result sealed the row as one.
         if !buf.is_empty() {
+            raw.push_event(&buf, &[]);
             let (out, refund) = forward_sse_event(&buf, &route.canonical);
             if refund.is_some() {
                 inline_refund = refund;
@@ -1919,14 +1985,8 @@ impl Inner {
         // refund, and sends it even when its own persistence of that token
         // failed — the one case where recovery can never answer. See
         // [`forward_sse_event`].
-        self.settle_proxy_refund(
-            &db_conn,
-            &spend,
-            &auth_value,
-            &route,
-            inline_refund.as_ref(),
-        )
-        .await;
+        self.settle_proxy_refund(&db_conn, &mut spend, &route, inline_refund.as_ref())
+            .await;
         self.record_proxy_request(
             &route,
             &headers,
@@ -1950,47 +2010,30 @@ impl Inner {
         }
     }
 
-    /// Settle a proxied call's credential: the inline refund when the response
-    /// carried one, otherwise the recovery endpoint. A no-op for the
-    /// zero-spend backends, and best-effort throughout — a wallet hiccup must
-    /// not turn a delivered answer into a failure.
+    /// Settle a proxied call's inputs: the inline refunds when the response
+    /// carried them, otherwise the recovery endpoint, input by input. A no-op
+    /// for the zero-spend backends, and best-effort throughout — a wallet
+    /// hiccup must not turn a delivered answer into a failure.
     async fn settle_proxy_refund(
         &self,
         db_conn: &turso::Connection,
-        spend: &Option<crate::SpendPrep>,
-        auth_value: &Option<String>,
+        spend: &mut Option<crate::SpendPrep>,
         route: &ProxyRoute,
         inline: Option<&Value>,
     ) {
         let Some(spend) = spend else { return };
-        let refund_obj = match inline {
-            Some(object) => Some(object.clone()),
-            None => match auth_value {
-                Some(auth) => recover_refund(&route.client, &route.base_url, auth)
-                    .await
-                    .ok(),
-                None => None,
-            },
-        };
-        let Some(refund_obj) = refund_obj else {
-            eprintln!("warning: a proxied call's credential refund could not be recovered");
-            return;
-        };
-        let applied = process_refund(
-            &refund_obj,
-            &spend.params,
-            &spend.spend_proof,
-            &spend.pre_refund,
-            &spend.public_key,
-            db_conn,
-            &spend.pre_cred_id,
-            spend.cred.generation + 1,
-            now_ms(),
-        )
-        .await;
-        match applied {
-            Ok(()) => self.bus.emit(Change::Wallet),
-            Err(e) => eprintln!("warning: a proxied call's refund failed to apply: {e}"),
+        let (_, error) = spend
+            .settle(
+                &route.client,
+                &route.base_url,
+                db_conn,
+                &self.bus,
+                inline,
+                now_ms(),
+            )
+            .await;
+        if let Some(e) = error {
+            eprintln!("warning: a proxied call's credential refund was not applied: {e}");
         }
     }
 }
@@ -2018,6 +2061,8 @@ impl Inner {
 fn engine_model_info(id: String, context_tokens: u32) -> ModelInfo {
     ModelInfo {
         id,
+        sha256: None,
+        tags: Vec::new(),
         context_length: u64::from(context_tokens),
         max_output_tokens: None,
         output_budget_class: None,
@@ -2046,15 +2091,21 @@ fn offers_running_engines_only(exposure: LocalExposure, starts_on_demand: bool) 
 /// framing (`Host`, `Content-Length`) — the protocol, not a claim about this
 /// app — and the body is serialized here rather than by `json()` for the same
 /// reason: a helper that sets a header is a second author of the set.
+///
+/// An Eidola spend goes into the body here, in its `credentials` member
+/// ([`crate::body_with_spend`]), onto a copy: `body` is what the Record keeps,
+/// and it never holds a credential.
 fn build_upstream_request(
     route: &ProxyRoute,
     body: &Value,
+    spend: Option<&crate::SpendPrep>,
     headers: &SentHeaders,
 ) -> Result<reqwest::Request, AppError> {
+    let sent = crate::body_with_spend(body, spend);
     let mut request = route
         .client
         .post(format!("{}/v1/chat/completions", route.base_url))
-        .body(body.to_string())
+        .body(sent.to_string())
         .build()
         .map_err(|e| AppError::Network {
             message: format!(
@@ -2070,10 +2121,11 @@ fn build_upstream_request(
                 message: format!("`{name}` is not a usable header name"),
             }
         })?;
-        let value =
+        let mut value =
             reqwest::header::HeaderValue::from_str(value).map_err(|_| AppError::Config {
                 message: format!("`{name}` carries a value that cannot travel in a header"),
             })?;
+        value.set_sensitive(is_secret_header(name.as_str()));
         out.insert(name, value);
     }
     Ok(request)
@@ -2269,16 +2321,19 @@ fn forward_sse_event(event: &[u8], canonical: &str) -> (Vec<u8>, Option<Value>) 
     else {
         return (event.to_vec(), None);
     };
-    let refund = value.get("refund").cloned();
+    let refund = crate::inline_refund(&value).cloned();
+    let carries_refunds = value
+        .get(eidola_common::spend_credentials::REFUNDS_MEMBER)
+        .is_some();
     let misnames = value
         .get("model")
         .and_then(Value::as_str)
         .is_some_and(|model| model != canonical);
-    if refund.is_none() && !misnames {
+    if !carries_refunds && !misnames {
         return (event.to_vec(), None);
     }
     if let Some(object) = value.as_object_mut() {
-        object.remove("refund");
+        object.remove(eidola_common::spend_credentials::REFUNDS_MEMBER);
         if object.contains_key("model") {
             object.insert("model".to_string(), Value::String(canonical.to_string()));
         }
@@ -2407,6 +2462,31 @@ mod tests {
     }
 
     #[test]
+    fn an_external_key_is_sensitive_and_the_record_never_shows_it() {
+        let sent = headers(Some("Bearer sk-secret"), false, TraceUpstream::Off).materialize();
+        let recorded = sent.for_record();
+        assert!(!recorded.contains("sk-secret"), "{recorded}");
+        assert!(!format!("{sent:?}").contains("sk-secret"));
+        let route = route_with_pending_attestation("eidola", "http://127.0.0.1:9");
+        let request = build_upstream_request(&route, &serde_json::json!({}), None, &sent).unwrap();
+        assert!(!format!("{request:?}").contains("sk-secret"));
+        assert!(
+            request
+                .headers()
+                .get("authorization")
+                .unwrap()
+                .is_sensitive()
+        );
+        assert!(
+            !request
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .is_sensitive()
+        );
+    }
+
+    #[test]
     fn a_downstream_body_is_read_by_allowlist() {
         let body = serde_json::json!({
             "model": "m@local",
@@ -2419,6 +2499,8 @@ mod tests {
             "stream": true,
             "stream_options": {"include_usage": true, "something_else": 1},
             "max_tokens": 128,
+            "add_generation_prompt": false,
+            "continue_final_message": "reasoning_content",
             "logit_bias": {"1": 2},
             "x-vendor-extension": "whatever a future SDK sends"
         });
@@ -2437,6 +2519,8 @@ mod tests {
         assert_eq!(
             keys,
             vec![
+                "add_generation_prompt",
+                "continue_final_message",
                 "max_completion_tokens",
                 "messages",
                 "model",
@@ -2450,6 +2534,10 @@ mod tests {
             ],
             "no downstream key this app did not decide to send"
         );
+        // A continuation travels as the caller spelled it: the server and its
+        // engines hold it to their rule.
+        assert_eq!(object["add_generation_prompt"], false);
+        assert_eq!(object["continue_final_message"], "reasoning_content");
         assert_eq!(
             object["model"], "m",
             "the backend's own id goes on the wire"
@@ -2596,13 +2684,13 @@ mod tests {
         // carries a refund, and a chunk carrying both loses one and gains the
         // other.
         let (out, refund) = forward_sse_event(
-            br#"data: {"model":"m","refund":{"refund":"material","issuer_key_id":"ab"}}"#,
+            br#"data: {"model":"m","refunds":[{"refund":"material","issuer_key_id":"ab"}]}"#,
             "m@acme",
         );
         let text = String::from_utf8(out).expect("utf-8");
         assert!(!text.contains("material"), "{text}");
         assert!(text.contains(r#""model":"m@acme""#), "{text}");
-        assert_eq!(refund.expect("the refund")["refund"], "material");
+        assert_eq!(refund.expect("the refunds")[0]["refund"], "material");
     }
 
     #[test]
@@ -2610,7 +2698,7 @@ mod tests {
         // The server's real terminal event: Eidola's own metadata, with the
         // refund nested as `RefundInfo` — the shape `process_refund` reads.
         let (out, refund) = forward_sse_event(
-            br#"data: {"object":"eidola.chat.completion.metadata","id":"x","refund":{"refund":"credential-material","issuer_key_id":"ab"}}"#,
+            br#"data: {"object":"eidola.chat.completion.metadata","id":"x","refunds":[{"refund":"credential-material","issuer_key_id":"ab"}]}"#,
             "m@eidola",
         );
         let text = String::from_utf8(out).expect("utf-8");
@@ -2621,9 +2709,9 @@ mod tests {
         // **And the token is handed back rather than dropped** — the server
         // sends it even when its own persistence failed, which is the one case
         // where recovery can never answer.
-        let refund = refund.expect("the refund the event carried");
-        assert_eq!(refund["refund"], "credential-material");
-        assert_eq!(refund["issuer_key_id"], "ab");
+        let refunds = refund.expect("the refunds the event carried");
+        assert_eq!(refunds[0]["refund"], "credential-material");
+        assert_eq!(refunds[0]["issuer_key_id"], "ab");
     }
 
     /// **The cap bounds what is held, not only what is written.** Sealing
@@ -3060,7 +3148,12 @@ mod tests {
             .unwrap()
             .push(tinfoil_verifier::VerifiedAttestation {
                 platform: tinfoil_verifier::Platform::SevSnp,
-                matched_measurement: tinfoil_verifier::MatchedMeasurement::SevSnp("a".repeat(96)),
+                matched_measurement: tinfoil_verifier::MatchedMeasurement::SevSnp(
+                    tinfoil_verifier::SevSnpLaunchMeasurement {
+                        measurement: "a".repeat(96),
+                        host_data: "d".repeat(64),
+                    },
+                ),
                 attestation_hash: "second-handshake".into(),
                 attestation_doc: b"report".to_vec(),
                 pcr_digest: "b".repeat(96),
@@ -3152,8 +3245,13 @@ mod tests {
         };
         assert_eq!(
             Inner::proxy_completion_budget(&asking(None), None),
-            DEFAULT_MAX_COMPLETION_TOKENS,
+            crate::FALLBACK_MAX_COMPLETION_TOKENS,
             "a request that named none gets the app's own fallback"
+        );
+        assert_eq!(
+            Inner::proxy_completion_budget(&asking(None), Some(32_768)),
+            32_768,
+            "and where the model declares a ceiling, the app's own turn's ceiling"
         );
         assert_eq!(
             Inner::proxy_completion_budget(&asking(Some(100)), Some(500)),

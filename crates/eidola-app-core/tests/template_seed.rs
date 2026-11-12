@@ -68,6 +68,10 @@ fn a_fresh_database_is_seeded_with_a_usable_default_template() {
             t.participants[0].model_ref.as_deref(),
             Some(eidola_app_core::config::DEFAULT_MODEL)
         );
+        assert_eq!(
+            t.participants[0].label, "Gemma 4 E4B",
+            "the seeded agent carries the curated model's display name"
+        );
     });
 }
 

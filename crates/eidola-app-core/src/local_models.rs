@@ -141,6 +141,26 @@ pub const LOCAL_MODEL_CATALOG: &[LocalCatalogEntry] = &[
     },
 ];
 
+impl LocalCatalogEntry {
+    /// The `<slug>@local` model reference this entry is selected by once it
+    /// is in the managed store — the slug is its file's stem, so the
+    /// reference is spelled from `file_name`, never from `id`.
+    pub fn model_ref(&self) -> String {
+        engine_model_id(
+            crate::backends::LOCAL_BACKEND_ID,
+            &slug_for_file(self.file_name),
+        )
+    }
+}
+
+/// The curated entry a model reference names in the managed local store, if
+/// any.
+pub fn catalog_entry_for_model_ref(model_ref: &str) -> Option<&'static LocalCatalogEntry> {
+    LOCAL_MODEL_CATALOG
+        .iter()
+        .find(|entry| entry.model_ref() == model_ref)
+}
+
 // ============================================================================
 // DTOs — snapshots returned to the CLI/GUI.
 // ============================================================================
@@ -2242,12 +2262,17 @@ impl Inner {
                 (dir, EngineSource::External(backend.engine_path.clone()))
             };
 
-        let model_path =
-            find_model_file(&dir, &slug)
-                .await
-                .ok_or_else(|| AppError::LocalModel {
+        let model_path = find_model_file(&dir, &slug).await.ok_or_else(|| {
+            if backend_id == crate::backends::LOCAL_BACKEND_ID {
+                AppError::LocalModelNotDownloaded {
+                    model: engine_model_id(&backend_id, &slug),
+                }
+            } else {
+                AppError::LocalModel {
                     message: format!("no model file for `{slug}` in `{}`", dir.display()),
-                })?;
+                }
+            }
+        })?;
 
         let engine = match engine_source {
             EngineSource::Bundled => {
@@ -3043,6 +3068,26 @@ mod tests {
             assert_eq!(name, entry.file_name);
             assert!(entry.size_bytes > 1_000_000_000);
         }
+    }
+
+    #[test]
+    fn default_model_is_the_curated_e4b_in_the_local_store() {
+        let entry = catalog_entry_for_model_ref(crate::config::DEFAULT_MODEL)
+            .expect("the default model must be a curated local catalog entry");
+        assert_eq!(entry.id, "gemma-4-e4b");
+        assert_eq!(entry.model_ref(), crate::config::DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn a_curated_models_default_label_is_its_display_name() {
+        for entry in LOCAL_MODEL_CATALOG {
+            assert_eq!(
+                crate::db::default_agent_label(&entry.model_ref()),
+                entry.display_name
+            );
+        }
+        // Anything else is title-cased by token, backend dropped.
+        assert_eq!(crate::db::default_agent_label("qwen3-8b@ext"), "Qwen3 8b");
     }
 
     #[test]

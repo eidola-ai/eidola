@@ -3,12 +3,18 @@
 //! This crate holds the small pieces of pure logic that MUST be bit-identical
 //! on both sides of a contract boundary — the anonymous-credit pricing
 //! contract for chat-completion prompt holds ([`chargeable_prompt_tokens`]),
-//! outer chat-request construction ([`chat_completion_request_body`]), and
-//! the embed-marker recognition rule shared between the markdown editor's
-//! embed plugin and app-core's upstream quote expansion ([`embed`]). It is
-//! intentionally lib-only, pure Rust, and float-free so `eidola-app-core`,
-//! `eidola-server`, and tests can depend on it and compute identical results
-//! on any platform.
+//! outer chat-request construction ([`chat_completion_request_body`]), the
+//! wire contract shared by clients, the gateway and the inference nodes
+//! ([`engine_protocol`]: the prefix-cache key's shape and the weights
+//! header), the refund recovery key's wire form ([`refund_key`]), the public
+//! calendar issuer key windows are checked against ([`issuer_calendar`]), the
+//! `credentials` member a spend travels in and the ACT parameter `L`
+//! (`spend_credentials`, behind the `spend-credentials` feature), and the
+//! embed-marker recognition rule shared between the
+//! markdown editor's embed plugin and app-core's upstream quote expansion
+//! ([`embed`]). It is intentionally lib-only, pure Rust, and float-free so
+//! `eidola-app-core`, `eidola-server-gateway`, `eidola-server-engine`, and
+//! tests can depend on it and compute identical results on any platform.
 //!
 //! # The dependency rule
 //!
@@ -20,14 +26,33 @@
 //!
 //! > **A dependency is admissible here only if it is already in every
 //! > consumer's graph and is required for contract fidelity.** Today that
-//! > set is `serde_json`. Any addition needs the same argument written
+//! > set is `serde_json`, plus `argon2` behind the optional `argon2` feature
+//! > and `serde_yaml`, `serde` (derive) and `unsafe-libyaml` behind the
+//! > optional `deployment` feature, and `base64` and `serde` behind the
+//! > optional `spend-credentials` feature. Any addition needs the same argument written
 //! > down.
 //!
-//! `serde_json` qualifies on both counts: every consumer (app-core, server,
-//! gui; cli via app-core) already carries it, so admitting it adds no code,
-//! no trust surface, and no compile time to any binary — and it is what
-//! lets [`prompt_charge`] be the single walk both sides call rather than
-//! two implementations held together by a test.
+//! `argon2` qualifies because it is optional: it enters a graph only when a
+//! consumer enables the feature, and the two that do (the inference node and
+//! the gateway) already depend on `argon2 0.6` directly. It is what lets the
+//! node's boot and the gateway's pin check read a gateway-token hash through
+//! one function ([`engine_deployment::parse_gateway_token_hash`]). `serde_yaml`
+//! is optional on the same terms: `deployment` (which implies `argon2`) is
+//! enabled by the gateway's build and tests and by `measure-enclave`, the
+//! readers of engine deployment configs, so the one deployment check
+//! (`engine_deployment::deployment`) parses YAML once for both; `unsafe-libyaml`
+//! is the parser `serde_yaml` is built on, read directly for its event stream.
+//! `base64` and `serde` are optional on the same terms: `spend-credentials` is
+//! enabled by the two sides of a request's `credentials` member, app-core and
+//! the gateway, both of which depend on `base64 0.23` and `serde` (derive)
+//! directly, so one function writes the padded base64url a Token travels as,
+//! and one strict element type and one function refuse every other spelling.
+//!
+//! `serde_json` qualifies on both counts: every consumer (app-core, gateway,
+//! inference node, gui; cli via app-core) already carries it, so admitting it
+//! adds no code, no trust surface, and no compile time to any binary — and
+//! it is what lets [`prompt_charge`] be the single walk both sides call
+//! rather than two implementations held together by a test.
 //!
 //! # The prompt-hold pricing contract
 //!
@@ -99,7 +124,18 @@
 //! forward upstream). [`PromptCharge`] itself stays pure arithmetic — serde
 //! is for the walk, never for the accounting semantics.
 
+pub mod architecture;
 pub mod embed;
+pub mod engine_deployment;
+pub mod engine_protocol;
+pub mod issuer_calendar;
+#[cfg(feature = "catalog")]
+pub mod model_catalog;
+pub mod model_reference;
+pub mod refund_key;
+#[cfg(feature = "spend-credentials")]
+pub mod spend_credentials;
+pub mod weights_manifest;
 
 use serde_json::Value;
 
@@ -113,6 +149,20 @@ use serde_json::Value;
 ///
 /// An empty `tools` slice omits the field. `include_usage` only matters for a
 /// streaming request; it adds the local-engine `stream_options` request.
+///
+/// `cache_key` is the prefix-cache key ([`engine_protocol`]): `None` omits the
+/// field, so a body built without one is byte-for-byte the body built before
+/// the field existed. A key that is not [`engine_protocol::is_cache_key_text`]
+/// is a caller bug and panics rather than reaching a server that would refuse
+/// it. The key is secret: the returned `Value` holds a copy the caller is
+/// responsible for, and nothing here scrubs it.
+///
+/// `continuation` asks the model to continue the final message rather than
+/// answer it ([`engine_protocol::check_continuation`]): it adds
+/// `"add_generation_prompt": false` and `"continue_final_message"`, spelled
+/// [`engine_protocol::ContinueField::wire_value`]. `None` adds neither, so an
+/// ordinary body is unchanged by the parameter.
+#[allow(clippy::too_many_arguments)]
 pub fn chat_completion_request_body(
     model: &str,
     messages: &[Value],
@@ -120,6 +170,8 @@ pub fn chat_completion_request_body(
     tools: &[Value],
     stream: bool,
     include_usage: bool,
+    cache_key: Option<&str>,
+    continuation: Option<engine_protocol::ContinueField>,
 ) -> Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -134,6 +186,17 @@ pub fn chat_completion_request_body(
         if include_usage {
             body["stream_options"] = serde_json::json!({ "include_usage": true });
         }
+    }
+    if let Some(key) = cache_key {
+        assert!(
+            engine_protocol::is_cache_key_text(key),
+            "cache_key must be 32 bytes, base64url without padding"
+        );
+        body["cache_key"] = Value::String(key.to_owned());
+    }
+    if let Some(field) = continuation {
+        body["add_generation_prompt"] = Value::Bool(false);
+        body["continue_final_message"] = field.wire_value();
     }
     body
 }
@@ -186,7 +249,7 @@ pub fn chargeable_prompt_tokens(total_content_bytes: u64, message_count: u64) ->
 ///
 /// | Part of the request | Method | Counted as |
 /// | --- | --- | --- |
-/// | a `messages` entry | [`add_message`](Self::add_message) | one message + its `content` string's bytes |
+/// | a `messages` entry | [`add_message`](Self::add_message) | one message + its `content` and `reasoning_content` strings' bytes |
 /// | an assistant `tool_calls` entry | [`add_tool_call`](Self::add_tool_call) | the entry's compact JSON serialization, in bytes |
 /// | a request-level `tools` entry | [`add_tool_definition`](Self::add_tool_definition) | the entry's compact JSON serialization, in bytes |
 ///
@@ -260,7 +323,7 @@ impl PromptCharge {
     /// as the UTF-8 byte length of its compact JSON serialization.
     ///
     /// **The whole entry, not just `function.{name,arguments}`.** A client
-    /// replays the provider's call object verbatim and the proxy forwards it
+    /// replays the call object it received verbatim and the proxy forwards it
     /// verbatim, so the `id`, the `type`, and any provider extension field
     /// all reach the upstream — and which of them the chat template renders
     /// into the prompt is a per-model decision the proxy cannot see (Mistral
@@ -347,6 +410,10 @@ pub fn json_text_bytes(value: &Value) -> u64 {
 ///   multimodal message's image parts carry no prompt text of their own);
 ///   absent or `null` contributes zero. Every entry counts as one message
 ///   regardless.
+/// * **`reasoning_content`** — a string contributes its UTF-8 bytes. A chat
+///   template renders an assistant message's reasoning into the prompt (the
+///   final message of a continuation carries the reasoning so far), so its
+///   bytes are prompt text like the content's.
 /// * **`tool_calls[]`** — each entry contributes [`json_text_bytes`] of the
 ///   whole entry.
 /// * **`tools[]`** — each entry contributes [`json_text_bytes`] of the whole
@@ -359,7 +426,11 @@ pub fn prompt_charge(messages: &[Value], tools: Option<&[Value]>) -> PromptCharg
     let mut charge = PromptCharge::new();
 
     for message in messages {
-        charge.add_message(content_bytes(message.get("content")));
+        let reasoning = message
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .map_or(0, |s| s.len() as u64);
+        charge.add_message(content_bytes(message.get("content")).saturating_add(reasoning));
         if let Some(calls) = message.get("tool_calls").and_then(|c| c.as_array()) {
             for call in calls {
                 charge.add_tool_call(json_text_bytes(call));
@@ -396,6 +467,99 @@ fn content_bytes(content: Option<&Value>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // chat_completion_request_body: the cache key is opt-in
+    // -----------------------------------------------------------------
+
+    /// Without a cache key the body is exactly the bytes it was before the
+    /// parameter existed: every shape a client sends today, serialized and
+    /// compared with the same body written out by hand, in construction
+    /// order.
+    #[test]
+    fn a_body_without_a_cache_key_is_unchanged() {
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "f"}})];
+        let cases = [
+            (
+                chat_completion_request_body("m", &messages, 256, &[], false, false, None, None),
+                serde_json::json!({
+                    "model": "m", "messages": messages, "max_completion_tokens": 256,
+                }),
+            ),
+            (
+                chat_completion_request_body("m", &messages, 256, &tools, true, true, None, None),
+                serde_json::json!({
+                    "model": "m", "messages": messages, "max_completion_tokens": 256,
+                    "tools": tools, "stream": true,
+                    "stream_options": {"include_usage": true},
+                }),
+            ),
+        ];
+        for (built, expected) in cases {
+            assert_eq!(
+                serde_json::to_string(&built).unwrap(),
+                serde_json::to_string(&expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_cache_key_is_carried_as_given() {
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let body =
+            chat_completion_request_body("m", &messages, 1, &[], false, false, Some(key), None);
+        assert_eq!(body["cache_key"], key);
+    }
+
+    /// A continuation adds exactly the two members vLLM and SGLang read, in the
+    /// spelling the shared rule accepts, and nothing else.
+    #[test]
+    fn a_continuation_asks_to_continue_the_final_message() {
+        use engine_protocol::{ContinueField, FinalContent, FinalMessage, check_continuation};
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "content": "", "reasoning_content": "hm"}),
+        ];
+        for field in [ContinueField::Content, ContinueField::ReasoningContent] {
+            let body = chat_completion_request_body(
+                "m",
+                &messages,
+                1,
+                &[],
+                false,
+                false,
+                None,
+                Some(field),
+            );
+            let mut plain =
+                chat_completion_request_body("m", &messages, 1, &[], false, false, None, None);
+            plain["add_generation_prompt"] = serde_json::json!(false);
+            plain["continue_final_message"] = field.wire_value();
+            assert_eq!(body, plain);
+            let last = FinalMessage {
+                is_assistant: true,
+                content: FinalContent::Text(""),
+                has_tool_calls: false,
+                reasoning_content: Some("hm"),
+            };
+            assert_eq!(
+                check_continuation(
+                    body.get("continue_final_message"),
+                    body["add_generation_prompt"].as_bool(),
+                    Some(last)
+                ),
+                Ok(Some(field))
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "cache_key must be 32 bytes")]
+    fn a_malformed_cache_key_is_a_caller_bug() {
+        chat_completion_request_body("m", &[], 1, &[], false, false, Some("short"), None);
+    }
 
     #[test]
     fn zero_messages_charges_only_the_per_request_constant() {
@@ -588,6 +752,30 @@ mod tests {
         assert_eq!(charge.message_count(), 1);
     }
 
+    /// The template renders an assistant message's reasoning into the prompt,
+    /// so its bytes are charged like the content's — on the message, beside
+    /// the content, with no second message counted.
+    #[test]
+    fn reasoning_content_is_charged_as_prompt_text() {
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "partial",
+            "reasoning_content": "thinking é",
+        })];
+        let charge = prompt_charge(&messages, None);
+        assert_eq!(charge.total_content_bytes(), 7 + 11);
+        assert_eq!(charge.message_count(), 1);
+        // Only a string is prompt text; anything else reaches no template.
+        for reasoning in [serde_json::json!(null), serde_json::json!(5)] {
+            let messages = vec![serde_json::json!({
+                "role": "assistant",
+                "content": "partial",
+                "reasoning_content": reasoning,
+            })];
+            assert_eq!(prompt_charge(&messages, None).total_content_bytes(), 7);
+        }
+    }
+
     #[test]
     fn absent_or_null_content_still_counts_as_a_message() {
         for content in [
@@ -602,7 +790,7 @@ mod tests {
 
     #[test]
     fn the_whole_tool_call_entry_is_charged_not_just_name_and_arguments() {
-        // The client replays the provider's call object verbatim — id, `type`
+        // The client replays the call object it received verbatim — id, `type`
         // and any provider extension included — and those bytes reach the
         // upstream, where a template like Mistral's renders the call id
         // straight into the prompt.
@@ -672,7 +860,7 @@ mod tests {
     ///
     /// Each consumer keeps one agreement test that feeds its *own* request
     /// representation through the same walk and asserts the same 230
-    /// (`eidola-server`'s `tool_round_fixture_charges_the_pinned_contract_value`
+    /// (`eidola-server-gateway`'s `tool_round_fixture_charges_the_pinned_contract_value`
     /// over a parsed `ChatCompletionRequest`, `eidola-app-core`'s
     /// `prompt_charge_matches_the_shared_contract_fixture` over the `Value`
     /// messages a turn actually sends). Those still have teeth after the

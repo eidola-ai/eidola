@@ -90,7 +90,7 @@ fn check_revocation_at(
     Ok(())
 }
 
-fn unix_now() -> Result<u64, Error> {
+pub(crate) fn unix_now() -> Result<u64, Error> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| Error::CertChain(format!("system clock is before UNIX_EPOCH: {e}")))?
@@ -117,7 +117,7 @@ fn verify_validity_window(crl: &CertificateList, now: u64) -> Result<(), Error> 
     Ok(())
 }
 
-fn time_secs(time: Time) -> u64 {
+pub(crate) fn time_secs(time: Time) -> u64 {
     match time {
         Time::UtcTime(value) => value.to_unix_duration().as_secs(),
         Time::GeneralTime(value) => value.to_unix_duration().as_secs(),

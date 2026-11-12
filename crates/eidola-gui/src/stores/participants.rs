@@ -498,6 +498,50 @@ impl ParticipantsStore {
         });
     }
 
+    /// Switch a pinned participant to the newer weights its tag now names
+    /// (`AppCore::switch_to_newer_weights`): the one-click answer to its
+    /// "newer weights available" notice.
+    pub fn switch_to_newer_weights(
+        &mut self,
+        space_id: String,
+        participant_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let s = space_id.clone();
+        let key = participant_id.clone();
+        self.write_then_settle(space_id, key, cx, move |core| {
+            Box::pin(async move {
+                bridge(core, move |c| async move {
+                    c.switch_to_newer_weights(s, participant_id).await
+                })
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            })
+        });
+    }
+
+    /// Dismiss a followed tag's "model updated" notice for this participant
+    /// in this space (`AppCore::dismiss_model_update`).
+    pub fn dismiss_model_update(
+        &mut self,
+        space_id: String,
+        participant_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let s = space_id.clone();
+        let key = participant_id.clone();
+        self.write_then_settle(space_id, key, cx, move |core| {
+            Box::pin(async move {
+                bridge(core, move |c| async move {
+                    c.dismiss_model_update(s, participant_id).await
+                })
+                .await
+                .map_err(|e| e.to_string())
+            })
+        });
+    }
+
     /// Remove an agent participant from a space (the shared human can't be).
     pub fn remove(&mut self, space_id: String, participant_id: String, cx: &mut Context<Self>) {
         let s = space_id.clone();

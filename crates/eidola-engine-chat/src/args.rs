@@ -71,12 +71,14 @@
 
 use crate::json::{self, BigInt, Json, ObjectBuilder, PY_MAX_STR_DIGITS};
 use crate::pysem::{self, PyLit};
+use crate::tool_call::UnparsedText;
 
 /// The tools of a request, indexed for parameter typing.
 #[derive(Clone, Debug, Default)]
 pub struct ToolSchemas {
     tools: Vec<ToolEntry>,
     typing: ArgumentTyping,
+    unparsed: UnparsedText,
 }
 
 /// How parameter text becomes a JSON value.
@@ -120,6 +122,7 @@ impl ToolSchemas {
         ToolSchemas {
             tools: out,
             typing: ArgumentTyping::default(),
+            unparsed: UnparsedText::default(),
         }
     }
 
@@ -131,6 +134,16 @@ impl ToolSchemas {
 
     pub fn typing(&self) -> ArgumentTyping {
         self.typing
+    }
+
+    /// Selects what becomes of output text that is not a call.
+    pub fn with_unparsed_text(mut self, unparsed: UnparsedText) -> ToolSchemas {
+        self.unparsed = unparsed;
+        self
+    }
+
+    pub fn unparsed_text(&self) -> UnparsedText {
+        self.unparsed
     }
 
     /// Converts the raw text of `param` in a call to `function`.
@@ -401,6 +414,7 @@ fn literal_to_json(lit: &PyLit) -> Option<Json> {
             }
             Json::Int(i.clone())
         }
+        PyLit::OversizeInt { .. } => return None,
         PyLit::Float(f) => {
             if !f.is_finite() {
                 return None;
@@ -453,6 +467,53 @@ mod tests {
 
     fn conv(raw: &str, t: &str) -> String {
         json::dumps_default(&convert_parameter_sglang(raw, t))
+    }
+
+    /// A literal far past what `json.dumps` prints costs its length to read,
+    /// and the parameter takes the outcome Python gives it: its text where
+    /// the integer would be written, a value where a later equal key
+    /// replaced it.
+    #[test]
+    fn an_integer_too_long_to_print_is_not_converted() {
+        let big = format!("0x{}", "f".repeat(400_000));
+        for t in [
+            "object", "array", "integer", "number", "boolean", "anything",
+        ] {
+            assert_eq!(
+                convert_parameter_round_trip(&big, t),
+                Json::Str(big.clone()),
+                "{t}"
+            );
+        }
+        for literal in [
+            format!("[1, {big}]"),
+            format!("{{'a': -{big}}}"),
+            format!("{{{big}: 1}}"),
+        ] {
+            assert_eq!(
+                convert_parameter_round_trip(&literal, "object"),
+                Json::Str(literal.clone())
+            );
+        }
+        assert_eq!(
+            json::dumps_default(&convert_parameter_round_trip(
+                &format!("{{1: {big}, True: 'kept'}}"),
+                "object"
+            )),
+            "{\"1\": \"kept\"}"
+        );
+        // Within the bound nothing changed: converted, then refused or
+        // written by its decimal length.
+        let printable = format!("0x{}", "f".repeat(3571));
+        let Json::Int(value) = convert_parameter_round_trip(&printable, "object") else {
+            panic!("an integer");
+        };
+        assert_eq!(value.digits.len(), 4300);
+        let unprintable = format!("0x{}", "f".repeat(3572));
+        assert_eq!(
+            convert_parameter_round_trip(&unprintable, "object"),
+            Json::Str(unprintable.clone())
+        );
     }
 
     #[test]

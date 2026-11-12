@@ -1173,10 +1173,10 @@ fn register_settings(s: &mut Snapshots) {
                 trust.base_url = "https://staging.eidola.example/v1".into();
                 trust.base_url_is_override = true;
                 trust.trusted_measurements = vec![MeasurementInfo {
-                    snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
-                    tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    measurement: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f89d2bb3ef58af1e7c0c12f3b4a5d6e7f8".into(),
+                    host_data: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                         .into(),
-                    tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+                    guest_policy: "0x30133"
                         .into(),
                 }];
                 trust.trusted_measurements_are_override = true;
@@ -1650,8 +1650,7 @@ fn register_record(s: &mut Snapshots) {
                 method: "POST".into(),
                 path: "/v1/chat/completions".into(),
                 request_headers: Some(
-                    "content-type: application/json\nauthorization: PrivateToken token=\"…\""
-                        .into(),
+                    "content-type: application/json\naccept: text/event-stream".into(),
                 ),
                 request_body: Some(
                     br#"{"model":"gemma4-31b","stream":true,"messages":[{"role":"user","content":"Why is the sky blue?"}]}"#
@@ -1732,6 +1731,7 @@ fn agent_participant(id: &str, label: &str) -> eidola_app_core::ParticipantInfo 
         kind: "agent".into(),
         label: label.into(),
         model_ref: Some("kimi-k2-6".into()),
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "human".into(),
         role: "member".into(),
@@ -1750,6 +1750,7 @@ fn inspector_participants() -> (String, Vec<eidola_app_core::ParticipantInfo>) {
         // The **wire** label (task 64); the row shows "You".
         label: "User".into(),
         model_ref: None,
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "explicit".into(),
         role: "member".into(),
@@ -1787,6 +1788,8 @@ fn model_stores(cx: &mut App) -> Stores {
         s.models = vec![
             ModelInfo {
                 id: "gemma4-31b".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: Some(16_384),
                 output_budget_class: Some(OutputBudgetClass::Reasoning),
@@ -1802,6 +1805,8 @@ fn model_stores(cx: &mut App) -> Stores {
             },
             ModelInfo {
                 id: "kimi-k2-6".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 262_144,
                 max_output_tokens: Some(32_768),
                 output_budget_class: Some(OutputBudgetClass::Reasoning),
@@ -1820,6 +1825,8 @@ fn model_stores(cx: &mut App) -> Stores {
             // picker has to render one.
             ModelInfo {
                 id: "qwen3-coder-watt".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1834,6 +1841,8 @@ fn model_stores(cx: &mut App) -> Stores {
             // imply we sell one.
             ModelInfo {
                 id: "per-request-example".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 0,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1870,9 +1879,9 @@ fn stub_eidola_trust() -> eidola_app_core::EidolaTrust {
         trusted_measurements: Vec::new(),
         trusted_measurements_are_override: false,
         pinned_measurement: eidola_app_core::MeasurementInfo {
-            snp: "1122334455667788112233445566778811223344556677881122334455667788".into(),
-            tdx_rtmr1: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
-            tdx_rtmr2: "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa".into(),
+            measurement: "112233445566778811223344556677881122334455667788112233445566778811223344556677881122334455667788".into(),
+            host_data: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+            guest_policy: "0x30133".into(),
         },
         has_hardware_root_ca: false,
         hardware_root_ca_pem: None,

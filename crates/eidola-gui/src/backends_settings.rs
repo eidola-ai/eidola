@@ -170,7 +170,8 @@ pub struct BackendsSettingsView {
     /// ("Set custom certificate…" / "Replace…" revealed it). One at a time —
     /// the two rows share the edit-in-place shape with the base-URL row.
     editing_ca: Option<CaKind>,
-    /// The Eidola tab's add-a-measurement input (`<snp>:<rtmr1>:<rtmr2>`).
+    /// The Eidola tab's add-a-measurement input
+    /// (`<measurement>:<host_data>:<guest_policy>`).
     add_measurement_state: Entity<InputState>,
     /// The Eidola tab's hardware root-CA paste-PEM input.
     root_ca_state: Entity<TextareaState>,
@@ -208,8 +209,9 @@ impl BackendsSettingsView {
             InputState::new(window, cx).placeholder("https://huggingface.co/…/model.gguf")
         });
         let base_url_state = cx.new(|cx| InputState::new(window, cx).placeholder("https://…"));
-        let add_measurement_state =
-            cx.new(|cx| InputState::new(window, cx).placeholder("<snp>:<rtmr1>:<rtmr2>"));
+        let add_measurement_state = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(eidola_app_core::config::TRUST_SPEC_FORM)
+        });
         // Hardware-CA overrides are full PEM blocks — multi-line textareas
         // that grow with the pasted certificate rather than a single-line
         // field that hides all but a sliver of it.
@@ -495,7 +497,7 @@ impl BackendsSettingsView {
     }
 
     /// Add the trusted measurement in the add field (the CLI's
-    /// `<snp>:<rtmr1>:<rtmr2>` triple). A parse/validation failure surfaces in
+    /// `<measurement>:<host_data>:<guest_policy>` spec). A parse/validation failure surfaces in
     /// the config store's op-error banner and the input is kept so the user
     /// can fix it; a successful add clears the field.
     pub fn submit_add_measurement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -520,13 +522,13 @@ impl BackendsSettingsView {
 
     /// Untrust a single measurement (by its SNP key). Removing the last one
     /// reverts to the pin.
-    pub fn untrust_measurement(&mut self, snp: String, cx: &mut Context<Self>) {
+    pub fn untrust_measurement(&mut self, key: String, cx: &mut Context<Self>) {
         self.config
-            .update(cx, |c, cx| c.untrust_measurement(snp, cx));
+            .update(cx, |c, cx| c.untrust_measurement(key, cx));
         cx.notify();
     }
 
-    /// Trust a measurement from an explicit `<snp>:<rtmr1>:<rtmr2>` triple
+    /// Trust a measurement from an explicit `<measurement>:<host_data>:<guest_policy>` spec
     /// (not the add-field). Backs the pin card's "Trust" verb — re-adding the
     /// build pin to a trusted set that overrode it. Failures land in the
     /// config store's op-error banner.
@@ -1999,7 +2001,7 @@ impl BackendsSettingsView {
             let pin_trusted = trust
                 .trusted_measurements
                 .iter()
-                .any(|m| m.snp.eq_ignore_ascii_case(&pin.snp));
+                .any(|m| m.key() == pin.key());
             if !pin_trusted {
                 value = value.child(self.measurement_line(pin, MeasurementRole::PinNotTrusted, cx));
             }
@@ -2120,8 +2122,9 @@ impl BackendsSettingsView {
         trust_row("Trusted measurements", cx, value).into_any_element()
     }
 
-    /// One compact measurement line: the middle-truncated SNP launch digest
-    /// (mono — the full `<snp>:<rtmr1>:<rtmr2>` triple travels via the Copy
+    /// One compact measurement line: the middle-truncated SEV-SNP launch
+    /// digest and HOST_DATA (mono — the full
+    /// `<measurement>:<host_data>:<guest_policy>` spec travels via the Copy
     /// verb and the a11y labels), a role tag, and the role's verbs. Copy is
     /// always offered; Untrust only on user-override entries (the build pin
     /// is never untrustable — `untrust_measurement` edits the *override*
@@ -2134,7 +2137,7 @@ impl BackendsSettingsView {
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         let theme = cx.theme();
-        let triple = measurement_triple(m);
+        let triple = m.spec();
         let slug = match role {
             MeasurementRole::Override(idx) => format!("{idx}"),
             MeasurementRole::Pinned | MeasurementRole::PinNotTrusted => "pin".to_string(),
@@ -2151,18 +2154,18 @@ impl BackendsSettingsView {
         let mut verbs = h_flex().gap_3().flex_none().text_xs().child(copy_verb(
             SharedString::from(format!("eidola-measurement-{slug}-copy")),
             format!("settings/backends/eidola/measurements/{slug}/copy"),
-            format!("Copy measurement {}", hex_summary(&m.snp)),
+            format!("Copy measurement {}", measurement_summary(m)),
             triple.clone(),
             cx,
         ));
         match role {
             MeasurementRole::Pinned => {}
             MeasurementRole::Override(idx) => {
-                let snp = m.snp.clone();
+                let key = m.key();
                 // Short in the name, whole in the value: a 64-character hex
                 // string as an accessible *name* is read out character by
                 // character every time the element is focused.
-                let aria = format!("Untrust measurement {}", hex_summary(&snp));
+                let aria = format!("Untrust measurement {}", measurement_summary(m));
                 verbs =
                     verbs.child(
                         quiet_verb(
@@ -2176,9 +2179,9 @@ impl BackendsSettingsView {
                             gpui::Role::Button,
                             aria,
                         )
-                        .aria_value(m.snp.clone())
+                        .aria_value(key.clone())
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.untrust_measurement(snp.clone(), cx)
+                            this.untrust_measurement(key.clone(), cx)
                         })),
                     );
             }
@@ -2208,7 +2211,7 @@ impl BackendsSettingsView {
                     .text_xs()
                     .font_family("Menlo")
                     .text_color(theme.muted_foreground)
-                    .child(SharedString::from(hex_summary(&m.snp))),
+                    .child(SharedString::from(measurement_summary(m))),
             )
             .when_some(tag, |line, tag| {
                 line.child(
@@ -2438,11 +2441,14 @@ fn hex_summary(hex: &str) -> String {
     }
 }
 
-/// The re-addable `<snp>:<rtmr1>:<rtmr2>` triple form of a measurement — the
-/// format the add field / CLI accept, and what the Copy verbs place on the
-/// clipboard.
-fn measurement_triple(m: &MeasurementInfo) -> String {
-    format!("{}:{}:{}", m.snp, m.tdx_rtmr1, m.tdx_rtmr2)
+/// A launch identity, short: the digest names the release image, HOST_DATA
+/// which deployment of it (the digest alone is the same for every one).
+fn measurement_summary(m: &MeasurementInfo) -> String {
+    format!(
+        "{} · {}",
+        hex_summary(&m.measurement),
+        hex_summary(&m.host_data)
+    )
 }
 
 /// A quiet "Copy" text verb that places `value` on the clipboard. Mirrors the

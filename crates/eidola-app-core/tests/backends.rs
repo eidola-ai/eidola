@@ -220,29 +220,41 @@ fn eidola_row_owns_connection_and_trust_bundle() {
         assert!(!trust.base_url_is_override);
 
         // Trust a measurement (idempotent), then untrust back to pin.
-        let snp = "a".repeat(96);
-        let r1 = "b".repeat(96);
-        let r2 = "c".repeat(96);
+        let measurement = "a".repeat(96);
+        let host_data = "b".repeat(64);
+        let policy = "0x30133".to_string();
         let added = core
             .runtime()
-            .block_on(core.trust_measurement(snp.clone(), r1.clone(), r2.clone()))
+            .block_on(core.trust_measurement(
+                measurement.clone(),
+                host_data.clone(),
+                policy.clone(),
+            ))
             .unwrap();
         assert!(added);
         assert_eq!(drain(&mut rx), vec![Change::Backends]);
         let again = core
             .runtime()
-            .block_on(core.trust_measurement(snp.clone(), r1, r2))
+            .block_on(core.trust_measurement(measurement.clone(), host_data.clone(), policy))
             .unwrap();
         assert!(!again, "idempotent: no second write");
+        assert_eq!(drain(&mut rx), vec![]);
+        // A debug policy is no pin at all: refused before any write.
+        let err = core
+            .runtime()
+            .block_on(core.trust_measurement(measurement.clone(), "c".repeat(64), "0xb0133".into()))
+            .expect_err("debug policy");
+        assert!(matches!(err, AppError::Config { .. }), "{err}");
         assert_eq!(drain(&mut rx), vec![]);
         let trust = core.runtime().block_on(core.eidola_trust()).unwrap();
         assert!(trust.trusted_measurements_are_override);
         assert_eq!(trust.trusted_measurements.len(), 1);
-        assert_eq!(trust.trusted_measurements[0].snp, snp);
+        assert_eq!(trust.trusted_measurements[0].measurement, measurement);
+        assert_eq!(trust.trusted_measurements[0].host_data, host_data);
 
         let removed = core
             .runtime()
-            .block_on(core.untrust_measurement(snp.clone()))
+            .block_on(core.untrust_measurement(format!("{measurement}:{host_data}")))
             .unwrap();
         assert!(removed);
         assert_eq!(drain(&mut rx), vec![Change::Backends]);

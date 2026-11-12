@@ -51,10 +51,6 @@ space-footnote-delegation-failed = stopped: { $reason ->
 # word of the new answer arrives, so this is often the only thing on screen for
 # a long while — it says the request is out, not that anything is nearly done.
 space-regenerating = Regenerating…
-# Shown in the conversation's recovery notice when a response used its whole
-# length allowance on its own reasoning and never began an answer. Nothing was
-# recorded and nothing was replaced, so the answer already there is untouched.
-space-error-response-truncated = The model used its whole length allowance thinking and never started an answer. No answer was added or replaced — try again, or ask a shorter question.
 # Shown in the conversation's recovery notice when the model this turn would
 # have used is no longer in its backend's catalog — a row retired there, while
 # whoever answers here still names it. Two things carry the sentence, and both
@@ -66,13 +62,33 @@ space-error-response-truncated = The model used its whole length allowance think
 # TRANSLATORS: $model is the selection exactly as it was saved, an id rather
 # than a display name. Leave it verbatim; it is what the reader looks for.
 space-error-model-unavailable = { $model } is no longer offered by its backend, and nothing will answer in its place. Nothing was sent and nothing was charged — pick a different model, then try again.
+# Shown in the conversation's recovery notice when the model this turn would
+# have used runs on this computer but has not been downloaded — what a new
+# profile meets first, since its default agent uses an on-device model. Says
+# that nothing was sent, and the two ways on: download that model, or choose
+# another one. Retry stays offered, for after the download.
+# TRANSLATORS: $model is the model's display name (e.g. "Gemma 4 E4B") or, for
+# a model with none, its id. Leave it verbatim. "Settings ▸ Backends ▸ Local"
+# names the app's own menus; use the translated names those menus show.
+space-error-local-model-not-downloaded = { $model } runs on this computer but isn't downloaded yet, so nothing was sent. Download it in Settings ▸ Backends ▸ Local, or pick a different model, then try again.
 # A quiet marker beneath a response a regeneration was asked for while one was
 # already running against it somewhere this window cannot see. Not a failure:
 # the first one is still going, and its result will arrive here.
 space-regenerating-elsewhere = This response is already being regenerated.
 # A quiet marker beneath an answer that stopped because it reached its length
-# allowance rather than because the model was finished.
-space-answer-cut-off = This answer reached its length limit and stops mid-thought.
+# allowance rather than because the model was finished — reasoning that never
+# reached an answer included. Where the answer can be continued the marker
+# carries Continue beside it, so it states the fact and the way on is the verb.
+space-answer-cut-off = This answer stopped at its length limit.
+# The verb beside that marker: asks the same model to pick up exactly where the
+# answer stopped, mid-sentence or mid-thought, as a new version of the same
+# answer. Short, because it sits on the marker's line.
+space-continue-answer = Continue
+# What a screen reader announces for that verb — the action in full.
+space-continue-answer-label = Continue this answer from where it stopped
+# Shown above an answer while it is being continued, from the frame the press
+# was accepted in, until the continued text starts arriving.
+space-continuing = Continuing…
 # The source-highlight picker (src/space_view/references.rs): the popover that
 # opens when a clicked passage was quoted by more than one post, listing each
 # so the reader chooses the target rather than the app guessing.
@@ -104,3 +120,22 @@ space-highlight-picker-nth = { $label } ({ $n })
 # truncates discriminates nothing. Keep it in step with
 # `space-highlight-picker-nth`, whose tail it is.
 space-highlight-picker-ordinal = ({ $n })
+
+# Shown in the conversation's recovery notice when this app refused the
+# server's current payment key (the issuer key credits are converted under)
+# because its windows do not follow the public key schedule every client can
+# compute for itself. Nothing was charged; credits already held still work.
+# "Payment key" is deliberately plain: the reader needs to know the app
+# protected them, not the protocol's vocabulary.
+space-error-issuer-key-off-calendar = Eidola’s server offered a payment key that doesn’t follow the public key schedule, so this app didn’t use it. Nothing was sent and nothing was charged, and the credits you already hold still work.
+# The same notice when the server offered a different payment key for this
+# week from the one this app already saw. An honest server has one per week,
+# and a second one is what a server singling a reader out would show, so the
+# app refuses it until the next week's key. Retrying now will not help, which
+# is what the last sentence is for.
+space-error-issuer-key-second-for-epoch = Eidola’s server offered a different payment key this week from the one this app already has. An honest server uses one key per week, so this app won’t take new credits under it until next week’s key. Nothing was sent and nothing was charged, and the credits you already hold still work.
+# The same notice when the server offered one payment key for two different
+# weeks. An honest server has a distinct key every week, and a key reused
+# across weeks would let the server swap another key in unnoticed later, so
+# the app refuses it.
+space-error-issuer-key-reused = Eidola’s server offered the same payment key for two different weeks, which an honest server never does, so this app didn’t use it. Nothing was sent and nothing was charged, and the credits you already hold still work.

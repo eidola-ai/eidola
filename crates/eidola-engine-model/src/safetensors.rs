@@ -404,6 +404,14 @@ fn map_file(path: &Path, file_index: usize) -> Result<(MappedFile, Vec<(String, 
         path: path.to_path_buf(),
         reason,
     };
+    // The integrity manifest keys files by name, so a name must be its exact bytes: a
+    // lossy conversion would let distinct names (`\x80…`, `\x81…`) share one manifest
+    // entry. Refused before the file is opened.
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| bad("the file name is not UTF-8".into()))?;
     let file = File::open(path).map_err(|e| Error::io(path, e))?;
     // SAFETY: the mapping is read-only and the weight files are treated as
     // immutable for the lifetime of the `WeightSet`; modifying or truncating a
@@ -468,10 +476,6 @@ fn map_file(path: &Path, file_index: usize) -> Result<(MappedFile, Vec<(String, 
             },
         ));
     }
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
     Ok((
         MappedFile {
             path: path.to_path_buf(),
@@ -509,6 +513,21 @@ fn tensor_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name that is not UTF-8 is refused, never converted lossily into the manifest.
+    /// (Linux only: macOS filesystems cannot hold such a name.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_file_names_are_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("eidola-non-utf8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(std::ffi::OsStr::from_bytes(b"\x80.safetensors"));
+        std::fs::write(&path, b"").unwrap();
+        let err = WeightSet::open_files(&[path]).unwrap_err().to_string();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(err.contains("not UTF-8"), "{err}");
+    }
 
     /// Write a safetensors file with `header` and `data` and open it.
     fn open_with_header(tag: &str, header: &str, data: &[u8]) -> Result<WeightSet> {

@@ -12,6 +12,6 @@ name = "generate-openapi"
 path = "src/main.rs"
 
 [dependencies]
-eidola-server = { path = "../eidola-server" }
+eidola-server-gateway = { path = "../eidola-server-gateway" }
 rustls = { version = "0.23", default-features = false }
 rustls-rustcrypto = "0.0.2-alpha"

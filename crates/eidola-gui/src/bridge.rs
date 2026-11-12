@@ -260,6 +260,25 @@ pub fn regenerate_stream(
     (event_rx, done_rx)
 }
 
+/// Continue an answer that stopped at its length limit
+/// (`AppCore::continue_stream`): deltas on the first channel — opening with the
+/// text being continued — and the finished turn on the second.
+pub fn continue_stream(
+    core: Arc<AppCore>,
+    action_id: String,
+) -> (
+    mpsc::UnboundedReceiver<ChatStreamEvent>,
+    oneshot::Receiver<Result<ChatResult, AppError>>,
+) {
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (done_tx, done_rx) = oneshot::channel();
+    core.runtime().handle().clone().spawn(async move {
+        let res = core.continue_stream(action_id, event_tx).await;
+        let _ = done_tx.send(res);
+    });
+    (event_rx, done_rx)
+}
+
 /// **When the regeneration running against `item_id` ends** — however it ends.
 /// Resolves at once when nothing is running against it.
 ///

@@ -29,9 +29,9 @@
 //!
 //! ## Freshness — and its limits
 //!
-//! Re-attesting on every new TLS handshake means TCB-floor bumps and
-//! `ALLOWED_MEASUREMENTS` changes take effect immediately rather than only at
-//! process restart. The per-handshake nonce adds *freshness*: the enclave
+//! Re-attesting on every new TLS handshake means a change to the TCB floor
+//! or to the pinned measurements takes effect immediately rather than only
+//! at process restart. The per-handshake nonce adds *freshness*: the enclave
 //! folds our random nonce into the hardware report's `REPORT_DATA`
 //! (`REPORT_DATA == sha256(report-data-v1 URI || nonce ||
 //! sha256(crypto_material) || sha256(device_evidence))`), and the endorsed
@@ -64,8 +64,12 @@ use tower::{Layer, Service};
 use der::Decode;
 use sha2::Digest as _;
 
-use crate::measurement::EnclaveMeasurement;
-use crate::{Error, bundle, check_snp_measurement, sevsnp, sevsnp_crl};
+use crate::bundle::Platform;
+use crate::measurement::{
+    CompiledPin, CompiledPlatform, CompiledSevSnpPin, CompiledTdxPin, MatchedMeasurement,
+    SevSnpLaunchMeasurement, TdxLaunchMeasurement,
+};
+use crate::{Error, bundle, device, sevsnp, sevsnp_crl, tdx};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -89,7 +93,7 @@ pub(crate) struct BuildParams {
     pub inference_base_url: String,
     pub trusted_ark_der: Option<Vec<u8>>,
     pub trusted_ask_der: Option<Vec<u8>>,
-    pub allowed_measurements: Vec<EnclaveMeasurement>,
+    pub allowed_measurements: Vec<CompiledPin>,
     pub snp_policy: sevsnp::SevSnpTcbPolicy,
     pub snp_observer: Option<sevsnp::SevSnpObserver>,
     pub attestation_observer: Option<crate::AttestationObserver>,
@@ -112,7 +116,7 @@ pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Cli
     // Build a rustls config that pins ALPN to http/1.1 so the connection we
     // attest is the same connection hyper will use for the real request. The
     // root store comes from the caller verbatim — we do not consult any
-    // bundled or OS source here. The server (running inside an enclave with
+    // bundled or OS source here. The gateway (running inside an enclave with
     // no system trust store) supplies `webpki-roots`; the CLI / macOS app
     // supply `rustls-native-certs` so developers can install local dev CAs
     // in their keychain. We deliberately do not inject the AMD attestation
@@ -124,6 +128,7 @@ pub(crate) fn build_attesting_client(params: BuildParams) -> Result<reqwest::Cli
 
     let check = Arc::new(AttestationCheck {
         allowed_measurements,
+        intel_root_der: tdx::INTEL_SGX_ROOT_CA_DER.to_vec(),
         attestation_path: "/.well-known/tinfoil-attestation".to_string(),
         attestation_host: host,
         trusted_ark_der,
@@ -223,7 +228,12 @@ where
 
 /// Per-client attestation policy and target.
 struct AttestationCheck {
-    allowed_measurements: Vec<EnclaveMeasurement>,
+    /// Platform-tagged pins. Evidence is compared only with entries of its
+    /// own platform.
+    allowed_measurements: Vec<CompiledPin>,
+    /// The Intel SGX root every TDX quote's chains must end in. Always the
+    /// built-in root outside this module's tests.
+    intel_root_der: Vec<u8>,
     /// Base well-known path; a fresh `?nonce=<hex>` query is appended per
     /// handshake.
     attestation_path: String,
@@ -311,7 +321,22 @@ impl AttestationCheck {
             .map_err(|e| Error::Connector(format!("flush attestation request: {e}")))?;
 
         let body = read_http1_response(io).await?;
-        bundle::parse_document(&body)
+        self.parse_document(&body)
+    }
+
+    /// Parse a fetched document, refusing a platform with no pinned entry
+    /// before its payloads are decoded. `verify` re-checks the platform on
+    /// the resolved document.
+    fn parse_document(&self, body: &[u8]) -> Result<bundle::ResolvedAttestation, Error> {
+        let pinned: Vec<Platform> = [Platform::SevSnp, Platform::Tdx]
+            .into_iter()
+            .filter(|platform| {
+                self.allowed_measurements
+                    .iter()
+                    .any(|pin| pin.platform() == *platform)
+            })
+            .collect();
+        bundle::parse_document_for(body, &pinned)
     }
 
     /// Verify a freshly-fetched attestation document against the peer cert the
@@ -327,19 +352,27 @@ impl AttestationCheck {
         // recomputed REPORT_DATA before the document is trusted.
         self.verify_document_binding(resolved, peer_spki, sent_nonce)?;
 
+        // The document's author chooses the platform branch, so only a
+        // platform the caller pinned is a branch at all. With no entry for
+        // it, the evidence is refused before it is even authenticated: a
+        // SEV-SNP-only pin set refuses TDX no matter how genuine the quote.
+        let candidates: Vec<&CompiledPin> = self
+            .allowed_measurements
+            .iter()
+            .filter(|pin| pin.platform() == resolved.platform)
+            .collect();
+        if candidates.is_empty() {
+            return Err(Error::PlatformNotPinned {
+                platform: resolved.platform,
+            });
+        }
+
         match resolved.platform {
-            bundle::Platform::SevSnp => self.verify_snp(resolved, peer_spki),
-            // Refused outright — not because TDX hardware is distrusted,
-            // but because the policy checks for it are incomplete: MRTD
-            // (the only register measured by the TDX module itself) and
-            // RTMR0 are not checked, and RTMR1/RTMR2 are guest-extendable,
-            // so any firmware on a genuine TDX machine can replay the
-            // published digests into them. The document author chooses the
-            // platform branch, so accepting TDX would let anyone holding a
-            // valid cert for the endpoint sidestep the SNP measurement pin
-            // entirely. Fail closed until MRTD/RTMR0 (+ MR_SEAM/XFAM/
-            // FMSPC) policy lands.
-            bundle::Platform::Tdx => Err(Error::TdxNotAccepted),
+            Platform::SevSnp => self.verify_snp(resolved, peer_spki, &candidates),
+            Platform::Tdx => {
+                let now = sevsnp_crl::unix_now()?;
+                self.verify_tdx(resolved, peer_spki, &candidates, now)
+            }
         }
     }
 
@@ -393,6 +426,7 @@ impl AttestationCheck {
         &self,
         resolved: &bundle::ResolvedAttestation,
         peer_spki: &[u8; 32],
+        candidates: &[&CompiledPin],
     ) -> Result<(), Error> {
         let report = sevsnp::parse_report(&resolved.report_bytes)?;
 
@@ -462,14 +496,22 @@ impl AttestationCheck {
         }
         policy_result?;
 
-        let measurement_hex = hex::encode(report.measurement);
-        let matched = check_snp_measurement(&self.allowed_measurements, &measurement_hex)?;
+        let policy = sevsnp::raw_policy(&resolved.report_bytes)?;
+        let (observed, matching) =
+            appraise_snp_launch(candidates, &report.measurement, &report.host_data, policy)?;
+        let pcr_digest = format!("{}:{}", observed.measurement, observed.host_data);
+        let matched = MatchedMeasurement::SevSnp(observed);
 
         // Bind the hardware report to the nonce/TLS-key/HPKE-key the document
         // claimed. `verify_document_binding` already proved `tls_key_fp ==
         // peer_spki` and the nonce is fresh; this proves the AMD-signed report
-        // actually commits to those same values.
+        // actually commits to those same values — and to the exact device
+        // evidence section the next check reads.
         self.verify_report_data_binding(resolved, &report.report_data)?;
+        first_passing(matching, |(pin, snp)| {
+            sevsnp::check_guest_policy(policy, snp.guest_policy)?;
+            check_device_policy(resolved, pin)
+        })?;
 
         tracing::info!(
             measurement = %matched,
@@ -482,17 +524,188 @@ impl AttestationCheck {
 
         if let Some(observer) = &self.attestation_observer {
             observer(crate::VerifiedAttestation {
-                platform: bundle::Platform::SevSnp,
+                platform: Platform::SevSnp,
                 matched_measurement: matched,
                 attestation_hash: hex::encode(sha2::Sha256::digest(&resolved.report_bytes)),
                 attestation_doc: resolved.report_bytes.clone(),
-                pcr_digest: measurement_hex,
+                pcr_digest,
                 peer_spki_hash: hex::encode(peer_spki),
             });
         }
 
         Ok(())
     }
+
+    /// Authenticate a TDX quote with the document's captured Intel
+    /// collateral at `now`, then appraise it against the pinned entries.
+    fn verify_tdx(
+        &self,
+        resolved: &bundle::ResolvedAttestation,
+        peer_spki: &[u8; 32],
+        candidates: &[&CompiledPin],
+        now: u64,
+    ) -> Result<(), Error> {
+        let responses = resolved.intel_pcs.as_deref().ok_or_else(|| {
+            Error::Bundle("TDX document carries no Intel PCS collateral".to_string())
+        })?;
+        let quote =
+            tdx::authenticate(&resolved.report_bytes, responses, &self.intel_root_der, now)?;
+        self.verify_tdx_authenticated(resolved, peer_spki, candidates, &quote)
+    }
+
+    /// Appraise an authenticated TDX quote. Entries are selected by launch
+    /// identity (MRTD + MRCONFIGID); among those, the first whose machine
+    /// policy and device requirement both hold is the match.
+    fn verify_tdx_authenticated(
+        &self,
+        resolved: &bundle::ResolvedAttestation,
+        peer_spki: &[u8; 32],
+        candidates: &[&CompiledPin],
+        quote: &tdx::AuthenticatedQuote,
+    ) -> Result<(), Error> {
+        let observed = TdxLaunchMeasurement {
+            mrtd: hex::encode(quote.report.mr_td),
+            mrconfigid: hex::encode(quote.report.mr_config_id),
+        };
+        let matching: Vec<(&CompiledPin, &CompiledTdxPin)> = candidates
+            .iter()
+            .filter_map(|pin| match &pin.platform {
+                CompiledPlatform::Tdx(tdx_pin)
+                    if tdx_pin.mrtd == quote.report.mr_td
+                        && tdx_pin.mrconfigid == quote.report.mr_config_id =>
+                {
+                    Some((*pin, tdx_pin.as_ref()))
+                }
+                _ => None,
+            })
+            .collect();
+        if matching.is_empty() {
+            return Err(Error::MeasurementMismatch {
+                observed: MatchedMeasurement::Tdx(observed),
+                allowed_count: candidates.len(),
+            });
+        }
+
+        // Machine policy first, so a policy violation is reported as such
+        // rather than as a REPORT_DATA or device mismatch.
+        first_passing(matching.clone(), |(_, tdx_pin)| {
+            tdx::appraise(quote, tdx_pin)
+        })?;
+        self.verify_report_data_binding(resolved, &quote.report.report_data)?;
+        // The device requirement is read only now that REPORT_DATA has
+        // authenticated the device evidence section.
+        first_passing(matching, |(pin, tdx_pin)| {
+            tdx::appraise(quote, tdx_pin)?;
+            check_device_policy(resolved, pin)
+        })?;
+
+        let pcr_digest = format!("{}:{}", observed.mrtd, observed.mrconfigid);
+        let matched = MatchedMeasurement::Tdx(observed);
+        tracing::info!(
+            measurement = %matched,
+            tls_fingerprint = hex::encode(peer_spki),
+            mr_seam = hex::encode(quote.report.mr_seam),
+            tee_tcb_svn = hex::encode(quote.report.tee_tcb_svn),
+            fmspc = hex::encode(quote.fmspc),
+            ppid = hex::encode(quote.ppid),
+            tcb_info_evaluation_data_number = quote.tcb_info_evaluation_data_number,
+            qe_identity_evaluation_data_number = quote.qe_identity_evaluation_data_number,
+            "TDX attestation verified for new connection",
+        );
+
+        if let Some(observer) = &self.attestation_observer {
+            observer(crate::VerifiedAttestation {
+                platform: Platform::Tdx,
+                matched_measurement: matched,
+                attestation_hash: hex::encode(sha2::Sha256::digest(&resolved.report_bytes)),
+                attestation_doc: resolved.report_bytes.clone(),
+                pcr_digest,
+                peer_spki_hash: hex::encode(peer_spki),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The SEV-SNP entries an authenticated report's launch matches.
+///
+/// Entries are selected by launch identity: the image's digest and the
+/// deployment's config hash (HOST_DATA). The digest alone names every
+/// deployment of the image, anyone's. Among those, the guest policy, which
+/// the host chose at launch and which is outside the digest, must satisfy at
+/// least one entry's (`sevsnp::check_guest_policy`); the entries are returned
+/// for the device check, which re-applies it per entry.
+#[allow(clippy::type_complexity)]
+fn appraise_snp_launch<'a>(
+    candidates: &[&'a CompiledPin],
+    measurement: &[u8; 48],
+    host_data: &[u8; 32],
+    policy: u64,
+) -> Result<
+    (
+        SevSnpLaunchMeasurement,
+        Vec<(&'a CompiledPin, &'a CompiledSevSnpPin)>,
+    ),
+    Error,
+> {
+    let observed = SevSnpLaunchMeasurement {
+        measurement: hex::encode(measurement),
+        host_data: hex::encode(host_data),
+    };
+    let matching: Vec<(&CompiledPin, &CompiledSevSnpPin)> = candidates
+        .iter()
+        .filter_map(|pin| match &pin.platform {
+            CompiledPlatform::SevSnp(snp)
+                if snp.measurement == *measurement && snp.host_data == *host_data =>
+            {
+                Some((*pin, snp))
+            }
+            _ => None,
+        })
+        .collect();
+    if matching.is_empty() {
+        return Err(Error::MeasurementMismatch {
+            observed: MatchedMeasurement::SevSnp(observed),
+            allowed_count: candidates.len(),
+        });
+    }
+    first_passing(matching.clone(), |(_, snp)| {
+        sevsnp::check_guest_policy(policy, snp.guest_policy)
+    })?;
+    Ok((observed, matching))
+}
+
+/// Apply a matched entry's device-evidence requirement. Only called after
+/// the signed `REPORT_DATA` has been shown to commit to the device section.
+fn check_device_policy(
+    resolved: &bundle::ResolvedAttestation,
+    pin: &CompiledPin,
+) -> Result<(), Error> {
+    match pin.expected_gpus {
+        Some(expected) => {
+            device::check_gpu_evidence(&resolved.device_evidence, expected, &resolved.nonce)
+        }
+        None => Ok(()),
+    }
+}
+
+/// The first candidate `check` accepts; otherwise the first candidate's
+/// error, which names the closest pin's violation.
+fn first_passing<T>(
+    candidates: Vec<T>,
+    mut check: impl FnMut(T) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let mut first_error = None;
+    for candidate in candidates {
+        match check(candidate) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    Err(first_error
+        .unwrap_or_else(|| Error::Connector("no candidate measurement to check".to_string())))
 }
 
 /// Read a single HTTP/1.1 response from `io` and return its body bytes.
@@ -602,7 +815,8 @@ where
             rest.drain(..crlf + 2);
 
             if size == 0 {
-                // Last chunk; consume the trailing CRLF (assume no trailers).
+                // Last chunk: only the final CRLF may follow (no trailers),
+                // as nothing may follow a Content-Length body.
                 while rest.len() < 2 {
                     let mut chunk = [0u8; 64];
                     let n = io
@@ -613,6 +827,11 @@ where
                         return Err(Error::Connector("EOF after final chunk".to_string()));
                     }
                     rest.extend_from_slice(&chunk[..n]);
+                }
+                if rest != b"\r\n" {
+                    return Err(Error::Connector(
+                        "attestation endpoint sent bytes after the last chunk".to_string(),
+                    ));
                 }
                 break;
             }
@@ -671,7 +890,373 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+    use crate::measurement::{CompiledPin, compile_pins};
+    use crate::tdx::tests::{
+        FIXTURE_MRTD, FIXTURE_NOW, FIXTURE_QUOTE, authenticated, fixture_responses,
+    };
+    use crate::{AllowedMeasurement, TdxPin};
+
+    const PEER_SPKI: [u8; 32] = [0x19; 32];
+    const NONCE: [u8; 32] = [0x47; 32];
+
+    fn check(pins: &[AllowedMeasurement]) -> AttestationCheck {
+        AttestationCheck {
+            allowed_measurements: compile_pins(pins).unwrap(),
+            intel_root_der: tdx::INTEL_SGX_ROOT_CA_DER.to_vec(),
+            attestation_path: "/.well-known/tinfoil-attestation".to_string(),
+            attestation_host: "enclave.example".to_string(),
+            trusted_ark_der: None,
+            trusted_ask_der: None,
+            snp_policy: sevsnp::SevSnpTcbPolicy::default(),
+            snp_observer: None,
+            attestation_observer: None,
+        }
+    }
+
+    fn resolved(platform: Platform, report_bytes: Vec<u8>) -> bundle::ResolvedAttestation {
+        bundle::ResolvedAttestation {
+            platform,
+            report_bytes,
+            report_data: [0x5a; 64],
+            nonce: NONCE,
+            tls_key_fp: PEER_SPKI,
+            hpke_key: [0x45; 32],
+            vcek_der: None,
+            ask_der: None,
+            ark_der: None,
+            crl_der: None,
+            intel_pcs: Some(fixture_responses()),
+            device_evidence: vec![],
+        }
+    }
+
+    /// The server pin a client builds from its release record: SEV-SNP only.
+    fn server_pin() -> AllowedMeasurement {
+        AllowedMeasurement::sev_snp(crate::measurement::tests::sev_snp_pin())
+    }
+
+    /// The platform-branch attack: a genuine TDX quote presented to a
+    /// client whose pins are SEV-SNP only, as the server pin is. The
+    /// document chooses the TDX branch; with no TDX entry there is no such
+    /// branch, and the quote is never even parsed.
+    #[test]
+    fn tdx_evidence_against_sev_snp_only_pins_is_refused_before_authentication() {
+        let check = check(&[server_pin()]);
+
+        for report in [FIXTURE_QUOTE.to_vec(), b"not a quote".to_vec()] {
+            let mut doc = resolved(Platform::Tdx, report);
+            let err = check.verify(&doc, &PEER_SPKI, &NONCE).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::PlatformNotPinned {
+                        platform: Platform::Tdx
+                    }
+                ),
+                "{err}"
+            );
+            doc.intel_pcs = None;
+            let err = check.verify(&doc, &PEER_SPKI, &NONCE).unwrap_err();
+            assert!(matches!(err, Error::PlatformNotPinned { .. }), "{err}");
+        }
+    }
+
+    /// The handshake parser is gated on the client's own pins: an SEV-SNP
+    /// client handed a TDX envelope it could not even decode answers
+    /// `PlatformNotPinned`.
+    #[test]
+    fn handshake_parser_refuses_unpinned_platforms_before_decoding() {
+        let tdx_envelope = serde_json::to_vec(&serde_json::json!({
+            "format": bundle::ATTESTATION_V3_FORMAT,
+            "challenge": {"nonce": "", "report_data": "", "report_data_algorithm": ""},
+            "cpu_evidence": {
+                "format": bundle::TDX_QUOTE_V1_FORMAT,
+                "report_base64": "%%%",
+                "endorsed": {"crypto_material_hash": "", "device_evidence_hash": ""},
+            },
+            "crypto_material": "",
+            "device_evidence": "",
+            "collateral": [],
+        }))
+        .unwrap();
+        let snp_only = check(&[server_pin()]);
+        let err = snp_only.parse_document(&tdx_envelope).err().unwrap();
+        assert!(
+            matches!(
+                err,
+                Error::PlatformNotPinned {
+                    platform: Platform::Tdx
+                }
+            ),
+            "{err}"
+        );
+        let both = check(&[
+            server_pin(),
+            AllowedMeasurement::tdx(crate::measurement::tests::tdx_pin()),
+        ]);
+        let err = both.parse_document(&tdx_envelope).err().unwrap();
+        assert!(matches!(err, Error::Bundle(_)), "{err}");
+    }
+
+    #[test]
+    fn sev_snp_evidence_against_tdx_only_pins_is_refused() {
+        let check = check(&[AllowedMeasurement::tdx(crate::measurement::tests::tdx_pin())]);
+        let err = check
+            .verify(
+                &resolved(Platform::SevSnp, vec![0; 1184]),
+                &PEER_SPKI,
+                &NONCE,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::PlatformNotPinned {
+                    platform: Platform::SevSnp
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn document_binding_runs_before_platform_dispatch() {
+        let check = check(&[server_pin()]);
+        let err = check
+            .verify(&resolved(Platform::Tdx, vec![]), &PEER_SPKI, &[0; 32])
+            .unwrap_err();
+        assert!(matches!(err, Error::NonceMismatch { .. }), "{err}");
+        let err = check
+            .verify(&resolved(Platform::Tdx, vec![]), &[0; 32], &NONCE)
+            .unwrap_err();
+        assert!(matches!(err, Error::FingerprintMismatch { .. }), "{err}");
+    }
+
+    fn snp_candidates(pins: &[AllowedMeasurement]) -> Vec<CompiledPin> {
+        compile_pins(pins).unwrap()
+    }
+
+    /// The adversarial relaunches of a pinned SEV-SNP image: the image's
+    /// digest is fixed, so the host's levers are the config it passes
+    /// (HOST_DATA) and the guest policy. Each is refused; the honest launch
+    /// is accepted.
+    #[test]
+    fn sev_snp_launches_are_selected_by_digest_and_config_then_held_to_the_policy() {
+        let pin = crate::measurement::tests::sev_snp_pin();
+        let compiled = snp_candidates(&[AllowedMeasurement::sev_snp(pin.clone())]);
+        let candidates: Vec<&CompiledPin> = compiled.iter().collect();
+        let measurement = [0xab; 48];
+        let host_data: [u8; 32] = hex::decode(&pin.host_data).unwrap().try_into().unwrap();
+
+        let (observed, matching) =
+            appraise_snp_launch(&candidates, &measurement, &host_data, 0x30133).unwrap();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(observed.host_data, pin.host_data);
+
+        // The pinned image launched with another config: anyone's deployment
+        // of the same release, or ours with a changed secret hash or shape.
+        let other_config: [u8; 32] = hex::decode(crate::SevSnpPin::host_data_for_config(b"other"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        for host_data in [other_config, [0; 32]] {
+            let err =
+                appraise_snp_launch(&candidates, &measurement, &host_data, 0x30133).unwrap_err();
+            assert!(
+                matches!(&err, Error::MeasurementMismatch { observed: MatchedMeasurement::SevSnp(s), .. }
+                    if s.host_data == hex::encode(host_data)),
+                "{err}"
+            );
+        }
+        // Another image with our config.
+        let err = appraise_snp_launch(&candidates, &[0xcd; 48], &host_data, 0x30133).unwrap_err();
+        assert!(matches!(err, Error::MeasurementMismatch { .. }), "{err}");
+        // The pinned image and config with a weaker policy: DEBUG (the
+        // hypervisor may decrypt guest memory), a migration agent, CXL
+        // memory, or an older firmware ABI.
+        for policy in [0xb0133, 0x70133, 0x230133, 0x30100] {
+            let err =
+                appraise_snp_launch(&candidates, &measurement, &host_data, policy).unwrap_err();
+            assert!(matches!(err, Error::Report(_)), "{policy:#x}: {err}");
+        }
+        // A TDX entry never matches SEV-SNP evidence, whatever it pins.
+        let tdx = snp_candidates(&[AllowedMeasurement::tdx(crate::measurement::tests::tdx_pin())]);
+        let tdx: Vec<&CompiledPin> = tdx.iter().collect();
+        assert!(appraise_snp_launch(&tdx, &measurement, &host_data, 0x30133).is_err());
+    }
+
+    #[test]
+    fn sev_snp_entries_sharing_a_launch_identity_are_alternatives_by_policy() {
+        let strict = crate::measurement::tests::sev_snp_pin();
+        let mut newer = strict.clone();
+        newer.guest_policy = "0x30155".into();
+        let compiled = snp_candidates(&[
+            AllowedMeasurement::sev_snp(newer),
+            AllowedMeasurement::sev_snp(strict.clone()),
+        ]);
+        let candidates: Vec<&CompiledPin> = compiled.iter().collect();
+        let host_data: [u8; 32] = hex::decode(&strict.host_data).unwrap().try_into().unwrap();
+        appraise_snp_launch(&candidates, &[0xab; 48], &host_data, 0x30133)
+            .expect("the second entry's policy holds");
+        let err = appraise_snp_launch(&candidates, &[0xab; 48], &host_data, 0x30100).unwrap_err();
+        // The first entry's violation is the one reported.
+        assert!(err.to_string().contains("0x30155"), "{err}");
+    }
+
+    fn fixture_pin(mrtd: &str) -> AllowedMeasurement {
+        let mut pin = crate::measurement::tests::tdx_pin();
+        pin.mrtd = mrtd.to_string();
+        pin.mrconfigid = "00".repeat(48);
+        AllowedMeasurement::tdx(pin)
+    }
+
+    /// The real quote through the handshake verifier: it authenticates
+    /// offline, selects the entry by MRTD + MRCONFIGID, and is refused by
+    /// the IGVM-model appraisal because its launch extended RTMR0.
+    #[test]
+    fn real_tdx_quote_is_authenticated_then_appraised() {
+        let doc = resolved(Platform::Tdx, FIXTURE_QUOTE.to_vec());
+
+        let pinned = check(&[fixture_pin(FIXTURE_MRTD)]);
+        let candidates: Vec<&CompiledPin> = pinned.allowed_measurements.iter().collect();
+        let err = pinned
+            .verify_tdx(&doc, &PEER_SPKI, &candidates, FIXTURE_NOW)
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::TdxPolicy(m) if m.contains("RTMR0")),
+            "{err}"
+        );
+
+        let other = check(&[fixture_pin(&"11".repeat(48))]);
+        let candidates: Vec<&CompiledPin> = other.allowed_measurements.iter().collect();
+        let err = other
+            .verify_tdx(&doc, &PEER_SPKI, &candidates, FIXTURE_NOW)
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::MeasurementMismatch { observed: MatchedMeasurement::Tdx(t), .. }
+                if t.mrtd == FIXTURE_MRTD),
+            "{err}"
+        );
+
+        let mut tampered = doc;
+        tampered.intel_pcs.as_mut().unwrap().pop();
+        let err = pinned
+            .verify_tdx(&tampered, &PEER_SPKI, &candidates, FIXTURE_NOW)
+            .unwrap_err();
+        assert!(matches!(err, Error::Quote(_)), "{err}");
+    }
+
+    fn accept(
+        check: &AttestationCheck,
+        doc: &bundle::ResolvedAttestation,
+        quote: &tdx::AuthenticatedQuote,
+    ) -> Result<(), Error> {
+        let candidates: Vec<&CompiledPin> = check.allowed_measurements.iter().collect();
+        check.verify_tdx_authenticated(doc, &PEER_SPKI, &candidates, quote)
+    }
+
+    fn bound_quote(doc: &bundle::ResolvedAttestation) -> tdx::AuthenticatedQuote {
+        let mut quote = authenticated();
+        quote.report.report_data = doc.report_data;
+        quote
+    }
+
+    #[test]
+    fn authenticated_quote_matching_its_pin_and_report_data_is_accepted() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut check = check(&[AllowedMeasurement::tdx(crate::measurement::tests::tdx_pin())]);
+        check.allowed_measurements[0].expected_gpus = None;
+        let sink = seen.clone();
+        check.attestation_observer = Some(Arc::new(move |att: crate::VerifiedAttestation| {
+            sink.lock().unwrap().push(att);
+        }));
+        let doc = resolved(Platform::Tdx, b"quote".to_vec());
+        accept(&check, &doc, &bound_quote(&doc)).expect("accepted");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].platform, Platform::Tdx);
+        let pin = crate::measurement::tests::tdx_pin();
+        assert_eq!(
+            seen[0].pcr_digest,
+            format!("{}:{}", pin.mrtd, pin.mrconfigid)
+        );
+        assert!(
+            matches!(&seen[0].matched_measurement, MatchedMeasurement::Tdx(t) if t.mrtd == pin.mrtd)
+        );
+    }
+
+    #[test]
+    fn report_data_not_committing_to_this_document_is_refused() {
+        let check = check(&[AllowedMeasurement::tdx(crate::measurement::tests::tdx_pin())]);
+        let doc = resolved(Platform::Tdx, b"quote".to_vec());
+        let mut quote = bound_quote(&doc);
+        quote.report.report_data[63] ^= 1;
+        let err = accept(&check, &doc, &quote).unwrap_err();
+        assert!(matches!(err, Error::ReportDataMismatch { .. }), "{err}");
+    }
+
+    #[test]
+    fn the_matched_entrys_gpu_requirement_is_enforced() {
+        let pin = crate::measurement::tests::tdx_pin();
+        let check = check(&[AllowedMeasurement::tdx(pin).with_expected_gpus(2)]);
+        let mut doc = resolved(Platform::Tdx, b"quote".to_vec());
+        let quote = bound_quote(&doc);
+
+        doc.device_evidence = vec![crate::device::tests::gpu("gpu0", &NONCE)];
+        let err = accept(&check, &doc, &quote).unwrap_err();
+        assert!(matches!(err, Error::DeviceEvidence(_)), "{err}");
+
+        doc.device_evidence
+            .push(crate::device::tests::gpu("gpu1", &[0; 32]));
+        let err = accept(&check, &doc, &quote).unwrap_err();
+        assert!(matches!(err, Error::DeviceEvidence(_)), "{err}");
+
+        doc.device_evidence[1] = crate::device::tests::gpu("gpu1", &NONCE);
+        accept(&check, &doc, &quote).expect("two nonce-bound GPUs");
+    }
+
+    /// Entries sharing a launch identity are alternatives: the first whose
+    /// machine policy and device requirement both hold is the match.
+    #[test]
+    fn entries_sharing_a_launch_identity_are_alternatives() {
+        let mut other_module = crate::measurement::tests::tdx_pin();
+        other_module.policy.mr_seam = vec!["33".repeat(48)];
+        let doc = resolved(Platform::Tdx, b"quote".to_vec());
+        let quote = bound_quote(&doc);
+
+        let check_a = check(&[
+            AllowedMeasurement::tdx(other_module.clone()),
+            AllowedMeasurement::tdx(crate::measurement::tests::tdx_pin()),
+        ]);
+        accept(&check_a, &doc, &quote).expect("second entry's MR_SEAM matches");
+
+        let only_other = check(&[AllowedMeasurement::tdx(other_module)]);
+        let err = accept(&only_other, &doc, &quote).unwrap_err();
+        assert!(
+            matches!(&err, Error::TdxPolicy(m) if m.contains("MR_SEAM")),
+            "{err}"
+        );
+
+        let gpu_or_cpu = check(&[
+            AllowedMeasurement::tdx(crate::measurement::tests::tdx_pin()).with_expected_gpus(8),
+            AllowedMeasurement::tdx(crate::measurement::tests::tdx_pin()).with_expected_gpus(0),
+        ]);
+        accept(&gpu_or_cpu, &doc, &quote).expect("the zero-GPU entry matches");
+    }
+
+    #[test]
+    fn mrconfigid_selects_the_entry_for_this_deployments_config() {
+        let mut other_config = crate::measurement::tests::tdx_pin();
+        other_config.mrconfigid = TdxPin::mrconfigid_for_config(b"another config");
+        let check = check(&[AllowedMeasurement::tdx(other_config)]);
+        let doc = resolved(Platform::Tdx, b"quote".to_vec());
+        let err = accept(&check, &doc, &bound_quote(&doc)).unwrap_err();
+        assert!(matches!(err, Error::MeasurementMismatch { .. }), "{err}");
+    }
 
     /// Run `read_http1_response` over an in-memory pipe whose far end has
     /// already written `response` and hung up.
@@ -704,5 +1289,25 @@ mod tests {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
                          3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\n\r\n";
         assert_eq!(read_response(response).await.unwrap(), b"abcde");
+    }
+
+    /// Both framings refuse what follows the body.
+    #[tokio::test]
+    async fn bytes_after_the_body_are_refused() {
+        for response in [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nX"
+                .as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-T: 1\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nXY",
+        ] {
+            let err = read_response(response).await.unwrap_err().to_string();
+            assert!(err.contains("after the last chunk"), "{err}");
+        }
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcX";
+        let err = read_response(response).await.unwrap_err().to_string();
+        assert!(
+            err.contains("extra bytes after Content-Length body"),
+            "{err}"
+        );
     }
 }

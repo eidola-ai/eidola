@@ -1,0 +1,54 @@
+name: Platform Endorsements Drift
+
+# An engine pin's Intel TDX machine policy (TDX module, attributes, TCB
+# floors, and the machines by PPID) is derived from the platform provider's
+# signed platform endorsements, vendored under
+# releases/trust/platform-endorsements/<tag>/ and verified offline by every
+# gateway build. The provider publishes new `platform-vX.Y.Z` releases of
+# tinfoilsh/cvmimage on its own clock: raised TCB floors, machines added or
+# retired. Nothing in this tree changes when it does, so no in-repo check can
+# see it, and a raised floor would sit unadopted.
+#
+# So this is deliberately NOT a PR gate, for the same reason advisories.yml is
+# not one: an upstream release is not something a pull request introduced. It
+# runs daily against the default branch (plus on demand), and a newer release
+# than the newest vendored one, or than one a committed engine deployment
+# names, shows up as a red scheduled run. Adopting it is a maintainer step:
+# `just engine-platform-endorsements <tag>` (deploy/engine/README.md).
+#
+# Only the release listing is fetched here; the comparison is
+# scripts/platform-endorsements-drift.py (standard library only), which also
+# fails when either side lists no platform release, so a changed listing
+# cannot leave this green while comparing nothing.
+on:
+  schedule:
+    # Daily; minute/hour chosen off the whole-hour spikes GitHub asks
+    # schedules to avoid, and off advisories.yml's slot.
+    - cron: "41 7 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  platform-endorsements-drift:
+    name: Platform endorsements drift
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: List the provider's releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate 'repos/tinfoilsh/cvmimage/releases?per_page=100' \
+            --jq '.[] | select(.draft | not) | .tag_name' > "$RUNNER_TEMP/tags.txt"
+
+      - name: Compare with the vendored releases and the deployments
+        run: python3 -I scripts/platform-endorsements-drift.py . "$RUNNER_TEMP/tags.txt"

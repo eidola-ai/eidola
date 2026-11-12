@@ -20,7 +20,10 @@
 //! | `max_tokens` or the context window reached | `length` | `length` |
 //!
 //! A response cut off by `length` keeps the calls already completed; a call
-//! whose closing tag never arrived is dropped (see [`crate::tool_call`]).
+//! whose closing tag never arrived is given out as content (see
+//! [`crate::tool_call`]).
+
+use std::ops::Range;
 
 use crate::args::ToolSchemas;
 use crate::error::ChatError;
@@ -78,6 +81,11 @@ pub struct OutputConfig {
     pub tools: Option<ToolSchemas>,
     /// Drop special tokens from the text (the OpenAI-compatible default).
     pub skip_special_tokens: bool,
+    /// The final message's field the prompt ended inside
+    /// ([`crate::RenderOptions::continue_final_message`]), so the output
+    /// continues it: `reasoning_content` starts inside the reasoning, any other
+    /// field in the answer. `None` for a new assistant turn.
+    pub continuing: Option<&'static str>,
 }
 
 impl OutputConfig {
@@ -86,7 +94,15 @@ impl OutputConfig {
             thinking: enable_thinking != Some(false),
             tools: tools.filter(|t| !t.is_empty()),
             skip_special_tokens: true,
+            continuing: None,
         }
+    }
+
+    /// The same configuration for the output of a prompt rendered with
+    /// `continue_final_message` set to `field`.
+    pub fn continuing_in(mut self, field: Option<&'static str>) -> OutputConfig {
+        self.continuing = field;
+        self
     }
 }
 
@@ -138,6 +154,17 @@ pub struct OutputParser {
     reasoning: ReasoningParser,
     tools: Option<ToolCallParser>,
     tool_calls_emitted: bool,
+    /// What [`OutputParser::resumes_exactly`] compares: the text fed in, the
+    /// reasoning and content given out, whether the text lost bytes on the
+    /// way, and where the prompt ended.
+    raw: String,
+    emitted_reasoning: String,
+    emitted_content: String,
+    lossy: bool,
+    /// The output ended inside a possible delimiter a splitter was holding back.
+    cut_in_delimiter: bool,
+    thinking: bool,
+    continuing: Option<&'static str>,
 }
 
 impl std::fmt::Debug for OutputParser {
@@ -152,11 +179,108 @@ impl OutputParser {
     pub fn new(config: OutputConfig, ids: impl CallIdSource + 'static) -> OutputParser {
         OutputParser {
             detok: Detokenizer::new(config.skip_special_tokens),
-            reasoning: ReasoningParser::new(config.thinking),
+            reasoning: match config.continuing {
+                None => ReasoningParser::new(config.thinking),
+                Some(field) => ReasoningParser::resuming(field == "reasoning_content"),
+            },
             tools: config
                 .tools
                 .map(|schemas| ToolCallParser::new(schemas, ids)),
             tool_calls_emitted: false,
+            raw: String::new(),
+            emitted_reasoning: String::new(),
+            emitted_content: String::new(),
+            lossy: false,
+            cut_in_delimiter: false,
+            thinking: config.thinking,
+            continuing: config.continuing,
+        }
+    }
+
+    /// The text fed in was decoded lossily (an incomplete UTF-8 sequence
+    /// flushed at the end), so it is not the bytes the model generated. Called
+    /// by a caller that runs its own detokenizer and feeds text.
+    pub fn mark_lossy(&mut self) {
+        self.lossy = true;
+    }
+
+    /// **Whether this response can be continued from what it gave out**, read
+    /// after [`Self::finish`]: true exactly when the reasoning and content it
+    /// emitted, sent back as a continued final message (the answer once there
+    /// is any, the reasoning before), make the template render precisely the
+    /// text the model generated after the prompt — nothing dropped, nothing
+    /// added. A tool call, a tool-call block begun (past one the parser no
+    /// longer reads as a resumed one would), a lossy final character, a repeated or missing `<think>`, reasoning ended
+    /// by `<tool_call>` instead of `</think>`, a `</think>` with no answer after
+    /// it, an ending inside a possible delimiter (`</thi`, `<tool_`: text
+    /// byte-exact, but a resumed parser would not know it is mid-delimiter), or
+    /// a splitter in another mode than a resumed one starts in (still at the
+    /// start, right after a lone `<think>`) each make it false — so a resumed parse of the rest splits exactly as an
+    /// uninterrupted one would.
+    pub fn resumes_exactly(&self) -> bool {
+        self.continued_text()
+            .is_some_and(|(expected, _)| expected == self.raw)
+    }
+
+    /// [`Self::resumes_exactly`], **in tokens as well as in text**. `added` is
+    /// where in the text fed in the model sampled an added token (`<think>`,
+    /// `</think>`, `<tool_call>`, …): the byte range of each one's text, in
+    /// order. A continued prompt encodes an added token only where the template
+    /// writes one, the `<think>` and `</think>` around the reasoning, and
+    /// everything given out as reasoning or content is request data there, which
+    /// spells none ([`crate::MimoTokenizer::encode_prompt`]). So the verdict is
+    /// true only when the model sampled exactly those tags as tokens and no
+    /// other: a sampled added token that reached the text, or a tag the model
+    /// wrote out of ordinary tokens, would come back as different tokens.
+    pub fn resumes_exactly_as_tokens(&self, added: &[Range<usize>]) -> bool {
+        self.continued_text()
+            .is_some_and(|(expected, tags)| expected == self.raw && added == tags)
+    }
+
+    /// What the template renders after the prompt when the reasoning and
+    /// content given out come back as a continued final message, and where in it
+    /// the template's own `<think>` and `</think>` are. `None` where no
+    /// continuation would resume this parse.
+    fn continued_text(&self) -> Option<(String, Vec<Range<usize>>)> {
+        if self.tool_calls_emitted || self.lossy || self.cut_in_delimiter {
+            return None;
+        }
+        let (r, c) = (&self.emitted_reasoning, &self.emitted_content);
+        // **The splitter must be in the mode a resumed one starts in**: the
+        // answer once there is any (a resumed parser in content), the reasoning
+        // before (a resumed parser inside the reasoning). Right after a lone
+        // `<think>` the splitter is still at the start, where a further `<think>`
+        // is a tag to strip, and with thinking off it is in the answer although
+        // nothing has been said: neither is where a continuation would resume.
+        let resumed_mode = if c.is_empty() {
+            self.reasoning.in_reasoning()
+        } else {
+            self.reasoning.in_content()
+        };
+        if !resumed_mode {
+            return None;
+        }
+        let after_reasoning = |open: &str| {
+            let mut text = String::new();
+            let mut tags = Vec::new();
+            for (tag, written) in [(open, true), (r, false), ("</think>", true), (c, false)] {
+                if tag == "</think>" && written && c.is_empty() {
+                    break;
+                }
+                if written && !tag.is_empty() {
+                    tags.push(text.len()..text.len() + tag.len());
+                }
+                text.push_str(tag);
+            }
+            (text, tags)
+        };
+        match self.continuing {
+            None if self.thinking => Some(after_reasoning("<think>")),
+            Some("reasoning_content") => Some(after_reasoning("")),
+            // Thinking disabled, or the answer continued: the prompt already
+            // holds any reasoning, so all the output is answer.
+            _ if r.is_empty() => Some((c.clone(), Vec::new())),
+            _ => None,
         }
     }
 
@@ -176,12 +300,15 @@ impl OutputParser {
         if text.is_empty() {
             return ChatDelta::default();
         }
+        self.raw.push_str(text);
         let split = self.reasoning.push(text);
         let mut delta = ChatDelta {
             reasoning_content: split.reasoning,
             ..ChatDelta::default()
         };
         delta.append(self.route_content(&split.content));
+        self.emitted_reasoning.push_str(&delta.reasoning_content);
+        self.emitted_content.push_str(&delta.content);
         delta
     }
 
@@ -205,14 +332,24 @@ impl OutputParser {
 
     /// Ends the response: flushes held-back text and maps the finish reason.
     pub fn finish(&mut self, cause: StopCause) -> (ChatDelta, FinishReason) {
+        self.lossy |= self.detok.pending_len() > 0;
         let tail = self.detok.finish();
         let mut delta = self.push_text(&tail);
-        delta
-            .reasoning_content
-            .push_str(&self.reasoning.finish().reasoning);
+        let held = self.reasoning.finish().reasoning;
+        // What a splitter held back is a possible partial delimiter (`</thi`,
+        // `<tool_`): given out as text here, but a parser resumed from it starts
+        // with nothing held and would read the rest of the delimiter as text.
+        self.cut_in_delimiter |= !held.is_empty();
+        self.emitted_reasoning.push_str(&held);
+        delta.reasoning_content.push_str(&held);
         if let Some(parser) = &mut self.tools {
+            // Past a block, the parser no longer reads text as it does before one,
+            // and a resumed parser would start before any.
+            self.cut_in_delimiter |= !parser.before_any_block();
             let rest = parser.finish();
             self.tool_calls_emitted |= !rest.calls.is_empty();
+            self.cut_in_delimiter |= !rest.content.is_empty();
+            self.emitted_content.push_str(&rest.content);
             delta.content.push_str(&rest.content);
             delta.tool_calls.extend(rest.calls);
         }
@@ -304,8 +441,110 @@ mod tests {
             &["Hi <tool_call><function=get_weather>"],
             StopCause::MaxTokens,
         );
-        assert_eq!((d.content.as_str(), reason), ("Hi ", FinishReason::Length));
+        assert_eq!(
+            (d.content.as_str(), reason),
+            ("Hi <tool_call><function=get_weather>", FinishReason::Length)
+        );
         assert!(d.reasoning_content.is_empty());
+    }
+
+    /// With tools offered, an answer that mentions `<tool_call>` and never
+    /// closes it keeps every word, streamed or not.
+    #[test]
+    fn prose_mentioning_the_tag_reaches_the_answer() {
+        let text = "Emit <tool_call> followed by the function, and the rest of the answer.";
+        let mut p = parser(Some(false), true);
+        let chunks: Vec<String> = text.chars().map(String::from).collect();
+        let chunks: Vec<&str> = chunks.iter().map(String::as_str).collect();
+        let (d, reason) = run(&mut p, &chunks, StopCause::EndOfSequence);
+        assert_eq!((d.content.as_str(), reason), (text, FinishReason::Stop));
+        assert!(d.tool_calls.is_empty());
+        // Past a block, a cut is not resumed exactly.
+        let mut p = parser(Some(false), true);
+        run(&mut p, &[text], StopCause::MaxTokens);
+        assert!(!p.resumes_exactly());
+    }
+
+    /// Which length endings can be continued from what the parser gave out —
+    /// exactly those where the given-out text, rendered back as the continued
+    /// message, is the text the model generated.
+    #[test]
+    fn a_cut_resumes_exactly_only_where_nothing_was_dropped() {
+        let ends = |thinking: Option<bool>, tools: bool, chunks: &[&str]| {
+            let mut p = parser(thinking, tools);
+            run(&mut p, chunks, StopCause::MaxTokens);
+            p.resumes_exactly()
+        };
+        // Inside the reasoning, inside the answer, and an answer with thinking off.
+        assert!(ends(None, true, &["<think>weighing the"]));
+        assert!(ends(None, true, &["<think>weighed</think>The sky is"]));
+        assert!(ends(Some(false), true, &["The sky is"]));
+        // Markup the parser keeps as text is still exact.
+        assert!(ends(Some(false), false, &["Hi <tool_call><function=x>"]));
+        // An unfinished tool call is given out as text, but the parser is past a
+        // block.
+        assert!(!ends(
+            Some(false),
+            true,
+            &["Hi <tool_call><function=get_weather>"]
+        ));
+        assert!(!ends(
+            None,
+            true,
+            &["<think>plan<tool_call><function=get_weather>"]
+        ));
+        // A completed call is a tool round, never a continued answer.
+        assert!(!ends(
+            Some(false),
+            true,
+            &["<tool_call><function=get_weather></function></tool_call>"]
+        ));
+        // A repeated `<think>` is stripped; a `</think>` with no answer after it
+        // would be dropped by a reasoning continuation.
+        assert!(!ends(None, true, &["<think><think>twice"]));
+        assert!(!ends(None, true, &["<think>done</think>"]));
+        // No opening `<think>`: the continued prompt would add one.
+        assert!(!ends(None, true, &["straight into it"]));
+        // Right after a lone `<think>` the splitter is still at the start, where
+        // a further `<think>` is stripped; a resumed reasoning would keep it. And
+        // with thinking off and nothing said, the splitter is in the answer while
+        // a client would continue the (empty) reasoning.
+        assert!(!ends(None, true, &["<think>"]));
+        assert!(!ends(None, true, &["<think><think>"]));
+        assert!(!ends(Some(false), true, &[""]));
+        assert!(ends(None, true, &["<think>\n"]));
+        // Inside a delimiter written out of ordinary tokens: the text is
+        // byte-exact, but a resumed parser would not know it is mid-delimiter.
+        assert!(!ends(None, true, &["<think>plan</thi"]));
+        assert!(!ends(Some(false), true, &["Hi <tool_"]));
+        assert!(!ends(None, false, &["<thi"]));
+        // Past an undeclared function's block, returned to the answer as text:
+        // the parser no longer reads as it does before any block.
+        assert!(!ends(
+            Some(false),
+            true,
+            &["<tool_call><function=unknown></function></tool_call>"]
+        ));
+        // An incomplete final character is flushed lossily.
+        let mut p = parser(Some(false), false);
+        run(&mut p, &["ok"], StopCause::MaxTokens);
+        assert!(p.resumes_exactly());
+        p.mark_lossy();
+        assert!(!p.resumes_exactly());
+
+        // Continuations, judged from where their prompt ended.
+        let resumed = |field: &'static str, chunks: &[&str]| {
+            let mut p = OutputParser::new(
+                OutputConfig::new(None, None).continuing_in(Some(field)),
+                PrefixedCallIds("call_".into()),
+            );
+            run(&mut p, chunks, StopCause::MaxTokens);
+            p.resumes_exactly()
+        };
+        assert!(resumed("reasoning_content", &[" more thought"]));
+        assert!(resumed("reasoning_content", &[" more</think>An answer"]));
+        assert!(!resumed("reasoning_content", &[" more</think>"]));
+        assert!(resumed("content", &[" and the rest"]));
     }
 
     #[test]

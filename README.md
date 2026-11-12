@@ -14,7 +14,7 @@ For an explanation of how Eidola works, what it commits to, and what it doesn't 
 
 - [Privacy guarantees](docs/privacy-guarantees.md) — the specific properties human attestants commit to with every release.
 - [Threat model](docs/threat-model.md) — who Eidola defends against, who it doesn't.
-- [The client](docs/client.md), [server](docs/server.md), and [inference upstream](docs/upstream.md) — design pieces.
+- [The client](docs/client.md), [gateway](docs/gateway.md), and [inference engine](docs/engine.md) — design pieces.
 - [Releases](docs/releases.md) and [trust root spec](docs/trust-root.md) — how new code becomes trustable.
 - [Known gaps](docs/gaps.md) — what we don't yet defend against.
 
@@ -38,7 +38,7 @@ The server requires environment variables to work correctly. See .env.example. F
 
 There are two supported development workflows:
 
-**1. Full container stack** — postgres, server, shim, and stripe-cli all run inside docker (detached). Use this when you want a one-shot reproducible environment and don't mind rebuilding the server image:
+**1. Full container stack** — postgres, server, shim, and the optional billing receiver, worker and stripe-cli run inside docker (detached). Use this when you want a one-shot reproducible environment and don't mind rebuilding the server image:
 
 ```bash
 just dev
@@ -46,31 +46,32 @@ docker compose logs -f       # follow logs
 just down                    # stop everything
 ```
 
-**2. Host-mode server** — postgres, the tinfoil shim mock, and stripe-cli run in containers; the server runs on the host with cargo. The shim is configured to forward to `host.docker.internal:8080`, so requests from the shim and Stripe webhooks all flow into the cargo-built server. This is the recommended inner loop while iterating on `eidola-server`:
+**2. Host-mode server** — postgres, the tinfoil shim mock, and optional billing processes run in containers; the server runs on the host with cargo. The shim forwards client requests to `host.docker.internal:8080`; Stripe webhooks go directly to the separate billing receiver. This is the recommended inner loop while iterating on `eidola-server-gateway`:
 
 ```bash
-# Bring up postgres + shim + stripe-cli; captures the Stripe webhook secret
-# and writes .env.local. Stripe forwarding is enabled iff STRIPE_API_KEY is
-# set in your environment or .env.
+# Bring up postgres + shim and write .env.local. If STRIPE_API_KEY is set,
+# also start the billing receiver, worker and Stripe forwarding.
 just services
 
-# Load env vars (the .env.local override sets BIND_ADDR=0.0.0.0:8080 and
-# STRIPE_WEBHOOK_SECRET so the host server is reachable from the shim).
+# Load env vars (.env.local sets BIND_ADDR=0.0.0.0:8080 so the host server
+# is reachable from the shim; webhook credentials stay with the receiver).
 set -a; source .env; source .env.local; set +a
 
 # Run the server on the host machine with cargo
-cargo run -p eidola-server
+cargo run -p eidola-server-gateway
 
 # -- OR --
 
 # Run and automatically recompile/reload the server on the host machine with bacon
-bacon run-long -- -p eidola-server
+bacon run-long -- -p eidola-server-gateway
 
 # When you're done:
 just down
 ```
 
 Both modes expose the same endpoints externally: postgres on `localhost:5432`, the shim on `https://localhost:8443`, and (in container mode) the server on `http://localhost:8080`. CLI configuration is identical across the two modes.
+
+When billing is enabled, its receiver also listens on `http://localhost:8081`; its worker has no HTTP listener. Both roles use `eidola-billing:dev` (`docker buildx bake billing`) with separate commands and credentials. They can also run through `just run billing serve-webhooks` and `just run billing work`. The [billing playbook](crates/eidola-billing-cli/README.md) describes these processes and private support commands. This repository supplies the image and development wiring; production placement, TLS and credential provisioning are operator configuration.
 
 ### CLI
 
@@ -96,14 +97,14 @@ To run the CLI against a local development stack:
      --base-url https://localhost:8443 \
      --hardware-root-ca .dev-certs/ark.pem \
      --hardware-intermediate-ca .dev-certs/ask.pem \
-     --trust-measurement 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000:000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000:000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+     --trust-measurement 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000:0000000000000000000000000000000000000000000000000000000000000000:0x30133
    ```
 
-   `--trust-measurement` takes a `<snp>:<rtmr1>:<rtmr2>` triple — three 96-char hex strings separated by colons — since each Tinfoil release ships paired AMD SEV-SNP and Intel TDX measurements. The mock shim advertises all-zeros for every field, so the dev triple is just three zero blocks. Both `--hardware-root-ca` and `--hardware-intermediate-ca` are required when pointing the CLI at the local mock shim — without ASK, the verifier falls back to AMD's production Genoa ASK, which obviously isn't signed by your local mock ARK and the chain fails to verify. (If you ever rotate `.dev-certs/`, re-run this `configure` command to refresh the embedded certs.)
+   `--trust-measurement` takes the server's SEV-SNP launch identity as `<measurement>:<host_data>:<guest_policy>`: the launch digest of the platform release image (96 hex), the HOST_DATA it is launched with, which is the SHA-256 of its `tinfoil-config.yml` (64 hex), and the guest policy (`0x30133`). The mock shim advertises a zero digest and a zero HOST_DATA, so the dev spec is two zero blocks and the policy. Both `--hardware-root-ca` and `--hardware-intermediate-ca` are required when pointing the CLI at the local mock shim — without ASK, the verifier falls back to AMD's production Genoa ASK, which obviously isn't signed by your local mock ARK and the chain fails to verify. (If you ever rotate `.dev-certs/`, re-run this `configure` command to refresh the embedded certs.)
 
    The connection + trust bundle these flags set — base URL, hardware CAs, and trusted measurements — is stored on the `eidola` backend row in the local database (`~/Library/Application Support/eidola/eidola.db` on macOS); each is a per-column override of the embedded trust-root pin. Other CLI settings (default template and account credentials) live in `~/Library/Application Support/eidola/config.toml`.
 
-   To go back to the released service, clear each override — `configure --clear-base-url --clear-hardware-root-ca --clear-hardware-intermediate-ca --clear-trusted-measurements` (or just `just client-reset`). A cleared column *is* the pin, so nothing else is needed. Prefer `--clear-trusted-measurements` over `--untrust-measurement <snp>` when reverting: dropping the list by key leaves the column non-NULL, and a list that no longer names the pinned measurement rejects the real enclave. Note that accounts and wallet credentials are per-server: the account in `config.toml` was issued by whichever server you were pointed at, so expect to create one on the local stack (`eidola account create --accept-terms`) and to hit the mismatch in reverse on the way back.
+   To go back to the released service, clear each override — `configure --clear-base-url --clear-hardware-root-ca --clear-hardware-intermediate-ca --clear-trusted-measurements` (or just `just client-reset`). A cleared column *is* the pin, so nothing else is needed. Prefer `--clear-trusted-measurements` over `--untrust-measurement <measurement>:<host_data>` when reverting: dropping the list by key leaves the column non-NULL, and a list that no longer names the pinned measurement rejects the real enclave. Note that accounts and wallet credentials are per-server: the account in `config.toml` was issued by whichever server you were pointed at, so expect to create one on the local stack (`eidola account create --accept-terms`) and to hit the mismatch in reverse on the way back.
 
 Consider installing [bacon](https://github.com/Canop/bacon) (`cargo install bacon`) for convenience.
 

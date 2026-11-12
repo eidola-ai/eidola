@@ -1,8 +1,8 @@
 # Trust root
 
-This is the spec for spot-checking rigor: what is pinned at compile time, how schema versions work, and how the verifier walks the chain. For the narrative of how a release becomes trustable, see [releases.md](releases.md). For payload / archive / envelope / installable vocabulary and how to hash a download, see [verification.md](verification.md). For day-to-day operational procedures (rotating keys, updating Sigstore roots, etc.) see [`releases/README.md`](../releases/README.md).
+This is the specification of what is pinned at compile time, how schema versions work, and how the verifier walks the chain. For the narrative of how a release becomes trustable, see [releases.md](releases.md). For payload / archive / envelope / installable vocabulary and how to hash a download, see [verification.md](verification.md). For day-to-day operational procedures (rotating keys, updating Sigstore roots, etc.) see [`releases/README.md`](../releases/README.md).
 
-The trust root is the set of values compiled into the Eidola client at build time that determines every trust decision it will make at runtime. The client's verifier consults these values when checking a server attestation, when verifying a release, and when accepting or rejecting a self-update.
+The trust root is the set of values compiled into the Eidola client at build time that determines every trust decision it will make at runtime. The client's verifier consults these values when checking the gateway's attestation, when verifying a release, and when accepting or rejecting a self-update.
 
 ## What's pinned
 
@@ -10,9 +10,11 @@ Generated into the client at compile time by `crates/eidola-app-core/build.rs`, 
 
 | Constant | Source | Purpose |
 | --- | --- | --- |
-| `SERVER_URL` | derived from `releases/trust/server-enclave.json` | `gateway-<hash>.eidola.containers.tinfoil.sh`, where `<hash>` ties the URL to a server measurement |
-| `SERVER_SNP_MEASUREMENT` | `releases/trust/server-enclave.json` → `snp_measurement` | SEV-SNP launch measurement of the paired server enclave |
-| `SERVER_TDX_RTMR1` / `SERVER_TDX_RTMR2` | `releases/trust/server-enclave.json` → `tdx_measurement` | TDX runtime measurements of the paired server enclave — recorded for the release, but TDX presentations are currently refused by the verifier ([gaps.md](gaps.md#tdx-acceptance)) |
+| `SERVER_URL` | derived from `releases/trust/server-enclave.json` | `gateway-<hash>.eidola.containers.tinfoil.sh`, where `<hash>` ties the URL to a gateway measurement |
+| `SERVER_SNP_MEASUREMENT` | `releases/trust/server-enclave.json` → `sev_snp.measurement` | SEV-SNP launch digest of the platform release image the paired gateway's config names (the same for every deployment of that image) |
+| `SERVER_SNP_HOST_DATA` | `releases/trust/server-enclave.json` → `sev_snp.host_data` | HOST_DATA of the paired gateway: the SHA-256 of its `tinfoil-config.yml`, which is what makes the launch identity this server's |
+| `SERVER_SNP_GUEST_POLICY` | `releases/trust/server-enclave.json` → `sev_snp.guest_policy` | The guest policy a report must carry (outside the digest, so pinned separately) |
+| `SERVER_CVM_VERSION` / `SERVER_IGVM_SHA256` | `releases/trust/server-enclave.json` → `cvm_version`, `igvm_sha256` | The platform release (with its manifest pin) and the image the digest was computed from. The gateway is pinned on SEV-SNP only; TDX presentations of it are refused ([gaps.md](gaps.md#tdx-acceptance)) |
 | `TRUSTED_ATTESTANT_FINGERPRINTS` | `releases/trust/trust-constants.json` | `sha256(PKIX SubjectPublicKeyInfo DER)` in hex, for each authorized human-attestant key |
 | `MIN_HUMAN_ATTESTATIONS` | `releases/trust/trust-constants.json` | Minimum independently-verified human attestations a release must carry. Pinned here, not in `release.json`, so a forged index cannot lower it |
 | `EXPECTED_CI_IDENTITY_PATTERN` | `releases/trust/trust-constants.json` | Fulcio cert SAN pattern the release-signing workflow's OIDC identity must match |
@@ -27,7 +29,7 @@ The `eidola` backend row's overrides (`base_url`, `trusted_measurements`, and th
 
 ## Why the enclave block lives in its own file
 
-The enclave block (`snp_measurement`, `tdx_measurement.rtmr1`, `tdx_measurement.rtmr2`, `cmdline`) lives in `releases/trust/server-enclave.json`, separate from `artifact-manifest.json`. The reason is build reproducibility.
+The enclave block (`cvm_version`, `igvm_sha256`, `sev_snp.{measurement, host_data, guest_policy}`) lives in `releases/trust/server-enclave.json`, separate from `artifact-manifest.json`. The reason is build reproducibility.
 
 `artifact-manifest.json` records the eidola-cli OCI digest and the Nix desktop artifacts' `narHash` / `archiveSha256` among other artifacts. If the cli build COPYed (Docker) or filtered-in (Nix) the manifest as a build input, every regeneration of the manifest would also be an input to the build it's describing — a self-reference that produces a different digest on every run instead of converging.
 
@@ -41,12 +43,13 @@ Each release document carries an explicit `schema_version` (positive integer). T
 
 (Product versions — `release.version`, `release.previous_release.version` — remain semver strings, since those *do* benefit from ordering and matching the Rust/Cargo ecosystem.)
 
-Each document's shape is owned by the Rust `serde` types shared between the release-tool and the verifier — there is no separately-maintained JSON Schema file. Drift between signing and verifying is impossible because both sides deserialize from the same struct definitions.
+Each document's shape is owned by the Rust `serde` types shared between the release-tool and the verifier — there is no separately-maintained JSON Schema file. Signing and verifying cannot drift, because both sides deserialize from the same struct definitions.
 
 | Document | Shape (source of truth) | Notes |
 | --- | --- | --- |
 | `artifact-manifest.json` | format owned by `scripts/artifact-manifest.sh` | Emitted at `schema_version: 2`, accepted at `2` or `3` (`SUPPORTED_MANIFEST_SCHEMA_VERSIONS`; schema 3 adds the macOS unsigned shipping zip and the Debian packages as `file` rows and renames the Nix Linux row, all accepted before they are emitted). Records OCI `digest`s (the archive identity of each image), Nix desktop `narHash` (store-path checkpoint) plus `archiveSha256` (flake-built `.tar.gz` of the payload), and a denormalized copy of the enclave block. Signed by CI as a Sigstore bundle (Fulcio keyless, OIDC). Apple envelope / installable hashes never appear here — they live in the human attestation, and `scripts/check-manifest-determinism.sh` makes that structural. Vocabulary: [verification.md](verification.md). |
-| `releases/trust/server-enclave.json` | format owned by `scripts/artifact-manifest.sh`, consumed as raw JSON in `eidola-app-core/build.rs` | `schema_version: 1`. Holds just the enclave block (snp/tdx measurement + cmdline) so the cli build doesn't drag its own digest into its build context. |
+| `releases/trust/server-enclave.json` | format owned by `scripts/artifact-manifest.sh`, consumed as raw JSON in `eidola-app-core/build.rs` | `schema_version: 2`. Holds just the enclave block (the SEV-SNP launch identity and the release image it comes from) so the cli build doesn't drag its own digest into its build context. |
+| `releases/trust/engine-enclaves.json` | checked by `eidola-server-gateway/build.rs` (`src/engine_trust/manifest.rs`), generated by `measure-enclave`'s `measure-engine-enclaves` | `schema_version: 1`. The gateway's own pin set: the Eidola-hosted engine deployments it accepts, per weights hash, each with its platform-tagged launch pin (`tinfoil_verifier::AllowedMeasurement`'s shape; a TDX pin's machine policy and PPID allowlist derived from the vendored `releases/trust/platform-endorsements/<tag>/`, verified offline), weights hash and provenance, and prompt-cache retention. Not a client input. |
 | `release.json` | `eidola_attestation::ReleaseIndex` — `crates/eidola-attestation/src/trust_shapes.rs` | Unsigned URL-only index; cross-checked via referenced documents (see caveat below). Emitted at `schema_version: 1`, accepted at `1` or `2`; schema 2 adds the artifact index the installer downloads from, still URLs only — an unsigned document may say where bytes are, never what they must hash to |
 | `attestation.json` | `updater::human_attestation::AttestationProse` — `crates/eidola-app-core/src/updater/human_attestation.rs` | Signed by the attestant via `cosign sign-blob` (local PEM, PKCS#11 URI, or any KMS URI cosign supports), logged to Rekor as a `hashedrekord` v0.0.1 entry with a PKIX SubjectPublicKeyInfo (ECDSA-P256/P384 or Ed25519) in `signature.publicKey.content`. Emitted at `schema_version: 1`, accepted at `1` or `2`; schema 2 adds the macOS signing block — `apple_shipped_artifact_sha256`, `apple_signature_bundle_sha256`, `apple_team_id`, `apple_signing_identifier` — which is where every key-dependent value about a release lives |
 | `trust-constants.json` | `eidola_attestation::TrustConstants` — `crates/eidola-attestation/src/trust_shapes.rs` | Pinned trust values baked into the verifier at build time |
@@ -70,7 +73,7 @@ Two cryptographic systems carry the trust chain, dispatched by the verifier base
 | Engineer signs `attestation-<id>.json` | `cosign sign-blob --key <ref>` — `<ref>` is a local PEM, PKCS#11 URI (YubiKey-PIV / SmartCard), or any cosign KMS URI | `sha256(PKIX SubjectPublicKeyInfo DER)` matches `TRUSTED_ATTESTANT_FINGERPRINTS` | Posted to Rekor as a `hashedrekord` v0.0.1 entry (the entry kind that survives Rekor v2 — `rekord` and SSH PKI are being retired); inclusion proof saved in `attestation-<id>.bundle.json` |
 | Engineer signs the git tag | SSH signature (separate SSH key in the engineer's git config) | OpenSSH wire-format SHA-256 fingerprint — *not* the same as the cosign SPKI fingerprint above, even if the underlying private key is shared | Implicit via the repo |
 
-The CI side uses Sigstore because Fulcio's keyless OIDC binding is *the* mechanism that makes "this signature came from the release workflow on a specific tag" cryptographically meaningful — no other system offers that.
+The CI side uses Sigstore because Fulcio's keyless OIDC binding is what ties a signature to the release workflow running on a specific tag.
 
 The engineer side uses `cosign sign-blob` with a hardware-held key because:
 
@@ -82,7 +85,7 @@ Both paths ride the same Sigstore Rekor transparency log via the same entry kind
 
 ## Which layer carries which fact
 
-A macOS release publishes three objects, and only two of them are a function of source. Where each hash lives is therefore not a filing decision — it is what keeps `artifact-manifest.json` reproducible by anyone, with no key in sight:
+A macOS release publishes three objects, and only two of them are a function of source. Where each hash lives is what keeps `artifact-manifest.json` reproducible by anyone, without a key:
 
 | Layer | Carries | Determinism | Written by | Verified by |
 | --- | --- | --- | --- | --- |
@@ -111,7 +114,7 @@ The protection that *doesn't* hold without a signed `release.json` is **first-in
 
 ## Where each piece lives
 
-Almost everything under `releases/` is a **build input** — pinned data the client and server compile against (the one exception is `trust/attestant-provenance/`, informational auditor-facing evidence that no build or client reads). `artifact-manifest.json` at the repo root is the **build output** — a record of what was actually produced, signed by CI. They live in different places on purpose: files under `releases/` are bulk-copied/filtered into builds as a unit, while `artifact-manifest.json` is deliberately kept out of every build context to prevent self-reference cycles (it records the eidola-cli OCI digest and desktop `narHash` / `archiveSha256` that the cli build would otherwise see in its own input).
+Almost everything under `releases/` is a **build input** — pinned data the client and gateway compile against (the one exception is `trust/attestant-provenance/`, informational auditor-facing evidence that no build or client reads). `artifact-manifest.json` at the repo root is the **build output** — a record of what was actually produced, signed by CI. They live in different places on purpose: files under `releases/` are bulk-copied/filtered into builds as a unit, while `artifact-manifest.json` is deliberately kept out of every build context to prevent self-reference cycles (it records the eidola-cli OCI digest and desktop `narHash` / `archiveSha256` that the cli build would otherwise see in its own input).
 
 ```text
 releases/
@@ -120,27 +123,29 @@ releases/
     attestation-templates.json          # pinned claim templates
   trust/
     trust-constants.json                # non-derivable trust values (input)
-    sigstore-trusted-root.json          # upstream Sigstore TrustedRoot snapshot (input — both eidola-app-core (updater) and eidola-server (runtime upstream-measurement resolver) build.rs embed it)
-    server-enclave.json                 # paired-server enclave measurement (input — projection of artifact-manifest.json's enclave block, materialized as its own file so the cli build context can COPY it without dragging the manifest in)
+    sigstore-trusted-root.json          # upstream Sigstore TrustedRoot snapshot (input — eidola-app-core's build.rs embeds it for the updater)
+    platform-endorsements/<tag>/        # the platform provider's signed platform endorsements, one release (input — gateway build and measure-enclave only; engine pins' TDX machine policy is derived from it, verified offline against sigstore-trusted-root.json)
+    server-enclave.json                 # paired-gateway enclave measurement (input — projection of artifact-manifest.json's enclave block, materialized as its own file so the cli build context can COPY it without dragging the manifest in)
+    engine-enclaves.json                # Eidola-hosted engine deployments the gateway accepts (input — gateway build only; checked against deploy/engine/ on every build)
     attestant-provenance/               # informational hardware-attestation evidence for pinned attestant keys (NOT a build input — no build.rs or client reads it; auditor-facing only)
 artifact-manifest.json                  # full deployment record (output, signed by CI)
 crates/eidola-app-core/
   build.rs                              # generator: server-enclave.json + trust-constants.json + … → trust_root.gen.rs
   src/trust_root.rs                     # exposes the generated constants
-crates/eidola-server/
-  build.rs                              # generator: sigstore-trusted-root.json → sigstore_root.gen.rs
-  src/upstream_trust/                   # runtime upstream-measurement resolver (embeds SIGSTORE_TRUSTED_ROOT_JSON; resolves + Sigstore-verifies Tinfoil's latest release at runtime — no static measurement pin)
+deploy/engine/<name>/<variant>/         # one engine deployment: tinfoil-config.yml + deployment.json (pinned by engine-enclaves.json)
+models/<family>/<label>.toml            # one catalog row per weights hash, bound to the engine pins at build time
+crates/eidola-server-gateway/
+  build.rs                              # generator: engine-enclaves.json (checked against deploy/engine/) → engine_enclaves.gen.rs
+  src/engine_trust/                     # the engine pins and the gateway→node wire contract
+  src/models/                           # the model catalog, its build-time checks and binding, and model references
 ```
 
-The generator (`build.rs`) reads `releases/trust/server-enclave.json` — never the per-artifact digests. The chain that invalidates the pin: server source changes → server image digest changes → `tinfoil-config.yml` changes → kernel cmdline changes → enclave measurement changes → `server-enclave.json` changes → client rebuilds with the new pin. Because the client build context never reads `artifact-manifest.json`, regenerating the manifest after a client build doesn't trigger another client rebuild, so `just update-manifest` reaches a fixed point in a single run.
+The generator (`build.rs`) reads `releases/trust/server-enclave.json` — never the per-artifact digests. The chain that invalidates the pin: gateway source changes → gateway image digest changes → `tinfoil-config.yml` changes → its SHA-256, the pinned HOST_DATA, changes → `server-enclave.json` changes → client rebuilds with the new pin. Because the client build context never reads `artifact-manifest.json`, regenerating the manifest after a client build doesn't trigger another client rebuild, so `just update-manifest` reaches a fixed point in a single run.
 
 ## Known gaps
 
-The verifier has several deferred capabilities. They are catalogued in one place so a reader can see what is not yet defended against without needing to grep source comments. See [gaps.md](gaps.md).
+The verifier's deferred capabilities are catalogued in [gaps.md](gaps.md).
 
 ## Acknowledgements
 
-`sigstore-trusted-root.json` is a verbatim copy of the upstream Sigstore TrustedRoot. The Sigstore verification approach (CI side) is adapted from [tinfoil-rs](https://github.com/tinfoilsh/tinfoil-rs), which in turn adapts verification modules from [sigstore-rs](https://github.com/sigstore/sigstore-rs) (Apache 2.0). The human attestation path runs through the same Sigstore Bundle v0.3
-
-- `hashedrekord` v0.0.1 machinery as the CI path; the cosign-side
-signing flow comes from [cosign](https://github.com/sigstore/cosign) (Apache 2.0).
+`sigstore-trusted-root.json` is a verbatim copy of the upstream Sigstore TrustedRoot. The Sigstore verification approach (CI side) is adapted from [tinfoil-rs](https://github.com/tinfoilsh/tinfoil-rs), which in turn adapts verification modules from [sigstore-rs](https://github.com/sigstore/sigstore-rs) (Apache 2.0). The human attestation path runs through the same Sigstore Bundle v0.3 and `hashedrekord` v0.0.1 machinery as the CI path; the signing flow is [cosign](https://github.com/sigstore/cosign)'s (Apache 2.0).

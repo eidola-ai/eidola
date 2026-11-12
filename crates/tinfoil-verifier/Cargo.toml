@@ -11,6 +11,16 @@ license = "MIT OR Apache-2.0"
 # SEV-SNP attestation report parsing and certificate chain verification
 sev = { version = "8", default-features = false, features = ["snp", "crypto_nossl"] }
 
+# Intel TDX quote verification (pure Rust, RustCrypto backend): PCK chain to
+# the pinned Intel SGX root with CRL checks, TCB Info / QE Identity
+# signatures, QE report and quote signatures, platform/QE/TDX-module TCB
+# matching. Only offline verification is used — collateral comes from the
+# attestation document. `std` is deliberately off: it turns on
+# `serde_json/preserve_order`, which would change `serde_json::Value` key
+# order for every crate linked into the same binary. Without `report` there
+# is no PCS fetcher and no `ring`.
+dcap-qvl = { version = "=0.6.6", default-features = false, features = ["rustcrypto", "default-x509"] }
+
 # DER encoding (for SPKI fingerprint extraction; transitive dep of sev, pinned for direct use)
 x509-cert = "0.2"
 der = { version = "0.7", features = ["alloc"] }
@@ -28,7 +38,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 
 # TLS verification. Trust roots are supplied by the caller via
 # `AttestingClientConfig::tls_roots` — the verifier intentionally does not
-# bundle `webpki-roots` or `rustls-native-certs` so each consumer (server in
+# bundle `webpki-roots` or `rustls-native-certs` so each consumer (gateway in
 # enclave, CLI on developer machine, etc.) can pick the source that fits its
 # environment without dragging the wrong dep into the others.
 rustls = { version = "0.23", default-features = false, features = ["std"] }
@@ -59,18 +69,34 @@ pem = "4"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value` keeps Intel-signed JSON members as the exact bytes served.
+serde_json = { version = "1", features = ["raw_value"] }
 
 # Error handling
 thiserror = "2"
 
+# `platform_endorsements` (feature `platform-endorsements`): offline
+# verification of the platform provider's Sigstore-signed platform
+# endorsements — Fulcio chain and identity, DSSE signature, Rekor SET and
+# inclusion proof — for the pin-authoring tools (`measure-enclave`, the
+# gateway's build). The same crates and versions the updater verifies our own
+# releases with; none is linked into a build without the feature.
+const-oid = { version = "0.9", features = ["db"], optional = true }
+spki = { version = "0.7", optional = true }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"], optional = true }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"], optional = true }
+signature = { version = "2", optional = true }
+
 # Logging
 tracing = "0.1"
+
+[features]
+platform-endorsements = ["dep:const-oid", "dep:spki", "dep:p256", "dep:p384", "dep:signature"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 rustls = { version = "0.23", features = ["ring"] }
 # Live integration tests pull in WebPKI roots so they can talk to
-# inference.tinfoil.sh. Production callers (eidola-server) bring their
+# inference.tinfoil.sh. Production callers (eidola-server-gateway) bring their
 # own.
 webpki-roots = "1"

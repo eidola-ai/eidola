@@ -88,6 +88,12 @@ pub struct StreamingTurn {
     /// that never existed — and the reader would watch a conversation gain a
     /// turn it is not gaining.
     pub revising: bool,
+    /// A revising turn that **continues** its target rather than replacing it
+    /// ([`Space::continue_post`]): its stream opens with the target's own text,
+    /// so until anything arrives the render keeps the target's body on screen
+    /// beneath the pending line, instead of the blank a regeneration starts
+    /// from.
+    pub continuing: bool,
 }
 
 /// Whether a failure is worth offering **Retry** for — i.e. whether re-asking
@@ -216,6 +222,9 @@ pub struct ChatMessageView {
     /// half of the cut-off mark, carried from the post's own row so a space
     /// that was closed and reopened still says it.
     pub truncated: bool,
+    /// It can be continued (`PostNode::continuable`, the rule app-core's door
+    /// applies), so the cut-off mark offers **Continue**.
+    pub continuable: bool,
 }
 
 impl ChatMessageView {
@@ -243,6 +252,7 @@ impl ChatMessageView {
             regenerable: false,
             // …and no persisted row that could have recorded a ceiling.
             truncated: false,
+            continuable: false,
         }
     }
 
@@ -312,6 +322,7 @@ impl ChatMessageView {
             reasoning_expanded: false,
             regenerable,
             truncated: node.truncated,
+            continuable: node.continuable,
         }
     }
 }
@@ -434,15 +445,10 @@ pub enum SpaceEvent {
         seq: u64,
         response_action_id: Option<String>,
         /// The upstream stopped this turn at its **length allowance** rather
-        /// than because the model was finished, and it had already written
-        /// answer text (a turn cut off before writing any fails instead — see
-        /// `AppError::ResponseTruncated`).
-        ///
-        /// It rides the ending event because there is nowhere durable to keep
-        /// it: the post carries its text and no reason for where the text
-        /// stops. So the reader is told while they are watching it happen, and
-        /// a reopened window shows the answer without the marker — an honest
-        /// gap, not a claim that the answer is whole.
+        /// than because the model was finished — with answer text or before
+        /// any. The live half of the cut-off mark: the post's own row carries
+        /// the durable half (`PostData::truncated`), and this marks the
+        /// generation in the frames before the reload that brings the row in.
         truncated: bool,
     },
     /// A mutation or turn failed with a typed error. The view routes
@@ -2010,6 +2016,7 @@ impl Space {
                 target_action_id: None,
                 response: StreamingResponse::default(),
                 revising: false,
+                continuing: false,
             });
             return true;
         };
@@ -2240,12 +2247,48 @@ impl Space {
             target_action_id: Some(action_id.clone()),
             response: StreamingResponse::default(),
             revising: true,
+            continuing: false,
         });
         // Pushed **before** the backend is consulted, so the pending state is
         // on screen in the frame that accepted the click — including in stub
         // stores, where it is the whole observable effect.
         if let Some(app_core) = self.app_core.clone() {
             let (event_rx, done_rx) = bridge::regenerate_stream(app_core, action_id, model);
+            let runner = self.spawn_revision_runner(seq, event_rx, done_rx, cx);
+            self.turn_runners.insert(seq, runner);
+        }
+        cx.emit(SpaceEvent::MessagesChanged);
+        cx.notify();
+        true
+    }
+
+    /// Continue an answer that stopped at its length limit — a new generation
+    /// of `action_id`'s post via `AppCore::continue_stream` (spends credits),
+    /// written by the participant and model that wrote it and picking up where
+    /// it stopped. It is a regeneration in everything but its context, so it
+    /// takes the regeneration's place exactly: a keyed revising turn drawn in
+    /// place on the post, the same runner, the same claim collision, the same
+    /// completion. The stream opens with the text being continued, so the
+    /// buffers the render draws are the whole generation as it grows.
+    ///
+    /// Returns whether the continuation was **accepted**, for the reason
+    /// [`Self::regenerate_post`] does.
+    pub fn continue_post(&mut self, action_id: String, cx: &mut Context<Self>) -> bool {
+        if !self.accepts_mutation() {
+            return false;
+        }
+        self.supersede_load_for_mutation();
+        let seq = self.mint_turn_seq();
+        self.streams.push(StreamingTurn {
+            seq,
+            participant_id: None,
+            target_action_id: Some(action_id.clone()),
+            response: StreamingResponse::default(),
+            revising: true,
+            continuing: true,
+        });
+        if let Some(app_core) = self.app_core.clone() {
+            let (event_rx, done_rx) = bridge::continue_stream(app_core, action_id);
             let runner = self.spawn_revision_runner(seq, event_rx, done_rx, cx);
             self.turn_runners.insert(seq, runner);
         }
@@ -2516,6 +2559,7 @@ impl Space {
                 target_action_id: Some(target_action_id),
                 response: StreamingResponse::default(),
                 revising: false,
+                continuing: false,
             });
             cx.emit(SpaceEvent::MessagesChanged);
             cx.notify();
@@ -2554,6 +2598,7 @@ impl Space {
             target_action_id: Some(target_action_id.clone()),
             response: StreamingResponse::default(),
             revising: false,
+            continuing: false,
         });
 
         let (event_rx, done_rx) = bridge::respond_stream_as(
@@ -2805,6 +2850,7 @@ impl Space {
                 target_action_id: None,
                 response,
                 revising: false,
+                continuing: false,
             });
         }
         cx.notify();
@@ -2855,6 +2901,7 @@ impl Space {
             target_action_id,
             response,
             revising: false,
+            continuing: false,
         });
         cx.notify();
         seq
@@ -2992,6 +3039,7 @@ impl Space {
                 action_id: "decision-1".into(),
             }),
             truncated: false,
+            continuable: false,
         };
         // The synthetic read covers everything announced so far, which is
         // what a real exit reload's watermark says (`bridge::get_space_tree`

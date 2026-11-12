@@ -212,6 +212,7 @@ fn fixture_user_post(action_id: &str, text: &str) -> PostNode {
         references: Vec::new(),
         created_at: 0,
         truncated: false,
+        continuable: false,
     }
 }
 
@@ -1320,9 +1321,9 @@ fn settings_eidola_trust_editors_call_through(cx: &mut TestAppContext) {
 
     let mut trust = eidola_trust();
     trust.trusted_measurements = vec![eidola_app_core::MeasurementInfo {
-        snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
-        tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-        tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".into(),
+        measurement: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f89d2bb3ef58af1e7c0c12f3b4a5d6e7f8".into(),
+        host_data: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        guest_policy: "0x30133".into(),
     }];
     trust.trusted_measurements_are_override = true;
     trust.has_hardware_root_ca = true;
@@ -1644,6 +1645,12 @@ fn space_model_display_splits_name_and_backend(cx: &mut TestAppContext) {
         assert_eq!(
             v.model_display("gone@local", cx),
             ("gone".into(), "Local".into())
+        );
+        // A curated model with no file yet — a fresh profile's default — is
+        // still called by its catalog name.
+        assert_eq!(
+            v.model_display(eidola_app_core::config::DEFAULT_MODEL, cx),
+            ("Gemma 4 E4B".into(), "Local".into())
         );
     });
 }
@@ -2792,9 +2799,9 @@ fn eidola_trust() -> eidola_app_core::EidolaTrust {
         trusted_measurements: Vec::new(),
         trusted_measurements_are_override: false,
         pinned_measurement: eidola_app_core::MeasurementInfo {
-            snp: "1122334455667788112233445566778811223344556677881122334455667788".into(),
-            tdx_rtmr1: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
-            tdx_rtmr2: "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa".into(),
+            measurement: "112233445566778811223344556677881122334455667788112233445566778811223344556677881122334455667788".into(),
+            host_data: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+            guest_policy: "0x30133".into(),
         },
         has_hardware_root_ca: false,
         hardware_root_ca_pem: None,
@@ -2930,6 +2937,8 @@ fn inspector_participants_render_with_scroll_indicator(cx: &mut TestAppContext) 
         s.models = (0..12)
             .map(|i| eidola_app_core::ModelInfo {
                 id: format!("model-{i:02}"),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -3125,6 +3134,7 @@ fn open_floating_composer_scene(
         references: Vec::new(),
         created_at: 0,
         truncated: false,
+        continuable: false,
     };
     let nodes: Vec<PostNode> = (0..8)
         .map(|i| {
@@ -3352,6 +3362,7 @@ fn space_composer_dock_shadow_is_stable_cold(cx: &mut TestAppContext) {
         references: Vec::new(),
         created_at: 0,
         truncated: false,
+        continuable: false,
     };
     let mut nodes = Vec::new();
     for i in 0..12 {
@@ -3440,6 +3451,7 @@ fn space_resize_above_column_cap_does_not_churn_height_cache(cx: &mut TestAppCon
         references: Vec::new(),
         created_at: 0,
         truncated: false,
+        continuable: false,
     };
     let mut nodes = Vec::new();
     for i in 0..12 {
@@ -4281,6 +4293,7 @@ fn agent_participant(id: &str, label: &str) -> eidola_app_core::ParticipantInfo 
         kind: "agent".into(),
         label: label.into(),
         model_ref: Some("kimi-k2-6".into()),
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "human".into(),
         role: "member".into(),
@@ -5558,6 +5571,7 @@ fn space_composer_edit_arms_caret_scroll_into_view(cx: &mut TestAppContext) {
         references: Vec::new(),
         created_at: 0,
         truncated: false,
+        continuable: false,
     };
     let nodes: Vec<PostNode> = (0..8)
         .map(|i| {
@@ -5671,6 +5685,7 @@ fn space_scrolled_floating_composer_glides_to_its_top_by_the_dock(cx: &mut TestA
         references: Vec::new(),
         created_at: 0,
         truncated: false,
+        continuable: false,
     };
     let nodes: Vec<PostNode> = (0..8)
         .map(|i| {
@@ -8849,6 +8864,229 @@ fn inspector_participant_system_prompt_round_trips(cx: &mut TestAppContext) {
     assert_eq!(
         reopened.read_with(cx, |s, _| s.value().to_string()),
         "Answer only in questions."
+    );
+
+    drain_runtime(&core);
+}
+
+const SWITCH_OLD: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const SWITCH_NEW: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const SWITCH_FILES: &[eidola_app_core::model_catalog::WeightsFile] =
+    &[eidola_app_core::model_catalog::WeightsFile {
+        path: "model.safetensors",
+        size: 9,
+        sha256: "5555555555555555555555555555555555555555555555555555555555555555",
+    }];
+/// A catalog whose `switch-fixture` tag has moved from [`SWITCH_OLD`] to
+/// [`SWITCH_NEW`].
+const SWITCH_CATALOG: &[eidola_app_core::model_catalog::CatalogRow] = &[
+    eidola_app_core::model_catalog::CatalogRow {
+        sha256: SWITCH_NEW,
+        tags: &["switch-fixture"],
+        name: "Switch fixture",
+        repo: "example/fixture",
+        revision: "6666666666666666666666666666666666666666",
+        files: SWITCH_FILES,
+        lifecycle: eidola_app_core::model_catalog::Lifecycle::Current,
+    },
+    eidola_app_core::model_catalog::CatalogRow {
+        sha256: SWITCH_OLD,
+        tags: &[],
+        name: "Switch fixture (previous)",
+        repo: "example/fixture",
+        revision: "7777777777777777777777777777777777777777",
+        files: SWITCH_FILES,
+        lifecycle: eidola_app_core::model_catalog::Lifecycle::Current,
+    },
+];
+
+/// **A Save while a switch to newer weights is in flight keeps the switch.**
+/// The editor shows the model the switch replaces until the roster shows the
+/// switch landed, and the store runs the Save after the switch: written whole,
+/// the Save would put the old pin back. It writes the label and leaves the
+/// model to the switch.
+#[gpui::test]
+fn a_save_racing_a_weights_switch_keeps_the_newer_pin(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    let (stores, core, _dir, space) = participants_scene(cx);
+    core.test_set_model_catalog(SWITCH_CATALOG);
+    let old_pin = format!("switch-fixture@sha256:{SWITCH_OLD}@eidola");
+    let new_pin = format!("switch-fixture@sha256:{SWITCH_NEW}@eidola");
+    let agent = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .unwrap()
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the default template seeds one agent");
+    if agent.source == "referenced" {
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                space.clone(),
+                agent.id.clone(),
+                eidola_app_core::ParticipantOverride {
+                    model_ref: Some(Some(old_pin.clone())),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+    } else {
+        core.runtime()
+            .block_on(core.update_space_participant(
+                agent.id.clone(),
+                eidola_app_core::ParticipantUpdate {
+                    label: None,
+                    model_ref: Some(Some(old_pin.clone())),
+                    system_prompt: None,
+                    notify_policy: None,
+                },
+                eidola_app_core::ExpectedScope::Any,
+            ))
+            .unwrap();
+    }
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    let agent_id = agent.id.clone();
+    wait_until(cx, "the pin's notice", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space).iter().any(|p| {
+                p.id == agent_id
+                    && p.model_notices
+                        .iter()
+                        .any(|n| matches!(n, ModelNotice::NewerAvailable { .. }))
+            })
+        })
+    });
+    let notice = ModelNotice::NewerAvailable {
+        tag: "switch-fixture".into(),
+        newer_sha256: SWITCH_NEW.into(),
+    };
+
+    // Open the editor, switch, and Save a label change before any re-read.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent_id, window, cx)
+        });
+    })
+    .unwrap();
+    let label = view
+        .read_with(cx, |v, _| v.inspector_editing_label_state())
+        .expect("the editor");
+    cx.update_window(window, |_, window, cx| {
+        label.update(cx, |s, cx| s.set_value("Renamed", window, cx));
+        view.update(cx, |v, cx| {
+            v.inspector_act_on_model_notice(&agent_id, &notice, window, cx);
+            v.inspector_save_participant_edit(window, cx);
+        });
+    })
+    .unwrap();
+
+    wait_until(cx, "both writes settled", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .any(|p| p.id == agent_id && p.label == "Renamed")
+        })
+    });
+    let stored = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .unwrap()
+        .into_iter()
+        .find(|p| p.id == agent_id)
+        .unwrap();
+    assert_eq!(stored.label, "Renamed");
+    assert_eq!(
+        stored.model_ref.as_deref(),
+        Some(new_pin.as_str()),
+        "the switch held"
+    );
+
+    drain_runtime(&core);
+}
+
+/// **A Share while a switch to newer weights is in flight keeps the switch.**
+/// Share carries the editor's persona into the shared agent, and the store
+/// runs it after the switch; the persona leaves the model to the switch, so
+/// the shared agent has the newer pin.
+#[gpui::test]
+fn a_share_racing_a_weights_switch_keeps_the_newer_pin(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    let (stores, core, _dir, space) = participants_scene(cx);
+    core.test_set_model_catalog(SWITCH_CATALOG);
+    let old_pin = format!("switch-fixture@sha256:{SWITCH_OLD}@eidola");
+    let new_pin = format!("switch-fixture@sha256:{SWITCH_NEW}@eidola");
+    let agent = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .unwrap()
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the default template seeds one agent");
+    assert_eq!(agent.source, "owned", "the seeded agent starts space-owned");
+    core.runtime()
+        .block_on(core.update_space_participant(
+            agent.id.clone(),
+            eidola_app_core::ParticipantUpdate {
+                label: None,
+                model_ref: Some(Some(old_pin.clone())),
+                system_prompt: None,
+                notify_policy: None,
+            },
+            eidola_app_core::ExpectedScope::Any,
+        ))
+        .unwrap();
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    let agent_id = agent.id.clone();
+    wait_until(cx, "the pin's notice", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space).iter().any(|p| {
+                p.id == agent_id
+                    && p.model_notices
+                        .iter()
+                        .any(|n| matches!(n, ModelNotice::NewerAvailable { .. }))
+            })
+        })
+    });
+    let notice = ModelNotice::NewerAvailable {
+        tag: "switch-fixture".into(),
+        newer_sha256: SWITCH_NEW.into(),
+    };
+
+    // Open the editor, switch, and Share before any re-read.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent_id, window, cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_act_on_model_notice(&agent_id, &notice, window, cx);
+            v.inspector_begin_promote(window, cx);
+            v.inspector_confirm_promote(window, cx);
+        });
+    })
+    .unwrap();
+
+    wait_until(cx, "both writes settled", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .any(|p| p.id == agent_id && p.source == "referenced")
+        })
+    });
+    let stored = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .unwrap()
+        .into_iter()
+        .find(|p| p.id == agent_id)
+        .unwrap();
+    assert_eq!(stored.source, "referenced", "the share landed");
+    assert_eq!(
+        stored.model_ref.as_deref(),
+        Some(new_pin.as_str()),
+        "the switch held"
     );
 
     drain_runtime(&core);
@@ -14904,6 +15142,7 @@ fn inspector_participants_stub_scene(
                 kind: "agent".into(),
                 label: "Assistant".into(),
                 model_ref: Some("gemma4-31b".into()),
+                model_notices: Vec::new(),
                 system_prompt: Some("Be concise.".into()),
                 notify_policy: "human".into(),
                 role: "member".into(),
@@ -15119,6 +15358,7 @@ fn space_inspector_typing_in_a_system_prompt_does_not_jump_to_the_composer(
                 kind: "agent".into(),
                 label: "Assistant".into(),
                 model_ref: Some("gemma4-31b".into()),
+                model_notices: Vec::new(),
                 system_prompt: Some("Be concise.".into()),
                 notify_policy: "human".into(),
                 role: "member".into(),
@@ -17412,6 +17652,66 @@ async fn an_archived_conversations_refusal_is_localized(cx: &mut gpui::TestAppCo
     }
 }
 
+/// A refused issuer key is the reader's protection, not a network blip, and
+/// says so in their language: each refusal has its own words, never the
+/// error's English `Display`, and they follow a locale change.
+#[gpui::test]
+async fn a_refused_issuer_key_says_so_in_the_readers_language(cx: &mut gpui::TestAppContext) {
+    use eidola_app_core::error::IssuerKeyRefusal;
+    for (refusal, english_start, french_start) in [
+        (
+            IssuerKeyRefusal::NotOnCalendar,
+            "Eidola’s server offered a payment key that doesn’t follow the public key schedule",
+            "Le serveur d’Eidola a proposé une clé de paiement qui ne suit pas",
+        ),
+        (
+            IssuerKeyRefusal::SecondKeyForEpoch { epoch: 2966 },
+            "Eidola’s server offered a different payment key this week",
+            "Le serveur d’Eidola a proposé cette semaine une clé de paiement différente",
+        ),
+        (
+            IssuerKeyRefusal::OneKeyForSeveralEpochs { epoch: 2967 },
+            "Eidola’s server offered the same payment key for two different weeks",
+            "Le serveur d’Eidola a proposé la même clé de paiement pour deux semaines",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+        let stores = stub_stores_with_agents(cx, "s");
+        let (window, view) = open_space(cx, &stores, Some("s".into()));
+        let space = view.read_with(cx, |v, _| v.space().clone());
+        cx.update_window(window, |_, _, cx| {
+            space.update(cx, |s, cx| {
+                s.set_post_tree_for_test(vec![fixture_user_post("a1", "the only post")], cx)
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let error = AppError::IssuerKeyRefused {
+            refusal: refusal.clone(),
+        };
+        let display = error.to_string();
+        cx.update_window(window, |_, _, cx| {
+            space.update(cx, |s, cx| {
+                s.apply_turn_failure_for_test("agent-b", "a1", error, cx)
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        let english = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+        assert!(english.starts_with(english_start), "{refusal:?}: {english}");
+        assert_ne!(
+            english, display,
+            "the raw Display must not be what a reader sees"
+        );
+        cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+        cx.run_until_parked();
+        let french = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+        assert!(french.starts_with(french_start), "{refusal:?}: {french}");
+    }
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+}
+
 /// **A selection that has gone stale fails honestly, by name, and nothing
 /// answers in its place.**
 ///
@@ -17501,6 +17801,67 @@ async fn a_stale_model_selection_says_which_model_and_substitutes_none(
         "the model id survives translation verbatim: {french}"
     );
     cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+}
+
+/// **A fresh profile's first post names the model to download.**
+///
+/// The default agent uses an on-device model, and a new profile has not
+/// downloaded it, so the first turn meets `AppError::LocalModelNotDownloaded`.
+/// The notice says which model by the name Settings lists it under, says
+/// nothing was sent, and points at the download — never the log-shaped
+/// `Display`, which names neither and is English in every locale. Retry
+/// stands, for after the download.
+#[gpui::test]
+async fn a_model_that_is_not_downloaded_says_which_and_where_to_get_it(
+    cx: &mut gpui::TestAppContext,
+) {
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the only post")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::LocalModelNotDownloaded {
+                    model: eidola_app_core::config::DEFAULT_MODEL.into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let notice = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+    assert!(
+        notice.contains("Gemma 4 E4B"),
+        "the notice names the model by its catalog name: {notice}"
+    );
+    assert!(
+        notice.contains("Settings ▸ Backends ▸ Local"),
+        "and says where to download it: {notice}"
+    );
+    assert!(
+        notice.contains("nothing was sent"),
+        "and that nothing was sent: {notice}"
+    );
+    assert!(
+        !notice.contains("is not downloaded"),
+        "the raw Display must not be what a reader sees: {notice}"
+    );
+    space.read_with(cx, |s, _| {
+        assert!(s.can_retry(), "Retry stands for after the download")
+    });
 }
 
 /// **An affordance that cannot succeed is worse than none.**
@@ -17627,6 +17988,7 @@ fn a_watching_reader_may_quote_elsewhere_but_not_here(cx: &mut TestAppContext) {
                 kind: "agent".into(),
                 label: "Surveyor".into(),
                 model_ref: Some("gemma4-31b".into()),
+                model_notices: Vec::new(),
                 system_prompt: None,
                 notify_policy: "all".into(),
                 role: "member".into(),
@@ -18740,8 +19102,8 @@ fn space_regeneration_failure_keeps_the_generation_it_would_replace(cx: &mut Tes
         space.update(cx, |s, cx| {
             s.fail_revision_for_test(
                 seq,
-                AppError::ResponseTruncated {
-                    output_tokens: Some(4096),
+                AppError::ModelUnavailable {
+                    model: "kimi-k2".into(),
                 },
                 cx,
             )
@@ -18759,8 +19121,7 @@ fn space_regeneration_failure_keeps_the_generation_it_would_replace(cx: &mut Tes
     });
     view.read_with(cx, |v, cx| {
         assert!(
-            v.error_for_test(cx)
-                .is_some_and(|t| t.contains("length allowance")),
+            v.error_for_test(cx).is_some_and(|t| t.contains("kimi-k2")),
             "the reader is told what happened, in their own language"
         );
     });

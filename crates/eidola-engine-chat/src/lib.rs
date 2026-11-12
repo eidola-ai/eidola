@@ -7,9 +7,12 @@
 //!    (order-preserving, Python value semantics), and
 //!    [`ChatInput::normalize_tool_call_arguments`] decodes history tool-call
 //!    arguments sent as JSON strings.
-//! 2. [`ChatTemplate::render`] produces the prompt, byte-identical to Python
-//!    `transformers.apply_chat_template` with the model's own template.
-//! 3. [`MimoTokenizer::encode`] turns it into token ids.
+//! 2. [`ChatTemplate::render_prompt`] produces the prompt, its text
+//!    byte-identical to Python `transformers.apply_chat_template` with the
+//!    model's own template, and says which parts of it are request data.
+//! 3. [`MimoTokenizer::encode_prompt`] turns it into token ids. Only the
+//!    template's own text becomes an added token (`<|im_end|>`, `<think>`, …);
+//!    request data that spells one is encoded as text.
 //! 4. As the engine samples ids (stopping at [`MimoTokenizer::is_eos`] or a
 //!    length limit), [`OutputParser`] turns them into OpenAI deltas —
 //!    `reasoning_content`, `content`, `tool_calls` — and maps the
@@ -32,6 +35,6 @@ pub mod tool_call;
 pub use args::{ArgumentTyping, ToolSchemas};
 pub use error::ChatError;
 pub use output::{ChatDelta, FinishReason, OutputConfig, OutputParser, StopCause};
-pub use template::{ChatInput, ChatTemplate, RenderOptions};
+pub use template::{ChatInput, ChatTemplate, Prompt, RenderOptions};
 pub use tokenizer::{Detokenizer, MimoTokenizer};
-pub use tool_call::{CallIdSource, PrefixedCallIds, ToolCall};
+pub use tool_call::{CallIdSource, PrefixedCallIds, ToolCall, UnparsedText};

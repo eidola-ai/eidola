@@ -23,6 +23,8 @@ pub const KEY_SPKI_FP_SHA256_V1_FORMAT: &str = "https://tinfoil.sh/key/spki-fp-s
 pub const KEY_X25519_HPKE_V1_FORMAT: &str = "https://tinfoil.sh/key/x25519-hpke/v1";
 pub const COLLATERAL_AMD_VCEK_V1_FORMAT: &str = "https://tinfoil.sh/collateral/amd-vcek/v1";
 pub const COLLATERAL_AMD_CRL_V1_FORMAT: &str = "https://tinfoil.sh/collateral/amd-crl/v1";
+pub const COLLATERAL_INTEL_PCS_V1_FORMAT: &str = "https://tinfoil.sh/collateral/intel-pcs/v1";
+pub const NVIDIA_GPU_EVIDENCE_V1_FORMAT: &str = "https://tinfoil.sh/format/nvidia-gpu-evidence/v1";
 
 const ROLE_ENDORSEMENT: &str = "endorsement";
 const ROLE_REFERENCE_VALUES: &str = "reference-values";
@@ -123,11 +125,50 @@ struct AmdCrlCollateral {
     crl_der_base64: String,
 }
 
+/// `intel-pcs/v1` collateral: Intel PCS responses captured by the enclave's
+/// collateral service, carried so the verifier never contacts Intel.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntelPcsCollateral {
+    responses: Vec<IntelPcsResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntelPcsResponse {
+    url: String,
+    /// Absent or `null` when the capture kept no headers (Intel's root CA CRL
+    /// carries none the verifier reads).
+    #[serde(default)]
+    headers: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    body_base64: String,
+}
+
+/// One endorsed device evidence item. Its `evidence` payload is versioned by
+/// `format`; only formats a pinned policy names are interpreted.
+#[derive(Debug, Clone)]
+pub struct DeviceEvidence {
+    pub id: String,
+    pub kind: String,
+    pub vendor: String,
+    pub format: String,
+    pub evidence: serde_json::Value,
+}
+
 /// TEE platform identified by the CPU evidence format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     SevSnp,
     Tdx,
+}
+
+impl std::fmt::Display for Platform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::SevSnp => "SEV-SNP",
+            Self::Tdx => "TDX",
+        })
+    }
 }
 
 /// Fully decoded challenge and CPU evidence needed by the handshake verifier.
@@ -149,6 +190,11 @@ pub struct ResolvedAttestation {
     pub ark_der: Option<Vec<u8>>,
     /// Present and required for SEV-SNP evidence.
     pub crl_der: Option<Vec<u8>>,
+    /// Present and required for TDX evidence: the captured Intel PCS
+    /// responses that authenticate the quote.
+    pub intel_pcs: Option<Vec<crate::tdx::PcsResponse>>,
+    /// The endorsed device evidence items, in document order.
+    pub device_evidence: Vec<DeviceEvidence>,
 }
 
 /// Generate a fresh 32-byte challenge nonce from the OS CSPRNG.
@@ -199,11 +245,35 @@ pub async fn fetch_well_known(
 /// endorsed section hashes are computed over their exact decoded JSON bytes,
 /// never over a re-serialization.
 pub fn parse_document(raw: &[u8]) -> Result<ResolvedAttestation, Error> {
+    parse_document_for(raw, &[Platform::SevSnp, Platform::Tdx])
+}
+
+/// [`parse_document`] for a verifier that accepts only `pinned` platforms.
+///
+/// The CPU evidence format is identified right after the envelope's own
+/// JSON is parsed, and a platform outside `pinned` is refused with
+/// [`Error::PlatformNotPinned`] before any section is decoded and before any
+/// platform-specific payload (the CPU report, its vendor collateral) is
+/// touched. A verifier pinned to SEV-SNP never runs the TDX parsers, and the
+/// reverse.
+pub fn parse_document_for(raw: &[u8], pinned: &[Platform]) -> Result<ResolvedAttestation, Error> {
     reject_duplicate_members(raw, "attestation document")?;
     let doc: Document = serde_json::from_slice(raw)
         .map_err(|e| Error::Bundle(format!("parsing attestation document: {e}")))?;
 
     require_eq("document format", &doc.format, ATTESTATION_V3_FORMAT)?;
+    let platform = match doc.cpu_evidence.format.as_str() {
+        SEV_SNP_REPORT_V1_FORMAT => Platform::SevSnp,
+        TDX_QUOTE_V1_FORMAT => Platform::Tdx,
+        other => {
+            return Err(Error::Bundle(format!(
+                "unsupported CPU evidence format: {other}"
+            )));
+        }
+    };
+    if !pinned.contains(&platform) {
+        return Err(Error::PlatformNotPinned { platform });
+    }
     require_eq(
         "report_data_algorithm",
         &doc.challenge.report_data_algorithm,
@@ -244,6 +314,17 @@ pub fn parse_document(raw: &[u8]) -> Result<ResolvedAttestation, Error> {
         DEVICE_EVIDENCE_V1_FORMAT,
     )?;
     validate_device_evidence(&device.items)?;
+    let device_evidence = device
+        .items
+        .into_iter()
+        .map(|item| DeviceEvidence {
+            id: item.id,
+            kind: item.kind,
+            vendor: item.vendor,
+            format: item.format,
+            evidence: item.evidence,
+        })
+        .collect();
 
     let crypto_hash: [u8; 32] = Sha256::digest(&crypto_bytes).into();
     let device_hash: [u8; 32] = Sha256::digest(&device_bytes).into();
@@ -265,15 +346,6 @@ pub fn parse_document(raw: &[u8]) -> Result<ResolvedAttestation, Error> {
         ));
     }
 
-    let platform = match doc.cpu_evidence.format.as_str() {
-        SEV_SNP_REPORT_V1_FORMAT => Platform::SevSnp,
-        TDX_QUOTE_V1_FORMAT => Platform::Tdx,
-        other => {
-            return Err(Error::Bundle(format!(
-                "unsupported CPU evidence format: {other}"
-            )));
-        }
-    };
     let report_bytes = decode_canonical_base64(
         &doc.cpu_evidence.report_base64,
         "cpu_evidence.report_base64",
@@ -283,7 +355,7 @@ pub fn parse_document(raw: &[u8]) -> Result<ResolvedAttestation, Error> {
     }
 
     validate_collateral_entries(&doc.collateral)?;
-    let (vcek_der, ask_der, ark_der, crl_der) = match platform {
+    let (vcek_der, ask_der, ark_der, crl_der, intel_pcs) = match platform {
         Platform::SevSnp => {
             let vcek = endorsement_for(&doc.collateral, COLLATERAL_AMD_VCEK_V1_FORMAT, SUBJECT_CPU)
                 .ok_or_else(|| {
@@ -310,9 +382,41 @@ pub fn parse_document(raw: &[u8]) -> Result<ResolvedAttestation, Error> {
                     "SEV-SNP endorsement collateral contains empty DER material".to_string(),
                 ));
             }
-            (Some(vcek_der), Some(ask_der), Some(ark_der), Some(crl_der))
+            (
+                Some(vcek_der),
+                Some(ask_der),
+                Some(ark_der),
+                Some(crl_der),
+                None,
+            )
         }
-        Platform::Tdx => (None, None, None, None),
+        Platform::Tdx => {
+            let pcs = endorsement_for(&doc.collateral, COLLATERAL_INTEL_PCS_V1_FORMAT, SUBJECT_CPU)
+                .ok_or_else(|| {
+                    Error::Bundle(
+                        "document carries no intel-pcs endorsement collateral for the CPU"
+                            .to_string(),
+                    )
+                })?;
+            let pcs: IntelPcsCollateral = serde_json::from_value(pcs.data.clone())
+                .map_err(|e| Error::Bundle(format!("parsing intel-pcs collateral: {e}")))?;
+            let responses = pcs
+                .responses
+                .into_iter()
+                .enumerate()
+                .map(|(index, response)| {
+                    Ok(crate::tdx::PcsResponse {
+                        body: decode_canonical_base64(
+                            &response.body_base64,
+                            &format!("intel-pcs response {index} body_base64"),
+                        )?,
+                        url: response.url,
+                        headers: response.headers.unwrap_or_default().into_iter().collect(),
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            (None, None, None, None, Some(responses))
+        }
     };
 
     Ok(ResolvedAttestation {
@@ -326,6 +430,8 @@ pub fn parse_document(raw: &[u8]) -> Result<ResolvedAttestation, Error> {
         ask_der,
         ark_der,
         crl_der,
+        intel_pcs,
+        device_evidence,
     })
 }
 
@@ -512,7 +618,10 @@ fn require_eq(field: &str, actual: &str, expected: &str) -> Result<(), Error> {
     }
 }
 
-fn decode_lower_hex_array<const N: usize>(value: &str, field: &str) -> Result<[u8; N], Error> {
+pub(crate) fn decode_lower_hex_array<const N: usize>(
+    value: &str,
+    field: &str,
+) -> Result<[u8; N], Error> {
     if !value
         .bytes()
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -536,7 +645,7 @@ fn decode_canonical_base64(value: &str, field: &str) -> Result<Vec<u8>, Error> {
 }
 
 /// Reject duplicate member names recursively before typed deserialization.
-fn reject_duplicate_members(raw: &[u8], context: &str) -> Result<(), Error> {
+pub(crate) fn reject_duplicate_members(raw: &[u8], context: &str) -> Result<(), Error> {
     let mut deserializer = serde_json::Deserializer::from_slice(raw);
     StrictJson::deserialize(&mut deserializer)
         .map_err(|e| Error::Bundle(format!("parsing {context}: {e}")))?;

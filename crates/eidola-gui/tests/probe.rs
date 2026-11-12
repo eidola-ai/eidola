@@ -1128,9 +1128,9 @@ fn probe_eidola_trust() -> eidola_app_core::EidolaTrust {
         trusted_measurements: Vec::new(),
         trusted_measurements_are_override: false,
         pinned_measurement: eidola_app_core::MeasurementInfo {
-            snp: "1122334455667788112233445566778811223344556677881122334455667788".into(),
-            tdx_rtmr1: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
-            tdx_rtmr2: "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa".into(),
+            measurement: "112233445566778811223344556677881122334455667788112233445566778811223344556677881122334455667788".into(),
+            host_data: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+            guest_policy: "0x30133".into(),
         },
         has_hardware_root_ca: false,
         hardware_root_ca_pem: None,
@@ -1150,6 +1150,8 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
         s.models = vec![
             ModelInfo {
                 id: "gemma4-31b".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1160,6 +1162,8 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
             },
             ModelInfo {
                 id: "kimi-k2-6".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 262_144,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1170,6 +1174,8 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
             },
             ModelInfo {
                 id: "qwen3-coder-watt".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
                 max_output_tokens: None,
                 output_budget_class: None,
@@ -1625,6 +1631,7 @@ fn probe_post(action_id: &str, text: &str) -> PostNode {
         references: Vec::new(),
         created_at: 0,
         truncated: false,
+        continuable: false,
     }
 }
 
@@ -3614,9 +3621,9 @@ fn eidola_trust_surface_probes_cover_editor_and_overrides(cx: &mut TestAppContex
     trust.base_url = "https://staging.eidola.example/v1".into();
     trust.base_url_is_override = true;
     trust.trusted_measurements = vec![eidola_app_core::MeasurementInfo {
-        snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
-        tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-        tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".into(),
+        measurement: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f89d2bb3ef58af1e7c0c12f3b4a5d6e7f8".into(),
+        host_data: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        guest_policy: "0x30133".into(),
     }];
     trust.trusted_measurements_are_override = true;
     // Root CA overridden (with a viewable PEM) so the view/copy + Clear verbs
@@ -3941,6 +3948,7 @@ fn probe_participants() -> (String, Vec<ParticipantInfo>) {
         // must map it back to "You" through the shared presentation rule.
         label: "User".into(),
         model_ref: None,
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "explicit".into(),
         role: "member".into(),
@@ -3962,6 +3970,7 @@ fn probe_participants() -> (String, Vec<ParticipantInfo>) {
         kind: "agent".into(),
         label: "Assistant".into(),
         model_ref: Some("gemma4-31b".into()),
+        model_notices: Vec::new(),
         system_prompt: Some("Be concise.".into()),
         notify_policy: "human".into(),
         role: "member".into(),
@@ -3977,6 +3986,68 @@ fn open_participants_inspector(
 ) -> (AnyWindowHandle, Entity<eidola_gui::space_view::SpaceView>) {
     let stores = participants_inspector_stores(cx);
     open_participants_inspector_with(cx, stores)
+}
+
+/// **A model choice's notices sit on the participant's row**, closed or
+/// open, each as a labelled line: a followed tag that moved, a pin with newer
+/// weights, a retirement announced or passed, retired weights. A notice found
+/// only by opening an editor is not given.
+#[gpui::test]
+fn space_inspector_a_participants_model_notices_are_on_its_row(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    let _guard = probes_on();
+    let (space, mut roster) = probe_participants();
+    roster[1].model_notices = vec![
+        ModelNotice::Updated {
+            tag: "gemma4-31b".into(),
+            previous_sha256: "1".repeat(64),
+            current_sha256: "2".repeat(64),
+        },
+        ModelNotice::NewerAvailable {
+            tag: "gemma4-31b".into(),
+            newer_sha256: "3".repeat(64),
+        },
+        ModelNotice::Retiring {
+            retire_after: "2027-06-01".into(),
+            past: false,
+        },
+        ModelNotice::Retiring {
+            retire_after: "2026-01-01".into(),
+            past: true,
+        },
+        ModelNotice::Retired,
+    ];
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some((space, roster));
+    });
+    let (window, _view) = open_participants_inspector_with(cx, stores);
+    let entries = fresh_entries(cx, window);
+    for (i, label) in [
+        "Model updated: gemma4-31b now names newer weights.",
+        "Newer weights are available as gemma4-31b. This agent stays on the ones it is pinned to.",
+        "These weights retire after 2027-06-01.",
+        "These weights were due to retire on 2026-01-01. Choose another model.",
+        "These weights are retired. Choose another model.",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_probe(
+            &entries,
+            &format!("space/inspector/participants/agent-1/notice/{i}"),
+            gpui::Role::Label,
+            label,
+        );
+    }
+    // A participant with nothing to be told gets no line.
+    assert!(
+        !entries.iter().any(|(n, _)| n.starts_with(&format!(
+            "space/inspector/participants/{}/notice/",
+            eidola_app_core::HUMAN_PARTICIPANT_ID
+        ))),
+        "the human has no model and no notice"
+    );
 }
 
 /// **A notebook's owner carries no Remove** (task 36; Codex review, PR #279).
@@ -4793,6 +4864,327 @@ fn same_name_on_two_backends() -> eidola_app_core::LocalModelsState {
 /// tree, and two backends serving the same model name give a screen reader two
 /// rows it cannot tell apart. On the router picker that ambiguity is also the
 /// billing difference. One helper serves both pickers, so this pins both.
+/// The Eidola model fixture the identity and pin probes read: one tag that
+/// has moved onto newer weights.
+const PICKER_HASH: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const PICKER_FILES: &[eidola_app_core::model_catalog::WeightsFile] =
+    &[eidola_app_core::model_catalog::WeightsFile {
+        path: "model.safetensors",
+        size: 9,
+        sha256: "5555555555555555555555555555555555555555555555555555555555555555",
+    }];
+const PICKER_CATALOG: &[eidola_app_core::model_catalog::CatalogRow] =
+    &[eidola_app_core::model_catalog::CatalogRow {
+        sha256: PICKER_HASH,
+        tags: &["gemma4-31b"],
+        name: "Gemma 4 31B",
+        repo: "example/fixture",
+        revision: "6666666666666666666666666666666666666666",
+        files: PICKER_FILES,
+        lifecycle: eidola_app_core::model_catalog::Lifecycle::Current,
+    }];
+
+/// **The picker can pin, and says what it pins to.** Beside following an
+/// Eidola tag, each model the catalog publishes a hash for is offered pinned
+/// to those weights (stored `tag@sha256:<hex>@eidola`, shown with the start
+/// of the hash); and the field shows the chosen model's weights hash, its
+/// source and where to check it. A notice with an action carries its button
+/// on the row.
+#[gpui::test]
+fn the_model_picker_offers_a_pin_and_shows_the_weights(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    let _guard = probes_on();
+    let (space, mut roster) = probe_participants();
+    roster[1].model_notices = vec![
+        ModelNotice::NewerAvailable {
+            tag: "gemma4-31b".into(),
+            newer_sha256: PICKER_HASH.into(),
+        },
+        ModelNotice::Updated {
+            tag: "gemma4-31b".into(),
+            previous_sha256: "1".repeat(64),
+            current_sha256: PICKER_HASH.into(),
+        },
+    ];
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some((space, roster));
+        s.space_settings = Some(("demo".into(), eidola_app_core::SpaceSettings::default()));
+        s.model_catalog = PICKER_CATALOG;
+        s.models = vec![
+            ModelInfo {
+                id: format!("sha256:{}", "3".repeat(64)),
+                sha256: Some("3".repeat(64)),
+                tags: Vec::new(),
+                context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
+                prompt_credits_per_token: 0.53,
+                completion_credits_per_token: 1.5,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "gemma4-31b".into(),
+                sha256: Some(PICKER_HASH.into()),
+                tags: vec!["gemma4-31b".into()],
+                context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
+                prompt_credits_per_token: 0.53,
+                completion_credits_per_token: 1.5,
+                request_credits: None,
+            },
+        ];
+    });
+    let (window, view) = open_participants_inspector_with(cx, stores);
+
+    // The notices' actions sit on the row.
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/inspector/participants/agent-1/notice/0/switch",
+        gpui::Role::Button,
+        "Switch Assistant to the newer weights",
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/participants/agent-1/notice/1/dismiss",
+        gpui::Role::Button,
+        "Dismiss the model update for Assistant",
+    );
+
+    // The add form's picker: follow, or pin to these weights.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_begin_add_participant(window, cx);
+            v.inspector_open_add_picker_for_test(cx);
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    let options: Vec<String> = entries
+        .iter()
+        .filter(|(n, _)| n.starts_with("space/inspector/participants/add/model/option/"))
+        .map(|(_, e)| e.label.to_string())
+        .collect();
+    assert!(
+        options.iter().any(|l| l.starts_with("gemma4-31b · ")),
+        "following the tag is offered: {options:?}"
+    );
+    assert!(
+        options
+            .iter()
+            .any(|l| l.starts_with("gemma4-31b, pinned to 222222222222… · ")),
+        "pinning those weights is offered: {options:?}"
+    );
+    // A model listed by its hash alone is offered as itself, never as a
+    // second, unparseable pin of the hash.
+    assert!(
+        !options
+            .iter()
+            .any(|l| l.starts_with("sha256:") && l.contains("pinned")),
+        "no pin of a hash-only listing: {options:?}"
+    );
+    assert_eq!(
+        options.len(),
+        3,
+        "the hash-only model, the tag, and the tag's pin: {options:?}"
+    );
+    // Following the tag shows the weights it resolves to.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_select_participant_model("gemma4-31b", cx)
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/inspector/participants/add/model/weights",
+        gpui::Role::Label,
+        "Weights 222222222222… from example/fixture@6666666",
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/participants/add/model/verify",
+        gpui::Role::Label,
+        "Check these weights yourself: https://www.eidola.ai/docs/model-identity/",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The pin a switch of `gemma4-31b` to [`PICKER_HASH`] writes.
+fn switched_pin() -> String {
+    format!("gemma4-31b@sha256:{PICKER_HASH}@eidola")
+}
+
+/// **An open editor follows a switch to newer weights, once it has landed.**
+/// The editor holds its own working model; left on the old pin, a Save of any
+/// other field would write it back over the switch. Pressing Switch changes
+/// nothing in the editor until the roster shows the participant on the newer
+/// pin; then the editor's selection moves to it. A switch the roster never
+/// shows (refused, or overtaken by another window's write) leaves the editor
+/// as it was, and another participant's switch sent meanwhile never discards
+/// this one's.
+#[gpui::test]
+fn an_open_editor_follows_a_switch_to_newer_weights(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    let _guard = probes_on();
+    let (space, mut roster) = probe_participants();
+    let notice = ModelNotice::NewerAvailable {
+        tag: "gemma4-31b".into(),
+        newer_sha256: PICKER_HASH.into(),
+    };
+    roster[1].model_notices = vec![notice.clone()];
+    let mut second = roster[1].clone();
+    second.id = "agent-2".into();
+    second.label = "Second".into();
+    roster.push(second);
+    let seeded = roster.clone();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some((space.clone(), roster));
+        s.space_settings = Some(("demo".into(), eidola_app_core::SpaceSettings::default()));
+    });
+    let participants = stores.participants.clone();
+    let (window, view) = open_participants_inspector_with(cx, stores);
+    let editor_value = |cx: &mut TestAppContext| {
+        let entries = fresh_entries(cx, window);
+        entries
+            .iter()
+            .find(|(n, _)| n == "space/inspector/participants/editor/model")
+            .and_then(|(_, e)| e.value.clone())
+            .map(|v| v.to_string())
+    };
+    let switch_for = |cx: &mut TestAppContext, participant_id: &str| {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.inspector_act_on_model_notice(participant_id, &notice, window, cx);
+            });
+        })
+        .unwrap();
+    };
+    let switch = |cx: &mut TestAppContext| switch_for(cx, "agent-1");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant("agent-1", window, cx)
+        });
+    })
+    .unwrap();
+
+    // Sent, not landed: nothing moves.
+    switch(cx);
+    assert_eq!(editor_value(cx).as_deref(), Some("gemma4-31b · Eidola"));
+
+    // Overtaken by another write: the pending switch is dropped untouched.
+    let mut other = seeded.clone();
+    other[1].model_ref = Some("kimi-k2-6".into());
+    other[1].model_notices.clear();
+    participants.update(cx, |p, _| p.seed_for_test(&space, other));
+    assert_eq!(editor_value(cx).as_deref(), Some("gemma4-31b · Eidola"));
+    // …and a later roster on the newer pin does not revive it.
+    let mut landed = seeded.clone();
+    landed[1].model_ref = Some(switched_pin());
+    landed[1].model_notices.clear();
+    participants.update(cx, |p, _| p.seed_for_test(&space, landed.clone()));
+    assert_eq!(editor_value(cx).as_deref(), Some("gemma4-31b · Eidola"));
+
+    // A switch that lands, with another row's switch sent behind it: the
+    // editor follows its own.
+    participants.update(cx, |p, _| p.seed_for_test(&space, seeded.clone()));
+    switch(cx);
+    switch_for(cx, "agent-2");
+    participants.update(cx, |p, _| p.seed_for_test(&space, landed));
+    assert_eq!(
+        editor_value(cx).as_deref(),
+        Some("gemma4-31b, pinned to 222222222222… · Eidola")
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **A shared agent's "Everyone" draft does not follow a per-space switch.**
+/// The switch writes this space's override; the Everyone draft is the agent's
+/// global config, and adopting the pin there would publish it to every space
+/// on the next Save. Toggling to "This space" afterwards shows the newer pin,
+/// because the per-space source the fork re-seeds from carries the switch.
+#[gpui::test]
+fn an_everyone_draft_keeps_its_model_through_a_per_space_switch(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    use eidola_gui::participants::EditMode;
+    let _guard = probes_on();
+    let (space, mut roster) = probe_participants();
+    let notice = ModelNotice::NewerAvailable {
+        tag: "gemma4-31b".into(),
+        newer_sha256: PICKER_HASH.into(),
+    };
+    roster[1].scope = "global".into();
+    roster[1].source = "referenced".into();
+    roster[1].model_notices = vec![notice.clone()];
+    roster[1].reference = Some(ParticipantReference {
+        base_label: "Assistant".into(),
+        base_model_ref: Some("gemma4-31b".into()),
+        base_system_prompt: Some("Be concise.".into()),
+        base_notify_policy: "human".into(),
+        override_label: None,
+        override_model_ref: None,
+        override_system_prompt: None,
+        override_notify_policy: None,
+    });
+    let mut landed = roster.clone();
+    landed[1].model_ref = Some(switched_pin());
+    landed[1].model_notices.clear();
+    if let Some(r) = landed[1].reference.as_mut() {
+        r.override_model_ref = Some(switched_pin());
+    }
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some((space.clone(), roster));
+        s.space_settings = Some(("demo".into(), eidola_app_core::SpaceSettings::default()));
+    });
+    let participants = stores.participants.clone();
+    let (window, view) = open_participants_inspector_with(cx, stores);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant("agent-1", window, cx);
+            v.inspector_set_edit_mode(EditMode::Everywhere, window, cx);
+            v.inspector_act_on_model_notice("agent-1", &notice, window, cx);
+        });
+    })
+    .unwrap();
+    participants.update(cx, |p, _| p.seed_for_test(&space, landed));
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/inspector/participants/editor/model",
+        gpui::Role::Button,
+        "Model",
+        "gemma4-31b · Eidola",
+    );
+
+    // Toggling to "This space" re-seeds from the per-space source, which
+    // carries the switch: the newer pin, not the old one.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_set_edit_mode(EditMode::OverrideHere, window, cx);
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/inspector/participants/editor/model",
+        gpui::Role::Button,
+        "Model",
+        "gemma4-31b, pinned to 222222222222… · Eidola",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn model_picker_options_name_their_backend(cx: &mut TestAppContext) {
     let _guard = probes_on();
@@ -7758,6 +8150,7 @@ fn a_room_the_reader_only_watches_offers_no_regenerate(cx: &mut TestAppContext) 
         kind: "agent".into(),
         label: "Surveyor".into(),
         model_ref: Some("gemma4-31b".into()),
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "all".into(),
         role: "member".into(),
@@ -7840,6 +8233,7 @@ fn a_room_the_reader_belongs_to_keeps_its_verbs(cx: &mut TestAppContext) {
             kind: "human".into(),
             label: "User".into(),
             model_ref: None,
+            model_notices: Vec::new(),
             system_prompt: None,
             notify_policy: "explicit".into(),
             role: "owner".into(),
@@ -7852,6 +8246,7 @@ fn a_room_the_reader_belongs_to_keeps_its_verbs(cx: &mut TestAppContext) {
             kind: "agent".into(),
             label: "Surveyor".into(),
             model_ref: Some("gemma4-31b".into()),
+            model_notices: Vec::new(),
             system_prompt: None,
             notify_policy: "all".into(),
             role: "member".into(),
@@ -7968,6 +8363,7 @@ fn the_acting_gate_converges_and_its_interim_withholds(cx: &mut TestAppContext) 
                     kind: "agent".into(),
                     label: "Surveyor".into(),
                     model_ref: Some("gemma4-31b".into()),
+                    model_notices: Vec::new(),
                     system_prompt: None,
                     notify_policy: "all".into(),
                     role: "member".into(),
@@ -8180,6 +8576,7 @@ fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
         kind: "agent".into(),
         label: "Surveyor".into(),
         model_ref: Some("gemma4-31b".into()),
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "all".into(),
         role: "member".into(),
@@ -8255,6 +8652,7 @@ fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
                 kind: "human".into(),
                 label: "User".into(),
                 model_ref: None,
+                model_notices: Vec::new(),
                 system_prompt: None,
                 notify_policy: "explicit".into(),
                 role: "owner".into(),
@@ -8344,7 +8742,7 @@ fn a_conversations_turn_states_speak_the_readers_language(cx: &mut TestAppContex
         &entries,
         "space/post/2/cut-off",
         gpui::Role::Label,
-        "Cette réponse a atteint sa limite de longueur et s’interrompt en pleine pensée.",
+        "Cette réponse s’est arrêtée à sa limite de longueur.",
     );
     assert_probe(
         &entries,
@@ -10354,5 +10752,106 @@ fn a_proxy_bound_off_loopback_says_what_that_costs(cx: &mut TestAppContext) {
         warning.1.label
     );
 
+    probe::set_probes_enabled(false);
+}
+
+/// **A cut-off answer offers Continue exactly where it can be continued.** The
+/// verb rides the cut-off mark as a real button whose accessible name is the
+/// action in full, in the reader's language; an answer that stopped short but
+/// cannot be continued (its model is not one of Eidola's) carries the mark
+/// alone. An accepted press starts the continuation in place — "Continuing…"
+/// over the answer it extends — and the verb goes with the mutation it started,
+/// so nothing is left looking live.
+#[gpui::test]
+fn a_cut_off_answer_offers_continue_where_it_can_be_continued(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let agent = || PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    let mut continuable = probe_post("a1", "The tides are driven by");
+    continuable.action_type = "inference".into();
+    continuable.participant = agent();
+    continuable.truncated = true;
+    continuable.continuable = true;
+    let mut local = probe_post("a2", "A local model's answer that ran out of");
+    local.action_type = "inference".into();
+    local.parent_action_id = Some("a1".into());
+    local.participant = agent();
+    local.truncated = true;
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![continuable, local], cx)
+        });
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/0/continue",
+        gpui::Role::Button,
+        "Continue this answer from where it stopped",
+    );
+    assert_probe(
+        &entries,
+        "space/post/0/cut-off",
+        gpui::Role::Label,
+        "This answer stopped at its length limit.",
+    );
+    assert!(
+        entries.iter().any(|(n, _)| n == "space/post/1/cut-off"),
+        "the uncontinuable answer is still marked"
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n == "space/post/1/continue"),
+        "but offers no verb that could only be refused"
+    );
+
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/0/continue",
+        gpui::Role::Button,
+        "Poursuivre cette réponse là où elle s’est arrêtée",
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.continue_answer(&"a1".into(), &"a1".into(), window, cx)
+        });
+    })
+    .unwrap();
+    let seq = space.read_with(cx, |s, _| {
+        let seq = s
+            .revising_seq("a1")
+            .expect("the continuation is pending on its post");
+        assert!(
+            s.streams()
+                .iter()
+                .any(|t| t.seq == seq && t.revising && t.continuing),
+            "a revision that continues"
+        );
+        assert!(!s.accepts_mutation());
+        seq
+    });
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        &format!("space/streaming/{seq}/continuing"),
+        gpui::Role::Label,
+        "Poursuite de la réponse…",
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n.ends_with("/continue")),
+        "the verb is gone while its continuation runs"
+    );
     probe::set_probes_enabled(false);
 }

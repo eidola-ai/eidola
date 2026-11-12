@@ -1,33 +1,48 @@
-# Tinfoil Container configuration for eidola-server.
+# Tinfoil Container configuration for eidola-server-gateway.
 #
-# The SHA-256 of this file is embedded in the kernel command line and bound
-# into the enclave measurement. Any change — image digest, secret hash,
-# resource allocation — produces a different measurement.
+# The SHA-256 of this file is the HOST_DATA of every SEV-SNP report the
+# enclave produces: the host passes it at launch, and the guest refuses to
+# boot unless it hashes the config it was given to that value. Clients pin
+# it beside the launch digest of the release image `cvm-version` names, so
+# any change here — image digest, secret hash, resource allocation — is a
+# different server identity.
 #
-# Image digests below must match artifact-manifest.json.  After building,
-# run `just update-manifest` to stamp in the current digests and recompute
-# the enclave measurement.
+# `cvm-version` pins the platform release manifest inline; that manifest
+# names the SEV-SNP IGVM image, whose launch digest measure-enclave
+# recomputes. The image digest below must match artifact-manifest.json (the
+# gateway image is recorded there under its artifact key, `eidola-server`).
+# After building, run `just update-manifest` to stamp in the current digests
+# and recompute the enclave record.
 #
 # Secret hashes are generated with:
 #   cargo run -p hash-secret -- "<secret>"
 # and verified at server startup via verify_measured_secrets().
 
-cvm-version: 0.7.3
+# Platform release 0.15.3-rc.1 was rebuilt from source on 2026-11-11 and every
+# published file was byte-identical (docs/contributing/
+# rebuilding-platform-images.md). Rebuild again, and update this note, when
+# the version below changes.
+cvm-version: 0.15.3-rc.1@sha256:ddd2e76a629df1bd4ec507441a387ac5db010ebc1bda3e372756e095df8692eb
 cpus: 2
 memory: 8192
 
+# A container attached to no network has none: the gateway reaches its
+# database, Stripe, its telemetry endpoint and the engine nodes (whose
+# placement is operator data, not known here) over this one.
+networks:
+  egress:
+    egress: open
+
 containers:
-  - name: "eidola-server"
-    image: "ghcr.io/eidola-ai/eidola-server@sha256:a3d085af891e7f18d132c1563fef17d0a139b2bcac2a3fbdef3b16729115be8d"
-    devices:
-      - /dev/sev-guest
+  - name: "eidola-server-gateway"
+    image: "ghcr.io/eidola-ai/eidola-server-gateway@sha256:a3d085af891e7f18d132c1563fef17d0a139b2bcac2a3fbdef3b16729115be8d"
+    networks:
+      - egress
     secrets:
       - CREDENTIAL_MASTER_KEY
       - DATABASE_PASSWORD
       - OTEL_EXPORTER_OTLP_HEADERS
       - STRIPE_API_KEY
-      - STRIPE_WEBHOOK_SECRET
-      - TINFOIL_API_KEY
     env:
       - BIND_ADDR: "0.0.0.0:8080"
       - OTEL_EXPORTER_OTLP_ENDPOINT: "https://otlp-gateway-prod-us-west-0.grafana.net/otlp"
@@ -38,8 +53,6 @@ containers:
       - DATABASE_PASSWORD_HASH: "$argon2id$v=19$m=19456,t=2,p=1$cysXhP6SVPuB83IC4iD4yw$ygvRvdmSVfH5zq5+8P/Fgnyz6q93VwCuiZxU0GfjtLs"
       - OTEL_EXPORTER_OTLP_HEADERS_HASH: "$argon2id$v=19$m=19456,t=2,p=1$BU7g3wAtS+gxm9ADqglQrw$KPSjwJlNFppw1/JncRV9Oby1BCNc/53TRPdBv0j3uOw"
       - STRIPE_API_KEY_HASH: "$argon2id$v=19$m=19456,t=2,p=1$qucRiGbS8rYcqJINDlHDcw$qdu/tD4Ymq1by0uPVawIFFneCq757OzZ3/5EPeyFQ4Q"
-      - STRIPE_WEBHOOK_SECRET_HASH: "$argon2id$v=19$m=19456,t=2,p=1$4j33RHeU39z3dQiVU/k2rw$NryykMC9uwJGIQYLG5WeYkP3FHD/Sb8uPlAS2qzsLDc"
-      - TINFOIL_API_KEY_HASH: "$argon2id$v=19$m=19456,t=2,p=1$d8t7z4mWAjPzjoANx9fJFQ$+kN/8qNToSPgq7GIknW7PTCF38asH6vs1v9eegE1RbQ"
 
 shim:
   upstream-port: 8080

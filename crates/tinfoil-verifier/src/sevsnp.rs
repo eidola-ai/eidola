@@ -130,6 +130,59 @@ pub fn check_report_hygiene(report: &AttestationReport) -> Result<(), Error> {
                 .to_string(),
         ));
     }
+    // GUEST_SVN, FAMILY_ID and IMAGE_ID come only from an ID block, so a
+    // plain launch reports them zero; anything else is not the launch the
+    // checks above describe.
+    if report.guest_svn != 0 || report.family_id != [0u8; 16] || report.image_id != [0u8; 16] {
+        return Err(Error::Report(
+            "report carries a GUEST_SVN, FAMILY_ID or IMAGE_ID, which only an ID block sets"
+                .to_string(),
+        ));
+    }
+    // The report was requested from VMPL 0, the guest's most privileged
+    // level: the measured image runs there and runs no lower-privileged
+    // layer that could ask for reports of its own.
+    if report.vmpl != 0 {
+        return Err(Error::Report(format!(
+            "report was requested from VMPL {}; only VMPL 0 is accepted",
+            report.vmpl
+        )));
+    }
+    Ok(())
+}
+
+/// The guest policy exactly as the report carries it (`POLICY`, bytes
+/// 0x08..0x10, little-endian), without the `sev` crate's normalization of
+/// the reserved bit.
+pub(crate) fn raw_policy(report_bytes: &[u8]) -> Result<u64, Error> {
+    report_bytes
+        .get(0x08..0x10)
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_le_bytes)
+        .ok_or_else(|| Error::Report("attestation report is too short for POLICY".to_string()))
+}
+
+/// Appraise a report's guest policy against a pin's: every bit equal except
+/// the firmware ABI minimum (bits 0-15, major in 15:8 and minor in 7:0),
+/// which may be higher than the pin's, since a launch that asks for newer
+/// firmware than the image needs is not weaker for it. The pin's own policy
+/// has DEBUG and MIGRATE_MA clear (`measurement::compile_pins`), so equality
+/// refuses both, and refuses a launch that drops a restriction the image
+/// asks for or adds a permission it does not (CXL, for instance).
+pub(crate) fn check_guest_policy(reported: u64, pinned: u64) -> Result<(), Error> {
+    use crate::measurement::POLICY_ABI_MASK;
+    if reported & !POLICY_ABI_MASK != pinned & !POLICY_ABI_MASK {
+        return Err(Error::Report(format!(
+            "guest policy {reported:#x} differs from the pinned {pinned:#x} outside the \
+             firmware ABI minimum"
+        )));
+    }
+    let abi = |policy: u64| ((policy >> 8) & 0xff, policy & 0xff);
+    if abi(reported) < abi(pinned) {
+        return Err(Error::Report(format!(
+            "guest policy {reported:#x} allows older firmware than the pinned {pinned:#x}"
+        )));
+    }
     Ok(())
 }
 
@@ -763,6 +816,56 @@ mod tests {
             let bytes = v3_report_bytes(mutate);
             let err = check_report_hygiene(&parse_report(&bytes).unwrap()).unwrap_err();
             assert!(err.to_string().contains("ID-block"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn hygiene_rejects_id_block_fields_and_lower_vmpls() {
+        for (mutate, needle) in [
+            (
+                (|b: &mut [u8; 1184]| b[0x04] = 1) as fn(&mut [u8; 1184]),
+                "GUEST_SVN",
+            ),
+            (|b| b[0x10] = 1, "FAMILY_ID"),
+            (|b| b[0x20] = 1, "IMAGE_ID"),
+            (|b| b[0x30] = 1, "VMPL 1"),
+            (|b| b[0x30] = 3, "VMPL 3"),
+        ] {
+            let bytes = v3_report_bytes(mutate);
+            let err = check_report_hygiene(&parse_report(&bytes).unwrap()).unwrap_err();
+            assert!(err.to_string().contains(needle), "{needle}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_raw_policy_is_read_as_the_report_carries_it() {
+        // The reserved bit clear: the `sev` crate's conversion would set it.
+        let bytes = v3_report_bytes(|b| b[0x08..0x10].copy_from_slice(&0x10133u64.to_le_bytes()));
+        assert_eq!(raw_policy(&bytes).unwrap(), 0x10133);
+        assert!(raw_policy(&bytes[..12]).is_err());
+    }
+
+    #[test]
+    fn the_guest_policy_must_equal_the_pin_but_for_a_higher_abi_minimum() {
+        let pinned = 0x30133;
+        check_guest_policy(0x30133, pinned).expect("equal");
+        check_guest_policy(0x30134, pinned).expect("newer ABI minor");
+        check_guest_policy(0x30200, pinned).expect("newer ABI major");
+        for (reported, needle) in [
+            (0xb0133, "outside the firmware ABI"),  // DEBUG
+            (0x70133, "outside the firmware ABI"),  // MIGRATE_MA
+            (0x230133, "outside the firmware ABI"), // CXL_ALLOW
+            (0x130133, "outside the firmware ABI"), // SINGLE_SOCKET
+            (0x20133, "outside the firmware ABI"),  // SMT cleared
+            (0x10133, "outside the firmware ABI"),  // reserved bit cleared
+            (0x30132, "older firmware"),
+            (0x300ff, "older firmware"),
+            (0x30000, "older firmware"),
+        ] {
+            let err = check_guest_policy(reported, pinned)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{reported:#x}: {err}");
         }
     }
 

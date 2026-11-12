@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1@sha256:a7f5ec8c4a35a7f8cd9e6e413f59fd1bfd33f8b623c26981c684f5065dfe3044
+
+FROM stagex/pallet-rust:sx2026.09.0@sha256:6033fb215dd7c87c885dd7b1c12de42464606dcc0323fc57339318d61f010a30 AS base
+
+ARG CARGO_PROFILE=release
+ENV TARGET=x86_64-unknown-linux-musl
+ENV SOURCE_DATE_EPOCH=0
+ENV CARGO_INCREMENTAL=0
+ENV ZERO_AR_DATE=1
+ENV RUSTFLAGS="-C target-feature=+crt-static -C debuginfo=0 -C target-cpu=generic"
+WORKDIR /src
+
+FROM base AS fetch
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY --parents crates/*/Cargo.toml ./
+
+# Match the manifest-only dependency build used by the other workspace images.
+RUN find . -name Cargo.toml -not -path ./Cargo.toml | while read -r manifest; do \
+      dir="$(dirname "$manifest")/src"; mkdir -p "$dir"; \
+      touch "$dir/lib.rs"; \
+      if grep -q '^\[\[bin\]\]' "$manifest"; then echo 'fn main(){}' > "$dir/main.rs"; fi; \
+    done
+
+ARG CARGO_PROFILE=release
+RUN cargo fetch --locked --target ${TARGET}
+RUN --network=none \
+    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-billing-cli
+
+FROM fetch AS build
+ARG CARGO_PROFILE=release
+COPY crates/ ./crates/
+
+# Ensure Cargo notices real sources over dependency-stage stubs even when COPY
+# timestamps were clamped to SOURCE_DATE_EPOCH.
+RUN find crates/ -name '*.rs' -exec touch {} +
+RUN --network=none \
+    cargo build --frozen --profile ${CARGO_PROFILE} --target ${TARGET} -p eidola-billing-cli \
+    && install -D target/${TARGET}/${CARGO_PROFILE}/eidola-billing /out/eidola-billing
+
+FROM scratch AS package
+COPY --from=build /out/eidola-billing /eidola-billing
+EXPOSE 8080
+USER 65534:65534
+# Select serve-webhooks or work explicitly. The same image can run independent
+# receiver and worker containers without either role starting the other.
+ENTRYPOINT ["/eidola-billing"]

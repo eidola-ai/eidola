@@ -12,11 +12,25 @@
 //!
 //! Writes assert that the target block is mapped by exactly one (slot, index) pair: blocks
 //! shared through the prefix cache are immutable.
+//!
+//! `Encrypt` and `Decrypt` really XOR a block's image (each entry's value as two
+//! little-endian words, then its position) with the [`crate::kv_cipher`] keystream, so a
+//! read of a block left encrypted fails like a read of a zeroed one. The mock also records
+//! which key encrypted each block (as a keystream fingerprint, not the key) and fails a
+//! step that decrypts under another key, decrypts a plaintext block or encrypts twice.
+//!
+//! With a host tier ([`KvGroupSpec::host_blocks`], see [`with_host_tier`]) the mock keeps
+//! a second memory per group. `Demote` copies a block and its key fingerprint there and
+//! fails on a block that is not encrypted; `Promote` copies back and fails unless the host
+//! block holds ciphertext and the device block is zero (its zero ran first); `ZeroHost`
+//! scrubs. So a plaintext block can never reach the host tier through a passing step.
 
 use std::collections::HashMap;
 
-use crate::executor::{Executor, ExecutorError, Maintenance, StepInput, StepOutput};
+use crate::executor::{Executor, ExecutorError, Maintenance, SeqEntry, StepInput, StepOutput};
+use crate::kv_cipher::{KvKeystream, KvNonce};
 use crate::sampling::{self, SamplingParams, Stream, mix64};
+use crate::secret::KvKey;
 use crate::spec::{AttentionKind, Bucket, KvGroupSpec, KvRole, ModelSpec, NULL_BLOCK};
 
 /// Mock model parameters.
@@ -61,6 +75,7 @@ pub fn mimo_like_spec(
         head_dim_qk: 192,
         head_dim_v: 128,
         num_blocks,
+        host_blocks: 0,
     };
     ModelSpec {
         vocab_size: vocab,
@@ -101,6 +116,15 @@ pub fn mimo_like_spec(
             },
         ],
     }
+}
+
+/// `spec` with a host tier of `host_blocks` blocks (the null block included) in every
+/// group.
+pub fn with_host_tier(mut spec: ModelSpec, host_blocks: u32) -> ModelSpec {
+    for g in &mut spec.kv_groups {
+        g.host_blocks = host_blocks;
+    }
+    spec
 }
 
 /// KV value for `token` at `pos` in `group` (never zero).
@@ -170,6 +194,14 @@ pub fn reference_generate(
     out
 }
 
+/// A stand-in for "which key": the first keystream words under a fixed nonce no block
+/// hash yields in practice. Test instrumentation only.
+fn fingerprint(key: &KvKey) -> u64 {
+    let mut w = [0u32; 2];
+    KvKeystream::new(key, &KvNonce::from_words([u32::MAX; 3])).apply_words(&mut w);
+    u64::from(w[0]) | (u64::from(w[1]) << 32)
+}
+
 /// The mock executor.
 #[derive(Debug)]
 pub struct MockExecutor {
@@ -182,8 +214,21 @@ pub struct MockExecutor {
     /// `[group]`: block -> number of (slot, index) mappings.
     mapped: Vec<HashMap<u32, u32>>,
     zero_log: Vec<(u64, u32, u32)>,
+    /// `[group][block]`: the fingerprint of the key the block is encrypted under.
+    encrypted: Vec<Vec<Option<u64>>>,
+    /// Every executed encrypt (`true`) or decrypt as `(step, group, block, encrypt)`.
+    crypt_log: Vec<(u64, u32, u32, bool)>,
+    /// `[group][host * block_size + offset]`: the host tier, like `memory`.
+    host_memory: Vec<Vec<(u64, u32)>>,
+    /// `[group][host]`: the fingerprint of the key a host block's ciphertext is under.
+    host_encrypted: Vec<Vec<Option<u64>>>,
+    /// Every executed demote (`true`) or promote as `(step, group, block, host, demote)`.
+    transfer_log: Vec<(u64, u32, u32, u32, bool)>,
+    /// Every executed host zero as `(step, group, host)`.
+    host_zero_log: Vec<(u64, u32, u32)>,
     steps: u64,
     buckets_used: Vec<Bucket>,
+    rows_used: Vec<Vec<SeqEntry>>,
 }
 
 impl MockExecutor {
@@ -201,8 +246,27 @@ impl MockExecutor {
             tables: vec![vec![vec![NULL_BLOCK; width]; groups]; spec.num_state_slots as usize],
             mapped: vec![HashMap::new(); groups],
             zero_log: Vec::new(),
+            encrypted: spec
+                .kv_groups
+                .iter()
+                .map(|g| vec![None; g.num_blocks as usize])
+                .collect(),
+            crypt_log: Vec::new(),
+            host_memory: spec
+                .kv_groups
+                .iter()
+                .map(|g| vec![(0, 0); g.host_blocks as usize * bs])
+                .collect(),
+            host_encrypted: spec
+                .kv_groups
+                .iter()
+                .map(|g| vec![None; g.host_blocks as usize])
+                .collect(),
+            transfer_log: Vec::new(),
+            host_zero_log: Vec::new(),
             steps: 0,
             buckets_used: Vec::new(),
+            rows_used: Vec::new(),
             spec,
             cfg,
         }
@@ -211,6 +275,59 @@ impl MockExecutor {
     /// Every executed zero as `(step, group, block)`.
     pub fn zero_log(&self) -> &[(u64, u32, u32)] {
         &self.zero_log
+    }
+
+    /// Every executed encrypt (`true`) or decrypt as `(step, group, block, encrypt)`.
+    pub fn crypt_log(&self) -> &[(u64, u32, u32, bool)] {
+        &self.crypt_log
+    }
+
+    /// Whether a block is held encrypted.
+    pub fn block_is_encrypted(&self, group: u32, block: u32) -> bool {
+        self.encrypted[group as usize][block as usize].is_some()
+    }
+
+    /// The keystream fingerprint of the key a block is encrypted under (`None`: plaintext).
+    /// Equal fingerprints mean the same key.
+    pub fn encrypted_under(&self, group: u32, block: u32) -> Option<u64> {
+        self.encrypted[group as usize][block as usize]
+    }
+
+    /// Every executed demote (`true`) or promote as `(step, group, block, host, demote)`.
+    pub fn transfer_log(&self) -> &[(u64, u32, u32, u32, bool)] {
+        &self.transfer_log
+    }
+
+    /// Every executed host zero as `(step, group, host)`.
+    pub fn host_zero_log(&self) -> &[(u64, u32, u32)] {
+        &self.host_zero_log
+    }
+
+    /// Whether every byte of a host block is zero.
+    pub fn host_block_is_zero(&self, group: u32, host: u32) -> bool {
+        self.host_block(group, host)
+            .iter()
+            .all(|&(v, p)| v == 0 && p == 0)
+    }
+
+    /// The keystream fingerprint a host block's ciphertext is under (`None`: it holds
+    /// none).
+    pub fn host_encrypted_under(&self, group: u32, host: u32) -> Option<u64> {
+        self.host_encrypted[group as usize][host as usize]
+    }
+
+    /// A host block's stored entries, `(value, position)` per offset, as they are.
+    pub fn host_block(&self, group: u32, host: u32) -> &[(u64, u32)] {
+        let bs = self.spec.block_size as usize;
+        let start = host as usize * bs;
+        &self.host_memory[group as usize][start..start + bs]
+    }
+
+    /// A device block's stored entries, `(value, position)` per offset, as they are.
+    pub fn device_block(&self, group: u32, block: u32) -> &[(u64, u32)] {
+        let bs = self.spec.block_size as usize;
+        let start = block as usize * bs;
+        &self.memory[group as usize][start..start + bs]
     }
 
     /// Steps executed.
@@ -223,6 +340,11 @@ impl MockExecutor {
         &self.buckets_used
     }
 
+    /// Rows of the executed steps, in order.
+    pub fn rows_used(&self) -> &[Vec<SeqEntry>] {
+        &self.rows_used
+    }
+
     /// Whether every byte of a block is zero.
     pub fn block_is_zero(&self, group: u32, block: u32) -> bool {
         let bs = self.spec.block_size as usize;
@@ -230,6 +352,51 @@ impl MockExecutor {
         self.memory[group as usize][start..start + bs]
             .iter()
             .all(|&(v, p)| v == 0 && p == 0)
+    }
+
+    /// XORs block `block` of `group` with its keystream, and checks and records its state.
+    fn crypt(
+        &mut self,
+        group: u32,
+        block: u32,
+        key: &KvKey,
+        nonce: &KvNonce,
+        encrypt: bool,
+    ) -> Result<(), ExecutorError> {
+        let print = fingerprint(key);
+        let state = &mut self.encrypted[group as usize][block as usize];
+        match (encrypt, *state) {
+            (true, None) => *state = Some(print),
+            (false, Some(p)) if p == print => *state = None,
+            (false, Some(_)) => {
+                return Err(ExecutorError(format!(
+                    "group {group} block {block}: decrypt under another key"
+                )));
+            }
+            (true, Some(_)) => {
+                return Err(ExecutorError(format!(
+                    "group {group} block {block}: encrypted twice"
+                )));
+            }
+            (false, None) => {
+                return Err(ExecutorError(format!(
+                    "group {group} block {block}: decrypt of a plaintext block"
+                )));
+            }
+        }
+        let bs = self.spec.block_size as usize;
+        let start = block as usize * bs;
+        let cells = &mut self.memory[group as usize][start..start + bs];
+        KvKeystream::new(key, nonce).range(3 * bs, |i, k| {
+            let (v, p) = &mut cells[i / 3];
+            match i % 3 {
+                0 => *v ^= u64::from(k),
+                1 => *v ^= u64::from(k) << 32,
+                _ => *p ^= k,
+            }
+        });
+        self.crypt_log.push((self.steps, group, block, encrypt));
+        Ok(())
     }
 
     fn set_table(&mut self, slot: u32, group: u32, index: u32, block: u32) {
@@ -373,13 +540,33 @@ impl Executor for MockExecutor {
             return Err(ExecutorError("batch exceeds its bucket".into()));
         }
         self.buckets_used.push(step.bucket);
+        self.rows_used.push(step.seqs.clone());
         let bs = self.spec.block_size as usize;
         for m in &step.maintenance {
             match *m {
                 Maintenance::Zero { group, block } => {
                     let start = block as usize * bs;
                     self.memory[group as usize][start..start + bs].fill((0, 0));
+                    self.encrypted[group as usize][block as usize] = None;
                     self.zero_log.push((self.steps, group, block));
+                }
+                Maintenance::Encrypt {
+                    group,
+                    block,
+                    key,
+                    nonce,
+                }
+                | Maintenance::Decrypt {
+                    group,
+                    block,
+                    key,
+                    nonce,
+                } => {
+                    let encrypt = matches!(m, Maintenance::Encrypt { .. });
+                    let key = step.kv_keys.get(key as usize).ok_or_else(|| {
+                        ExecutorError(format!("maintenance names key {key}, not in the step"))
+                    })?;
+                    self.crypt(group, block, key, &nonce, encrypt)?;
                 }
                 Maintenance::Copy { group, src, dst } => {
                     let g = &mut self.memory[group as usize];
@@ -387,6 +574,45 @@ impl Executor for MockExecutor {
                         src as usize * bs..(src as usize + 1) * bs,
                         dst as usize * bs,
                     );
+                    let e = &mut self.encrypted[group as usize];
+                    e[dst as usize] = e[src as usize];
+                }
+                Maintenance::Demote { group, block, host } => {
+                    let (g, b, h) = (group as usize, block as usize, host as usize);
+                    let Some(print) = self.encrypted[g][b] else {
+                        return Err(ExecutorError(format!(
+                            "group {group} block {block}: demote of a plaintext block"
+                        )));
+                    };
+                    let cells = self.memory[g][b * bs..(b + 1) * bs].to_vec();
+                    self.host_memory[g][h * bs..(h + 1) * bs].copy_from_slice(&cells);
+                    self.host_encrypted[g][h] = Some(print);
+                    self.transfer_log
+                        .push((self.steps, group, block, host, true));
+                }
+                Maintenance::Promote { group, host, block } => {
+                    let (g, b, h) = (group as usize, block as usize, host as usize);
+                    let Some(print) = self.host_encrypted[g][h] else {
+                        return Err(ExecutorError(format!(
+                            "group {group} host block {host}: promote of a block holding no ciphertext"
+                        )));
+                    };
+                    if !self.block_is_zero(group, block) || self.encrypted[g][b].is_some() {
+                        return Err(ExecutorError(format!(
+                            "group {group} block {block}: promote into a block that is not zero"
+                        )));
+                    }
+                    let cells = self.host_memory[g][h * bs..(h + 1) * bs].to_vec();
+                    self.memory[g][b * bs..(b + 1) * bs].copy_from_slice(&cells);
+                    self.encrypted[g][b] = Some(print);
+                    self.transfer_log
+                        .push((self.steps, group, block, host, false));
+                }
+                Maintenance::ZeroHost { group, host } => {
+                    let (g, h) = (group as usize, host as usize);
+                    self.host_memory[g][h * bs..(h + 1) * bs].fill((0, 0));
+                    self.host_encrypted[g][h] = None;
+                    self.host_zero_log.push((self.steps, group, host));
                 }
                 Maintenance::ResetSlot { slot } => {
                     for g in 0..self.spec.kv_groups.len() {
