@@ -8,28 +8,31 @@
 # so it is a dynamic glibc binary; StageX's Rust targets musl only. The binary,
 # the C runtime it ships with and the GPU kernel images are all built by the
 # repository flake (`packages.x86_64-linux.eidola-server-engine-image-root`,
-# whose comments say what goes in and why), with Nix running inside a pinned
-# container exactly as the kernel build's own `build-in-docker.sh` does. The
-# final stage is that tree and nothing else.
+# whose comments say what goes in and why). The final stage is that tree and
+# nothing else.
+#
+# Two ways to reach it, one image. CI's release build runs Nix on the runner,
+# in Nix's own sandbox, and hands the tree in as the `build` named context
+# (docker-bake.hcl, ENGINE_BUILD_CONTEXT): a directory holding `rootfs/`,
+# which replaces the `build` stage below, so neither the `inputs` nor the
+# `build` stage runs. Without that context (`just engine-image`, and CI's
+# reproduction of it) the `build` stage runs Nix inside a pinned container.
+# The `package` stage is the same either way, and so is the digest when the
+# trees are equal, which CI requires of the two.
 
 # ── inputs ─────────────────────────────────────────────────────────────────────
 # nixos/nix 2.32.4, the release the kernel build pins; the linux/amd64
 # manifest digest of the multi-arch index that script names.
 FROM nixos/nix:2.32.4@sha256:59627baee1756479291d429a94fb60d2d4552d32ca61bcd70b853e476f9eb90e AS inputs
 
-# The container is the isolation boundary: Nix's own sandbox needs privileges
-# a build container lacks, and its seccomp filter cannot be loaded under amd64
-# emulation. Every input is still fixed by hash (flake.lock, Cargo.lock, the
-# toolchain and kernel-source pins), and the image root derivation checks what
-# it ships. One derivation at a time, on at most four cores: the kernel build
-# runs one nvcc per core, and a CUTLASS translation unit takes gigabytes, so
-# more cores than that runs a 16 GiB builder out of memory. Neither bound
-# reaches the output: the kernels' bytes do not depend on parallelism, and
-# the node's release profile is one codegen unit with fat LTO.
+# One derivation at a time, on at most four cores: the kernel build runs one
+# nvcc per core, and a CUTLASS translation unit takes gigabytes, so more cores
+# than that runs a 16 GiB builder out of memory. Neither bound reaches the
+# output: the kernels' bytes do not depend on parallelism, and the node's
+# release profile is one codegen unit with fat LTO. CI's runner build sets the
+# same bounds. Each stage below adds its own sandbox settings.
 RUN printf '%s\n' \
       'experimental-features = nix-command flakes' \
-      'sandbox = false' \
-      'filter-syscalls = false' \
       'max-jobs = 1' \
       'cores = 4' \
       >> /etc/nix/nix.conf
@@ -49,21 +52,48 @@ COPY crates/ ./crates/
 # fails there rather than first in the image build on `main`.
 FROM inputs AS eval
 
-RUN nix eval --raw .#eidola-server-engine-image-root.drvPath
+# Evaluation only, in an ordinary build step, which can host neither Nix's
+# sandbox nor, under emulation, its syscall filter; whatever evaluation
+# builds stays in this stage.
+RUN printf '%s\n' 'sandbox = false' 'filter-syscalls = false' >> /etc/nix/nix.conf \
+    && nix eval --raw .#eidola-server-engine-image-root.drvPath
 
 # ── build ──────────────────────────────────────────────────────────────────────
 FROM inputs AS build
 
+# Nix's sandbox on by default (no network, only the build's declared inputs
+# visible), which needs the privileged step below: the bake target requests
+# `security.insecure` for it and the builder must allow that entitlement
+# (`scripts/artifact-manifest.sh --ensure-builder` creates one that does).
+# The sandbox's syscall filter cannot be loaded under emulation (an amd64
+# build on an arm64 host), so it is on only when the builder runs natively.
+# NIX_SANDBOX=false builds with no sandbox at all, which CI uses to show the
+# sandbox does not reach the bytes. Every input is fixed by hash either way
+# (flake.lock, Cargo.lock, the toolchain and kernel-source pins), and the
+# image root derivation checks what it ships.
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+ARG NIX_SANDBOX=true
+RUN filter=false \
+    && if [ "$BUILDPLATFORM" = "$TARGETPLATFORM" ]; then filter=true; fi \
+    && printf '%s\n' \
+      "sandbox = $NIX_SANDBOX" \
+      'sandbox-fallback = false' \
+      "filter-syscalls = $filter" \
+      >> /etc/nix/nix.conf
+
 # One step, so the store this build fills is not kept in any layer: the root
 # tree is copied out and everything else collected.
-RUN root="$(nix build --no-link --print-out-paths --print-build-logs .#eidola-server-engine-image-root)" \
+RUN --security=insecure \
+    root="$(nix build --no-link --print-out-paths --print-build-logs .#eidola-server-engine-image-root)" \
     && mkdir /rootfs \
     && cp -R --preserve=mode "$root"/. /rootfs/ \
     && nix-collect-garbage >/dev/null
 
 # ── package ────────────────────────────────────────────────────────────────────
 # Final minimal image: the node, its C runtime in /lib64, the kernel images in
-# /opt/eidola/kernels. The driver is not here: the NVIDIA container runtime
+# /opt/eidola/kernels, copied from the `build` stage or the context that
+# replaces it. The driver is not here: the NVIDIA container runtime
 # mounts the host's into the container. The weights are not here: a deployment
 # mounts them read-only under /tinfoil/models. Every setting is the
 # deployment's measured environment; the image sets none.

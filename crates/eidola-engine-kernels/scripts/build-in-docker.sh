@@ -41,30 +41,35 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-if [[ -z $platform ]]; then
-  case $(docker info --format '{{.Architecture}}') in
-    aarch64 | arm64) platform=linux/arm64 ;;
-    *) platform=linux/amd64 ;;
-  esac
-fi
+case $(docker info --format '{{.Architecture}}') in
+  aarch64 | arm64) host_platform=linux/arm64 ;;
+  *) host_platform=linux/amd64 ;;
+esac
+platform=${platform:-$host_platform}
 arch=${platform#linux/}
 out=${out:-$repo_dir/target/engine-kernels/$arch}
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 
-# The container is the isolation boundary: Nix's own sandbox needs privileges
-# a default container lacks, and its seccomp filter cannot be loaded under
-# amd64 emulation on an arm64 host. Inputs are still fixed by hash, and the
-# build script makes output independent of the build directory.
+# Nix's sandbox is on: the build reaches no network and sees only its
+# declared inputs. It needs namespaces a default container cannot create, so
+# the container is privileged. Its syscall filter cannot be loaded under
+# emulation (linux/amd64 on an arm64 host), so it is on only when the
+# container runs natively. Inputs are fixed by hash either way, and the build
+# script makes output independent of the build directory.
 # (Set in nix.conf: on the command line filter-syscalls does not reach every
 # build Nix starts.)
-nix_conf='sandbox = false\nfilter-syscalls = false\nmax-jobs = 1\ncores = 0\n'
+filter=false
+if [[ $platform == "$host_platform" ]]; then
+  filter=true
+fi
+nix_conf="sandbox = true\nsandbox-fallback = false\nfilter-syscalls = $filter\nmax-jobs = 1\ncores = 0\n"
 check_cmd=":"
 if [[ $check -eq 1 ]]; then
   check_cmd="nix-build --check /src/nix"
 fi
 
-docker run --rm --platform "$platform" \
+docker run --rm --privileged --platform "$platform" \
   -v "eidola-kernels-nix-$arch:/nix" \
   -v "$crate_dir:/src:ro" \
   -v "$out:/out" \

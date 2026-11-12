@@ -79,9 +79,12 @@ build system:
         ;;
     esac
 
-# Build the inference node's OCI image the way CI does (Docker, linux/amd64:
-# emulated on other hosts, and slow there) and print its digest, the value an
-# engine deployment's tinfoil-config.yml pins.
+# Build the inference node's OCI image and print its digest, the value an
+# engine deployment's tinfoil-config.yml pins: Nix inside the Containerfile's
+# pinned container (Docker, linux/amd64: emulated on other hosts, and slow
+# there), in Nix's sandbox from a privileged build step. CI's release build
+# runs Nix on the runner instead and requires this way to reach the same
+# digest. See crates/eidola-server-engine/AGENTS.md → The image.
 engine-image:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -91,7 +94,8 @@ engine-image:
     jq -r '."server-engine"."containerimage.digest"' "$metadata"
 
 # Build the inference engine's GPU kernels ahead of time on a GPU-less Linux
-# builder (pinned Nix in a pinned container; requires Docker). `--verify` fails
+# builder (pinned Nix in Nix's sandbox in a privileged, pinned container;
+# requires Docker). `--verify` fails
 # unless the result equals the committed kernels.manifest.json byte for byte;
 # `--update` rewrites it. See crates/eidola-engine-kernels/AGENTS.md.
 engine-kernels *args:

@@ -57,6 +57,11 @@ fi
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 BUILDKIT_IMAGE="moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b"
+# The inference node's container build runs Nix's sandbox in a privileged
+# step (oci/eidola-server-engine/Containerfile), so the builder this script
+# creates allows that one entitlement and every bake is passed `--allow` for
+# it. A target that does not request it is unaffected.
+BUILDKIT_FLAGS="--allow-insecure-entitlement security.insecure"
 
 # Pinned Nix runner image for cross-host Linux builds (see
 # build_linux_gui_via_docker). This is a deliberately *different* mechanism
@@ -459,6 +464,8 @@ ensure_builder() {
     needs_recreate=1
   elif ! grep -Fq "linux/amd64*" <<<"$inspect_output"; then
     needs_recreate=1
+  elif ! grep -Eq -- '--allow-insecure-entitlement[ =]security\.insecure' <<<"$inspect_output"; then
+    needs_recreate=1
   fi
 
   if [[ "$needs_recreate" -eq 1 ]]; then
@@ -472,6 +479,7 @@ ensure_builder() {
       --driver docker-container \
       --platform linux/amd64 \
       --driver-opt "image=${BUILDKIT_IMAGE}" \
+      --buildkitd-flags "$BUILDKIT_FLAGS" \
       >/dev/null
   fi
 
@@ -538,6 +546,7 @@ build_metadata() {
   fi
 
   docker buildx bake "${bake_targets[@]}" \
+    --allow security.insecure \
     ${builder_args[@]+"${builder_args[@]}"} \
     ${buildx_set_args[@]+"${buildx_set_args[@]}"} \
     --metadata-file "$METADATA_FILE"

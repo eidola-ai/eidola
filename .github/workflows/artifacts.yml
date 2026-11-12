@@ -335,20 +335,34 @@ jobs:
 
   # ── The inference node's image (cheap ubuntu runner, long build) ────────────
   # Its own job because nothing in the `oci` chain consumes it and its build
-  # is the longest of the images: Nix in the Containerfile's builder stage
-  # compiles the GPU kernels (fetching the pinned CUDA toolkit) and the node
-  # from a cold store. Built on every run, so the build is exercised before
-  # the manifest schema that records its digest is emitted; below that
-  # schema its partial is empty and `verify` checks nothing for it.
+  # is the longest of the images: Nix compiles the GPU kernels (fetching the
+  # pinned CUDA toolkit) and the node. Nix runs here on the runner, in its
+  # own sandbox, and BuildKit packages the tree it builds (the Containerfile's
+  # `build` stage replaced by that tree as a named context), so bake, the
+  # timestamp rewrite and the digest are those of every other image. Built on
+  # every run, so the build is exercised before the manifest schema that
+  # records its digest is emitted; below that schema its partial is empty and
+  # `verify` checks nothing for it. `oci-engine-container` rebuilds the same
+  # image the local way, and `artifact-manifest` requires the two digests to
+  # be equal.
   oci-engine:
     name: Build the inference node image
     needs: guard
     runs-on: ubuntu-24.04
     timeout-minutes: 150
+    # Same Cachix write-token gating as the linux-gui job: only main pushes
+    # get the branch-restricted `cachix-write` environment; other runs pull
+    # anonymously, and v* tag runs use no project cache at all.
+    environment: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'cachix-write' || '' }}
     env:
       ENGINE_BAKE_METADATA_FILE: ${{ github.workspace }}/.bake-server-engine.json
+      # The directory BuildKit receives as the `build` named context. Inside
+      # the workspace, where bake may read without a filesystem entitlement;
+      # under target/, which .dockerignore and .gitignore both exclude.
+      ENGINE_BUILD_CONTEXT: ${{ github.workspace }}/target/engine-image-build
     outputs:
       artifact_manifest: ${{ steps.partial.outputs.actual }}
+      digest: ${{ steps.partial.outputs.digest }}
     permissions:
       contents: read
       packages: write # push OCI images to ghcr.io on push events
@@ -360,8 +374,8 @@ jobs:
           persist-credentials: false
 
       - name: Free up disk space
-        # The builder stage holds the Rust toolchain, the CUDA toolkit and
-        # a release build's target directory at once.
+        # The Nix store holds the Rust toolchain, the CUDA toolkit and a
+        # release build's target directory at once.
         run: |
           before=$(df --output=avail -BG / | tail -1)
           sudo rm -rf \
@@ -372,6 +386,98 @@ jobs:
             /opt/hostedtoolcache/CodeQL \
             /usr/share/swift
           echo "Root disk avail: $before -> $(df --output=avail -BG / | tail -1)"
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          # The Nix release the container build pins (nixos/nix 2.32.4 in
+          # oci/eidola-server-engine/Containerfile), by its installer, which
+          # holds the release tarball's hash.
+          install_url: https://releases.nixos.org/nix/nix-2.32.4/install
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          # The sandbox with its syscall filter (the default on Linux), and no
+          # silent fallback to building without it. One derivation at a time
+          # on at most four cores, as in the container build: one nvcc per
+          # core runs this runner's 16 GiB out of memory.
+          extra_nix_config: |
+            sandbox = true
+            sandbox-fallback = false
+            filter-syscalls = true
+            max-jobs = 1
+            cores = 4
+
+      # Pull only: the push is the explicit step below, which keeps NVIDIA's
+      # toolkit out of the public cache. Skipped on v* release tags so the
+      # attested image is rebuilt from source, like the empty CACHE_REGISTRY
+      # on tags. (Upstream store paths still come from cache.nixos.org,
+      # pinned by flake.lock narHashes.)
+      - name: Configure Nix binary cache
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: eidola
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+          skipPush: true
+
+      - name: Build the GPU kernels and the image root in Nix's sandbox
+        run: |
+          set -euo pipefail
+          nix build --print-build-logs --out-link result-engine-kernels .#eidola-engine-kernels
+          nix build --print-build-logs --out-link result-engine-image-root .#eidola-server-engine-image-root
+
+      - name: Verify the kernels against kernels.manifest.json
+        # The image root fails on a mismatch too; this names the cause.
+        run: |
+          set -euo pipefail
+          if ! cmp -s result-engine-kernels/manifest.json crates/eidola-engine-kernels/kernels.manifest.json; then
+            diff -u crates/eidola-engine-kernels/kernels.manifest.json result-engine-kernels/manifest.json || true
+            echo "::error::the sandboxed kernel build does not reproduce kernels.manifest.json"
+            exit 1
+          fi
+          echo "kernels match kernels.manifest.json"
+
+      - name: Push this build's store paths to the project cache
+        # Every path this build realised whose closure holds nothing of
+        # NVIDIA's (the toolkit's licence does not let it be redistributed,
+        # and the cache is public). The list is checked before anything is
+        # pushed, so a reference to the toolkit fails the step, not the
+        # licence.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          nvidia='^/nix/store/[0-9a-z]{32}-(cuda|libcu|libnv|nvidia|nsight)'
+          scratch="$(mktemp -d)"
+          drv="$(nix path-info --derivation .#eidola-server-engine-image-root)"
+          nix-store --query --requisites --include-outputs "$drv" \
+            | grep -v '\.drv$' | sort -u > "$scratch/realised"
+          find /nix/store -mindepth 1 -maxdepth 1 | grep -E "$nvidia" > "$scratch/nvidia" || true
+          if [ -s "$scratch/nvidia" ]; then
+            xargs -r nix-store --query --referrers-closure < "$scratch/nvidia" | sort -u > "$scratch/tainted"
+          else
+            : > "$scratch/tainted"
+          fi
+          comm -23 "$scratch/realised" "$scratch/tainted" > "$scratch/push"
+          if xargs -r nix-store --query --requisites < "$scratch/push" | grep -E "$nvidia"; then
+            echo "::error::a path to push has an NVIDIA path in its closure"
+            exit 1
+          fi
+          echo "pushing $(wc -l < "$scratch/push") paths; withheld $(comm -12 "$scratch/realised" "$scratch/tainted" | wc -l)"
+          cachix push eidola < "$scratch/push"
+
+      - name: Lay out the image root as the build context
+        # The tree the container build's `build` stage leaves at /rootfs,
+        # made the same way: a 0755 directory, the store tree copied in with
+        # its modes. BuildKit sends the context owned by root, as that stage
+        # copies it.
+        run: |
+          set -euo pipefail
+          rm -rf "${ENGINE_BUILD_CONTEXT}"
+          mkdir -p "${ENGINE_BUILD_CONTEXT}"
+          mkdir -m 0755 "${ENGINE_BUILD_CONTEXT}/rootfs"
+          cp -R --preserve=mode "$(readlink -f result-engine-image-root)"/. "${ENGINE_BUILD_CONTEXT}/rootfs/"
 
       - name: Set up Docker Buildx # zizmor: ignore[cache-poisoning]
         # Same pinned buildx and BuildKit as the `oci` job, for the same
@@ -417,33 +523,19 @@ jobs:
           echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
-      - name: Build the inference node image
+      - name: Package the inference node image
         env:
           REGISTRY: ${{ steps.tags.outputs.registry || '' }}
           TAGS: ${{ steps.tags.outputs.tags || 'dev' }}
           EVENT_NAME: ${{ github.event_name }}
-          GIT_REF: ${{ github.ref }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          REPO: ${{ github.repository }}
-          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           PUSH_FLAG=""
           if [ "${EVENT_NAME}" = "push" ]; then
             PUSH_FLAG="--push"
           fi
 
-          # Same trusted-producer gating of the shared registry cache as the
-          # `oci` job's phases. Empty on v* release tags for a clean
-          # attested build.
-          if [[ "${GIT_REF}" == refs/tags/v* ]]; then
-            export CACHE_REGISTRY=""
-          elif [[ "${EVENT_NAME}" == "push" ]] || { [[ "${PR_HEAD_REF}" == "next" ]] && [[ "${PR_HEAD_REPO}" == "${REPO}" ]]; }; then
-            export CACHE_REGISTRY="ghcr.io/$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          else
-            export CACHE_REGISTRY=""
-          fi
-
+          # ENGINE_BUILD_CONTEXT (job env) replaces the Containerfile's
+          # `build` stage; no registry layer cache applies to this build.
           ./scripts/artifact-manifest.sh build \
             ${PUSH_FLAG} --targets server-engine \
             --metadata-file "${ENGINE_BAKE_METADATA_FILE}"
@@ -458,6 +550,8 @@ jobs:
             PUSH_FLAG="--push"
           fi
           jq . "${ENGINE_BAKE_METADATA_FILE}"
+          digest="$(jq -er 'to_entries[] | select(.key | test("^(ci-)?server-engine$")) | .value."containerimage.digest"' "${ENGINE_BAKE_METADATA_FILE}")"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
           {
             echo 'actual<<__EIDOLA_EOF__'
             ./scripts/artifact-manifest.sh print ${PUSH_FLAG} \
@@ -480,6 +574,100 @@ jobs:
             --metadata-file "${ENGINE_BAKE_METADATA_FILE}" --targets server-engine \
             --manifest artifact-manifest.json \
             || echo "::warning::the committed manifest does not record this engine image; the artifact-manifest job will fail"
+
+  # ── The inference node's image, the local way (cheap ubuntu, long build) ─────
+  # The same image built as `just engine-image` builds it: Nix inside the
+  # Containerfile's pinned container, here with Nix's sandbox off
+  # (ENGINE_NIX_SANDBOX=false). Never pushed. `artifact-manifest` requires its
+  # digest to equal `oci-engine`'s, so the sandbox is shown not to reach the
+  # image's bytes, and a local build that reproduces CI's digest is checking
+  # the image CI built. It keeps the engine's registry layer cache.
+  oci-engine-container:
+    name: Rebuild the inference node image in its container
+    needs: guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      ENGINE_BAKE_METADATA_FILE: ${{ github.workspace }}/.bake-server-engine.json
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    permissions:
+      contents: read
+      packages: write # write the shared registry layer cache on trusted runs
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free up disk space
+        # The builder stage holds the Rust toolchain, the CUDA toolkit and
+        # a release build's target directory at once.
+        run: |
+          before=$(df --output=avail -BG / | tail -1)
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift
+          echo "Root disk avail: $before -> $(df --output=avail -BG / | tail -1)"
+
+      - name: Set up Docker Buildx # zizmor: ignore[cache-poisoning]
+        # Same pinned buildx and BuildKit as the `oci` job, for the same
+        # reasons (see there).
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.31.1
+          platforms: linux/amd64
+          cache-binary: false
+          driver-opts: |
+            image=moby/buildkit:v0.28.0@sha256:60bfb07e39a6e524e78e6c4723114902c6b61ee36714493e357e39861bea753b
+          # The container build's Nix step is privileged, to host Nix's
+          # sandbox (oci/eidola-server-engine/Containerfile).
+          buildkitd-flags: --allow-insecure-entitlement security.insecure
+
+      - name: Log in to GHCR
+        # Same gating as the `oci` job.
+        if: github.event_name == 'push' || (github.event.pull_request.head.ref == 'next' && github.event.pull_request.head.repo.full_name == github.repository)
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the inference node image in its container
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.repository }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          ENGINE_NIX_SANDBOX: "false"
+        run: |
+          # Same trusted-producer gating of the shared registry cache as the
+          # `oci` job's phases. Empty on v* release tags for a clean
+          # attested build.
+          if [[ "${GIT_REF}" == refs/tags/v* ]]; then
+            export CACHE_REGISTRY=""
+          elif [[ "${EVENT_NAME}" == "push" ]] || { [[ "${PR_HEAD_REF}" == "next" ]] && [[ "${PR_HEAD_REPO}" == "${REPO}" ]]; }; then
+            export CACHE_REGISTRY="ghcr.io/$(echo "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          else
+            export CACHE_REGISTRY=""
+          fi
+
+          ./scripts/artifact-manifest.sh build --targets server-engine \
+            --metadata-file "${ENGINE_BAKE_METADATA_FILE}"
+
+      - name: Record the digest
+        id: digest
+        run: |
+          jq . "${ENGINE_BAKE_METADATA_FILE}"
+          digest="$(jq -er '."server-engine"."containerimage.digest"' "${ENGINE_BAKE_METADATA_FILE}")"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
   # ── Engine pins, re-measured from the platform's images (cheap ubuntu) ──────
   # Every gateway build holds each engine pin's MRTD to the platform release
@@ -863,6 +1051,7 @@ jobs:
     needs:
       - oci
       - oci-engine
+      - oci-engine-container
       - apple
       - linux-gui
       - linux-deb-arm64
@@ -873,6 +1062,22 @@ jobs:
       pull-requests: write # post REQUEST_CHANGES review when manifest is stale
 
     steps:
+      - name: Require the container build to reproduce the inference node image
+        # oci-engine built it in Nix's sandbox on the runner; oci-engine-
+        # container built it inside the Containerfile's container with the
+        # sandbox off. Different digests mean the build is not a function of
+        # its inputs alone, and neither is trusted.
+        env:
+          SANDBOXED: ${{ needs.oci-engine.outputs.digest }}
+          CONTAINER: ${{ needs.oci-engine-container.outputs.digest }}
+        run: |
+          echo "sandboxed on the runner: ${SANDBOXED:-<none>}"
+          echo "in the container:        ${CONTAINER:-<none>}"
+          if [ -z "${SANDBOXED}" ] || [ "${SANDBOXED}" != "${CONTAINER}" ]; then
+            echo "::error::the inference node image's two builds differ (${SANDBOXED:-<none>} vs ${CONTAINER:-<none>})"
+            exit 1
+          fi
+
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -27,6 +27,21 @@ variable "CARGO_PROFILE" {
   default = "release"
 }
 
+# The inference node's image root, already built: a directory holding
+# `rootfs/` (CI's runner-side Nix build, in Nix's sandbox). Set, it replaces
+# the Containerfile's `build` stage as a named context; empty (the default,
+# and every local build), that stage runs Nix inside its pinned container.
+variable "ENGINE_BUILD_CONTEXT" {
+  default = ""
+}
+
+# Nix's sandbox in the container build of that root: "true" (the default) or
+# "false", which CI's reproduction uses to show the sandbox does not reach
+# the image's bytes.
+variable "ENGINE_NIX_SANDBOX" {
+  default = "true"
+}
+
 # ── Base target: shared settings applied to all images ─────────────────────────
 
 target "_common" {
@@ -64,9 +79,24 @@ target "_cache_postgres" {
   cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:postgres,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
 }
 
+# The engine's cache holds the container build's layers, so a build from a
+# named context neither reads nor writes it: its one step is a copy, and
+# writing would replace the container build's layers with that copy.
 target "_cache_server_engine" {
-  cache-from = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:server-engine"] : []
-  cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:server-engine,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
+  cache-from = CACHE_REGISTRY != "" && ENGINE_BUILD_CONTEXT == "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:server-engine"] : []
+  cache-to   = CACHE_REGISTRY != "" && ENGINE_BUILD_CONTEXT == "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:server-engine,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
+}
+
+# How the engine image's root is reached (see ENGINE_BUILD_CONTEXT). The
+# container build's Nix step is privileged so it can host Nix's sandbox, so
+# it requests `security.insecure`, which the builder must allow; a build from
+# the named context runs no such step and requests nothing.
+target "_engine_root" {
+  args = {
+    NIX_SANDBOX = ENGINE_NIX_SANDBOX
+  }
+  contexts     = ENGINE_BUILD_CONTEXT != "" ? { build = ENGINE_BUILD_CONTEXT } : {}
+  entitlements = ENGINE_BUILD_CONTEXT != "" ? [] : ["security.insecure"]
 }
 
 # ── Local dev targets ─────────────────────────────────────────────────────────
@@ -118,10 +148,10 @@ target "postgres" {
 # The inference node (eidola-server-engine, CUDA executor). Recorded under
 # the manifest key `eidola-server-engine` from the manifest schema that
 # records it (scripts/artifact-manifest.sh, ENGINE_IMAGE_SCHEMA). Its build
-# is Nix inside the Containerfile's builder stage, so CARGO_PROFILE does not
-# reach it: the image is always the release profile.
+# is Nix (on CI's runner, or in the Containerfile's builder stage), so
+# CARGO_PROFILE does not reach it: the image is always the release profile.
 target "server-engine" {
-  inherits   = ["_common", "_cache_server_engine"]
+  inherits   = ["_common", "_cache_server_engine", "_engine_root"]
   context    = "."
   dockerfile = "oci/eidola-server-engine/Containerfile"
   tags       = ["eidola-server-engine:dev"]
@@ -180,7 +210,7 @@ target "ci-postgres" {
 }
 
 target "ci-server-engine" {
-  inherits   = ["_ci", "_cache_server_engine"]
+  inherits   = ["_ci", "_cache_server_engine", "_engine_root"]
   context    = "."
   dockerfile = "oci/eidola-server-engine/Containerfile"
   tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-server-engine:${t}"]
