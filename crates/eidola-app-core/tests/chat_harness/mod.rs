@@ -251,17 +251,22 @@ pub enum ChatBehavior {
     /// it arrives, so a reader that measures only what is left after draining
     /// complete events takes this one whole.
     StreamingOneOversizedEvent,
-    /// A `200` SSE stream of **ordinary, well-framed events that never stops
-    /// coming** — far more content than any completion, each event small, and
-    /// a `[DONE]` only at the very end.
+    /// A `200` SSE stream of **ordinary, well-framed events carrying more
+    /// content than any completion** — each event small, then the metadata
+    /// event with the round's refunds and `[DONE]`.
     ///
     /// Not [`ChatBehavior::StreamingUnterminatedFlood`]: every event here ends
-    /// properly, so a frame-buffer ceiling never trips. What has to end it is a
-    /// ceiling on the stream as a whole, because a turn assembles the deltas
-    /// into an answer in memory and a stream without end is an answer without
-    /// end. The total is spelled here rather than imported — the mock is the
-    /// peer and must not learn this app's ceilings.
+    /// properly, so a frame-buffer ceiling never trips. What has to refuse it
+    /// is the ceiling on the answer, because a turn assembles the deltas into
+    /// an answer in memory. The total is spelled here rather than imported —
+    /// the mock is the peer and must not learn this app's ceilings.
     StreamingPastReadCeiling,
+    /// A `200` SSE stream whose **envelope passes the read ceiling while its
+    /// answer stays small**: each event carries one byte of content inside a
+    /// large member around it, as every real delta arrives inside an event
+    /// many times its size, then the metadata event with the round's refunds
+    /// and `[DONE]`.
+    StreamingEnvelopePastReadCeiling,
     /// Accept the request, then drop the connection before sending any
     /// response bytes (network error after send).
     DropBeforeResponse,
@@ -2417,7 +2422,38 @@ async fn handle_chat(
             // ceiling, in events no larger than any frame bound.
             let piece = "y".repeat(64 * 1024);
             let pieces: Vec<&str> = std::iter::repeat_n(piece.as_str(), 160).collect();
-            write_sse_stream(stream, true, &pieces).await
+            write_sse_stream_with_metadata(stream, &pieces, completed_refunds()).await
+        }
+        ChatBehavior::StreamingEnvelopePastReadCeiling => {
+            // 160 events of 64 KiB each, ten megabytes of stream, carrying
+            // 160 bytes of answer.
+            let envelope = "e".repeat(64 * 1024);
+            let mut events: Vec<String> = (0..160)
+                .map(|_| {
+                    serde_json::json!({
+                        "system_fingerprint": envelope,
+                        "choices": [{ "delta": { "content": "y" } }],
+                    })
+                    .to_string()
+                })
+                .collect();
+            events.push(
+                serde_json::json!({
+                    "choices": [{ "delta": {}, "finish_reason": "stop" }],
+                    "usage": { "prompt_tokens": 11, "completion_tokens": 160 },
+                })
+                .to_string(),
+            );
+            let mut metadata = serde_json::json!({
+                "object": "eidola.chat.completion.metadata",
+                "id": "chatcmpl-mock",
+            });
+            if let Some(refunds) = completed_refunds() {
+                metadata["refunds"] = refunds;
+            }
+            events.push(metadata.to_string());
+            events.push("[DONE]".to_string());
+            write_sse_events(stream, &events).await
         }
         ChatBehavior::OkStreamingOversized => {
             // Three large content deltas — together far past what a Record row
@@ -3364,6 +3400,25 @@ async fn write_raw(
     );
     stream.write_all(head.as_bytes()).await?;
     stream.write_all(body.as_bytes()).await?;
+    stream.flush().await
+}
+
+/// Each of `events` as one `data:` event, in a chunked `200` stream.
+async fn write_sse_events(stream: &mut TcpStream, events: &[String]) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Connection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    for payload in events {
+        let event = format!("data: {payload}\n\n");
+        stream
+            .write_all(format!("{:x}\r\n", event.len()).as_bytes())
+            .await?;
+        stream.write_all(event.as_bytes()).await?;
+        stream.write_all(b"\r\n").await?;
+    }
+    stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await
 }
 
