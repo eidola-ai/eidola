@@ -15,7 +15,7 @@ An engine deployment:
 
 The gateway is a *client* of these deployments. It verifies each one's attestation on every TCP+TLS connection it opens, using the same `tinfoil-verifier` crate the Eidola client uses to verify the gateway.
 
-**One deployment is pinned, and none is running.** The catalog lists one model, MiMo-V2.6-Flash, and the source tree commits and pins one deployment of it, `deploy/engine/mimo-v2.6-flash/b300x1/` (one NVIDIA B300). That deployment has not been launched. A gateway built from this tree lists the model on `/v1/models`, and refuses every request for it with `503` and a full refund, because no running engine is placed for it. A catalog row, its price and its pin land together, and the gateway's build refuses a row without a pin or a pin without a row.
+**One deployment is pinned, and none is running.** The catalog lists one model, MiMo-V2.6-Flash, and the source tree commits and pins one deployment of it, `deploy/engine/mimo-v2.6-flash/b300x1/` (one NVIDIA B300). That deployment has not been launched. A gateway built from this tree lists the model on `/v1/models`, and refuses every request for it with `503`, refunding all but the request fee, because no running engine is placed for it. A catalog row, its price and its pin land together, and the gateway's build refuses a row without a pin or a pin without a row.
 
 ## What pins the engine
 
