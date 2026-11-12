@@ -48,6 +48,8 @@ The cryptographic-verifier gaps are also noted at the top of [`crates/eidola-app
 
 **Current behavior.** A fresh client (no prior installed `git_commit`) bypasses continuity, so an adversary serving an internally-consistent *older* `release.json` could route them onto a real-but-stale release.
 
+**Today every client is a fresh client.** No build knows the commit it was released from, and none can learn it at build time: the release commit records the binaries' `narHash` in `artifact-manifest.json`, so a binary embedding that commit could never reach a fixed point (the same reason the manifest is excluded from the build's source). The installed commit has to come from the updater recording what it installed, which waits on promotion (Install / atomic-replace, below). Until then the continuity stage is skipped on every check, and the version gate (`latest > installed`, against the compile-time workspace version) is the only ordering the client enforces.
+
 **Mitigations today.** None that the client can enforce. A first install is exactly the case where the client has nothing to compare against, so the surface "did you download a current release or a stale-but-internally-consistent one?" lives outside the client's reach today.
 
 **Future.** A *freshness anchor* is something a fresh install *can* validate at the moment of download, without needing prior state. The general shape: every release embeds (or references) a recent timestamped artifact from a public, append-only system that an attacker cannot retroactively forge.
