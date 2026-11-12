@@ -2608,20 +2608,26 @@ impl Inner {
     }
 
     /// Rewrite the config: load it strictly, apply `change`, save it whole —
-    /// under one process-wide lock for the whole span. Each save already
-    /// publishes only its own bytes, but a setter that loaded the file before
-    /// a background account create saved its credentials, and renamed after,
-    /// would publish a whole, well-formed snapshot with no account in it:
-    /// the only copy of the secret, lost to a zoom step. Every setter holds
-    /// the lock from load through rename, so the snapshot it saves is the
-    /// file it read. The lock is held across no `.await`: every caller loads,
-    /// changes and saves synchronously, and the account flows do their network
-    /// work before calling in.
+    /// under this core's config lock for the whole span. The lock is per
+    /// `AppCore`, which is per profile: the database's exclusive lock refuses
+    /// a second core on the same profile. Each save already publishes only its
+    /// own bytes, but a setter that loaded the file before a background
+    /// account create saved its credentials, and renamed after, would publish
+    /// a whole, well-formed snapshot with no account in it: the only copy of
+    /// the secret, lost to a zoom step. Every setter holds the lock from load
+    /// through rename, so the snapshot it saves is the file it read. The lock
+    /// is held across no `.await`: every caller loads, changes and saves
+    /// synchronously, and the account flows do their network work before
+    /// calling in.
+    ///
+    /// Holding it is also what makes this the moment to remove temporaries a
+    /// crashed save left behind: no save of the file can be in flight.
     fn update_config(
         &self,
         change: impl FnOnce(&mut Config) -> Result<(), AppError>,
     ) -> Result<(), AppError> {
         let _serialized = self.config_write.lock().unwrap_or_else(|e| e.into_inner());
+        config::sweep_stale_temporaries(&self.config_path);
         let mut cfg = Config::load_for_update(&self.config_path)?;
         change(&mut cfg)?;
         cfg.save_to(&self.config_path)

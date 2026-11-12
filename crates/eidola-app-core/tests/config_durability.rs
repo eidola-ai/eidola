@@ -21,9 +21,9 @@ fn config_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
     dir.path().join("config.toml")
 }
 
-/// A hand edit the parser refuses (here an unquoted string) used to read as
-/// "no config at all", and the next preference write then saved those
-/// defaults over the file — the account secret with them.
+/// A hand edit the parser refuses (here an unquoted string) must never read
+/// as "no config at all" to a setter, or the next preference write saves
+/// those defaults over the file — the account secret with them.
 #[test]
 fn a_typo_elsewhere_in_config_never_erases_the_account() {
     let (core, dir) = make_core();
@@ -45,8 +45,8 @@ fn a_typo_elsewhere_in_config_never_erases_the_account() {
     );
 }
 
-/// Same hole, worse door: an unreadable config shows first-run onboarding,
-/// and linking an account there must not write over the one already held.
+/// An unreadable config shows first-run onboarding, and linking an account
+/// there must not write over the one already held.
 #[test]
 fn an_unreadable_config_refuses_new_credentials() {
     let (core, dir) = make_core();
@@ -99,9 +99,9 @@ fn refusing_an_unreadable_config_never_quotes_the_secret() {
     );
 }
 
-/// `fs::write` truncates in place, so a reader landing between the truncate
-/// and the write sees no account at all (and a crash there leaves it so). The
-/// file must only ever be replaced whole.
+/// A write that truncates in place lets a reader landing between the
+/// truncate and the write see no account at all (and a crash there leaves it
+/// so). The file is only ever replaced whole.
 #[test]
 fn a_reader_never_sees_a_half_written_config() {
     let (core, dir) = make_core();
@@ -172,6 +172,37 @@ fn concurrent_setters_lose_no_update() {
     assert_eq!(saved.language_override.as_deref(), Some("lang-199"));
     assert_eq!(saved.font_scale_override, Some(1.49));
     assert_eq!(saved.account_secret.as_deref(), Some("s3cret-never-lost"));
+}
+
+/// A crash between a save's create and its rename leaves its temporary
+/// beside the profile, holding the secret. The next update sweeps it, under
+/// the lock no other save of the file can be in flight without, and leaves
+/// anything that only resembles one alone.
+#[test]
+fn a_crashed_saves_temporary_is_swept_by_the_next_update() {
+    let (core, dir) = make_core();
+    core.set_account_credentials("acct-1".into(), "s3cret".into())
+        .unwrap();
+    let stale = dir
+        .path()
+        .join(format!("config.toml.{}.tmp", "0123456789abcdef".repeat(2)));
+    std::fs::write(&stale, "account_secret = \"s3cret\"\n").unwrap();
+    let kept = ["config.toml.notes.tmp", "config.toml.bak", "other.toml.tmp"];
+    for name in kept {
+        std::fs::write(dir.path().join(name), "").unwrap();
+    }
+
+    core.set_font_scale(1.25).unwrap();
+
+    assert!(
+        !stale.exists(),
+        "the crashed save's temporary was left behind"
+    );
+    for name in kept {
+        assert!(dir.path().join(name).exists(), "{name} was swept");
+    }
+    let saved = Config::load_for_update(&config_path(&dir)).unwrap();
+    assert_eq!(saved.account_secret.as_deref(), Some("s3cret"));
 }
 
 /// `POST /v1/account` that changes the profile under the create before it

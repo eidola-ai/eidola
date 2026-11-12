@@ -402,6 +402,12 @@ impl Config {
     /// as needed. The file is replaced whole — written beside it, synced, then
     /// renamed over — so a reader or a crash never sees it truncated, and on
     /// Unix it is created owner-only, since it holds the account secret.
+    ///
+    /// `Ok` means the new file is in place: the rename is the commit. The
+    /// directory syncs that follow it make the rename crash-durable; one that
+    /// fails is logged rather than returned, because the file has already been
+    /// replaced and an `Err` would tell the caller its bytes were not saved
+    /// when every later read will find them.
     pub fn save_to(&self, path: &Path) -> Result<(), AppError> {
         use std::io::Write;
 
@@ -434,8 +440,8 @@ impl Config {
         // copy of the account secret. With its own name, a call can only
         // publish the bytes it wrote and synced; `create_new` makes that a
         // guarantee rather than a convention. A crash between create and
-        // rename leaves a `config.toml.<id>.tmp` behind, owner-only and
-        // inert.
+        // rename leaves a `config.toml.<id>.tmp` behind, owner-only;
+        // [`sweep_stale_temporaries`] removes it under the update lock.
         let tmp = path.with_extension(format!("toml.{}.tmp", uuid::Uuid::new_v4().simple()));
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -469,22 +475,63 @@ impl Config {
                 } else {
                     dir
                 };
-                fs::File::open(dir)
-                    .and_then(|dir| dir.sync_all())
-                    .map_err(write_err)
+                if let Err(e) = fs::File::open(dir).and_then(|dir| dir.sync_all()) {
+                    eprintln!(
+                        "eidola: saved {} but could not sync {}: {e}",
+                        path.display(),
+                        dir.display()
+                    );
+                }
             };
-            sync_dir(path.parent().unwrap_or(Path::new(".")))?;
+            sync_dir(path.parent().unwrap_or(Path::new(".")));
             // Deepest first is not required; each created directory's entry
             // is made durable in the directory that holds it.
             for created in &created_dirs {
                 if let Some(holder) = created.parent() {
-                    sync_dir(holder)?;
+                    sync_dir(holder);
                 }
             }
         }
         #[cfg(not(unix))]
         let _ = created_dirs;
         Ok(())
+    }
+}
+
+/// Remove the temporaries a crashed [`Config::save_to`] of `path` left behind
+/// (`<name>.<32 hex>.tmp` beside it — owner-only, and holding whatever the
+/// file held, account secret included).
+///
+/// Only safe where no save of `path` can be in flight: the caller holds the
+/// lock every save of `path` is made under (`Inner::update_config`), and that
+/// lock belongs to the one `AppCore` that may write this profile, since the
+/// database's exclusive lock refuses a second. Best effort: a temporary that
+/// cannot be removed is left for the next update.
+pub(crate) fn sweep_stale_temporaries(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return;
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(id) = file_name
+            .to_str()
+            .and_then(|n| n.strip_prefix(name))
+            .and_then(|n| n.strip_prefix('.'))
+            .and_then(|n| n.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let _ = fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -812,6 +859,39 @@ mod tests {
             parsed.update_feed_override.as_deref(),
             Some("http://localhost:8123")
         );
+    }
+
+    /// Once the rename has replaced the file the save has happened, so a
+    /// directory sync that fails after it is not an error the caller can act
+    /// on: reporting one would have an account create hand back, as unsaved,
+    /// an account every later read finds in the profile. The directory is
+    /// made unreadable (write and search only), which lets the temporary be
+    /// created and renamed but refuses the open the sync needs.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_sync_that_fails_after_the_rename_is_still_a_save() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        fs::create_dir(&profile).unwrap();
+        let path = profile.join("config.toml");
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o300)).unwrap();
+        // A user the permission bits do not bind (root) can open the
+        // directory anyway; there is nothing to observe then.
+        let refused = fs::File::open(&profile).is_err();
+        let cfg = Config {
+            account_id: Some("acct-1".into()),
+            account_secret: Some("s3cret".into()),
+            ..Config::default()
+        };
+        let saved = cfg.save_to(&path);
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o700)).unwrap();
+        if !refused {
+            return;
+        }
+        saved.expect("the rename succeeded, so the save did");
+        let on_disk = Config::load_for_update(&path).unwrap();
+        assert_eq!(on_disk.account_secret.as_deref(), Some("s3cret"));
     }
 
     /// Saves can overlap (a background account create against a GUI
