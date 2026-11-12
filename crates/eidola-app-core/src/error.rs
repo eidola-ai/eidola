@@ -205,11 +205,16 @@ pub enum AppError {
     /// asked can show it to be saved and linked once the profile is fixed.
     /// `Display` names only the account id and the cause; the secret is in
     /// [`AccountSecret`], which prints redacted, so a log line cannot copy it.
+    ///
+    /// The accepted terms were still submitted as the new account, and
+    /// `terms` is the standing that left — the same report a saved create
+    /// returns — so a surface can say what linking it will still need.
     #[error("the account {account_id} was created but this profile could not save it: {reason}")]
     AccountNotSaved {
         account_id: String,
         secret: AccountSecret,
         reason: String,
+        terms: Box<crate::TermsAcceptance>,
     },
 
     /// A model notice's action (switching to newer weights, dismissing a

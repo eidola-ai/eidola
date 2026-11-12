@@ -943,6 +943,7 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                         account_id,
                         secret,
                         reason,
+                        terms,
                     }) => {
                         eprintln!(
                             "the account was created, but this profile could not save it: {reason}"
@@ -953,6 +954,7 @@ async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
                         eprintln!(
                             "once the profile is fixed, link it with: eidola account configure --id <id> --secret <secret>"
                         );
+                        report_terms_standing(&terms);
                         std::process::exit(1);
                     }
                     Err(e) => return Err(e.into()),

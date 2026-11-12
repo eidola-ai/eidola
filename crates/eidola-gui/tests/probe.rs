@@ -10879,6 +10879,7 @@ fn an_unsaved_account_shows_its_credential_to_copy(cx: &mut TestAppContext) {
                 account_id: "00000000-0000-0000-0000-00000000000c".into(),
                 secret: eidola_app_core::error::AccountSecret::new("only-copy".into()),
                 reason: "config error: unreadable".into(),
+                terms: Box::new(eidola_app_core::TermsAcceptance::Complete),
             },
             cx,
         );

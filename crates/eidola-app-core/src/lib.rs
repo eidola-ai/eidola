@@ -3342,14 +3342,9 @@ impl Inner {
             cfg.account_secret = Some(created.secret.clone());
             Ok(())
         });
-        if let Err(e) = saved {
-            return Err(AppError::AccountNotSaved {
-                account_id: created.account_id.to_string(),
-                secret: crate::error::AccountSecret::new(created.secret),
-                reason: e.to_string(),
-            });
+        if saved.is_ok() {
+            self.bus.emit(Change::Config);
         }
-        self.bus.emit(Change::Config);
 
         // Record the user's acceptance of exactly the documents the caller
         // presented — never a freshly fetched set, which would record consent
@@ -3365,10 +3360,28 @@ impl Inner {
         // nothing is known to have been recorded, nothing is assumed: the
         // standing is read with an empty recorded set, which lists everything
         // currently required.
-        let terms = match self.submit_terms(&accepted_terms).await {
+        //
+        // Submitted as the account just created, whether or not the profile
+        // kept it: the reader accepted this snapshot for *this* account, and an
+        // unsaved one linked later would otherwise come back gated, with
+        // nothing on the onboarding path that could accept for it again.
+        let account_id = created.account_id.to_string();
+        let terms = match self
+            .submit_terms_as(&account_id, &created.secret, &accepted_terms)
+            .await
+        {
             Ok(()) => self.terms_standing(&accepted_terms).await,
             Err(_) => self.terms_standing(&[]).await,
         };
+
+        if let Err(e) = saved {
+            return Err(AppError::AccountNotSaved {
+                account_id,
+                secret: crate::error::AccountSecret::new(created.secret),
+                reason: e.to_string(),
+                terms: Box::new(terms),
+            });
+        }
 
         Ok(AccountCreateResult {
             id: created.account_id.to_string(),
@@ -3443,11 +3456,26 @@ impl Inner {
         if presented.is_empty() {
             return Ok(());
         }
-
         let cfg = self.load_config();
+        let (id, secret) = self.require_credentials(&cfg)?;
+        self.submit_terms_as(id, secret, presented).await
+    }
+
+    /// [`Self::submit_terms`] for named credentials rather than the
+    /// profile's: account creation submits as the account it just created,
+    /// which the profile may have been unable to keep.
+    async fn submit_terms_as(
+        &self,
+        id: &str,
+        secret: &str,
+        presented: &[TermsDocument],
+    ) -> Result<(), AppError> {
+        if presented.is_empty() {
+            return Ok(());
+        }
+
         let eidola = self.eidola_resolved().await?;
         let base_url = eidola.base_url.as_str();
-        let (id, secret) = self.require_credentials(&cfg)?;
         let client = self.build_client(&eidola, None).await?;
 
         for d in presented {

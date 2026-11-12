@@ -160,13 +160,52 @@ impl wiremock::Respond for CreateAfter {
     }
 }
 
-/// Create an account against a server whose create rewrites `config.toml` to
-/// `rewrite_to` first; returns the create's outcome and the file after it.
+/// `POST /v1/account/terms` — records the `Authorization` each submission
+/// went out under, and accepts it.
+struct RecordTerms(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl wiremock::Respond for RecordTerms {
+    fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let auth = request
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        self.0.lock().unwrap().push(auth);
+        wiremock::ResponseTemplate::new(204)
+    }
+}
+
+/// The one document the reader is shown and accepts.
+fn presented_terms() -> eidola_app_core::TermsDocument {
+    eidola_app_core::TermsDocument {
+        document: "terms_of_service".into(),
+        version: 3,
+        url: "https://example.invalid/terms_of_service/".into(),
+        sha256: "a".repeat(64),
+    }
+}
+
+/// HTTP Basic credentials as they go on the wire.
+fn basic(id: &str, secret: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{id}:{secret}"))
+    )
+}
+
+/// Create an account, accepting [`presented_terms`], against a server whose
+/// create rewrites `config.toml` to `rewrite_to` first; returns the create's
+/// outcome, the file after it, and the `Authorization` of each terms
+/// submission.
 fn create_while_config_becomes(
     rewrite_to: &'static str,
 ) -> (
     Result<eidola_app_core::AccountCreateResult, AppError>,
     String,
+    Vec<String>,
 ) {
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let dir = tempfile::tempdir().unwrap();
@@ -175,6 +214,7 @@ fn create_while_config_becomes(
         AppCore::with_test_http_client(dir.path().to_path_buf(), dir.path().join("data"), client)
             .expect("open core");
     let path = config_path(&dir);
+    let submissions = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let server = core.runtime().block_on(async {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -185,14 +225,37 @@ fn create_while_config_becomes(
             })
             .mount(&server)
             .await;
+        let doc = presented_terms();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/terms"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "documents": [{
+                        "document": doc.document,
+                        "version": doc.version,
+                        "url": doc.url,
+                        "sha256": doc.sha256,
+                    }],
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/account/terms"))
+            .respond_with(RecordTerms(submissions.clone()))
+            .mount(&server)
+            .await;
         server
     });
     core.runtime()
         .block_on(core.set_base_url(server.uri()))
         .expect("set base url");
-    let created = core.runtime().block_on(core.account_create(Vec::new()));
+    let created = core
+        .runtime()
+        .block_on(core.account_create(vec![presented_terms()]));
     let after = std::fs::read_to_string(&path).unwrap();
-    (created, after)
+    let submitted = submissions.lock().unwrap().clone();
+    (created, after, submitted)
 }
 
 /// The strict reload refuses a config that became unparseable while the
@@ -202,17 +265,34 @@ fn create_while_config_becomes(
 #[test]
 fn a_created_account_survives_a_config_that_broke_in_flight() {
     let broken = "font_scale = big\n";
-    let (created, after) = create_while_config_becomes(broken);
+    let (created, after, submitted) = create_while_config_becomes(broken);
     match created {
         Err(AppError::AccountNotSaved {
-            account_id, secret, ..
+            account_id,
+            secret,
+            terms,
+            ..
         }) => {
             assert_eq!(account_id, "00000000-0000-0000-0000-00000000000c");
             assert_eq!(secret.expose(), "only-copy-of-the-new-secret");
+            // The snapshot the reader accepted is recorded for the account it
+            // was accepted for, so linking it later does not come back gated.
+            assert!(
+                matches!(*terms, eidola_app_core::TermsAcceptance::Complete),
+                "the accepted terms were not recorded: {terms:?}"
+            );
         }
         other => panic!("the created credential was not handed back: {other:?}"),
     }
     assert_eq!(after, broken, "the unreadable config was written over");
+    assert_eq!(
+        submitted,
+        vec![basic(
+            "00000000-0000-0000-0000-00000000000c",
+            "only-copy-of-the-new-secret"
+        )],
+        "the accepted terms did not go out as the new account"
+    );
 }
 
 /// The preflight's "no account yet" ran before the request. An account linked
@@ -221,7 +301,17 @@ fn a_created_account_survives_a_config_that_broke_in_flight() {
 #[test]
 fn an_account_linked_while_creating_is_never_overwritten() {
     let linked = "account_id = \"acct-1\"\naccount_secret = \"s3cret-never-lost\"\n";
-    let (created, after) = create_while_config_becomes(linked);
+    let (created, after, submitted) = create_while_config_becomes(linked);
+    // Accepted for the account being created, never for the one that was
+    // linked meanwhile.
+    assert_eq!(
+        submitted,
+        vec![basic(
+            "00000000-0000-0000-0000-00000000000c",
+            "only-copy-of-the-new-secret"
+        )],
+        "the accepted terms went out under another account"
+    );
     let err = match created {
         Err(e @ AppError::AccountNotSaved { .. }) => e,
         other => panic!("the create wrote over a linked account: {other:?}"),
