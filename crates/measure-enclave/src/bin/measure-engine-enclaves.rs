@@ -8,9 +8,11 @@
 //!     --output releases/trust/engine-enclaves.json
 //!
 //! `--release-dir` holds, for every `cvm-version` a deployment selects, the
-//! platform provider's `tinfoil-inference-v<version>-manifest.json` and
-//! `tinfoil-tdx-v<version>.igvm`. The manifest must hash to the pin in the
-//! config's `cvm-version`, and the image to the manifest's record of it.
+//! platform provider's `tinfoil-tdx-v<version>.igvm`. The release's manifest
+//! is read from where it is vendored,
+//! `releases/trust/cvm-releases/v<tag>/tinfoil-inference-v<version>-manifest.json`:
+//! it must hash to the pin in the config's `cvm-version`, and the image to
+//! the manifest's record of it.
 //! Each deployment's TDX machine policy is derived from the platform
 //! endorsements release its `deployment.json` names, vendored under
 //! `releases/trust/platform-endorsements/` and verified offline.
@@ -29,7 +31,7 @@ struct Cli {
     /// The workspace root.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
-    /// Directory holding each selected release's manifest and TDX IGVM image.
+    /// Directory holding each selected release's TDX IGVM image.
     #[arg(long)]
     release_dir: PathBuf,
     /// Where to write the file (stdout when absent).
@@ -55,16 +57,11 @@ fn main() -> Result<()> {
             let sidecar = read(&variant.join("deployment.json"))?;
             let (version, _) =
                 engine_enclaves::required_release(&config).with_context(|| config_path.clone())?;
-            let release_manifest = read(
-                &cli.release_dir
-                    .join(format!("tinfoil-inference-v{version}-manifest.json")),
-            )?;
             let igvm = read(&cli.release_dir.join(format!("tinfoil-tdx-v{version}.igvm")))?;
             let entry = engine_enclaves::deployment_entry(&DeploymentInputs {
                 config_path: &config_path,
                 config: &config,
                 sidecar: &sidecar,
-                release_manifest: &release_manifest,
                 igvm: &igvm,
                 read: &workspace_file,
             })

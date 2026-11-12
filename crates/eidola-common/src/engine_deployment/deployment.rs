@@ -103,6 +103,143 @@ pub fn is_platform_release_tag(tag: &str) -> bool {
         })
 }
 
+/// Where the platform provider's release manifests are vendored, relative to
+/// the workspace root: one directory per release tag, holding the manifest of
+/// each of its images that a committed engine config pins.
+pub const CVM_RELEASES_ROOT: &str = "releases/trust/cvm-releases";
+
+/// The vendored release manifest a config's `cvm-version` pins:
+/// `releases/trust/cvm-releases/v<tag>/tinfoil-inference-v<version>-manifest.json`,
+/// where `<version>` is the config's (`0.15.3-rc.1+gpu`) and `<tag>` the
+/// release it belongs to (`0.15.3-rc.1`), as the provider names the asset.
+pub fn release_manifest_file(cvm_version: &str) -> Result<String, String> {
+    let release = parse_cvm_version(cvm_version).map_err(|e| e.to_string())?;
+    let version = release.version;
+    // The version becomes a path component: a release version's characters,
+    // and nothing that could leave the directory.
+    if !version.starts_with(|c: char| c.is_ascii_digit())
+        || !version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+    {
+        return Err(format!(
+            "cvm-version {version:?} is not a release version ([0-9][0-9A-Za-z.+-]*)"
+        ));
+    }
+    let tag = version.split_once('+').map_or(version, |(tag, _)| tag);
+    Ok(format!(
+        "{CVM_RELEASES_ROOT}/v{tag}/tinfoil-inference-v{version}-manifest.json"
+    ))
+}
+
+/// What a platform release manifest states about its TDX image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleaseTdxLaunch {
+    /// The release the manifest describes, as it states it (`v0.15.3-rc.1+gpu`).
+    pub version: String,
+    /// SHA-256 of the TDX IGVM image (`igvm.tdx`, lowercase hex).
+    pub igvm_sha256: String,
+    /// The image's MRTD (`igvm.tdx_launch.mrtd`, lowercase hex).
+    pub mrtd: String,
+}
+
+/// The members of a release manifest read here; the rest (the SEV-SNP
+/// image, the kernel command line, disk hashes) is not.
+#[derive(serde::Deserialize)]
+struct ReleaseManifestFile {
+    version: String,
+    igvm: ReleaseIgvm,
+}
+
+#[derive(serde::Deserialize)]
+struct ReleaseIgvm {
+    format_version: u32,
+    tdx: String,
+    tdx_launch: ReleaseTdxLaunchFile,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseTdxLaunchFile {
+    mrtd: String,
+    rtmr0: String,
+    rtmr1: String,
+    rtmr2: String,
+    rtmr3: String,
+}
+
+/// Read a release manifest's TDX launch statement, in the launch model the
+/// measurement implements: `igvm.format_version` 1, and RTMR0–RTMR3 zero
+/// (no measured boot after launch).
+pub fn read_release_manifest(manifest: &[u8]) -> Result<ReleaseTdxLaunch, String> {
+    let file: ReleaseManifestFile =
+        serde_json::from_slice(manifest).map_err(|e| format!("parsing release manifest: {e}"))?;
+    if file.igvm.format_version != 1 {
+        return Err(format!(
+            "release manifest igvm.format_version {} is not supported",
+            file.igvm.format_version
+        ));
+    }
+    let launch = &file.igvm.tdx_launch;
+    let zero = "00".repeat(48);
+    for (name, value) in [
+        ("rtmr0", &launch.rtmr0),
+        ("rtmr1", &launch.rtmr1),
+        ("rtmr2", &launch.rtmr2),
+        ("rtmr3", &launch.rtmr3),
+    ] {
+        if *value != zero {
+            return Err(format!(
+                "release states a non-zero TDX {name}; it is not an IGVM-model release"
+            ));
+        }
+    }
+    if !is_lower_hex(&file.igvm.tdx, 32) {
+        return Err("release manifest igvm.tdx must be 64 lowercase hex digits".to_string());
+    }
+    if !is_lower_hex(&launch.mrtd, 48) {
+        return Err(
+            "release manifest igvm.tdx_launch.mrtd must be 96 lowercase hex digits".to_string(),
+        );
+    }
+    Ok(ReleaseTdxLaunch {
+        version: file.version,
+        igvm_sha256: file.igvm.tdx,
+        mrtd: launch.mrtd.clone(),
+    })
+}
+
+/// Check the vendored release manifest a config's `cvm-version` pins inline
+/// (`manifest`, read from [`release_manifest_file`]): it hashes to that pin,
+/// describes that release, and is read by [`read_release_manifest`].
+pub fn check_release_manifest(
+    cvm_version: &str,
+    manifest: &[u8],
+) -> Result<ReleaseTdxLaunch, String> {
+    use sha2::Digest as _;
+    let release = parse_cvm_version(cvm_version).map_err(|e| e.to_string())?;
+    let pinned = release.manifest_sha256.ok_or_else(|| {
+        format!("cvm-version {cvm_version:?} does not pin its release manifest inline")
+    })?;
+    let actual: String = sha2::Sha256::digest(manifest)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if actual != pinned {
+        return Err(format!(
+            "release manifest SHA-256 is {actual}, not the pinned {pinned}"
+        ));
+    }
+    let launch = read_release_manifest(manifest)?;
+    if launch.version != format!("v{}", release.version) {
+        return Err(format!(
+            "config selects cvm-version {}, but the release manifest is {}",
+            release.version, launch.version
+        ));
+    }
+    Ok(launch)
+}
+
 /// Check one deployment: its config (`config_path`, read as `config`) and
 /// its sidecar (`sidecar_path`, read as `sidecar`). Errors name the file and
 /// the rule, never a secret.
@@ -849,5 +986,87 @@ shim:
         );
         let err = env_of(&twice).unwrap_err();
         assert!(err.contains("duplicate mapping key"), "{err}");
+    }
+
+    #[test]
+    fn a_release_manifest_is_vendored_under_its_release() {
+        let pin = format!("@sha256:{}", "ab".repeat(32));
+        assert_eq!(
+            release_manifest_file(&format!("0.15.3-rc.1+gpu{pin}")).unwrap(),
+            "releases/trust/cvm-releases/v0.15.3-rc.1/tinfoil-inference-v0.15.3-rc.1+gpu-manifest.json"
+        );
+        assert_eq!(
+            release_manifest_file("0.15.3").unwrap(),
+            "releases/trust/cvm-releases/v0.15.3/tinfoil-inference-v0.15.3-manifest.json"
+        );
+        for bad in ["0.15/../../x", ".15", "0.15 3", "v0.15.3"] {
+            assert!(release_manifest_file(bad).is_err(), "{bad}");
+        }
+    }
+
+    fn release_manifest(mrtd: &str, rtmr0: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "version": "v0.0.0-test+gpu",
+            "root": "00",
+            "igvm": {
+                "format_version": 1,
+                "snp": "11".repeat(32),
+                "tdx": "22".repeat(32),
+                "tdx_launch": {
+                    "mrtd": mrtd,
+                    "rtmr0": rtmr0,
+                    "rtmr1": "00".repeat(48),
+                    "rtmr2": "00".repeat(48),
+                    "rtmr3": "00".repeat(48),
+                },
+            },
+        }))
+        .unwrap()
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// The manifest must be the one the config pins, describe the release
+    /// the config selects, and state a launch in the model measured.
+    #[test]
+    fn a_release_manifest_is_the_pinned_one_and_in_the_measured_model() {
+        let zero = "00".repeat(48);
+        let good = release_manifest(&"33".repeat(48), &zero);
+        let cvm = |m: &[u8], version: &str| format!("{version}@sha256:{}", sha256_hex(m));
+        let launch = check_release_manifest(&cvm(&good, "0.0.0-test+gpu"), &good).unwrap();
+        assert_eq!(
+            launch,
+            ReleaseTdxLaunch {
+                version: "v0.0.0-test+gpu".into(),
+                igvm_sha256: "22".repeat(32),
+                mrtd: "33".repeat(48),
+            }
+        );
+
+        let err = |cvm_version: &str, m: &[u8]| check_release_manifest(cvm_version, m).unwrap_err();
+        assert!(err("0.0.0-test+gpu", &good).contains("does not pin"));
+        let other = format!("0.0.0-test+gpu@sha256:{}", "cd".repeat(32));
+        assert!(err(&other, &good).contains("not the pinned"));
+        assert!(err(&cvm(&good, "0.0.0-test"), &good).contains("config selects cvm-version"));
+        let measured_boot = release_manifest(&"33".repeat(48), &"22".repeat(48));
+        assert!(err(&cvm(&measured_boot, "0.0.0-test+gpu"), &measured_boot).contains("rtmr0"));
+        let short = release_manifest(&"33".repeat(32), &zero);
+        assert!(err(&cvm(&short, "0.0.0-test+gpu"), &short).contains("96 lowercase hex"));
+        let upper = release_manifest(&"AA".repeat(48), &zero);
+        assert!(err(&cvm(&upper, "0.0.0-test+gpu"), &upper).contains("96 lowercase hex"));
+        let mut future: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        future["igvm"]["format_version"] = 2.into();
+        let future = serde_json::to_vec(&future).unwrap();
+        assert!(err(&cvm(&future, "0.0.0-test+gpu"), &future).contains("format_version"));
+        let mut extra: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        extra["igvm"]["tdx_launch"]["rtmr4"] = zero.clone().into();
+        let extra = serde_json::to_vec(&extra).unwrap();
+        assert!(err(&cvm(&extra, "0.0.0-test+gpu"), &extra).contains("unknown field"));
     }
 }

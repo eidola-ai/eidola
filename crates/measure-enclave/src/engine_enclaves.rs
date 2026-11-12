@@ -17,15 +17,17 @@
 //!   policy of a vendored platform endorsements release (tag and file hash),
 //!   plus the PCK platform flags the endorsements do not carry.
 //!
-//! [`deployment_entry`] turns one such directory, plus the release manifest
-//! and TDX IGVM image its `cvm-version` names, into the file's entry: the
+//! [`deployment_entry`] turns one such directory, plus the TDX IGVM image
+//! its `cvm-version` names and that release's manifest, vendored under
+//! `releases/trust/cvm-releases/`, into the file's entry: the
 //! TDX launch identity (MRTD recomputed from the image, MRCONFIGID from the
 //! config, via [`crate::tdx_igvm::release_pin`]) with the machine policy
 //! derived from the verified endorsements
 //! ([`crate::platform_endorsements::tdx_policy`]), and the weights and cache
 //! policy the config sets. The gateway's build re-derives everything here
-//! except MRTD from the same committed files, so a hand edit that disagrees
-//! with them fails that build.
+//! from the same committed files, MRTD as the vendored manifest states it
+//! (the image itself is not committed), so a hand edit that disagrees with
+//! them fails that build.
 //!
 //! Only TDX deployments are measured here: the platform provider deploys
 //! engines on its IGVM launch model, which has no SEV-SNP image. The file's
@@ -39,7 +41,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use eidola_common::engine_deployment::deployment::{
-    ModelIdentity, check_deployment, check_model_agreement,
+    ModelIdentity, check_deployment, check_model_agreement, release_manifest_file,
 };
 
 use tinfoil_verifier::{AllowedMeasurement, PlatformMeasurement, TdxPin};
@@ -57,12 +59,11 @@ pub struct DeploymentInputs<'a> {
     pub config_path: &'a str,
     pub config: &'a [u8],
     pub sidecar: &'a [u8],
-    /// The `tinfoil-inference-<version>-manifest.json` the config pins.
-    pub release_manifest: &'a [u8],
     /// The release's `tinfoil-tdx-<version>.igvm`.
     pub igvm: &'a [u8],
-    /// Reads other committed files (the vendored platform endorsements and
-    /// the Sigstore trusted root) by path relative to the workspace root.
+    /// Reads other committed files (the vendored release manifest and
+    /// platform endorsements, the Sigstore trusted root) by path relative to
+    /// the workspace root.
     pub read: &'a ReadFile<'a>,
 }
 
@@ -105,9 +106,14 @@ pub fn deployment_entry(inputs: &DeploymentInputs<'_>) -> Result<Entry> {
         .as_ref()
         .context("deployment.json states no tdx machines; only TDX deployments are measured")?;
 
+    // The vendored manifest, from where the gateway's build reads it;
+    // `release_pin` reads it by the build's rule and measures the image
+    // against it.
+    let manifest_path = release_manifest_file(&checked.cvm_version).map_err(anyhow::Error::msg)?;
+    let release_manifest = (inputs.read)(&manifest_path)?;
     let (_, manifest_sha256) = required_release(inputs.config)?;
     let launch = tdx_igvm::release_pin(
-        inputs.release_manifest,
+        &release_manifest,
         &manifest_sha256,
         inputs.igvm,
         inputs.config,
@@ -330,6 +336,22 @@ containers:
         crate::platform_endorsements::tests::read(relative)
     }
 
+    /// Where a config of [`config`] has its release manifest vendored.
+    const MANIFEST: &str =
+        "releases/trust/cvm-releases/v0.0.0-test/tinfoil-inference-v0.0.0-test+gpu-manifest.json";
+
+    /// Reads as [`workspace_file`], with `release` vendored as the manifest
+    /// of the fixture's release.
+    fn vendoring(release: &[u8]) -> impl Fn(&str) -> Result<Vec<u8>> + '_ {
+        move |path| {
+            if path == MANIFEST {
+                Ok(release.to_vec())
+            } else {
+                workspace_file(path)
+            }
+        }
+    }
+
     /// The machine policy `SIDECAR` names: `tdx-b300-prod` of the fixture
     /// release `platform-v0.1.11`, with the sidecar's PCK flags.
     fn b300_policy() -> Value {
@@ -363,9 +385,8 @@ containers:
             config_path: PATH,
             config: config.as_bytes(),
             sidecar: SIDECAR.as_bytes(),
-            release_manifest: &release,
             igvm: &igvm,
-            read: &workspace_file,
+            read: &vendoring(&release),
         })
         .unwrap();
 
@@ -415,9 +436,8 @@ containers:
                 config_path: path,
                 config: config.as_bytes(),
                 sidecar: sidecar.as_bytes(),
-                release_manifest: &release,
                 igvm: &igvm,
-                read: &workspace_file,
+                read: &vendoring(&release),
             })
             .unwrap()
         };
@@ -489,9 +509,8 @@ containers:
                 config_path: PATH,
                 config: config.as_bytes(),
                 sidecar: sidecar.as_bytes(),
-                release_manifest: &release,
                 igvm: &igvm,
-                read: &workspace_file,
+                read: &vendoring(&release),
             })
             .unwrap_err()
             .to_string()
@@ -519,6 +538,32 @@ containers:
         assert!(entry(&unpinned, SIDECAR).contains("pin its release manifest"));
         let other_release = good.replace(&release_sha, &"ab".repeat(32));
         assert!(entry(&other_release, SIDECAR).contains("not the pinned"));
+        // The manifest is the vendored one, read where the gateway's build
+        // reads it, and must state the MRTD the image measures to.
+        let unvendored = deployment_entry(&DeploymentInputs {
+            config_path: PATH,
+            config: good.as_bytes(),
+            sidecar: SIDECAR.as_bytes(),
+            igvm: &igvm,
+            read: &workspace_file,
+        })
+        .unwrap_err();
+        assert!(
+            format!("{unvendored:#}").contains(MANIFEST),
+            "{unvendored:#}"
+        );
+        let wrong_mrtd = manifest(&igvm, &"11".repeat(48), &"00".repeat(48));
+        let wrong_config = config(&hex::encode(Sha256::digest(&wrong_mrtd)));
+        let err = deployment_entry(&DeploymentInputs {
+            config_path: PATH,
+            config: wrong_config.as_bytes(),
+            sidecar: SIDECAR.as_bytes(),
+            igvm: &igvm,
+            read: &vendoring(&wrong_mrtd),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("disagrees with the MRTD release"), "{err}");
 
         // The machine policy comes only from verified endorsements: a policy
         // the release does not define, a recorded hash that is not the

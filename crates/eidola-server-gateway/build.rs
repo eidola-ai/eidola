@@ -7,8 +7,10 @@
 //! config it names, or that names no committed config, fails the build. A TDX
 //! pin's machine policy is re-derived from the vendored platform endorsements
 //! its deployment names (`releases/trust/platform-endorsements/<tag>/`),
-//! verified offline against `releases/trust/sigstore-trusted-root.json`; every
-//! file read is a `rerun-if-changed` input, and nothing reads the network.
+//! verified offline against `releases/trust/sigstore-trusted-root.json`, and
+//! its MRTD must be the one the platform release manifest its config pins
+//! states (vendored under `releases/trust/cvm-releases/`); every file read is
+//! a `rerun-if-changed` input, and nothing reads the network.
 //!
 //! The model catalog, at the workspace root, is `models/<family>/<label>.toml`:
 //! one file per set of weights, keyed by its weights hash. Each file is

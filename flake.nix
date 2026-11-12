@@ -197,8 +197,9 @@
             #   * eidola-app-core → all of `releases/trust/*.json` +
             #     `releases/schema/*.json` (client trust root)
             #   * eidola-server-gateway → `releases/trust/engine-enclaves.json`
-            #     (the engine pins), and the platform endorsements and Sigstore
-            #     trusted root their machine policy is re-derived from
+            #     (the engine pins), the platform endorsements and Sigstore
+            #     trusted root their machine policy is re-derived from, and the
+            #     platform release manifests their MRTD is checked against
             # Included only when either crate is built, so unrelated crates
             # do not cache-bust on every manifest regeneration.
             # `artifact-manifest.json` (at the root, not under `releases/`)
@@ -213,6 +214,11 @@
             isPlatformEndorsementsPath =
               relPath == "/releases/trust/platform-endorsements"
               || pkgs.lib.hasPrefix "/releases/trust/platform-endorsements/" relPath;
+            # The vendored platform release manifests, likewise the gateway's
+            # alone.
+            isCvmReleasesPath =
+              relPath == "/releases/trust/cvm-releases"
+              || pkgs.lib.hasPrefix "/releases/trust/cvm-releases/" relPath;
             # `eidola-server-gateway/build.rs` also checks every engine pin in
             # `releases/trust/engine-enclaves.json` against the committed
             # deployment configs it names.
@@ -224,7 +230,12 @@
             # weights under `models/`, bound to those pins by weights hash.
             isModelCatalogPath = relPath == "/models" || pkgs.lib.hasPrefix "/models/" relPath;
           in
-          (crateInSet "eidola-app-core" && isTrustRootPath && !isPlatformEndorsementsPath)
+          (
+            crateInSet "eidola-app-core"
+            && isTrustRootPath
+            && !isPlatformEndorsementsPath
+            && !isCvmReleasesPath
+          )
           || (crateInSet "eidola-server-gateway" && isTrustRootPath)
           || (crateInSet "eidola-server-gateway" && isEngineDeployPath)
           || (crateInSet "eidola-server-gateway" && isModelCatalogPath)

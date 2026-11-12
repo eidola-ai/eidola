@@ -124,7 +124,8 @@ SPDX-License-Identifier = "MIT"
 
 # Verbatim release data of the platform provider (tinfoilsh/cvmimage, declared
 # AGPL-3.0): its signed platform endorsements and their Sigstore attestation
-# bundles, vendored as trust inputs; and two of its attestation bundles kept
+# bundles, and the release manifests engine configs pin, vendored as trust
+# inputs and copied as test fixtures; and two of its attestation bundles kept
 # as test fixtures (one from tinfoilsh/confidential-model-router, declared
 # AGPL-3.0). Both repositories ship the AGPL-3.0 text with no version
 # statement, and the licence's section 14 lets the recipient then choose any
@@ -134,7 +135,10 @@ SPDX-License-Identifier = "MIT"
 [[annotations]]
 path = [
     "releases/trust/platform-endorsements/**",
+    "releases/trust/cvm-releases/**",
     "crates/measure-enclave/tests/fixtures/platform-endorsements/*.sigstore.json",
+    "crates/measure-enclave/tests/fixtures/platform-endorsements/platform-v*/**",
+    "crates/eidola-server-gateway/tests/fixtures/engine-trust/releases/trust/**",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = "© Tinfoil contributors"
