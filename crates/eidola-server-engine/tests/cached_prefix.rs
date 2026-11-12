@@ -400,8 +400,11 @@ async fn a_refusal_after_waiting_for_admission_is_still_a_plain_error() {
     );
     let (status, v) = node.chat_json(&declared).await;
     assert_refused(status, &v, "cached_prefix_missing");
-    let s = node.stats();
-    assert_eq!(s.prefix_refused, 1);
+    // The engine thread publishes its counters after it has answered.
+    node.wait_for(std::time::Duration::from_secs(10), |s| {
+        s.prefix_refused == 1
+    })
+    .await;
     running.await.unwrap();
 }
 
