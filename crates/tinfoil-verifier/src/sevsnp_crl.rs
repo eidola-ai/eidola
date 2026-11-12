@@ -336,7 +336,12 @@ mod tests {
         let crl = base64::engine::general_purpose::STANDARD
             .decode(AMD_CRL_B64)
             .unwrap();
-        let (ark, _) = crate::sevsnp::resolve_chain_certs_der(None, None).unwrap();
+        let (ark, _) = crate::sevsnp::resolve_chain_certs_der(
+            crate::sevsnp::SevSnpGeneration::Genoa,
+            None,
+            None,
+        )
+        .unwrap();
         let ark = Certificate::from_der(&ark).unwrap();
         (crl, ark)
     }
