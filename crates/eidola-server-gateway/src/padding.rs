@@ -117,6 +117,9 @@ struct SharedState {
     framer: Framer,
     sender_alive: bool,
     stream_alive: bool,
+    /// When the stream last wrote a frame (or opened): how
+    /// [`EventSender::stalled`] tells a client that has stopped reading.
+    last_frame: tokio::time::Instant,
 }
 
 impl Shared {
@@ -178,6 +181,23 @@ impl EventSender {
     }
 }
 
+impl EventSender {
+    /// Resolves once the stream has written no frame for `limit`: its client
+    /// has stopped reading. The stream writes a frame every tick while the
+    /// client reads, whether or not anything is waiting, so a pause this long
+    /// is a client (and the buffers between it and this server) that has
+    /// taken nothing, not a slow model.
+    pub async fn stalled(&self, limit: Duration) {
+        loop {
+            let since = self.shared.lock().last_frame;
+            tokio::time::sleep_until(since + limit).await;
+            if self.shared.lock().last_frame == since {
+                return;
+            }
+        }
+    }
+}
+
 impl Drop for EventSender {
     fn drop(&mut self) {
         self.shared.lock().sender_alive = false;
@@ -193,6 +213,7 @@ pub fn channel(cadence: Cadence) -> (EventSender, PaddedStream) {
             framer: Framer::new(cadence.frames),
             sender_alive: true,
             stream_alive: true,
+            last_frame: tokio::time::Instant::now(),
         }),
         space: Notify::new(),
         max_backlog_bytes: cadence.max_backlog_bytes,
@@ -251,7 +272,11 @@ impl Stream for PaddedStream {
         }
         match this.interval.poll_tick(cx) {
             Poll::Ready(_) => {
-                let frame = this.shared.lock().framer.frame();
+                let frame = {
+                    let mut state = this.shared.lock();
+                    state.last_frame = tokio::time::Instant::now();
+                    state.framer.frame()
+                };
                 this.shared.space.notify_one();
                 Poll::Ready(Some(Ok(Bytes::from(frame))))
             }

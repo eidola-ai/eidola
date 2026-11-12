@@ -93,6 +93,8 @@ fn fast_config() -> RouterConfig {
         probe_interval: Duration::from_secs(3600),
         probe_timeout: Duration::from_secs(10),
         request_attempts: 3,
+        stream_headers_limit: Duration::from_secs(10),
+        stream_idle_limit: Duration::from_secs(2),
     }
 }
 
@@ -135,6 +137,9 @@ enum Mode {
     Hold,
     /// Answer nothing, headers included, until `release`; then serve.
     Stall,
+    /// Stream the role chunk's frame, then write nothing at all, the
+    /// connection left open: a node that has stopped.
+    Wedge,
 }
 
 /// One chat request as an engine received it.
@@ -410,7 +415,7 @@ async fn chat(
             serde_json::json!({"error": {"message": "the engine stopped", "type": "engine_unavailable", "code": null}})
                 .to_string(),
         ))],
-        Mode::StreamTruncated => vec![],
+        Mode::StreamTruncated | Mode::Wedge => vec![],
         Mode::MalformedChunk | Mode::UnknownEvent => {
             let odd = if mode == Mode::MalformedChunk {
                 Written::Event(StreamEvent::Json(
@@ -455,7 +460,7 @@ async fn chat(
         ],
     };
     let hold = mode == Mode::Hold;
-    shaped_stream(role, hold, state, rest)
+    shaped_stream(role, hold, mode == Mode::Wedge, state, rest)
 }
 
 const WEIGHTS_HEADER_NAME: &str = eidola_common::engine_protocol::WEIGHTS_HEADER;
@@ -475,6 +480,7 @@ enum Written {
 fn shaped_stream(
     role: Written,
     hold: bool,
+    wedge: bool,
     state: Arc<EngineState>,
     rest: Vec<Written>,
 ) -> Response {
@@ -506,11 +512,15 @@ fn shaped_stream(
     let cadence = eidola_common::engine_protocol::STREAM_CADENCE;
     let interval = tokio::time::interval(cadence.tick());
     let body = futures_util::stream::unfold(
-        (rx, Framer::new(cadence), interval, false),
-        |(mut rx, mut framer, mut interval, mut closed)| async move {
+        (rx, Framer::new(cadence), interval, false, false),
+        move |(mut rx, mut framer, mut interval, mut closed, mut started)| async move {
+            if wedge && started {
+                std::future::pending::<()>().await;
+            }
             if framer.backlog() == 0 && (framer.done() || closed) {
                 return None;
             }
+            started = true;
             interval.tick().await;
             let mut out = Vec::new();
             loop {
@@ -530,7 +540,7 @@ fn shaped_stream(
             out.extend_from_slice(&framer.frame());
             Some((
                 Ok::<_, std::convert::Infallible>(bytes::Bytes::from(out)),
-                (rx, framer, interval, closed),
+                (rx, framer, interval, closed, started),
             ))
         },
     );
@@ -542,6 +552,14 @@ fn shaped_stream(
 }
 
 fn router_for(engines: &[&Engine], models: Vec<EngineModel>) -> EngineRouter {
+    router_with(engines, models, fast_config())
+}
+
+fn router_with(
+    engines: &[&Engine],
+    models: Vec<EngineModel>,
+    config: RouterConfig,
+) -> EngineRouter {
     let shim = engines[0].shim.as_ref().unwrap();
     let mut tls_roots = rustls::RootCertStore::empty();
     tls_roots
@@ -557,7 +575,7 @@ fn router_for(engines: &[&Engine], models: Vec<EngineModel>) -> EngineRouter {
             trusted_ark_der: Some(shim.ark_der.clone()),
             trusted_ask_der: Some(shim.ask_der.clone()),
         }),
-        fast_config(),
+        config,
     )
 }
 
@@ -1567,4 +1585,224 @@ async fn an_unreadable_stream_event_ends_the_stream_as_an_error() {
             "{mode:?}: counted as failures"
         );
     }
+}
+
+/// **A node that stops answering is let go of at once, not at the request's
+/// deadline.** Response headers that do not come within the bound are no
+/// response: the request goes to the next engine, and the silent one is
+/// counted as failing. An open stream that delivers nothing, not even a
+/// padding frame, for the idle bound ends as an error of that engine, which
+/// the handler settles on what was generated (`early_cost`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_engine_is_given_up_on_within_its_bounds() {
+    let engines = [
+        engine(Identity::of(MODEL_A)).await,
+        engine(Identity::of(MODEL_A)).await,
+    ];
+    let refs: Vec<&Engine> = engines.iter().collect();
+    let config = RouterConfig {
+        stream_headers_limit: Duration::from_millis(500),
+        stream_idle_limit: Duration::from_millis(500),
+        ..fast_config()
+    };
+    let router = router_with(&refs, models(), config);
+    let rows: Vec<EnginePlacementRow> = engines
+        .iter()
+        .map(|e| e.row(MODEL_A, DEPLOYMENT_A))
+        .collect();
+    router.apply_placement(&rows).await;
+    router.probe_due().await;
+    let (stalled, other) = (&engines[0], &engines[1]);
+    let key = key_text(key_ranking_first(
+        &router,
+        MODEL_A,
+        &stalled.base_url,
+        &[&other.base_url],
+    ));
+
+    // No headers: the next engine serves it.
+    stalled.set_mode(Mode::Stall);
+    let done = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut rx = router
+            .send_stream(&request(MODEL_A, Some(&key), true))
+            .await
+            .unwrap();
+        let mut done = false;
+        while let Some(event) = rx.recv().await {
+            done |= matches!(event, Ok(BackendStreamEvent::Done(..)));
+        }
+        done
+    })
+    .await
+    .expect("the silent engine is given up on long before this");
+    assert!(done, "served by the other engine");
+    assert_eq!(stalled.chats().len(), 1);
+    assert_eq!(other.chats().len(), 1);
+    stalled.state.release.notify_waiters();
+
+    // An open stream that goes silent: an error of its own, counted.
+    other.set_mode(Mode::Wedge);
+    let only_other = router_with(&refs, models(), config);
+    only_other
+        .apply_placement(&[other.row(MODEL_A, DEPLOYMENT_A)])
+        .await;
+    only_other.probe_due().await;
+    for _ in 0..2 {
+        let events = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut rx = only_other
+                .send_stream(&request(MODEL_A, None, true))
+                .await
+                .unwrap();
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        })
+        .await
+        .expect("the silent stream is ended long before this");
+        assert!(
+            matches!(events.first(), Some(Ok(BackendStreamEvent::Chunk(..)))),
+            "the role chunk came through"
+        );
+        assert!(
+            matches!(events.last(), Some(Err(ServerError::Network(_)))),
+            "ends as a network error of the engine"
+        );
+    }
+    assert!(
+        !upstream(&only_other, MODEL_A, &other.base_url).routable(),
+        "counted as failures"
+    );
+}
+
+/// A cache key whose ranking over the upstreams at `order` is exactly that
+/// order.
+fn key_ranking(router: &EngineRouter, model: &str, order: &[&str]) -> u64 {
+    let ups: Vec<Arc<Upstream>> = order
+        .iter()
+        .map(|url| upstream(router, model, url))
+        .collect();
+    (0..)
+        .find(|&i| {
+            let ranked = rendezvous::rank_by_key(&CacheKey::from_bytes(key_bytes(i)), ups.clone());
+            ranked
+                .iter()
+                .map(|u| u.base_url.as_str())
+                .eq(order.iter().copied())
+        })
+        .unwrap()
+}
+
+/// Three engines a key ranks stalled first, `second` next and `third` last,
+/// with headers given up on quickly.
+async fn ranked_behind_a_stall() -> ([Engine; 3], EngineRouter, String) {
+    let engines = [
+        engine(Identity::of(MODEL_A)).await,
+        engine(Identity::of(MODEL_A)).await,
+        engine(Identity::of(MODEL_A)).await,
+    ];
+    let refs: Vec<&Engine> = engines.iter().collect();
+    let config = RouterConfig {
+        stream_headers_limit: Duration::from_millis(500),
+        ..fast_config()
+    };
+    let router = router_with(&refs, models(), config);
+    let rows: Vec<EnginePlacementRow> = engines
+        .iter()
+        .map(|e| e.row(MODEL_A, DEPLOYMENT_A))
+        .collect();
+    router.apply_placement(&rows).await;
+    router.probe_due().await;
+    let order: Vec<&str> = engines.iter().map(|e| e.base_url.as_str()).collect();
+    let key = key_text(key_ranking(&router, MODEL_A, &order));
+    engines[0].set_mode(Mode::Stall);
+    (engines, router, key)
+}
+
+/// **A half-open engine takes one request at a time, decided at the
+/// attempt.** Requests planned while its slot was free, all reaching it at
+/// once (each having waited on an engine ranked ahead that never answers),
+/// send it exactly one; the rest go on to the next engine. Once the one it
+/// took is served, it is healthy and takes every request.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_open_engine_takes_one_request_however_many_arrive() {
+    let ([stalled, recovering, next], router, key) = ranked_behind_a_stall().await;
+    let config = fast_config().breaker;
+    {
+        let up = upstream(&router, MODEL_A, &recovering.base_url);
+        up.breaker().trip(Instant::now(), &config);
+        up.breaker().on_probe(true, Instant::now(), &config);
+        assert!(up.routable(), "half-open, its slot free");
+    }
+    recovering.set_mode(Mode::Hold);
+    let requests: Vec<_> = (0..4)
+        .map(|_| {
+            let router = router.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                router
+                    .send_stream(&request(MODEL_A, Some(&key), true))
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect();
+    let mut streams = Vec::new();
+    for r in requests {
+        streams.push(r.await.unwrap());
+    }
+    assert_eq!(
+        stalled.chats().len(),
+        4,
+        "each tried the stalled engine first"
+    );
+    assert_eq!(recovering.chats().len(), 1, "one request at a time");
+    assert_eq!(next.chats().len(), 3, "the rest went on");
+    let up = upstream(&router, MODEL_A, &recovering.base_url);
+    assert!(!up.routable(), "its slot is taken");
+
+    // The one it took is served: healthy, every request admitted.
+    recovering.state.release.notify_waiters();
+    for mut rx in streams {
+        while rx.recv().await.is_some() {}
+    }
+    stalled.state.release.notify_waiters();
+    assert!(up.routable());
+    let guards: Vec<_> = (0..3).map(|_| up.admit().expect("healthy")).collect();
+    drop(guards);
+}
+
+/// **A planned fallback is rechecked when its turn comes.** A request whose
+/// plan held a healthy engine behind one that never answers does not reach
+/// it once it has opened in the meantime: with nothing else to try, it is
+/// the answer no engine could take.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fallback_that_opened_while_the_request_waited_is_skipped() {
+    let ([stalled, fallback, last], router, key) = ranked_behind_a_stall().await;
+    last.set_mode(Mode::Stall);
+    let pending = {
+        let router = router.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            router
+                .send_stream(&request(MODEL_A, Some(&key), true))
+                .await
+                .map(|_| ())
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(stalled.chats().len(), 1, "waiting on the first engine");
+    upstream(&router, MODEL_A, &fallback.base_url)
+        .breaker()
+        .trip(Instant::now(), &fast_config().breaker);
+    let outcome = pending.await.unwrap();
+    assert!(
+        matches!(outcome, Err(ServerError::ServiceUnavailable(_))),
+        "no engine took it"
+    );
+    assert_eq!(fallback.chats().len(), 0, "the opened engine was skipped");
+    assert_eq!(last.chats().len(), 1, "the one after it was still tried");
+    stalled.state.release.notify_waiters();
+    last.state.release.notify_waiters();
 }
