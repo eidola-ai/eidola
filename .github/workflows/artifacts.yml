@@ -111,7 +111,7 @@ jobs:
         # cache-free StageX/OCI build below. save-if still scopes writes to main
         # for non-tag runs.
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -152,7 +152,7 @@ jobs:
         # also get an empty CACHE_REGISTRY below, so they neither read nor write
         # the shared cache (a fork's token is read-only regardless).
         if: github.event_name == 'push' || (github.event.pull_request.head.ref == 'next' && github.event.pull_request.head.repo.full_name == github.repository)
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -387,7 +387,7 @@ jobs:
       - name: Log in to GHCR
         # Same gating as the `oci` job.
         if: github.event_name == 'push' || (github.event.pull_request.head.ref == 'next' && github.event.pull_request.head.repo.full_name == github.repository)
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -511,7 +511,7 @@ jobs:
         # Skipped on v* release tags, as in `artifact-manifest`, so a release
         # measures from a clean cargo state.
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -593,7 +593,7 @@ jobs:
           printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
 
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
           extra_nix_config: |
@@ -629,7 +629,7 @@ jobs:
         # needs the file to exist somewhere they can fetch it. The tagged
         # release workflow pulls these from this run and re-checks each
         # hash against the manifest before attaching them.
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets-macos
           path: /tmp/eidola-release-assets
@@ -652,7 +652,7 @@ jobs:
           shasum -a 256 /tmp/eidola-shipping/eidola-gui-macos-universal.zip
 
       - name: Upload the unsigned macOS shipping zip
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: eidola-gui-macos-universal-zip
           path: /tmp/eidola-shipping/eidola-gui-macos-universal.zip
@@ -725,7 +725,7 @@ jobs:
           printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
 
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
           extra_nix_config: |
@@ -756,7 +756,7 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Upload the Linux amd64 release assets
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets-linux-amd64
           path: /tmp/eidola-release-assets
@@ -822,7 +822,7 @@ jobs:
           printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
 
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
           extra_nix_config: |
@@ -849,7 +849,7 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Upload the Linux arm64 release assets
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets-linux-arm64
           path: /tmp/eidola-release-assets
@@ -888,7 +888,7 @@ jobs:
         # cross-check in tinfoil-build.yml. save-if scopes writes to main
         # otherwise; this job only verifies the manifest and publishes nothing.
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
