@@ -401,7 +401,7 @@ pub struct SeqEntry {
 pub struct StepAux {
     /// Per row, where the window chain's top layer starts (see *Window chain* in the
     /// module docs). Equal to the row's `context_len` when every layer computes every
-    /// position of the row, which is always so for a row of one host token. Empty unless
+    /// position of the row, which is always so for a row that samples from one host token. Empty unless
     /// the model has a [`crate::spec::WindowChain`].
     pub chain_start: Vec<u32>,
     /// Per row, [`ModelSpec::token_history`] token ids: the tokens at the positions just
