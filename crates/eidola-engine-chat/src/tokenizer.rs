@@ -18,6 +18,7 @@ use std::path::Path;
 
 use tokenizers::tokenizer::{Model, Normalizer, OffsetType, PreTokenizedString, PreTokenizer};
 
+use crate::ChatFormat;
 use crate::error::ChatError;
 use crate::template::{Prompt, sha256_hex};
 
@@ -25,16 +26,29 @@ use crate::template::{Prompt, sha256_hex};
 pub const TOKENIZER_FILE: &str = "tokenizer.json";
 /// File name of the generation config inside a model directory.
 pub const GENERATION_CONFIG_FILE: &str = "generation_config.json";
+/// File name of the model config inside a model directory.
+pub const CONFIG_FILE: &str = "config.json";
 
 /// SHA-256 of the MiMo-V2.6 `tokenizer.json` (identical in Flash and Pro).
 pub const MIMO_V2_6_TOKENIZER_SHA256: &str =
     "ff15eb925890d6b71b5160de4b846fbd13178438ab463b38ecc953e8cd1dcb3e";
 
-/// Every `tokenizer.json` this crate will load.
+/// Every MiMo `tokenizer.json` this crate will load.
 pub const PINNED_TOKENIZER_SHA256: &[&str] = &[MIMO_V2_6_TOKENIZER_SHA256];
 
-/// The MiMo tokenizer plus the per-token byte table used for decoding.
-pub struct MimoTokenizer {
+/// SHA-256 of the DeepSeek-V4.1-Flash `tokenizer.json`.
+pub const DEEPSEEK_V4_1_TOKENIZER_SHA256: &str =
+    "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b";
+
+/// Every DeepSeek-V4.1 `tokenizer.json` this crate will load.
+pub const PINNED_DEEPSEEK_V4_1_TOKENIZER_SHA256: &[&str] = &[DEEPSEEK_V4_1_TOKENIZER_SHA256];
+
+/// The tokenizer of a MiMo model: [`Tokenizer`] loaded through its MiMo
+/// constructors.
+pub type MimoTokenizer = Tokenizer;
+
+/// A model's tokenizer plus the per-token byte table used for decoding.
+pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
     /// Bytes each id contributes to decoded text; every id below its length is a
     /// token.
@@ -43,13 +57,15 @@ pub struct MimoTokenizer {
     special: Vec<bool>,
     /// Ids of added tokens, which text matches whole and the model never merges.
     added: Vec<bool>,
+    /// Added tokens a copy of which can overlap itself (`｜DSML｜`).
+    self_overlapping: Vec<String>,
     eos: Vec<u32>,
     sha256: String,
 }
 
-impl std::fmt::Debug for MimoTokenizer {
+impl std::fmt::Debug for Tokenizer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MimoTokenizer")
+        f.debug_struct("Tokenizer")
             .field("sha256", &self.sha256)
             .field("vocab_size", &self.token_bytes.len())
             .field("eos", &self.eos)
@@ -57,20 +73,11 @@ impl std::fmt::Debug for MimoTokenizer {
     }
 }
 
-impl MimoTokenizer {
-    /// Loads `tokenizer.json` and `generation_config.json` from a model
-    /// directory. The tokenizer must match a pinned hash.
+impl Tokenizer {
+    /// Loads a MiMo model's `tokenizer.json` and `generation_config.json` from
+    /// its model directory. The tokenizer must match a pinned hash.
     pub fn from_model_dir(dir: &Path) -> Result<MimoTokenizer, ChatError> {
-        let read = |name: &str| {
-            let path = dir.join(name);
-            std::fs::read(&path).map_err(|e| ChatError::Io {
-                path: path.display().to_string(),
-                message: e.to_string(),
-            })
-        };
-        let tokenizer_json = read(TOKENIZER_FILE)?;
-        let generation_config = read(GENERATION_CONFIG_FILE)?;
-        MimoTokenizer::from_bytes(&tokenizer_json, &generation_config)
+        Tokenizer::for_format_from_model_dir(ChatFormat::MimoV2_6, dir)
     }
 
     /// Builds the tokenizer from file contents, refusing an unpinned
@@ -79,14 +86,44 @@ impl MimoTokenizer {
         tokenizer_json: &[u8],
         generation_config_json: &[u8],
     ) -> Result<MimoTokenizer, ChatError> {
+        Tokenizer::for_format(ChatFormat::MimoV2_6, tokenizer_json, generation_config_json)
+    }
+
+    /// Loads the tokenizer of a model in `format` from its model directory:
+    /// `tokenizer.json` and the file its end-of-sequence ids are read from
+    /// ([`ChatFormat::eos_config_file`]).
+    pub fn for_format_from_model_dir(
+        format: ChatFormat,
+        dir: &Path,
+    ) -> Result<Tokenizer, ChatError> {
+        let read = |name: &str| {
+            let path = dir.join(name);
+            std::fs::read(&path).map_err(|e| ChatError::Io {
+                path: path.display().to_string(),
+                message: e.to_string(),
+            })
+        };
+        let tokenizer_json = read(TOKENIZER_FILE)?;
+        let eos_config = read(format.eos_config_file())?;
+        Tokenizer::for_format(format, &tokenizer_json, &eos_config)
+    }
+
+    /// Builds the tokenizer of a model in `format` from file contents: its
+    /// `tokenizer.json`, which must match a hash pinned for that format, and
+    /// the contents of [`ChatFormat::eos_config_file`].
+    pub fn for_format(
+        format: ChatFormat,
+        tokenizer_json: &[u8],
+        eos_config_json: &[u8],
+    ) -> Result<Tokenizer, ChatError> {
         let sha256 = sha256_hex(tokenizer_json);
-        if !PINNED_TOKENIZER_SHA256.contains(&sha256.as_str()) {
+        if !format.pinned_tokenizer_sha256().contains(&sha256.as_str()) {
             return Err(ChatError::UnpinnedArtifact {
                 what: "tokenizer.json",
                 sha256,
             });
         }
-        MimoTokenizer::build(tokenizer_json, generation_config_json, sha256)
+        Tokenizer::build(tokenizer_json, eos_config_json, sha256)
     }
 
     /// Like [`MimoTokenizer::from_bytes`] without the pin, for synthetic test
@@ -97,14 +134,14 @@ impl MimoTokenizer {
         generation_config_json: &[u8],
     ) -> Result<MimoTokenizer, ChatError> {
         let sha256 = sha256_hex(tokenizer_json);
-        MimoTokenizer::build(tokenizer_json, generation_config_json, sha256)
+        Tokenizer::build(tokenizer_json, generation_config_json, sha256)
     }
 
     fn build(
         tokenizer_json: &[u8],
         generation_config_json: &[u8],
         sha256: String,
-    ) -> Result<MimoTokenizer, ChatError> {
+    ) -> Result<Tokenizer, ChatError> {
         let inner = tokenizers::Tokenizer::from_bytes(tokenizer_json)
             .map_err(|e| ChatError::InvalidArtifact(format!("tokenizer.json: {e}")))?;
         let eos = parse_eos(generation_config_json)?;
@@ -126,10 +163,17 @@ impl MimoTokenizer {
         let mut special = vec![false; size];
         let mut added = vec![false; size];
         let decoder = inner.get_added_tokens_decoder();
+        // Matching a `normalized` token against normalized text is a plain
+        // literal match only when normalization changes nothing.
+        let identity_normalizer = normalizer_is_identity(tokenizer_json)?;
         for (id, token) in &decoder {
             // `encode_prompt` reads an added token's span in the text off its
             // offsets, which is the token's own text only for a plain literal match.
-            if token.single_word || token.lstrip || token.rstrip || token.normalized {
+            if token.single_word
+                || token.lstrip
+                || token.rstrip
+                || (token.normalized && !identity_normalizer)
+            {
                 return Err(ChatError::InvalidArtifact(format!(
                     "tokenizer.json: added token {:?} is not matched as plain text",
                     token.content
@@ -141,13 +185,18 @@ impl MimoTokenizer {
             }
         }
         // No added token may contain or overlap another: leaving one unmatched
-        // then never uncovers a different match.
+        // then never uncovers a different match. A token that can only overlap a
+        // second copy of itself is accepted, and `encode_with_data` refuses the
+        // text where a copy left unmatched hides one the template wrote.
+        let mut self_overlapping = Vec::new();
         for a in decoder.values() {
             for b in decoder.values() {
                 let (a, b) = (a.content.as_str(), b.content.as_str());
                 let overlaps =
                     (1..a.len()).any(|i| a.is_char_boundary(i) && b.starts_with(&a[i..]));
-                if overlaps || (a != b && b.contains(a)) {
+                if a == b && overlaps {
+                    self_overlapping.push(a.to_string());
+                } else if overlaps || (a != b && b.contains(a)) {
                     return Err(ChatError::InvalidArtifact(format!(
                         "tokenizer.json: added tokens {a:?} and {b:?} overlap"
                     )));
@@ -161,11 +210,12 @@ impl MimoTokenizer {
                 )));
             }
         }
-        Ok(MimoTokenizer {
+        Ok(Tokenizer {
             inner,
             token_bytes,
             special,
             added,
+            self_overlapping,
             eos,
             sha256,
         })
@@ -218,6 +268,7 @@ impl MimoTokenizer {
         let (mut piece_token, mut piece_byte, mut unmatch) = (0, 0, false);
         let flush = |out: &mut Vec<u32>, tokens: Range<usize>, bytes: Range<usize>, plain| {
             if plain {
+                self.refuse_hidden_token(text, bytes.clone(), data)?;
                 out.extend(self.encode_plain(&text[bytes])?);
             } else {
                 out.extend_from_slice(&ids[tokens]);
@@ -249,6 +300,34 @@ impl MimoTokenizer {
             unmatch,
         )?;
         Ok(out)
+    }
+
+    /// Refuses a piece about to be encoded with no added-token matching when it
+    /// holds a self-overlapping added token entirely in the template's own
+    /// text: a copy that touches request data was matched in its place, and
+    /// leaving that one unmatched would lose the template's.
+    fn refuse_hidden_token(
+        &self,
+        text: &str,
+        piece: Range<usize>,
+        data: &[Range<usize>],
+    ) -> Result<(), ChatError> {
+        for token in &self.self_overlapping {
+            let first = token.chars().next().map_or(1, char::len_utf8);
+            // Every occurrence, overlapping ones included.
+            let mut from = piece.start;
+            while let Some(at) = text[from..piece.end].find(token.as_str()) {
+                let (start, end) = (from + at, from + at + token.len());
+                let next = data.partition_point(|span| span.end <= start);
+                if data.get(next).is_none_or(|span| span.start >= end) {
+                    return Err(ChatError::InvalidInput(format!(
+                        "request text overlaps the prompt's own {token:?}"
+                    )));
+                }
+                from = start + first;
+            }
+        }
+        Ok(())
     }
 
     /// Encodes text with no added-token matching: normalizer, pre-tokenizer
@@ -331,6 +410,23 @@ impl MimoTokenizer {
     }
 }
 
+/// Whether the tokenizer's normalizer leaves every text unchanged: absent, or
+/// an empty sequence.
+fn normalizer_is_identity(tokenizer_json: &[u8]) -> Result<bool, ChatError> {
+    let tokenizer: serde_json::Value = serde_json::from_slice(tokenizer_json)
+        .map_err(|e| ChatError::InvalidArtifact(format!("tokenizer.json: {e}")))?;
+    Ok(match tokenizer.get("normalizer") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(normalizer) => {
+            normalizer.get("type").and_then(|t| t.as_str()) == Some("Sequence")
+                && normalizer
+                    .get("normalizers")
+                    .and_then(|n| n.as_array())
+                    .is_some_and(|n| n.is_empty())
+        }
+    })
+}
+
 fn tokenization_failed(e: impl std::fmt::Display) -> ChatError {
     ChatError::InvalidInput(format!("tokenization failed: {e}"))
 }
@@ -405,7 +501,7 @@ impl Detokenizer {
 
     /// Feeds one token and returns the text it completes (possibly empty). An id the
     /// tokenizer does not define is refused, leaving the detokenizer unchanged.
-    pub fn push(&mut self, tokenizer: &MimoTokenizer, id: u32) -> Result<String, ChatError> {
+    pub fn push(&mut self, tokenizer: &Tokenizer, id: u32) -> Result<String, ChatError> {
         let bytes = tokenizer
             .token_bytes(id)
             .ok_or(ChatError::UnknownToken(id))?;
@@ -960,5 +1056,114 @@ mod reference_tests {
         assert!(t.token_bytes(151_674).is_some());
         assert_eq!(t.token_bytes(151_675), None);
         assert_eq!(t.token_bytes(152_575), None);
+    }
+
+    fn deepseek() -> Tokenizer {
+        let dir = fixtures_dir().join("deepseek_v4_1");
+        let compressed = std::fs::read(dir.join("tokenizer.json.gz")).unwrap();
+        let mut tokenizer_json = Vec::new();
+        flate2::read::GzDecoder::new(compressed.as_slice())
+            .read_to_end(&mut tokenizer_json)
+            .unwrap();
+        let config = std::fs::read(dir.join(CONFIG_FILE)).unwrap();
+        // Each format's pin refuses the other's tokenizer.
+        assert!(matches!(
+            Tokenizer::from_bytes(&tokenizer_json, &config),
+            Err(ChatError::UnpinnedArtifact { .. })
+        ));
+        Tokenizer::for_format(ChatFormat::DeepSeekV4_1, &tokenizer_json, &config)
+            .expect("pinned tokenizer")
+    }
+
+    #[test]
+    fn deepseek_decode_table_matches_tokenizers_for_every_id() {
+        let t = deepseek();
+        assert_eq!(t.eos_token_ids(), &[1]);
+        assert_eq!(t.token_to_id("<｜end▁of▁sentence｜>"), Some(1));
+        // 128,000 base ids and 1,280 added tokens, dense.
+        assert_eq!(t.vocab_size(), 129_280);
+        assert_eq!(t.token_bytes(129_280), None);
+        for id in 0..t.vocab_size() as u32 {
+            assert_eq!(
+                t.decode(&[id], false).unwrap(),
+                t.inner.decode(&[id], false).unwrap(),
+                "id {id}"
+            );
+        }
+        let mut state = 0x2545f4914f6cdd1du64;
+        for _ in 0..2000 {
+            let len = (state % 24) as usize;
+            let seq: Vec<u32> = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state % t.vocab_size() as u64) as u32
+                })
+                .collect();
+            for skip in [false, true] {
+                assert_eq!(
+                    t.decode(&seq, skip).unwrap(),
+                    t.inner.decode(&seq, skip).unwrap()
+                );
+            }
+        }
+    }
+
+    /// The format's markers are added tokens that are not special, so they
+    /// reach the output parsers as text; the end-of-sequence token is special.
+    #[test]
+    fn deepseek_markers_decode_as_text() {
+        let t = deepseek();
+        for marker in [
+            "<think>",
+            "</think>",
+            "｜DSML｜",
+            "<｜User｜>",
+            "<｜Assistant｜>",
+        ] {
+            let id = t.token_to_id(marker).unwrap();
+            assert!(t.is_added(id) && !t.is_special(id), "{marker}");
+            assert_eq!(t.decode(&[id], true).unwrap(), marker);
+            assert_eq!(t.encode(marker).unwrap(), [id]);
+        }
+        assert!(t.is_special(1) && t.is_eos(1));
+        assert_eq!(t.decode(&[1], true).unwrap(), "");
+    }
+
+    /// `｜DSML｜` can overlap a second copy of itself. A copy that touches
+    /// request data is left unmatched like any other, and where that would
+    /// lose a copy lying wholly in the format's own text, the prompt is
+    /// refused.
+    #[test]
+    fn deepseek_self_overlapping_token_is_unmatched_or_refused() {
+        let t = deepseek();
+        let dsml = t.token_to_id("｜DSML｜").unwrap();
+        assert_eq!(t.self_overlapping, ["｜DSML｜"]);
+
+        let text = "a｜DSML｜b<｜DSML｜ calls>";
+        let all = t.encode_with_data(text, &[]).unwrap();
+        assert_eq!(all, t.encode(text).unwrap());
+        assert_eq!(all.iter().filter(|&&id| id == dsml).count(), 2);
+        let data = 0.."a｜DSML｜b".len();
+        let served = t
+            .encode_with_data(text, std::slice::from_ref(&data))
+            .unwrap();
+        assert_eq!(served.iter().filter(|&&id| id == dsml).count(), 1);
+        assert_eq!(t.decode(&served, false).unwrap(), text);
+
+        // Data `｜DSML` run into the format's own `｜DSML｜`.
+        let text = "｜DSML｜DSML｜ calls";
+        let data = 0.."｜DSML".len();
+        assert!(matches!(
+            t.encode_with_data(text, std::slice::from_ref(&data)),
+            Err(ChatError::InvalidInput(_))
+        ));
+        // The same text as data throughout is only text.
+        let served = t
+            .encode_with_data(text, std::slice::from_ref(&(0..text.len())))
+            .unwrap();
+        assert!(!served.contains(&dsml));
+        assert_eq!(t.decode(&served, false).unwrap(), text);
     }
 }
