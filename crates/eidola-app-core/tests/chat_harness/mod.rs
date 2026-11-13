@@ -781,7 +781,7 @@ pub struct MockConfig {
     pub context_length: Option<u64>,
     /// Price and size [`MODEL`]'s row as the shipped MiMo-V2.6-Flash row is
     /// served ([`MIMO_CONTEXT_LENGTH`], [`MIMO_MAX_OUTPUT_TOKENS`], and its
-    /// $0.50 / $2.00 per million at the gateway's 1.5 markup), so a long
+    /// $0.75 / $3.00 per million), so a long
     /// prompt holds more than one denomination. `false` — the default —
     /// keeps the one-credit-a-token row every other test pins.
     pub mimo_priced: bool,
@@ -805,7 +805,7 @@ pub const MIMO_CONTEXT_LENGTH: u64 = 1_048_576;
 /// The `max_output_tokens` [`MockConfig::mimo_priced`] declares.
 pub const MIMO_MAX_OUTPUT_TOKENS: u64 = 65_536;
 /// [`MockConfig::mimo_priced`]'s rates, in credits per token at a scale of
-/// 1,000,000: $0.50 and $2.00 per million tokens, each times 1.5.
+/// 1,000,000: $0.75 and $3.00 per million tokens.
 pub const MIMO_PROMPT_RATE: u64 = 750_000;
 pub const MIMO_COMPLETION_RATE: u64 = 3_000_000;
 

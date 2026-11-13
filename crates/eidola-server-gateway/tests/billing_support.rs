@@ -67,7 +67,7 @@ impl TestDb {
 
     fn state(&self, stripe: Option<StripeClient>) -> AppState {
         AppState::new(
-            Catalog::new(None, None).unwrap(),
+            Catalog::new(None).unwrap(),
             None,
             self.pool.clone(),
             stripe,

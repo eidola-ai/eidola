@@ -155,8 +155,8 @@ pub fn refused_charge(hold: u128) -> u128 {
 mod tests {
     use super::*;
 
-    /// MiMo-V2.6-Flash at the default markup, with a cached rate a quarter of
-    /// the prompt rate.
+    /// MiMo-V2.6-Flash as its catalog row prices it, with a cached rate a
+    /// quarter of the prompt rate.
     const RATES: TokenRates = TokenRates {
         prompt: 750_000,
         cached_prompt: Some(187_500),

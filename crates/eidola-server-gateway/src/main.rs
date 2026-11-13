@@ -25,7 +25,6 @@ struct Config {
     database_ssl_cert: Option<String>,
     stripe_api_key: Option<String>,
     credential_master_key: [u8; 32],
-    pricing_markup: Option<f64>,
     /// Static seed for the required-terms gate (dev/test pin; see
     /// `terms_seed` parsing). Applied via the same monotonic upsert the
     /// terms-feed poller uses.
@@ -77,21 +76,6 @@ impl Config {
         // by its Argon2id hash like the others when `ENGINE_TOKEN_HASH` is set.
         // Absent, the gateway starts without an engine router (see `main`).
         let engine_token = std::env::var("ENGINE_TOKEN").ok().filter(|s| !s.is_empty());
-
-        let pricing_markup = std::env::var("PRICING_MARKUP")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                s.parse::<f64>()
-                    .map_err(|_| "PRICING_MARKUP must be a valid number".to_string())
-            })
-            .transpose()?;
-        // Refuse to start with a markup below the pricing contract's safe
-        // cost factor — see `validate_pricing_markup` for the loss-window
-        // rationale (and the future dynamic-factor-via-/models note).
-        eidola_server_gateway::backend::validate_pricing_markup(
-            pricing_markup.unwrap_or(eidola_server_gateway::backend::DEFAULT_PRICING_MARKUP),
-        )?;
 
         let credential_master_key_hex = std::env::var("CREDENTIAL_MASTER_KEY")
             .map_err(|_| "CREDENTIAL_MASTER_KEY environment variable is required")?;
@@ -207,7 +191,6 @@ impl Config {
             database_ssl_cert,
             stripe_api_key,
             credential_master_key,
-            pricing_markup,
             terms_seed,
             terms_feed_base_url,
             terms_refresh,
@@ -361,11 +344,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pricing_overrides = std::env::var("PRICING_OVERRIDES")
         .ok()
         .filter(|s| !s.is_empty());
-    let catalog =
-        Catalog::new(config.pricing_markup, pricing_overrides.as_deref()).map_err(|e| {
-            error!("{e}");
-            e
-        })?;
+    let catalog = Catalog::new(pricing_overrides.as_deref()).map_err(|e| {
+        error!("{e}");
+        e
+    })?;
 
     // Create shared state
     let state = AppState::new(

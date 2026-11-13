@@ -95,14 +95,12 @@
 //!   of the same request (same `messages` array → same content bytes and
 //!   message count), and the server clamps its charged prompt tokens to the
 //!   formula's value. No under-allocation is possible.
-//! - **Cost recovery.** For any BPE tokenizer, actual tokens ≤ content bytes.
-//!   The byte term charges at least `bytes / N` where
-//!   `N = SAFE_COST_FACTOR_NUM / SAFE_COST_FACTOR_DEN`, so the worst-case
-//!   actual/charged token ratio on the byte term is exactly `N`. Break-even
-//!   on dynamic costs therefore requires `N ≤ PRICING_MARKUP`; the server
-//!   asserts `PRICING_MARKUP ≥ N` at startup and refuses to start otherwise
-//!   (a markup below the factor would silently open a loss window). The
-//!   factor is thus "the safe cost factor" — the floor of the markup.
+//! - **A bounded undercount.** For any BPE tokenizer, actual tokens ≤ content
+//!   bytes. The byte term charges at least `bytes / N` where
+//!   `N = SAFE_COST_FACTOR_NUM / SAFE_COST_FACTOR_DEN`, so a prompt is never
+//!   charged for fewer than `1 / N` of the tokens it can become: the
+//!   worst-case actual/charged token ratio on the byte term is exactly `N`.
+//!   A model's per-token price is set knowing that.
 //!
 //! # Inputs
 //!
@@ -209,8 +207,8 @@ pub fn chat_completion_request_body(
 /// Numerator of the safe cost factor `N = NUM/DEN = 1.5`.
 ///
 /// Kept as an integer ratio so client and server compute identically —
-/// floats are forbidden in the formula. `N` is the floor of the server's
-/// `PRICING_MARKUP` (see the crate docs' cost-recovery invariant).
+/// floats are forbidden in the formula. `N` bounds how far a prompt's charged
+/// tokens can fall below its actual ones (see the crate docs).
 pub const SAFE_COST_FACTOR_NUM: u64 = 3;
 
 /// Denominator of the safe cost factor `N = NUM/DEN = 1.5`.
@@ -264,10 +262,10 @@ pub fn chargeable_prompt_tokens(total_content_bytes: u64, message_count: u64) ->
 /// strings: the advertised `tools` schemas are re-injected into the prompt by
 /// the chat template on **every** round of an agentic loop, and a model's own
 /// `arguments` are replayed verbatim in the follow-up request. Counting only
-/// `content` would let all of it ride upstream uncharged — a cost-recovery
+/// `content` would let all of it reach the engine uncharged — a pricing
 /// gap (never a safety one: the hold and the charge cap are the same
 /// function, so hold ≥ charge held either way). It is the byte term, not a
-/// new constant, because the cost-recovery invariant it rests on —
+/// new constant, because the invariant it rests on —
 /// `actual_tokens ≤ bytes` for any BPE tokenizer — holds for JSON exactly as
 /// it does for prose.
 ///
@@ -599,7 +597,7 @@ mod tests {
 
     #[test]
     fn charge_is_at_least_bytes_over_factor() {
-        // Cost-recovery invariant: charged ≥ bytes / N for the byte term.
+        // Bounded undercount: charged ≥ bytes / N for the byte term.
         for bytes in [0u64, 1, 2, 3, 100, 12345, 1_000_000] {
             let charged = chargeable_prompt_tokens(bytes, 0) - PER_REQUEST_TOKENS;
             assert!(
