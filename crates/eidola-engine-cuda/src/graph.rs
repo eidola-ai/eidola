@@ -1185,9 +1185,14 @@ mod tests {
         assert_eq!(read(w, l.token_ids, 8), [11, 22, 33, 0, 0, 0, 0, 0]);
         assert_eq!(read(w, l.positions, 8), [17, 40, 1100, 0, 0, 0, 0, 0]);
         assert_eq!(read(w, l.logit_rows, 8), (0..8).collect::<Vec<_>>());
-        for i in 0..8 {
+        assert_eq!(rows.samples.len(), 3);
+        let padded = rows
+            .samples
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_with(pad_sample));
+        for (i, want) in padded.take(8).enumerate() {
             let at = l.sample_rows + i * SAMPLE_ROW_WORDS;
-            let want = if i < 3 { rows.samples[i] } else { pad_sample() };
             assert_eq!(w[at..at + SAMPLE_ROW_WORDS], sample_row_words(&want));
         }
         // A padding row samples greedily (temperature 0) from real row 0's

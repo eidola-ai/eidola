@@ -1,0 +1,65 @@
+# syntax=docker/dockerfile:1@sha256:a7f5ec8c4a35a7f8cd9e6e413f59fd1bfd33f8b623c26981c684f5065dfe3044
+
+# The inference engine's GPU kernel images, as an image the node's image takes
+# as an input pinned by digest (`oci/eidola-server-engine/Containerfile`).
+#
+# The kernels are compiled by NVIDIA's CUDA toolkit, a closed tool StageX does
+# not carry, so this image is built by the kernel crate's own Nix expression
+# (`crates/eidola-engine-kernels/nix`, the build `just engine-kernels` runs),
+# with Nix inside a pinned container. Its output is held to the committed
+# `kernels.manifest.json` byte for byte before anything is copied out, and the
+# image is that output and nothing else, so its digest is a function of the
+# crate's committed files.
+
+# ── inputs ─────────────────────────────────────────────────────────────────────
+# nixos/nix 2.32.4, the release the kernel build pins; the linux/amd64
+# manifest digest of the multi-arch index `build-in-docker.sh` names.
+FROM nixos/nix:2.32.4@sha256:59627baee1756479291d429a94fb60d2d4552d32ca61bcd70b853e476f9eb90e AS inputs
+
+# The container is the isolation boundary: Nix's own sandbox needs privileges
+# a build container lacks, and its seccomp filter cannot be loaded under amd64
+# emulation. Every input is still fixed by hash (the nixpkgs revision, the
+# toolkit and the kernel sources). One derivation at a time, on at most four
+# cores: the build runs one nvcc per core, and a CUTLASS translation unit
+# takes gigabytes, so more cores than that runs a 16 GiB builder out of
+# memory. Neither bound reaches the output.
+RUN printf '%s\n' \
+      'sandbox = false' \
+      'filter-syscalls = false' \
+      'max-jobs = 1' \
+      'cores = 4' \
+      >> /etc/nix/nix.conf
+
+COPY crates/eidola-engine-kernels/ /src/
+
+# ── eval ───────────────────────────────────────────────────────────────────────
+# Not part of the image. `scripts/check-oci-stub-workspace.sh` builds this
+# stage on PRs, so an input the expression reads but the step above does not
+# copy fails there rather than first in the image build on `main`.
+FROM inputs AS eval
+
+RUN nix-instantiate /src/nix
+
+# ── build ──────────────────────────────────────────────────────────────────────
+# One step, so the store this build fills is not kept in any layer.
+FROM inputs AS build
+
+RUN <<-'EOF'
+	set -eu
+	out="$(nix-build --no-out-link /src/nix)"
+	if [ "$(sha256sum < "$out/manifest.json")" != "$(sha256sum < /src/kernels.manifest.json)" ]; then
+		echo "error: the kernel build does not reproduce kernels.manifest.json" >&2
+		exit 1
+	fi
+	mkdir /rootfs
+	cp -R "$out/cubin" "$out/fatbin" "$out/manifest.json" /rootfs/
+	chmod -R a-w,a+rX /rootfs
+	nix-collect-garbage >/dev/null
+EOF
+
+# ── package ────────────────────────────────────────────────────────────────────
+# `cubin/`, `fatbin/` and the build's `manifest.json` at the root. Not a
+# runnable image: the node's image copies these files out of it.
+FROM scratch AS package
+
+COPY --from=build /rootfs/ /

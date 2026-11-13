@@ -15,7 +15,7 @@ variable "TAGS" {
 # Empty (the default, and what local builds use) disables the cache entirely;
 # CI sets it for non-release builds and leaves it empty for v* release tags so
 # the attested artifacts compile clean. The dev and ci-* variant of each image
-# share one ref per image (eidola-buildcache:{server,cli,postgres,server-engine}), so the
+# share one ref per image (eidola-buildcache:{server,cli,postgres,engine-kernels,server-engine}), so the
 # promotion PR (which builds the dev targets) warms the post-merge push to main
 # (which builds the ci-* targets). See .github/workflows/artifacts.yml.
 variable "CACHE_REGISTRY" {
@@ -62,6 +62,11 @@ target "_cache_cli" {
 target "_cache_postgres" {
   cache-from = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:postgres"] : []
   cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:postgres,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
+}
+
+target "_cache_engine_kernels" {
+  cache-from = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:engine-kernels"] : []
+  cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:engine-kernels,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
 }
 
 target "_cache_server_engine" {
@@ -115,15 +120,29 @@ target "postgres" {
   tags       = ["eidola-postgres:dev"]
 }
 
+# The inference engine's GPU kernel images (Nix, CUDA toolkit), the input the
+# node's image pins by digest. Not recorded in the manifest: the node's image
+# carries every file of it.
+target "engine-kernels" {
+  inherits   = ["_common", "_cache_engine_kernels"]
+  context    = "."
+  dockerfile = "oci/eidola-engine-kernels/Containerfile"
+  tags       = ["eidola-engine-kernels:dev"]
+}
+
 # The inference node (eidola-server-engine, CUDA executor). Recorded under
 # the manifest key `eidola-server-engine` from the manifest schema that
-# records it (scripts/artifact-manifest.sh, ENGINE_IMAGE_SCHEMA). Its build
-# is Nix inside the Containerfile's builder stage, so CARGO_PROFILE does not
-# reach it: the image is always the release profile.
+# records it (scripts/artifact-manifest.sh, ENGINE_IMAGE_SCHEMA). The image
+# is always the release profile, so CARGO_PROFILE does not reach it. Its
+# Containerfile pins the kernel image by digest; here that input is the
+# `engine-kernels` target built from this tree, and scripts/artifact-manifest.sh
+# fails the build unless that target's digest is the pinned one, so an
+# unpublished pin builds the same image a published one does.
 target "server-engine" {
   inherits   = ["_common", "_cache_server_engine"]
   context    = "."
   dockerfile = "oci/eidola-server-engine/Containerfile"
+  contexts   = { kernels = "target:engine-kernels" }
   tags       = ["eidola-server-engine:dev"]
 }
 
@@ -179,9 +198,17 @@ target "ci-postgres" {
   tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-postgres:${t}"]
 }
 
+target "ci-engine-kernels" {
+  inherits   = ["_ci", "_cache_engine_kernels"]
+  context    = "."
+  dockerfile = "oci/eidola-engine-kernels/Containerfile"
+  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-engine-kernels:${t}"]
+}
+
 target "ci-server-engine" {
   inherits   = ["_ci", "_cache_server_engine"]
   context    = "."
   dockerfile = "oci/eidola-server-engine/Containerfile"
+  contexts   = { kernels = "target:ci-engine-kernels" }
   tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-server-engine:${t}"]
 }

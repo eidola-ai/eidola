@@ -1,0 +1,10 @@
+# The StageX pallet-rust image every Containerfile here compiles Rust with,
+# and the Rust it ships. There is one Rust version in this repository:
+# rust-toolchain.toml's channel must be `rust` below, and every
+# `FROM stagex/pallet-rust` line must be `image` below
+# (scripts/check-rust-toolchain.sh). The inference node's image build checks
+# `rust` against `rustc --version` inside the image, so this record cannot
+# drift from the image it names. Move all of it together with the StageX
+# release.
+image stagex/pallet-rust:sx2026.09.0@sha256:6033fb215dd7c87c885dd7b1c12de42464606dcc0323fc57339318d61f010a30
+rust 1.97.1

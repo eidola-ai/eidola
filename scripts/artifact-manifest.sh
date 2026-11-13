@@ -25,7 +25,10 @@ Options:
                                setup-buildx-action).
   --targets GROUP              For `build`: bake group to build (default: full manifest).
                                Recognized values: `all` (default), `server`, `cli`,
-                               `server-engine` (the inference node's image). Both push
+                               `server-engine` (the inference node's image, with the
+                               `engine-kernels` image it is built from, which must be
+                               the image its Containerfile pins), `engine-kernels`
+                               (the GPU kernel image alone). Both push
                                and non-push modes accept the split selectors so CI can
                                build and push each phase independently.
                                For `print`/`verify`: space-separated list of target names
@@ -94,6 +97,13 @@ ARTIFACT_SET_SCHEMA=3
 # a row the declared schema does not have is a claims change to every
 # installed client, exactly like a missing one.
 ENGINE_IMAGE_SCHEMA=4
+
+# The node's Containerfile pins the GPU kernel image it copies the kernels
+# from; this is that line. The bake targets build the input from this tree
+# instead (`engine-kernels`), so a build of the node also checks that build
+# against the pin (`check_kernels_pin`).
+ENGINE_CONTAINERFILE="$REPO_ROOT/oci/eidola-server-engine/Containerfile"
+KERNELS_PIN_PATTERN='^FROM ghcr\.io/eidola-ai/eidola-engine-kernels@sha256:[0-9a-f]{64} AS kernels$'
 
 # Every artifact key the emitted schema requires — the emitter's half of the
 # contract `crates/eidola-app-core/src/updates.rs` states for clients. A
@@ -512,23 +522,25 @@ build_metadata() {
   # --push.
   if [[ "$PUSH_MODE" -eq 1 ]]; then
     case "$TARGETS" in
-      all)    bake_targets=(ci-server ci-cli ci-postgres ci-server-engine) ;;
+      all)    bake_targets=(ci-server ci-cli ci-postgres ci-engine-kernels ci-server-engine) ;;
       server) bake_targets=(ci-server ci-postgres) ;;
       cli)    bake_targets=(ci-cli) ;;
-      server-engine) bake_targets=(ci-server-engine) ;;
+      server-engine) bake_targets=(ci-engine-kernels ci-server-engine) ;;
+      engine-kernels) bake_targets=(ci-engine-kernels) ;;
       *)
-        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli, server-engine)" >&2
+        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli, server-engine, engine-kernels)" >&2
         exit 1
         ;;
     esac
   else
     case "$TARGETS" in
-      all)    bake_targets=(server cli postgres server-engine) ;;
+      all)    bake_targets=(server cli postgres engine-kernels server-engine) ;;
       server) bake_targets=(server postgres) ;;
       cli)    bake_targets=(cli) ;;
-      server-engine) bake_targets=(server-engine) ;;
+      server-engine) bake_targets=(engine-kernels server-engine) ;;
+      engine-kernels) bake_targets=(engine-kernels) ;;
       *)
-        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli, server-engine)" >&2
+        echo "error: unknown --targets value: $TARGETS (expected: all, server, cli, server-engine, engine-kernels)" >&2
         exit 1
         ;;
     esac
@@ -541,6 +553,36 @@ build_metadata() {
     ${builder_args[@]+"${builder_args[@]}"} \
     ${buildx_set_args[@]+"${buildx_set_args[@]}"} \
     --metadata-file "$METADATA_FILE"
+
+  case "$TARGETS" in
+    all | server-engine) check_kernels_pin ;;
+  esac
+}
+
+# The digest the node's Containerfile pins its kernel image at.
+kernels_pin() {
+  local pin
+  pin="$(grep -E "$KERNELS_PIN_PATTERN" "$ENGINE_CONTAINERFILE" | grep -oE 'sha256:[0-9a-f]{64}' || true)"
+  if [[ "$(printf '%s\n' "$pin" | grep -c .)" -ne 1 ]]; then
+    echo "error: $ENGINE_CONTAINERFILE must pin its kernel image on exactly one line matching: $KERNELS_PIN_PATTERN" >&2
+    exit 1
+  fi
+  printf '%s\n' "$pin"
+}
+
+# The node's image was built from the `engine-kernels` target, not from the
+# image its Containerfile pins: they must be the same image. A kernel change
+# therefore moves the pin in the same commit, and the first build of a new pin
+# (before it is published) is the build that publishes it.
+check_kernels_pin() {
+  local pin built
+  pin="$(kernels_pin)"
+  built="$(metadata_digest "$METADATA_FILE" "$(target_key engine-kernels)")"
+  if [[ "$built" != "$pin" ]]; then
+    echo "error: the kernel image this tree builds is $built, but $ENGINE_CONTAINERFILE pins $pin" >&2
+    exit 1
+  fi
+  echo "kernel image matches the pin: $pin" >&2
 }
 
 # Extract a single image digest from a bake metadata file by target name.

@@ -81,7 +81,9 @@ build system:
 
 # Build the inference node's OCI image the way CI does (Docker, linux/amd64:
 # emulated on other hosts, and slow there) and print its digest, the value an
-# engine deployment's tinfoil-config.yml pins.
+# engine deployment's tinfoil-config.yml pins. The GPU kernel image it is
+# built from is built too, and the build fails unless that image's digest is
+# the one oci/eidola-server-engine/Containerfile pins.
 engine-image:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -96,6 +98,18 @@ engine-image:
 # `--update` rewrites it. See crates/eidola-engine-kernels/AGENTS.md.
 engine-kernels *args:
     crates/eidola-engine-kernels/scripts/build-in-docker.sh {{args}}
+
+# Build the GPU kernel image the inference node's image is built from, as CI
+# does, and print its digest: the value oci/eidola-server-engine/Containerfile
+# pins on its `AS kernels` line, moved in the same commit as any change to the
+# kernels. See crates/eidola-engine-kernels/AGENTS.md.
+engine-kernels-image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    metadata="$(mktemp)"
+    trap 'rm -f "$metadata"' EXIT
+    ./scripts/artifact-manifest.sh build --ensure-builder --targets engine-kernels --metadata-file "$metadata"
+    jq -r '."engine-kernels"."containerimage.digest"' "$metadata"
 
 # Vendor a release of the platform provider's signed platform endorsements
 # (`platform-vX.Y.Z` of tinfoilsh/cvmimage) into
@@ -201,6 +215,9 @@ check:
     rumdl check .
     cargo-deny check licenses bans sources
     ./scripts/check-manifest-determinism.sh
+    ./scripts/check-rust-toolchain.sh
+    ./scripts/test-check-rust-toolchain.sh
+    ./scripts/test-require-needs-success.sh
     ./scripts/artifact-manifest.sh check-complete
     ./scripts/test-release-assets.sh
     ./scripts/test-weights-hash.sh

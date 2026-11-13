@@ -829,7 +829,7 @@ impl Inner {
             }
             .await;
             #[cfg(feature = "test-support")]
-            let rooms = match self.enumeration_faults.fetch_update(
+            let rooms = match self.enumeration_faults.try_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |n| n.checked_sub(1),
@@ -1650,7 +1650,7 @@ impl Inner {
                     #[cfg(feature = "test-support")]
                     if self
                         .anchor_lookup_faults
-                        .fetch_update(
+                        .try_update(
                             std::sync::atomic::Ordering::SeqCst,
                             std::sync::atomic::Ordering::SeqCst,
                             |n| n.checked_sub(1),

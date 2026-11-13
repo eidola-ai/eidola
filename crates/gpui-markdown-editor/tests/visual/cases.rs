@@ -344,7 +344,7 @@ pub fn register(s: &mut Snapshots) {
             cx.new(|cx| {
                 let state = EditorState {
                     markdown: FRONTMATTER.into(),
-                    selection: selection.clone(),
+                    selection,
                     ..Default::default()
                 };
                 EditorHarness::with_state(state, window, cx)

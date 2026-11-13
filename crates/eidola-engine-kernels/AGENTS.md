@@ -173,7 +173,9 @@ Editing a kernel or the build recipe without rebuilding fails here.
 
 ## Repository integration
 
-The root flake imports the derivation unchanged, with its own nixpkgs, so the toolchain record the build writes is the one the committed manifest holds:
+**The kernel image.** `oci/eidola-engine-kernels/Containerfile` runs this directory's expression (`nix-build nix`, with its own pinned nixpkgs, the flake's revision) inside the pinned `nixos/nix` container, fails unless the build's `manifest.json` equals `kernels.manifest.json` byte for byte, and ships `cubin/`, `fatbin/` and that `manifest.json` in a `FROM scratch` image, `ghcr.io/eidola-ai/eidola-engine-kernels` (bake `engine-kernels` / `ci-engine-kernels`; CI's `oci-engine` job builds it and pushes it on push events). Its digest is a function of this crate's committed files. The inference node's image (`oci/eidola-server-engine/Containerfile`, `crates/eidola-server-engine/AGENTS.md` → The image) names it by digest on its `AS kernels` line and copies the images from it into `/opt/eidola/kernels` after checking that the image's `manifest.json` is the committed one and that every cubin and fatbin it lists has its recorded size and SHA-256, and no other. Every node image build therefore is an x86_64 `--verify` of this crate. **Changing a kernel or the build recipe moves that pin**: after `--update`, `just engine-kernels-image` builds the kernel image as CI does and prints its digest, which goes on the node Containerfile's `AS kernels` line in the same commit; a node build (`just engine-image`, CI) fails while the two disagree. Its `eval` stage is built on PRs (`scripts/check-oci-stub-workspace.sh`), so a file the expression reads that the image does not copy fails before `main`.
+
+**The flake.** The root flake imports the derivation unchanged, with its own nixpkgs, so the toolchain record the build writes is the one the committed manifest holds:
 
 ```nix
 engineKernels = import ./crates/eidola-engine-kernels/nix {
@@ -183,4 +185,4 @@ engineKernels = import ./crates/eidola-engine-kernels/nix {
 };
 ```
 
-It is `packages.x86_64-linux.eidola-engine-kernels`, and the inference node's image root (`eidola-server-engine-image-root`, `crates/eidola-server-engine/AGENTS.md` → The image) is built from it: that derivation fails unless the build's `manifest.json` equals `kernels.manifest.json` byte for byte, every cubin and fatbin the committed manifest lists has its recorded size and SHA-256, and the build produced no image the manifest does not list; it then copies exactly the listed images into the image at `/opt/eidola/kernels`. So every image build is also an x86_64 `--verify` of this crate, natively on CI's amd64 runner. Any import must pass the root's own nixpkgs revision, or the manifest's toolchain record changes.
+It is `packages.x86_64-linux.eidola-engine-kernels`. Any import must pass the root's own nixpkgs revision, or the manifest's toolchain record changes; the standalone default (what `build-in-docker.sh` and the kernel image run) pins the same revision, so a `flake.lock` bump moves it too.
