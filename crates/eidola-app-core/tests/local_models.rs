@@ -146,12 +146,10 @@ fn a_failed_signed_download_keeps_its_token_out_of_the_error() {
     run(|| {
         let (core, dir) = bare_core();
         // A port with nothing listening: the send fails during connect, which
-        // is exactly when reqwest has a URL to attach.
-        let dead_port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let url = format!("http://127.0.0.1:{dead_port}/models/secret-model.gguf?token=s3cret");
+        // is exactly when reqwest has a URL to attach. Port 1 is privileged,
+        // so no other test can be listening on it, as one could on a port
+        // freed by a listener bound and dropped here.
+        let url = "http://127.0.0.1:1/models/secret-model.gguf?token=s3cret".to_string();
 
         core.runtime()
             .block_on(core.download_local_model(url))
