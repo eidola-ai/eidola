@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - next
+      - deepseek-v41-flash
 
 permissions:
   contents: read
