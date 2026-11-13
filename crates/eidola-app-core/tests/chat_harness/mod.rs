@@ -734,12 +734,19 @@ pub struct MockConfig {
     /// epoch's windows on [`MockConfig::issuer_calendar`], so no test written
     /// before key deadlines mattered can meet one. A test about a key's
     /// deadlines sets them relative to now ([`KeyWindow::epoch_ending_at`]),
-    /// with the calendar that puts them on one.
+    /// with the calendar that puts them on one; a deadline seconds away is
+    /// set once the profile is open ([`MockConfig::key_deadline`]).
     pub key_window: Option<KeyWindow>,
     /// The issuer calendar the mock lists windows on and the client checks
     /// them against (`AppCore::test_set_issuer_calendar`, applied by
     /// [`core_for`]). `None` is the production calendar.
     pub issuer_calendar: Option<IssuerCalendar>,
+    /// A calendar and key window set once the profile is open
+    /// ([`KeyDeadline::issuing_ends_in`]), in place of
+    /// [`MockConfig::issuer_calendar`] and [`MockConfig::key_window`]: a
+    /// deadline seconds away is measured from after the setup, however long
+    /// opening the profile took.
+    pub key_deadline: KeyDeadline,
     /// Switch the mock to a second, real issuer key: listed as current and
     /// signing issuances, in the same epoch as the first. What a server
     /// rotating within an epoch (or singling a client out) looks like.
@@ -980,6 +987,36 @@ impl KeyWindow {
     }
 }
 
+/// See [`MockConfig::key_deadline`].
+#[derive(Clone, Default)]
+pub struct KeyDeadline(Arc<std::sync::Mutex<Option<(IssuerCalendar, Option<KeyWindow>)>>>);
+
+impl KeyDeadline {
+    /// Put the mock and `core` on a calendar of `epoch_secs`-long epochs
+    /// whose current epoch stops issuing `secs` seconds from this call, and
+    /// return that instant (unix seconds) with the calendar. With
+    /// `pin_window` the mock keeps listing that epoch's key window after it
+    /// ends, as [`MockConfig::key_window`] does; without, it lists whichever
+    /// epoch is current, as [`MockConfig::issuer_calendar`] does.
+    pub fn issuing_ends_in(
+        &self,
+        core: &AppCore,
+        secs: i64,
+        epoch_secs: u64,
+        pin_window: bool,
+    ) -> (i64, IssuerCalendar) {
+        let issue_until = eidola_app_core::now_ms().div_euclid(1_000) + secs;
+        let (window, calendar) = KeyWindow::epoch_ending_at(issue_until, epoch_secs);
+        core.test_set_issuer_calendar(calendar);
+        *self.0.lock().unwrap() = Some((calendar, pin_window.then_some(window)));
+        (issue_until, calendar)
+    }
+
+    fn get(&self) -> Option<(IssuerCalendar, Option<KeyWindow>)> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
 impl Default for MockConfig {
     fn default() -> Self {
         Self {
@@ -1010,6 +1047,7 @@ impl Default for MockConfig {
             key_window: None,
             issuance: IssuanceKnobs::default(),
             issuer_calendar: None,
+            key_deadline: KeyDeadline::default(),
             key_swap: KeySwap::default(),
             omit_previous_key: Arc::default(),
             cached_prompt_price: None,
@@ -4557,12 +4595,18 @@ fn keys_body(issuer: &Issuer, config: &MockConfig) -> String {
     // key across a boundary lists that key for two epochs, as a dishonest
     // server would; a test wanting the next epoch accepted gives it a new key
     // ([`KeySwap`]).
-    let calendar = config.issuer_calendar.unwrap_or(ISSUER_CALENDAR);
+    let (calendar, window) = match config.key_deadline.get() {
+        Some((calendar, window)) => (calendar, window),
+        None => (
+            config.issuer_calendar.unwrap_or(ISSUER_CALENDAR),
+            config.key_window.clone(),
+        ),
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("after 1970")
         .as_secs();
-    let window = config.key_window.clone().unwrap_or_else(|| {
+    let window = window.unwrap_or_else(|| {
         KeyWindow::of_epoch(&calendar, calendar.epoch_at(now).expect("on the calendar"))
     });
     let current_epoch = eidola_app_core::iso_to_ms(&window.issue_from)
