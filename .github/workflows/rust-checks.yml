@@ -27,6 +27,7 @@ on:
     branches:
       - main
       - next
+      - deepseek-v41-flash
 
 # Cancel superseded PR runs; let pushes to main and tag releases finish.
 concurrency:
