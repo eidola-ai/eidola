@@ -110,6 +110,21 @@ fn setup(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) {
     chat_harness::core_for(config)
 }
 
+/// Wait until the mock has received more than `past` completion requests: a
+/// turn whose request has reached the upstream has taken its claim and its
+/// hold, which come before the request. The mock's `chat_delay_ms` then holds
+/// the turn there.
+async fn until_upstream_reached(mock: &MockServer, past: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while mock.chat_hits() <= past {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the turn never reached the upstream"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// The shared constructor is the only outer request shape app-core may send.
 /// Read every input from the harness-captured body, so a field added at either
 /// dispatch call site makes this exact-body comparison fail.
@@ -9147,7 +9162,7 @@ fn a_second_regeneration_of_one_post_is_refused_before_it_spends() {
             let b = async {
                 // Let the first claim its item before the second asks. The
                 // held response keeps it claimed until well after this.
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                until_upstream_reached(&mock, before).await;
                 core.regenerate_stream(answer.clone(), MODEL.into(), tx2)
                     .await
             };
@@ -9328,7 +9343,7 @@ fn a_regeneration_that_waited_for_the_claim_revises_the_generation_it_finds() {
 #[test]
 fn a_reply_written_during_a_regeneration_rethreads_onto_the_answer_it_never_saw() {
     run(|| {
-        let (_mock, core, _dir) = setup(MockConfig {
+        let (mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::OkEitherTransport,
             chat_delay_ms: 1_500,
             ..MockConfig::default()
@@ -9344,6 +9359,7 @@ fn a_reply_written_during_a_regeneration_rethreads_onto_the_answer_it_never_saw(
             .block_on(core.get_space_tree(first.space_id.clone()))
             .expect("tree");
         let answer = tree[1].action_id.clone();
+        let before = mock.chat_hits();
 
         // Both in flight at once: the answer is being revised while a reply is
         // written against the generation that is on its way out.
@@ -9356,7 +9372,7 @@ fn a_reply_written_during_a_regeneration_rethreads_onto_the_answer_it_never_saw(
             };
             let replying = async {
                 // Let the regeneration claim and get its request out first.
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                until_upstream_reached(&mock, before).await;
                 let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
                 let r =
                     core.respond_stream(first.space_id.clone(), MODEL.into(), answer.clone(), tx2);
@@ -9405,7 +9421,7 @@ fn a_failed_regeneration_still_settles_its_claim() {
         // The regeneration's stream ends without ever saying it finished — a
         // failure that writes no successor, which is exactly the ending
         // supersession cannot provide.
-        let (_mock, core, _dir) = setup(MockConfig {
+        let (mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::OkThenStreamEndsWithoutDone,
             chat_delay_ms: 2_000,
             ..MockConfig::default()
@@ -9433,6 +9449,7 @@ fn a_failed_regeneration_still_settles_its_claim() {
             .await
         });
         assert!(idle.is_ok(), "an unclaimed item settles immediately");
+        let before = mock.chat_hits();
 
         let (regen, (second, early)) = core.runtime().block_on(async {
             let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
@@ -9444,7 +9461,7 @@ fn a_failed_regeneration_still_settles_its_claim() {
             let probe = async {
                 // Let the claim be taken; the held response keeps it claimed
                 // well past everything below.
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                until_upstream_reached(&mock, before).await;
                 let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
                 let second = {
                     let s = core.regenerate_stream(answer.clone(), MODEL.into(), tx2);
@@ -9659,7 +9676,7 @@ fn a_hold_a_live_turn_is_flying_with_is_not_recovered() {
             let taking = core.chat("How do tides work?".into(), MODEL.into(), None);
             let recovering = async {
                 // Let the turn take its hold and get its request out.
-                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                until_upstream_reached(&mock, 0).await;
                 let in_flight = core
                     .wallet_spending_credentials()
                     .await
