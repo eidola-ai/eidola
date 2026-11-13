@@ -771,7 +771,11 @@ async fn stop_sequences_truncate_the_output_and_end_the_request() {
     let stop: String = chars[chars.len() / 2..chars.len() / 2 + 3].iter().collect();
     let cut = full_text.find(&stop).unwrap();
 
-    let mut body = request(LONG_TEXT, max);
+    // Room past the stop for the engine to keep generating until the cancel reaches
+    // it, however late the stream's reader sees the stop: greedy, the output up to
+    // the stop is the same, and a request that ran out its tokens first would end
+    // `finished`, not cancelled.
+    let mut body = request(LONG_TEXT, 16 * max);
     body["stop"] = json!([stop, "\u{1}never\u{1}"]);
     for stream in [false, true] {
         let (text, finish, usage) = if stream {
