@@ -68,8 +68,16 @@ pub struct CatalogRow {
 /// A row's base price, USD before the markup.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RowPrice {
-    PerToken { input_per_m: f64, output_per_m: f64 },
-    PerRequest { usd: f64 },
+    /// `cached_input_per_m` prices a prompt token a request declares cached,
+    /// where the row sells one; never above `input_per_m`.
+    PerToken {
+        input_per_m: f64,
+        output_per_m: f64,
+        cached_input_per_m: Option<f64>,
+    },
+    PerRequest {
+        usd: f64,
+    },
 }
 
 /// One file the weights hash covers.

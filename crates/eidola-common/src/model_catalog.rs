@@ -26,7 +26,12 @@
 //! - the source is `<owner>/<name>` at a 40-hex-digit revision;
 //! - display and capabilities are complete (a context window, a ceiling
 //!   inside it, text in and text out, no repeated modality);
-//! - the base price is finite and non-negative, per token or per request;
+//! - the base price is finite and non-negative, per token or per request; a
+//!   per-token row may also state a cached-input price, no higher than its
+//!   input price, and **a token-priced row declares `max_output_tokens`**:
+//!   it is the top of the ladder of completion ceilings a request is held
+//!   at, so a row without one would be held and served at its whole
+//!   context window;
 //! - the lifecycle is consistent: `deprecated` carries `retire_after`
 //!   (`YYYY-MM-DD`), `current` does not.
 //!
@@ -71,6 +76,11 @@ pub struct Row {
     /// `standard` or `reasoning`.
     pub output_budget_class: String,
     pub price: Price,
+    /// What a prompt token declared cached costs, USD per million before the
+    /// markup, where the row sells one: only beside a per-token price, and no
+    /// higher than its input price. `None` means a request to this model
+    /// cannot declare a cached prefix.
+    pub cached_input_per_m: Option<f64>,
     pub lifecycle: Lifecycle,
 }
 
@@ -149,6 +159,7 @@ struct RawCapabilities {
 struct RawPrice {
     input_per_m: Option<f64>,
     output_per_m: Option<f64>,
+    cached_input_per_m: Option<f64>,
     per_request: Option<f64>,
 }
 
@@ -317,6 +328,26 @@ pub fn parse(path: &str, bytes: &[u8]) -> Result<Row, String> {
             ));
         }
     };
+    let cached_input_per_m = match (raw.price.cached_input_per_m, price) {
+        (None, _) => None,
+        (Some(cached), Price::PerToken { input_per_m, .. })
+            if usable(cached) && cached <= input_per_m =>
+        {
+            Some(cached)
+        }
+        _ => {
+            return Err(at(
+                "price.cached_input_per_m belongs to a per-token price, finite, non-negative \
+                 and no higher than input_per_m",
+            ));
+        }
+    };
+    if matches!(price, Price::PerToken { .. }) && caps.max_output_tokens.is_none() {
+        return Err(at(
+            "a token-priced row declares capabilities.max_output_tokens: it bounds the \
+             completion a request is held and served for",
+        ));
+    }
 
     let lifecycle = match (raw.lifecycle.status.as_str(), raw.lifecycle.retire_after) {
         ("current", None) => Lifecycle::Current,
@@ -363,6 +394,7 @@ pub fn parse(path: &str, bytes: &[u8]) -> Result<Row, String> {
         max_output_tokens: caps.max_output_tokens,
         output_budget_class: caps.output_budget_class,
         price,
+        cached_input_per_m,
         lifecycle,
     })
 }

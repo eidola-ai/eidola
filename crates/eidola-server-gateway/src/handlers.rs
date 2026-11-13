@@ -9,6 +9,7 @@ use axum::extract::{FromRequest, Request, State};
 use axum::response::IntoResponse;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use eidola_common::pricing::{self, Prompt, TokenRates};
 use eidola_common::spend_credentials::{ACT_L, partial_returns};
 use opentelemetry::KeyValue;
 use serde::de::DeserializeOwned;
@@ -17,7 +18,7 @@ use tracing::{error, warn};
 
 use crate::AppState;
 use crate::auth::{ActSpend, AuthContext, AuthMethod};
-use crate::backend::{BackendStreamEvent, PRICING_SCALE_FACTOR, ResolvedModel};
+use crate::backend::{BackendStreamEvent, ResolvedModel};
 use crate::credentials::{self, KeyUse, RefundStage, SignedRefund};
 use crate::engine_trust::protocol::ValidatedRequest;
 use crate::error::ServerError;
@@ -26,7 +27,8 @@ use crate::response::{
     EidolaStreamMetadata, RefundInfo, build_privacy_metadata, build_verification_metadata,
 };
 use crate::types::{
-    ChatCompletionChunk, ChatCompletionRequest, ErrorResponse, Model, ModelsResponse, Usage,
+    CachedPrefixMember, ChatCompletionChunk, ChatCompletionRequest, ErrorResponse, Model,
+    ModelsResponse, Usage,
 };
 
 /// Health check endpoint.
@@ -121,8 +123,8 @@ pub(crate) fn effective_max_completion(request: &ChatCompletionRequest, model: &
 /// the same function of that request; quietly lowering the field would
 /// answer a different request from the one priced and leave the caller
 /// unable to tell why its answer stopped short. A refusal after the
-/// nullifier is recorded refunds the whole charge, as every validation
-/// refusal does, and is padded like every other response. With the ceiling
+/// nullifier is recorded is charged the request fee, as every validation
+/// refusal is, and is padded like every other response. With the ceiling
 /// written into a request that named none, every accepted request's
 /// completion side is the declared ceiling at most, whoever the client is.
 fn check_completion_ceiling(
@@ -139,72 +141,104 @@ fn check_completion_ceiling(
     }
 }
 
-/// Compute the worst-case cost in credits for a request — the pre-flight
-/// minimum hold.
-///
-/// For a model priced per request, returns the flat per-request price. For token-based models, the prompt side is the shared client/server
-/// pricing contract (`eidola_common::chargeable_prompt_tokens`: a content-byte
-/// term at the safe cost factor plus per-message and per-request constants),
-/// and the completion side uses `max_completion_tokens` (or context_length).
-/// The client sizes its hold with the identical function of the identical
-/// request, so the client and server go/no-go decisions agree bit-for-bit.
-pub(crate) fn worst_case_cost(request: &ChatCompletionRequest, model: &Model) -> u128 {
-    // Per-request pricing: flat cost regardless of token count.
-    if let Some(ref per_req) = model.pricing.per_request {
-        return (per_req.value as u128).div_ceil(per_req.scale_factor as u128);
+/// How a request's prompt is priced: by its declared cached prefix when it
+/// carries one, otherwise by the byte contract's chargeable tokens.
+pub(crate) fn priced_prompt(request: &ChatCompletionRequest) -> Prompt {
+    match request.cached_prefix {
+        Some(CachedPrefixMember(prefix)) => Prompt::Declared {
+            cached_tokens: u64::from(prefix.cached_tokens),
+            new_tokens: u64::from(prefix.new_tokens),
+        },
+        None => Prompt::Counted {
+            chargeable_tokens: chargeable_prompt_tokens_for(request),
+        },
     }
-
-    let sf = PRICING_SCALE_FACTOR as u128;
-
-    // Prompt: the shared contract formula.
-    let prompt_rate = model.pricing.per_prompt_token.value as u128;
-    let prompt_credits = (chargeable_prompt_tokens_for(request) as u128 * prompt_rate).div_ceil(sf);
-
-    // Completion: use max_completion_tokens or fall back to context_length.
-    let completion_rate = model.pricing.per_completion_token.value as u128;
-    let completion_credits =
-        (effective_max_completion(request, model) as u128 * completion_rate).div_ceil(sf);
-
-    prompt_credits + completion_credits
 }
 
-/// Compute the actual cost in credits from usage data, clamped to the
-/// pricing contract.
-///
-/// The prompt component charges `min(actual_prompt_tokens,
-/// chargeable_prompt_tokens(...))` — the contract's cap, which guarantees
-/// the charge never exceeds the hold both sides computed pre-flight. The
-/// completion component is bounded by the request's effective
-/// max-completion ceiling anyway (the model stops there), but is clamped
-/// defensively against a misbehaving upstream usage report.
-fn actual_cost(
-    usage: &Usage,
-    model: &Model,
-    chargeable_prompt_tokens: u64,
-    max_completion_tokens: u64,
-) -> u128 {
-    // Per-request pricing: flat cost regardless of actual token usage.
-    if let Some(ref per_req) = model.pricing.per_request {
-        return (per_req.value as u128).div_ceil(per_req.scale_factor as u128);
+/// A model's published per-token rates, as the shared pricing functions take
+/// them (scaled by `RATE_SCALE`, which is
+/// [`crate::backend::PRICING_SCALE_FACTOR`]).
+fn token_rates(model: &Model) -> TokenRates {
+    TokenRates {
+        prompt: model.pricing.per_prompt_token.value,
+        cached_prompt: model
+            .pricing
+            .per_cached_prompt_token
+            .as_ref()
+            .map(|p| p.value),
+        completion: model.pricing.per_completion_token.value,
     }
-
-    let sf = PRICING_SCALE_FACTOR as u128;
-    let charged_prompt = (usage.prompt_tokens as u64).min(chargeable_prompt_tokens);
-    let charged_completion = (usage.completion_tokens as u64).min(max_completion_tokens);
-    let prompt_cost = charged_prompt as u128 * model.pricing.per_prompt_token.value as u128;
-    let completion_cost =
-        charged_completion as u128 * model.pricing.per_completion_token.value as u128;
-    // Ceiling division for each component, then sum
-    let prompt_credits = prompt_cost.div_ceil(sf);
-    let completion_credits = completion_cost.div_ceil(sf);
-    prompt_credits + completion_credits
 }
 
-/// What a request that ended early costs: the prompt and the output the engine
-/// had generated by the last chunk the gateway received from it, priced and
-/// clamped to the contract like any usage ([`actual_cost`]); before any chunk
-/// arrived, the prompt alone (at the contract's cap, the most it may be
-/// charged), since the engine has begun on it.
+/// Everything a request's price is a function of, fixed from the request and
+/// its model before it is dispatched: the hold, every charge it can settle at,
+/// and nothing an engine reports about its cache.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RequestPrice {
+    /// A model priced per request: its flat price in credits.
+    per_request: Option<u128>,
+    rates: TokenRates,
+    prompt: Prompt,
+    max_completion: u64,
+}
+
+impl RequestPrice {
+    /// The price of `request` to `model`.
+    pub(crate) fn of(request: &ChatCompletionRequest, model: &Model) -> Self {
+        Self {
+            per_request: model
+                .pricing
+                .per_request
+                .as_ref()
+                .map(|p| (p.value as u128).div_ceil(p.scale_factor as u128)),
+            rates: token_rates(model),
+            prompt: priced_prompt(request),
+            max_completion: effective_max_completion(request, model),
+        }
+    }
+
+    /// The hold: the most the request can cost, which the client presents
+    /// exactly (`eidola_common::pricing::token_hold` / `request_hold`). `None`
+    /// for a declared prompt to a model that sells no cached rate, which
+    /// cannot be priced.
+    pub(crate) fn hold(&self) -> Option<u128> {
+        match self.per_request {
+            Some(flat) => Some(pricing::request_hold(flat)),
+            None => pricing::token_hold(&self.rates, self.prompt, self.max_completion),
+        }
+    }
+
+    /// The charge for `prompt_tokens` and `completion_tokens` as reported,
+    /// clamped to what the hold priced (`eidola_common::pricing::token_charge`).
+    fn charge(&self, prompt_tokens: u64, completion_tokens: u64) -> Option<u128> {
+        match self.per_request {
+            Some(flat) => Some(pricing::request_hold(flat)),
+            None => pricing::token_charge(
+                &self.rates,
+                self.prompt,
+                self.max_completion,
+                prompt_tokens,
+                completion_tokens,
+            ),
+        }
+    }
+
+    /// The tokens a declared prompt prices at the cached rate.
+    fn declared_cached_tokens(&self) -> Option<u64> {
+        match self.prompt {
+            Prompt::Declared { cached_tokens, .. } => Some(cached_tokens),
+            Prompt::Counted { .. } => None,
+        }
+    }
+}
+
+/// What a request that ended early costs: the fee, the prompt and the output
+/// the engine had generated by the last chunk the gateway received from it,
+/// priced and clamped like any usage; before any chunk arrived, the fee and
+/// the prompt at the most its pricing covers ([`Prompt::token_limit`]: for a
+/// declared prompt, its cached part at the cached rate and its whole budget at
+/// the prompt rate), since the engine has begun on it. `hold` stands in for a
+/// price that cannot be computed, which validation has already refused.
 ///
 /// **Generated, not delivered.** The count is the engine's running one, which
 /// rides on every delta chunk the gateway receives; it covers output still in
@@ -214,38 +248,27 @@ fn actual_cost(
 /// chunk reached the gateway (at most the steps in flight before the cancel
 /// reaches it) is not counted: the gateway's count is the one it can vouch
 /// for.
-pub(crate) fn early_cost(
-    usage: Option<&Usage>,
-    model: &Model,
-    chargeable_prompt_tokens: u64,
-    max_completion_tokens: u64,
-) -> u128 {
-    let prompt_only = Usage {
-        prompt_tokens: u32::try_from(chargeable_prompt_tokens).unwrap_or(u32::MAX),
-        completion_tokens: 0,
-        total_tokens: 0,
+pub(crate) fn early_cost(usage: Option<&Usage>, price: &RequestPrice, hold: u128) -> u128 {
+    let (prompt_tokens, completion_tokens) = match usage {
+        Some(u) => (u64::from(u.prompt_tokens), u64::from(u.completion_tokens)),
+        None => (price.prompt.token_limit(), 0),
     };
-    actual_cost(
-        usage.unwrap_or(&prompt_only),
-        model,
-        chargeable_prompt_tokens,
-        max_completion_tokens,
-    )
+    price
+        .charge(prompt_tokens, completion_tokens)
+        .unwrap_or(hold)
 }
 
 /// What a completed request costs: its usage priced and clamped to the
-/// contract ([`actual_cost`]), or the whole charge when the upstream reported
-/// no usage.
-pub(crate) fn settled_cost(
-    usage: Option<&Usage>,
-    model: &Model,
-    chargeable_prompt_tokens: u64,
-    max_completion_tokens: u64,
-    charge_credits: u128,
-) -> u128 {
+/// contract (`eidola_common::pricing::token_charge`), or the whole hold when
+/// the upstream reported no usage.
+///
+/// Only `prompt_tokens` and `completion_tokens` are read: what the engine
+/// reports about its prefix cache (`prompt_tokens_details.cached_tokens`) is
+/// never an input. A declared prompt is priced by its declaration.
+pub(crate) fn settled_cost(usage: Option<&Usage>, price: &RequestPrice, hold: u128) -> u128 {
     usage
-        .map(|u| actual_cost(u, model, chargeable_prompt_tokens, max_completion_tokens))
-        .unwrap_or(charge_credits)
+        .and_then(|u| price.charge(u64::from(u.prompt_tokens), u64::from(u.completion_tokens)))
+        .unwrap_or(hold)
 }
 
 /// Send a request to the engines that serve its model, as a stream.
@@ -547,27 +570,60 @@ pub(crate) async fn check_presented_spends(
 }
 
 /// Validate the model and the request's hold (the sum of its inputs'
-/// shares) against the request.
+/// shares) against the request, returning the resolved model and the
+/// request's price.
 ///
-/// Called after the nullifiers are recorded. Errors here require full
-/// refunds. `resolution` is the request's `model`, resolved at the edge
-/// (`Catalog::resolve`).
+/// Called after the nullifiers are recorded, so a refusal here is charged the
+/// request fee ([`refuse_paid`]). `resolution` is the request's `model`,
+/// resolved at the edge (`Catalog::resolve`).
 fn validate_request(
     hold: u128,
     request: &ChatCompletionRequest,
     resolution: Result<&ResolvedModel, crate::models::ModelRefError>,
-) -> Result<ResolvedModel, ServerError> {
+) -> Result<(ResolvedModel, RequestPrice), ServerError> {
     // The model, resolved to its weights hash, and its pricing.
     let resolved = resolution.map_err(ServerError::ModelReference)?.clone();
 
     // No completion past the declared ceiling, whatever the client.
     check_completion_ceiling(request, &resolved.model)?;
 
+    // A declared cached prefix the model can price and its window can hold.
+    check_declared_prompt(request, &resolved.model)?;
+
     // The presented hold must be exactly the worst-case cost (the shared
     // contract's hold), neither less nor more.
-    check_hold_equals_worst_case(hold, request, &resolved.model)?;
+    let price = RequestPrice::of(request, &resolved.model);
+    check_hold_equals_worst_case(hold, &price)?;
 
-    Ok(resolved)
+    Ok((resolved, price))
+}
+
+/// Refuse a declared cached prefix this model cannot honour: one to a model
+/// that sells no cached prompt rate (its price could not be computed), or one
+/// whose prompt limit (`cached_tokens + new_tokens`) is past the model's
+/// context window (no prompt it covers could be served whole). Fixed messages:
+/// the declared numbers are request-derived and never logged.
+fn check_declared_prompt(
+    request: &ChatCompletionRequest,
+    model: &Model,
+) -> Result<(), ServerError> {
+    let Some(CachedPrefixMember(prefix)) = request.cached_prefix else {
+        return Ok(());
+    };
+    if model.pricing.per_request.is_some() || model.pricing.per_cached_prompt_token.is_none() {
+        return Err(ServerError::BadRequest {
+            message: "this model sells no cached prompt rate, so a request to it may declare no \
+                      cached_prefix"
+                .to_string(),
+        });
+    }
+    if prefix.prompt_limit() > model.context_length {
+        return Err(ServerError::BadRequest {
+            message: "cached_prefix declares a prompt longer than this model's context window"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Pre-flight go/no-go: refuse a spend whose hold is not exactly the
@@ -579,13 +635,17 @@ fn validate_request(
 /// what the request needs, a degree of freedom it could be recognised by, and
 /// with an exact hold a request settled without reported usage is charged
 /// the worst case and never more. Refused after the nullifier is recorded,
-/// like every validation refusal, so it is answered with a full refund.
+/// like every validation refusal, so it is charged the request fee (or the
+/// whole hold, where the hold is smaller than the fee).
 fn check_hold_equals_worst_case(
     charge_credits: u128,
-    request: &ChatCompletionRequest,
-    model: &Model,
+    price: &RequestPrice,
 ) -> Result<(), ServerError> {
-    let wc = worst_case_cost(request, model);
+    let Some(wc) = price.hold() else {
+        return Err(ServerError::BadRequest {
+            message: "this request's prompt cannot be priced for this model".to_string(),
+        });
+    };
     if charge_credits < wc {
         return Err(ServerError::PaymentRequired {
             message: format!(
@@ -626,14 +686,14 @@ fn check_hold_equals_worst_case(
     request_body = ChatCompletionRequest,
     responses(
         (status = 200, description = "The answer, as server-sent events written in fixed-size frames on a fixed tick: `ChatCompletionChunk` events, then an `EidolaStreamMetadata` event carrying the privacy and verification metadata and the refunds, then `[DONE]`. A stream that ended early (its engine failed, its client stopped reading, or it reached the gateway's deadline) carries the metadata event, charged for what was generated, and no `[DONE]`", content_type = "text/event-stream", body = ChatCompletionChunk),
-        (status = 400, description = "Invalid request; a request that does not set `stream` to true (every chat answer is a stream), a malformed model reference (`invalid_model_reference`: not `tag`, `tag@sha256:<hex>` or `sha256:<hex>`), a malformed refund recovery key, more than two credentials, one credential presented twice, a share of zero, or a credential in a header (refused before any credential is spent); or a hold above the worst-case cost (refunded in full)", body = ErrorResponse),
+        (status = 400, description = "Invalid request; a request that does not set `stream` to true (every chat answer is a stream), a malformed model reference (`invalid_model_reference`: not `tag`, `tag@sha256:<hex>` or `sha256:<hex>`), a malformed refund recovery key, more than two credentials, one credential presented twice, a share of zero, or a credential in a header (refused before any credential is spent); or, after the credentials are spent and charged only the request fee (each share's remainder refunded, in input order): a hold above the worst-case cost, a completion ceiling past the model's `max_output_tokens`, a `cached_prefix` without a `cache_key` or with no cached token, a `cached_prefix` to a model that sells no cached prompt rate or declaring a prompt longer than its context window", body = ErrorResponse),
         (status = 401, description = "Authentication failed", body = ErrorResponse),
-        (status = 402, description = "A hold below the worst-case cost (refunded in full)", body = ErrorResponse),
-        (status = 404, description = "The model reference names no model (`model_not_found`); refunded in full", body = ErrorResponse),
-        (status = 409, description = "A credential already spent; none of the request's credentials is recorded", body = ErrorResponse),
-        (status = 410, description = "The model reference names a retired model (`model_retired`); refunded in full", body = ErrorResponse),
-        (status = 502, description = "Inference engine error", body = ErrorResponse),
-        (status = 503, description = "No engine is available for the model", body = ErrorResponse)
+        (status = 402, description = "A hold below the worst-case cost (charged the request fee, or the whole hold where it is smaller)", body = ErrorResponse),
+        (status = 404, description = "The model reference names no model (`model_not_found`); charged the request fee", body = ErrorResponse),
+        (status = 409, description = "A credential already spent (`conflict`; none of the request's credentials is recorded, nothing charged); or the engine refused the request's declared cached prefix before computing anything: `cached_prefix_missing` (its cache does not hold that many of the prompt's leading tokens under the request's `cache_key`) or `prompt_budget_exceeded` (the prompt is longer than `cached_tokens + new_tokens`), charged the request fee; send it again without the declaration", body = ErrorResponse),
+        (status = 410, description = "The model reference names a retired model (`model_retired`); charged the request fee", body = ErrorResponse),
+        (status = 502, description = "Inference engine error; charged the request fee when the engine produced nothing", body = ErrorResponse),
+        (status = 503, description = "No engine is available for the model; charged the request fee", body = ErrorResponse)
     )
 )]
 pub async fn chat_completions(
@@ -645,7 +705,7 @@ pub async fn chat_completions(
     // the request is rewritten to name the hash, so routing, the node,
     // billing, logs and telemetry see only the hash, never the tag the
     // client sent. A reference that does not resolve is refused after the
-    // credential is spent, with a full refund, like every validation
+    // credential is spent, charged the request fee, like every validation
     // refusal.
     let resolution = state.catalog.resolve(&validated.request().model);
     if let Ok(resolved) = &resolution {
@@ -790,8 +850,8 @@ async fn record_inputs(
 /// dispatch and every settlement run here, and a request
 /// whose handler has gone still ends with its final refunds stored for
 /// recovery. A request whose handler went away before its engine answered is
-/// dispatched to its answer like any other: a refusal settles as a full
-/// refund, and an opened stream finds its client gone at once, releases the
+/// dispatched to its answer like any other: a refusal settles charged the
+/// request fee ([`refuse_paid`]), and an opened stream finds its client gone at once, releases the
 /// engine and settles as that early ending ([`forward_stream`]). The deadline
 /// bounds it.
 pub(crate) async fn run_paid_request(
@@ -810,33 +870,50 @@ pub(crate) async fn run_paid_request(
         let request = validated.request();
 
         // Phase 3: Validate the request (model, hold). On failure, every
-        // input's share is returned in full.
-        let resolved = match validate_request(
-            inputs.hold(),
-            request,
-            resolution.as_ref().map_err(|e| *e),
-        ) {
-            Ok(resolved) => resolved,
-            Err(e) => {
-                warn!(
-                    "Request validation failed after nullifier recorded, issuing full refund: {e}"
-                );
-                let refunds = settle_inputs(&state, &inputs, 0).await;
-                return Ok(error_response_with_refunds(&e, refunds));
-            }
-        };
+        // input's share is returned but for the request fee.
+        let (resolved, price) =
+            match validate_request(inputs.hold(), request, resolution.as_ref().map_err(|e| *e)) {
+                Ok(validated) => validated,
+                Err(e) => {
+                    warn!("Request validation failed after nullifier recorded: {e}");
+                    return Ok(refuse_paid(&state, &inputs, &e).await);
+                }
+            };
 
         // Phase 4: Handle the request.
-        handle_streaming_request(state.clone(), &validated, inputs, &resolved, deadline).await
+        handle_streaming_request(
+            state.clone(),
+            &validated,
+            inputs,
+            &resolved,
+            price,
+            deadline,
+        )
+        .await
     })
     .await;
     answer.map_err(|_| ServerError::Internal("the request's task failed".to_string()))?
 }
 
+/// Answer a paid request refused before an engine produced anything (by
+/// validation, the node's subset, an engine's refusal, no engine at all, or a
+/// declared cached prefix the engine does not hold): charged the request fee,
+/// or the whole hold where the hold is smaller
+/// (`eidola_common::pricing::refused_charge`), consumed from the inputs in
+/// input order like any charge, the rest of each share returned.
+async fn refuse_paid(
+    state: &AppState,
+    inputs: &PaidInputs,
+    error: &ServerError,
+) -> axum::response::Response {
+    let refunds = settle_inputs(state, inputs, pricing::refused_charge(inputs.hold())).await;
+    error_response_with_refunds(error, refunds)
+}
+
 /// Open the engine's stream for a paid request. A refusal, or no engine
-/// answering, is settled here as a full refund; not opened by the deadline,
-/// the engine may have begun, and the whole hold is charged. Either way the
-/// error is the request's answer, its refunds in it.
+/// answering, is settled here as a refusal ([`refuse_paid`]); not opened by
+/// the deadline, the engine may have begun, and the whole hold is charged.
+/// Either way the error is the request's answer, its refunds in it.
 async fn open_upstream(
     state: &AppState,
     validated: &ValidatedRequest,
@@ -847,12 +924,8 @@ async fn open_upstream(
         Ok(Ok(rx)) => Opened::Stream(rx),
         Ok(Err(e)) => {
             // Nothing was generated: the engine refused it or never took it.
-            warn!(
-                "Engine error before the answer opened, issuing full refund: {}",
-                e
-            );
-            let refunds = settle_inputs(state, inputs, 0).await;
-            Opened::Answered(error_response_with_refunds(&e, refunds))
+            warn!("Engine error before the answer opened, charging the request fee: {e}");
+            Opened::Answered(refuse_paid(state, inputs, &e).await)
         }
         Err(_) => {
             warn!("Request reached its deadline before its answer opened, issuing zero refund");
@@ -1062,11 +1135,11 @@ async fn handle_streaming_request(
     validated: &ValidatedRequest,
     inputs: PaidInputs,
     resolved: &ResolvedModel,
+    price: RequestPrice,
     deadline: tokio::time::Instant,
 ) -> Result<axum::response::Response, ServerError> {
     let model = &resolved.model;
     let charge_credits = inputs.hold();
-    let request = validated.request();
     let auth_context = AuthContext {
         method: AuthMethod::AnonymousCredential,
     };
@@ -1089,11 +1162,6 @@ async fn handle_streaming_request(
     let spent = inputs;
     let model_id = model.sha256.clone();
     let echo = resolved.echo.clone();
-    let task_model = model.clone();
-    // Contract clamp inputs, computed from the request before the task takes
-    // over (the spawned task never sees the request itself).
-    let chargeable_prompt = chargeable_prompt_tokens_for(request);
-    let max_completion = effective_max_completion(request, model);
     let provider = crate::engine_router::PROVIDER;
 
     tokio::spawn(async move {
@@ -1123,19 +1191,25 @@ async fn handle_streaming_request(
                         &[model_attr, KeyValue::new("type", "completion")],
                     );
                 }
+                // The prompt tokens a settled request was charged at the
+                // cached rate: its declaration, never the engine's report of
+                // its cache.
+                if let Some(cached) = price.declared_cached_tokens() {
+                    crate::telemetry::metrics::CHAT_TOKENS.add(
+                        cached,
+                        &[
+                            KeyValue::new("model", model_id.clone()),
+                            KeyValue::new("type", "declared_cached_prompt"),
+                        ],
+                    );
+                }
 
                 let privacy = build_privacy_metadata(&auth_context, is_tee, &meta.provider);
                 let verification = build_verification_metadata(None);
 
                 // Compute the refund from usage, with the charge clamped
                 // to the pricing contract.
-                let cost = settled_cost(
-                    final_usage.as_ref(),
-                    &task_model,
-                    chargeable_prompt,
-                    max_completion,
-                    charge_credits,
-                );
+                let cost = settled_cost(final_usage.as_ref(), &price, charge_credits);
                 let refunds = settle_inputs(&state, &spent, cost).await;
 
                 send_metadata_event(
@@ -1158,12 +1232,7 @@ async fn handle_streaming_request(
                     reason.label()
                 );
                 timing.finish(reason.label(), None, Instant::now());
-                let cost = early_cost(
-                    final_usage.as_ref(),
-                    &task_model,
-                    chargeable_prompt,
-                    max_completion,
-                );
+                let cost = early_cost(final_usage.as_ref(), &price, charge_credits);
                 let refunds = settle_inputs(&state, &spent, cost).await;
                 if reason != EarlyEnding::ClientGone {
                     // A client cut off at the deadline or for not reading is
@@ -1609,6 +1678,17 @@ pub(crate) mod tests {
     }
 
     use super::*;
+    use crate::backend::PRICING_SCALE_FACTOR;
+
+    /// Compute the worst-case cost in credits for a request — the hold it must
+    /// present, exactly ([`RequestPrice::hold`]).
+    ///
+    /// The client sizes its hold with the identical function of the identical
+    /// request (`eidola_common::pricing`), so the client and server go/no-go
+    /// decisions agree bit-for-bit.
+    pub(crate) fn worst_case_cost(request: &ChatCompletionRequest, model: &Model) -> Option<u128> {
+        RequestPrice::of(request, model).hold()
+    }
 
     /// The extractor's result over `body`: the value, or the refusal's status and text.
     async fn extract(body: String) -> Result<serde_json::Value, (axum::http::StatusCode, String)> {
@@ -1929,6 +2009,7 @@ pub(crate) mod tests {
                     value: 2 * PRICING_SCALE_FACTOR,
                     scale_factor: PRICING_SCALE_FACTOR,
                 },
+                per_cached_prompt_token: None,
                 per_request: None,
             },
         }
@@ -2060,28 +2141,134 @@ pub(crate) mod tests {
         assert_eq!(timing.observations(None), (Some(0.010), None));
     }
 
+    /// The request fee, as the pricing contract charges it.
+    const FEE: u128 = pricing::REQUEST_FEE_CREDITS as u128;
+
+    /// What `usage` settles `req` to model `model` at.
+    fn charge(usage: &Usage, req: &ChatCompletionRequest, model: &Model) -> u128 {
+        settled_cost(Some(usage), &RequestPrice::of(req, model), u128::MAX)
+    }
+
+    /// [`test_model`] selling a cached prompt token at a quarter credit.
+    pub(crate) fn cached_model() -> Model {
+        let mut model = test_model();
+        model.pricing.per_cached_prompt_token = Some(ScaledPrice {
+            value: PRICING_SCALE_FACTOR / 4,
+            scale_factor: PRICING_SCALE_FACTOR,
+        });
+        model
+    }
+
+    /// `request(contents, max_completion_tokens)` declaring a cached prefix.
+    fn declared(
+        contents: &[&str],
+        max_completion_tokens: u32,
+        cached_tokens: u32,
+        new_tokens: u32,
+    ) -> ChatCompletionRequest {
+        let mut req = request(contents, max_completion_tokens);
+        req.cached_prefix = Some(CachedPrefixMember(
+            eidola_common::engine_protocol::CachedPrefix {
+                cached_tokens,
+                new_tokens,
+            },
+        ));
+        req
+    }
+
     #[test]
     fn worst_case_cost_uses_the_shared_contract() {
         // One 12-byte message, max 100 completion tokens.
         // chargeable prompt = ceil(12*2/3) + 8*1 + 32 = 8 + 8 + 32 = 48.
-        // wc = 48 * 1 credit + 100 * 2 credits = 248.
+        // wc = fee + 48 * 1 credit + 100 * 2 credits = 1,248.
         let req = request(&["hello world!"], 100);
         assert_eq!(chargeable_prompt_tokens_for(&req), 48);
-        assert_eq!(worst_case_cost(&req, &test_model()), 248);
+        assert_eq!(worst_case_cost(&req, &test_model()), Some(1_248));
+        // The cached rate prices nothing for a request that declares nothing.
+        assert_eq!(worst_case_cost(&req, &cached_model()), Some(1_248));
+    }
+
+    /// **A declared prompt is held and charged by its declaration**, its
+    /// cached part at the cached rate and the rest at the prompt rate, against
+    /// hand-computed numbers: never by the byte contract, and never by what
+    /// the engine reports about its cache.
+    #[test]
+    fn a_declared_prompt_is_held_and_charged_by_its_declaration() {
+        // 1,024 cached at 0.25 = 256; 300 new at 1 = 300; 100 completion at
+        // 2 = 200.
+        let req = declared(&["hello world!"], 100, 1_024, 300);
+        let model = cached_model();
+        let price = RequestPrice::of(&req, &model);
+        assert_eq!(price.hold(), Some(FEE + 256 + 300 + 200));
+        let usage = |prompt: u32, completion: u32| Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+        };
+        // 1,100 reported: 76 computed past the declared prefix.
+        assert_eq!(charge(&usage(1_100, 40), &req, &model), FEE + 256 + 76 + 80);
+        // Shorter than the prefix: the prefix is still charged whole.
+        assert_eq!(charge(&usage(10, 0), &req, &model), FEE + 256);
+        // Past the budget: the budget.
+        assert_eq!(
+            charge(&usage(9_999, 9_999), &req, &model),
+            FEE + 256 + 300 + 200
+        );
+        // Before any count, an early ending is the fee and the whole prompt
+        // the declaration covers.
+        assert_eq!(early_cost(None, &price, u128::MAX), FEE + 256 + 300);
+        assert_eq!(price.declared_cached_tokens(), Some(1_024));
+        assert_eq!(
+            RequestPrice::of(&request(&["hi"], 1), &model).declared_cached_tokens(),
+            None
+        );
+    }
+
+    /// A declared prompt to a model that sells no cached rate cannot be
+    /// priced and is refused, as is one whose prompt limit is past the
+    /// model's context window; both are validation refusals, after the
+    /// nullifier, so they are charged the fee.
+    #[test]
+    fn a_declaration_a_model_cannot_price_or_hold_is_refused() {
+        let req = declared(&["hi"], 100, 256, 10);
+        let uncached = test_model();
+        assert_eq!(worst_case_cost(&req, &uncached), None);
+        let refused = check_declared_prompt(&req, &uncached).unwrap_err();
+        assert_eq!(refused.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(!refused.to_string().contains("256"), "{refused}");
+        assert!(matches!(
+            check_hold_equals_worst_case(5_000, &RequestPrice::of(&req, &uncached)),
+            Err(ServerError::BadRequest { .. })
+        ));
+
+        let mut per_request = cached_model();
+        per_request.pricing.per_request = Some(ScaledPrice {
+            value: 5 * PRICING_SCALE_FACTOR,
+            scale_factor: PRICING_SCALE_FACTOR,
+        });
+        assert!(check_declared_prompt(&req, &per_request).is_err());
+
+        let cached = cached_model(); // a context window of 8,192
+        assert!(check_declared_prompt(&req, &cached).is_ok());
+        assert!(check_declared_prompt(&declared(&["hi"], 1, 8_000, 192), &cached).is_ok());
+        let past = check_declared_prompt(&declared(&["hi"], 1, 8_000, 193), &cached).unwrap_err();
+        assert!(!past.to_string().contains("8000"), "{past}");
+        assert!(!past.to_string().contains("8193"), "{past}");
+        assert!(check_declared_prompt(&request(&["hi"], 1), &uncached).is_ok());
     }
 
     /// **A stream that ends early is charged for what was generated**: the
-    /// engine's last running count, priced and clamped by the contract; before
-    /// any count, the prompt alone at the contract's cap. Never nothing (a
-    /// client could otherwise generate freely and leave), never the whole
-    /// hold for what was not produced.
+    /// fee and the engine's last running count, priced and clamped by the
+    /// contract; before any count, the fee and the prompt at the contract's
+    /// cap. Never nothing (a client could otherwise generate freely and
+    /// leave), never the whole hold for what was not produced.
     #[test]
     fn an_early_ending_is_charged_for_what_was_generated() {
         let req = request(&["hello world!"], 100);
         let model = test_model();
         let chargeable = chargeable_prompt_tokens_for(&req);
-        let max_completion = effective_max_completion(&req, &model);
-        let hold = worst_case_cost(&req, &model);
+        let price = RequestPrice::of(&req, &model);
+        let hold = price.hold().unwrap();
         let usage = |prompt: u32, completion: u32| Usage {
             prompt_tokens: prompt,
             completion_tokens: completion,
@@ -2091,25 +2278,20 @@ pub(crate) mod tests {
         // token.
         let prompt = u32::try_from(chargeable).unwrap();
         assert_eq!(
-            early_cost(Some(&usage(prompt, 7)), &model, chargeable, max_completion),
-            u128::from(prompt) + 14
+            early_cost(Some(&usage(prompt, 7)), &price, hold),
+            FEE + u128::from(prompt) + 14
         );
         assert_eq!(
-            early_cost(None, &model, chargeable, max_completion),
-            u128::from(prompt),
-            "nothing reported yet: the prompt, which the engine has begun on"
+            early_cost(None, &price, hold),
+            FEE + u128::from(prompt),
+            "nothing reported yet: the fee and the prompt, which the engine has begun on"
         );
         // Clamped like any usage, so never past the hold.
         assert_eq!(
-            early_cost(
-                Some(&usage(prompt + 1000, 1_000_000)),
-                &model,
-                chargeable,
-                max_completion
-            ),
+            early_cost(Some(&usage(prompt + 1000, 1_000_000)), &price, hold),
             hold
         );
-        assert!(early_cost(Some(&usage(prompt, 1)), &model, chargeable, max_completion) < hold);
+        assert!(early_cost(Some(&usage(prompt, 1)), &price, hold) < hold);
     }
 
     /// The forwarding loop, driven directly: a channel standing in for the
@@ -2406,26 +2588,43 @@ pub(crate) mod tests {
 
     #[test]
     fn preflight_requires_the_hold_to_equal_the_worst_case() {
-        let req = request(&["hello world!"], 100);
-        let model = test_model();
-        let wc = worst_case_cost(&req, &model);
+        let counted = request(&["hello world!"], 100);
+        let declared = declared(&["hello world!"], 100, 512, 40);
+        let model = cached_model();
+        for req in [&counted, &declared] {
+            let price = RequestPrice::of(req, &model);
+            let wc = price.hold().unwrap();
 
-        // One credit short → 402 PaymentRequired, before anything upstream.
-        let err = check_hold_equals_worst_case(wc - 1, &req, &model)
-            .expect_err("hold below the minimum must be rejected");
-        assert!(
-            matches!(err, ServerError::PaymentRequired { .. }),
-            "got {err:?}"
+            // One credit short → 402 PaymentRequired, before anything upstream.
+            let err = check_hold_equals_worst_case(wc - 1, &price)
+                .expect_err("hold below the minimum must be rejected");
+            assert!(
+                matches!(err, ServerError::PaymentRequired { .. }),
+                "got {err:?}"
+            );
+
+            // One credit over → refused too, and the log line names no amount.
+            let err = check_hold_equals_worst_case(wc + 1, &price)
+                .expect_err("a hold above the worst case must be rejected");
+            assert!(matches!(err, ServerError::BadRequest { .. }), "got {err:?}");
+            assert!(!err.to_string().contains(&(wc + 1).to_string()));
+
+            // The hold without the fee → refused.
+            assert!(check_hold_equals_worst_case(wc - FEE, &price).is_err());
+
+            // Exactly the worst case → accepted.
+            check_hold_equals_worst_case(wc, &price).expect("the exact hold is accepted");
+        }
+        // The declared hold is its declaration's: 512 at 0.25, 40 at 1, 100
+        // completion at 2; the counted one is the byte contract's 48 at 1.
+        assert_eq!(
+            RequestPrice::of(&declared, &model).hold(),
+            Some(FEE + 128 + 40 + 200)
         );
-
-        // One credit over → refused too, and the log line names no amount.
-        let err = check_hold_equals_worst_case(wc + 1, &req, &model)
-            .expect_err("a hold above the worst case must be rejected");
-        assert!(matches!(err, ServerError::BadRequest { .. }), "got {err:?}");
-        assert!(!err.to_string().contains(&(wc + 1).to_string()));
-
-        // Exactly the worst case → accepted.
-        check_hold_equals_worst_case(wc, &req, &model).expect("the exact hold is accepted");
+        assert_eq!(
+            RequestPrice::of(&counted, &model).hold(),
+            Some(FEE + 48 + 200)
+        );
     }
 
     #[test]
@@ -2433,14 +2632,14 @@ pub(crate) mod tests {
         // The defect the contract fixes: 40 one-byte messages have 40
         // content bytes, but the chat template adds per-message tokens the
         // old bytes-as-tokens hold never covered. The old-style hold
-        // (bytes × prompt_rate + max_completion × completion_rate = 240)
-        // must now fail pre-flight instead of under-funding the charge.
+        // (fee + bytes × prompt_rate + max_completion × completion_rate)
+        // must fail pre-flight instead of under-funding the charge.
         let contents: Vec<&str> = vec!["x"; 40];
         let req = request(&contents, 100);
         let model = test_model();
-        let old_style_hold = 40 + 100 * 2;
+        let old_style_hold = FEE + 40 + 100 * 2;
         assert!(
-            check_hold_equals_worst_case(old_style_hold, &req, &model).is_err(),
+            check_hold_equals_worst_case(old_style_hold, &RequestPrice::of(&req, &model)).is_err(),
             "bytes-as-tokens hold must be below the contract minimum"
         );
     }
@@ -2450,8 +2649,6 @@ pub(crate) mod tests {
         // Same request as above: chargeable prompt = 48, max completion 100.
         let req = request(&["hello world!"], 100);
         let model = test_model();
-        let chargeable = chargeable_prompt_tokens_for(&req);
-        let max_completion = effective_max_completion(&req, &model);
 
         // Upstream reports 1000 actual prompt tokens (> chargeable): the
         // prompt component is charged at the clamp, not the actual count.
@@ -2460,12 +2657,16 @@ pub(crate) mod tests {
             completion_tokens: 50,
             total_tokens: 1050,
         };
-        let cost = actual_cost(&usage, &model, chargeable, max_completion);
-        assert_eq!(cost, 48 + 50 * 2, "prompt clamped to 48, completion real");
+        let cost = charge(&usage, &req, &model);
+        assert_eq!(
+            cost,
+            FEE + 48 + 50 * 2,
+            "prompt clamped to 48, completion real"
+        );
 
         // And the refund reflects the clamped charge.
-        let wc = worst_case_cost(&req, &model);
-        assert_eq!(wc.saturating_sub(cost), 248 - 148);
+        let wc = worst_case_cost(&req, &model).unwrap();
+        assert_eq!(wc - cost, 248 - 148);
     }
 
     #[test]
@@ -2479,13 +2680,7 @@ pub(crate) mod tests {
             completion_tokens: 500,
             total_tokens: 510,
         };
-        let cost = actual_cost(
-            &usage,
-            &model,
-            chargeable_prompt_tokens_for(&req),
-            effective_max_completion(&req, &model),
-        );
-        assert_eq!(cost, 10 + 100 * 2);
+        assert_eq!(charge(&usage, &req, &model), FEE + 10 + 100 * 2);
     }
 
     #[test]
@@ -2496,13 +2691,17 @@ pub(crate) mod tests {
             scale_factor: PRICING_SCALE_FACTOR,
         });
         let req = request(&["hi"], 100);
-        assert_eq!(worst_case_cost(&req, &model), 5);
+        assert_eq!(worst_case_cost(&req, &model), Some(FEE + 5));
         let usage = Usage {
             prompt_tokens: 1_000_000,
             completion_tokens: 1_000_000,
             total_tokens: 2_000_000,
         };
-        assert_eq!(actual_cost(&usage, &model, 1, 1), 5);
+        assert_eq!(charge(&usage, &req, &model), FEE + 5);
+        assert_eq!(
+            early_cost(None, &RequestPrice::of(&req, &model), u128::MAX),
+            FEE + 5
+        );
     }
 
     /// **No completion past the declared ceiling, and an absent field is the
@@ -2538,6 +2737,214 @@ pub(crate) mod tests {
         assert_eq!(effective_max_completion(&absent, &undeclared), 8_192);
     }
 
+    /// **Every refusal after the nullifiers are recorded is charged the
+    /// request fee and nothing more**, consumed from the inputs in input
+    /// order like any charge: a model reference that does not resolve (or
+    /// names a retired model), a completion ceiling past the declared one, a
+    /// hold below or above the worst case, a declared cached prefix the model
+    /// sells no rate for or whose prompt limit is past its window, and no
+    /// engine to send it to. Driven through `run_paid_request` with two
+    /// inputs whose first share is smaller than the fee, so the fee spans
+    /// both; the refunds complete to exactly `share − allocated fee` each. A
+    /// hold smaller than the fee is charged whole.
+    #[test]
+    fn every_refusal_after_recording_is_charged_the_fee() {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(refusals_after_recording())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn refusals_after_recording() {
+        use crate::credentials::tests::{Cache, DAY, add_key, spend, unreachable_state};
+        use crate::models::ModelRefError;
+
+        const CREDITS: u128 = 100_000;
+        let body = |extra: &str| {
+            format!(
+                r#"{{"model":"test-model","messages":[{{"role":"user","content":"hello world!"}}],"max_completion_tokens":100,"stream":true{extra}}}"#
+            )
+        };
+        let key = r#","cache_key":"_-0123456789abcdefghijklmnopqrstuvwxyzABCDE""#;
+        let declaring = format!(r#"{key},"cached_prefix":{{"cached_tokens":512,"new_tokens":40}}"#);
+        let past_window =
+            format!(r#"{key},"cached_prefix":{{"cached_tokens":8000,"new_tokens":193}}"#);
+        let counted = body("");
+        let over_ceiling = counted.replace(
+            "\"max_completion_tokens\":100",
+            "\"max_completion_tokens\":4097",
+        );
+        let hold_of = |text: &str, model: &Model| {
+            let request: ChatCompletionRequest = serde_json::from_str(text).unwrap();
+            worst_case_cost(&request, model)
+        };
+        let counted_hold = hold_of(&counted, &test_model()).unwrap();
+        let resolved = |model: Model| -> Result<ResolvedModel, ModelRefError> {
+            Ok(ResolvedModel {
+                model,
+                echo: "test-model".to_string(),
+            })
+        };
+
+        // The case, its body, its resolution, the hold presented, and the
+        // status answered.
+        type Case = (
+            &'static str,
+            String,
+            Result<ResolvedModel, ModelRefError>,
+            u128,
+            u16,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "unknown model",
+                counted.clone(),
+                Err(ModelRefError::Unknown),
+                counted_hold,
+                404,
+            ),
+            (
+                "retired model",
+                counted.clone(),
+                Err(ModelRefError::Retired),
+                counted_hold,
+                410,
+            ),
+            (
+                "past the completion ceiling",
+                over_ceiling,
+                resolved(test_model()),
+                counted_hold,
+                400,
+            ),
+            (
+                "hold below",
+                counted.clone(),
+                resolved(test_model()),
+                counted_hold - 1,
+                402,
+            ),
+            (
+                "hold above",
+                counted.clone(),
+                resolved(test_model()),
+                counted_hold + 1,
+                400,
+            ),
+            (
+                "hold without the fee",
+                counted.clone(),
+                resolved(test_model()),
+                counted_hold - FEE,
+                402,
+            ),
+            (
+                "declared, no cached rate",
+                body(&declaring),
+                resolved(test_model()),
+                counted_hold,
+                400,
+            ),
+            (
+                "declared past the window",
+                body(&past_window),
+                resolved(cached_model()),
+                hold_of(&body(&past_window), &cached_model()).unwrap(),
+                400,
+            ),
+            (
+                "no engine",
+                counted.clone(),
+                resolved(test_model()),
+                counted_hold,
+                503,
+            ),
+            (
+                "declared, no engine",
+                body(&declaring),
+                resolved(cached_model()),
+                hold_of(&body(&declaring), &cached_model()).unwrap(),
+                503,
+            ),
+            // A hold smaller than the fee is charged whole.
+            (
+                "a hold under the fee",
+                counted.clone(),
+                Err(ModelRefError::Unknown),
+                700,
+                404,
+            ),
+        ];
+
+        let mut keys = Cache::new();
+        let hash = add_key(&mut keys, SystemTime::now() + DAY);
+        let params = keys[&hash].params.clone();
+        let public = keys[&hash].secret_key.public().clone();
+        let mut spends = Vec::new();
+        for (_, _, _, hold, _) in &cases {
+            // A first share smaller than the fee, so the fee spans both.
+            let first = 600.min(*hold - 1);
+            let shares = [first, hold - first];
+            let (a, a_pre) = spend(&keys[&hash], CREDITS, shares[0]);
+            let (b, b_pre) = spend(&keys[&hash], CREDITS, shares[1]);
+            spends.push((shares, [(a, a_pre), (b, b_pre)]));
+        }
+        let state = unreachable_state(keys);
+
+        for ((case, text, resolution, hold, status), (shares, inputs)) in
+            cases.into_iter().zip(spends)
+        {
+            let validated = ValidatedRequest::from_bytes(bytes::Bytes::from(text)).unwrap();
+            let acts: Vec<ActSpend> = inputs
+                .iter()
+                .map(|(act, _)| ActSpend {
+                    live: Some(std::sync::Arc::new(state.live_spends.serve(act))),
+                    ..act.clone()
+                })
+                .collect();
+            let recording = async move { Ok(paid_inputs(acts, shares.to_vec())) };
+            let response = run_paid_request(state.clone(), validated, resolution, recording)
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status, "{case}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let answer: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let refunds = answer["refunds"].as_array().expect("refunds");
+            assert_eq!(refunds.len(), 2, "{case}: one refund per input");
+
+            let charged = pricing::refused_charge(hold);
+            assert_eq!(charged, FEE.min(hold), "{case}");
+            let returns = partial_returns(&shares, charged).unwrap();
+            assert_eq!(returns.iter().sum::<u128>(), hold - charged, "{case}");
+            for (i, ((act, pre), refund)) in inputs.iter().zip(refunds).enumerate() {
+                let refund = anonymous_credit_tokens::Refund::from_cbor(
+                    &URL_SAFE_NO_PAD
+                        .decode(refund["refund"].as_str().unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+                let next = pre
+                    .to_credit_token(&params, &act.spend_proof, &refund, &public)
+                    .unwrap();
+                assert_eq!(
+                    scalar_to_credit::<ACT_L>(&next.credits()).unwrap(),
+                    CREDITS - shares[i] + returns[i],
+                    "{case}: input {i}"
+                );
+            }
+        }
+    }
+
     /// The two halves are wired into the handler: the default is applied
     /// before anything reads the request, and the refusal sits beside the
     /// charge check it precedes. A source scan, because the handler needs a
@@ -2568,10 +2975,14 @@ pub(crate) mod tests {
         let check = validate
             .find("check_completion_ceiling(")
             .expect("validate_request refuses a ceiling past the declared one");
+        let declared = validate
+            .find("check_declared_prompt(")
+            .expect("validate_request refuses a declaration the model cannot price or hold");
         let charge = validate
             .find("check_hold_equals_worst_case(")
             .expect("and checks the charge");
         assert!(check < charge, "{validate}");
+        assert!(declared < charge, "{validate}");
     }
 
     /// **A request's charge never depends on whether its prompt was served
@@ -2579,9 +2990,11 @@ pub(crate) mod tests {
     /// an Eidola engine sends (`eidola-server-engine`'s `usage()`), alike but
     /// for `prompt_tokens_details.cached_tokens` — none of the prompt cached,
     /// and nearly all of it — settle to one charge, for a token-priced model
-    /// and a per-request-priced one, with and without the contract's clamp
-    /// biting. A discount for a cache hit would make the charge, which the
-    /// refund reveals, say whether this prompt's prefix was seen before.
+    /// (with and without a cached rate) and a per-request-priced one, with and
+    /// without the contract's clamp biting, and for a counted prompt and a
+    /// declared one. A discount for a cache hit would make the charge, which
+    /// the refund reveals, say whether this prompt's prefix was seen before;
+    /// a declared prompt is priced by its declaration alone.
     #[test]
     fn the_settled_charge_ignores_prefix_cache_hits() {
         let engine_usage = |cached: u32| -> Usage {
@@ -2597,29 +3010,61 @@ pub(crate) mod tests {
         let warm = engine_usage(896);
 
         let token_priced = test_model();
+        let cached = cached_model();
         let mut per_request = test_model();
         per_request.pricing.per_request = Some(ScaledPrice {
             value: 7 * PRICING_SCALE_FACTOR,
             scale_factor: PRICING_SCALE_FACTOR,
         });
-        for model in [&token_priced, &per_request] {
+        let price = |model: &Model, prompt: Prompt| RequestPrice {
+            prompt,
+            max_completion: 4_096,
+            ..RequestPrice::of(&request(&["hi"], 1), model)
+        };
+        for model in [&token_priced, &cached, &per_request] {
             // Chargeable prompt above the reported count (the usual case) and
-            // below it (the clamp charging the contract's figure).
-            for chargeable in [2_000, 500] {
-                let settle =
-                    |usage: &Usage| settled_cost(Some(usage), model, chargeable, 4_096, 99_999);
-                assert_eq!(
-                    settle(&cold),
-                    settle(&warm),
-                    "{} with chargeable {chargeable}",
-                    model.id
-                );
+            // below it (the clamp charging the contract's figure); a declared
+            // prompt whose cached part is below the report and above it.
+            let mut prompts = vec![
+                Prompt::Counted {
+                    chargeable_tokens: 2_000,
+                },
+                Prompt::Counted {
+                    chargeable_tokens: 500,
+                },
+            ];
+            if model.pricing.per_cached_prompt_token.is_some() {
+                prompts.push(Prompt::Declared {
+                    cached_tokens: 768,
+                    new_tokens: 500,
+                });
+                prompts.push(Prompt::Declared {
+                    cached_tokens: 1_024,
+                    new_tokens: 0,
+                });
+            }
+            for prompt in prompts {
+                let price = price(model, prompt);
+                let settle = |usage: &Usage| settled_cost(Some(usage), &price, 99_999);
+                assert_eq!(settle(&cold), settle(&warm), "{} with {prompt:?}", model.id);
             }
         }
-        // And the figure is the full price of every prompt token reported.
+        // And the figure is the full price of every prompt token reported,
+        let counted = Prompt::Counted {
+            chargeable_tokens: 2_000,
+        };
         assert_eq!(
-            settled_cost(Some(&warm), &token_priced, 2_000, 4_096, 99_999),
-            900 + 2 * 250
+            settled_cost(Some(&warm), &price(&token_priced, counted), 99_999),
+            FEE + 900 + 2 * 250
+        );
+        // or, declared, its declaration's: 768 at 0.25, 132 at 1.
+        let declared = Prompt::Declared {
+            cached_tokens: 768,
+            new_tokens: 500,
+        };
+        assert_eq!(
+            settled_cost(Some(&cold), &price(&cached, declared), 99_999),
+            FEE + 192 + 132 + 2 * 250
         );
     }
 
@@ -2839,7 +3284,6 @@ pub(crate) mod tests {
             completion_tokens: 10,
             total_tokens: 160,
         };
-        let cost = actual_cost(&usage, &model, chargeable, 100);
-        assert_eq!(cost, 150 + 10 * 2);
+        assert_eq!(charge(&usage, &req, &model), FEE + 150 + 10 * 2);
     }
 }

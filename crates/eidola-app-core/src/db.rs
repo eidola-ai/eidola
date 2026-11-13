@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 21;
+const LATEST_VERSION: i64 = 22;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -1633,6 +1633,25 @@ pub struct Request {
     pub backend_id: Option<String>,
 }
 
+/// Attach request rows written before their action existed to `action_id`:
+/// the earlier requests of an answer a turn continued automatically, written
+/// as each was answered and attached when the answer is.
+pub(crate) async fn attach_requests(
+    conn: &Connection,
+    request_ids: &[String],
+    action_id: &str,
+) -> Result<(), AppError> {
+    for id in request_ids {
+        conn.execute(
+            "UPDATE request SET action_id = ?2 WHERE id = ?1 AND action_id IS NULL",
+            (Value::Text(id.clone()), Value::Text(action_id.to_string())),
+        )
+        .await
+        .map_err(AppError::db)?;
+    }
+    Ok(())
+}
+
 pub async fn insert_request(conn: &Connection, entry: &Request) -> Result<(), AppError> {
     // 17 parameters — beyond turso's tuple IntoParams impls, so a Vec.
     let params: Vec<Value> = vec![
@@ -1703,8 +1722,12 @@ fn opt_str(v: Option<&str>) -> Value {
 
 /// What a claim hands the request being written.
 pub(crate) enum ClaimOutcome {
-    /// The lineage's key — reused, or freshly minted and stored.
-    Claimed(crate::prefix_cache::CacheKey),
+    /// The lineage's key — reused, or freshly minted and stored — and which
+    /// of the lineage's keys it is.
+    Claimed(
+        crate::prefix_cache::CacheKey,
+        crate::prefix_cache::KeyIdentity,
+    ),
     /// The lineage can no longer send ([`lineage_sendable_sql`]), or its
     /// participant answers there with another model than the request's:
     /// nothing was stored, and the request carries no key of the lineage's.
@@ -1715,7 +1738,7 @@ pub(crate) enum ClaimOutcome {
 impl ClaimOutcome {
     fn claimed(self) -> Option<crate::prefix_cache::CacheKey> {
         match self {
-            ClaimOutcome::Claimed(key) => Some(key),
+            ClaimOutcome::Claimed(key, _) => Some(key),
             ClaimOutcome::Unsendable => None,
         }
     }
@@ -1861,6 +1884,7 @@ async fn claim_prefix_cache_key_body(
         .await
         .map_err(AppError::db)?;
     let mut stored: Option<(StoredKeyAge, i64, Zeroizing<Vec<u8>>)> = None;
+    use crate::prefix_cache::KeyIdentity;
     if let Some(row) = rows.next().await.map_err(AppError::db)? {
         let age = StoredKeyAge {
             model: row.get::<String>(0).map_err(AppError::db)?,
@@ -1892,7 +1916,14 @@ async fn claim_prefix_cache_key_body(
         )
         .await
         .map_err(AppError::db)?;
-        return Ok((ClaimOutcome::Claimed(CacheKey::from_bytes(bytes)), false));
+        let identity = KeyIdentity {
+            generation: *generation,
+            created_at: age.created_at,
+        };
+        return Ok((
+            ClaimOutcome::Claimed(CacheKey::from_bytes(bytes), identity),
+            false,
+        ));
     }
 
     let Some(fresh) = mint() else {
@@ -1924,7 +1955,9 @@ async fn claim_prefix_cache_key_body(
          ON CONFLICT (space_id, participant_id) DO UPDATE SET \
              model = excluded.model, trust_domain = excluded.trust_domain, \
              generation = excluded.generation, key_bytes = excluded.key_bytes, \
-             created_at = excluded.created_at, last_used_at = excluded.last_used_at",
+             created_at = excluded.created_at, last_used_at = excluded.last_used_at, \
+             resume_prompt_digest = NULL, resume_message_count = NULL, \
+             resume_prompt_tokens = NULL",
         vec![
             lineage.0,
             lineage.1,
@@ -1938,9 +1971,131 @@ async fn claim_prefix_cache_key_body(
     .await
     .map_err(AppError::db)?;
     Ok((
-        ClaimOutcome::Claimed(CacheKey::from_bytes(&fresh)),
+        ClaimOutcome::Claimed(
+            CacheKey::from_bytes(&fresh),
+            KeyIdentity {
+                generation,
+                created_at: now,
+            },
+        ),
         stored.is_some(),
     ))
+}
+
+/// A lineage's key as a request about to be prepared sees it, **without the
+/// key**: what the rotation rule judges it by, which key it is, and its
+/// resume point ([`crate::prefix_cache::ResumePoint`]) if it has one. `None`
+/// when the lineage holds no key.
+pub(crate) async fn prefix_cache_resume(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+) -> Result<
+    Option<(
+        crate::prefix_cache::StoredKeyAge,
+        crate::prefix_cache::KeyIdentity,
+        Option<crate::prefix_cache::ResumePoint>,
+    )>,
+    AppError,
+> {
+    use crate::prefix_cache::{KeyIdentity, ResumePoint, StoredKeyAge};
+    let mut rows = conn
+        .query(
+            &format!(
+                "SELECT model, trust_domain, created_at, last_used_at, generation, \
+                        resume_prompt_digest, resume_message_count, resume_prompt_tokens \
+                 FROM prefix_cache_key WHERE {LINEAGE_IS}"
+            ),
+            (
+                Value::Text(space_id.to_string()),
+                Value::Text(participant_id.to_string()),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    let Some(row) = rows.next().await.map_err(AppError::db)? else {
+        return Ok(None);
+    };
+    let age = StoredKeyAge {
+        model: row.get::<String>(0).map_err(AppError::db)?,
+        trust_domain: row.get::<String>(1).map_err(AppError::db)?,
+        created_at: row.get::<i64>(2).map_err(AppError::db)?,
+        last_used_at: row.get::<i64>(3).map_err(AppError::db)?,
+    };
+    let identity = KeyIdentity {
+        generation: row.get::<i64>(4).map_err(AppError::db)?,
+        created_at: age.created_at,
+    };
+    let digest = |bytes: Option<Vec<u8>>| bytes.and_then(|b| <[u8; 32]>::try_from(b).ok());
+    let prompt_digest = digest(row.get::<Option<Vec<u8>>>(5).map_err(AppError::db)?);
+    let message_count = row.get::<Option<i64>>(6).map_err(AppError::db)?;
+    let prompt_tokens = row.get::<Option<i64>>(7).map_err(AppError::db)?;
+    let point = match (prompt_digest, message_count, prompt_tokens) {
+        (Some(prompt_digest), Some(message_count), Some(prompt_tokens)) => Some(ResumePoint {
+            prompt_digest,
+            message_count,
+            prompt_tokens,
+        }),
+        _ => None,
+    };
+    Ok(Some((age, identity, point)))
+}
+
+/// Set (or, with `None`, clear) the resume point of the lineage's key — **only
+/// if that key is still `identity`**, the one the request it describes was
+/// sent with. A key replaced in the meantime keeps its own (empty) resume
+/// point. Emits nothing: no surface reads it.
+pub(crate) async fn record_prefix_resume(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    identity: crate::prefix_cache::KeyIdentity,
+    point: Option<&crate::prefix_cache::ResumePoint>,
+) -> Result<(), AppError> {
+    let blob = |b: Option<&[u8; 32]>| b.map_or(Value::Null, |b| Value::Blob(b.to_vec()));
+    let int = |i: Option<i64>| i.map_or(Value::Null, Value::Integer);
+    conn.execute(
+        &format!(
+            "UPDATE prefix_cache_key SET resume_prompt_digest = ?5, resume_message_count = ?6, \
+                 resume_prompt_tokens = ?7 \
+             WHERE {LINEAGE_IS} AND generation = ?3 AND created_at = ?4"
+        ),
+        vec![
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+            Value::Integer(identity.generation),
+            Value::Integer(identity.created_at),
+            blob(point.map(|p| &p.prompt_digest)),
+            int(point.map(|p| p.message_count)),
+            int(point.map(|p| p.prompt_tokens)),
+        ],
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+/// Clear the resume point of the lineage's key, whichever key it holds: an
+/// engine refused what the lineage believed it held. Emits nothing.
+pub(crate) async fn forget_prefix_resume(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+) -> Result<(), AppError> {
+    conn.execute(
+        &format!(
+            "UPDATE prefix_cache_key SET resume_prompt_digest = NULL, \
+                 resume_message_count = NULL, resume_prompt_tokens = NULL \
+             WHERE {LINEAGE_IS}"
+        ),
+        (
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
 }
 
 /// Every lineage holding a key, **without the key**: `(space, participant,

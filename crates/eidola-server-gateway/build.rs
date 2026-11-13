@@ -142,7 +142,9 @@ fn render_catalog(rows: &[models::Row]) -> String {
                 input_per_m,
                 output_per_m,
             } => format!(
-                "RowPrice::PerToken {{ input_per_m: {input_per_m:?}, output_per_m: {output_per_m:?} }}"
+                "RowPrice::PerToken {{ input_per_m: {input_per_m:?}, output_per_m: {output_per_m:?}, \
+                 cached_input_per_m: {:?} }}",
+                row.cached_input_per_m
             ),
             models::Price::PerRequest { usd } => format!("RowPrice::PerRequest {{ usd: {usd:?} }}"),
         };

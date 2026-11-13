@@ -10,6 +10,7 @@
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use eidola_common::engine_protocol::DeclaredPrefixRefusal;
 
 /// Why a request was refused or failed.
 #[derive(Debug)]
@@ -35,6 +36,10 @@ pub enum ApiError {
     Unavailable,
     /// A failure on this side (500). The text is authored here and content-free.
     Internal(&'static str),
+    /// The request's declared cached prefix does not hold (409): the prefix cache does
+    /// not have it, or the prompt is longer than the declaration allows. Raised after the
+    /// prompt was rendered and tokenized, before anything of it was computed.
+    DeclaredPrefix(DeclaredPrefixRefusal),
 }
 
 impl ApiError {
@@ -60,6 +65,9 @@ impl ApiError {
             ApiError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::Overloaded | ApiError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::DeclaredPrefix(_) => {
+                StatusCode::from_u16(DeclaredPrefixRefusal::STATUS).expect("a valid status code")
+            }
         }
     }
 
@@ -77,6 +85,7 @@ impl ApiError {
             ApiError::Overloaded => t::OVERLOADED,
             ApiError::Unavailable => t::ENGINE_UNAVAILABLE,
             ApiError::Internal(_) => t::INTERNAL_ERROR,
+            ApiError::DeclaredPrefix(r) => r.error_type(),
         }
     }
 
@@ -95,6 +104,13 @@ impl ApiError {
             ApiError::Overloaded => "the node is at capacity; retry later".into(),
             ApiError::Unavailable => "the engine is not running".into(),
             ApiError::Internal(m) => (*m).into(),
+            ApiError::DeclaredPrefix(DeclaredPrefixRefusal::Missing) => {
+                "the prefix cache does not hold the declared cached prefix under this cache_key"
+                    .into()
+            }
+            ApiError::DeclaredPrefix(DeclaredPrefixRefusal::OverBudget) => {
+                "the prompt has more tokens than cached_prefix allows".into()
+            }
         }
     }
 
@@ -164,11 +180,55 @@ mod tests {
             (ApiError::ContextLengthExceeded("x".into()), None),
             (ApiError::PayloadTooLarge, None),
             (ApiError::Internal("x"), None),
+            (
+                ApiError::DeclaredPrefix(DeclaredPrefixRefusal::Missing),
+                None,
+            ),
+            (
+                ApiError::DeclaredPrefix(DeclaredPrefixRefusal::OverBudget),
+                None,
+            ),
         ];
         for (e, expected) in cases {
             assert_eq!(
                 refused_before_admission(e.status().as_u16(), e.error_type()),
                 expected,
+                "{e}"
+            );
+        }
+    }
+
+    /// The two declared-prefix refusals read as exactly themselves on the wire, and as
+    /// nothing else: every other refusal is no declared-prefix refusal.
+    #[test]
+    fn declared_prefix_refusals_say_so_and_nothing_else_does() {
+        use eidola_common::engine_protocol::declared_prefix_refusal;
+        for r in [
+            DeclaredPrefixRefusal::Missing,
+            DeclaredPrefixRefusal::OverBudget,
+        ] {
+            let e = ApiError::DeclaredPrefix(r);
+            assert_eq!(e.status().as_u16(), 409);
+            assert_eq!(
+                declared_prefix_refusal(e.status().as_u16(), e.error_type()),
+                Some(r)
+            );
+        }
+        for e in [
+            ApiError::Unauthorized,
+            ApiError::WeightsHashRequired,
+            ApiError::WeightsHashMismatch,
+            ApiError::ModelNotFound,
+            ApiError::invalid("x"),
+            ApiError::ContextLengthExceeded("x".into()),
+            ApiError::PayloadTooLarge,
+            ApiError::Overloaded,
+            ApiError::Unavailable,
+            ApiError::Internal("x"),
+        ] {
+            assert_eq!(
+                declared_prefix_refusal(e.status().as_u16(), e.error_type()),
+                None,
                 "{e}"
             );
         }

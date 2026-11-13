@@ -530,28 +530,12 @@ impl KvManager {
         };
 
         if self.policy.enabled {
-            let cap_blocks = (tokens.len() as u32 - 1) / bs;
-            let mut hashes = Vec::new();
-            extend_chain(
-                seq.lineage.salt(),
-                &tokens[..(cap_blocks * bs) as usize],
-                bs as usize,
-                &mut hashes,
-            );
-            let mut chain = Vec::new();
-            for h in &hashes {
-                let Some(&eid) = self.map.get(h) else { break };
-                if self.expired(eid, now) {
-                    self.remove_subtree(eid);
-                    break;
-                }
-                chain.push(eid);
+            let (mut hashes, mut chain, expired) = self.match_chain(&seq.lineage, tokens, now);
+            if let Some(eid) = expired {
+                self.remove_subtree(eid);
             }
             let branch = chain.len() as u32;
-            let mut m = branch;
-            while m > 0 && !self.window_covered(&chain, m) {
-                m -= 1;
-            }
+            let mut m = self.covered_hit(&chain);
             if self.has_host_tier()
                 && let Some(&deepest) = chain.last()
             {
@@ -616,6 +600,61 @@ impl KvManager {
         let cached = seq.computed;
         self.seqs.insert(id, seq);
         Some(cached)
+    }
+
+    /// The prefix-cache hit [`KvManager::admit`] would find for `tokens` under `lineage`'s
+    /// salt, in positions, counting demoted blocks as present (admission promotes them,
+    /// and shortens its hit only if the device cannot take them). A pure lookup: no
+    /// expired entry is removed, no LRU position or retention point moves, and no block is
+    /// mapped, promoted, decrypted or computed, so a request refused for a short hit
+    /// leaves the cache exactly as it found it.
+    pub fn lookup(&self, lineage: &Lineage, tokens: &[u32], now: Millis) -> u32 {
+        if !self.policy.enabled || tokens.is_empty() {
+            return 0;
+        }
+        let (_, chain, _) = self.match_chain(lineage, tokens, now);
+        self.covered_hit(&chain) * self.block_size
+    }
+
+    /// The salted chain of `tokens`' full blocks before its last token, and the cached
+    /// entries it matches from the root, stopping at the first missing or expired one
+    /// (returned, for the caller to remove).
+    fn match_chain(
+        &self,
+        lineage: &Lineage,
+        tokens: &[u32],
+        now: Millis,
+    ) -> (Vec<BlockHash>, Vec<EntryId>, Option<EntryId>) {
+        let bs = self.block_size;
+        let cap_blocks = (tokens.len() as u32 - 1) / bs;
+        let mut hashes = Vec::new();
+        extend_chain(
+            lineage.salt(),
+            &tokens[..(cap_blocks * bs) as usize],
+            bs as usize,
+            &mut hashes,
+        );
+        let mut chain = Vec::new();
+        let mut expired = None;
+        for h in &hashes {
+            let Some(&eid) = self.map.get(h) else { break };
+            if self.expired(eid, now) {
+                expired = Some(eid);
+                break;
+            }
+            chain.push(eid);
+        }
+        (hashes, chain, expired)
+    }
+
+    /// The longest hit, in blocks, along a matched `chain` whose every sliding window is
+    /// attached.
+    fn covered_hit(&self, chain: &[EntryId]) -> u32 {
+        let mut m = chain.len() as u32;
+        while m > 0 && !self.window_covered(chain, m) {
+            m -= 1;
+        }
+        m
     }
 
     /// Ensures blocks are mapped for positions `[0, upto)` in every group, evicting cache

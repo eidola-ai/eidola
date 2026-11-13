@@ -116,6 +116,7 @@ fn request(
         prompt,
         sampling,
         max_tokens: max,
+        required_cached_tokens: 0,
         stop_token_ids: Vec::new(),
         cache,
     }

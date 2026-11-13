@@ -562,6 +562,70 @@ fn a_room_that_concluded_on_a_truncated_answer_says_so_in_its_report() {
     });
 }
 
+/// **A driven turn's answer is continued like any turn's**: a helper whose
+/// answer stops at its ceiling, exactly continuable, is continued at once
+/// within its turn, under the same bound — the model's declared limit for
+/// the answer — so the room holds the whole answer and the report concludes
+/// on it, not on a cut-off one. The driver never presses the reader's
+/// continue verb; the turn does this by itself.
+#[test]
+fn a_driven_turns_answer_is_continued_within_its_turn() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::LongAnswer {
+                requests: 2,
+                fail_at: None,
+            },
+            declared_max_output: Some(65_536),
+            context_length: Some(262_144),
+            ..MockConfig::default()
+        });
+        // On Eidola's own backend, the one whose answers can be continued.
+        chat_harness::with_account(&core);
+        let parent = parent_with_a_post(&core);
+        let eidola_agent = |label: &str| {
+            let added = core
+                .runtime()
+                .block_on(core.add_space_participant(
+                    parent.clone(),
+                    NewParticipant {
+                        label: label.to_string(),
+                        model_ref: Some(chat_harness::MODEL.to_string()),
+                        system_prompt: None,
+                        notify_policy: "human".into(),
+                    },
+                ))
+                .expect("add agent");
+            core.runtime()
+                .block_on(core.promote_participant(added.id.clone(), None, None))
+                .expect("promote");
+            added.id
+        };
+        let owner = eidola_agent("Navigator");
+        let helper = eidola_agent("Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+
+        let before = mock.chat_bodies().len();
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let room = tree(&core, &out.space.id);
+        assert_eq!(room.len(), 2, "brief + one answer: {room:?}");
+        assert!(!room[1].truncated, "the answer was continued to its end");
+        let sent = &mock.chat_bodies()[before..];
+        assert_eq!(
+            sent.len(),
+            3,
+            "the helper's request, its continuation, and the report"
+        );
+        assert!(sent[1].get("continue_final_message").is_some());
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report.references[0].delegation_end,
+            Some(DelegationEnd::Concluded { truncated: false })
+        );
+    });
+}
+
 /// **A pause resting on a cut-off answer says both too.**
 ///
 /// The marker rides every ending that invites an action assuming coherent words

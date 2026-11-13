@@ -17910,6 +17910,75 @@ async fn a_stale_model_selection_says_which_model_and_substitutes_none(
     cx.update(|cx| eidola_gui::i18n::apply("en", cx));
 }
 
+/// **A hold past one denomination is the request's problem, and the notice
+/// says so in the reader's language.**
+///
+/// App-core refuses a turn whose worst-case cost is more than a held
+/// credential and one fresh denomination pay together
+/// (`AppError::HoldExceedsDenomination`), because the alternative is an
+/// issuance sized to the request. Adding credit cannot lift that, so the copy
+/// must not route the reader to buy any: it says the request was not sent and
+/// names what does help, with no figures. **It promises nothing about the rest
+/// of the reply**: the refusal can come at a later tool round, or at the resend
+/// of a request the server refused, after earlier requests were charged.
+/// Switched to French without re-emitting, as every localized arm is pinned.
+#[gpui::test]
+async fn a_hold_past_one_denomination_is_explained_without_offering_to_sell_credit(
+    cx: &mut gpui::TestAppContext,
+) {
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the only post")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::HoldExceedsDenomination {
+                    hold: 1_400_000,
+                    denomination: 1_000_000,
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let english = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+    assert!(
+        english.contains("the request was not sent and nothing was charged for it"),
+        "{english}"
+    );
+    assert!(
+        !english.contains("nothing was sent"),
+        "earlier requests of the reply may have been sent and charged: {english}"
+    );
+    assert!(
+        english.contains("Adding credit won’t change that"),
+        "{english}"
+    );
+    assert!(
+        !english.contains("credits") && !english.contains("1400000"),
+        "neither the raw Display nor the figures reach the reader: {english}"
+    );
+
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    cx.run_until_parked();
+    let french = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+    assert!(french.contains("Ajouter du crédit"), "{french}");
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+}
+
 /// **A fresh profile's first post names the model to download.**
 ///
 /// The default agent uses an on-device model, and a new profile has not

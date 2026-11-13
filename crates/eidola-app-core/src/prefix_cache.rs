@@ -202,6 +202,110 @@ pub(crate) fn decide(
     Claim::Reuse
 }
 
+/// Which of a lineage's keys a request was sent with: the row's `generation`
+/// and the key's birth. A lineage's resume point is written only against the
+/// key that carried the request it describes, so it never outlives that key
+/// or attaches to a successor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeyIdentity {
+    pub generation: i64,
+    pub created_at: i64,
+}
+
+/// What the lineage's **anchor** left in the engine under its key: the most
+/// recent answered request that asked for a new assistant turn, so that its
+/// prompt ended at the template's generation prompt. It is what lets the
+/// lineage's next requests declare a cached prefix
+/// (`eidola_common::engine_protocol::CachedPrefix`) instead of paying for
+/// their whole prompt again.
+///
+/// Only an anchor's prompt is ever declared. A request that continued an
+/// answer is not an anchor and leaves the resume point as it is: it sent the
+/// answer back as text, and text does not always encode to the tokens the
+/// model sampled, so nothing past the anchor is known to be in the cache
+/// (`engine_protocol::declarable_cached_tokens`).
+///
+/// Kept beside the key on its row and cleared whenever the key is replaced
+/// or forgotten, so a rotated, forgotten or re-minted key has nothing to
+/// declare.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResumePoint {
+    /// [`prompt_digest`] of the anchor's `tools` and `messages`, as sent.
+    pub prompt_digest: [u8; 32],
+    /// How many `messages` the anchor sent.
+    pub message_count: i64,
+    /// The prompt tokens the engine reported for it.
+    pub prompt_tokens: i64,
+}
+
+/// The digest a [`ResumePoint`] compares a request's prompt by: its `tools`
+/// and `messages`, each in its JSON serialization (members sorted), domain
+/// separated and length prefixed so no two prompts share one by moving a
+/// boundary.
+pub(crate) fn prompt_digest(
+    tools: &[serde_json::Value],
+    messages: &[serde_json::Value],
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"eidola/prefix-cache/resume/v1");
+    h.update((tools.len() as u64).to_be_bytes());
+    for part in tools.iter().chain(messages) {
+        let bytes = serde_json::to_vec(part).expect("a JSON value serializes");
+        h.update((bytes.len() as u64).to_be_bytes());
+        h.update(&bytes);
+    }
+    h.finalize().into()
+}
+
+/// The final message of a request that continues an answer: the answer's
+/// reasoning and text so far, as the partial assistant message the engine
+/// continues (`continue_final_message`).
+pub(crate) fn continuation_message(reasoning: &str, content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "role": "assistant",
+        "reasoning_content": reasoning,
+        "content": content,
+    })
+}
+
+/// The cached prefix a request may declare, given its lineage's anchor
+/// ([`ResumePoint`]), or `None` when it can claim nothing.
+///
+/// One rule for every request — a new turn, a tool round, a regeneration, a
+/// continuation of an answer: its `tools` are the anchor's and its leading
+/// `messages` are exactly the anchor's `messages`. It declares the anchor's
+/// prompt, and what follows is added, priced by the byte contract: the new
+/// turn's messages, a tool round's call and results, or a continuation's
+/// partial assistant message holding the whole answer so far.
+///
+/// The numbers are `engine_protocol::declared_prompt`'s, bounded by the
+/// model's window (`context_length`, zero where it is not known): what is
+/// added is budgeted at no more than the window leaves after the cached part.
+/// Byte-for-byte equal requests render to equal tokens, so a prompt that
+/// repeats an earlier one's bytes repeats its tokens; anything less and
+/// nothing is declared.
+pub(crate) fn declaration(
+    point: &ResumePoint,
+    tools: &[serde_json::Value],
+    messages: &[serde_json::Value],
+    context_length: u64,
+) -> Option<eidola_common::engine_protocol::CachedPrefix> {
+    use eidola_common::engine_protocol::declared_prompt;
+    let prompt_tokens = u64::try_from(point.prompt_tokens).ok()?;
+    let shared = usize::try_from(point.message_count).ok()?;
+    if messages.len() < shared || prompt_digest(tools, &messages[..shared]) != point.prompt_digest {
+        return None;
+    }
+    let added = eidola_common::prompt_charge(&messages[shared..], None);
+    declared_prompt(
+        prompt_tokens,
+        added.total_content_bytes(),
+        added.message_count(),
+        context_length,
+    )
+}
+
 /// 32 fresh bytes from the operating system's CSPRNG, or `None` when it
 /// cannot supply them — in which case the turn sends no key at all rather
 /// than a weaker one.
@@ -262,6 +366,114 @@ mod tests {
             created_at,
             last_used_at,
         }
+    }
+
+    fn msg(role: &str, content: &str) -> serde_json::Value {
+        serde_json::json!({ "role": role, "content": content })
+    }
+
+    fn point_for(
+        tools: &[serde_json::Value],
+        messages: &[serde_json::Value],
+        prompt_tokens: i64,
+    ) -> ResumePoint {
+        ResumePoint {
+            prompt_digest: prompt_digest(tools, messages),
+            message_count: messages.len() as i64,
+            prompt_tokens,
+        }
+    }
+
+    #[test]
+    fn a_request_that_extends_the_last_one_declares_its_prompt() {
+        use eidola_common::engine_protocol::declared_prompt;
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "t"}})];
+        let first = vec![msg("system", "s"), msg("user", "u1")];
+        let point = point_for(&tools, &first, 1_000);
+        let mut next = first.clone();
+        next.push(msg("assistant", "a1"));
+        next.push(msg("user", "u2"));
+        let added = eidola_common::prompt_charge(&next[2..], None);
+        assert_eq!(added.message_count(), 2);
+        assert_eq!(
+            declaration(&point, &tools, &next, 0),
+            declared_prompt(1_000, added.total_content_bytes(), 2, 0)
+        );
+        // A regeneration repeats it whole and adds nothing.
+        assert_eq!(
+            declaration(&point, &tools, &first, 0),
+            declared_prompt(1_000, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn anything_but_an_exact_prefix_declares_nothing() {
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "t"}})];
+        let first = vec![msg("system", "s"), msg("user", "u1")];
+        let point = point_for(&tools, &first, 1_000);
+        // An edited earlier message.
+        let edited = vec![msg("system", "s"), msg("user", "u1!"), msg("user", "u2")];
+        assert_eq!(declaration(&point, &tools, &edited, 0), None);
+        // Changed tools.
+        assert_eq!(declaration(&point, &[], &first, 0), None);
+        // A shorter prompt.
+        assert_eq!(declaration(&point, &tools, &first[..1], 0), None);
+        // Too little to declare: nothing at or past a quantum boundary.
+        let small = point_for(&tools, &first, 256);
+        assert_eq!(declaration(&small, &tools, &first, 0), None);
+    }
+
+    #[test]
+    fn a_continuation_declares_its_anchor_and_adds_the_answer() {
+        use eidola_common::engine_protocol::declared_prompt;
+        let first = vec![msg("system", "s"), msg("user", "u1")];
+        let point = point_for(&[], &first, 1_000);
+        let mut continued = first.clone();
+        continued.push(continuation_message("r", "partial answer"));
+        let added = eidola_common::prompt_charge(&continued[2..], None);
+        assert_eq!(
+            declaration(&point, &[], &continued, 0),
+            declared_prompt(1_000, added.total_content_bytes(), 1, 0)
+        );
+        // A longer answer, continued again, declares the same anchor; only
+        // what is added grows.
+        let mut again = first.clone();
+        again.push(continuation_message("r", "partial answer, and more of it"));
+        let longer = eidola_common::prompt_charge(&again[2..], None);
+        let first_decl = declaration(&point, &[], &continued, 0).unwrap();
+        let again_decl = declaration(&point, &[], &again, 0).unwrap();
+        assert_eq!(first_decl.cached_tokens, again_decl.cached_tokens);
+        assert_eq!(
+            Some(again_decl),
+            declared_prompt(1_000, longer.total_content_bytes(), 1, 0)
+        );
+        assert!(again_decl.new_tokens > first_decl.new_tokens);
+    }
+
+    /// What a request adds is budgeted at no more than the window leaves: a
+    /// large addition to a conversation that fits the window still declares
+    /// its anchor, where the byte contract's count alone would pass the
+    /// window.
+    #[test]
+    fn a_large_addition_is_budgeted_at_what_the_window_leaves() {
+        let first = vec![msg("system", "s"), msg("user", "u1")];
+        let point = point_for(&[], &first, 1_000);
+        let mut next = first.clone();
+        next.push(msg("user", &"x".repeat(30_000)));
+        let free = declaration(&point, &[], &next, 0).unwrap();
+        assert!(free.prompt_limit() > 8_192);
+        let bounded = declaration(&point, &[], &next, 8_192).unwrap();
+        assert_eq!(bounded.cached_tokens, free.cached_tokens);
+        assert_eq!(bounded.prompt_limit(), 8_192);
+        // An anchor the window could not have held declares nothing.
+        assert_eq!(declaration(&point, &[], &next, 999), None);
+    }
+
+    #[test]
+    fn a_prompt_digest_moves_with_any_boundary() {
+        let a = prompt_digest(&[serde_json::json!("x")], &[serde_json::json!("y")]);
+        let b = prompt_digest(&[], &[serde_json::json!("x"), serde_json::json!("y")]);
+        assert_ne!(a, b, "a tool moved into the messages is another prompt");
     }
 
     #[test]

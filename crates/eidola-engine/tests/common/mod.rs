@@ -199,6 +199,7 @@ pub fn request(
         prompt,
         sampling: params,
         max_tokens,
+        required_cached_tokens: 0,
         stop_token_ids: Vec::new(),
         cache,
     }

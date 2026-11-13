@@ -20,7 +20,8 @@
 //! the error is log-safe as well as client-facing.
 
 use eidola_common::engine_protocol::{
-    SubsetError, check_continuation, check_max_completion_tokens, check_stop, check_tool_choice,
+    SubsetError, check_cached_prefix, check_continuation, check_max_completion_tokens, check_stop,
+    check_tool_choice,
 };
 use serde::Deserialize;
 
@@ -53,6 +54,11 @@ pub fn check(request: &ValidatedRequest) -> Result<(), ServerError> {
             .as_ref(),
         parsed.add_generation_prompt,
         parsed.messages.last().map(|m| m.as_final()),
+    )
+    .map_err(refuse)?;
+    check_cached_prefix(
+        parsed.cached_prefix.map(|p| p.0),
+        parsed.cache_key.is_some(),
     )
     .map_err(refuse)?;
     check_sampling(parsed.temperature, parsed.top_p)
@@ -189,6 +195,11 @@ mod tests {
             let message = refusal(&request(extra, content));
             assert!(message.contains(reason), "{extra} {content}: {message}");
         }
+        let prefix = r#","cached_prefix":{"cached_tokens":256,"new_tokens":1}"#;
+        assert!(refusal(&request(prefix, r#""hi""#)).contains("cache_key"));
+        let key = r#","cache_key":"_-0123456789abcdefghijklmnopqrstuvwxyzABCDE""#;
+        let empty = format!(r#"{key},"cached_prefix":{{"cached_tokens":0,"new_tokens":1}}"#);
+        assert!(refusal(&request(&empty, r#""hi""#)).contains("at least 1"));
         let long_stop = format!(r#","stop":["{}"]"#, "x".repeat(257));
         assert!(refusal(&request(&long_stop, r#""hi""#)).contains("256 bytes"));
         let empty = ValidatedRequest::from_bytes(bytes::Bytes::from_static(
@@ -218,6 +229,11 @@ mod tests {
             (r#","stop":["a","b","c","d"]"#, r#""hi""#),
             (r#","temperature":0,"top_p":1"#, r#""hi""#),
             (r#","temperature":2.5,"top_p":0.01"#, r#""hi""#),
+            (
+                r#","cache_key":"_-0123456789abcdefghijklmnopqrstuvwxyzABCDE","cached_prefix":{"cached_tokens":1,"new_tokens":0}"#,
+                r#""hi""#,
+            ),
+            (r#","cached_prefix":null"#, r#""hi""#),
             (
                 r#","stream":true,"stream_options":{"include_usage":false}"#,
                 r#""hi""#,

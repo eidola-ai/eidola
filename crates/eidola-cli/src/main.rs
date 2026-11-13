@@ -606,6 +606,13 @@ fn app_hint(e: &AppError) {
                  `eidola account checkout <price_id>` to add credit"
             );
         }
+        AppError::HoldExceedsDenomination { .. } => {
+            eprintln!(
+                "hint: adding credit will not help — this request could cost more than this \
+                 client pays without issuing a credential sized to it; shorten the \
+                 conversation or choose another model"
+            );
+        }
         AppError::TermsAcceptanceRequired { .. } => {
             eprintln!(
                 "hint: the terms of service or privacy policy changed — run \

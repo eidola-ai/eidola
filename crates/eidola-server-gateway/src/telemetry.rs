@@ -482,7 +482,11 @@ pub mod metrics {
             .build()
     });
 
-    /// Total tokens processed in chat completions (by model and type).
+    /// Total tokens processed in chat completions (by model and type):
+    /// `prompt` and `completion` as the engine reported them, and
+    /// `declared_cached_prompt`, the prompt tokens a request declared cached
+    /// and was charged at the cached rate. What an engine reports about its
+    /// cache is never counted.
     ///
     /// Deliberately success-only: a disconnected or errored stream reports
     /// no usage (there is nothing trustworthy to count), so this totals

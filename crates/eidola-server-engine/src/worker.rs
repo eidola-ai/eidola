@@ -132,6 +132,11 @@ pub enum Output {
     Accepted,
     /// The engine refused it at submission.
     Rejected(SubmitError),
+    /// A request with a required cached prefix was admitted: its requirement held, and
+    /// nothing more will refuse it. Sent once, after `Accepted` and before its first
+    /// tokens; a request whose requirement did not hold gets instead a `Tokens` finishing
+    /// with [`FinishReason::CachedPrefixMissing`]. Requests without one never get it.
+    Admitted,
     /// Tokens produced by one step, the cached-prompt count once known (with the first
     /// tokens, and again with the finish), and the finish if it finished.
     Tokens {
@@ -156,6 +161,8 @@ pub struct Stats {
     pub cut_off: u64,
     /// Requests the engine refused at submission.
     pub rejected: u64,
+    /// Requests the engine refused at first admission for a short prefix-cache hit.
+    pub prefix_refused: u64,
     /// Requests in the engine now (waiting or running).
     pub in_engine: u64,
     /// Idle-KV keys the engine holds (a count): zero whenever no request is in the
@@ -437,6 +444,8 @@ struct Live {
     events: mpsc::Sender<Output>,
     _permit: Arc<Permit>,
     reported_cached: bool,
+    /// A required cached prefix whose admission has not been announced yet.
+    awaiting_admission: bool,
 }
 
 /// What the engine thread shares with its watchdog.
@@ -626,6 +635,7 @@ impl<E: Executor> Worker<E> {
                 };
                 match stepped {
                     Ok(events) => {
+                        self.announce_admissions();
                         for ev in events {
                             self.deliver(ev, now);
                         }
@@ -656,6 +666,7 @@ impl<E: Executor> Worker<E> {
                 permit,
             } => {
                 let id = request.id;
+                let awaiting_admission = request.required_cached_tokens > 0;
                 match self.engine.submit(request) {
                     Ok(()) => {
                         self.counters.submitted += 1;
@@ -666,6 +677,7 @@ impl<E: Executor> Worker<E> {
                                 events,
                                 _permit: permit,
                                 reported_cached: false,
+                                awaiting_admission,
                             },
                         );
                     }
@@ -685,11 +697,29 @@ impl<E: Executor> Worker<E> {
         }
     }
 
+    /// Sends [`Output::Admitted`] to every request with a required cached prefix that the
+    /// engine has admitted since the last step. (One admitted and finished within a single
+    /// step is announced by [`Worker::deliver`] instead.)
+    fn announce_admissions(&mut self) {
+        let mut map = lock(&self.shared.live);
+        for (&id, live) in map.iter_mut().filter(|(_, l)| l.awaiting_admission) {
+            if self.engine.cached_prompt_tokens(id).is_some() {
+                live.awaiting_admission = false;
+                let _ = live.events.try_send(Output::Admitted);
+            }
+        }
+    }
+
     fn deliver(&mut self, ev: eidola_engine::engine::Event, now: u64) {
         let mut map = lock(&self.shared.live);
         let Some(live) = map.get_mut(&ev.id) else {
             return;
         };
+        let refused = ev.finish == Some(FinishReason::CachedPrefixMissing);
+        if live.awaiting_admission && !refused {
+            live.awaiting_admission = false;
+            let _ = live.events.try_send(Output::Admitted);
+        }
         let cached = if ev.finish.is_some() {
             Some(ev.cached_prompt_tokens)
         } else if !live.reported_cached {
@@ -707,7 +737,11 @@ impl<E: Executor> Worker<E> {
             // Finished either way; a full buffer just means the reader misses the end
             // (its channel closes now, so it sees an error after draining).
             map.remove(&ev.id);
-            self.counters.finished += 1;
+            if refused {
+                self.counters.prefix_refused += 1;
+            } else {
+                self.counters.finished += 1;
+            }
         } else if let Err(e) = sent {
             // The reader is gone (its guard's cancel may still be in flight), or has
             // stopped reading: cut it off, which also closes its channel.

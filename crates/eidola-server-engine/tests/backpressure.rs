@@ -47,6 +47,7 @@ fn a_stalled_reader_is_cut_off_and_its_buffer_stays_admitted() {
                 sampling: SamplingParams::greedy(),
                 // Far more steps than the buffer holds.
                 max_tokens: 4000,
+                required_cached_tokens: 0,
                 stop_token_ids: Vec::new(),
                 cache: CacheScope::Private,
             },

@@ -116,6 +116,58 @@ pub struct ChatCompletionRequest {
     #[serde(default, skip_serializing_if = "never_serialized")]
     #[schema(value_type = Vec<SpendCredential>, min_items = 1, max_items = 2)]
     pub credentials: Credentials,
+
+    /// The prompt's declared cached prefix (`eidola_common::engine_protocol::
+    /// CachedPrefix`): its first `cached_tokens` tokens are in the engine's
+    /// prefix cache under this request's `cache_key`, and it has at most
+    /// `new_tokens` after them. The request is held and charged by exactly
+    /// these numbers, the cached part at `per_cached_prompt_token`, and the
+    /// engine refuses it before computing anything unless both hold (`409`,
+    /// `cached_prefix_missing` or `prompt_budget_exceeded`). It needs a
+    /// `cache_key`, at least one cached token, and a model that sells a
+    /// cached rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<CachedPrefix>)]
+    pub cached_prefix: Option<CachedPrefixMember>,
+}
+
+/// A request's `cached_prefix` member, read by the shared rule
+/// (`eidola_common::engine_protocol::CachedPrefix::from_value`): an object of
+/// exactly `cached_tokens` and `new_tokens`, each an integer that fits `u32`.
+/// Anything else is refused at deserialization with a fixed message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachedPrefixMember(pub eidola_common::engine_protocol::CachedPrefix);
+
+impl Serialize for CachedPrefixMember {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.to_value().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CachedPrefixMember {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(d)?;
+        eidola_common::engine_protocol::CachedPrefix::from_value(&value)
+            .map(Self)
+            .ok_or_else(|| {
+                serde::de::Error::custom(
+                    "cached_prefix must be {\"cached_tokens\": <u32>, \"new_tokens\": <u32>}",
+                )
+            })
+    }
+}
+
+/// A request's declared cached prefix (the member [`CachedPrefixMember`]
+/// reads): exactly these two members.
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub struct CachedPrefix {
+    /// Leading prompt tokens held in the prefix cache under the request's
+    /// `cache_key`. At least 1.
+    #[schema(minimum = 1)]
+    pub cached_tokens: u32,
+    /// The most prompt tokens the request may have after them.
+    pub new_tokens: u32,
 }
 
 /// The `skip_serializing_if` predicate of a member that is never serialized.
@@ -599,7 +651,7 @@ pub struct Model {
     /// What this model can do.
     pub capabilities: ModelCapabilities,
 
-    /// Pricing in integer credits per 1k tokens.
+    /// Pricing in scaled integer credits per token (or per request).
     pub pricing: ModelPricing,
 }
 
@@ -788,8 +840,15 @@ pub struct ModelCapabilities {
 /// Pricing for a model in scaled integer credits per token (or per request).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelPricing {
+    /// A prompt token the engine computes.
     pub per_prompt_token: ScaledPrice,
+    /// A completion token.
     pub per_completion_token: ScaledPrice,
+    /// A prompt token a request declares cached (its `cached_prefix`), for a
+    /// model that sells one; absent when it sells none, and a request to it
+    /// may then declare no cached prefix. Never above `per_prompt_token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_cached_prompt_token: Option<ScaledPrice>,
     /// Per-request pricing, for a model that charges per request rather than
     /// per token. When present, `per_prompt_token` and `per_completion_token`
     /// are zero.
@@ -1501,6 +1560,77 @@ mod tests {
         );
         let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
         assert!(request.cache_key.is_some());
+    }
+
+    /// The shared body with a declared cached prefix written by the shared
+    /// writer (`CachedPrefix::insert_into`) is accepted by the strict type,
+    /// read back as the numbers written, for a turn and a continuation alike.
+    #[test]
+    fn the_shared_body_with_a_cached_prefix_is_accepted() {
+        use eidola_common::engine_protocol::{CachedPrefix, ContinueField};
+        let prefix = CachedPrefix {
+            cached_tokens: 1_024,
+            new_tokens: 77,
+        };
+        let messages = [
+            serde_json::json!({"role": "user", "content": "Hello."}),
+            serde_json::json!({"role": "assistant", "content": "Hello to"}),
+        ];
+        for continuation in [None, Some(ContinueField::Content)] {
+            let mut body = eidola_common::chat_completion_request_body(
+                "test-model",
+                &messages,
+                256,
+                &[],
+                true,
+                true,
+                Some(CACHE_KEY),
+                continuation,
+            );
+            prefix.insert_into(&mut body);
+            let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+            assert_eq!(request.cached_prefix, Some(CachedPrefixMember(prefix)));
+        }
+    }
+
+    /// `cached_prefix` is held to the shared shape: exactly the two members,
+    /// each an integer that fits `u32`. Anything else is refused at
+    /// deserialization with a fixed message that quotes nothing.
+    #[test]
+    fn a_cached_prefix_is_read_in_the_shared_shape_only() {
+        let parse = |member: &str| {
+            serde_json::from_str::<ChatCompletionRequest>(&format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"cached_prefix":{member}}}"#
+            ))
+        };
+        let read = parse(r#"{"cached_tokens":256,"new_tokens":0}"#).unwrap();
+        assert_eq!(
+            read.cached_prefix
+                .map(|p| (p.0.cached_tokens, p.0.new_tokens)),
+            Some((256, 0))
+        );
+        assert!(parse("null").unwrap().cached_prefix.is_none());
+        for bad in [
+            r#"{"cached_tokens":256}"#,
+            r#"{"cached_tokens":256,"new_tokens":1,"extra":7654321}"#,
+            r#"{"cached_tokens":7654321.5,"new_tokens":1}"#,
+            r#"{"cached_tokens":-1,"new_tokens":1}"#,
+            r#"{"cached_tokens":4294967296,"new_tokens":1}"#,
+            r#"{"cached_tokens":"7654321","new_tokens":1}"#,
+            r#"[256,1]"#,
+            "7654321",
+        ] {
+            let err = parse(bad).unwrap_err().to_string();
+            assert!(err.contains("cached_prefix must be"), "{bad}: {err}");
+            assert!(!err.contains("7654321"), "{bad}: {err}");
+        }
+        // It serializes in the shared shape, so the pricing walk's copy of a
+        // request carries the numbers it was priced by.
+        let value = serde_json::to_value(&read).unwrap();
+        assert_eq!(
+            value["cached_prefix"],
+            serde_json::json!({"cached_tokens": 256, "new_tokens": 0})
+        );
     }
 
     #[test]

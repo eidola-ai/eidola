@@ -185,6 +185,7 @@ fn main() {
             prompt: prompt.to_vec(),
             sampling: SamplingParams::greedy(),
             max_tokens: 1,
+            required_cached_tokens: 0,
             stop_token_ids: Vec::new(),
             cache,
         }

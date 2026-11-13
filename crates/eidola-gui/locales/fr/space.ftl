@@ -18,6 +18,7 @@ space-footnote-delegation-failed = s’est arrêtée : { $reason ->
 
 space-regenerating = Régénération…
 space-error-model-unavailable = { $model } n’est plus proposé par son backend, et aucun autre modèle ne répondra à sa place. Rien n’a été envoyé ni facturé : choisissez un autre modèle, puis réessayez.
+space-error-hold-exceeds-denomination = Cette réponse pourrait coûter plus qu’une seule requête n’est autorisée à retenir : la requête n’a donc pas été envoyée et rien n’a été facturé pour elle. Ajouter du crédit n’y changera rien — essayez une conversation plus courte ou un autre modèle.
 space-regenerating-elsewhere = Cette réponse est déjà en cours de régénération.
 space-answer-cut-off = Cette réponse s’est arrêtée à sa limite de longueur.
 space-continue-answer = Continuer
@@ -26,3 +27,4 @@ space-continuing = Poursuite de la réponse…
 space-error-issuer-key-off-calendar = Le serveur d’Eidola a proposé une clé de paiement qui ne suit pas le calendrier public des clés ; cette application ne l’a donc pas utilisée. Rien n’a été envoyé ni facturé, et les crédits que vous détenez déjà fonctionnent toujours.
 space-error-issuer-key-second-for-epoch = Le serveur d’Eidola a proposé cette semaine une clé de paiement différente de celle que cette application connaît déjà. Un serveur honnête n’utilise qu’une clé par semaine : cette application n’acceptera donc pas de nouveaux crédits sous cette clé avant celle de la semaine prochaine. Rien n’a été envoyé ni facturé, et les crédits que vous détenez déjà fonctionnent toujours.
 space-error-issuer-key-reused = Le serveur d’Eidola a proposé la même clé de paiement pour deux semaines différentes, ce qu’un serveur honnête ne fait jamais ; cette application ne l’a donc pas utilisée. Rien n’a été envoyé ni facturé, et les crédits que vous détenez déjà fonctionnent toujours.
+space-error-uncached-retry-unfunded = Le moteur d’Eidola n’avait plus le contexte précédent de cette conversation, et les crédits que détient cette application ne suffisent pas à la renvoyer en entier. Rien de plus n’a été converti depuis votre compte. Réessayez pour l’envoyer comme une nouvelle requête.

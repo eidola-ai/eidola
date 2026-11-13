@@ -10,7 +10,13 @@
 //! or wrong gateway token; a missing or different `X-Eidola-Weights-Sha256` (checked
 //! before the body is read); a full read bound (checked before the body is read); a body
 //! that is too large, malformed, outside the subset, or for another model; a full
-//! admission bound. Only then is the prompt rendered, tokenized and submitted.
+//! admission bound. Only then is the prompt rendered, tokenized and submitted. A request
+//! that declares a cached prefix (`cached_prefix`) is refused with `409` after that, and
+//! before anything of it is computed: `prompt_budget_exceeded` when its prompt has more
+//! tokens than the declaration allows, `cached_prefix_missing` when the engine's prefix
+//! cache does not hold the declared prefix under its key at admission. Its response is
+//! not opened until the engine has admitted it, so both are plain HTTP errors; a request
+//! that declares nothing opens its response as soon as the engine accepts it.
 //!
 //! **Every response is shaped** (`eidola_common::stream_shape`): a chat answer, always a
 //! stream, is written as frames of one size at [`STREAM_CADENCE`] from the moment it
@@ -37,9 +43,10 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use eidola_common::engine_protocol::DeclaredPrefixRefusal;
 use eidola_common::engine_protocol::STREAM_CADENCE;
 use eidola_common::stream_shape::{Framer, StreamEvent, pad_body};
-use eidola_engine::engine::SubmitError;
+use eidola_engine::engine::{FinishReason, SubmitError};
 use eidola_engine::secret::SaltDeriver;
 use futures_util::stream::Stream;
 use serde_json::{Value, json};
@@ -270,9 +277,10 @@ async fn chat(state: Arc<AppState>, request: Request) -> Result<Response, ApiErr
         output,
         stop,
         window_bound,
+        declared,
     } = prepared;
 
-    let (guard, mut events) = state
+    let (mut guard, mut events) = state
         .engine
         .submit(request, permit)
         .map_err(|_| ApiError::Unavailable)?;
@@ -280,6 +288,23 @@ async fn chat(state: Arc<AppState>, request: Request) -> Result<Response, ApiErr
         Some(Output::Accepted) => {}
         Some(Output::Rejected(e)) => return Err(submit_error(e, prompt_tokens)),
         _ => return Err(ApiError::Unavailable),
+    }
+    // A declared cached prefix is refused at admission, which can be after the
+    // submission was accepted: the response opens only once the engine has admitted the
+    // request, so that refusal is a plain HTTP error too.
+    if declared {
+        match events.recv().await {
+            Some(Output::Admitted) => {}
+            Some(Output::Tokens {
+                finish: Some(FinishReason::CachedPrefixMissing),
+                ..
+            }) => {
+                guard.finished();
+                return Err(ApiError::DeclaredPrefix(DeclaredPrefixRefusal::Missing));
+            }
+            Some(Output::Failed) | None => return Err(ApiError::Unavailable),
+            Some(_) => return Err(ApiError::Internal("unexpected engine message")),
+        }
     }
 
     let response = ResponseMeta {
@@ -312,6 +337,11 @@ fn submit_error(e: SubmitError, prompt_tokens: u32) -> ApiError {
         ),
         SubmitError::EmptyPrompt => ApiError::invalid("the prompt is empty"),
         SubmitError::ZeroMaxTokens => ApiError::invalid("max_completion_tokens must be at least 1"),
+        // The requirement reaches the final prompt token, which is always recomputed: the
+        // cache can never hold it.
+        SubmitError::UnsatisfiablePrefix => {
+            ApiError::DeclaredPrefix(DeclaredPrefixRefusal::Missing)
+        }
         SubmitError::InvalidToken | SubmitError::DuplicateId => {
             ApiError::Internal("the engine refused the request")
         }
@@ -385,7 +415,7 @@ impl Run {
                 }
             }
             Some(Output::Failed) | None => Polled::Failed(ApiError::Unavailable),
-            Some(Output::Accepted) | Some(Output::Rejected(_)) => {
+            Some(Output::Accepted) | Some(Output::Rejected(_)) | Some(Output::Admitted) => {
                 Polled::Failed(ApiError::Internal("unexpected engine message"))
             }
         }

@@ -35,6 +35,7 @@ fn request(handle: &worker::EngineHandle, prompt: Vec<u32>, cache: CacheScope) -
         prompt,
         sampling: SamplingParams::greedy(),
         max_tokens: 1,
+        required_cached_tokens: 0,
         stop_token_ids: Vec::new(),
         cache,
     }

@@ -62,6 +62,15 @@ space-regenerating = Regenerating…
 # TRANSLATORS: $model is the selection exactly as it was saved, an id rather
 # than a display name. Leave it verbatim; it is what the reader looks for.
 space-error-model-unavailable = { $model } is no longer offered by its backend, and nothing will answer in its place. Nothing was sent and nothing was charged — pick a different model, then try again.
+# Shown in the conversation's recovery notice when a request's worst-case cost
+# is more than this app pays for one request, so that request was refused
+# before it was sent or charged. It is not a balance problem — adding credit
+# does not lift it — so the copy must not point at buying more; a shorter
+# conversation or a different model is what lets the next press through.
+# TRANSLATORS: the promise is about the one refused request. An earlier step
+# of the same reply (a tool call, an attempt the server refused) may have been
+# sent and charged, so do not say that nothing at all was sent or charged.
+space-error-hold-exceeds-denomination = This reply could cost more than a single request is allowed to hold, so the request was not sent and nothing was charged for it. Adding credit won’t change that — try a shorter conversation or a different model.
 # Shown in the conversation's recovery notice when the model this turn would
 # have used runs on this computer but has not been downloaded — what a new
 # profile meets first, since its default agent uses an on-device model. Says
@@ -139,3 +148,12 @@ space-error-issuer-key-second-for-epoch = Eidola’s server offered a different 
 # across weeks would let the server swap another key in unnoticed later, so
 # the app refuses it.
 space-error-issuer-key-reused = Eidola’s server offered the same payment key for two different weeks, which an honest server never does, so this app didn’t use it. Nothing was sent and nothing was charged, and the credits you already hold still work.
+
+# Shown when Eidola's engine no longer held what this conversation's earlier
+# replies left in it, and the credits this app already holds cannot pay to
+# send the request again in full. The app deliberately converts no account
+# credit for that resend (someone able to empty the engine's cache could
+# otherwise choose when it converts), so it stops and says so. The refused
+# request cost only its small request fee; trying again is an ordinary send,
+# which converts credit as any other does.
+space-error-uncached-retry-unfunded = Eidola’s engine no longer had this conversation’s earlier context ready, and the credits this app holds can’t cover sending it again in full. Nothing more was converted from your account. Try again to send it as a new request.

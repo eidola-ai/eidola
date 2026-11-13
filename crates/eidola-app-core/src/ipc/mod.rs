@@ -1104,9 +1104,14 @@ impl WireError {
                 "InsufficientBalance",
                 json!({ "available": available, "required": required }),
             ),
+            AppError::HoldExceedsDenomination { hold, denomination } => (
+                "HoldExceedsDenomination",
+                json!({ "hold": hold, "denomination": denomination }),
+            ),
             AppError::ProvisioningTimeout { message } => {
                 ("ProvisioningTimeout", json!({ "message": message }))
             }
+            AppError::UncachedRetryUnfunded => ("UncachedRetryUnfunded", json!({})),
             AppError::TermsAcceptanceRequired { message } => {
                 ("TermsAcceptanceRequired", json!({ "message": message }))
             }
@@ -1215,9 +1220,14 @@ impl WireError {
                 refusal: serde_json::from_value(f.get("refusal")?.clone()).ok()?,
             },
             "NoAccount" => AppError::NoAccount,
+            "UncachedRetryUnfunded" => AppError::UncachedRetryUnfunded,
             "InsufficientBalance" => AppError::InsufficientBalance {
                 available: i("available")?,
                 required: i("required")?,
+            },
+            "HoldExceedsDenomination" => AppError::HoldExceedsDenomination {
+                hold: i("hold")?,
+                denomination: i("denomination")?,
             },
             "ProvisioningTimeout" => AppError::ProvisioningTimeout { message: msg() },
             "TermsAcceptanceRequired" => AppError::TermsAcceptanceRequired { message: msg() },
@@ -1946,9 +1956,14 @@ mod tests {
     fn a_typed_app_error_survives_the_round_trip_with_its_fields() {
         let cases = [
             AppError::NoAccount,
+            AppError::UncachedRetryUnfunded,
             AppError::InsufficientBalance {
                 available: 12,
                 required: 34,
+            },
+            AppError::HoldExceedsDenomination {
+                hold: 1_400_000,
+                denomination: 1_000_000,
             },
             AppError::DatabaseInUse {
                 pid: Some(4242),

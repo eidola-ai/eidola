@@ -212,6 +212,7 @@ impl Job {
             prompt: self.prompt.clone(),
             sampling: self.sampling,
             max_tokens: self.max,
+            required_cached_tokens: 0,
             stop_token_ids: Vec::new(),
             cache: self
                 .key

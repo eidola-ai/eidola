@@ -286,7 +286,15 @@ proptest! {
             .collect();
         prop_assert_eq!(read_back.len(), 1);
         let model = crate::handlers::tests::test_model();
-        let cost = |u: &Usage| crate::handlers::settled_cost(Some(u), &model, 48, 4096, u128::MAX);
+        let price = crate::handlers::RequestPrice::of(
+            &serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello world!"}],
+            }))
+            .unwrap(),
+            &model,
+        );
+        let cost = |u: &Usage| crate::handlers::settled_cost(Some(u), &price, u128::MAX);
         prop_assert_eq!(cost(&read_back[0]), cost(&usage));
         prop_assert_eq!(read_back[0].prompt_tokens, usage.prompt_tokens);
         prop_assert_eq!(read_back[0].completion_tokens, usage.completion_tokens);

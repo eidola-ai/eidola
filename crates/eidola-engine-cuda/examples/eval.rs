@@ -211,6 +211,7 @@ fn generate(kernels: &str, model: &str, prompts: &str, out: &str, max_new: u32, 
             prompt: ids(&r["prompt_ids"]),
             sampling: SamplingParams::greedy(),
             max_tokens: max_new,
+            required_cached_tokens: 0,
             stop_token_ids: Vec::new(),
             cache: CacheScope::Private,
         })

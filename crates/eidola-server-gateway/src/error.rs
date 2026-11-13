@@ -188,6 +188,7 @@ impl std::error::Error for ServerError {}
 /// this crate's own bucket for upstream error bodies that didn't parse.
 const KNOWN_UPSTREAM_ERROR_TYPES: &[&str] = &[
     "authentication_error",
+    "cached_prefix_missing",
     "context_length_exceeded",
     "engine_unavailable",
     "insufficient_quota",
@@ -195,6 +196,7 @@ const KNOWN_UPSTREAM_ERROR_TYPES: &[&str] = &[
     "not_found_error",
     "overloaded",
     "permission_error",
+    "prompt_budget_exceeded",
     "rate_limit_error",
     "server_error",
     "unknown",
@@ -300,6 +302,21 @@ mod tests {
             err.to_error_response().error.error_type,
             "you requested 9001 tokens"
         );
+    }
+
+    /// The node's two refusals of a declared cached prefix are logged by
+    /// their fixed labels.
+    #[test]
+    fn declared_prefix_refusals_are_logged_by_label() {
+        for kind in ["cached_prefix_missing", "prompt_budget_exceeded"] {
+            let err = ServerError::Backend {
+                status: 409,
+                error_type: kind.to_string(),
+                message: "the prompt has 123457 tokens".to_string(),
+            };
+            assert_eq!(err.to_string(), format!("backend error (409): {kind}"));
+            assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        }
     }
 
     /// serde error messages quote offending values, and the error position

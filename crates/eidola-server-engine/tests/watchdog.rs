@@ -217,6 +217,7 @@ fn run_one(handle: &EngineHandle, max_tokens: u32) -> bool {
                 prompt: vec![1, 2, 3],
                 sampling: SamplingParams::greedy(),
                 max_tokens,
+                required_cached_tokens: 0,
                 stop_token_ids: Vec::new(),
                 cache: CacheScope::Private,
             },

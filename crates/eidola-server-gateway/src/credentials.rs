@@ -674,7 +674,8 @@ pub async fn record_spend(
 /// none** ([`db::record_nullifiers`]): the sealed tokens stored, in input
 /// order, if every nullifier was recorded by this call; `None` if any was
 /// already recorded, in which case nothing was written and every other input
-/// is still unrecorded, so its holder recovers it with a full refund.
+/// is still unrecorded, so its holder recovers it (charged only the request
+/// fee, [`recover_refund`]).
 ///
 /// The chat spend records each input with its provisional refund (`t = 0`,
 /// the one its pre-flight verification signed).
@@ -1207,8 +1208,8 @@ pub async fn load_key(
 /// verifies here and discards the refund, and verifies again when it signs:
 /// the chat spend does, since its `t` is known only once the response is
 /// settled (`handlers::check_presented_spends`, then [`sign_refund`]). Recovery
-/// knows its `t` (the whole charge) before it reads the database, so it
-/// verifies once ([`verify_and_sign_full_refund`]).
+/// knows its `t` (the share less the request fee) before it reads the
+/// database, so it verifies once ([`verify_and_sign_refused_refund`]).
 ///
 /// Every verification passes through here, which is what the
 /// `verification_count` seam counts in tests.
@@ -1252,7 +1253,7 @@ fn invalid_spend_proof() -> ServerError {
 /// balance recoverable. The chat spend calls this before it records the
 /// nullifier, so a proof that does not verify never reaches the database.
 /// Recovery, which knows its refund already, verifies with
-/// [`verify_and_sign_full_refund`] instead.
+/// [`verify_and_sign_refused_refund`] instead.
 pub fn verify_presented_spend(
     key: &DecryptedIssuerKey,
     act: &crate::auth::ActSpend,
@@ -1285,25 +1286,31 @@ impl SignedRefund {
 }
 
 /// Check a presented spend proof as [`verify_presented_spend`] does, and
-/// keep the refund that one verification signs: a full refund, returning the
-/// whole charge. The proof is verified exactly once.
+/// keep the refund that one verification signs: the refund of a request that
+/// was refused before an engine produced anything, returning the share `s`
+/// less the request fee (`s − eidola_common::pricing::refused_charge(s)`). The
+/// proof is verified exactly once.
 ///
 /// The key is the one `act` names, as for [`sign_refund`], and must still be
 /// usable for [`KeyUse::Refund`] at `now`. Nothing is recorded: a refund
 /// signed here leaves the gateway only if the caller goes on to record the
 /// spend's nullifier, so signing it before the database is read changes
 /// nothing anyone sees.
-pub fn verify_and_sign_full_refund(
+pub fn verify_and_sign_refused_refund(
     cache: &HashMap<[u8; 32], DecryptedIssuerKey>,
     act: &crate::auth::ActSpend,
     now: SystemTime,
 ) -> Result<SignedRefund, ServerError> {
     let key = usable_key(cache, &act.issuer_key_hash, KeyUse::Refund, now)?;
     check_presented_context(key, act)?;
-    // `t = s`. Any refusal is the proof's: a verified proof's charge fits the
-    // credential's `L` bits (`ACT_L`), and `t = s` is within `0 <= t <= s`.
-    let refund =
-        verify_and_refund(key, act, act.spend_proof.charge()).map_err(|_| invalid_spend_proof())?;
+    // A charge that does not fit the credential's `L` bits (`ACT_L`) is no
+    // valid proof's, and is refused unverified like one.
+    let share = anonymous_credit_tokens::scalar_to_credit::<ACT_L>(&act.spend_proof.charge())
+        .map_err(|_| invalid_spend_proof())?;
+    let t = credit_to_scalar::<ACT_L>(share - eidola_common::pricing::refused_charge(share))
+        .map_err(|_| invalid_spend_proof())?;
+    // Any refusal is the proof's: `0 <= t <= s` by construction.
+    let refund = verify_and_refund(key, act, t).map_err(|_| invalid_spend_proof())?;
     SignedRefund::encode(act, refund)
 }
 
@@ -1848,8 +1855,10 @@ impl RefundRecoveryResponse {
 /// `provisional`) if it is still being served.
 ///
 /// If the nullifier was NOT recorded (the original request never arrived),
-/// the server verifies the spend proof, records the nullifier with a full
-/// refund (no credits consumed) stored beside it, and returns that refund.
+/// the server verifies the spend proof, records the nullifier with the refund
+/// of a refused request stored beside it (the share returned less the request
+/// fee, or nothing where the share is smaller than the fee), and returns that
+/// refund.
 ///
 /// In both cases, the client gets a refund token it can combine with its
 /// local `PreRefund` state to reconstruct a credential.
@@ -1911,13 +1920,13 @@ pub(crate) async fn recover_presented_refund(
     // public key id write rows, and answering 200 or 404 for one would let
     // anyone who knows a nullifier ask what became of its spend.
     //
-    // The one verification also signs the full refund the never-arrived
-    // branch returns (the verifier cannot verify without signing). It leaves
-    // the gateway only if that branch records the nullifier; otherwise it is
+    // The one verification also signs the refund the never-arrived branch
+    // returns (the verifier cannot verify without signing). It leaves the
+    // gateway only if that branch records the nullifier; otherwise it is
     // dropped.
-    let full_refund = {
+    let refused_refund = {
         let cache = state.credential_key_cache.read().await;
-        verify_and_sign_full_refund(&cache, act, SystemTime::now())?
+        verify_and_sign_refused_refund(&cache, act, SystemTime::now())?
     };
 
     let key_id = hex::encode(act.issuer_key_hash);
@@ -2001,9 +2010,10 @@ pub(crate) async fn recover_presented_refund(
 
     // The nullifier has no stored token: it was never recorded (the request
     // never arrived), or a spend recorded it a moment ago. Record it with the
-    // full refund (the charge returned in full, since no work was done)
-    // stored beside it, in one statement; if that wins, the spend is ours.
-    let recorded = record_spend(state, act, RefundStage::Final, &full_refund).await?;
+    // refund of a refused request (the share less the request fee: the spend
+    // was accepted, and no engine did any work) stored beside it, in one
+    // statement; if that wins, the spend is ours.
+    let recorded = record_spend(state, act, RefundStage::Final, &refused_refund).await?;
 
     if recorded.is_none() {
         // Recorded by someone else between the read and the insert: the
@@ -2018,7 +2028,7 @@ pub(crate) async fn recover_presented_refund(
     let SignedRefund {
         cbor: refund_cbor,
         issuer_key_id: key_id,
-    } = full_refund;
+    } = refused_refund;
     Ok(RefundRecoveryResponse::new(
         &refund_cbor,
         key_id,
@@ -3481,7 +3491,7 @@ pub(crate) mod tests {
 
         // An input already recorded refuses the request, and records nothing
         // of the other input.
-        let (drain, drain_pre) = input(current, 1_000, 1_000, 1).await;
+        let (drain, drain_pre) = input(current, 3_000, 3_000, 1).await;
         let (fill, _) = input(next, 5_000, 2_000, 2).await;
         let (p_drain, p_fill) = (provisional_of(&drain).await, provisional_of(&fill).await);
         assert!(
@@ -3498,10 +3508,11 @@ pub(crate) mod tests {
             !recorded(&drain).await,
             "and the other input is not recorded"
         );
-        // The unrecorded input is still its holder's: recovered whole.
+        // The unrecorded input is still its holder's: recovered as a request
+        // that never arrived, charged the request fee and nothing more.
         let Json(answer) = recover_presented_refund(&state, &drain).await.unwrap();
         assert!(!answer.provisional);
-        let whole = {
+        let recovered = {
             let keys = cache.read().await;
             let key = &keys[&current];
             drain_pre
@@ -3514,7 +3525,10 @@ pub(crate) mod tests {
                 )
                 .unwrap()
         };
-        assert_eq!(scalar_to_credit::<ACT_L>(&whole.credits()).unwrap(), 1_000);
+        assert_eq!(
+            scalar_to_credit::<ACT_L>(&recovered.credits()).unwrap(),
+            3_000 - eidola_common::pricing::REQUEST_FEE_CREDITS as u128
+        );
 
         // The same credential twice in one request records nothing.
         let (twice, _) = input(current, 1_000, 300, 3).await;
@@ -3931,19 +3945,23 @@ pub(crate) mod tests {
                 .unwrap()
         };
 
-        let (proof, prerefund) = spend(1000, 300).await;
+        let (proof, prerefund) = spend(5_000, 3_000).await;
         let nullifier = proof.nullifier().as_bytes().to_vec();
         let ck = client_key(7);
 
-        // The original request never arrived: a full refund is issued, its
-        // proof verified once...
+        // The original request never arrived: the refund of a refused request
+        // (the share less the request fee) is issued, its proof verified
+        // once...
         let first = recover(proof.clone(), ck.clone()).await.unwrap();
         assert_eq!(verification_count::of(&proof), 1);
         let first_cbor = URL_SAFE_NO_PAD.decode(&first).unwrap();
         // ...and what Postgres holds is the sealed token, not the CBOR.
         let row = stored_row(&nullifier).await;
         assert_eq!(row[0], SEALED_REFUND_VERSION);
-        let t_bytes = credit_to_scalar::<ACT_L>(300).unwrap().to_bytes();
+        let t_bytes =
+            credit_to_scalar::<ACT_L>(3_000 - eidola_common::pricing::REQUEST_FEE_CREDITS as u128)
+                .unwrap()
+                .to_bytes();
         assert!(contains(&first_cbor, &t_bytes));
         assert!(!contains(&row, &t_bytes));
         assert!(!first_cbor.windows(12).any(|w| contains(&row, w)));
@@ -3970,7 +3988,10 @@ pub(crate) mod tests {
                 .to_credit_token(&key.params, &proof, &refund, key.secret_key.public())
                 .unwrap()
         };
-        assert_eq!(scalar_to_credit::<ACT_L>(&next.credits()).unwrap(), 1000);
+        assert_eq!(
+            scalar_to_credit::<ACT_L>(&next.credits()).unwrap(),
+            5_000 - eidola_common::pricing::REQUEST_FEE_CREDITS as u128
+        );
 
         // A spend the chat path is serving: it is in this process's live set
         // before its nullifier is recorded, its row holds the provisional
@@ -4325,26 +4346,38 @@ pub(crate) mod tests {
     }
 
     /// Recovery's one verification signs the refund it returns: the refund
-    /// verifies for the client and returns the whole charge.
+    /// verifies for the client and returns the share less the request fee,
+    /// or nothing of a share smaller than the fee.
     #[test]
-    fn the_full_refund_signed_by_verification_completes_the_credential() {
+    fn the_refused_refund_signed_by_verification_completes_the_credential() {
         let mut keys = Cache::new();
         let hash = add_key(&mut keys, SystemTime::now() + DAY);
         let key = &keys[&hash];
-        let (act, pre_refund) = spend(key, 100, 30);
-        let signed = verify_and_sign_full_refund(&keys, &act, SystemTime::now()).unwrap();
-        assert_eq!(verification_count::of(&act.spend_proof), 1);
-        assert_eq!(signed.issuer_key_id, hex::encode(hash));
-        let refund = anonymous_credit_tokens::Refund::from_cbor(&signed.cbor).unwrap();
-        let next = pre_refund
-            .to_credit_token(
-                &key.params,
-                &act.spend_proof,
-                &refund,
-                key.secret_key.public(),
-            )
-            .unwrap();
-        assert_eq!(scalar_to_credit::<ACT_L>(&next.credits()).unwrap(), 100);
+        let fee = eidola_common::pricing::REQUEST_FEE_CREDITS as u128;
+        for (credits, share, after) in [
+            (10_000, 3_000, 10_000 - fee),
+            (10_000, fee, 10_000 - fee),
+            (100, 30, 70),
+        ] {
+            let (act, pre_refund) = spend(key, credits, share);
+            let signed = verify_and_sign_refused_refund(&keys, &act, SystemTime::now()).unwrap();
+            assert_eq!(verification_count::of(&act.spend_proof), 1);
+            assert_eq!(signed.issuer_key_id, hex::encode(hash));
+            let refund = anonymous_credit_tokens::Refund::from_cbor(&signed.cbor).unwrap();
+            let next = pre_refund
+                .to_credit_token(
+                    &key.params,
+                    &act.spend_proof,
+                    &refund,
+                    key.secret_key.public(),
+                )
+                .unwrap();
+            assert_eq!(
+                scalar_to_credit::<ACT_L>(&next.credits()).unwrap(),
+                after,
+                "a share of {share}"
+            );
+        }
     }
 
     /// Two issuances of one account's whole balance cannot both pass the

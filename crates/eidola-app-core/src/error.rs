@@ -127,6 +127,31 @@ pub enum AppError {
     #[error("insufficient balance: {required} credits required, {available} available")]
     InsufficientBalance { available: i64, required: i64 },
 
+    /// A request's worst-case charge is more than this client will pay
+    /// without issuing a credential sized to it. A just-in-time issuance is
+    /// always the denomination (`denomination`, `DEFAULT_ALLOCATION_CREDITS`)
+    /// or the whole remaining balance, never the request's own size, because
+    /// the amount issued is visible on the account surface and a request's
+    /// share is visible at its spend; so a request is paid only when what the
+    /// wallet holds, or one held credential drained beside one fresh
+    /// denomination, covers it (`docs/anonymous-credits.md` → Issuance
+    /// sizing). Refused before any credential is touched or anything is
+    /// issued, so the refused request is charged nothing. **That is a
+    /// statement about one request, not about its turn**: a later tool round
+    /// can be refused after earlier rounds were answered and charged, and the
+    /// resend of a declaration an engine refused comes after that request's
+    /// fee. A surface says the request was not sent, never that the turn cost
+    /// nothing. Distinct from [`AppError::InsufficientBalance`]: adding credit
+    /// does not lift it; a smaller request does.
+    ///
+    /// `hold` is the request's worst case in credits, saturated at
+    /// `i64::MAX` for one too large to represent.
+    #[error(
+        "this request's worst case ({hold} credits) is more than one held credential and \
+         one fresh credential of {denomination} credits can pay together"
+    )]
+    HoldExceedsDenomination { hold: i64, denomination: i64 },
+
     /// The wallet-level ACT provisioning queue timed out waiting for an
     /// in-flight credential refund to free spendable balance for a concurrent
     /// turn. Distinct from [`AppError::InsufficientBalance`] (which is a true
@@ -136,6 +161,19 @@ pub enum AppError {
     /// user can simply retry once the other turn settles.
     #[error("provisioning timed out: {message}")]
     ProvisioningTimeout { message: String },
+
+    /// An Eidola engine refused a request's declared cached prefix (it no
+    /// longer held what the conversation's earlier requests left in it), and
+    /// the credits already held could not pay for sending it again without
+    /// the declaration. That resend is never paid by converting account
+    /// credit: whoever can empty an engine's cache could otherwise choose
+    /// when this client converts. Nothing was converted; the refused request
+    /// was charged its request fee. Retrying is an ordinary request, which
+    /// converts as any other does.
+    #[error(
+        "the engine no longer held this conversation's cached prompt, and the credits held cannot pay to send it again in full; try again"
+    )]
+    UncachedRetryUnfunded,
 
     /// The server requires acceptance of the current terms-of-service /
     /// privacy-policy versions before purchases or credential issuance can

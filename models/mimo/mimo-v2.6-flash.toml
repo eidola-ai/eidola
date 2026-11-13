@@ -690,6 +690,7 @@ output_budget_class = "reasoning"
 [price]
 input_per_m = 0.50
 output_per_m = 2.00
+cached_input_per_m = 0.125
 
 [lifecycle]
 status = "current"

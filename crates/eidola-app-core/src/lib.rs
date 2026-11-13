@@ -1864,25 +1864,30 @@ pub struct SpendTrailEntry {
     pub linkability: Option<String>,
 }
 
-/// Default number of credits to allocate into a fresh anonymous credential
-/// when a chat needs one and the account has balance available
-/// (auto-provisioning). The actual amount is
-/// `min(available, max(DEFAULT_ALLOCATION_CREDITS, required))` — see
-/// [`auto_allocation_amount`].
+/// **The denomination**: the one public size this client issues credentials
+/// in, ahead of need ([`Inner::provision_once`]) and just in time
+/// ([`auto_allocation_amount`]), the latter converting the whole remaining
+/// balance instead when that is less. Credits are micro-USD, so this is
+/// $1.00.
 ///
-/// Why 1,000,000: credits are micro-USD-denominated (the server's
-/// `PRICING_SCALE_FACTOR` is 1e6 — `usd_per_M_tokens × markup` becomes
-/// credits-per-token directly, e.g. output at $1.00/M × 1.5 markup
-/// = 1.5 credits/token). A single chat turn's worst-case hold is
-/// `chargeable_prompt_tokens(bytes, msgs) × prompt_rate + 4096 ×
-/// completion_rate` (the shared `eidola-common` contract): ≈6,200 credits
-/// at that rate, ≈32,000 for the most expensive catalog
-/// models (output 7.875 credits/token) — mostly refunded after the actual
-/// usage settles. 1,000,000 credits ($1.00 of balance) therefore covers
-/// ~30 worst-case holds or 100+ typical turns: small enough that only a
-/// sliver of the account balance is parked in one unlinkable credential
-/// at a time, large enough that re-allocation (an account-linked,
-/// timing-correlatable operation) stays infrequent.
+/// One size makes every issuance look like every other on the account
+/// surface, which is where the amount is visible; no issuance is ever sized
+/// to the request it pays for, since a request's share is visible at its
+/// spend and the two would match. The size is a trade: large enough that
+/// issuance, an account-linked and timed operation, is rare against what
+/// ordinary turns hold, and small enough that little of a customer's balance
+/// sits in anonymous credentials ahead of need, where it lapses with its key.
+/// What a request holds is the shared pricing contract
+/// (`eidola_common::pricing`): the request fee, its prompt at the catalog
+/// row's rates (counted by its bytes, or declared cached), and the completion
+/// ceiling it names. So how many requests one denomination carries is a
+/// property of the catalog and of the requests, not of this constant. The
+/// ceiling an Eidola turn names is lowered while the hold would pass this
+/// constant ([`ladder_ceiling`]), so only a prompt can take a hold past it.
+/// A request is paid when what the wallet holds, or one held credential
+/// drained beside one fresh denomination, covers its hold, and refused
+/// otherwise ([`AppError::HoldExceedsDenomination`]);
+/// `docs/anonymous-credits.md` → Issuance sizing.
 pub const DEFAULT_ALLOCATION_CREDITS: i64 = 1_000_000;
 
 // --- Ahead-of-need provisioning ---------------------------------------------
@@ -1896,13 +1901,12 @@ pub const DEFAULT_ALLOCATION_CREDITS: i64 = 1_000_000;
 /// for at least [`PROVISION_HORIZON`] fall below this, it issues credentials
 /// of [`DEFAULT_ALLOCATION_CREDITS`] ([`PROVISION_CREDENTIALS_PER_KEY`]).
 ///
-/// A quarter of an allocation: about eight worst-case holds of the most
-/// expensive catalogued model and forty of the default one, so the credential
-/// already held normally carries the requests made between the provisioner's
-/// looks, and the new one is first spent only once that runs out, at a time
-/// set by the reader's own use rather than by the issuance. Small, so what is
-/// held at once is at most this plus [`PROVISION_CREDENTIALS_PER_KEY`]
-/// allocations.
+/// A quarter of an allocation, so the credential already held normally
+/// carries the requests made between the provisioner's looks (how many is a
+/// property of the catalog's rates and declared ceilings), and the new one is
+/// first spent only once that runs out, at a time set by the reader's own use
+/// rather than by the issuance. Small, so what is held at once is at most this
+/// plus [`PROVISION_CREDENTIALS_PER_KEY`] allocations.
 pub const PROVISION_THRESHOLD_CREDITS: i64 = DEFAULT_ALLOCATION_CREDITS / 4;
 
 /// How many credentials of [`DEFAULT_ALLOCATION_CREDITS`] the provisioner
@@ -1951,8 +1955,8 @@ pub const PROVISION_CHECK_MAX: std::time::Duration = std::time::Duration::from_s
 /// is spendable for up to two epochs; one issued at its end, for one.
 pub const PROVISION_LATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
 
-/// See [`PROVISION_LATE_WINDOW`]: enough for a few worst-case holds of the
-/// most expensive model.
+/// See [`PROVISION_LATE_WINDOW`]: a tenth of an allocation, enough that what
+/// is held carries the requests of the hours until the next key.
 pub const PROVISION_DEFER_FLOOR_CREDITS: i64 = DEFAULT_ALLOCATION_CREDITS / 10;
 
 /// How old a pending issuance must be before it is asked for again. Longer
@@ -2125,22 +2129,38 @@ const PROVISION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Poll cadence while the provisioning queue waits on an in-flight refund.
 const PROVISION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Decide how many credits to auto-allocate, given the account's available
-/// balance and the credits required for the operation that triggered
-/// provisioning. Pure function so the decision logic is unit-testable
-/// without HTTP.
+/// What a just-in-time issuance converts, given the account's `available`
+/// balance and `need`, the least a new credential must hold for the request
+/// waiting on it to be paid.
 ///
-/// Returns [`AppError::InsufficientBalance`] when the balance cannot cover
-/// even the required amount; otherwise the chunk size:
-/// `min(available, max(DEFAULT_ALLOCATION_CREDITS, required))`.
-fn auto_allocation_amount(available: i64, required: i64) -> Result<i64, AppError> {
-    if available < required {
-        return Err(AppError::InsufficientBalance {
-            available,
-            required,
-        });
+/// **The amount is never a function of the request.** It is the denomination
+/// ([`DEFAULT_ALLOCATION_CREDITS`]), or the whole available balance when that
+/// is less. `need` decides only *whether* to issue: `None` when that amount
+/// would not cover it (an empty account, a balance below `need`, or a `need`
+/// past one denomination), and nothing is converted.
+fn auto_allocation_amount(available: i64, need: i64) -> Option<i64> {
+    let amount = available.min(DEFAULT_ALLOCATION_CREDITS);
+    (amount > 0 && amount >= need).then_some(amount)
+}
+
+/// The largest hold a request can be paid without issuing more than one
+/// credential, and that one only of the denomination: any two of the
+/// wallet's credentials (`held`, and `in_flight` at their face value, the
+/// most a successor can hold), or the largest of them drained beside one
+/// fresh [`DEFAULT_ALLOCATION_CREDITS`]. A request past it is refused
+/// ([`AppError::HoldExceedsDenomination`]) before anything is touched; this
+/// bounds what any wait or issuance could make payable, whatever the
+/// account's balance.
+pub(crate) fn largest_payable_hold(held: &[i64], in_flight: &[i64]) -> i64 {
+    let mut top = [0i64; 2];
+    for &balance in held.iter().chain(in_flight) {
+        if balance > top[0] {
+            top = [balance, top[0]];
+        } else if balance > top[1] {
+            top[1] = balance;
+        }
     }
-    Ok(available.min(DEFAULT_ALLOCATION_CREDITS.max(required)))
+    top[0].saturating_add(top[1].max(DEFAULT_ALLOCATION_CREDITS))
 }
 
 /// Incremental events emitted by `AppCore::chat_stream`. The terminal
@@ -7108,35 +7128,52 @@ impl Inner {
     ///
     /// Resolution order (retried in a bounded loop):
     /// 1. The wallet covers the hold, alone or as a drain and a fill → use it.
-    /// 2. Otherwise `need` is what is missing: the whole hold, or the hold
-    ///    less the first credential's balance when that one is to be drained.
-    ///    A stranded hold is asked for first
+    /// 2. The hold is past [`largest_payable_hold`] — more than any two of the
+    ///    wallet's credentials, held or in flight, or the largest of them
+    ///    beside one fresh denomination, can pay → refused with
+    ///    [`AppError::HoldExceedsDenomination`] before anything else: no
+    ///    recovery, no balance read, no issuance, no credential touched.
+    ///    Nothing is ever issued sized to the request.
+    /// 3. Otherwise `need` is what is missing: the whole hold, or the hold
+    ///    less the largest credential's balance, which a new credential
+    ///    filling beside its drain must cover. A stranded hold is asked for
+    ///    first
     ///    ([`Inner::recover_stranded_spends`], unlinked), and once more
     ///    during any wait below. No account configured →
     ///    [`AppError::NoAccount`] (the UI routes to account creation).
-    /// 3. An issuance of the account's is pending → nothing is converted, and
+    /// 4. An issuance of the account's is pending → nothing is converted, and
     ///    nothing is sent to the account surface: the pending issuance is
     ///    never asked for again from here (that is the provisioner's pass and
-    ///    the explicit doors'), and the request waits as in 4 with nothing
+    ///    the explicit doors'), and the request waits as in 5 with nothing
     ///    convertible; when the wait cannot help,
-    ///    [`AppError::ProvisioningTimeout`]. Otherwise the available balance
-    ///    covers `need` → allocate
-    ///    `min(available, max(DEFAULT_ALLOCATION_CREDITS, need))` (the pool)
-    ///    and choose again: the new credential is the fill, or the whole.
-    /// 4. Balance can't cover it but a mid-spend credential whose own
-    ///    `credits` cover `need` exists (a concurrent turn holds usable
-    ///    coverage) → wait bounded for its refund to write a successor, then
-    ///    retry. A mid-spend credential *smaller* than `need` is ignored — a
-    ///    successor is worth at most the original face value, and refunds
-    ///    don't top up balance, so waiting on it is futile.
-    /// 5. Bounded wait elapses with a covering credential still in flight →
+    ///    [`AppError::ProvisioningTimeout`]. Otherwise, when the amount a
+    ///    just-in-time issuance converts ([`auto_allocation_amount`]: the
+    ///    denomination, or the whole available balance when less) covers
+    ///    `need` → issue exactly that amount and choose again: the new
+    ///    credential is the fill, or the whole.
+    /// 5. No issuance covers it but a mid-spend credential could pay, alone
+    ///    or as one of two inputs ([`settlement_could_cover`]; a concurrent
+    ///    turn holds usable coverage) → wait bounded for its refund to write
+    ///    a successor, then retry. A mid-spend credential that could not is
+    ///    ignored — a successor is worth at most the original face value, and
+    ///    refunds don't top up balance, so waiting on it is futile.
+    /// 6. Bounded wait elapses with a covering credential still in flight →
     ///    [`AppError::ProvisioningTimeout`]; no covering credential in flight
     ///    (true shortfall) → [`AppError::InsufficientBalance`] *immediately*.
+    ///
+    /// Under [`Funding::HeldOnly`] (the resend of a refused cached-prefix
+    /// declaration) nothing past the stranded-hold ask of step 3 runs: the
+    /// request waits only for a settlement in flight that could pay it, and
+    /// otherwise fails with [`AppError::UncachedRetryUnfunded`] — nothing is
+    /// converted and nothing is sent to the account surface. Step 2 applies
+    /// to it as to any request, so a hold no later attempt could pay is told
+    /// apart from one an attempt that may convert would.
     async fn ensure_spend_inputs(
         &self,
         cfg: &Config,
         db_conn: &turso::Connection,
         charge_credits: i64,
+        funding: Funding,
     ) -> Result<Vec<(db::SpendableCredential, i64)>, AppError> {
         let wait = self.provision_wait();
         let deadline = tokio::time::Instant::now() + wait;
@@ -7151,11 +7188,64 @@ impl Inner {
                 return Ok(inputs);
             }
 
+            // Past what the wallet and one fresh denomination could ever pay:
+            // refused before a stranded hold is asked for, a balance read or
+            // anything issued, since none of them could make it payable.
+            //
+            // In flight is read first. A settlement is not under
+            // `spend_gate`, so one can land between the two reads; it moves
+            // a credential out of `spending` and writes its successor in one
+            // insert. Read in this order, such a credential is counted in
+            // flight and its successor as held, which can only raise the
+            // bound; read the other way it would be in neither list, and a
+            // payable request would be refused for good.
+            let in_flight: Vec<i64> = db::list_spending_credentials(db_conn)
+                .await?
+                .into_iter()
+                .map(|c| c.credits)
+                .collect();
+            let held: Vec<i64> = db::spendable_credentials(db_conn)
+                .await?
+                .into_iter()
+                .map(|c| c.credits)
+                .collect();
+            if charge_credits > largest_payable_hold(&held, &in_flight) {
+                return Err(AppError::HoldExceedsDenomination {
+                    hold: charge_credits,
+                    denomination: DEFAULT_ALLOCATION_CREDITS,
+                });
+            }
+
             if stranded_asks == 2 {
                 stranded_asks = 1;
                 if self.recover_stranded_spends_by(deadline).await {
                     continue;
                 }
+            }
+
+            if funding == Funding::HeldOnly {
+                // Nothing is converted: what the wallet holds pays, or what a
+                // settlement in flight returns to it, or nothing does.
+                let in_flight: Vec<i64> = db::list_spending_credentials(db_conn)
+                    .await?
+                    .into_iter()
+                    .map(|c| c.credits)
+                    .collect();
+                let held: Vec<i64> = db::spendable_credentials(db_conn)
+                    .await?
+                    .into_iter()
+                    .map(|c| c.credits)
+                    .collect();
+                if settlement_could_cover(&in_flight, &held, charge_credits)
+                    && tokio::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
+                    continue;
+                }
+                return match chosen_inputs(db_conn, charge_credits).await? {
+                    Ok(inputs) => Ok(inputs),
+                    Err(_) => Err(AppError::UncachedRetryUnfunded),
+                };
             }
 
             if cfg.account_id.is_none() || cfg.account_secret.is_none() {
@@ -7185,10 +7275,10 @@ impl Inner {
                     (None, need)
                 } else {
                     let balances = self.account_balances_bounded().await?;
-                    if balances.available >= need {
-                        // Enough to allocate at least what is missing — grow
-                        // the pool, and choose again.
-                        let amount = auto_allocation_amount(balances.available, need)?;
+                    // The amount is the denomination or the whole balance,
+                    // whatever the request; what is missing decides only
+                    // whether it is issued.
+                    if let Some(amount) = auto_allocation_amount(balances.available, need) {
                         self.allocate_on_its_own_task(amount).await?;
                         continue;
                     }
@@ -7202,14 +7292,16 @@ impl Inner {
             // Balance can't cover a fresh allocation. Waiting only helps if a
             // concurrent turn holds coverage this turn could actually use once
             // its refunds land. A refund recovers a *wallet successor* worth at
-            // most the original credential's face value (a full refund on a
-            // failed turn) — it never tops up the account balance. So waiting
+            // most the original credential's face value (less the request fee
+            // a refused or failed request is still charged) — it never tops up
+            // the account balance. So waiting
             // helps only when some in-flight credential, at its face value,
             // could pay alone or as one of two inputs ([`settlement_could_cover`]),
-            // the other being a held credential or one the available balance
-            // can still be converted into (the in-flight credential drained,
-            // the allocation filling the rest); otherwise this is a true
-            // shortfall.
+            // the other being a held credential or the one a just-in-time
+            // issuance would make from the available balance (the
+            // denomination, or the balance when less; the in-flight
+            // credential drained, the issuance filling the rest); otherwise
+            // this is a true shortfall.
             let in_flight: Vec<i64> = db::list_spending_credentials(db_conn)
                 .await?
                 .into_iter()
@@ -7219,7 +7311,9 @@ impl Inner {
                 .await?
                 .into_iter()
                 .map(|c| c.credits)
-                .chain(std::iter::once(available))
+                .chain(std::iter::once(
+                    available.clamp(0, DEFAULT_ALLOCATION_CREDITS),
+                ))
                 .collect();
             let recoverable = settlement_could_cover(&in_flight, &held, charge_credits);
             if recoverable && tokio::time::Instant::now() < deadline {
@@ -7264,7 +7358,11 @@ impl Inner {
             // is taken again rather than refused on the stale amount.
             match chosen_inputs(db_conn, charge_credits).await? {
                 Ok(inputs) => return Ok(inputs),
-                Err(missing) if missing < need && available >= missing => continue,
+                Err(missing)
+                    if missing < need && auto_allocation_amount(available, missing).is_some() =>
+                {
+                    continue;
+                }
                 Err(_) => {}
             }
             if recoverable {
@@ -7349,7 +7447,6 @@ impl Inner {
         budget: Option<i64>,
         directive: &TurnDirective,
     ) -> Result<TurnPrep, AppError> {
-        let cfg = self.load_config();
         let now = now_ms();
 
         let db_conn = self.db_conn().await?;
@@ -8260,11 +8357,10 @@ impl Inner {
                 } else {
                     ContinueField::Content
                 };
-                messages.push(serde_json::json!({
-                    "role": "assistant",
-                    "reasoning_content": basis.thinking,
-                    "content": basis.text,
-                }));
+                messages.push(prefix_cache::continuation_message(
+                    &basis.thinking,
+                    &basis.text,
+                ));
                 if !context_action_ids.iter().any(|id| id == target_action_id) {
                     context_action_ids.push(target_action_id.to_string());
                 }
@@ -8392,31 +8488,12 @@ impl Inner {
         // (an openai backend's bearer key rides in `external_auth` instead)
         // — which also means non-eidola inference needs no account or
         // onboarding.
-        let (charge_credits, spend, auth_value) = match remote_pricing {
-            None => (0u128, None, external_auth),
-            Some(pricing) => {
-                let charge_credits = estimate_charge_credits(
-                    &messages,
-                    &tool_schemas,
-                    max_completion_tokens,
-                    pricing,
-                );
-                if charge_credits == 0 {
-                    return Err(AppError::Credential {
-                        message: "computed charge is zero — model pricing may be missing".into(),
-                    });
-                }
-                // Spend budget ceiling — checked *per round*, so a tool loop's
-                // later rounds re-check it against their own (grown) estimate.
-                check_turn_budget(charge_credits, budget)?;
-                let spend = self
-                    .acquire_spend(&cfg, &db_conn, charge_credits, now)
-                    .await?;
-                (charge_credits, Some(spend), None)
-            }
+        let auth_value = match remote_pricing {
+            None => external_auth,
+            Some(_) => None,
         };
 
-        Ok(TurnPrep {
+        let mut prep = TurnPrep {
             db_conn,
             provider_id,
             backend_id: backend.id,
@@ -8433,6 +8510,11 @@ impl Inner {
             weights_moved: false,
             model_participant_id,
             max_completion_tokens,
+            output_limit: max_completion_tokens,
+            continues_automatically: backend_kind == BackendKind::Eidola
+                && can_continue(Some(model))
+                && remote_pricing.is_some(),
+            answer: AnswerSoFar::default(),
             continues: continuation.is_some(),
             continuation,
             inf_item_id,
@@ -8452,16 +8534,25 @@ impl Inner {
             tool_policy,
             cache_scope,
             cache_clock: self.cache_clock.clone(),
+            claimed_key: Arc::new(Mutex::new(None)),
+            declared: None,
+            context_length,
             remote_pricing,
             budget,
-            charge_credits,
-            total_credits: charge_credits,
-            spend,
+            charge_credits: 0,
+            total_credits: 0,
+            spend: None,
             external_auth: auth_value,
             plain_route: backend_kind != BackendKind::Eidola,
             whole: whole_answer::WholeAnswer::for_backend(backend_kind),
             bus: self.bus.clone(),
-        })
+        };
+        // The spend side runs only for eidola turns (a no-op otherwise): the
+        // first round's hold, priced by a declared cached prefix where the
+        // lineage has one to declare.
+        self.fund_round(&mut prep, Funding::MayConvert, true)
+            .await?;
+        Ok(prep)
     }
 
     /// The **agent-side decline checkpoint** (see [`decline`]).
@@ -8553,17 +8644,24 @@ impl Inner {
         db_conn: &turso::Connection,
         charge_credits: u128,
         now: i64,
+        funding: Funding,
     ) -> Result<SpendPrep, AppError> {
         // ACT provisioning queue: serialize acquire → spend-proof →
         // flip-to-`spending` across concurrent turns so two turns fired at
         // once can never both spend the same credential. The gate is held only
         // through `insert_spend_inputs` below (the point the inputs become
         // `spending`); the HTTP request runs outside it.
+        // A hold too large for the wallet's arithmetic is far past anything one
+        // denomination pays, and is refused as that, before anything is read.
+        let hold =
+            i64::try_from(charge_credits).map_err(|_| AppError::HoldExceedsDenomination {
+                hold: i64::MAX,
+                denomination: DEFAULT_ALLOCATION_CREDITS,
+            })?;
         let _spend_guard = self.spend_gate.lock().await;
         // Boxed: the provisioning queue's own future (with an issuance inside
         // it) is large, and it sits inside every turn's.
-        let chosen =
-            Box::pin(self.ensure_spend_inputs(cfg, db_conn, charge_credits as i64)).await?;
+        let chosen = Box::pin(self.ensure_spend_inputs(cfg, db_conn, hold, funding)).await?;
 
         let params = params_from_domain_separator(cfg.domain_separator())?;
         let mut inputs = Vec::with_capacity(chosen.len());
@@ -8656,9 +8754,9 @@ impl Inner {
     /// Non-spend turns (local / llamacpp / openai backends) fall through
     /// untouched — they have no pricing, so a round costs nothing to start.
     async fn begin_next_round(&self, prep: &mut TurnPrep) -> Result<(), AppError> {
-        let Some(pricing) = prep.remote_pricing else {
+        if prep.remote_pricing.is_none() {
             return Ok(());
-        };
+        }
         // **A hold is never abandoned to take another one.** Acquiring below
         // overwrites `prep.spend`, which is the only in-memory handle to the
         // materials that settle the current one — so an unsettled hold would be
@@ -8679,26 +8777,91 @@ impl Inner {
                     .into(),
             });
         }
-        let cfg = self.load_config();
-        let charge_credits = estimate_charge_credits(
-            &prep.messages,
-            &prep.tool_schemas,
-            prep.max_completion_tokens,
-            pricing,
-        );
+        self.fund_round(prep, Funding::MayConvert, true).await
+    }
+
+    /// Price and pay for the next request of a turn: decide its declared
+    /// cached prefix (when `declare` and the lineage has one to declare —
+    /// [`TurnPrep::declarable_prefix`]), compute its hold from that or from
+    /// the byte contract, check the per-turn `budget` against it, and acquire
+    /// the hold under `funding`. The one place a turn's hold is sized, so
+    /// every round is priced by the rule its body states. A no-op for the
+    /// non-spend backends.
+    async fn fund_round(
+        &self,
+        prep: &mut TurnPrep,
+        funding: Funding,
+        declare: bool,
+    ) -> Result<(), AppError> {
+        let Some(pricing) = prep.remote_pricing else {
+            prep.declared = None;
+            return Ok(());
+        };
+        prep.declared = if declare {
+            prep.declarable_prefix(pricing).await
+        } else {
+            None
+        };
+        let prompt = match prep.declared {
+            Some(prefix) => eidola_common::pricing::Prompt::Declared {
+                cached_tokens: u64::from(prefix.cached_tokens),
+                new_tokens: u64::from(prefix.new_tokens),
+            },
+            None => counted_prompt(&prep.messages, &prep.tool_schemas),
+        };
+        // The declaration is decided first: it does not depend on the
+        // ceiling, and the rung is a function of the prompt it prices.
+        if prep.continues_automatically {
+            prep.max_completion_tokens =
+                ladder_ceiling(prep.output_limit, prompt, &pricing, prep.answer.generated);
+        }
+        let charge_credits = pricing.hold(prompt, prep.max_completion_tokens);
         if charge_credits == 0 {
             return Err(AppError::Credential {
                 message: "computed charge is zero — model pricing may be missing".into(),
             });
         }
+        // Spend budget ceiling — checked *per round*, so a tool loop's later
+        // rounds re-check it against their own (grown) estimate.
         check_turn_budget(charge_credits, prep.budget)?;
+        let cfg = self.load_config();
         let spend = self
-            .acquire_spend(&cfg, &prep.db_conn, charge_credits, prep.now)
+            .acquire_spend(&cfg, &prep.db_conn, charge_credits, prep.now, funding)
             .await?;
         prep.charge_credits = charge_credits;
         prep.total_credits += charge_credits;
         prep.spend = Some(spend);
         Ok(())
+    }
+
+    /// Send a round again **without its declared cached prefix**, after the
+    /// engine refused the declaration (`409 cached_prefix_missing` or
+    /// `prompt_budget_exceeded`): the lineage's resume point is forgotten,
+    /// the refused request's hold is settled (it was charged the request
+    /// fee), and a fresh hold is taken for the undeclared request.
+    ///
+    /// **That hold never converts account credit** ([`Funding::HeldOnly`]):
+    /// it is paid from what the wallet holds, or what a settlement in flight
+    /// returns, or the turn fails with [`AppError::UncachedRetryUnfunded`].
+    /// Whoever can empty an engine's cache can cause this retry, and it must
+    /// not let them choose the moment this client converts.
+    async fn resend_undeclared(&self, prep: &mut TurnPrep) -> Result<(), AppError> {
+        if let Err(e) =
+            db::forget_prefix_resume(&prep.db_conn, &prep.space_id, &prep.model_participant_id)
+                .await
+        {
+            eprintln!("warning: a lineage's cache resume point could not be forgotten: {e}");
+        }
+        if prep.spend.as_ref().is_some_and(|s| !s.all_settled())
+            && !prep.try_refund_recovery().await
+        {
+            return Err(AppError::Credential {
+                message: "the refused request's credential could not be settled — its hold is \
+                          recoverable with `eidola wallet credentials recover`"
+                    .into(),
+            });
+        }
+        self.fund_round(prep, Funding::HeldOnly, false).await
     }
 
     /// [`ChatResult::continuable`], from the door's own predicate: only an
@@ -8828,8 +8991,33 @@ impl Inner {
         // per-round future (request, SSE-free body read, refund, persistence)
         // is by far the largest state machine in the crate, and keeping it on
         // the heap keeps the turn off the worker stack.
-        for round in 1..=MAX_TURN_ROUNDS {
+        //
+        // A round is one answer: the requests that continue an answer that
+        // stopped at its ceiling belong to the round whose answer they
+        // extend, bounded by the model's declared output limit rather than
+        // by `MAX_TURN_ROUNDS`.
+        let mut round = 1;
+        loop {
             let mut outcome = Box::pin(self.run_turn_round(&mut prep, round)).await;
+            // A refused declaration is sent once more, undeclared.
+            if matches!(outcome, Ok(RoundOutcome::PrefixRefused(_))) {
+                if let Err(e) = self.resend_undeclared(&mut prep).await {
+                    if prep.carries_answer() {
+                        return self.write_carried_answer(&mut prep, e).await;
+                    }
+                    self.bus.emit(Change::Space(prep.space_id.clone()));
+                    return Err(e);
+                }
+                outcome = Box::pin(self.run_turn_round(&mut prep, round)).await;
+            }
+            // **A continuation that fails loses nothing**: the answer it was
+            // continuing is written as it stood, at its ceiling, and the turn
+            // ends as a ceiling ending does.
+            if prep.carries_answer()
+                && let Err(e) = outcome
+            {
+                return self.write_carried_answer(&mut prep, e).await;
+            }
             // Degrade-on-rejection: a backend that refuses the `tools` field
             // gets one toolless retry of this round rather than turning "the
             // user branched their conversation" into a broken turn. The map is
@@ -8851,20 +9039,94 @@ impl Inner {
                 }
             }
             match outcome? {
-                RoundOutcome::Final(result) => {
-                    // The turn is committed and emitted; a branch that grew by
-                    // this response is summarized behind it (see [`summaries`]).
-                    self.spawn_branch_summaries(&result.space_id);
-                    return self.settle_continuable(result).await;
+                RoundOutcome::Final(result) => return self.finish_turn(result).await,
+                // The round cap is asked inside the round, before it returns
+                // this, so `round` never passes `MAX_TURN_ROUNDS`.
+                RoundOutcome::ToolRound => round += 1,
+                RoundOutcome::Continued => {
+                    if let Err(e) = self.begin_next_round(&mut prep).await {
+                        return self.write_carried_answer(&mut prep, e).await;
+                    }
                 }
-                RoundOutcome::ToolRound => continue,
+                // Only a resend that declared again can be refused here,
+                // and no resend declares.
+                RoundOutcome::PrefixRefused(refused) => {
+                    if prep.carries_answer() {
+                        return self.write_carried_answer(&mut prep, refused).await;
+                    }
+                    self.bus.emit(Change::Space(prep.space_id.clone()));
+                    return Err(refused);
+                }
             }
         }
+    }
 
-        // Unreachable: the last round either returns a final result or exits
-        // with `AppError::ToolLoop` (the `round == MAX_TURN_ROUNDS` guard), so
-        // the loop never runs out.
-        unreachable!("the tool loop returns on its last round")
+    /// The end of a turn that wrote its answer: a branch that grew by it is
+    /// summarized behind it (see [`summaries`]), and an answer that stopped at
+    /// its ceiling says whether the reader can continue it.
+    async fn finish_turn(&self, result: ChatResult) -> Result<ChatResult, AppError> {
+        self.spawn_branch_summaries(&result.space_id);
+        self.settle_continuable(result).await
+    }
+
+    /// Write the answer a turn was continuing **as it stood** when the
+    /// request continuing it could not be paid, was refused, or failed
+    /// (`cause`, which the turn does not return): the generation every
+    /// earlier request of the answer produced, at its ceiling and continuable
+    /// exactly, carrying their request rows. The failed request's own row, if
+    /// it got one, stays attached to nothing. Then the turn ends as a ceiling
+    /// ending does.
+    async fn write_carried_answer(
+        &self,
+        prep: &mut TurnPrep,
+        cause: AppError,
+    ) -> Result<ChatResult, AppError> {
+        eprintln!(
+            "warning: an answer's continuation did not complete; the answer is written as it \
+             stood: {cause}"
+        );
+        let continuation = prep
+            .continuation
+            .take()
+            .expect("a carried answer has its continuation");
+        prep.messages.pop();
+        let input_tokens = prep.answer.input_tokens;
+        let output_tokens = prep.answer.output_tokens;
+        let response_action_id = prep
+            .persist_turn(
+                "complete",
+                true,
+                true,
+                input_tokens,
+                output_tokens,
+                &continuation.reasoning,
+                &continuation.content,
+                None,
+            )
+            .await?;
+        if response_action_id.is_some() {
+            self.bus.emit(Change::Space(prep.space_id.clone()));
+            if prep.spend.is_some() {
+                self.bus.emit(Change::Wallet);
+            }
+        }
+        self.bus.emit(Change::Record);
+        let result = ChatResult {
+            space_id: prep.space_id.clone(),
+            content: continuation.content,
+            model: prep.model.clone(),
+            input_tokens,
+            output_tokens,
+            credits_charged: prep.total_credits as i64,
+            response_action_id,
+            declined: None,
+            truncated: true,
+            continuable: false,
+        };
+        if result.response_action_id.is_none() {
+            return Ok(result);
+        }
+        self.finish_turn(result).await
     }
 
     /// One round of the blocking turn loop: send the request, read the JSON
@@ -9041,6 +9303,27 @@ impl Inner {
             }
         }
 
+        // **A refused declaration is not an answer.** The engine computed
+        // nothing; the exchange is recorded, the hold settled above, and the
+        // loop sends the round again without the declaration. Nothing is
+        // written at the semantic layer, so the retry can still write the
+        // turn's answer.
+        if !status.is_success()
+            && let Some(refused) = prep.declared_prefix_refusal(status, &body, &response_text)
+        {
+            prep.insert_unattached_request(
+                &request_body_json,
+                request_at,
+                response_at,
+                status.as_u16(),
+                response_record,
+                None,
+            )
+            .await?;
+            self.bus.emit(Change::Record);
+            return Ok(RoundOutcome::PrefixRefused(refused));
+        }
+
         let usage = body.get("usage");
         let input_tokens = usage
             .and_then(|u| u.get("prompt_tokens"))
@@ -9121,6 +9404,7 @@ impl Inner {
             // after the text it continued, so that is the round's narration.
             let (response_reasoning, response_content) =
                 prep.round_text(&response_reasoning, &response_content);
+            prep.note_answered(&request_body_json, input_tokens).await;
             prep.persist_tool_call_action(
                 &tool_calls,
                 &response_reasoning,
@@ -9186,7 +9470,10 @@ impl Inner {
                 status: status.as_u16(),
                 message: parse_server_error_message(&response_text),
             };
-            if self.should_degrade_tools(prep, round, &rejected) {
+            // Nor when the request continued an answer this turn is
+            // carrying: the loop writes that answer as it stood, under the
+            // turn's item.
+            if self.should_degrade_tools(prep, round, &rejected) || prep.carries_answer() {
                 prep.insert_unattached_request(
                     &request_body_json,
                     request_at,
@@ -9231,6 +9518,33 @@ impl Inner {
         } else {
             (response_reasoning, response_content)
         };
+        if status.is_success() {
+            prep.note_answered(&request_body_json, input_tokens).await;
+            // **An answer that stopped at its ceiling is continued at once**,
+            // where the engine says it can be continued exactly and the
+            // answer is still under the model's limit.
+            if resumable && prep.continues_answer(output_tokens) {
+                prep.carry_answer(
+                    Exchange {
+                        request_body_json: &request_body_json,
+                        request_at,
+                        response_at,
+                        http_status: status.as_u16(),
+                        response_body: response_record,
+                    },
+                    input_tokens,
+                    output_tokens,
+                    response_reasoning,
+                    response_content,
+                )
+                .await?;
+                self.bus.emit(Change::Record);
+                return Ok(RoundOutcome::Continued);
+            }
+        }
+        // The answer's tokens are every request it took.
+        let input_tokens = sum_tokens(prep.answer.input_tokens, input_tokens);
+        let output_tokens = sum_tokens(prep.answer.output_tokens, output_tokens);
 
         #[cfg(feature = "test-support")]
         if prep.mechanical {
@@ -9249,11 +9563,13 @@ impl Inner {
                 output_tokens,
                 &response_reasoning,
                 &response_content,
-                &request_body_json,
-                request_at,
-                response_at,
-                status.as_u16(),
-                response_record.clone(),
+                Some(Exchange {
+                    request_body_json: &request_body_json,
+                    request_at,
+                    response_at,
+                    http_status: status.as_u16(),
+                    response_body: response_record.clone(),
+                }),
             )
             .await?;
         if response_action_id.is_none() {
@@ -9669,8 +9985,32 @@ impl Inner {
             }
         }
 
-        for round in 1..=MAX_TURN_ROUNDS {
+        // A round is one answer, its continuations included (see the
+        // blocking twin).
+        let mut round = 1;
+        loop {
             let mut outcome = Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await;
+            // A refused declaration is sent once more, undeclared — answered
+            // before any stream opened, so the caller saw nothing of it.
+            if matches!(outcome, Ok(RoundOutcome::PrefixRefused(_))) {
+                if let Err(e) = self.resend_undeclared(&mut prep).await {
+                    if prep.carries_answer() {
+                        return self.write_carried_answer(&mut prep, e).await;
+                    }
+                    self.bus.emit(Change::Space(prep.space_id.clone()));
+                    return Err(e);
+                }
+                outcome = Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await;
+            }
+            // A continuation that fails loses nothing (see the blocking twin).
+            // The caller holds every delta of the answer as written, and
+            // perhaps some of the failed request's: the result's content is
+            // the answer as written.
+            if prep.carries_answer()
+                && let Err(e) = outcome
+            {
+                return self.write_carried_answer(&mut prep, e).await;
+            }
             // Degrade-on-rejection — see the blocking twin. A rejected request
             // is answered before any SSE body, so nothing was streamed to the
             // caller and the retry is invisible to it.
@@ -9685,17 +10025,24 @@ impl Inner {
                 }
             }
             match outcome? {
-                RoundOutcome::Final(result) => {
-                    // The turn is committed and emitted; a branch that grew by
-                    // this response is summarized behind it (see [`summaries`]).
-                    self.spawn_branch_summaries(&result.space_id);
-                    return self.settle_continuable(result).await;
+                RoundOutcome::Final(result) => return self.finish_turn(result).await,
+                RoundOutcome::ToolRound => round += 1,
+                RoundOutcome::Continued => {
+                    if let Err(e) = self.begin_next_round(&mut prep).await {
+                        return self.write_carried_answer(&mut prep, e).await;
+                    }
                 }
-                RoundOutcome::ToolRound => continue,
+                // Only a resend that declared again can be refused here,
+                // and no resend declares.
+                RoundOutcome::PrefixRefused(refused) => {
+                    if prep.carries_answer() {
+                        return self.write_carried_answer(&mut prep, refused).await;
+                    }
+                    self.bus.emit(Change::Space(prep.space_id.clone()));
+                    return Err(refused);
+                }
             }
         }
-
-        unreachable!("the tool loop returns on its last round")
     }
 
     /// One round of the streaming turn loop: send the request, pump the SSE
@@ -9801,6 +10148,25 @@ impl Inner {
                 .flatten()
                 .and_then(|body| inline_refund(&body).cloned());
             prep.settle(inline.as_ref()).await;
+            // A refused declaration is not an answer (see the blocking twin):
+            // recorded, settled, and sent again undeclared by the loop.
+            if !status.is_success() && !answer.over_ceiling {
+                let body = serde_json::from_str::<serde_json::Value>(&response_text)
+                    .unwrap_or(serde_json::Value::Null);
+                if let Some(refused) = prep.declared_prefix_refusal(status, &body, &response_text) {
+                    prep.insert_unattached_request(
+                        &request_body_json,
+                        request_at,
+                        now_ms(),
+                        status.as_u16(),
+                        recorded::recorded_answer(&answer),
+                        None,
+                    )
+                    .await?;
+                    self.bus.emit(Change::Record);
+                    return Ok(RoundOutcome::PrefixRefused(refused));
+                }
+            }
             // The ceiling decides first, whatever the status
             // (`peer_read::answer_past_ceiling`).
             let failure = if answer.over_ceiling {
@@ -10112,6 +10478,7 @@ impl Inner {
             // As the blocking twin: a continued round's narration is the
             // continued text.
             let (full_reasoning, full_content) = prep.round_text(&full_reasoning, &full_content);
+            prep.note_answered(&request_body_json, input_tokens).await;
             prep.persist_tool_call_action(
                 &tool_calls,
                 &full_reasoning,
@@ -10167,6 +10534,30 @@ impl Inner {
         let truncated = stopped_at_ceiling(finish_reason.as_deref());
         let resumable = truncated && continuable == Some(true) && text_is_generated;
         let (full_reasoning, full_content) = prep.round_text(&full_reasoning, &full_content);
+        prep.note_answered(&request_body_json, input_tokens).await;
+        // An answer that stopped at its ceiling is continued at once (see
+        // the blocking twin). The caller has every delta so far, and the next
+        // request's deltas follow them.
+        if resumable && prep.continues_answer(output_tokens) {
+            prep.carry_answer(
+                Exchange {
+                    request_body_json: &request_body_json,
+                    request_at,
+                    response_at,
+                    http_status: status.as_u16(),
+                    response_body: response_buf,
+                },
+                input_tokens,
+                output_tokens,
+                full_reasoning,
+                full_content,
+            )
+            .await?;
+            self.bus.emit(Change::Record);
+            return Ok(RoundOutcome::Continued);
+        }
+        let input_tokens = sum_tokens(prep.answer.input_tokens, input_tokens);
+        let output_tokens = sum_tokens(prep.answer.output_tokens, output_tokens);
 
         #[cfg(feature = "test-support")]
         if prep.mechanical {
@@ -10181,11 +10572,13 @@ impl Inner {
                 output_tokens,
                 &full_reasoning,
                 &full_content,
-                &request_body_json,
-                request_at,
-                response_at,
-                status.as_u16(),
-                response_buf,
+                Some(Exchange {
+                    request_body_json: &request_body_json,
+                    request_at,
+                    response_at,
+                    http_status: status.as_u16(),
+                    response_body: response_buf,
+                }),
             )
             .await?;
         if response_action_id.is_none() {
@@ -14237,6 +14630,10 @@ struct IssueCredentialsResponse {
 #[derive(Deserialize)]
 struct ModelPricingInfo {
     per_prompt_token: ScaledPriceInfo,
+    /// A prompt token declared cached (`cached_prefix`), where the model sells
+    /// one; absent otherwise, and then no request to it declares one.
+    #[serde(default)]
+    per_cached_prompt_token: Option<ScaledPriceInfo>,
     per_completion_token: ScaledPriceInfo,
     /// Present only for models priced per request (e.g. transcription).
     #[serde(default)]
@@ -14464,6 +14861,8 @@ fn keyed_body(prep: &TurnPrep, body: &serde_json::Value) -> (reqwest::Body, usiz
         .clone()
         .expect("only a keyed turn builds a keyed body");
     let clock = prep.cache_clock.clone();
+    let claimed_key = Arc::clone(&prep.claimed_key);
+    *claimed_key.lock().expect("claimed key lock poisoned") = None;
     let chunk = async move {
         let claimed = db::claim_prefix_cache_key(
             &conn,
@@ -14476,7 +14875,10 @@ fn keyed_body(prep: &TurnPrep, body: &serde_json::Value) -> (reqwest::Body, usiz
         )
         .await;
         let key = match claimed {
-            Ok(db::ClaimOutcome::Claimed(key)) => key,
+            Ok(db::ClaimOutcome::Claimed(key, identity)) => {
+                *claimed_key.lock().expect("claimed key lock poisoned") = Some(identity);
+                key
+            }
             Ok(db::ClaimOutcome::Unsendable) => one_use_key()?,
             Err(_) => {
                 eprintln!(
@@ -14521,6 +14923,42 @@ impl Continuation {
             format!("{}{content}", self.content),
         )
     }
+}
+
+/// The requests an answer took before the one now in flight, when the turn
+/// is continuing it automatically: each stopped at its ceiling with the
+/// engine saying it could be continued exactly, and each is in the Record,
+/// attached to nothing until the answer is written.
+#[derive(Debug, Default)]
+struct AnswerSoFar {
+    /// Their request rows, attached to the action the answer is written as.
+    request_ids: Vec<String>,
+    /// The prompt and completion tokens they reported, summed.
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    /// Their holds, summed.
+    credits: u128,
+    /// The output counted against the model's declared limit: for each
+    /// request, the ceiling it stopped at or the completion it reported,
+    /// whichever is larger.
+    generated: u64,
+}
+
+/// Two optional token counts summed: `None` only when neither is known.
+fn sum_tokens(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+    }
+}
+
+/// One request's exchange as a request row records it.
+struct Exchange<'a> {
+    request_body_json: &'a serde_json::Value,
+    request_at: i64,
+    response_at: i64,
+    http_status: u16,
+    response_body: Vec<u8>,
 }
 
 // ============================================================================
@@ -14593,12 +15031,27 @@ struct TurnPrep {
     /// scope mid-flight — so the pinned echo is derived from this id inside
     /// `db::insert_action`'s own statement rather than carried here.
     model_participant_id: String,
+    /// The completion ceiling the current request asks for: a rung of the
+    /// ceiling ladder ([`ladder_ceiling`]) on a turn whose answers continue
+    /// automatically, chosen each time a request is priced; the model's
+    /// whole declared limit everywhere else.
     max_completion_tokens: u32,
-    /// The partial answer a [`ResponseMode::Continue`] turn's next request
-    /// continues, which is the last entry of `messages` while it is set. Taken
-    /// by the round that answers it ([`Continuation::extend`]): whatever that
-    /// round writes is the continued text, and a later round of the same turn
-    /// is an ordinary one.
+    /// The model's declared output limit, within its window
+    /// ([`completion_ceiling`]): the most one answer of this turn produces,
+    /// however many requests it takes.
+    output_limit: u32,
+    /// Whether this turn's ceilings come from the ladder and an answer that
+    /// stops at one is continued at once: an Eidola turn, whose engines
+    /// honour a continuation ([`can_continue`]).
+    continues_automatically: bool,
+    /// The requests the answer under way took before the current one.
+    answer: AnswerSoFar,
+    /// The partial answer the turn's next request continues — a
+    /// [`ResponseMode::Continue`] turn's target, or an answer this turn is
+    /// continuing by itself ([`TurnPrep::carry_answer`]) — which is the last
+    /// entry of `messages` while it is set. Taken by the round that answers it
+    /// ([`Continuation::extend`]): whatever that round writes is the continued
+    /// text, and a later round of the same turn is an ordinary one.
     continuation: Option<Continuation>,
     /// The inference's attach plan (Reply → fresh item; Revise → a new
     /// generation superseding the target).
@@ -14670,8 +15123,21 @@ struct TurnPrep {
     cache_scope: Option<prefix_cache::CacheScope>,
     /// The clock the key is judged by, at the moment it is claimed.
     cache_clock: CacheClock,
-    /// `(prompt_rate, completion_rate, scale_factor)` for eidola turns; `None`
-    /// for every non-spend backend. Kept so a later round can re-estimate.
+    /// Which of the lineage's keys the current round's request was sent with,
+    /// set by [`keyed_body`] at its claim: what the round's resume point is
+    /// written against ([`TurnPrep::note_answered`]). `None` until a claim,
+    /// and for a request that carried a one-use key.
+    claimed_key: Arc<Mutex<Option<prefix_cache::KeyIdentity>>>,
+    /// The cached prefix the current round's request declares
+    /// ([`TurnPrep::declarable_prefix`]), and is priced by; `None` for a
+    /// request that declares none, which is every request that carries no
+    /// lineage key or goes to a model with no cached rate.
+    declared: Option<eidola_common::engine_protocol::CachedPrefix>,
+    /// The model's context window as the catalog states it (`0` when it is not
+    /// known): a declaration whose prompt limit exceeds it is not sent.
+    context_length: u64,
+    /// The model's catalog pricing for eidola turns; `None` for every
+    /// non-spend backend. Kept so a later round can re-estimate.
     remote_pricing: Option<ChargePricing>,
     /// The per-turn spend ceiling, checked **per round** against that round's
     /// own estimate over the grown messages array.
@@ -14704,6 +15170,17 @@ struct TurnPrep {
     /// The invalidation bus, so the one place a settled hold is durably
     /// committed ([`Self::process_refund_obj`]) can emit at the write.
     bus: BroadcastSource,
+}
+
+/// Where a request's hold may come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Funding {
+    /// The wallet, and when it cannot pay, account credit converted for it
+    /// ([`Inner::ensure_spend_inputs`]).
+    MayConvert,
+    /// The wallet alone: what it holds, or what a settlement in flight returns
+    /// to it. Never a conversion, and never a request to the account surface.
+    HeldOnly,
 }
 
 /// The pre-credential ids this process is spending **right now**.
@@ -14969,8 +15446,10 @@ async fn chosen_inputs(
 ///    a later one is drained only when the first has no fill but another pair
 ///    covers `W`, so a wallet able to pay is never sent to allocation.
 /// 3. If no pair covers `W` (or the wallet is empty), a new credential is
-///    allocated to fill beside the first credential's drain (or to pay alone),
-///    and the rule runs again.
+///    allocated, and the rule runs again: it fills beside a drain (or pays
+///    alone). It must hold at least `W` less the largest balance; it is
+///    issued only at the denomination or the whole remaining balance, never
+///    at that size ([`auto_allocation_amount`]).
 ///
 /// Every share is `W`, a drained balance, or the rest of `W` after a drain,
 /// so the shares sum to exactly `W` and reveal nothing but the drained
@@ -14983,7 +15462,7 @@ pub(crate) enum InputChoice {
     /// the order) pays the rest.
     Two { drain: usize, fill: usize },
     /// No pair in the wallet covers the hold: a new credential must cover
-    /// `need`, the whole hold, or the hold less the first credential's
+    /// `need`, the whole hold, or the hold less the largest credential's
     /// balance.
     Allocate { need: i64 },
 }
@@ -15009,8 +15488,11 @@ pub(crate) fn choose_inputs(balances: &[i64], worst: i64) -> InputChoice {
             };
         }
     }
+    // Every balance is below the hold here; the largest is the drain a new
+    // credential needs the least beside.
+    let largest = balances.iter().copied().max().unwrap_or(first);
     InputChoice::Allocate {
-        need: worst - first,
+        need: worst - largest,
     }
 }
 
@@ -15061,7 +15543,7 @@ impl TurnPrep {
         // (accurate refunds depend on it), so the remote request stays
         // minimal — but a local llama-server only reports usage when the
         // client asks.
-        eidola_common::chat_completion_request_body(
+        let mut body = eidola_common::chat_completion_request_body(
             &self.wire_model,
             &self.messages,
             self.max_completion_tokens,
@@ -15070,7 +15552,150 @@ impl TurnPrep {
             stream && self.spend.is_none(),
             self.cache_scope.as_ref().map(|_| CACHE_KEY_PLACEHOLDER),
             self.continuation.as_ref().map(|c| c.field),
+        );
+        if let Some(prefix) = self.declared {
+            prefix.insert_into(&mut body);
+        }
+        body
+    }
+
+    /// The cached prefix this round's request may declare, or `None`.
+    ///
+    /// **A declaration is the client's own statement about its own earlier
+    /// request**, and it is made only where that statement is known true:
+    /// the request carries its lineage's key, the model sells a cached rate,
+    /// the key the request will be sent with is the one that carried the
+    /// lineage's most recent answered request (its resume point is on that
+    /// key's row, and the rotation rule would keep the key now), and this
+    /// request's prompt begins with exactly what that request left
+    /// ([`prefix_cache::declaration`]). Its budget for what the request adds
+    /// stops at the model's window, and it must lower the hold; otherwise the
+    /// request declares nothing and its body is the one it would be without
+    /// this feature.
+    ///
+    /// The key is judged again at the claim, after the connection is open; a
+    /// key that rotated in between carries a declaration its engine cannot
+    /// meet, which it refuses, and the request is sent again undeclared.
+    async fn declarable_prefix(
+        &self,
+        pricing: ChargePricing,
+    ) -> Option<eidola_common::engine_protocol::CachedPrefix> {
+        use eidola_common::pricing::Prompt;
+        let scope = self.cache_scope.as_ref()?;
+        if !pricing.sells_cached_prompt() {
+            return None;
+        }
+        let (age, _, point) = match db::prefix_cache_resume(
+            &self.db_conn,
+            &self.space_id,
+            &self.model_participant_id,
         )
+        .await
+        {
+            Ok(found) => found?,
+            Err(e) => {
+                eprintln!("warning: a lineage's cache resume point could not be read: {e}");
+                return None;
+            }
+        };
+        let point = point?;
+        let model = prefix_cache::key_model(&self.model, self.resolved_sha256.as_deref());
+        if prefix_cache::decide(
+            Some(&age),
+            &model,
+            &scope.trust_domain,
+            &scope.policy,
+            self.cache_clock.now_ms(),
+        ) != prefix_cache::Claim::Reuse
+        {
+            return None;
+        }
+        // Bounded by the model's window, so the gateway's own check of the
+        // declared limit against the window never refuses it.
+        let prefix = prefix_cache::declaration(
+            &point,
+            &self.tool_schemas,
+            &self.messages,
+            self.context_length,
+        )?;
+        let declared = pricing.hold(
+            Prompt::Declared {
+                cached_tokens: u64::from(prefix.cached_tokens),
+                new_tokens: u64::from(prefix.new_tokens),
+            },
+            self.max_completion_tokens,
+        );
+        let counted = pricing.hold(
+            counted_prompt(&self.messages, &self.tool_schemas),
+            self.max_completion_tokens,
+        );
+        (declared != 0 && declared < counted).then_some(prefix)
+    }
+
+    /// Record what an answered request (`request_body`, as sent) left in the
+    /// engine under the key that carried it, **when it is an anchor**: a
+    /// request that asked for a new assistant turn becomes the lineage's
+    /// resume point ([`prefix_cache::ResumePoint`]), cleared instead when the
+    /// engine reported no prompt tokens. A request that continued an answer
+    /// (`continue_final_message`) is not an anchor and leaves the resume point
+    /// as it is, so every continuation of an answer, and the requests that
+    /// follow it, declare the request that began the answer. A no-op for a
+    /// request that carried no lineage key. Best-effort: a failed write costs
+    /// the next request its declaration, never the turn.
+    async fn note_answered(&self, request_body: &serde_json::Value, prompt_tokens: Option<i64>) {
+        if self.cache_scope.is_none() || request_body.get("continue_final_message").is_some() {
+            return;
+        }
+        let Some(identity) = *self.claimed_key.lock().expect("claimed key lock poisoned") else {
+            return;
+        };
+        let empty = Vec::new();
+        let messages = request_body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .unwrap_or(&empty);
+        let tools = request_body
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .unwrap_or(&empty);
+        let point = prompt_tokens.map(|prompt_tokens| prefix_cache::ResumePoint {
+            prompt_digest: prefix_cache::prompt_digest(tools, messages),
+            message_count: messages.len() as i64,
+            prompt_tokens,
+        });
+        if let Err(e) = db::record_prefix_resume(
+            &self.db_conn,
+            &self.space_id,
+            &self.model_participant_id,
+            identity,
+            point.as_ref(),
+        )
+        .await
+        {
+            eprintln!("warning: a lineage's cache resume point could not be written: {e}");
+        }
+    }
+
+    /// The engine's refusal of this round's declared cached prefix, read from
+    /// a non-2xx answer's status and its error document's `error.type`
+    /// (`engine_protocol::declared_prefix_refusal`). `None` for a request that
+    /// declared nothing, and for every other answer.
+    fn declared_prefix_refusal(
+        &self,
+        status: reqwest::StatusCode,
+        body: &serde_json::Value,
+        text: &str,
+    ) -> Option<AppError> {
+        self.declared?;
+        let kind = body
+            .get("error")
+            .and_then(|e| e.get("type"))
+            .and_then(|t| t.as_str())?;
+        eidola_common::engine_protocol::declared_prefix_refusal(status.as_u16(), kind)?;
+        Some(AppError::Server {
+            status: status.as_u16(),
+            message: parse_server_error_message(text),
+        })
     }
 
     /// The text a round writes: its reasoning and answer, or — for the round
@@ -15095,6 +15720,83 @@ impl TurnPrep {
                 continuation.extend(reasoning, content)
             }
         }
+    }
+
+    /// The output a request that stopped at its ceiling counts against the
+    /// model's declared limit: the ceiling it asked for, or what it reported
+    /// generating where that is more, so a server that under-reports cannot
+    /// stretch an answer past the limit.
+    fn request_generated(&self, output_tokens: Option<i64>) -> u64 {
+        let reported = output_tokens
+            .and_then(|t| u64::try_from(t).ok())
+            .unwrap_or(0);
+        u64::from(self.max_completion_tokens).max(reported)
+    }
+
+    /// Whether an answer that just stopped at its ceiling, exactly
+    /// continuable, is continued at once: this turn continues its answers
+    /// automatically, and the answer, counting this request, is still under
+    /// the model's declared output limit — so an answer produces no more than
+    /// one request asking for the whole limit would.
+    fn continues_answer(&self, output_tokens: Option<i64>) -> bool {
+        self.continues_automatically
+            && self
+                .answer
+                .generated
+                .saturating_add(self.request_generated(output_tokens))
+                < u64::from(self.output_limit)
+    }
+
+    /// Carry the answer so far into the request that continues it: this
+    /// request's exchange is recorded (attached to the answer once it is
+    /// written), its tokens, hold and output join the answer's, and the
+    /// whole answer so far becomes the final partial message of the next
+    /// request — the request that began the answer, which `messages` holds
+    /// again once [`Self::round_text`] has taken any earlier partial message,
+    /// continued in the field it stopped in.
+    async fn carry_answer(
+        &mut self,
+        exchange: Exchange<'_>,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
+        reasoning: String,
+        content: String,
+    ) -> Result<(), AppError> {
+        let id = self
+            .insert_unattached_request(
+                exchange.request_body_json,
+                exchange.request_at,
+                exchange.response_at,
+                exchange.http_status,
+                exchange.response_body,
+                None,
+            )
+            .await?;
+        let generated = self.request_generated(output_tokens);
+        self.answer.request_ids.push(id);
+        self.answer.input_tokens = sum_tokens(self.answer.input_tokens, input_tokens);
+        self.answer.output_tokens = sum_tokens(self.answer.output_tokens, output_tokens);
+        self.answer.credits += self.charge_credits;
+        self.answer.generated = self.answer.generated.saturating_add(generated);
+        let field = if content.is_empty() {
+            ContinueField::ReasoningContent
+        } else {
+            ContinueField::Content
+        };
+        self.messages
+            .push(prefix_cache::continuation_message(&reasoning, &content));
+        self.continuation = Some(Continuation {
+            field,
+            reasoning,
+            content,
+        });
+        Ok(())
+    }
+
+    /// Whether an answer is being carried into a continuation that has not
+    /// been answered yet: what a failure of that request must not lose.
+    fn carries_answer(&self) -> bool {
+        self.continuation.is_some() && !self.answer.request_ids.is_empty()
     }
 
     /// Attach `body` to `request`: as JSON for every turn without a prefix
@@ -15297,11 +15999,12 @@ impl TurnPrep {
         http_status: u16,
         response_body: Vec<u8>,
         error: Option<String>,
-    ) -> Result<(), AppError> {
+    ) -> Result<String, AppError> {
+        let id = Uuid::now_v7().to_string();
         db::insert_request(
             &self.db_conn,
             &db::Request {
-                id: Uuid::now_v7().to_string(),
+                id: id.clone(),
                 connection_id: self.connection_id.clone(),
                 action_id: None,
                 method: "POST".to_string(),
@@ -15320,7 +16023,8 @@ impl TurnPrep {
                 backend_id: Some(self.backend_id.clone()),
             },
         )
-        .await
+        .await?;
+        Ok(id)
     }
 
     /// Persist one **tool round**: the model's tool-requesting output as a
@@ -15450,6 +16154,9 @@ impl TurnPrep {
         http_status: u16,
         response_body: Vec<u8>,
     ) -> Result<String, AppError> {
+        // A round whose answer was continued before it called a tool is
+        // written as one action, carrying every request it took.
+        let answer = std::mem::take(&mut self.answer);
         let action_id = Uuid::now_v7().to_string();
         db::insert_action(
             &self.db_conn,
@@ -15464,11 +16171,14 @@ impl TurnPrep {
                 status: "complete".to_string(),
                 intent: self.action_intent(),
                 model: Some(self.model.clone()),
-                input_tokens,
-                output_tokens,
-                // This round's own hold — each round is a separate priced
+                input_tokens: sum_tokens(answer.input_tokens, input_tokens),
+                output_tokens: sum_tokens(answer.output_tokens, output_tokens),
+                // This round's own holds — each round is a separate priced
                 // request, so each round's action carries its own charge.
-                credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
+                credits_consumed: self
+                    .spend
+                    .as_ref()
+                    .map(|_| (answer.credits + self.charge_credits) as i64),
                 truncated: false,
                 resumable: false,
                 created_at: now_ms(),
@@ -15519,6 +16229,7 @@ impl TurnPrep {
             ordinal += 1;
         }
 
+        db::attach_requests(&self.db_conn, &answer.request_ids, &action_id).await?;
         db::insert_request(
             &self.db_conn,
             &db::Request {
@@ -15789,11 +16500,7 @@ impl TurnPrep {
         output_tokens: Option<i64>,
         reasoning: &str,
         content: &str,
-        request_body_json: &serde_json::Value,
-        request_at: i64,
-        response_at: i64,
-        http_status: u16,
-        response_body: Vec<u8>,
+        exchange: Option<Exchange<'_>>,
     ) -> Result<Option<String>, AppError> {
         db::begin_write(&self.db_conn).await?;
         let persisted = self
@@ -15805,11 +16512,7 @@ impl TurnPrep {
                 output_tokens,
                 reasoning,
                 content,
-                request_body_json,
-                request_at,
-                response_at,
-                http_status,
-                response_body,
+                exchange,
             )
             .await;
         match persisted {
@@ -15872,11 +16575,7 @@ impl TurnPrep {
         output_tokens: Option<i64>,
         reasoning: &str,
         content: &str,
-        request_body_json: &serde_json::Value,
-        request_at: i64,
-        response_at: i64,
-        http_status: u16,
-        response_body: Vec<u8>,
+        exchange: Option<Exchange<'_>>,
     ) -> Result<Option<String>, AppError> {
         match self.revalidate_mechanical_report().await? {
             MechanicalReportGate::Proceed => {}
@@ -15885,18 +16584,29 @@ impl TurnPrep {
                 // about work nobody wants continued. Stale: the model wrote
                 // about wording a reader no longer sees, so the driver
                 // retries rather than settling a misleading footnote.
-                self.insert_unattached_request(
-                    request_body_json,
-                    request_at,
-                    response_at,
-                    http_status,
-                    response_body,
-                    None,
-                )
-                .await?;
+                if let Some(exchange) = exchange {
+                    self.insert_unattached_request(
+                        exchange.request_body_json,
+                        exchange.request_at,
+                        exchange.response_at,
+                        exchange.http_status,
+                        exchange.response_body,
+                        None,
+                    )
+                    .await?;
+                }
                 return Ok(None);
             }
         }
+        // An answer continued automatically is one generation, carrying
+        // every request it took: their holds and their rows (the caller sums
+        // their tokens, which it also reports).
+        let answer = std::mem::take(&mut self.answer);
+        let this_credits = if exchange.is_some() {
+            self.charge_credits
+        } else {
+            0
+        };
         let inference_action_id = Uuid::now_v7().to_string();
         db::insert_action(
             &self.db_conn,
@@ -15913,7 +16623,10 @@ impl TurnPrep {
                 input_tokens,
                 output_tokens,
                 // Local turns record no charge (`None`), not a fake zero.
-                credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
+                credits_consumed: self
+                    .spend
+                    .as_ref()
+                    .map(|_| (answer.credits + this_credits) as i64),
                 truncated,
                 resumable: truncated && resumable,
                 created_at: now_ms(),
@@ -16012,29 +16725,32 @@ impl TurnPrep {
             .await?;
         }
 
-        db::insert_request(
-            &self.db_conn,
-            &db::Request {
-                id: Uuid::now_v7().to_string(),
-                connection_id: self.connection_id.clone(),
-                action_id: Some(inference_action_id.clone()),
-                method: "POST".to_string(),
-                path: "/v1/chat/completions".to_string(),
-                request_headers: None,
-                request_body: Some(recorded::recorded_request(request_body_json)),
-                response_status: Some(http_status as i64),
-                response_headers: None,
-                response_body: Some(response_body),
-                request_at,
-                response_at: Some(response_at),
-                duration_ms: Some(response_at - request_at),
-                error: None,
-                credential_nonce: self.credential_nonce(),
-                created_at: now_ms(),
-                backend_id: Some(self.backend_id.clone()),
-            },
-        )
-        .await?;
+        db::attach_requests(&self.db_conn, &answer.request_ids, &inference_action_id).await?;
+        if let Some(exchange) = exchange {
+            db::insert_request(
+                &self.db_conn,
+                &db::Request {
+                    id: Uuid::now_v7().to_string(),
+                    connection_id: self.connection_id.clone(),
+                    action_id: Some(inference_action_id.clone()),
+                    method: "POST".to_string(),
+                    path: "/v1/chat/completions".to_string(),
+                    request_headers: None,
+                    request_body: Some(recorded::recorded_request(exchange.request_body_json)),
+                    response_status: Some(exchange.http_status as i64),
+                    response_headers: None,
+                    response_body: Some(exchange.response_body),
+                    request_at: exchange.request_at,
+                    response_at: Some(exchange.response_at),
+                    duration_ms: Some(exchange.response_at - exchange.request_at),
+                    error: None,
+                    credential_nonce: self.credential_nonce(),
+                    created_at: now_ms(),
+                    backend_id: Some(self.backend_id.clone()),
+                },
+            )
+            .await?;
+        }
 
         Ok(Some(inference_action_id))
     }
@@ -16242,6 +16958,14 @@ pub(crate) fn inline_refund(body: &serde_json::Value) -> Option<&serde_json::Val
 /// and the spend this constant bounds is unaffected: the endpoint rejected the
 /// request before doing any work, so its hold refunds in full. Pinned by
 /// `a_degraded_turn_costs_one_extra_request_and_no_more`.
+///
+/// **Nor is a request that continues an answer.** A round is one answer, and
+/// the requests that continue an answer which stopped at its ceiling belong
+/// to its round. They are bounded by the model's declared output limit
+/// instead — each is sent only while the answer is under it, and asks for no
+/// more than what remains of it — so a round produces no more output than one
+/// request asking for the whole limit, and each continuation is priced and
+/// checked against `budget` like any request.
 pub const MAX_TURN_ROUNDS: usize = 8;
 
 /// What one round of a turn's bounded loop produced.
@@ -16253,6 +16977,18 @@ enum RoundOutcome {
     /// actions are persisted, the results are appended to the messages array,
     /// and the next round's hold is already in place.
     ToolRound,
+    /// The engine refused the round's declared cached prefix: the refused
+    /// exchange is in the Record and its hold settled, nothing was written
+    /// at the semantic layer, and the loop sends the round again undeclared
+    /// ([`Inner::resend_undeclared`]). Carries the refusal, for a loop that
+    /// cannot resend.
+    PrefixRefused(AppError),
+    /// The answer stopped at its ceiling, the engine said it can be
+    /// continued exactly, and it is still under the model's declared limit:
+    /// the request is in the Record (attached once the answer is written),
+    /// the answer so far is the final partial message of the next request,
+    /// and the loop funds that request and sends it as part of the same round.
+    Continued,
 }
 
 /// One tool call as the model requested it.
@@ -16558,28 +17294,50 @@ async fn execute_tool_calls(
 /// One model's catalog pricing, as a hold computation reads it.
 ///
 /// **Built in one place, from the catalog row itself** ([`Self::from_catalog`]),
-/// so no path can carry part of the price and drop the rest. The three that
-/// spend — a space turn, a utility chore, a proxied completion — each built a
-/// `(prompt_rate, completion_rate, scale_factor)` tuple by hand, and every one
-/// dropped `per_request`: a flat-priced model was then held on its token rates,
-/// which the server does not charge by — zero rates refused locally as a zero
-/// charge, nonzero ones held a sum the server's own worst case disagrees with.
+/// so no path can carry part of the price and drop the rest: a flat-priced
+/// model is held at its flat price, and a token-priced one on its rates,
+/// including the cached-prompt rate where the catalog publishes one.
+///
+/// The arithmetic is the shared contract's (`eidola_common::pricing`), which
+/// the gateway runs over the same request, so the hold is exactly the worst
+/// case it recomputes. Its rates are on one scale (`pricing::RATE_SCALE`); a
+/// catalog rate published on another is converted where the conversion is
+/// exact, and a model whose rates do not convert exactly cannot be priced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ChargePricing {
-    prompt_rate: u128,
-    completion_rate: u128,
-    scale_factor: u128,
+    /// The per-token rates, or `None` when the catalog's do not convert
+    /// exactly onto the shared scale.
+    rates: Option<eidola_common::pricing::TokenRates>,
     /// `(value, scale_factor)` of a flat per-request price, for a model the
     /// catalog prices per request rather than per token.
     per_request: Option<(u128, u128)>,
 }
 
+/// A catalog rate on the shared contract's scale: `value / scale_factor`
+/// credits per token as `rate / RATE_SCALE`, where that is exact.
+fn rate_on_shared_scale(price: &ScaledPriceInfo) -> Option<u64> {
+    let scaled = u128::from(price.value) * u128::from(eidola_common::pricing::RATE_SCALE);
+    let scale = u128::from(price.scale_factor);
+    if scale == 0 || !scaled.is_multiple_of(scale) {
+        return None;
+    }
+    u64::try_from(scaled / scale).ok()
+}
+
 impl ChargePricing {
     fn from_catalog(pricing: &ModelPricingInfo) -> Self {
+        let rates = (|| {
+            Some(eidola_common::pricing::TokenRates {
+                prompt: rate_on_shared_scale(&pricing.per_prompt_token)?,
+                cached_prompt: match &pricing.per_cached_prompt_token {
+                    Some(price) => Some(rate_on_shared_scale(price)?),
+                    None => None,
+                },
+                completion: rate_on_shared_scale(&pricing.per_completion_token)?,
+            })
+        })();
         Self {
-            prompt_rate: pricing.per_prompt_token.value as u128,
-            completion_rate: pricing.per_completion_token.value as u128,
-            scale_factor: pricing.per_prompt_token.scale_factor as u128,
+            rates,
             per_request: pricing
                 .per_request
                 .as_ref()
@@ -16587,60 +17345,96 @@ impl ChargePricing {
         }
     }
 
-    /// Token pricing alone (tests).
+    /// Token pricing alone, on the shared scale (tests).
     #[cfg(test)]
-    pub(crate) fn per_token(prompt_rate: u128, completion_rate: u128, scale_factor: u128) -> Self {
+    pub(crate) fn per_token(prompt: u64, cached_prompt: Option<u64>, completion: u64) -> Self {
         Self {
-            prompt_rate,
-            completion_rate,
-            scale_factor,
+            rates: Some(eidola_common::pricing::TokenRates {
+                prompt,
+                cached_prompt,
+                completion,
+            }),
             per_request: None,
         }
     }
+
+    /// The per-token rates of a model priced per token, `None` for one priced
+    /// per request or whose rates cannot be priced.
+    fn token_rates(&self) -> Option<eidola_common::pricing::TokenRates> {
+        self.per_request.is_none().then_some(self.rates).flatten()
+    }
+
+    /// Whether a request to this model may declare a cached prefix: it is
+    /// priced per token and sells a cached-prompt rate.
+    fn sells_cached_prompt(&self) -> bool {
+        self.per_request.is_none() && self.rates.is_some_and(|r| r.cached_prompt.is_some())
+    }
+
+    /// The hold of one request whose prompt is priced as `prompt` and whose
+    /// completion ceiling is `max_completion_tokens` — **the client half of
+    /// the gateway's worst case, through the same functions**.
+    ///
+    /// A model priced per request costs the request fee and its flat price
+    /// whatever the request holds, rounded up exactly as the gateway rounds
+    /// it; that branch comes first and nothing else is consulted, as there.
+    /// Otherwise the fee, the prompt at its limit and the completion at its
+    /// ceiling (`pricing::token_hold`). `0` for a model that cannot be priced
+    /// (a flat price with no scale, rates that do not convert, a declared
+    /// prompt with no cached rate), which every caller refuses rather than
+    /// sends.
+    fn hold(&self, prompt: eidola_common::pricing::Prompt, max_completion_tokens: u32) -> u128 {
+        use eidola_common::pricing;
+        if let Some((value, scale_factor)) = self.per_request {
+            return if scale_factor == 0 {
+                0
+            } else {
+                pricing::request_hold(value.div_ceil(scale_factor))
+            };
+        }
+        self.rates
+            .and_then(|rates| pricing::token_hold(&rates, prompt, u64::from(max_completion_tokens)))
+            .unwrap_or(0)
+    }
 }
 
-/// The worst-case charge in credits for one request over `messages` and the
-/// `tool_schemas` that request advertises — **the client half of the server's
-/// `worst_case_cost`, branch for branch**.
-///
-/// A model priced per request costs its flat price whatever the request
-/// holds, rounded up exactly as the server rounds it; that branch comes first
-/// and nothing else is consulted, as on the server. Otherwise the prompt side
-/// is the shared contract's **single walk**, `eidola_common::prompt_charge` —
-/// the same function the server calls over the same request, which is what
-/// makes hold ≥ charge structural rather than a property two crates must keep
-/// agreeing on — and the completion side is the full `max_completion_tokens`
-/// ceiling. A flat price with a zero scale factor is no price at all and
-/// answers zero, which every caller refuses as a zero charge rather than
-/// dividing by it.
+/// The prompt of a request over `messages` and the `tool_schemas` it
+/// advertises, priced by the byte contract: the shared contract's **single
+/// walk**, `eidola_common::prompt_charge`, the function the gateway calls over
+/// the same request.
+fn counted_prompt(
+    messages: &[serde_json::Value],
+    tool_schemas: &[serde_json::Value],
+) -> eidola_common::pricing::Prompt {
+    eidola_common::pricing::Prompt::Counted {
+        chargeable_tokens: eidola_common::prompt_charge(messages, Some(tool_schemas))
+            .chargeable_prompt_tokens(),
+    }
+}
+
+/// The hold in credits of one request over `messages` and `tool_schemas`
+/// that declares no cached prefix ([`ChargePricing::hold`] of its
+/// [`counted_prompt`]). `0` when the model cannot be priced.
 fn estimate_charge_credits(
     messages: &[serde_json::Value],
     tool_schemas: &[serde_json::Value],
     max_completion_tokens: u32,
     pricing: ChargePricing,
 ) -> u128 {
-    if let Some((value, scale_factor)) = pricing.per_request {
-        return if scale_factor == 0 {
-            0
-        } else {
-            value.div_ceil(scale_factor)
-        };
-    }
-    let sf = pricing.scale_factor;
-    let chargeable_prompt =
-        eidola_common::prompt_charge(messages, Some(tool_schemas)).chargeable_prompt_tokens();
-    let prompt_credits = (chargeable_prompt as u128 * pricing.prompt_rate).div_ceil(sf);
-    let completion_credits = (max_completion_tokens as u128 * pricing.completion_rate).div_ceil(sf);
-    prompt_credits + completion_credits
+    pricing.hold(
+        counted_prompt(messages, tool_schemas),
+        max_completion_tokens,
+    )
 }
 
 #[cfg(test)]
 mod charge_pricing_tests {
     use super::*;
+    use eidola_common::pricing::{Prompt, REQUEST_FEE_CREDITS};
 
     /// The server's own scale (`PRICING_SCALE_FACTOR`), so the values below
     /// are the ones its `worst_case_cost` tests use.
     const SF: u64 = 1_000_000;
+    const FEE: u128 = REQUEST_FEE_CREDITS as u128;
 
     fn catalog(per_request: Option<u64>, token_rate: u64) -> ModelPricingInfo {
         let mut pricing = serde_json::json!({
@@ -16657,58 +17451,98 @@ mod charge_pricing_tests {
         vec![serde_json::json!({ "role": "user", "content": prompt })]
     }
 
-    /// REGRESSION: **a flat-priced model is held at its flat price.** The
-    /// catalog's `per_request` was dropped where the pricing was copied out,
-    /// so a model the server charges per request was held on its token rates:
-    /// zero rates refused locally as a zero charge, and nonzero ones held a
-    /// sum the server's own worst case does not compute. The server returns
-    /// the flat price, rounded up, whatever the request holds — so must this.
+    /// REGRESSION: **a flat-priced model is held at its flat price**, and
+    /// the request fee. The gateway returns the fee and the flat price,
+    /// rounded up, whatever the request holds — so must this.
     #[test]
     fn a_flat_priced_model_is_held_at_its_flat_price() {
         // The server's fixture: 5 credits flat, with no token rates at all.
         let flat = ChargePricing::from_catalog(&catalog(Some(5 * SF), 0));
-        assert_eq!(estimate_charge_credits(&messages("hi"), &[], 100, flat), 5);
+        assert_eq!(
+            estimate_charge_credits(&messages("hi"), &[], 100, flat),
+            FEE + 5
+        );
         // Whatever the request holds, and whatever its token rates say.
         let flat_with_rates = ChargePricing::from_catalog(&catalog(Some(5 * SF), 7 * SF));
         let long = "x".repeat(10_000);
         assert_eq!(
             estimate_charge_credits(&messages(&long), &[], 4096, flat_with_rates),
-            5
+            FEE + 5
         );
         // Rounded up, as the server's `div_ceil` rounds it.
         let fractional = ChargePricing::from_catalog(&catalog(Some(5 * SF + 1), 0));
         assert_eq!(
             estimate_charge_credits(&messages("hi"), &[], 100, fractional),
-            6
+            FEE + 6
         );
+        // A flat-priced model never takes a declaration.
+        assert!(!flat.sells_cached_prompt());
     }
 
-    /// A token-priced row is unchanged by the flat branch: the same sum the
-    /// shared contract walk always produced.
+    /// A token-priced row holds the fee, the shared walk's prompt and the
+    /// whole ceiling.
     #[test]
     fn a_token_priced_model_is_held_on_its_rates() {
         let from_catalog = ChargePricing::from_catalog(&catalog(None, SF));
-        assert_eq!(
-            from_catalog,
-            ChargePricing::per_token(SF as u128, SF as u128, SF as u128)
-        );
+        assert_eq!(from_catalog, ChargePricing::per_token(SF, None, SF));
         let prompt = eidola_common::prompt_charge(&messages("hi"), Some(&[]))
             .chargeable_prompt_tokens() as u128;
         assert_eq!(
             estimate_charge_credits(&messages("hi"), &[], 100, from_catalog),
-            prompt + 100
+            FEE + prompt + 100
         );
+        assert!(!from_catalog.sells_cached_prompt());
     }
 
-    /// A flat price with no scale is no price: zero, which every caller
-    /// refuses as a zero charge, rather than a division by zero.
+    /// A catalog's cached rate is read, converted onto the shared scale, and
+    /// prices a declared prompt: its cached part at the cached rate, the rest
+    /// at the prompt rate.
     #[test]
-    fn a_flat_price_with_no_scale_is_a_zero_charge() {
+    fn a_declared_prompt_is_held_at_the_cached_rate() {
+        let row: ModelPricingInfo = serde_json::from_value(serde_json::json!({
+            "per_prompt_token": { "value": 1, "scale_factor": 1 },
+            "per_cached_prompt_token": { "value": 1, "scale_factor": 4 },
+            "per_completion_token": { "value": 3, "scale_factor": 1 },
+        }))
+        .expect("a catalog pricing row");
+        let pricing = ChargePricing::from_catalog(&row);
+        assert_eq!(pricing, ChargePricing::per_token(SF, Some(SF / 4), 3 * SF));
+        assert!(pricing.sells_cached_prompt());
+        let declared = Prompt::Declared {
+            cached_tokens: 1_024,
+            new_tokens: 100,
+        };
+        // 1,024 / 4 = 256; 100 × 1; 10 × 3.
+        assert_eq!(pricing.hold(declared, 10), FEE + 256 + 100 + 30);
+        // Without a cached rate a declaration cannot be priced: no hold.
+        let no_cached = ChargePricing::per_token(SF, None, 3 * SF);
+        assert_eq!(no_cached.hold(declared, 10), 0);
+    }
+
+    /// A flat price with no scale, or a rate that does not land on the shared
+    /// scale exactly, is no price: zero, which every caller refuses, rather
+    /// than a division by zero or a rounded rate the gateway does not hold.
+    #[test]
+    fn an_unreadable_price_is_a_zero_charge() {
         let mut row = catalog(Some(5), 0);
         row.per_request.as_mut().expect("flat").scale_factor = 0;
         let pricing = ChargePricing::from_catalog(&row);
         assert_eq!(
             estimate_charge_credits(&messages("hi"), &[], 100, pricing),
+            0
+        );
+        let inexact: ModelPricingInfo = serde_json::from_value(serde_json::json!({
+            "per_prompt_token": { "value": 1, "scale_factor": 3 * SF },
+            "per_completion_token": { "value": 1, "scale_factor": 1 },
+        }))
+        .expect("a catalog pricing row");
+        assert_eq!(
+            estimate_charge_credits(
+                &messages("hi"),
+                &[],
+                100,
+                ChargePricing::from_catalog(&inexact)
+            ),
             0
         );
     }
@@ -16719,7 +17553,7 @@ mod charge_pricing_tests {
 /// per iteration" the parameter was introduced for.
 fn check_turn_budget(charge_credits: u128, budget: Option<i64>) -> Result<(), AppError> {
     if let Some(b) = budget
-        && charge_credits as i64 > b
+        && i64::try_from(charge_credits).map_or(true, |charge| charge > b)
     {
         return Err(AppError::Credential {
             message: format!("estimated charge {charge_credits} exceeds the turn budget {b}"),
@@ -17657,7 +18491,8 @@ fn stopped_at_ceiling(finish_reason: Option<&str>) -> bool {
 /// app's own turns, and a proxied request that named none.
 pub(crate) const FALLBACK_MAX_COMPLETION_TOKENS: u32 = 4096;
 
-/// The completion ceiling a turn asks for (`max_completion_tokens`): the
+/// The model's declared output limit (`max_completion_tokens` of every turn
+/// off Eidola's backend, and the bound on one answer of a turn on it): the
 /// largest completion the backend declares the model may be asked for, or
 /// [`FALLBACK_MAX_COMPLETION_TOKENS`] where it declares none, never past the
 /// model's context window when that is known (`context_length` 0 means it is
@@ -17669,11 +18504,11 @@ pub(crate) const FALLBACK_MAX_COMPLETION_TOKENS: u32 = 4096;
 /// apply — it clamps the request to what is left of its window, knowing the
 /// prompt's real token count, where this side has only the pricing contract's
 /// estimate, which is deliberately an over-count and would cut answers short
-/// exactly when a conversation is long. What a larger ceiling costs is a larger
-/// hold: the completion side of the charge estimate is this many tokens at the
-/// completion rate, held for the request and refunded down to what was
-/// generated. An answer that still reaches it is continued
-/// ([`AppCore::continue_stream`]) rather than lost.
+/// exactly when a conversation is long. An Eidola turn asks for a rung of the
+/// ceiling ladder below it ([`ladder_ceiling`]) and continues an answer that
+/// reaches a rung by itself, up to this limit; an answer that reaches the
+/// limit is continued by the reader ([`AppCore::continue_stream`]) rather
+/// than lost.
 pub(crate) fn completion_ceiling(declared_max_output: Option<u64>, context_length: u64) -> u32 {
     let declared = declared_max_output.unwrap_or(u64::from(FALLBACK_MAX_COMPLETION_TOKENS));
     let ceiling = if context_length == 0 {
@@ -17682,6 +18517,72 @@ pub(crate) fn completion_ceiling(declared_max_output: Option<u64>, context_lengt
         declared.min(context_length)
     };
     u32::try_from(ceiling).unwrap_or(u32::MAX).max(1)
+}
+
+/// The lowest rung of the ceiling ladder ([`ladder_ceiling`]).
+pub const FIRST_CEILING_RUNG: u64 = 8_192;
+
+/// The rungs of the ceiling ladder under a model's declared output limit
+/// `limit`, lowest first: [`FIRST_CEILING_RUNG`], doubling while below the
+/// limit, and the limit itself as the top rung. A limit at or below the first
+/// rung is the only rung.
+fn ceiling_rungs(limit: u64) -> Vec<u64> {
+    let mut rungs = Vec::new();
+    let mut rung = FIRST_CEILING_RUNG;
+    while rung < limit {
+        rungs.push(rung);
+        rung = rung.saturating_mul(2);
+    }
+    rungs.push(limit.max(1));
+    rungs
+}
+
+/// The completion ceiling a request of a turn that continues its answers
+/// automatically asks for: a rung of a short public ladder, chosen by a pure
+/// function of the request (`prompt`, the pricing it states, and `generated`,
+/// the output its answer has already produced) and the model's published
+/// numbers (`limit`, its declared output limit within its window, and
+/// `pricing`, its published prices).
+///
+/// - **Wanted**: the smallest rung whose price at the completion rate is at
+///   least the price of reading the request's priced prompt
+///   (`Prompt::token_limit`) at the cached rate (the prompt rate where the
+///   model sells none), and which is at least `generated`; the top rung where
+///   none is.
+/// - **Fit**: while the request's hold at that rung exceeds one standard token
+///   ([`DEFAULT_ALLOCATION_CREDITS`]) and a lower rung exists, one rung lower.
+/// - Never more than `limit − generated` (and never zero).
+///
+/// So a continuation never re-reads more than the output it buys, and the
+/// ceiling on the wire says nothing the request does not: it reads no wallet,
+/// history or setting. A model priced per request, or one whose rates cannot
+/// be priced, asks for what remains of its whole limit: its hold does not
+/// depend on the ceiling.
+pub(crate) fn ladder_ceiling(
+    limit: u32,
+    prompt: eidola_common::pricing::Prompt,
+    pricing: &ChargePricing,
+    generated: u64,
+) -> u32 {
+    let limit = u64::from(limit);
+    let remaining = limit.saturating_sub(generated).max(1);
+    let ceiling = |rung: u64| u32::try_from(rung.min(remaining)).unwrap_or(u32::MAX);
+    let Some(rates) = pricing.token_rates() else {
+        return ceiling(remaining);
+    };
+    let rungs = ceiling_rungs(limit);
+    let read =
+        u128::from(prompt.token_limit()) * u128::from(rates.cached_prompt.unwrap_or(rates.prompt));
+    let mut at = rungs
+        .iter()
+        .position(|&rung| {
+            u128::from(rung) * u128::from(rates.completion) >= read && rung >= generated
+        })
+        .unwrap_or(rungs.len() - 1);
+    while at > 0 && pricing.hold(prompt, ceiling(rungs[at])) > DEFAULT_ALLOCATION_CREDITS as u128 {
+        at -= 1;
+    }
+    ceiling(rungs[at])
 }
 
 /// Whether an answer recorded under `model` can be continued: it was served
@@ -17831,6 +18732,142 @@ mod ceiling_and_continuation_tests {
         // Never zero, never past a `u32`.
         assert_eq!(completion_ceiling(Some(0), 0), 1);
         assert_eq!(completion_ceiling(Some(u64::MAX), 0), u32::MAX);
+    }
+
+    const SF: u64 = eidola_common::pricing::RATE_SCALE;
+
+    fn counted(tokens: u64) -> eidola_common::pricing::Prompt {
+        eidola_common::pricing::Prompt::Counted {
+            chargeable_tokens: tokens,
+        }
+    }
+
+    #[test]
+    fn the_rungs_double_from_the_first_to_the_declared_limit() {
+        assert_eq!(
+            ceiling_rungs(131_072),
+            [8_192, 16_384, 32_768, 65_536, 131_072]
+        );
+        assert_eq!(
+            ceiling_rungs(100_000),
+            [8_192, 16_384, 32_768, 65_536, 100_000]
+        );
+        assert_eq!(ceiling_rungs(8_192), [8_192]);
+        // A limit below the first rung is the only rung.
+        assert_eq!(ceiling_rungs(4_096), [4_096]);
+        assert_eq!(ceiling_rungs(0), [1]);
+    }
+
+    /// The rung follows the price of re-reading the prompt, at the cached
+    /// rate where the model sells one and the prompt rate where it does not.
+    #[test]
+    fn the_rung_grows_with_what_the_prompt_costs_to_read() {
+        let cached = ChargePricing::per_token(SF, Some(SF / 4), SF);
+        let uncached = ChargePricing::per_token(SF, None, SF);
+        assert_eq!(ladder_ceiling(131_072, counted(1_000), &cached, 0), 8_192);
+        // 32,768 at a quarter reads as 8,192: the first rung still buys it.
+        assert_eq!(ladder_ceiling(131_072, counted(32_768), &cached, 0), 8_192);
+        assert_eq!(ladder_ceiling(131_072, counted(32_769), &cached, 0), 16_384);
+        assert_eq!(ladder_ceiling(131_072, counted(70_000), &cached, 0), 32_768);
+        assert_eq!(
+            ladder_ceiling(131_072, counted(8_193), &uncached, 0),
+            16_384
+        );
+        // A declared prompt is read as its whole limit, cached part and budget.
+        let declared = eidola_common::pricing::Prompt::Declared {
+            cached_tokens: 30_000,
+            new_tokens: 4_000,
+        };
+        assert_eq!(ladder_ceiling(131_072, declared, &cached, 0), 16_384);
+        // Past every rung, the top one.
+        assert_eq!(
+            ladder_ceiling(131_072, counted(200_000), &uncached, 0),
+            131_072
+        );
+        // Under a limit below the first rung there is one choice.
+        assert_eq!(ladder_ceiling(4_096, counted(100_000), &uncached, 0), 4_096);
+    }
+
+    /// The rung is at least what the answer has generated, and never more
+    /// than what remains of the model's limit.
+    #[test]
+    fn the_rung_follows_what_the_answer_has_generated_and_stops_at_the_limit() {
+        let pricing = ChargePricing::per_token(SF, Some(SF / 4), SF);
+        assert_eq!(ladder_ceiling(65_536, counted(100), &pricing, 8_192), 8_192);
+        assert_eq!(
+            ladder_ceiling(65_536, counted(100), &pricing, 8_193),
+            16_384
+        );
+        assert_eq!(
+            ladder_ceiling(65_536, counted(100), &pricing, 16_384),
+            16_384
+        );
+        assert_eq!(
+            ladder_ceiling(65_536, counted(100), &pricing, 32_768),
+            32_768
+        );
+        // What remains bounds the rung.
+        assert_eq!(
+            ladder_ceiling(40_000, counted(100), &pricing, 32_768),
+            7_232
+        );
+        assert_eq!(
+            ladder_ceiling(40_000, counted(100), &pricing, 24_576),
+            15_424
+        );
+        // Never zero, even past the limit.
+        assert_eq!(ladder_ceiling(40_000, counted(100), &pricing, 40_000), 1);
+    }
+
+    /// A rung whose hold passes one standard token steps down while a lower
+    /// rung exists; the first rung is kept whatever it holds.
+    #[test]
+    fn a_rung_that_would_hold_more_than_a_standard_token_steps_down() {
+        // 100 credits a token, both sides: a prompt of 9,000 reads at
+        // 900,000, which wants the second rung, held at 2,539,400.
+        let dear = ChargePricing::per_token(100 * SF, None, 100 * SF);
+        assert_eq!(ladder_ceiling(131_072, counted(9_000), &dear, 0), 8_192);
+        assert!(
+            dear.hold(counted(9_000), 8_192) > DEFAULT_ALLOCATION_CREDITS as u128,
+            "the lowest rung is kept even above a standard token"
+        );
+        // Ten credits a token: the second rung is wanted (a prompt reading at
+        // more than 81,920), and held at 1000 + 82,000 + 163,840, under a
+        // standard token, so it stays.
+        let mid = ChargePricing::per_token(10 * SF, None, 10 * SF);
+        assert_eq!(ladder_ceiling(131_072, counted(8_200), &mid, 0), 16_384);
+        // A prompt reading past the top rung at that price wants the top,
+        // whose hold passes a standard token; it steps down to the highest
+        // rung that fits.
+        let wanted_top = counted(200_000);
+        assert!(mid.hold(wanted_top, 8_192) > DEFAULT_ALLOCATION_CREDITS as u128);
+        assert_eq!(ladder_ceiling(131_072, wanted_top, &mid, 0), 8_192);
+        let fits = counted(50_000);
+        // 50,000 reads at 500,000: wants 65,536 (655,360), held at
+        // 1000 + 500,000 + 655,360 = 1,156,360; one lower, 32,768, holds
+        // 828,680.
+        assert_eq!(ladder_ceiling(131_072, fits, &mid, 0), 32_768);
+    }
+
+    /// A model priced per request holds the same whatever its ceiling, so it
+    /// asks for what remains of its limit; so does one that cannot be priced.
+    #[test]
+    fn a_flat_or_unpriceable_model_asks_for_what_remains() {
+        let flat = ChargePricing {
+            rates: Some(eidola_common::pricing::TokenRates {
+                prompt: SF,
+                cached_prompt: None,
+                completion: SF,
+            }),
+            per_request: Some((5, 1)),
+        };
+        assert_eq!(ladder_ceiling(131_072, counted(10), &flat, 0), 131_072);
+        assert_eq!(ladder_ceiling(131_072, counted(10), &flat, 1_072), 130_000);
+        let unpriced = ChargePricing {
+            rates: None,
+            per_request: None,
+        };
+        assert_eq!(ladder_ceiling(32_768, counted(10), &unpriced, 0), 32_768);
     }
 
     #[test]
@@ -20200,7 +21237,8 @@ mod tests {
     /// **The input rule** (`docs/anonymous-credits.md` → Spending several tokens in one request), over a
     /// wallet already in its spend order: the first credential alone when it
     /// covers the hold; otherwise drained, with the first *later* credential
-    /// that covers the rest; otherwise a new credential for what is missing.
+    /// that covers the rest; otherwise a new credential for what is missing
+    /// beside the largest.
     #[test]
     fn inputs_are_the_first_credential_or_a_drain_and_the_first_fill() {
         use InputChoice::*;
@@ -20223,8 +21261,8 @@ mod tests {
         // Exactly the rest is enough.
         assert_eq!(choose_inputs(&[1, 6_199], w), Two { drain: 0, fill: 1 });
         // No pair covers the hold: a new credential, for the rest of the
-        // first credential's drain only.
-        assert_eq!(choose_inputs(&[3_000, 3_199], w), Allocate { need: 3_200 });
+        // largest credential's drain only.
+        assert_eq!(choose_inputs(&[3_000, 3_199], w), Allocate { need: 3_001 });
         assert_eq!(choose_inputs(&[3_000], w), Allocate { need: 3_200 });
         // The first has no fill, but a later pair covers the hold: that pair
         // pays, rather than allocation ($0.10, $0.60 and $0.60 against $1).
@@ -20276,7 +21314,7 @@ mod tests {
                 }
                 Allocate { need } => {
                     assert!(!first_covers && !pair_covers, "{wallet:?}");
-                    assert_eq!(need, worst - wallet.first().copied().unwrap_or(0));
+                    assert_eq!(need, worst - wallet.iter().copied().max().unwrap_or(0));
                 }
             }
         }
@@ -20872,7 +21910,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                assert!(matches!(claimed, db::ClaimOutcome::Claimed(_)));
+                assert!(matches!(claimed, db::ClaimOutcome::Claimed(..)));
                 let mut rows = conn
                     .query(
                         "SELECT key_bytes FROM prefix_cache_key WHERE space_id = ?1",
@@ -21015,34 +22053,129 @@ mod tests {
     // --- Auto-provisioning decision logic ---------------------------------
 
     #[test]
-    fn auto_allocation_uses_default_chunk_when_balance_is_plentiful() {
-        // Plenty of balance, small charge → allocate the default chunk,
-        // leaving the rest of the balance in the account.
-        let amount = auto_allocation_amount(10 * DEFAULT_ALLOCATION_CREDITS, 6_200).unwrap();
-        assert_eq!(amount, DEFAULT_ALLOCATION_CREDITS);
+    fn auto_allocation_issues_the_denomination_when_balance_is_plentiful() {
+        // Plenty of balance, small need → the denomination, leaving the rest
+        // of the balance in the account.
+        let amount = auto_allocation_amount(10 * DEFAULT_ALLOCATION_CREDITS, 6_200);
+        assert_eq!(amount, Some(DEFAULT_ALLOCATION_CREDITS));
     }
 
     #[test]
-    fn auto_allocation_is_capped_by_available_balance() {
-        // Balance covers the charge but is below the default chunk →
-        // allocate everything that's available.
-        let amount = auto_allocation_amount(50_000, 6_200).unwrap();
-        assert_eq!(amount, 50_000);
+    fn auto_allocation_issues_the_whole_balance_when_less_than_the_denomination() {
+        assert_eq!(auto_allocation_amount(50_000, 6_200), Some(50_000));
+        assert_eq!(auto_allocation_amount(6_200, 6_200), Some(6_200));
+    }
+
+    /// REGRESSION: **a need past the denomination is never issued to its own
+    /// size.** The amount issued is visible on the account surface and a
+    /// fill's share at its spend, so an issuance equal to the share links the
+    /// two. Nothing is issued instead, however large the balance.
+    #[test]
+    fn auto_allocation_never_grows_to_cover_a_large_need() {
+        let need = DEFAULT_ALLOCATION_CREDITS + 500_000;
+        assert_eq!(
+            auto_allocation_amount(10 * DEFAULT_ALLOCATION_CREDITS, need),
+            None
+        );
+        assert_eq!(auto_allocation_amount(i64::MAX, need), None);
     }
 
     #[test]
-    fn auto_allocation_grows_to_cover_a_large_charge() {
-        // A single charge larger than the default chunk must still fit in
-        // one credential (spends draw from exactly one credential).
-        let required = DEFAULT_ALLOCATION_CREDITS + 500_000;
-        let amount = auto_allocation_amount(10 * DEFAULT_ALLOCATION_CREDITS, required).unwrap();
-        assert_eq!(amount, required);
+    fn auto_allocation_issues_nothing_a_balance_cannot_cover() {
+        assert_eq!(auto_allocation_amount(1_000, 6_200), None);
+        assert_eq!(auto_allocation_amount(0, 1), None);
+        assert_eq!(auto_allocation_amount(-5, 1), None);
     }
 
+    /// **The amount issued is never a function of the need.** Over edge
+    /// values and a seeded sweep: whenever anything is issued, it is the
+    /// denomination or the whole balance when less, and it is issued exactly
+    /// when that amount covers the need.
     #[test]
-    fn auto_allocation_exact_balance_allocates_it_all() {
-        let amount = auto_allocation_amount(6_200, 6_200).unwrap();
-        assert_eq!(amount, 6_200);
+    fn the_issued_amount_never_depends_on_the_need() {
+        let d = DEFAULT_ALLOCATION_CREDITS;
+        let check = |available: i64, need: i64| {
+            let issuable = available.min(d);
+            match auto_allocation_amount(available, need) {
+                Some(amount) => {
+                    assert_eq!(amount, issuable, "available {available}, need {need}");
+                    assert!(
+                        amount >= need && amount > 0,
+                        "available {available}, need {need}"
+                    );
+                }
+                None => assert!(
+                    issuable < need || issuable <= 0,
+                    "available {available}, need {need}: an issuance would have paid"
+                ),
+            }
+        };
+        let edges = [
+            i64::MIN,
+            -1,
+            0,
+            1,
+            2,
+            d / 4,
+            d - 1,
+            d,
+            d + 1,
+            2 * d,
+            i64::from(u32::MAX),
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+        for &available in &edges {
+            for &need in &edges {
+                check(available, need);
+            }
+        }
+        // A fixed-seed splitmix64, so a failure names a reproducible case.
+        let mut state: u64 = 0x5eed_0fd3_0a11;
+        let mut next = move || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        for _ in 0..20_000 {
+            let available = (next() % (4 * d as u64)) as i64;
+            let need = 1 + (next() % (3 * d as u64)) as i64;
+            check(available, need);
+            // The same balance answers every need it covers with one amount.
+            if let (Some(a), Some(b)) = (
+                auto_allocation_amount(available, need),
+                auto_allocation_amount(available, 1),
+            ) {
+                assert_eq!(a, b, "available {available}");
+            }
+        }
+    }
+
+    /// The largest payable hold: any two credentials, held or in flight, or
+    /// the largest beside one fresh denomination.
+    #[test]
+    fn the_largest_payable_hold_is_two_credentials_or_one_beside_a_denomination() {
+        let d = DEFAULT_ALLOCATION_CREDITS;
+        assert_eq!(
+            largest_payable_hold(&[], &[]),
+            d,
+            "an empty wallet: one denomination"
+        );
+        assert_eq!(largest_payable_hold(&[1_000], &[]), 1_000 + d);
+        assert_eq!(
+            largest_payable_hold(&[1_000, 600_000, 3_000], &[]),
+            600_000 + d,
+            "the largest residual, not the first, is drained"
+        );
+        assert_eq!(largest_payable_hold(&[], &[700_000]), 700_000 + d);
+        assert_eq!(
+            largest_payable_hold(&[2 * d], &[3 * d]),
+            5 * d,
+            "two credentials larger than the denomination pay together"
+        );
+        assert_eq!(largest_payable_hold(&[i64::MAX], &[i64::MAX]), i64::MAX);
     }
 
     /// A required-document row as `current_terms` would hand it back. Only
@@ -21150,32 +22283,6 @@ mod tests {
             }
             other => panic!("expected TermsAcceptanceRequired, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn auto_allocation_fails_typed_when_balance_cannot_cover_charge() {
-        let err = auto_allocation_amount(1_000, 6_200).unwrap_err();
-        match err {
-            AppError::InsufficientBalance {
-                available,
-                required,
-            } => {
-                assert_eq!(available, 1_000);
-                assert_eq!(required, 6_200);
-            }
-            other => panic!("expected InsufficientBalance, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn auto_allocation_fails_typed_on_zero_balance() {
-        assert!(matches!(
-            auto_allocation_amount(0, 1),
-            Err(AppError::InsufficientBalance {
-                available: 0,
-                required: 1
-            })
-        ));
     }
 
     // -----------------------------------------------------------------

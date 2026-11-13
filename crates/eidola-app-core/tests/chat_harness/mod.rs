@@ -401,6 +401,16 @@ pub enum ChatBehavior {
     /// the tool round answers [`TOOL_FINAL_CONTENT`]. Whichever transport
     /// asked.
     ContinueIntoToolRound,
+    /// **An answer longer than its ceiling**, in whichever transport asked:
+    /// the turn's first chat request answers [`LONG_REASONING`] and
+    /// [`long_part`]`(1)` and stops at its ceiling, exactly continuable; each
+    /// request continuing it (`continue_final_message`) answers the part after
+    /// the last one its partial message holds, the `requests`th with `stop`
+    /// and every one before it at its ceiling. A request numbered `fail_at` is answered `500` instead,
+    /// refunding all but the request fee. Every other request is an ordinary
+    /// answer ([`STREAM_CONTENT`]). A `length` ending reports the request's
+    /// whole `max_completion_tokens` spent.
+    LongAnswer { requests: u64, fail_at: Option<u64> },
     /// An answer opening with a mimicked header line ([`MIMICKED_HEADER`]) and
     /// then cut off at the ceiling, which the engine reports `continuable` —
     /// the strip this app applies is what makes the stored text differ.
@@ -427,6 +437,19 @@ pub const CONTINUED_REASONING: &str = " and so: the moon.";
 pub const CONTINUED_ANSWER: &str = "The tides follow the moon.";
 /// The rest of a continued answer.
 pub const CONTINUED_TAIL: &str = " Then it carries on.";
+
+/// The reasoning a [`ChatBehavior::LongAnswer`] opens with.
+pub const LONG_REASONING: &str = "Let me lay it out.";
+
+/// The `n`th part of a [`ChatBehavior::LongAnswer`]: the first request's
+/// answer, then what each continuation adds.
+pub fn long_part(n: u64) -> String {
+    if n == 1 {
+        "Part 1.".to_string()
+    } else {
+        format!(" Part {n}.")
+    }
+}
 
 /// The reason the decline behaviours state; asserted on the persisted
 /// `decision` action's text block.
@@ -698,7 +721,7 @@ pub struct MockConfig {
     /// in input order as the gateway consumes it (clamped to the hold).
     /// `None` — the default — charges nothing: every input's share returns
     /// whole. Applies to the in-band refunds of a completed request; a
-    /// refusal or a recovery returns every share whole as before.
+    /// refusal or a recovery is charged the request fee ([`REQUEST_FEE`]).
     pub settled_charge: Option<u128>,
     /// When set, issuance signs under this request context instead of the one
     /// every credential under the key shares. `None` uses the shared one.
@@ -732,7 +755,59 @@ pub struct MockConfig {
     /// `false` — the default — answers it as the gateway does: every
     /// completion a behaviour writes goes out as a stream.
     pub ignores_stream: bool,
+    /// The `(value, scale_factor)` of [`MODEL`]'s cached-prompt rate, which
+    /// `GET /v1/models` publishes as `pricing.per_cached_prompt_token`.
+    /// `None` — the default — publishes none: the model sells no cached rate
+    /// and no request to it may declare a cached prefix.
+    pub cached_prompt_price: Option<(u64, u64)>,
+    /// Answer keyed chat requests as an engine with a prefix cache: each
+    /// answer reports `base + bytes / 4 + 10 × messages` prompt tokens, over
+    /// the bytes the pricing walk counts (the mock's own count: a prompt's
+    /// prefix never counts more, and an extension never adds more than the
+    /// byte contract allows for what it adds), every answered keyed
+    /// request is remembered under its key, and a request declaring a cached
+    /// prefix is served only if the declaration is exactly what the mock's
+    /// own arithmetic derives from a request it remembers under the same key
+    /// (else `409 cached_prefix_missing`) and its prompt fits the declared
+    /// budget (else `409 prompt_budget_exceeded`). `None` — the default —
+    /// reports 11 prompt tokens and remembers nothing.
+    pub engine_prompt_tokens: Option<i64>,
+    /// When set, the **next** request that declares a cached prefix is
+    /// refused `409` with this `error.type` (an engine that lost its cache
+    /// entry, or a prompt denser than its budget), and the setting clears.
+    pub refuse_next_declared: RefuseNextDeclared,
+    /// The `context_length` `GET /v1/models` declares for [`MODEL`]. `None` —
+    /// the default — declares 8,192, which bounds every ceiling to it.
+    pub context_length: Option<u64>,
+    /// Price and size [`MODEL`]'s row as the shipped MiMo-V2.6-Flash row is
+    /// served ([`MIMO_CONTEXT_LENGTH`], [`MIMO_MAX_OUTPUT_TOKENS`], and its
+    /// $0.50 / $2.00 per million at the gateway's 1.5 markup), so a long
+    /// prompt holds more than one denomination. `false` — the default —
+    /// keeps the one-credit-a-token row every other test pins.
+    pub mimo_priced: bool,
 }
+
+/// A one-shot refusal of the next declared request (see
+/// [`MockConfig::refuse_next_declared`]).
+pub type RefuseNextDeclared = Arc<std::sync::Mutex<Option<&'static str>>>;
+
+/// The request fee, spelled here rather than imported: the mock is the
+/// gateway's stand-in and computes every hold and refund independently of
+/// the shared rule.
+pub const REQUEST_FEE: u128 = 1_000;
+
+/// The step a declared cached prefix is rounded down to, spelled here for the
+/// same reason.
+pub const CACHED_PREFIX_QUANTUM: u64 = 256;
+
+/// The context window [`MockConfig::mimo_priced`] declares.
+pub const MIMO_CONTEXT_LENGTH: u64 = 1_048_576;
+/// The `max_output_tokens` [`MockConfig::mimo_priced`] declares.
+pub const MIMO_MAX_OUTPUT_TOKENS: u64 = 65_536;
+/// [`MockConfig::mimo_priced`]'s rates, in credits per token at a scale of
+/// 1,000,000: $0.50 and $2.00 per million tokens, each times 1.5.
+pub const MIMO_PROMPT_RATE: u64 = 750_000;
+pub const MIMO_COMPLETION_RATE: u64 = 3_000_000;
 
 /// See [`MockConfig::key_swap`].
 #[derive(Clone, Default)]
@@ -937,6 +1012,11 @@ impl Default for MockConfig {
             issuer_calendar: None,
             key_swap: KeySwap::default(),
             omit_previous_key: Arc::default(),
+            cached_prompt_price: None,
+            engine_prompt_tokens: None,
+            refuse_next_declared: RefuseNextDeclared::default(),
+            context_length: None,
+            mimo_priced: false,
         }
     }
 }
@@ -1028,6 +1108,8 @@ pub struct MockServer {
     models_hits: Arc<AtomicU64>,
     /// The issuance switches the server was started with.
     issuance: IssuanceKnobs,
+    /// The one-shot declared-request refusal the server was started with.
+    refuse_next_declared: RefuseNextDeclared,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -1054,6 +1136,26 @@ impl MockServer {
     pub fn hold_mismatches(&self) -> u64 {
         self.issuer.hold_mismatches.load(Ordering::SeqCst)
     }
+    /// Declared requests the caching engine refused `409`, for any reason.
+    pub fn declared_refusals(&self) -> u64 {
+        self.issuer.declared_refusals.load(Ordering::SeqCst)
+    }
+    /// Declared requests whose declaration the caching engine could not
+    /// derive from anything it served under their key (each refused
+    /// `cached_prefix_missing`).
+    pub fn declaration_mismatches(&self) -> u64 {
+        self.issuer.declaration_mismatches.load(Ordering::SeqCst)
+    }
+    /// Refuse the next request that declares a cached prefix `409` with this
+    /// `error.type` ([`MockConfig::refuse_next_declared`]).
+    pub fn refuse_next_declared(&self, kind: &'static str) {
+        *self.refuse_next_declared.lock().unwrap() = Some(kind);
+    }
+    /// Forget everything the caching engine served: an engine that restarted
+    /// or evicted every entry.
+    pub fn evict_engine_cache(&self) {
+        self.issuer.engine_cache.lock().unwrap().clear();
+    }
     /// The issuance endpoint's switches (see [`MockConfig::issuance`]).
     pub fn issuance_knobs(&self) -> IssuanceKnobs {
         self.issuance.clone()
@@ -1070,6 +1172,11 @@ impl MockServer {
     /// The credits converted by every debiting issuance.
     pub fn issuance_debited_credits(&self) -> i64 {
         self.issuer.issuance_debited_credits.load(Ordering::SeqCst) as i64
+    }
+    /// The amount every debiting issuance converted, in the order they
+    /// debited: what the account surface saw of each.
+    pub fn issued_amounts(&self) -> Vec<i64> {
+        self.issuer.issued_amounts.lock().unwrap().clone()
     }
     /// Debit and store every issuance [`IssuanceKnobs::hold_next`] held, as
     /// a stalled original reaching its debit late would.
@@ -1480,6 +1587,8 @@ struct Issuer {
     issuance_debits: AtomicU64,
     /// The credits all those debits converted.
     issuance_debited_credits: AtomicU64,
+    /// The amount of every debiting issuance, in the order they debited.
+    issued_amounts: std::sync::Mutex<Vec<i64>>,
     /// A public key listed as the previous epoch's, for an epoch the mock
     /// never listed a current key for: stable for the mock's life.
     decoy_public_key: Vec<u8>,
@@ -1491,6 +1600,18 @@ struct Issuer {
     /// Spending chat requests that did not ask for a stream, which the
     /// gateway refuses.
     blocking_asks: AtomicU64,
+    /// What the caching engine served, by key ([`MockConfig::engine_prompt_tokens`]).
+    engine_cache: std::sync::Mutex<Vec<EngineEntry>>,
+    /// Each spend's part of its request's refused charge, by nullifier: the
+    /// request fee allocated across the request's inputs in input order, as
+    /// the gateway allocates a charge. What a recovery of that spend charges
+    /// for a request that was refused, failed, or never arrived.
+    refused_charges: std::sync::Mutex<std::collections::HashMap<Vec<u8>, u128>>,
+    /// Declared requests refused `409`, for any reason.
+    declared_refusals: AtomicU64,
+    /// Declared requests whose declaration was not one the caching engine
+    /// derives from what it served under their key.
+    declaration_mismatches: AtomicU64,
 }
 
 impl Issuer {
@@ -1504,6 +1625,7 @@ impl Issuer {
         self.issuance_debits.fetch_add(1, Ordering::SeqCst);
         self.issuance_debited_credits
             .fetch_add(signed.credits.max(0) as u64, Ordering::SeqCst);
+        self.issued_amounts.lock().unwrap().push(signed.credits);
         issuances.insert(signed.idem, (signed.request_digest, signed.body));
     }
 
@@ -1532,6 +1654,7 @@ impl Issuer {
             issuance_requests: AtomicU64::new(0),
             issuance_debits: AtomicU64::new(0),
             issuance_debited_credits: AtomicU64::new(0),
+            issued_amounts: std::sync::Mutex::new(Vec::new()),
             decoy_public_key: PrivateKey::random(OsRng)
                 .public()
                 .to_cbor()
@@ -1539,6 +1662,10 @@ impl Issuer {
             listed: std::sync::Mutex::new(std::collections::HashMap::new()),
             hold_mismatches: AtomicU64::new(0),
             blocking_asks: AtomicU64::new(0),
+            engine_cache: std::sync::Mutex::new(Vec::new()),
+            refused_charges: std::sync::Mutex::new(std::collections::HashMap::new()),
+            declared_refusals: AtomicU64::new(0),
+            declaration_mismatches: AtomicU64::new(0),
         }
     }
 
@@ -1549,6 +1676,30 @@ impl Issuer {
         let nullifier = proof.nullifier().as_bytes().to_vec();
         let mut keys = self.spend_keys.lock().unwrap();
         *keys.entry(nullifier).or_insert(key) == key
+    }
+
+    /// Remember each input's part of the request fee, allocated in input
+    /// order ([`Issuer::refused_charges`]).
+    fn note_refused_charges(&self, inputs: &[Presented]) {
+        let mut left = REQUEST_FEE;
+        let mut charges = self.refused_charges.lock().unwrap();
+        for input in inputs {
+            let part = input.share().unwrap_or(0).min(left);
+            left -= part;
+            charges.insert(input.proof.nullifier().as_bytes().to_vec(), part);
+        }
+    }
+
+    /// A recovered spend's part of its request's refused charge: what
+    /// [`Issuer::note_refused_charges`] recorded, or the fee (clamped to the
+    /// share) for a spend that never arrived.
+    fn refused_charge_of(&self, input: &Presented) -> u128 {
+        self.refused_charges
+            .lock()
+            .unwrap()
+            .get(input.proof.nullifier().as_bytes().as_slice())
+            .copied()
+            .unwrap_or(REQUEST_FEE)
     }
 
     /// How many distinct spends arrived with a refund recovery key.
@@ -1669,6 +1820,7 @@ pub async fn start(config: MockConfig) -> MockServer {
     config.close_switch.install(close_tx);
     let issuer = Arc::new(Issuer::new());
     let issuance = config.issuance.clone();
+    let refuse_next_declared = config.refuse_next_declared.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
     let base_url = format!("http://{addr}");
@@ -1721,8 +1873,9 @@ pub async fn start(config: MockConfig) -> MockServer {
                 let chat_spends = chat_spends.clone();
                 let refund_hits = refund_hits.clone();
                 let models_hits = models_hits.clone();
-                tokio::spawn(
-                    GATEWAY_STREAM.scope(std::cell::Cell::new(None), async move {
+                tokio::spawn(GATEWAY_STREAM.scope(
+                    std::cell::Cell::new(None),
+                    ENGINE_USAGE.scope(std::cell::Cell::new(EngineUsage::default()), async move {
                         let _ = handle_conn(
                             stream,
                             issuer,
@@ -1738,7 +1891,7 @@ pub async fn start(config: MockConfig) -> MockServer {
                         )
                         .await;
                     }),
-                );
+                ));
             }
         })
     };
@@ -1755,6 +1908,7 @@ pub async fn start(config: MockConfig) -> MockServer {
         issuer,
         models_hits,
         issuance,
+        refuse_next_declared,
         _task: task,
     }
 }
@@ -2065,6 +2219,7 @@ async fn handle_conn(
             {
                 return write_json(&mut stream, 400, &error_body("one credential twice")).await;
             }
+            issuer.note_refused_charges(&inputs);
             let parsed: serde_json::Value =
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
             // **The hold is exactly the worst case**, as the gateway requires:
@@ -2087,10 +2242,40 @@ async fn handle_conn(
                 let mut body: serde_json::Value =
                     serde_json::from_str(&error_body("the hold must equal the worst-case cost"))
                         .expect("error body");
-                if let Some(refunds) = refunds_value(&issuer, &config, &inputs, 0) {
+                if let Some(refunds) = refunds_value(&issuer, &config, &inputs, REQUEST_FEE) {
                     body["refunds"] = refunds;
                 }
                 return write_json(&mut stream, 400, &body.to_string()).await;
+            }
+            // **The caching engine** (`engine_prompt_tokens`): a keyed request
+            // is counted, a declared one is checked against what the engine
+            // served under its key, and an answered one is remembered.
+            let engine_key = config.engine_prompt_tokens.and_then(|base| {
+                let key = parsed.get("cache_key")?.as_str()?.to_string();
+                Some((base, key))
+            });
+            if let Some((base, key)) = &engine_key {
+                let count = engine_prompt_count(*base, &parsed);
+                let _ = ENGINE_USAGE.try_with(|u| {
+                    u.set(EngineUsage {
+                        prompt: Some(count),
+                        completion: None,
+                    })
+                });
+                if let Some(declared) = parsed.get("cached_prefix") {
+                    let refusal = engine_refusal(&issuer, &config, key, count, declared, &parsed);
+                    if let Some(kind) = refusal {
+                        issuer.declared_refusals.fetch_add(1, Ordering::SeqCst);
+                        let mut body = serde_json::json!({
+                            "error": { "message": "declared prefix refused", "type": kind },
+                        });
+                        if let Some(refunds) = refunds_value(&issuer, &config, &inputs, REQUEST_FEE)
+                        {
+                            body["refunds"] = refunds;
+                        }
+                        return write_json(&mut stream, 409, &body.to_string()).await;
+                    }
+                }
             }
             // A branch-summary request is recognized by its system prompt (it
             // shares the router's model) and answered first, so a test can
@@ -2161,6 +2346,22 @@ async fn handle_conn(
                 }
                 _ => {
                     handle_chat(&mut stream, &issuer, &config, &inputs, hit, &parsed).await?;
+                    // An answer that reported its usage leaves its prompt and
+                    // output in the engine's cache under its key.
+                    if let Some((_, key)) = engine_key
+                        && let Ok(EngineUsage {
+                            prompt: Some(prompt),
+                            completion: Some(_),
+                        }) = ENGINE_USAGE.try_with(std::cell::Cell::get)
+                    {
+                        issuer.engine_cache.lock().unwrap().push(EngineEntry {
+                            key,
+                            tools: request_tools(&parsed),
+                            messages: request_messages(&parsed),
+                            continued: parsed.get("continue_final_message").is_some(),
+                            prompt,
+                        });
+                    }
                 }
             }
         }
@@ -2291,15 +2492,16 @@ async fn handle_refund(
     let stored_provisional = matches!(config.refund, RefundMode::ProvisionalFirst(_));
     let provisional = matches!(config.refund, RefundMode::ProvisionalFirst(n) if attempt <= n);
     // The stored provisional refund returns nothing; a stream cut short is
-    // charged what it generated; any other returns the share whole. Signed
-    // under the key the input names.
+    // charged what it generated; any other — a request refused, failed before
+    // an answer, or that never arrived — is charged the request fee and
+    // returns the rest of the share. Signed under the key the input names.
     let refunds = input.and_then(|input| {
         let charge = if stored_provisional {
             input.share()?
         } else if let RefundMode::ChargedEarly(charged) = config.refund {
             charged
         } else {
-            0
+            issuer.refused_charge_of(&input)
         };
         refunds_value(issuer, config, std::slice::from_ref(&input), charge)
     });
@@ -2342,8 +2544,9 @@ async fn handle_chat(
     } else {
         None
     };
-    // Every share whole: what a refusal carries.
-    let full_refunds = || refunds_value(issuer, config, inputs, 0);
+    // Every share but the request fee, consumed in input order: what a
+    // refusal carries.
+    let full_refunds = || refunds_value(issuer, config, inputs, REQUEST_FEE);
     // What a completed stream's metadata carries, whatever the refund mode.
     let completed_refunds =
         || refunds_value(issuer, config, inputs, config.settled_charge.unwrap_or(0));
@@ -2360,7 +2563,7 @@ async fn handle_chat(
                     "content": "Hello from the mock.",
                     "reasoning_content": "thinking…",
                 } }],
-                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) },
             });
             if matches!(config.chat, ChatBehavior::OkBlocking)
                 && let Some(refund) = inline_refund
@@ -2382,7 +2585,7 @@ async fn handle_chat(
                     "role": "assistant",
                     "content": "Hello from the mock.",
                 } }],
-                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) },
             });
             // Past `proxy::route::MAX_RESPONSE_BYTES` (8 MiB) — spelled here
             // rather than imported, because the mock is the *peer* and must not
@@ -2440,7 +2643,7 @@ async fn handle_chat(
             events.push(
                 serde_json::json!({
                     "choices": [{ "delta": {}, "finish_reason": "stop" }],
-                    "usage": { "prompt_tokens": 11, "completion_tokens": 160 },
+                    "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(160) },
                 })
                 .to_string(),
             );
@@ -2568,7 +2771,7 @@ async fn handle_chat(
                     "role": "assistant",
                     "content": "Hello from the mock.",
                 } }],
-                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) },
             });
             if let Some(refund) = inline_refund {
                 body["refunds"] = refund;
@@ -2591,7 +2794,7 @@ async fn handle_chat(
                         "role": "assistant",
                         "content": TOOL_FINAL_CONTENT,
                     } }],
-                    "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                    "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) },
                 });
                 if let Some(refund) = inline_refund {
                     body["refunds"] = refund;
@@ -2620,7 +2823,7 @@ async fn handle_chat(
                         "role": "assistant",
                         "content": TOOL_FINAL_CONTENT,
                     } }],
-                    "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                    "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) },
                 })
             };
             if let Some(refund) = inline_refund {
@@ -2651,7 +2854,7 @@ async fn handle_chat(
                     "tool_calls": { "id": tool_call_id(1), "function": {
                         "name": TOOL_NAME, "arguments": "{}" } },
                 } }],
-                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) },
             });
             if let Some(refund) = inline_refund {
                 body["refunds"] = refund;
@@ -2665,7 +2868,7 @@ async fn handle_chat(
                     "content": TOOL_FINAL_CONTENT,
                     "tool_calls": serde_json::Value::Null,
                 } }],
-                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) },
             });
             if let Some(refund) = inline_refund {
                 body["refunds"] = refund;
@@ -2715,7 +2918,7 @@ async fn handle_chat(
                     "role": "assistant",
                     "content": "Hello from the mock.",
                 } }],
-                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) },
             });
             if let Some(refund) = inline_refund {
                 body["refunds"] = refund;
@@ -2731,7 +2934,7 @@ async fn handle_chat(
                     "role": "assistant",
                     "content": "Hello from the mock.",
                 } }],
-                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) },
             });
             if let Some(refund) = inline_refund {
                 body["refunds"] = refund;
@@ -2752,7 +2955,7 @@ async fn handle_chat(
                     "finish_reason": "length",
                     "continuable": true,
                 }],
-                "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS },
+                "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(CEILING_TOKENS) },
             });
             if let Some(refund) = inline_refund {
                 body["refunds"] = refund;
@@ -2773,7 +2976,7 @@ async fn handle_chat(
                     "finish_reason": "length",
                     "continuable": true,
                 }],
-                "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS },
+                "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(CEILING_TOKENS) },
             });
             if let Some(refund) = inline_refund {
                 body["refunds"] = refund;
@@ -2808,6 +3011,51 @@ async fn handle_chat(
                 content,
                 finish,
                 exact,
+            )
+            .await
+        }
+        ChatBehavior::LongAnswer { requests, fail_at } => {
+            if fail_at == Some(hit) {
+                let mut body: serde_json::Value =
+                    serde_json::from_str(&error_body("upstream model error")).expect("error body");
+                if let Some(refunds) = full_refunds() {
+                    body["refunds"] = refunds;
+                }
+                return write_json(stream, 500, &body.to_string()).await;
+            }
+            let continues = request.get("continue_final_message").is_some();
+            // Which part this request answers is read off the answer so far
+            // it continues, so a refused or failed request in between does
+            // not move it.
+            let part = request["messages"]
+                .as_array()
+                .and_then(|m| m.last())
+                .and_then(|m| m["content"].as_str())
+                .map_or(0, |so_far| so_far.matches("Part ").count() as u64)
+                + 1;
+            let (reasoning, content, finish) = if continues {
+                (
+                    "",
+                    long_part(part),
+                    if part < requests { "length" } else { "stop" },
+                )
+            } else if hit == 1 {
+                (
+                    LONG_REASONING,
+                    long_part(1),
+                    if requests > 1 { "length" } else { "stop" },
+                )
+            } else {
+                ("", STREAM_CONTENT.to_string(), "stop")
+            };
+            write_ending(
+                stream,
+                request,
+                inline_refund,
+                reasoning,
+                &content,
+                finish,
+                true,
             )
             .await
         }
@@ -2860,7 +3108,7 @@ async fn handle_chat(
                     "role": "assistant",
                     "content": "Hello from the mock.",
                 } }],
-                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) },
             });
             if let Some(refund) = inline_refund {
                 body["refunds"] = refund;
@@ -2884,7 +3132,7 @@ async fn handle_chat(
                     "role": "assistant",
                     "content": "Hello from the mock.",
                 } }],
-                "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) },
             });
             if let Some(refund) = inline_refund {
                 body["refunds"] = refund;
@@ -2934,7 +3182,7 @@ async fn handle_chat(
                         "role": "assistant",
                         "content": TOOL_FINAL_CONTENT,
                     } }],
-                    "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                    "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) },
                 })
             } else {
                 let calls: Vec<serde_json::Value> = script
@@ -2954,7 +3202,7 @@ async fn handle_chat(
                         "content": serde_json::Value::Null,
                         "tool_calls": calls,
                     } }],
-                    "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+                    "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) },
                 })
             };
             if let Some(refund) = inline_refund {
@@ -2975,7 +3223,7 @@ async fn write_sse_bad_tool_calls_stream(stream: &mut TcpStream) -> std::io::Res
     stream.write_all(&sse_event(&delta.to_string())).await?;
     stream
         .write_all(&sse_event(
-            &serde_json::json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5}})
+            &serde_json::json!({"choices":[],"usage":{"prompt_tokens":reported_prompt_tokens(),"completion_tokens":reported_completion_tokens(5)}})
                 .to_string(),
         ))
         .await?;
@@ -3032,7 +3280,7 @@ async fn write_sse_decline_stream(stream: &mut TcpStream) -> std::io::Result<()>
     call["index"] = serde_json::json!(0);
     let deltas = vec![
         serde_json::json!({"choices":[{"delta":{"tool_calls":[call]}}]}),
-        serde_json::json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5}}),
+        serde_json::json!({"choices":[],"usage":{"prompt_tokens":reported_prompt_tokens(),"completion_tokens":reported_completion_tokens(5)}}),
     ];
     for d in deltas {
         stream.write_all(&sse_event(&d.to_string())).await?;
@@ -3083,7 +3331,7 @@ async fn write_sse_script_stream(
     }
     stream
         .write_all(&sse_event(
-            &serde_json::json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5}})
+            &serde_json::json!({"choices":[],"usage":{"prompt_tokens":reported_prompt_tokens(),"completion_tokens":reported_completion_tokens(5)}})
                 .to_string(),
         ))
         .await?;
@@ -3100,7 +3348,7 @@ fn tool_call_body(call: &serde_json::Value) -> serde_json::Value {
             "content": serde_json::Value::Null,
             "tool_calls": [call],
         } }],
-        "usage": { "prompt_tokens": 11, "completion_tokens": 5 },
+        "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) },
     })
 }
 
@@ -3160,7 +3408,7 @@ async fn write_sse_tool_stream(
         serde_json::json!({"choices":[{"delta":{"tool_calls":[call_3]}}]}),
         serde_json::json!({"choices":[{"delta":{"tool_calls":[
             {"index":0,"function":{"arguments":args_b}}]}}]}),
-        serde_json::json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5}}),
+        serde_json::json!({"choices":[],"usage":{"prompt_tokens":reported_prompt_tokens(),"completion_tokens":reported_completion_tokens(5)}}),
     ];
     for d in deltas {
         stream.write_all(&sse_event(&d.to_string())).await?;
@@ -3247,7 +3495,7 @@ async fn write_sse_length_stream(
 
     let terminal = serde_json::json!({
         "choices": [{ "delta": {}, "finish_reason": "length", "continuable": true }],
-        "usage": { "prompt_tokens": 11, "completion_tokens": CEILING_TOKENS }
+        "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(CEILING_TOKENS) }
     });
     stream.write_all(&sse_event(&terminal.to_string())).await?;
     stream.write_all(&sse_event("[DONE]")).await?;
@@ -3257,8 +3505,9 @@ async fn write_sse_length_stream(
 }
 
 /// Answer in whichever transport asked: `reasoning`, then `content`, ending
-/// with `finish`. A `length` ending reports the whole ceiling spent, as the
-/// truncating behaviours do, with the engine's `continuable` verdict (`exact`).
+/// with `finish`. A `length` ending reports the whole ceiling spent — the
+/// request's own `max_completion_tokens`, as an engine that stopped there
+/// reports it — with the engine's `continuable` verdict (`exact`).
 /// A stream carries the reasoning as one delta and the content as two, so the
 /// client's accumulation is exercised.
 async fn write_ending(
@@ -3271,7 +3520,10 @@ async fn write_ending(
     exact: bool,
 ) -> std::io::Result<()> {
     let completion_tokens = if finish == "length" {
-        CEILING_TOKENS
+        request
+            .get("max_completion_tokens")
+            .and_then(|m| m.as_i64())
+            .unwrap_or(CEILING_TOKENS)
     } else {
         5
     };
@@ -3285,7 +3537,7 @@ async fn write_ending(
                 },
                 "finish_reason": finish,
             }],
-            "usage": { "prompt_tokens": 11, "completion_tokens": completion_tokens },
+            "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(completion_tokens) },
         });
         if finish == "length" {
             body["choices"][0]["continuable"] = serde_json::json!(exact);
@@ -3313,7 +3565,7 @@ async fn write_ending(
     }
     let mut terminal = serde_json::json!({
         "choices": [{ "delta": {}, "finish_reason": finish }],
-        "usage": { "prompt_tokens": 11, "completion_tokens": completion_tokens }
+        "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(completion_tokens) }
     });
     if finish == "length" {
         terminal["choices"][0]["continuable"] = serde_json::json!(exact);
@@ -3451,7 +3703,7 @@ async fn write_sse_stream_with_metadata(
     }
     let usage = serde_json::json!({
         "choices": [],
-        "usage": { "prompt_tokens": 11, "completion_tokens": 5 }
+        "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) }
     });
     stream.write_all(&send_event(usage.to_string())).await?;
 
@@ -3562,7 +3814,7 @@ async fn write_padded_sse_stream(
         "object": "chat.completion.chunk",
         "model": STREAM_WIRE_MODEL,
         "choices": [],
-        "usage": { "prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16 }
+        "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5), "total_tokens": 16 }
     });
     framer.push(&StreamEvent::Json(usage.to_string()));
     let mut metadata = serde_json::json!({
@@ -3716,7 +3968,7 @@ async fn write_padded_near_ceiling(stream: &mut TcpStream) -> std::io::Result<()
             .to_string(),
         serde_json::json!({
             "choices": [],
-            "usage": { "prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16 }
+            "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5), "total_tokens": 16 }
         })
         .to_string(),
         serde_json::json!({ "object": "eidola.chat.completion.metadata", "id": "chatcmpl-mock" })
@@ -3805,7 +4057,7 @@ async fn write_sse_stream_split_data(
     let usage = serde_json::json!({
         "model": STREAM_WIRE_MODEL,
         "choices": [],
-        "usage": { "prompt_tokens": 11, "completion_tokens": 5 }
+        "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) }
     });
     stream.write_all(&send_event(&usage)).await?;
     let mut metadata = serde_json::json!({
@@ -3892,7 +4144,7 @@ async fn write_sse_stream(
 
     let usage = serde_json::json!({
         "choices": [],
-        "usage": { "prompt_tokens": 11, "completion_tokens": 5 }
+        "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) }
     });
     stream.write_all(&send_event(usage.to_string())).await?;
 
@@ -3963,7 +4215,7 @@ async fn write_sse_stream_with_terminator(
     let usage = serde_json::json!({
         "model": STREAM_WIRE_MODEL,
         "choices": [],
-        "usage": { "prompt_tokens": 11, "completion_tokens": 5 }
+        "usage": { "prompt_tokens": reported_prompt_tokens(), "completion_tokens": reported_completion_tokens(5) }
     });
     stream
         .write_all(&send_event(next, usage.to_string()))
@@ -3981,6 +4233,156 @@ async fn write_sse_stream_with_terminator(
 /// the shared contract plus the completion ceiling (the request's own, or the
 /// row's declared one) at the completion rate, each rounded up. `None` for a
 /// model the catalog does not list.
+/// One answered keyed request, as the mock's caching engine remembers it.
+struct EngineEntry {
+    key: String,
+    tools: Vec<serde_json::Value>,
+    messages: Vec<serde_json::Value>,
+    /// Whether the request continued a partial final message, which makes
+    /// it no anchor.
+    continued: bool,
+    prompt: i64,
+}
+
+fn request_tools(request: &serde_json::Value) -> Vec<serde_json::Value> {
+    request
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn request_messages(request: &serde_json::Value) -> Vec<serde_json::Value> {
+    request
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The caching engine's prompt-token count for a request: `base`, a token per
+/// four counted bytes (tools included) and ten per message, so an extension of
+/// a prompt never counts fewer tokens than it.
+fn engine_prompt_count(base: i64, request: &serde_json::Value) -> i64 {
+    let messages = request_messages(request);
+    let tool_bytes: u64 = request_tools(request)
+        .iter()
+        .map(|t| serde_json::to_string(t).map_or(0, |s| s.len()) as u64)
+        .sum();
+    let bytes = engine_added_bytes(&messages) + tool_bytes;
+    base + (bytes / 4) as i64 + 10 * messages.len() as i64
+}
+
+/// The bytes the pricing walk counts for `messages`, by the mock's own reading:
+/// each message's `content` and `reasoning_content` strings, and each of its
+/// `tool_calls` entries as compact JSON.
+fn engine_added_bytes(messages: &[serde_json::Value]) -> u64 {
+    messages
+        .iter()
+        .map(|m| {
+            let text = |k: &str| m.get(k).and_then(|v| v.as_str()).map_or(0, str::len) as u64;
+            let calls: u64 = m
+                .get("tool_calls")
+                .and_then(|c| c.as_array())
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .map(|c| serde_json::to_string(c).map_or(0, |s| s.len()) as u64)
+                        .sum()
+                })
+                .unwrap_or(0);
+            text("content") + text("reasoning_content") + calls
+        })
+        .sum()
+}
+
+/// The declarations the caching engine would serve for `request`, each
+/// derived with the mock's own arithmetic from one **anchor** it remembers
+/// under `key` — an answered request that asked for a new assistant turn —
+/// whose tools are the request's tools and whose messages lead the request's:
+/// that anchor's prompt, with whatever follows priced as added. A request
+/// that continued an answer is remembered but is never an anchor: it sent the
+/// answer back as text, and a real engine cannot be relied on to hold that
+/// text's tokens, so a declaration reaching past the anchor into the answer
+/// is refused, as a real node refuses it in general.
+///
+/// What is added is budgeted at no more than the model's window leaves after
+/// the cached part, and an anchor longer than the window yields nothing.
+fn engine_declarations(
+    issuer: &Issuer,
+    config: &MockConfig,
+    key: &str,
+    request: &serde_json::Value,
+) -> Vec<(u64, u64)> {
+    let tools = request_tools(request);
+    let messages = request_messages(request);
+    let quantum = CACHED_PREFIX_QUANTUM;
+    let window = model_context_length(config);
+    let mut out = Vec::new();
+    for entry in issuer.engine_cache.lock().unwrap().iter() {
+        if entry.key != key || entry.tools != tools || entry.continued {
+            continue;
+        }
+        if messages.len() < entry.messages.len()
+            || messages[..entry.messages.len()] != entry.messages[..]
+        {
+            continue;
+        }
+        let (resumed, added) = (entry.prompt as u64, &messages[entry.messages.len()..]);
+        let cached = resumed.saturating_sub(1) / quantum * quantum;
+        if cached == 0 || resumed > window {
+            continue;
+        }
+        let byte_term = (engine_added_bytes(added) * 2).div_ceil(3);
+        let new = resumed - cached + byte_term + 8 * added.len() as u64 + 32;
+        out.push((cached, new.min(window - cached)));
+    }
+    out
+}
+
+/// Why the caching engine refuses a declared request, if it does: the
+/// test's one-shot refusal, a declaration it cannot derive from anything it
+/// served under the key (counted as a mismatch), or a prompt past the budget.
+fn engine_refusal(
+    issuer: &Issuer,
+    config: &MockConfig,
+    key: &str,
+    count: i64,
+    declared: &serde_json::Value,
+    request: &serde_json::Value,
+) -> Option<&'static str> {
+    if let Some(kind) = config.refuse_next_declared.lock().unwrap().take() {
+        return Some(kind);
+    }
+    let pair = (|| {
+        Some((
+            declared.get("cached_tokens")?.as_u64()?,
+            declared.get("new_tokens")?.as_u64()?,
+        ))
+    })();
+    let served_under_key = issuer
+        .engine_cache
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e.key == key);
+    // Nothing under the key (never served there, or evicted) is a miss; an
+    // entry the declaration does not derive from is the client's mistake.
+    if !served_under_key {
+        return Some("cached_prefix_missing");
+    }
+    let Some((cached, new)) =
+        pair.filter(|p| engine_declarations(issuer, config, key, request).contains(p))
+    else {
+        issuer.declaration_mismatches.fetch_add(1, Ordering::SeqCst);
+        return Some("cached_prefix_missing");
+    };
+    if count as u64 > cached + new {
+        return Some("prompt_budget_exceeded");
+    }
+    None
+}
+
 fn worst_case_cost(config: &MockConfig, request: &serde_json::Value) -> Option<u128> {
     let catalog: serde_json::Value = serde_json::from_str(&models_body(config)).ok()?;
     let model = request.get("model")?.as_str()?;
@@ -3997,10 +4399,32 @@ fn worst_case_cost(config: &MockConfig, request: &serde_json::Value) -> Option<u
         ))
     };
     if let Some((value, scale)) = price("per_request") {
-        return Some(value.div_ceil(scale));
+        return Some(REQUEST_FEE + value.div_ceil(scale));
     }
-    let (prompt_rate, scale) = price("per_prompt_token")?;
-    let (completion_rate, _) = price("per_completion_token")?;
+    let (prompt_rate, prompt_scale) = price("per_prompt_token")?;
+    let (completion_rate, completion_scale) = price("per_completion_token")?;
+    let completion = request
+        .get("max_completion_tokens")
+        .and_then(|m| m.as_u64())
+        .or_else(|| row.get("max_output_tokens").and_then(|m| m.as_u64()))
+        .or_else(|| row.get("context_length").and_then(|m| m.as_u64()))?;
+    let completion_credits = (u128::from(completion) * completion_rate).div_ceil(completion_scale);
+    // A declared prompt: its cached part at the cached rate and the rest of
+    // its budget at the prompt rate. A model that sells no cached rate cannot
+    // price one, and no hold matches.
+    if let Some(declared) = request.get("cached_prefix") {
+        let cached = u128::from(declared.get("cached_tokens")?.as_u64()?);
+        let new = u128::from(declared.get("new_tokens")?.as_u64()?);
+        let Some((cached_rate, cached_scale)) = price("per_cached_prompt_token") else {
+            return Some(0);
+        };
+        return Some(
+            REQUEST_FEE
+                + (cached * cached_rate).div_ceil(cached_scale)
+                + (new * prompt_rate).div_ceil(prompt_scale)
+                + completion_credits,
+        );
+    }
     let messages = request.get("messages")?.as_array()?;
     let tools = request
         .get("tools")
@@ -4008,21 +4432,22 @@ fn worst_case_cost(config: &MockConfig, request: &serde_json::Value) -> Option<u
         .map(Vec::as_slice);
     let prompt =
         u128::from(eidola_common::prompt_charge(messages, tools).chargeable_prompt_tokens());
-    let completion = request
-        .get("max_completion_tokens")
-        .and_then(|m| m.as_u64())
-        .or_else(|| row.get("max_output_tokens").and_then(|m| m.as_u64()))
-        .or_else(|| row.get("context_length").and_then(|m| m.as_u64()))?;
-    Some(
-        (prompt * prompt_rate).div_ceil(scale)
-            + (u128::from(completion) * completion_rate).div_ceil(scale),
-    )
+    Some(REQUEST_FEE + (prompt * prompt_rate).div_ceil(prompt_scale) + completion_credits)
+}
+
+/// The context window [`MODEL`]'s row declares, in tokens.
+fn model_context_length(config: &MockConfig) -> u64 {
+    if config.mimo_priced {
+        MIMO_CONTEXT_LENGTH
+    } else {
+        config.context_length.unwrap_or(8192)
+    }
 }
 
 fn models_body(config: &MockConfig) -> String {
     let mut primary = serde_json::json!({
         "id": MODEL,
-        "context_length": 8192u64,
+        "context_length": model_context_length(config),
         "pricing": {
             "per_prompt_token": { "value": 1u64, "scale_factor": 1u64 },
             "per_completion_token": { "value": 1u64, "scale_factor": 1u64 }
@@ -4046,6 +4471,17 @@ fn models_body(config: &MockConfig) -> String {
     }
     if let Some(ceiling) = config.declared_max_output {
         primary["max_output_tokens"] = serde_json::json!(ceiling);
+    }
+    if config.mimo_priced {
+        primary["max_output_tokens"] = serde_json::json!(MIMO_MAX_OUTPUT_TOKENS);
+        primary["pricing"] = serde_json::json!({
+            "per_prompt_token": { "value": MIMO_PROMPT_RATE, "scale_factor": 1_000_000u64 },
+            "per_completion_token": { "value": MIMO_COMPLETION_RATE, "scale_factor": 1_000_000u64 }
+        });
+    }
+    if let Some((value, scale_factor)) = config.cached_prompt_price {
+        primary["pricing"]["per_cached_prompt_token"] =
+            serde_json::json!({ "value": value, "scale_factor": scale_factor });
     }
     if let Some(sha256) = config
         .published_sha256
@@ -4193,6 +4629,40 @@ tokio::task_local! {
     /// The value is how long such a stream runs before its first delta
     /// ([`MockConfig::answer_ms`]).
     static GATEWAY_STREAM: std::cell::Cell<Option<u64>>;
+
+    /// What the chat request this connection is answering reports as its
+    /// usage, when the mock answers as a caching engine
+    /// ([`MockConfig::engine_prompt_tokens`]): the prompt tokens it counts for
+    /// the request, and the completion tokens its answer reported.
+    static ENGINE_USAGE: std::cell::Cell<EngineUsage>;
+}
+
+/// See [`ENGINE_USAGE`].
+#[derive(Clone, Copy, Debug, Default)]
+struct EngineUsage {
+    prompt: Option<i64>,
+    completion: Option<i64>,
+}
+
+/// The prompt tokens a chat answer reports: the caching engine's count for
+/// the request, or 11.
+fn reported_prompt_tokens() -> i64 {
+    ENGINE_USAGE
+        .try_with(|u| u.get().prompt)
+        .ok()
+        .flatten()
+        .unwrap_or(11)
+}
+
+/// The completion tokens a chat answer reports, remembered for the caching
+/// engine's entry.
+fn reported_completion_tokens(n: i64) -> i64 {
+    let _ = ENGINE_USAGE.try_with(|u| {
+        let mut usage = u.get();
+        usage.completion = Some(n);
+        u.set(usage);
+    });
+    n
 }
 
 /// Whether this connection answers as the gateway does ([`GATEWAY_STREAM`]).

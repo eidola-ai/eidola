@@ -16,8 +16,9 @@
 
 use base64::Engine as _;
 use eidola_common::engine_protocol::{
-    CACHE_KEY_BYTES, CACHE_KEY_TEXT_LEN, ContinueField, FinalContent, FinalMessage, SubsetError,
-    ToolChoice, check_continuation, check_max_completion_tokens, check_stop, check_tool_choice,
+    CACHE_KEY_BYTES, CACHE_KEY_TEXT_LEN, CachedPrefix, ContinueField, FinalContent, FinalMessage,
+    SubsetError, ToolChoice, check_cached_prefix, check_continuation, check_max_completion_tokens,
+    check_stop, check_tool_choice,
 };
 use eidola_engine::secret::CacheKey;
 use eidola_engine_chat::json::{self as chat_json, Json};
@@ -72,6 +73,12 @@ pub struct ChatCompletionRequest {
     /// serde drops the partly built request.
     #[serde(default)]
     pub cache_key: Option<CacheKeyText>,
+    /// The declared cached prefix, `{"cached_tokens", "new_tokens"}` exactly
+    /// (`eidola_common::engine_protocol::CachedPrefix`): the request is served only if
+    /// the prefix cache holds that many of its prompt's leading tokens under its key and
+    /// the prompt has at most that many more.
+    #[serde(default)]
+    pub cached_prefix: Option<serde_json::Value>,
 }
 
 /// The cache key's JSON text, zeroed when dropped. Deserialized straight from a string, so
@@ -201,6 +208,9 @@ pub struct ValidRequest {
     /// The final message's field the prompt continues, or `None` for a new assistant
     /// turn.
     pub continuation: Option<ContinueField>,
+    /// The declared cached prefix, checked against the tokenized prompt and then by the
+    /// engine at admission.
+    pub cached_prefix: Option<CachedPrefix>,
 }
 
 impl std::fmt::Debug for ValidRequest {
@@ -263,6 +273,12 @@ pub fn parse_request(body: &[u8], model_id: &str) -> Result<ValidRequest, ApiErr
         req.messages.last().map(Message::as_final),
     )
     .map_err(invalid)?;
+    let cached_prefix = req
+        .cached_prefix
+        .as_ref()
+        .map(|v| CachedPrefix::from_value(v).ok_or_else(|| ApiError::invalid(CACHED_PREFIX_SHAPE)))
+        .transpose()?;
+    check_cached_prefix(cached_prefix, cache_key.is_some()).map_err(invalid)?;
 
     // The same body, parsed order-preserving for the template.
     let text = std::str::from_utf8(body).map_err(|_| ApiError::invalid("body is not UTF-8"))?;
@@ -299,6 +315,7 @@ pub fn parse_request(body: &[u8], model_id: &str) -> Result<ValidRequest, ApiErr
         stop,
         cache_key,
         continuation,
+        cached_prefix,
     })
 }
 
@@ -332,6 +349,9 @@ const STREAM_REQUIRED: &str =
     "this node answers only a stream: stream must be true, with stream_options.include_usage";
 
 const CACHE_KEY_SHAPE: &str = "cache_key must be 32 bytes, base64url without padding";
+
+const CACHED_PREFIX_SHAPE: &str =
+    "cached_prefix must be {\"cached_tokens\": <u32>, \"new_tokens\": <u32>} and nothing else";
 
 #[cfg(test)]
 mod tests {

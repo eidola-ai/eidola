@@ -51,6 +51,7 @@ fn the_fixture_parses_whole() {
             output_per_m: 5.75
         }
     );
+    assert_eq!(row.cached_input_per_m, Some(0.45));
     assert_eq!(row.lifecycle, Lifecycle::Current);
 }
 
@@ -198,6 +199,22 @@ fn display_capabilities_and_price_are_complete() {
     assert!(parse(&no_window).is_err());
     let ceiling = FIXTURE.replace("max_output_tokens = 32768", "max_output_tokens = 1048576");
     assert!(parse(&ceiling).unwrap_err().contains("max_output_tokens"));
+    // A token-priced row's completion is held at a ceiling no higher than
+    // the one it declares, so it must declare one; a per-request row's price
+    // does not depend on it.
+    let undeclared = FIXTURE.replace("max_output_tokens = 32768\n", "");
+    assert_ne!(undeclared, FIXTURE);
+    assert!(
+        parse(&undeclared)
+            .unwrap_err()
+            .contains("token-priced row declares capabilities.max_output_tokens")
+    );
+    let flat_undeclared = undeclared.replace(
+        "input_per_m = 1.80\noutput_per_m = 5.75\ncached_input_per_m = 0.45",
+        "per_request = 0.01",
+    );
+    assert_ne!(flat_undeclared, undeclared);
+    assert_eq!(parse(&flat_undeclared).unwrap().max_output_tokens, None);
     let no_text = FIXTURE.replace(
         "input_modalities = [\"text\"]",
         "input_modalities = [\"image\"]",
@@ -215,12 +232,30 @@ fn display_capabilities_and_price_are_complete() {
     let both = FIXTURE.replace("[price]\n", "[price]\nper_request = 0.01\n");
     assert!(parse(&both).unwrap_err().contains("price"));
     let per_request = FIXTURE.replace(
-        "input_per_m = 1.80\noutput_per_m = 5.75",
+        "input_per_m = 1.80\noutput_per_m = 5.75\ncached_input_per_m = 0.45",
         "per_request = 0.01",
     );
     assert_eq!(
         parse(&per_request).unwrap().price,
         file::Price::PerRequest { usd: 0.01 }
+    );
+    // A cached rate sits beside a per-token price, at most its input price.
+    let uncached = FIXTURE.replace("cached_input_per_m = 0.45\n", "");
+    assert_eq!(parse(&uncached).unwrap().cached_input_per_m, None);
+    let above = FIXTURE.replace("cached_input_per_m = 0.45", "cached_input_per_m = 1.81");
+    assert!(parse(&above).unwrap_err().contains("cached_input_per_m"));
+    let at_input = FIXTURE.replace("cached_input_per_m = 0.45", "cached_input_per_m = 1.80");
+    assert_eq!(parse(&at_input).unwrap().cached_input_per_m, Some(1.80));
+    let negative_cached = FIXTURE.replace("cached_input_per_m = 0.45", "cached_input_per_m = -0.1");
+    assert!(parse(&negative_cached).is_err());
+    let cached_per_request = FIXTURE.replace(
+        "input_per_m = 1.80\noutput_per_m = 5.75",
+        "per_request = 0.01",
+    );
+    assert!(
+        parse(&cached_per_request)
+            .unwrap_err()
+            .contains("cached_input_per_m")
     );
     let bad_repo = FIXTURE.replace("example/fixture-flash", "fixture-flash");
     assert!(parse(&bad_repo).unwrap_err().contains("source.repo"));

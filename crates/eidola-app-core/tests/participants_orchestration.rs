@@ -1383,6 +1383,48 @@ fn a_remote_routers_hold_is_settled_when_the_body_read_fails() {
     });
 }
 
+/// **A remote router's hold is the request fee and the byte contract's
+/// prompt and ceiling, and it never declares a cached prefix**: a chore is a
+/// one-shot prompt with no lineage, so it carries no key and has nothing to
+/// claim. The mock recomputes the hold and would refuse any other.
+#[test]
+fn a_remote_routers_hold_carries_the_fee_and_no_declaration() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            router: chat_harness::RouterBehavior::Reply(r#"{"notify": []}"#.into()),
+            cached_prompt_price: Some((1, 4)),
+            engine_prompt_tokens: Some(0),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let (space, post) = space_with_two_candidates(&core);
+        core.runtime()
+            .block_on(core.set_space_router_model(
+                space.clone(),
+                Some(chat_harness::ROUTER_REMOTE_MODEL.into()),
+            ))
+            .expect("set remote router model");
+        let _ = planned(&core, &space, &post);
+
+        let bodies = mock.chat_bodies();
+        let charges = mock.chat_charges();
+        let (body, charge) = bodies
+            .iter()
+            .zip(&charges)
+            .find(|(b, _)| b["model"] == chat_harness::ROUTER_REMOTE_MODEL)
+            .expect("the router was asked");
+        assert!(body.get("cached_prefix").is_none() && body.get("cache_key").is_none());
+        let messages = body["messages"].as_array().unwrap();
+        let prompt = eidola_common::prompt_charge(messages, None).chargeable_prompt_tokens();
+        let ceiling = body["max_completion_tokens"].as_u64().unwrap();
+        assert_eq!(
+            *charge,
+            Some(chat_harness::REQUEST_FEE + u128::from(prompt + ceiling))
+        );
+        assert_eq!(mock.hold_mismatches(), 0);
+    });
+}
+
 /// **A remote router's answer cut short at the gateway is no routing
 /// decision, and its hold settles on the refund the stream carried.** The
 /// chore asks the Eidola gateway for a stream; one that ends without finishing
