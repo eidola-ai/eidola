@@ -109,14 +109,17 @@ pub fn encode(text: &str, format: Format) -> Vec<u8> {
 /// contents go to a sibling temporary file that is renamed over the target,
 /// so a crash or a full disk leaves either the old file or the new one.
 ///
-/// An existing file's permissions carry over to its replacement, and the
-/// temporary file has them before it holds a byte, so a private note is never
-/// readable through its sibling. A symlink is written *through* rather than
-/// replaced, so a note symlinked into a vault stays a symlink — even when the
-/// file it points at has gone, which the write then recreates.
+/// An existing file's permissions and group carry over to its replacement,
+/// and the temporary file has both before it holds a byte, so a private note
+/// is never readable through its sibling, nor by a group the note was not
+/// shared with. A save that cannot keep the group is refused. A symlink is
+/// written *through* rather than replaced, so a note symlinked into a vault
+/// stays a symlink — even when the file it points at has gone, which the
+/// write then recreates.
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let target = resolve_links(path);
-    let existing = fs::metadata(&target).ok().map(|meta| meta.permissions());
+    let existing_meta = fs::metadata(&target).ok();
+    let existing = existing_meta.as_ref().map(|meta| meta.permissions());
     let dir = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -128,6 +131,9 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let (temp, mut file) = create_temp(dir, &name, existing.as_ref())?;
 
     let result = (|| {
+        if let Some(meta) = &existing_meta {
+            keep_group(&file, meta)?;
+        }
         file.write_all(bytes)?;
         file.sync_all()?;
         if let Some(permissions) = existing {
@@ -173,6 +179,30 @@ fn create_temp(
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Give the still-empty temporary file the group of the file it will replace.
+/// A new file takes its group from the directory or the process, which need
+/// not be the target's, and the mode's group bits would then grant the note
+/// to a different set of people.
+#[cfg(unix)]
+fn keep_group(temp: &fs::File, target: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let gid = target.gid();
+    if temp.metadata()?.gid() == gid {
+        return Ok(());
+    }
+    std::os::unix::fs::fchown(temp, None, Some(gid)).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("the file's group ({gid}) could not be kept on its replacement: {e}"),
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn keep_group(_temp: &fs::File, _target: &fs::Metadata) -> io::Result<()> {
+    Ok(())
 }
 
 /// The document's name as it appears in a temporary file's: enough to tell
@@ -360,6 +390,46 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// A group this user belongs to other than the one a new file in `dir`
+    /// gets, if there is one: the only kind an unprivileged test can give a
+    /// file.
+    #[cfg(unix)]
+    fn another_group(dir: &Path) -> Option<u32> {
+        use std::os::unix::fs::MetadataExt;
+        let probe = dir.join("probe");
+        fs::write(&probe, b"").unwrap();
+        let default = fs::metadata(&probe).unwrap().gid();
+        let out = std::process::Command::new("id").arg("-G").output().ok()?;
+        String::from_utf8(out.stdout)
+            .ok()?
+            .split_whitespace()
+            .filter_map(|g| g.parse::<u32>().ok())
+            .filter(|g| *g != default)
+            .find(|g| std::os::unix::fs::chown(&probe, None, Some(*g)).is_ok())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_atomic_write_keeps_the_files_group() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let Some(group) = another_group(dir.path()) else {
+            eprintln!("skipped: this user has one group, so no file can differ from the default");
+            return;
+        };
+        let path = dir.path().join("shared.md");
+        fs::write(&path, b"old").unwrap();
+        std::os::unix::fs::chown(&path, None, Some(group)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_atomically(&path, b"new").unwrap();
+
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(meta.gid(), group);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o640);
+    }
+
     #[test]
     fn overlapping_atomic_writes_each_land_whole() {
         let dir = tempfile::tempdir().unwrap();
