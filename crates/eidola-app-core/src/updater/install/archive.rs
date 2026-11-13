@@ -95,7 +95,13 @@ pub fn unpack_zip(bytes: &[u8], dest: &Path, label: &str) -> Result<usize, Insta
         // `enclosed_name` is the crate's own traversal check; the component
         // walk below is ours, because "the library said it was fine" is not
         // the kind of thing this should be taking on faith.
-        let raw_name = entry.name().to_string();
+        let raw_name = entry
+            .name()
+            .map_err(|e| InstallError::Archive {
+                label: label.to_string(),
+                reason: format!("member {index} has a name that could not be decoded: {e}"),
+            })?
+            .into_owned();
         let relative = safe_relative_path(&raw_name).ok_or_else(|| InstallError::Archive {
             label: label.to_string(),
             reason: format!("member `{raw_name}` is not a safe relative path"),
