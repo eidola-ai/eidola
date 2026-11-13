@@ -132,13 +132,17 @@ target "engine-kernels" {
 
 # The inference node (eidola-server-engine, CUDA executor). Recorded under
 # the manifest key `eidola-server-engine` from the manifest schema that
-# records it (scripts/artifact-manifest.sh, ENGINE_IMAGE_SCHEMA). Its build
-# is Nix inside the Containerfile's builder stage, so CARGO_PROFILE does not
-# reach it: the image is always the release profile.
+# records it (scripts/artifact-manifest.sh, ENGINE_IMAGE_SCHEMA). The image
+# is always the release profile, so CARGO_PROFILE does not reach it. Its
+# Containerfile pins the kernel image by digest; here that input is the
+# `engine-kernels` target built from this tree, and scripts/artifact-manifest.sh
+# fails the build unless that target's digest is the pinned one, so an
+# unpublished pin builds the same image a published one does.
 target "server-engine" {
   inherits   = ["_common", "_cache_server_engine"]
   context    = "."
   dockerfile = "oci/eidola-server-engine/Containerfile"
+  contexts   = { kernels = "target:engine-kernels" }
   tags       = ["eidola-server-engine:dev"]
 }
 
@@ -205,5 +209,6 @@ target "ci-server-engine" {
   inherits   = ["_ci", "_cache_server_engine"]
   context    = "."
   dockerfile = "oci/eidola-server-engine/Containerfile"
+  contexts   = { kernels = "target:ci-engine-kernels" }
   tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-server-engine:${t}"]
 }

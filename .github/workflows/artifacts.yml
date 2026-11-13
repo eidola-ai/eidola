@@ -335,10 +335,13 @@ jobs:
 
   # ── The inference node's image (cheap ubuntu runner, long build) ────────────
   # Its own job because nothing in the `oci` chain consumes it and its build
-  # is the longest of the images: Nix in the Containerfile's builder stage
-  # compiles the GPU kernels (fetching the pinned CUDA toolkit) and the node
-  # from a cold store. Built on every run, so the build is exercised before
-  # the manifest schema that records its digest is emitted; below that
+  # is the longest of the images. One bake builds two: the GPU kernel image
+  # (Nix, fetching the pinned CUDA toolkit) and the node's StageX image, which
+  # takes that kernel build as its input. The build fails unless the kernel
+  # image's digest is the one the node's Containerfile pins, so the run that
+  # first builds a new pin is the run that publishes it (pushed with the node
+  # on push events). Built on every run, so the build is exercised before
+  # the manifest schema that records the node's digest is emitted; below that
   # schema its partial is empty and `verify` checks nothing for it.
   oci-engine:
     name: Build the inference node image
@@ -360,8 +363,8 @@ jobs:
           persist-credentials: false
 
       - name: Free up disk space
-        # The builder stage holds the Rust toolchain, the CUDA toolkit and
-        # a release build's target directory at once.
+        # The builders hold the CUDA toolkit, the StageX toolchain and a
+        # release build's target directory.
         run: |
           before=$(df --output=avail -BG / | tail -1)
           sudo rm -rf \
@@ -417,7 +420,7 @@ jobs:
           echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
-      - name: Build the inference node image
+      - name: Build the GPU kernel and inference node images
         env:
           REGISTRY: ${{ steps.tags.outputs.registry || '' }}
           TAGS: ${{ steps.tags.outputs.tags || 'dev' }}
