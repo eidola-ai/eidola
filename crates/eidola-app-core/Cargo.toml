@@ -73,7 +73,7 @@ x509-cert = "0.2"
 # Scrubs the prefix-cache key (`prefix_cache`) wherever this crate holds it.
 # Already in this crate's graph through the credential and TLS crates.
 zeroize = "1"
-zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [build-dependencies]
 # The model catalog's reader (`models/`), the one the gateway's build runs, so
@@ -95,7 +95,7 @@ tempfile = "3"
 # Building the containers the install fixtures download. Same crate and
 # features the installer unpacks with, so a test never proves a shape the
 # shipping reader would refuse.
-zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
 wiremock = "0.6"
 anonymous-credit-tokens = "0.4"
