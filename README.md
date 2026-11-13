@@ -28,7 +28,7 @@ To sign, add the appropriate entry to `CLA-SIGNERS.txt` in a commit to this repo
 
 **Prerequisites:** `rustup`, `direnv`, `docker`
 
-The Rust toolchain version is pinned in `rust-toolchain.toml` and installed automatically by rustup. On first `cd` into the repo, `direnv` builds the pinned Rust-based dev tools (including `just` itself) from `crates/devtools/` and puts them on `PATH`, so `rustup` + `direnv` is the whole setup — no separate `just` install. Run `just` to see all available recipes.
+The Rust toolchain version is pinned in `rust-toolchain.toml` (the Rust of the pinned StageX release that builds the server images) and installed automatically by rustup. On first `cd` into the repo, `direnv` builds the pinned Rust-based dev tools (including `just` itself) from `crates/devtools/` and puts them on `PATH`, so `rustup` + `direnv` is the whole setup — no separate `just` install. Run `just` to see all available recipes.
 
 All Rust workspace packages live under `crates/`, including the code generation binary `generate-openapi` and operational utilities such as `tinfoil-shim-mock`, `hash-secret`, and `measure-enclave`. `crates/devtools/` is an anchor crate that version-pins upstream Rust-based dev tools — `just`, the [rumdl](https://rumdl.dev/) markdown linter, and [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) — in `Cargo.lock`; `.envrc` builds them and direnv exposes them on `PATH`. `just check` runs rumdl and cargo-deny, and `just lint-md-fix` applies auto-fixes.
 

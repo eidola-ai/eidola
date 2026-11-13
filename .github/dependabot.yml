@@ -51,11 +51,7 @@ updates:
       - dependency-name: "ed25519-dalek"
         update-types: ["version-update:semver-major"]
 
-  # Maintain dependencies for Rust/Toolchain.
-  - package-ecosystem: "rust-toolchain"
-    directory: "/"
-    target-branch: "next"
-    schedule:
-      interval: "weekly"
-    cooldown:
-      default-days: 7
+  # No `rust-toolchain` ecosystem: rust-toolchain.toml names the Rust of the
+  # pinned StageX release (the compiler that builds the release images), and
+  # it moves only together with that release, never on its own
+  # (scripts/check-rust-toolchain.sh).

@@ -31,7 +31,3 @@ path = "src/lib.rs"
 rumdl = "=0.2.75"
 just = "=1.59.0"
 cargo-deny = "=0.20.2"
-
-# A dependency here exists to be pinned and built by name, never imported.
-[lints.cargo]
-unused_dependencies = "allow"
