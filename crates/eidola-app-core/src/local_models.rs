@@ -1521,23 +1521,27 @@ pub(crate) fn resolve_local_engine(cfg: &Config) -> Option<PathBuf> {
 /// only rejects the known-dishonest case, and a real spawn failure still
 /// surfaces its own error.
 fn usable_engine_binary(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use std::io::Read;
-        let mut header = Vec::new();
-        let readable = std::fs::File::open(path)
-            .map(|f| f.take(MACHO_HEADER_READ_LEN).read_to_end(&mut header))
-            .is_ok();
-        if readable {
-            return macho_machine_compatible(
-                macho_cpu_types(&header).as_deref(),
-                machine_supports_arm64(),
-            );
-        }
-    }
+    path.is_file() && runs_on_this_machine(path)
+}
+
+/// The Mach-O half of [`usable_engine_binary`]: an unreadable header passes.
+#[cfg(target_os = "macos")]
+fn runs_on_this_machine(path: &Path) -> bool {
+    use std::io::Read;
+    let mut header = Vec::new();
+    let readable = std::fs::File::open(path)
+        .map(|f| f.take(MACHO_HEADER_READ_LEN).read_to_end(&mut header))
+        .is_ok();
+    !readable
+        || macho_machine_compatible(
+            macho_cpu_types(&header).as_deref(),
+            machine_supports_arm64(),
+        )
+}
+
+/// Every other platform ships its sidecar for the machine it runs on.
+#[cfg(not(target_os = "macos"))]
+fn runs_on_this_machine(_path: &Path) -> bool {
     true
 }
 
