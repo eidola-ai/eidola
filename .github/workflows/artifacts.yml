@@ -861,11 +861,23 @@ jobs:
           # artifact this attempt already uploaded.
           overwrite: true
 
+  # A required check, so it must always reach a verdict of its own: with a
+  # plain `needs` a failed build would skip it, and GitHub (and `gh pr
+  # checks`) count a skipped job as a satisfied check. `always()` rather than
+  # `!cancelled()`, because a job a cancelled run never starts can also end
+  # skipped rather than cancelled: this job starts even then, and its first
+  # step fails unless every job it needs succeeded. So it is red for an
+  # invalid head (Guard failed, the builds skipped) at the cost of a few
+  # seconds of an ubuntu runner, red after any failed, skipped or cancelled
+  # job, and cancelled (never green) if it is itself cancelled.
   artifact-manifest:
     name: Verify artifact manifest
+    if: ${{ always() }}
     needs:
+      - guard
       - oci
       - oci-engine
+      - engine-enclaves
       - apple
       - linux-gui
       - linux-deb-arm64
@@ -880,6 +892,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Require every needed job to have succeeded
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 -I scripts/require-needs-success.py
 
       - name: Install Rust toolchain
         run: rustup show
@@ -905,6 +922,7 @@ jobs:
           key: cvm-${{ hashFiles('tinfoil-config.yml') }}
 
       - name: Materialize oci outputs and build partials
+        id: materialize
         env:
           STAMPED_CONFIG: ${{ needs.oci.outputs.stamped_tinfoil_config }}
           SERVER_ENCLAVE: ${{ needs.oci.outputs.server_enclave }}
@@ -914,13 +932,36 @@ jobs:
           LINUX_GUI_MANIFEST: ${{ needs.linux-gui.outputs.artifact_manifest }}
           LINUX_DEB_MANIFEST: ${{ needs.linux-deb-arm64.outputs.artifact_manifest }}
         run: |
+          # The committed tinfoil-config.yml and server-enclave.json must be
+          # exactly what the oci job recomputed: the stamped config (the
+          # committed one with the built gateway's digest) and the enclave
+          # measured from it. Nothing below reads the committed copies, and
+          # both ship (the config is what the platform deploys and the
+          # release's HOST_DATA check hashes; the enclave file is the cli's
+          # trust-root input), so a stale copy beside a correct manifest
+          # would otherwise pass.
+          printf '%s\n' "$STAMPED_CONFIG" > /tmp/stamped-tinfoil-config.yml
+          printf '%s\n' "$SERVER_ENCLAVE" > /tmp/recomputed-server-enclave.json
+          committed=true
+          if ! cmp -s tinfoil-config.yml /tmp/stamped-tinfoil-config.yml; then
+            echo "::error::the committed tinfoil-config.yml is not the config this build stamped"
+            diff -u tinfoil-config.yml /tmp/stamped-tinfoil-config.yml || true
+            committed=false
+          fi
+          if ! cmp -s releases/trust/server-enclave.json /tmp/recomputed-server-enclave.json; then
+            echo "::error::the committed releases/trust/server-enclave.json is not the enclave this build recomputed"
+            diff -u releases/trust/server-enclave.json /tmp/recomputed-server-enclave.json || true
+            committed=false
+          fi
+          echo "committed=$committed" >> "$GITHUB_OUTPUT"
+
           # Overwrite the workspace tinfoil-config.yml and server-enclave.json
           # with the authoritative values the oci job produced. verify-full
           # below reads both via --config / --server-enclave and recomputes
           # the enclave from the stamped config — by construction the
-          # recompute equals the server-enclave we just installed, so the
-          # only thing being verified is "does the committed
-          # artifact-manifest.json equal what the build actually produced?"
+          # recompute equals the server-enclave we just installed, so what
+          # it verifies is "does the committed artifact-manifest.json equal
+          # what the build actually produced?"
           printf '%s\n' "$STAMPED_CONFIG" > tinfoil-config.yml
           printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
           printf '%s' "$OCI_MANIFEST" > /tmp/oci-artifact-manifest.json
@@ -951,7 +992,7 @@ jobs:
           fi
 
       - name: Request manifest update (PR only)
-        if: steps.verify.outputs.match == 'false' && github.event_name == 'pull_request'
+        if: (steps.verify.outputs.match == 'false' || steps.materialize.outputs.committed == 'false') && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -983,5 +1024,5 @@ jobs:
               --input -
 
       - name: Fail on manifest mismatch
-        if: steps.verify.outputs.match == 'false'
+        if: steps.verify.outputs.match == 'false' || steps.materialize.outputs.committed == 'false'
         run: exit 1

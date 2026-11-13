@@ -217,6 +217,7 @@ check:
     ./scripts/check-manifest-determinism.sh
     ./scripts/check-rust-toolchain.sh
     ./scripts/test-check-rust-toolchain.sh
+    ./scripts/test-require-needs-success.sh
     ./scripts/artifact-manifest.sh check-complete
     ./scripts/test-release-assets.sh
     ./scripts/test-weights-hash.sh

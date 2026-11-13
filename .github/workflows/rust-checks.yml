@@ -145,6 +145,12 @@ jobs:
           ./scripts/check-rust-toolchain.sh
           ./scripts/test-check-rust-toolchain.sh
 
+      - name: Test the needs gate of required jobs
+        # Deliberately ungated: the script decides whether a required
+        # artifacts check may pass, and that job runs only on the `main`
+        # chain, so every case it decides is driven here. Python 3 only.
+        run: ./scripts/test-require-needs-success.sh
+
       - name: Check artifact-manifest completeness
         # The committed manifest must carry exactly the artifact set the
         # emitted schema requires. A schema change that forgets a row is
