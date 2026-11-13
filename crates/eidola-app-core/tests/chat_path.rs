@@ -740,10 +740,11 @@ fn a_new_credential_fills_what_the_wallet_cannot() {
 // ---------------------------------------------------------------------------
 
 /// A prompt whose hold on [`MockConfig::mimo_priced`]'s row is about
-/// 1,400,000 credits: past one denomination, so no single credential this
+/// 1,225,000 credits: past one denomination, so no single credential this
 /// client issues pays it. Each byte is about half a credit there (two thirds
 /// of a chargeable token at 0.75 credits a token), and the completion side
-/// holds 196,608.
+/// holds the ladder's lowest rung, 24,576: a turn's ceiling is lowered as far
+/// as the ladder goes before its hold passes one denomination.
 fn a_prompt_past_one_denomination() -> String {
     "x".repeat(2_400_000)
 }
@@ -764,7 +765,7 @@ fn wallet_states(core: &AppCore) -> Vec<(String, i64)> {
 
 /// REGRESSION: **a hold past one denomination is issued one denomination,
 /// never its own size, and is paid by a drain and a fill.** On the shipped
-/// MiMo row a long prompt holds about 1.4 denominations. The wallet holds
+/// MiMo row a long prompt holds about 1.2 denominations. The wallet holds
 /// 100,000 and 600,000: no pair of them pays, and a credential sized to fill
 /// beside the first (the hold less 100,000) would be issued for exactly the
 /// share its spend then shows, linking the account to the request by amount.
@@ -791,6 +792,11 @@ fn a_large_hold_is_issued_one_denomination_and_paid_by_a_drain_and_a_fill() {
         assert!(
             worst > DEFAULT_ALLOCATION_CREDITS && worst <= 600_000 + DEFAULT_ALLOCATION_CREDITS,
             "the hold is past one denomination and within the residual beside one: {worst}"
+        );
+        assert_eq!(
+            mock.chat_bodies()[0]["max_completion_tokens"].as_u64(),
+            Some(8_192),
+            "a prompt that alone passes one denomination asks for the lowest rung"
         );
         assert!(worst - 100_000 > DEFAULT_ALLOCATION_CREDITS);
         assert_eq!(
@@ -856,7 +862,7 @@ fn a_balance_below_the_denomination_is_issued_whole() {
 
 /// REGRESSION: **a hold past what a residual and one denomination can pay is
 /// refused before anything is issued or any credential touched.** The wallet
-/// holds 100,000 and the hold is about 1.4 denominations: paying it would need
+/// holds 100,000 and the hold is about 1.2 denominations: paying it would need
 /// an issuance sized to the request. The turn fails with the typed refusal;
 /// no issuance is asked for, no chat request is sent, the wallet is exactly
 /// as it was, and only the post (which a turn persists first) is announced.
@@ -931,6 +937,45 @@ fn an_empty_wallets_hold_past_one_denomination_is_refused() {
         assert_eq!(mock.issuance_requests(), 0);
         assert!(mock.issued_amounts().is_empty());
         assert_eq!(mock.chat_hits(), 0);
+    });
+}
+
+/// **A hold is fitted under one denomination before it is refused.** On the
+/// shipped MiMo row this prompt held at the model's whole output limit passes
+/// one denomination, which an empty wallet could not pay. The ceiling ladder
+/// lowers the ceiling a rung at a time while the hold would pass the
+/// denomination, so the turn asks for less output, holds less than one
+/// denomination, and is paid by the one issued for it: the ladder's fit and
+/// the payability rule turn on the same constant.
+#[test]
+fn a_long_prompt_is_fitted_under_one_denomination_instead_of_refused() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            mimo_priced: true,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("x".repeat(1_700_000), MODEL.into(), None))
+            .expect("one denomination pays the fitted hold");
+
+        let hold = mock.chat_charges()[0].expect("a hold") as i64;
+        let ceiling = mock.chat_bodies()[0]["max_completion_tokens"]
+            .as_u64()
+            .expect("a ceiling");
+        assert_eq!(ceiling, 32_768, "one rung under the declared limit");
+        assert!(hold <= DEFAULT_ALLOCATION_CREDITS, "{hold}");
+        let at_the_limit = hold
+            + ((chat_harness::MIMO_MAX_OUTPUT_TOKENS - ceiling)
+                * chat_harness::MIMO_COMPLETION_RATE
+                / 1_000_000) as i64;
+        assert!(
+            at_the_limit > DEFAULT_ALLOCATION_CREDITS,
+            "held at the whole limit it would have been refused: {at_the_limit}"
+        );
+        assert_eq!(mock.issued_amounts(), vec![DEFAULT_ALLOCATION_CREDITS]);
+        assert_eq!(mock.chat_shares()[0], vec![hold as u128], "one input");
+        assert_eq!(mock.hold_mismatches(), 0);
     });
 }
 
@@ -14408,4 +14453,81 @@ fn the_undeclared_resend_never_converts() {
             assert!(mock.issuance_requests() > issuances);
         });
     }
+}
+
+/// **A resend no attempt could pay is refused as the request's problem.** A
+/// request is cheap to hold while an engine holds its prefix and dear without
+/// it: here the declared request is paid from the wallet's one credential,
+/// the engine refuses the declaration, and the same request undeclared holds
+/// more than that credential and one fresh denomination pay together. The
+/// resend is refused with `HoldExceedsDenomination`, not the retryable
+/// `UncachedRetryUnfunded`, because an attempt free to convert would be
+/// refused too; nothing is asked of the account, no undeclared request is
+/// sent, and the wallet has paid the refused declaration's fee and nothing
+/// else.
+#[test]
+fn a_resend_past_what_one_denomination_pays_is_refused_as_the_requests_problem() {
+    run(|| {
+        // A window that holds the whole conversation: a declaration past the
+        // model's window is never made.
+        let (mock, core, _dir) = setup(MockConfig {
+            context_length: Some(4_194_304),
+            ..declaring_config(ChatBehavior::StreamingWithMetadataRefund)
+        });
+        with_account(&core);
+        // One credential that pays the first turn alone.
+        let held = 2_100_000;
+        core.runtime()
+            .block_on(core.account_allocate(held))
+            .expect("an allocation");
+        let first = turn(&core, &"x".repeat(3_000_000), None, None);
+        let space = first.space_id.clone();
+        assert_eq!(active_balances(&core), vec![held]);
+        let issuances = mock.issuance_requests();
+        mock.refuse_next_declared("cached_prefix_missing");
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let err = core
+            .runtime()
+            .block_on(core.chat_stream_reply(
+                "y".repeat(2_100_000),
+                MODEL.into(),
+                Some(space),
+                None,
+                tx,
+            ))
+            .expect_err("nothing could pay the request undeclared");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2, "no undeclared request was sent");
+        assert!(declared_prefix(&bodies[1]).is_some());
+        assert_eq!(mock.declared_refusals(), 1);
+        let declared = mock.chat_charges()[1].expect("a hold") as i64;
+        assert!(declared <= held, "declared, the wallet paid it: {declared}");
+        let undeclared = undeclared_hold(&bodies[1]) as i64;
+        let left = held - chat_harness::REQUEST_FEE as i64;
+        assert!(
+            undeclared > left + DEFAULT_ALLOCATION_CREDITS,
+            "undeclared, it is past the credential and one denomination: {undeclared}"
+        );
+        match err {
+            AppError::HoldExceedsDenomination { hold, denomination } => {
+                assert_eq!(hold, undeclared);
+                assert_eq!(denomination, DEFAULT_ALLOCATION_CREDITS);
+            }
+            other => panic!("expected HoldExceedsDenomination, got {other:?}"),
+        }
+        assert_eq!(
+            mock.issuance_requests(),
+            issuances,
+            "nothing was asked of the account"
+        );
+        assert!(spending_credentials(&core).is_empty());
+        assert_eq!(
+            active_balances(&core),
+            vec![left],
+            "the refused declaration cost its fee and nothing else"
+        );
+        assert_eq!(mock.hold_mismatches(), 0);
+    });
 }

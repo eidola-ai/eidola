@@ -344,8 +344,8 @@ pub fn parse(path: &str, bytes: &[u8]) -> Result<Row, String> {
     };
     if matches!(price, Price::PerToken { .. }) && caps.max_output_tokens.is_none() {
         return Err(at(
-            "a token-priced row declares capabilities.max_output_tokens: its completion is held \
-             and served at that ceiling",
+            "a token-priced row declares capabilities.max_output_tokens: it bounds the \
+             completion a request is held and served for",
         ));
     }
 

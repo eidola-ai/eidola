@@ -1877,14 +1877,17 @@ pub struct SpendTrailEntry {
 /// issuance, an account-linked and timed operation, is rare against what
 /// ordinary turns hold, and small enough that little of a customer's balance
 /// sits in anonymous credentials ahead of need, where it lapses with its key.
-/// What a turn holds is the shared pricing contract
-/// (`eidola_common::prompt_charge`) applied to the catalog row's rates and
-/// declared `max_output_tokens`, so how many turns one denomination carries
-/// is a property of the catalog, not of this constant. A request is paid
-/// when what the wallet holds, or one held credential drained beside one
-/// fresh denomination, covers its hold, and refused otherwise
-/// ([`AppError::HoldExceedsDenomination`]); `docs/anonymous-credits.md` →
-/// Issuance sizing.
+/// What a request holds is the shared pricing contract
+/// (`eidola_common::pricing`): the request fee, its prompt at the catalog
+/// row's rates (counted by its bytes, or declared cached), and the completion
+/// ceiling it names. So how many requests one denomination carries is a
+/// property of the catalog and of the requests, not of this constant. The
+/// ceiling an Eidola turn names is lowered while the hold would pass this
+/// constant ([`ladder_ceiling`]), so only a prompt can take a hold past it.
+/// A request is paid when what the wallet holds, or one held credential
+/// drained beside one fresh denomination, covers its hold, and refused
+/// otherwise ([`AppError::HoldExceedsDenomination`]);
+/// `docs/anonymous-credits.md` → Issuance sizing.
 pub const DEFAULT_ALLOCATION_CREDITS: i64 = 1_000_000;
 
 // --- Ahead-of-need provisioning ---------------------------------------------
@@ -7182,12 +7185,20 @@ impl Inner {
             // Past what the wallet and one fresh denomination could ever pay:
             // refused before a stranded hold is asked for, a balance read or
             // anything issued, since none of them could make it payable.
-            let held: Vec<i64> = db::spendable_credentials(db_conn)
+            //
+            // In flight is read first. A settlement is not under
+            // `spend_gate`, so one can land between the two reads; it moves
+            // a credential out of `spending` and writes its successor in one
+            // insert. Read in this order, such a credential is counted in
+            // flight and its successor as held, which can only raise the
+            // bound; read the other way it would be in neither list, and a
+            // payable request would be refused for good.
+            let in_flight: Vec<i64> = db::list_spending_credentials(db_conn)
                 .await?
                 .into_iter()
                 .map(|c| c.credits)
                 .collect();
-            let in_flight: Vec<i64> = db::list_spending_credentials(db_conn)
+            let held: Vec<i64> = db::spendable_credentials(db_conn)
                 .await?
                 .into_iter()
                 .map(|c| c.credits)

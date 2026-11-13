@@ -17867,9 +17867,11 @@ async fn a_stale_model_selection_says_which_model_and_substitutes_none(
 /// credential and one fresh denomination pay together
 /// (`AppError::HoldExceedsDenomination`), because the alternative is an
 /// issuance sized to the request. Adding credit cannot lift that, so the copy
-/// must not route the reader to buy any: it says nothing was sent or charged
-/// and names what does help, with no figures. Switched to French without
-/// re-emitting, as every localized arm is pinned.
+/// must not route the reader to buy any: it says the request was not sent and
+/// names what does help, with no figures. **It promises nothing about the rest
+/// of the reply**: the refusal can come at a later tool round, or at the resend
+/// of a request the server refused, after earlier requests were charged.
+/// Switched to French without re-emitting, as every localized arm is pinned.
 #[gpui::test]
 async fn a_hold_past_one_denomination_is_explained_without_offering_to_sell_credit(
     cx: &mut gpui::TestAppContext,
@@ -17904,8 +17906,12 @@ async fn a_hold_past_one_denomination_is_explained_without_offering_to_sell_cred
 
     let english = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
     assert!(
-        english.contains("nothing was sent and nothing was charged"),
+        english.contains("the request was not sent and nothing was charged for it"),
         "{english}"
+    );
+    assert!(
+        !english.contains("nothing was sent"),
+        "earlier requests of the reply may have been sent and charged: {english}"
     );
     assert!(
         english.contains("Adding credit won’t change that"),

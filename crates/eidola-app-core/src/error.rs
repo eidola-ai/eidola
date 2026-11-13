@@ -136,9 +136,13 @@ pub enum AppError {
     /// wallet holds, or one held credential drained beside one fresh
     /// denomination, covers it (`docs/anonymous-credits.md` → Issuance
     /// sizing). Refused before any credential is touched or anything is
-    /// issued, so nothing was charged. Distinct from
-    /// [`AppError::InsufficientBalance`]: adding credit does not lift it; a
-    /// smaller request does.
+    /// issued, so the refused request is charged nothing. **That is a
+    /// statement about one request, not about its turn**: a later tool round
+    /// can be refused after earlier rounds were answered and charged, and the
+    /// resend of a declaration an engine refused comes after that request's
+    /// fee. A surface says the request was not sent, never that the turn cost
+    /// nothing. Distinct from [`AppError::InsufficientBalance`]: adding credit
+    /// does not lift it; a smaller request does.
     ///
     /// `hold` is the request's worst case in credits, saturated at
     /// `i64::MAX` for one too large to represent.

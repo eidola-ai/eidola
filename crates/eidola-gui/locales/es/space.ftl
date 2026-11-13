@@ -18,7 +18,7 @@ space-footnote-delegation-failed = se detuvo: { $reason ->
 
 space-regenerating = Regenerando…
 space-error-model-unavailable = { $model } ya no está disponible en su backend, y ningún otro modelo responderá en su lugar. No se envió nada ni se cobró nada: elige otro modelo e inténtalo de nuevo.
-space-error-hold-exceeds-denomination = Esta respuesta podría costar más de lo que una sola solicitud puede retener, así que no se envió nada ni se cobró nada. Añadir crédito no lo cambiará: prueba con una conversación más corta o con otro modelo.
+space-error-hold-exceeds-denomination = Esta respuesta podría costar más de lo que una sola solicitud puede retener, así que la solicitud no se envió ni se cobró nada por ella. Añadir crédito no lo cambiará: prueba con una conversación más corta o con otro modelo.
 space-regenerating-elsewhere = Esta respuesta ya se está regenerando.
 space-answer-cut-off = Esta respuesta se detuvo en su límite de longitud.
 space-continue-answer = Continuar
