@@ -75,58 +75,24 @@ pub enum BackendStreamEvent {
 // Static model catalog
 // ---------------------------------------------------------------------------
 
-/// Default pricing markup factor.
-pub const DEFAULT_PRICING_MARKUP: f64 = 1.5;
-
-/// Validate that the pricing markup covers the contract's safe cost factor.
-///
-/// The shared client/server pricing contract (`eidola-common`) charges the
-/// prompt-side byte term at no less than `bytes / N`, where `N =
-/// SAFE_COST_FACTOR_NUM / SAFE_COST_FACTOR_DEN` — and since BPE tokenizers
-/// never produce more tokens than content bytes, the worst-case
-/// actual/charged token ratio on that term is exactly `N`. Break-even on
-/// dynamic costs therefore requires `PRICING_MARKUP >= N`; a markup below
-/// the factor silently opens a loss window, so startup refuses it outright.
-///
-/// Future refinement (out of scope for now): when the configured markup
-/// exceeds the factor, the server could publish a larger dynamic factor to
-/// clients via the `/models` payload instead of both sides relying on the
-/// compiled-in constants.
-pub fn validate_pricing_markup(markup: f64) -> Result<(), String> {
-    let floor =
-        eidola_common::SAFE_COST_FACTOR_NUM as f64 / eidola_common::SAFE_COST_FACTOR_DEN as f64;
-    // `is_nan` check: a NaN markup must fail too, and `<` alone lets it pass.
-    if markup.is_nan() || markup < floor {
-        return Err(format!(
-            "PRICING_MARKUP ({markup}) must be >= the safe cost factor \
-             {}/{} = {floor}: the pricing contract charges prompt bytes at \
-             1/{floor} of their worst-case token count, so a lower markup \
-             would sell tokens below cost",
-            eidola_common::SAFE_COST_FACTOR_NUM,
-            eidola_common::SAFE_COST_FACTOR_DEN,
-        ));
-    }
-    Ok(())
-}
-
 /// Fixed scale factor for pricing: credits per token = value / PRICING_SCALE_FACTOR.
 /// It is the shared pricing contract's own scale, so a published rate is the
 /// rate `eidola_common::pricing` computes with.
 pub const PRICING_SCALE_FACTOR: u64 = eidola_common::pricing::RATE_SCALE;
 
-/// Convert USD per million tokens to scaled integer credits, applying markup.
+/// Convert USD per million tokens to scaled integer credits.
 ///
 /// The 1e6 (USD→µ$) and /1e6 (per-M→per-token) factors cancel, leaving:
-/// `scaled = usd_per_million * markup * PRICING_SCALE_FACTOR`
-fn usd_per_m_to_scaled_credits(usd_per_million: f64, markup: f64) -> u64 {
-    (usd_per_million * markup * PRICING_SCALE_FACTOR as f64).ceil() as u64
+/// `scaled = usd_per_million * PRICING_SCALE_FACTOR`
+fn usd_per_m_to_scaled_credits(usd_per_million: f64) -> u64 {
+    (usd_per_million * PRICING_SCALE_FACTOR as f64).ceil() as u64
 }
 
-/// Convert USD per request to scaled integer credits, applying markup.
-fn usd_per_req_to_scaled_credits(usd_per_request: f64, markup: f64) -> u64 {
-    // credits/request = USD * 1e6 (USD→µ$) * markup
+/// Convert USD per request to scaled integer credits.
+fn usd_per_req_to_scaled_credits(usd_per_request: f64) -> u64 {
+    // credits/request = USD * 1e6 (USD→µ$)
     // scaled = credits/request * PRICING_SCALE_FACTOR
-    (usd_per_request * 1e6 * markup * PRICING_SCALE_FACTOR as f64).ceil() as u64
+    (usd_per_request * 1e6 * PRICING_SCALE_FACTOR as f64).ceil() as u64
 }
 
 /// Runtime pricing override for one model, from `PRICING_OVERRIDES`.
@@ -235,8 +201,8 @@ pub fn parse_pricing_overrides(
 
 /// The models this gateway sells, as published on `/v1/models`: the served
 /// `MODEL_CATALOG` rows (`crate::models`), each with its pin's
-/// capabilities and deployments and with prices after markup and any
-/// `PRICING_OVERRIDES`.
+/// capabilities and deployments and with each row's price, or its
+/// `PRICING_OVERRIDES` entry.
 ///
 /// **The catalog is a build input, never a boot-time read of anything.** It
 /// is what an enclave *publishes* about the models it sells, and clients
@@ -266,15 +232,11 @@ pub struct ResolvedModel {
 }
 
 impl Catalog {
-    /// The shipped catalog, at `pricing_markup` (default
-    /// [`DEFAULT_PRICING_MARKUP`]) with `pricing_overrides` (the
-    /// `PRICING_OVERRIDES` JSON) applied. An override that does not name a
+    /// The shipped catalog, at the prices its rows state, with
+    /// `pricing_overrides` (the `PRICING_OVERRIDES` JSON) applied. An override that does not name a
     /// served row by hash, or does not fit its pricing shape, is an error:
     /// the boot refuses it.
-    pub fn new(
-        pricing_markup: Option<f64>,
-        pricing_overrides: Option<&str>,
-    ) -> Result<Self, String> {
+    pub fn new(pricing_overrides: Option<&str>) -> Result<Self, String> {
         Self::build(
             MODEL_CATALOG,
             engine_trust::PINNED_MODELS,
@@ -282,7 +244,6 @@ impl Catalog {
                 engine_trust::accepted_deployments(id)
                     .unwrap_or_else(|e| panic!("the compiled-in pins of {id} do not read: {e}"))
             },
-            pricing_markup.unwrap_or(DEFAULT_PRICING_MARKUP),
             pricing_overrides,
         )
     }
@@ -291,7 +252,6 @@ impl Catalog {
         rows: &'static [CatalogRow],
         pins: &[PinnedModel],
         deployments: &dyn Fn(&str) -> Vec<engine_trust::AcceptedDeployment>,
-        markup: f64,
         pricing_overrides: Option<&str>,
     ) -> Result<Self, String> {
         let overrides = match pricing_overrides {
@@ -306,13 +266,7 @@ impl Catalog {
                     .iter()
                     .find(|p| p.id() == row.sha256)
                     .unwrap_or_else(|| panic!("{} has no engine pin", row.sha256));
-                published(
-                    row,
-                    pin,
-                    deployments(row.sha256),
-                    markup,
-                    overrides.get(row.sha256),
-                )
+                published(row, pin, deployments(row.sha256), overrides.get(row.sha256))
             })
             .collect();
         Ok(Self { rows, models })
@@ -323,10 +277,9 @@ impl Catalog {
     pub(crate) fn from_parts(
         rows: &'static [CatalogRow],
         pins: &[PinnedModel],
-        markup: f64,
         pricing_overrides: Option<&str>,
     ) -> Result<Self, String> {
-        Self::build(rows, pins, &|_| Vec::new(), markup, pricing_overrides)
+        Self::build(rows, pins, &|_| Vec::new(), pricing_overrides)
     }
 
     /// Resolve a client's `model` field (`crate::models::resolve`).
@@ -354,7 +307,6 @@ fn published(
     row: &CatalogRow,
     pin: &PinnedModel,
     deployments: Vec<engine_trust::AcceptedDeployment>,
-    markup: f64,
     ovr: Option<&PricingOverride>,
 ) -> Model {
     let pricing = match row.price {
@@ -371,7 +323,7 @@ fn published(
                 },
                 per_cached_prompt_token: None,
                 per_request: Some(ScaledPrice {
-                    value: usd_per_req_to_scaled_credits(per_req, markup),
+                    value: usd_per_req_to_scaled_credits(per_req),
                     scale_factor: PRICING_SCALE_FACTOR,
                 }),
             }
@@ -386,15 +338,15 @@ fn published(
             let cached_input = ovr.and_then(|o| o.cached_input).or(cached_input_per_m);
             ModelPricing {
                 per_prompt_token: ScaledPrice {
-                    value: usd_per_m_to_scaled_credits(input, markup),
+                    value: usd_per_m_to_scaled_credits(input),
                     scale_factor: PRICING_SCALE_FACTOR,
                 },
                 per_completion_token: ScaledPrice {
-                    value: usd_per_m_to_scaled_credits(output, markup),
+                    value: usd_per_m_to_scaled_credits(output),
                     scale_factor: PRICING_SCALE_FACTOR,
                 },
                 per_cached_prompt_token: cached_input.map(|usd| ScaledPrice {
-                    value: usd_per_m_to_scaled_credits(usd, markup),
+                    value: usd_per_m_to_scaled_credits(usd),
                     scale_factor: PRICING_SCALE_FACTOR,
                 }),
                 per_request: None,
@@ -487,35 +439,16 @@ pub(crate) mod tests {
     use crate::types::{Modality, OutputBudgetClass};
 
     #[test]
-    fn markup_below_safe_cost_factor_is_rejected() {
-        // The startup gate: a markup under the contract's safe cost factor
-        // (3/2 = 1.5) would sell prompt tokens below cost.
-        assert!(validate_pricing_markup(1.2).is_err());
-        assert!(validate_pricing_markup(0.0).is_err());
-        assert!(validate_pricing_markup(f64::NAN).is_err());
-        assert!(validate_pricing_markup(1.5).is_ok());
-        assert!(validate_pricing_markup(DEFAULT_PRICING_MARKUP).is_ok());
-        assert!(validate_pricing_markup(2.0).is_ok());
-    }
-
-    #[test]
     fn test_usd_per_m_to_scaled_credits() {
-        // $1.8/M tokens with 1.5x markup.
         // The 1e6 factors (USD→µ$ and /M→/token) cancel:
-        // scaled = 1.8 * 1.5 * 1_000_000 = 2_700_000
-        assert_eq!(usd_per_m_to_scaled_credits(1.8, 1.5), 2_700_000);
+        // scaled = 2.7 * 1_000_000 = 2_700_000
+        assert_eq!(usd_per_m_to_scaled_credits(2.7), 2_700_000);
+        assert_eq!(usd_per_m_to_scaled_credits(0.225), 225_000);
+        assert_eq!(usd_per_m_to_scaled_credits(0.0), 0);
 
-        // $0.15/M with 1.5x markup
-        // scaled = 0.15 * 1.5 * 1_000_000 = 225_000
-        assert_eq!(usd_per_m_to_scaled_credits(0.15, 1.5), 225_000);
-
-        // Zero price
-        assert_eq!(usd_per_m_to_scaled_credits(0.0, 1.5), 0);
-
-        // A rate with no exact binary representation: $0.05/M with 1.5x markup.
-        // 0.05 * 1.5 = 0.075; ceil(0.075 * 1e6) = 75_000
-        // (may be 75_001 due to f64 representation — ceil rounds up any epsilon)
-        let epsilon_rate = usd_per_m_to_scaled_credits(0.05, 1.5);
+        // A rate with no exact binary representation rounds up, by at most
+        // one scaled unit.
+        let epsilon_rate = usd_per_m_to_scaled_credits(0.075);
         assert!(
             epsilon_rate == 75_000 || epsilon_rate == 75_001,
             "got {epsilon_rate}"
@@ -524,13 +457,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_usd_per_req_to_scaled_credits() {
-        // $0.01/req with 1.5x markup
-        // credits/req = 0.01 * 1e6 * 1.5 = 15_000
+        // $0.015/req: credits/req = 0.015 * 1e6 = 15_000
         // scaled = 15_000 * 1e6 = 15_000_000_000
-        assert_eq!(usd_per_req_to_scaled_credits(0.01, 1.5), 15_000_000_000);
-
-        // Zero
-        assert_eq!(usd_per_req_to_scaled_credits(0.0, 1.5), 0);
+        assert_eq!(usd_per_req_to_scaled_credits(0.015), 15_000_000_000);
+        assert_eq!(usd_per_req_to_scaled_credits(0.0), 0);
     }
 
     // -----------------------------------------------------------------
@@ -640,19 +570,16 @@ pub(crate) mod tests {
     ];
     pub(crate) const FIXTURE_PINS: &[PinnedModel] = &[ENGINE_PIN, pin(STANDARD_SHA, false)];
 
-    fn fixture(markup: f64, overrides: Option<&str>) -> Catalog {
-        Catalog::from_parts(FIXTURE_CATALOG, FIXTURE_PINS, markup, overrides).unwrap()
+    fn fixture(overrides: Option<&str>) -> Catalog {
+        Catalog::from_parts(FIXTURE_CATALOG, FIXTURE_PINS, overrides).unwrap()
     }
 
     /// The production catalog and the fixture one, each with its pins: every
     /// check below runs over both.
     fn catalogs() -> [(&'static [CatalogRow], Catalog); 2] {
         [
-            (
-                MODEL_CATALOG,
-                Catalog::new(Some(DEFAULT_PRICING_MARKUP), None).unwrap(),
-            ),
-            (FIXTURE_CATALOG, fixture(DEFAULT_PRICING_MARKUP, None)),
+            (MODEL_CATALOG, Catalog::new(None).unwrap()),
+            (FIXTURE_CATALOG, fixture(None)),
         ]
     }
 
@@ -662,7 +589,7 @@ pub(crate) mod tests {
 
     /// Every served row reaches the wire **whole**: its hash, tags, source and
     /// manifest, lifecycle, window, capabilities, declared output ceiling, and
-    /// prices multiplied by the markup and by nothing else. A retired row is
+    /// prices as the row states them. A retired row is
     /// not listed.
     ///
     /// The table this walks is the catalog itself rather than a second
@@ -725,7 +652,7 @@ pub(crate) mod tests {
                 match row.price {
                     RowPrice::PerRequest { usd } => assert_eq!(
                         model.pricing.per_request.as_ref().map(|p| p.value),
-                        Some(usd_per_req_to_scaled_credits(usd, DEFAULT_PRICING_MARKUP)),
+                        Some(usd_per_req_to_scaled_credits(usd)),
                         "{id} request price"
                     ),
                     RowPrice::PerToken {
@@ -740,20 +667,17 @@ pub(crate) mod tests {
                                 .per_cached_prompt_token
                                 .as_ref()
                                 .map(|p| p.value),
-                            cached_input_per_m.map(|usd| usd_per_m_to_scaled_credits(
-                                usd,
-                                DEFAULT_PRICING_MARKUP
-                            )),
+                            cached_input_per_m.map(usd_per_m_to_scaled_credits),
                             "{id} cached prompt price"
                         );
                         assert_eq!(
                             model.pricing.per_prompt_token.value,
-                            usd_per_m_to_scaled_credits(input_per_m, DEFAULT_PRICING_MARKUP),
+                            usd_per_m_to_scaled_credits(input_per_m),
                             "{id} prompt price"
                         );
                         assert_eq!(
                             model.pricing.per_completion_token.value,
-                            usd_per_m_to_scaled_credits(output_per_m, DEFAULT_PRICING_MARKUP),
+                            usd_per_m_to_scaled_credits(output_per_m),
                             "{id} completion price"
                         );
                     }
@@ -806,7 +730,7 @@ pub(crate) mod tests {
     #[test]
     fn pricing_overrides_are_keyed_by_weights_hash() {
         let overrides = format!(r#"{{"{ENGINE_SHA}": {{"input": 2.0, "output": 6.0}}}}"#);
-        let models = fixture(1.0, Some(&overrides)).list().data;
+        let models = fixture(Some(&overrides)).list().data;
         let overridden = models.iter().find(|m| m.sha256 == ENGINE_SHA).unwrap();
         assert_eq!(overridden.pricing.per_prompt_token.value, 2_000_000);
         assert_eq!(overridden.pricing.per_completion_token.value, 6_000_000);
@@ -816,16 +740,16 @@ pub(crate) mod tests {
         let other = models.iter().find(|m| m.sha256 == STANDARD_SHA).unwrap();
         assert_eq!(
             other.pricing.per_prompt_token.value,
-            usd_per_m_to_scaled_credits(0.20, 1.0)
+            usd_per_m_to_scaled_credits(0.20)
         );
     }
 
-    /// A row's cached prompt rate reaches the wire with the markup applied
-    /// like its other prices, and is absent for a row that sells none; an
+    /// A row's cached prompt rate reaches the wire like its other prices, and
+    /// is absent for a row that sells none; an
     /// override's `cached_input` sets it, on a row that sold one or not.
     #[test]
     fn the_cached_prompt_rate_is_published_and_overridable() {
-        let models = fixture(1.5, None).list().data;
+        let models = fixture(None).list().data;
         let engine = models.iter().find(|m| m.sha256 == ENGINE_SHA).unwrap();
         assert_eq!(
             engine
@@ -833,8 +757,8 @@ pub(crate) mod tests {
                 .per_cached_prompt_token
                 .as_ref()
                 .map(|p| p.value),
-            Some(675_000),
-            "$0.45/M at 1.5"
+            Some(450_000),
+            "$0.45/M"
         );
         let standard = models.iter().find(|m| m.sha256 == STANDARD_SHA).unwrap();
         assert!(standard.pricing.per_cached_prompt_token.is_none());
@@ -843,13 +767,13 @@ pub(crate) mod tests {
         let wire = serde_json::to_value(engine).unwrap();
         assert_eq!(
             wire["pricing"]["per_cached_prompt_token"],
-            serde_json::json!({"value": 675_000, "scale_factor": PRICING_SCALE_FACTOR})
+            serde_json::json!({"value": 450_000, "scale_factor": PRICING_SCALE_FACTOR})
         );
 
         let overrides = format!(
             r#"{{"{ENGINE_SHA}": {{"cached_input": 0.30}}, "{STANDARD_SHA}": {{"cached_input": 0.05, "input": 0.10}}}}"#
         );
-        let models = fixture(1.0, Some(&overrides)).list().data;
+        let models = fixture(Some(&overrides)).list().data;
         let engine = models.iter().find(|m| m.sha256 == ENGINE_SHA).unwrap();
         assert_eq!(
             engine
@@ -871,7 +795,7 @@ pub(crate) mod tests {
         );
 
         // The shipped catalog publishes its rows' cached rates too.
-        let shipped = Catalog::new(Some(DEFAULT_PRICING_MARKUP), None).unwrap();
+        let shipped = Catalog::new(None).unwrap();
         for row in served(MODEL_CATALOG) {
             let model = shipped
                 .resolve(&format!("sha256:{}", row.sha256))
@@ -884,7 +808,7 @@ pub(crate) mod tests {
             {
                 assert_eq!(
                     model.pricing.per_cached_prompt_token.map(|p| p.value),
-                    Some(usd_per_m_to_scaled_credits(usd, DEFAULT_PRICING_MARKUP))
+                    Some(usd_per_m_to_scaled_credits(usd))
                 );
             }
         }
@@ -897,7 +821,7 @@ pub(crate) mod tests {
     #[test]
     fn a_cached_input_override_that_cannot_apply_fails_loudly() {
         let refused = |json: &str| {
-            Catalog::from_parts(FIXTURE_CATALOG, FIXTURE_PINS, 1.0, Some(json))
+            Catalog::from_parts(FIXTURE_CATALOG, FIXTURE_PINS, Some(json))
                 .err()
                 .unwrap_or_else(|| panic!("{json} was accepted"))
         };
@@ -916,32 +840,22 @@ pub(crate) mod tests {
             on(r#""input": 0.45"#),
         ] {
             assert!(
-                Catalog::from_parts(FIXTURE_CATALOG, FIXTURE_PINS, 1.0, Some(&ok)).is_ok(),
+                Catalog::from_parts(FIXTURE_CATALOG, FIXTURE_PINS, Some(&ok)).is_ok(),
                 "{ok}"
             );
         }
         let per_request = format!(r#"{{"{PER_REQUEST_SHA}": {{"cached_input": 0.001}}}}"#);
         assert!(
-            Catalog::from_parts(
-                PER_REQUEST_FIXTURE,
-                PER_REQUEST_PINS,
-                1.0,
-                Some(&per_request)
-            )
-            .err()
-            .expect("a per-request row takes no cached_input")
-            .contains("per request")
+            Catalog::from_parts(PER_REQUEST_FIXTURE, PER_REQUEST_PINS, Some(&per_request))
+                .err()
+                .expect("a per-request row takes no cached_input")
+                .contains("per request")
         );
         let with_request =
             format!(r#"{{"{PER_REQUEST_SHA}": {{"request": 0.02, "cached_input": 0.001}}}}"#);
         assert!(
-            Catalog::from_parts(
-                PER_REQUEST_FIXTURE,
-                PER_REQUEST_PINS,
-                1.0,
-                Some(&with_request)
-            )
-            .is_err()
+            Catalog::from_parts(PER_REQUEST_FIXTURE, PER_REQUEST_PINS, Some(&with_request))
+                .is_err()
         );
     }
 
@@ -951,7 +865,7 @@ pub(crate) mod tests {
     #[test]
     fn an_override_that_cannot_apply_fails_loudly() {
         let refused = |json: &str| {
-            Catalog::from_parts(FIXTURE_CATALOG, FIXTURE_PINS, 1.0, Some(json))
+            Catalog::from_parts(FIXTURE_CATALOG, FIXTURE_PINS, Some(json))
                 .err()
                 .unwrap_or_else(|| panic!("{json} was accepted"))
         };
@@ -973,7 +887,7 @@ pub(crate) mod tests {
                 .contains("PRICING_OVERRIDES")
         );
         assert!(refused("not json").contains("PRICING_OVERRIDES"));
-        assert!(Catalog::from_parts(FIXTURE_CATALOG, FIXTURE_PINS, 1.0, Some("{}")).is_ok());
+        assert!(Catalog::from_parts(FIXTURE_CATALOG, FIXTURE_PINS, Some("{}")).is_ok());
     }
 
     /// The per-request pricing shape, exercised against a **synthetic** row.
@@ -992,8 +906,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_per_request_model_pricing() {
-        let catalog =
-            Catalog::from_parts(PER_REQUEST_FIXTURE, PER_REQUEST_PINS, 1.0, None).unwrap();
+        let catalog = Catalog::from_parts(PER_REQUEST_FIXTURE, PER_REQUEST_PINS, None).unwrap();
         let model = &catalog.list().data[0];
         assert_eq!(model.pricing.per_prompt_token.value, 0);
         assert_eq!(model.pricing.per_completion_token.value, 0);
@@ -1005,8 +918,7 @@ pub(crate) mod tests {
 
         let overrides = format!(r#"{{"{PER_REQUEST_SHA}": {{"request": 0.02}}}}"#);
         let catalog =
-            Catalog::from_parts(PER_REQUEST_FIXTURE, PER_REQUEST_PINS, 1.0, Some(&overrides))
-                .unwrap();
+            Catalog::from_parts(PER_REQUEST_FIXTURE, PER_REQUEST_PINS, Some(&overrides)).unwrap();
         assert_eq!(
             catalog.list().data[0]
                 .pricing
@@ -1022,7 +934,7 @@ pub(crate) mod tests {
             price: RowPrice::PerRequest { usd: 0.0 },
             ..PER_REQUEST_FIXTURE[0]
         }];
-        let free = Catalog::from_parts(FREE, PER_REQUEST_PINS, 1.0, Some(&overrides)).unwrap();
+        let free = Catalog::from_parts(FREE, PER_REQUEST_PINS, Some(&overrides)).unwrap();
         let free = &free.list().data[0];
         assert_eq!(
             free.pricing.per_request.as_ref().unwrap().value,
@@ -1031,13 +943,7 @@ pub(crate) mod tests {
         assert_eq!(free.pricing.per_prompt_token.value, 0);
         let wrong_shape = format!(r#"{{"{PER_REQUEST_SHA}": {{"input": 0.02}}}}"#);
         assert!(
-            Catalog::from_parts(
-                PER_REQUEST_FIXTURE,
-                PER_REQUEST_PINS,
-                1.0,
-                Some(&wrong_shape)
-            )
-            .is_err()
+            Catalog::from_parts(PER_REQUEST_FIXTURE, PER_REQUEST_PINS, Some(&wrong_shape)).is_err()
         );
     }
 
@@ -1045,7 +951,7 @@ pub(crate) mod tests {
     /// tag the client used with the hash it resolved to.
     #[test]
     fn a_reference_resolves_to_its_hash() {
-        let catalog = fixture(1.5, None);
+        let catalog = fixture(None);
         let resolved = catalog.resolve("engine-latest").unwrap();
         assert_eq!(resolved.model.sha256, ENGINE_SHA);
         assert_eq!(resolved.echo, format!("engine-latest@sha256:{ENGINE_SHA}"));
@@ -1086,7 +992,7 @@ pub(crate) mod tests {
             "/../../releases/trust/engine-enclaves.json"
         )))
         .unwrap();
-        let catalog = Catalog::new(Some(DEFAULT_PRICING_MARKUP), None).unwrap();
+        let catalog = Catalog::new(None).unwrap();
         for row in served(MODEL_CATALOG) {
             let sha = row.sha256;
             for tag in row.tags {
@@ -1136,7 +1042,7 @@ pub(crate) mod tests {
     /// (a row is listed only with the deployments its build accepts).
     #[test]
     fn the_shipped_catalog_lists_only_its_pinned_rows() {
-        let catalog = Catalog::new(Some(DEFAULT_PRICING_MARKUP), None).unwrap();
+        let catalog = Catalog::new(None).unwrap();
         let listed = catalog.list().data;
         assert_eq!(listed.len(), served(MODEL_CATALOG).count());
         for model in &listed {
@@ -1152,7 +1058,7 @@ pub(crate) mod tests {
     /// A row publishes its pin's weights and prompt-cache retention.
     #[test]
     fn a_row_publishes_what_its_pin_fixes() {
-        let engine = &fixture(1.5, None).list().data[0];
+        let engine = &fixture(None).list().data[0];
         assert_eq!(
             engine.capabilities.prompt_cache,
             PromptCacheCapability {
@@ -1184,7 +1090,7 @@ pub(crate) mod tests {
             engine_capabilities(&pin(ENGINE_SHA, false)).0,
             PromptCacheCapability::unsupported()
         );
-        let models = fixture(1.5, None).list().data;
+        let models = fixture(None).list().data;
         let wire = serde_json::to_value(&models[1]).unwrap();
         assert_eq!(
             wire["capabilities"]["prompt_cache"],

@@ -31,7 +31,7 @@ output_modalities = ["text"]
 max_output_tokens = 32768              # below context_length; required for a token-priced row
 output_budget_class = "reasoning"      # or "standard"
 
-[price]                                # USD before PRICING_MARKUP
+[price]                                # USD, as charged; `PRICING_OVERRIDES` can replace it at boot
 input_per_m = 1.80
 output_per_m = 5.75                    # or per_request = … alone
 cached_input_per_m = 0.45              # optional: a prompt token declared cached; at most input_per_m

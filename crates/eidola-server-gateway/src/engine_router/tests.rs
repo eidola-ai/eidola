@@ -904,7 +904,7 @@ async fn a_stream_dropped_before_it_opens_is_settled() {
     let (act, _) = spend(&keys[&hash], 1_000_000, hold);
     let proof = act.spend_proof.clone();
     let state = crate::AppState::new(
-        crate::backend::Catalog::new(None, None).unwrap(),
+        crate::backend::Catalog::new(None).unwrap(),
         Some(router),
         crate::db::create_pool(
             "postgres://nobody@127.0.0.1:1/none?sslmode=disable",
@@ -1829,7 +1829,7 @@ async fn paid_handler_for(
     };
     let nullifier = act.spend_proof.nullifier().as_bytes().to_vec();
     let state = crate::AppState::new(
-        crate::backend::Catalog::new(None, None).unwrap(),
+        crate::backend::Catalog::new(None).unwrap(),
         Some(router.clone()),
         crate::db::create_pool(
             "postgres://nobody@127.0.0.1:1/none?sslmode=disable",

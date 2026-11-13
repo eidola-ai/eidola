@@ -688,9 +688,9 @@ max_output_tokens = 65536
 output_budget_class = "reasoning"
 
 [price]
-input_per_m = 0.50
-output_per_m = 2.00
-cached_input_per_m = 0.125
+input_per_m = 0.75
+output_per_m = 3.00
+cached_input_per_m = 0.1875
 
 [lifecycle]
 status = "current"

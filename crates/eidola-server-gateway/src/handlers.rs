@@ -1917,7 +1917,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_request_that_does_not_ask_for_a_stream_is_refused_before_any_spend() {
         let state = crate::AppState::new(
-            crate::backend::Catalog::new(None, None).unwrap(),
+            crate::backend::Catalog::new(None).unwrap(),
             None,
             crate::db::create_pool(
                 "postgres://nobody@127.0.0.1:1/none?sslmode=disable",

@@ -76,8 +76,8 @@ pub struct Row {
     /// `standard` or `reasoning`.
     pub output_budget_class: String,
     pub price: Price,
-    /// What a prompt token declared cached costs, USD per million before the
-    /// markup, where the row sells one: only beside a per-token price, and no
+    /// What a prompt token declared cached costs, USD per million, where the
+    /// row sells one: only beside a per-token price, and no
     /// higher than its input price. `None` means a request to this model
     /// cannot declare a cached prefix.
     pub cached_input_per_m: Option<f64>,
@@ -93,7 +93,7 @@ pub struct WeightsFile {
     pub sha256: String,
 }
 
-/// A row's base price, USD before the markup.
+/// A row's price, in USD.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Price {
     PerToken { input_per_m: f64, output_per_m: f64 },
@@ -324,7 +324,7 @@ pub fn parse(path: &str, bytes: &[u8]) -> Result<Row, String> {
         _ => {
             return Err(at(
                 "price is input_per_m and output_per_m, or per_request alone, each finite and \
-                 non-negative (USD before the markup)",
+                 non-negative (USD)",
             ));
         }
     };

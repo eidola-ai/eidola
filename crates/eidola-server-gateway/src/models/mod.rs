@@ -59,13 +59,13 @@ pub struct CatalogRow {
     /// rather than derived from `reasoning`, so a model can be moved between
     /// ladders without the catalog having to lie about what it does.
     pub output_budget_class: OutputBudgetClass,
-    /// The base price, USD before the markup. The variant is the row's
+    /// The price, in USD. The variant is the row's
     /// pricing shape, whatever the amounts (a zero price keeps its shape).
     pub price: RowPrice,
     pub lifecycle: Lifecycle,
 }
 
-/// A row's base price, USD before the markup.
+/// A row's price, in USD.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RowPrice {
     /// `cached_input_per_m` prices a prompt token a request declares cached,
