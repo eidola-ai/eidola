@@ -14262,6 +14262,47 @@ fn a_replaced_key_keeps_nothing_of_its_predecessor() {
     });
 }
 
+/// **What a turn adds is budgeted at no more than the window leaves.** The
+/// byte contract counts two thirds of a token a byte, so a large message
+/// added to a conversation that fits the model's window can count past the
+/// window. The turn still declares its anchor: the budget for the rest is the
+/// window less the cached part, the hold is priced by it, and the engine,
+/// which derives the same two numbers by its own arithmetic, serves it.
+/// Priced undeclared, the whole conversation would be held at the prompt
+/// rate, as if nothing of it were cached.
+#[test]
+fn a_large_addition_is_declared_up_to_the_window() {
+    run(|| {
+        // The harness's model declares a window of 8,192 tokens.
+        let window = 8_192;
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        turn(&core, &"y".repeat(12_000), Some(first.space_id), None);
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        let (cached, new) = declared_prefix(&bodies[1]).expect("the turn declares");
+        assert!(cached > 0);
+        assert_eq!(cached + new, window, "the budget stops at the window");
+        assert!(
+            contract_prompt_tokens(&bodies[1]) > window,
+            "the byte contract counts the prompt past the window"
+        );
+        let ceiling = bodies[1]["max_completion_tokens"]
+            .as_u64()
+            .expect("a ceiling");
+        let held = mock.chat_charges()[1].expect("a hold");
+        assert_eq!(
+            held,
+            chat_harness::REQUEST_FEE + u128::from(cached.div_ceil(4) + new + ceiling),
+            "held by the declaration: the cached part at a quarter, the rest of the window whole"
+        );
+        assert!(held < undeclared_hold(&bodies[1]));
+        assert_eq!(mock.declared_refusals(), 0, "and served");
+        assert_declarations_exact(&mock);
+    });
+}
+
 /// **A model that sells no cached rate is sent exactly what it was sent
 /// before declarations existed**: a keyed body, byte for byte the shared
 /// construction, with no `cached_prefix` member.

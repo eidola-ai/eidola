@@ -106,16 +106,20 @@ pub fn prepare(
         .encode_prompt(&prompt)
         .map_err(|e| ApiError::invalid(e.to_string()))?;
     let prompt_tokens = tokens.len() as u32;
-    // The declaration prices the prompt at `cached_tokens + new_tokens` at most: a longer
-    // one is refused here, before the engine sees it.
-    if cached_prefix.is_some_and(|p| u64::from(prompt_tokens) > p.prompt_limit()) {
-        return Err(ApiError::DeclaredPrefix(DeclaredPrefixRefusal::OverBudget));
-    }
+    // The window first. A prompt it cannot hold is refused as that whatever was
+    // declared: a declared budget may reach the whole window, and a client told its
+    // budget was exceeded sends the request again without one, which could only be
+    // refused here a second time.
     if prompt_tokens >= max_model_len {
         return Err(ApiError::ContextLengthExceeded(format!(
             "the prompt is {prompt_tokens} tokens; this model's limit is {max_model_len} \
              including at least one completion token"
         )));
+    }
+    // The declaration prices the prompt at `cached_tokens + new_tokens` at most: a longer
+    // one is refused here, before the engine sees it.
+    if cached_prefix.is_some_and(|p| u64::from(prompt_tokens) > p.prompt_limit()) {
+        return Err(ApiError::DeclaredPrefix(DeclaredPrefixRefusal::OverBudget));
     }
     let room = max_model_len - prompt_tokens;
     let max_tokens = max_completion_tokens.map_or(room, |m| m.min(room));

@@ -31,6 +31,10 @@ fn long_message() -> String {
     .repeat(6)
 }
 
+/// The dev model's window in tokens (`common`'s `MAX_MODEL_LEN`), which bounds what a
+/// declaration budgets.
+const WINDOW: u64 = 1_024;
+
 fn key(byte: u8) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32])
 }
@@ -113,7 +117,7 @@ async fn a_new_turn_declaring_the_last_ones_prompt_is_served() {
     let k = key(1);
     let (first, answer) = first_turn(&node, &k, 6).await;
     let (next, bytes, messages) = next_turn(&first, &answer, Some(&k));
-    let prefix = declared_prompt(usage(&answer, "prompt_tokens"), bytes, messages).unwrap();
+    let prefix = declared_prompt(usage(&answer, "prompt_tokens"), bytes, messages, WINDOW).unwrap();
     let (status, served) = node.chat_json(&declaring(next.clone(), prefix)).await;
     assert_eq!(status, 200, "{served}");
     assert!(
@@ -132,7 +136,7 @@ async fn a_regeneration_declaring_its_prompt_is_served() {
     let node = TestNode::start(&[]).await;
     let k = key(2);
     let (first, answer) = first_turn(&node, &k, 6).await;
-    let prefix = declared_prompt(usage(&answer, "prompt_tokens"), 0, 0).unwrap();
+    let prefix = declared_prompt(usage(&answer, "prompt_tokens"), 0, 0, WINDOW).unwrap();
     let (status, again) = node.chat_json(&declaring(first.clone(), prefix)).await;
     assert_eq!(status, 200, "{again}");
     assert!(cached(&again) >= u64::from(prefix.cached_tokens), "{again}");
@@ -274,7 +278,7 @@ async fn a_continuation_declaring_prompt_and_completion_needs_canonical_tokens()
         let next = |k: &str| continuing(&message, &format!("{so_far}{content}"), 6, k);
 
         // Whether the continuation's tokens are the earlier ones through the boundary.
-        let full = declared_prompt(prompt + completion, 0, 0).unwrap();
+        let full = declared_prompt(prompt + completion, 0, 0, WINDOW).unwrap();
         let first_tokens = continued_tokens(&first);
         assert_eq!(first_tokens.len() as u64, prompt);
         let mut resumed = first_tokens.clone();
@@ -302,7 +306,7 @@ async fn a_continuation_declaring_prompt_and_completion_needs_canonical_tokens()
             .await;
         assert_eq!(status, 200);
         assert_eq!(again["choices"], answer["choices"]);
-        let safe = declared_prompt(prompt, content.len() as u64, 0).unwrap();
+        let safe = declared_prompt(prompt, content.len() as u64, 0, WINDOW).unwrap();
         let (status, v) = node.chat_json(&declaring(next(&safe_key), safe)).await;
         assert_eq!(status, 200, "max {max}: {v} {safe:?}");
         assert!(
@@ -347,10 +351,13 @@ async fn declarations(node: &TestNode, first_key: &str, key: &str) -> [Value; 2]
     let (first, answer) = first_turn(node, first_key, 6).await;
     let prompt = usage(&answer, "prompt_tokens");
     let (next, bytes, messages) = next_turn(&first, &answer, Some(key));
-    let mut regen = declaring(first, declared_prompt(prompt, 0, 0).unwrap());
+    let mut regen = declaring(first, declared_prompt(prompt, 0, 0, WINDOW).unwrap());
     regen["cache_key"] = key.into();
     [
-        declaring(next, declared_prompt(prompt, bytes, messages).unwrap()),
+        declaring(
+            next,
+            declared_prompt(prompt, bytes, messages, WINDOW).unwrap(),
+        ),
         regen,
     ]
 }
@@ -417,7 +424,7 @@ async fn a_prompt_past_its_budget_is_refused_before_submission() {
     let (first, answer) = first_turn(&node, &k, 6).await;
     let prompt = usage(&answer, "prompt_tokens");
     let (next, bytes, messages) = next_turn(&first, &answer, Some(&k));
-    let fair = declared_prompt(prompt, bytes, messages).unwrap();
+    let fair = declared_prompt(prompt, bytes, messages, WINDOW).unwrap();
     let before = node
         .wait_for(std::time::Duration::from_secs(5), |s| {
             s.in_engine == 0 && s.kv_keys_held == 0
@@ -452,6 +459,50 @@ async fn a_prompt_past_its_budget_is_refused_before_submission() {
     let (status, v) = node.chat_json(&declaring(first.clone(), exact)).await;
     assert_eq!(status, 200, "{v}");
     assert!(cached(&v) >= 256);
+}
+
+/// A declared prompt longer than the window is refused for its length, not for its
+/// budget. The rule a client declares by budgets what a request adds at no more than
+/// the window leaves, so a prompt past the window is past that budget too; told its
+/// budget was exceeded, the client would send the request again without a declaration
+/// and be refused, and charged, a second time for the length.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declared_prompt_past_the_window_is_refused_for_its_length() {
+    let node = TestNode::start(&[]).await;
+    let k = key(14);
+    let (first, answer) = first_turn(&node, &k, 6).await;
+    let prompt = usage(&answer, "prompt_tokens");
+    // The conversation, extended by a message that alone fills the window.
+    let addition = long_message().repeat(4);
+    let mut messages = first["messages"].as_array().unwrap().clone();
+    messages.push(json!({"role": "assistant", "content": message_text(&answer, "content")}));
+    messages.push(json!({"role": "user", "content": addition}));
+    let added_bytes = (message_text(&answer, "content").len() + addition.len()) as u64;
+    let next = body(Value::Array(messages), 6, Some(&k));
+    let prefix = declared_prompt(prompt, added_bytes, 2, WINDOW).unwrap();
+    assert_eq!(
+        prefix.prompt_limit(),
+        WINDOW,
+        "the budget stops at the window"
+    );
+    let before = node
+        .wait_for(std::time::Duration::from_secs(5), |s| {
+            s.in_engine == 0 && s.kv_keys_held == 0
+        })
+        .await;
+
+    let (status, v) = node.chat_json(&declaring(next.clone(), prefix)).await;
+    assert_eq!(status, 400, "{v}");
+    assert_eq!(v["error"]["type"], "context_length_exceeded", "{v}");
+    // Undeclared, it is refused the same way: the declaration changed nothing.
+    let (status, v) = node.chat_json(&next).await;
+    assert_eq!(status, 400, "{v}");
+    assert_eq!(v["error"]["type"], "context_length_exceeded", "{v}");
+    let after = node.stats();
+    assert_eq!(
+        after.submitted, before.submitted,
+        "nothing reached the engine"
+    );
 }
 
 /// A declaration reaching the prompt's final token can never hold (that token is always

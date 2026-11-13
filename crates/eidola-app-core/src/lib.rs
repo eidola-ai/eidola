@@ -15562,9 +15562,10 @@ impl TurnPrep {
     /// lineage's most recent answered request (its resume point is on that
     /// key's row, and the rotation rule would keep the key now), and this
     /// request's prompt begins with exactly what that request left
-    /// ([`prefix_cache::declaration`]). It must also fit the model's window
-    /// and lower the hold; otherwise the request declares nothing and its body
-    /// is the one it would be without this feature.
+    /// ([`prefix_cache::declaration`]). Its budget for what the request adds
+    /// stops at the model's window, and it must lower the hold; otherwise the
+    /// request declares nothing and its body is the one it would be without
+    /// this feature.
     ///
     /// The key is judged again at the claim, after the connection is open; a
     /// key that rotated in between carries a declaration its engine cannot
@@ -15603,10 +15604,14 @@ impl TurnPrep {
         {
             return None;
         }
-        let prefix = prefix_cache::declaration(&point, &self.tool_schemas, &self.messages)?;
-        if self.context_length != 0 && prefix.prompt_limit() > self.context_length {
-            return None;
-        }
+        // Bounded by the model's window, so the gateway's own check of the
+        // declared limit against the window never refuses it.
+        let prefix = prefix_cache::declaration(
+            &point,
+            &self.tool_schemas,
+            &self.messages,
+            self.context_length,
+        )?;
         let declared = pricing.hold(
             Prompt::Declared {
                 cached_tokens: u64::from(prefix.cached_tokens),

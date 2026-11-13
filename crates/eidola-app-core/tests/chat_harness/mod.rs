@@ -4305,10 +4305,19 @@ fn engine_added_bytes(messages: &[serde_json::Value]) -> u64 {
 /// answer back as text, and a real engine cannot be relied on to hold that
 /// text's tokens, so a declaration reaching past the anchor into the answer
 /// is refused, as a real node refuses it in general.
-fn engine_declarations(issuer: &Issuer, key: &str, request: &serde_json::Value) -> Vec<(u64, u64)> {
+///
+/// What is added is budgeted at no more than the model's window leaves after
+/// the cached part, and an anchor longer than the window yields nothing.
+fn engine_declarations(
+    issuer: &Issuer,
+    config: &MockConfig,
+    key: &str,
+    request: &serde_json::Value,
+) -> Vec<(u64, u64)> {
     let tools = request_tools(request);
     let messages = request_messages(request);
     let quantum = CACHED_PREFIX_QUANTUM;
+    let window = model_context_length(config);
     let mut out = Vec::new();
     for entry in issuer.engine_cache.lock().unwrap().iter() {
         if entry.key != key || entry.tools != tools || entry.continued {
@@ -4321,12 +4330,12 @@ fn engine_declarations(issuer: &Issuer, key: &str, request: &serde_json::Value) 
         }
         let (resumed, added) = (entry.prompt as u64, &messages[entry.messages.len()..]);
         let cached = resumed.saturating_sub(1) / quantum * quantum;
-        if cached == 0 {
+        if cached == 0 || resumed > window {
             continue;
         }
         let byte_term = (engine_added_bytes(added) * 2).div_ceil(3);
         let new = resumed - cached + byte_term + 8 * added.len() as u64 + 32;
-        out.push((cached, new));
+        out.push((cached, new.min(window - cached)));
     }
     out
 }
@@ -4363,7 +4372,7 @@ fn engine_refusal(
         return Some("cached_prefix_missing");
     }
     let Some((cached, new)) =
-        pair.filter(|p| engine_declarations(issuer, key, request).contains(p))
+        pair.filter(|p| engine_declarations(issuer, config, key, request).contains(p))
     else {
         issuer.declaration_mismatches.fetch_add(1, Ordering::SeqCst);
         return Some("cached_prefix_missing");
@@ -4426,10 +4435,19 @@ fn worst_case_cost(config: &MockConfig, request: &serde_json::Value) -> Option<u
     Some(REQUEST_FEE + (prompt * prompt_rate).div_ceil(prompt_scale) + completion_credits)
 }
 
+/// The context window [`MODEL`]'s row declares, in tokens.
+fn model_context_length(config: &MockConfig) -> u64 {
+    if config.mimo_priced {
+        MIMO_CONTEXT_LENGTH
+    } else {
+        config.context_length.unwrap_or(8192)
+    }
+}
+
 fn models_body(config: &MockConfig) -> String {
     let mut primary = serde_json::json!({
         "id": MODEL,
-        "context_length": config.context_length.unwrap_or(8192),
+        "context_length": model_context_length(config),
         "pricing": {
             "per_prompt_token": { "value": 1u64, "scale_factor": 1u64 },
             "per_completion_token": { "value": 1u64, "scale_factor": 1u64 }
@@ -4455,7 +4473,6 @@ fn models_body(config: &MockConfig) -> String {
         primary["max_output_tokens"] = serde_json::json!(ceiling);
     }
     if config.mimo_priced {
-        primary["context_length"] = serde_json::json!(MIMO_CONTEXT_LENGTH);
         primary["max_output_tokens"] = serde_json::json!(MIMO_MAX_OUTPUT_TOKENS);
         primary["pricing"] = serde_json::json!({
             "per_prompt_token": { "value": MIMO_PROMPT_RATE, "scale_factor": 1_000_000u64 },

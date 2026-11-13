@@ -279,13 +279,17 @@ pub(crate) fn continuation_message(reasoning: &str, content: &str) -> serde_json
 /// turn's messages, a tool round's call and results, or a continuation's
 /// partial assistant message holding the whole answer so far.
 ///
-/// The numbers are `engine_protocol::declared_prompt`'s. Byte-for-byte equal
-/// requests render to equal tokens, so a prompt that repeats an earlier one's
-/// bytes repeats its tokens; anything less and nothing is declared.
+/// The numbers are `engine_protocol::declared_prompt`'s, bounded by the
+/// model's window (`context_length`, zero where it is not known): what is
+/// added is budgeted at no more than the window leaves after the cached part.
+/// Byte-for-byte equal requests render to equal tokens, so a prompt that
+/// repeats an earlier one's bytes repeats its tokens; anything less and
+/// nothing is declared.
 pub(crate) fn declaration(
     point: &ResumePoint,
     tools: &[serde_json::Value],
     messages: &[serde_json::Value],
+    context_length: u64,
 ) -> Option<eidola_common::engine_protocol::CachedPrefix> {
     use eidola_common::engine_protocol::declared_prompt;
     let prompt_tokens = u64::try_from(point.prompt_tokens).ok()?;
@@ -298,6 +302,7 @@ pub(crate) fn declaration(
         prompt_tokens,
         added.total_content_bytes(),
         added.message_count(),
+        context_length,
     )
 }
 
@@ -391,13 +396,13 @@ mod tests {
         let added = eidola_common::prompt_charge(&next[2..], None);
         assert_eq!(added.message_count(), 2);
         assert_eq!(
-            declaration(&point, &tools, &next),
-            declared_prompt(1_000, added.total_content_bytes(), 2)
+            declaration(&point, &tools, &next, 0),
+            declared_prompt(1_000, added.total_content_bytes(), 2, 0)
         );
         // A regeneration repeats it whole and adds nothing.
         assert_eq!(
-            declaration(&point, &tools, &first),
-            declared_prompt(1_000, 0, 0)
+            declaration(&point, &tools, &first, 0),
+            declared_prompt(1_000, 0, 0, 0)
         );
     }
 
@@ -408,14 +413,14 @@ mod tests {
         let point = point_for(&tools, &first, 1_000);
         // An edited earlier message.
         let edited = vec![msg("system", "s"), msg("user", "u1!"), msg("user", "u2")];
-        assert_eq!(declaration(&point, &tools, &edited), None);
+        assert_eq!(declaration(&point, &tools, &edited, 0), None);
         // Changed tools.
-        assert_eq!(declaration(&point, &[], &first), None);
+        assert_eq!(declaration(&point, &[], &first, 0), None);
         // A shorter prompt.
-        assert_eq!(declaration(&point, &tools, &first[..1]), None);
+        assert_eq!(declaration(&point, &tools, &first[..1], 0), None);
         // Too little to declare: nothing at or past a quantum boundary.
         let small = point_for(&tools, &first, 256);
-        assert_eq!(declaration(&small, &tools, &first), None);
+        assert_eq!(declaration(&small, &tools, &first, 0), None);
     }
 
     #[test]
@@ -427,22 +432,41 @@ mod tests {
         continued.push(continuation_message("r", "partial answer"));
         let added = eidola_common::prompt_charge(&continued[2..], None);
         assert_eq!(
-            declaration(&point, &[], &continued),
-            declared_prompt(1_000, added.total_content_bytes(), 1)
+            declaration(&point, &[], &continued, 0),
+            declared_prompt(1_000, added.total_content_bytes(), 1, 0)
         );
         // A longer answer, continued again, declares the same anchor; only
         // what is added grows.
         let mut again = first.clone();
         again.push(continuation_message("r", "partial answer, and more of it"));
         let longer = eidola_common::prompt_charge(&again[2..], None);
-        let first_decl = declaration(&point, &[], &continued).unwrap();
-        let again_decl = declaration(&point, &[], &again).unwrap();
+        let first_decl = declaration(&point, &[], &continued, 0).unwrap();
+        let again_decl = declaration(&point, &[], &again, 0).unwrap();
         assert_eq!(first_decl.cached_tokens, again_decl.cached_tokens);
         assert_eq!(
             Some(again_decl),
-            declared_prompt(1_000, longer.total_content_bytes(), 1)
+            declared_prompt(1_000, longer.total_content_bytes(), 1, 0)
         );
         assert!(again_decl.new_tokens > first_decl.new_tokens);
+    }
+
+    /// What a request adds is budgeted at no more than the window leaves: a
+    /// large addition to a conversation that fits the window still declares
+    /// its anchor, where the byte contract's count alone would pass the
+    /// window.
+    #[test]
+    fn a_large_addition_is_budgeted_at_what_the_window_leaves() {
+        let first = vec![msg("system", "s"), msg("user", "u1")];
+        let point = point_for(&[], &first, 1_000);
+        let mut next = first.clone();
+        next.push(msg("user", &"x".repeat(30_000)));
+        let free = declaration(&point, &[], &next, 0).unwrap();
+        assert!(free.prompt_limit() > 8_192);
+        let bounded = declaration(&point, &[], &next, 8_192).unwrap();
+        assert_eq!(bounded.cached_tokens, free.cached_tokens);
+        assert_eq!(bounded.prompt_limit(), 8_192);
+        // An anchor the window could not have held declares nothing.
+        assert_eq!(declaration(&point, &[], &next, 999), None);
     }
 
     #[test]

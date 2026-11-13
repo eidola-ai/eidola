@@ -655,25 +655,49 @@ pub const fn declarable_cached_tokens(anchor_prompt_tokens: u64) -> u32 {
 /// The cached part is the rule's. The budget for the rest is the anchor's
 /// tokens past the declared boundary, which the client knows exactly, and the
 /// byte contract's count for what was added ([`crate::chargeable_prompt_tokens`],
-/// whose constants cover the added messages' template tokens). `None` when
-/// there is nothing to declare, or the budget does not fit the member.
+/// whose constants cover the added messages' template tokens), **and never
+/// more than the model's window leaves after the cached part**.
+/// `context_length` is that window in tokens, as the model's catalog row
+/// publishes it; zero where it is not known, which bounds nothing.
+///
+/// The byte contract counts well over the tokens ordinary text has, so its
+/// count for what a request adds can pass the window while the prompt itself
+/// fits. No prompt longer than the window is served, whatever was declared,
+/// so the rest of the window covers every prompt the request can be served
+/// with: the hold stays the request's worst case, and a request near the top
+/// of a window is not priced as if nothing of it were cached.
+///
+/// `None` when there is nothing to declare, the anchor's prompt is longer than
+/// the window (no node served it whole), or the budget does not fit the
+/// member.
 ///
 /// A prompt whose added part is denser than the byte contract assumes can
 /// exceed the budget; the node then refuses it
 /// ([`DeclaredPrefixRefusal::OverBudget`]) and the request is sent again
-/// without a declaration.
+/// without a declaration. A prompt longer than the window is refused for its
+/// length instead, since sending it again could only be refused again.
 pub fn declared_prompt(
     anchor_prompt_tokens: u64,
     added_content_bytes: u64,
     added_messages: u64,
+    context_length: u64,
 ) -> Option<CachedPrefix> {
     let cached_tokens = declarable_cached_tokens(anchor_prompt_tokens);
     if cached_tokens == 0 {
         return None;
     }
-    let carried = anchor_prompt_tokens - cached_tokens as u64;
+    let cached = u64::from(cached_tokens);
+    let carried = anchor_prompt_tokens - cached;
     let added = crate::chargeable_prompt_tokens(added_content_bytes, added_messages);
-    let new_tokens = u32::try_from(carried.checked_add(added)?).ok()?;
+    let mut budget = carried.saturating_add(added);
+    if context_length != 0 {
+        if anchor_prompt_tokens > context_length {
+            return None;
+        }
+        // At least `carried`, since the anchor fits the window.
+        budget = budget.min(context_length - cached);
+    }
+    let new_tokens = u32::try_from(budget).ok()?;
     Some(CachedPrefix {
         cached_tokens,
         new_tokens,
@@ -1459,18 +1483,18 @@ mod tests {
     #[test]
     fn a_declared_prompt_budgets_the_carried_tokens_and_the_added_bytes() {
         // Nothing to declare below one quantum.
-        assert_eq!(declared_prompt(256, 10_000, 2), None);
+        assert_eq!(declared_prompt(256, 10_000, 2, 0), None);
         // A regeneration: an anchor of 10,000 tokens, nothing added. 9,984
         // cached, 16 carried, and the per-request allowance.
         assert_eq!(
-            declared_prompt(10_000, 0, 0),
+            declared_prompt(10_000, 0, 0, 0),
             Some(CachedPrefix {
                 cached_tokens: 9_984,
                 new_tokens: 16 + crate::PER_REQUEST_TOKENS as u32,
             })
         );
         // A new turn: 3,000 bytes in two messages added.
-        let turn = declared_prompt(10_000, 3_000, 2).unwrap();
+        let turn = declared_prompt(10_000, 3_000, 2, 0).unwrap();
         assert_eq!(turn.cached_tokens, 9_984);
         assert_eq!(
             turn.new_tokens as u64,
@@ -1478,12 +1502,107 @@ mod tests {
         );
         // The budget always covers the anchor's own tokens.
         for anchor in [257, 1_000, 65_536, 1_048_576] {
-            let p = declared_prompt(anchor, 0, 0).unwrap();
+            let p = declared_prompt(anchor, 0, 0, 0).unwrap();
             assert!(p.prompt_limit() >= anchor);
         }
-        // A budget past the member's range is not declared.
-        assert_eq!(declared_prompt(10_000, u64::MAX, 0), None);
-        assert_eq!(declared_prompt(10_000, 9_000_000_000, 0), None);
+        // With no window known, a budget past the member's range is not
+        // declared.
+        assert_eq!(declared_prompt(10_000, u64::MAX, 0, 0), None);
+        assert_eq!(declared_prompt(10_000, 9_000_000_000, 0, 0), None);
+    }
+
+    /// **The budget stops at the model's window.** The byte contract's count
+    /// for what a request adds can pass the window while the prompt fits it;
+    /// the budget is then what the window leaves after the cached part, which
+    /// no served prompt exceeds.
+    #[test]
+    fn a_declared_budget_never_passes_the_window() {
+        let window = 8_192;
+        // Well inside the window, the window changes nothing.
+        assert_eq!(
+            declared_prompt(1_000, 300, 1, window),
+            declared_prompt(1_000, 300, 1, 0)
+        );
+        // 30,000 added bytes count 20,040 tokens, past the window: the budget
+        // is the window less the 768 declared cached.
+        assert_eq!(
+            declared_prompt(1_000, 30_000, 1, window),
+            Some(CachedPrefix {
+                cached_tokens: 768,
+                new_tokens: 8_192 - 768,
+            })
+        );
+        // Exactly at the window is not cut; one token more is.
+        let fits = (window - 768 - 232 - 8 - crate::PER_REQUEST_TOKENS) * 3 / 2;
+        let at = declared_prompt(1_000, fits, 1, window).unwrap();
+        assert_eq!(at, declared_prompt(1_000, fits, 1, 0).unwrap());
+        assert_eq!(at.prompt_limit(), window);
+        let past = declared_prompt(1_000, fits + 2, 1, window).unwrap();
+        assert_eq!(past, at);
+        assert!(
+            declared_prompt(1_000, fits + 2, 1, 0)
+                .unwrap()
+                .prompt_limit()
+                > window
+        );
+        // An added part too large for the member is budgeted at the window's
+        // remainder where the window is known.
+        assert_eq!(
+            declared_prompt(10_000, u64::MAX, 0, 1_048_576).map(|p| p.prompt_limit()),
+            Some(1_048_576)
+        );
+        // An anchor that fills the window, or all but one token of it: the
+        // budget still covers the anchor's own tokens, and nothing more.
+        for anchor in [window - 1, window] {
+            let p = declared_prompt(anchor, 0, 0, window).unwrap();
+            assert!(p.prompt_limit() >= anchor && p.prompt_limit() <= window);
+        }
+        // An anchor longer than the window was never served whole.
+        assert_eq!(declared_prompt(window + 1, 0, 0, window), None);
+        assert_eq!(declared_prompt(1_000_000, 10, 1, window), None);
+    }
+
+    /// Over a sweep of anchors and added sizes at several windows: the
+    /// declared limit is within the window, covers the anchor, and equals the
+    /// unbounded rule's wherever that is within the window.
+    #[test]
+    fn the_window_bound_holds_over_a_sweep() {
+        for window in [1_024u64, 8_192, 262_144, 1_048_576] {
+            for anchor in [
+                257,
+                300,
+                511,
+                512,
+                513,
+                1_000,
+                window / 2,
+                window - 1,
+                window,
+            ] {
+                if anchor > window {
+                    continue;
+                }
+                for added_bytes in [0u64, 1, 100, 3_000, 40_000, 2_000_000, 40_000_000] {
+                    for messages in [0u64, 1, 2, 7] {
+                        let bounded = declared_prompt(anchor, added_bytes, messages, window)
+                            .unwrap_or_else(|| panic!("{anchor} {added_bytes} {window}"));
+                        assert_eq!(
+                            bounded.cached_tokens,
+                            declarable_cached_tokens(anchor),
+                            "the cached part is the rule's"
+                        );
+                        assert!(bounded.prompt_limit() <= window);
+                        assert!(bounded.prompt_limit() >= anchor);
+                        match declared_prompt(anchor, added_bytes, messages, 0) {
+                            Some(free) if free.prompt_limit() <= window => {
+                                assert_eq!(bounded, free)
+                            }
+                            _ => assert_eq!(bounded.prompt_limit(), window),
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
