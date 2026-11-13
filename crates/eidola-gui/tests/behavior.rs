@@ -10,6 +10,10 @@
 //!    keystrokes take in production.
 //! 4. Assert against the view/core's public state with `read_with`.
 
+#[path = "support/backing.rs"]
+mod backing;
+use backing::Backing;
+
 use eidola_app_core::AppCore;
 use eidola_app_core::changes::{Change, ChangeOrigin};
 use eidola_app_core::error::AppError;
@@ -18402,6 +18406,10 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
         AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
     );
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    // The drain barrier, bound before the listener: the transfer runs until the
+    // listener closes and resets its connection, and the listener — declared
+    // after this — drops first on every exit, a failed assertion included.
+    let _backing = Backing::new(core.clone(), dir);
 
     // A listener that accepts and never answers, so the first transfer is
     // genuinely still in flight when the second press lands — a port that
@@ -18732,7 +18740,6 @@ fn backends_a_catalog_press_cannot_race_a_pending_retry(cx: &mut TestAppContext)
 #[gpui::test]
 fn two_downloads_started_together_both_keep_their_rows(cx: &mut TestAppContext) {
     use eidola_app_core::LocalModelStatus;
-    use std::os::unix::fs::OpenOptionsExt;
 
     cx.executor().allow_parking();
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
@@ -18741,6 +18748,41 @@ fn two_downloads_started_together_both_keep_their_rows(cx: &mut TestAppContext) 
         AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
     );
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    // The drain barrier. Everything that keeps a core-side task running — the
+    // FIFO a read parks on, the listener the transfers wait on — is declared
+    // after it, so on every exit, a failed assertion included, it is released
+    // before the barrier waits, and the wait stays bounded.
+    let _backing = Backing::new(core.clone(), dir);
+
+    /// The FIFO sidecar a scan parks on, and the write end that holds a parked
+    /// read on its data. Dropping it unparks every read, present and future:
+    /// the sidecar leaves the directory (a later open fails rather than
+    /// blocking), a held write end closes (the parked read sees end of file),
+    /// and a read still blocked opening the FIFO is let through by a writer
+    /// that opens and closes at once.
+    struct FifoGate {
+        sidecar: std::path::PathBuf,
+        link: std::path::PathBuf,
+        writer: Option<std::fs::File>,
+    }
+    impl FifoGate {
+        /// A write end, if a read is blocked opening the FIFO right now.
+        fn open_writer(&self) -> Option<std::fs::File> {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.link)
+                .ok()
+        }
+    }
+    impl Drop for FifoGate {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.sidecar);
+            self.writer = None;
+            drop(self.open_writer());
+        }
+    }
 
     // The external directory with its stalling sidecar, and the hard link the
     // test keeps hold of it by.
@@ -18750,8 +18792,13 @@ fn two_downloads_started_together_both_keep_their_rows(cx: &mut TestAppContext) 
     let sidecar = external.path().join("slow.gguf.meta.json");
     let fifo = std::ffi::CString::new(sidecar.to_str().unwrap()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
-    let gate = held.path().join("gate");
-    std::fs::hard_link(&sidecar, &gate).unwrap();
+    let link = held.path().join("gate");
+    std::fs::hard_link(&sidecar, &link).unwrap();
+    let mut gate = FifoGate {
+        sidecar: sidecar.clone(),
+        link,
+        writer: None,
+    };
     core.runtime()
         .block_on(core.add_backend(eidola_app_core::NewBackend {
             id: "shelf".into(),
@@ -18781,20 +18828,18 @@ fn two_downloads_started_together_both_keep_their_rows(cx: &mut TestAppContext) 
     stores
         .local_models
         .update(cx, |s, cx| s.download(first.clone(), cx));
-    let mut writer = None;
     for _ in 0..400 {
         cx.run_until_parked();
-        if let Ok(f) = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&gate)
-        {
-            writer = Some(f);
+        gate.writer = gate.open_writer();
+        if gate.writer.is_some() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    let writer = writer.expect("a read after the first acceptance reaches the sidecar");
+    assert!(
+        gate.writer.is_some(),
+        "a read after the first acceptance reaches the sidecar"
+    );
     std::fs::remove_file(&sidecar).unwrap();
     assert!(
         pending(cx, &first),
@@ -18814,19 +18859,23 @@ fn two_downloads_started_together_both_keep_their_rows(cx: &mut TestAppContext) 
     }
     assert!(!pending(cx, &second), "the second download settles");
 
-    // Release the parked read and let anything it would land, land.
-    drop(writer);
-    for _ in 0..400 {
+    // Release the parked read and let anything it would land, land. Closing
+    // the listener resets the transfers' connections, so once the parked read
+    // has finished too the runtime goes idle — which is what establishes that
+    // every read has finished, and then the last park delivers whatever any of
+    // them would still land here.
+    drop(listener);
+    drop(gate);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while core.runtime().metrics().num_alive_tasks() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the released read and the reset transfers finish"
+        );
         cx.run_until_parked();
-        if !pending(cx, &first) {
-            break;
-        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    for _ in 0..8 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    cx.run_until_parked();
 
     let downloading: Vec<String> = stores.local_models.read_with(cx, |s, _| {
         s.models()
