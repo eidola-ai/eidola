@@ -10,6 +10,10 @@
 //!    keystrokes take in production.
 //! 4. Assert against the view/core's public state with `read_with`.
 
+#[path = "support/backing.rs"]
+mod backing;
+use backing::Backing;
+
 use eidola_app_core::AppCore;
 use eidola_app_core::changes::{Change, ChangeOrigin};
 use eidola_app_core::error::AppError;
@@ -18382,8 +18386,13 @@ fn backends_a_failed_download_verb_hands_the_keyboard_back(cx: &mut TestAppConte
 ///
 /// The assertion that pins it is the **control**, not the outcome: while the
 /// operation is pending the row paints no Retry at all, so there is nothing to
-/// press a second time — no tab stop, nothing to activate. The op-error
-/// assertion is the symptom the finding named, kept as the honest end state.
+/// press a second time — no tab stop, nothing to activate. And not only while
+/// it is pending: the slot clears when the initiating call lands, and if the
+/// snapshot showing the transfer arrived only by the bus refresh behind it,
+/// the frames between the two painted the failed row's Retry again over a
+/// transfer already running. So the test waits for the landing and asserts the
+/// row is the downloading one at once. The op-error assertion is the symptom
+/// the finding named, kept as the honest end state.
 #[gpui::test]
 fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext) {
     use eidola_app_core::{LocalModelInfo, LocalModelStatus};
@@ -18397,6 +18406,10 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
         AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
     );
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    // The drain barrier, bound before the listener: the transfer runs until the
+    // listener closes and resets its connection, and the listener — declared
+    // after this — drops first on every exit, a failed assertion included.
+    let _backing = Backing::new(core.clone(), dir);
 
     // A listener that accepts and never answers, so the first transfer is
     // genuinely still in flight when the second press lands — a port that
@@ -18483,6 +18496,41 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
     assert!(
         !names.contains(&"settings/backends/local/installed/0/retry".to_string()),
         "a pending retry must not leave a second door onto itself: {names:?}"
+    );
+
+    // Let the download settle. Whenever the slot clears, the row has to be the
+    // downloading one by then — in the same update. (These stores have no bus
+    // bridge, so the read that delivers that snapshot can only be the one the
+    // store issues for the accepted download itself.)
+    for _ in 0..200 {
+        if !stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(&url))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        cx.run_until_parked();
+    }
+    assert!(
+        !stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(&url)),
+        "the download settles while the transfer runs on"
+    );
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        !names.contains(&"settings/backends/local/installed/0/retry".to_string()),
+        "the slot hands over to the snapshot with no frame between them: {names:?}"
+    );
+    assert!(
+        names.contains(&"settings/backends/local/installed/0/cancel".to_string()),
+        "…which shows the accepted transfer, with its Cancel: {names:?}"
     );
 
     // The programmatic door is shut too, and nothing is published over the
@@ -18668,6 +18716,185 @@ fn backends_a_catalog_press_cannot_race_a_pending_retry(cx: &mut TestAppContext)
         live.models
     );
     assert_eq!(downloading[0].slug, "wisp");
+}
+
+/// **Two downloads started together cannot take each other's row away.** Each
+/// accepted download keeps its pending slot until a snapshot showing the
+/// transfer is installed, and the snapshot has exactly one writer — the
+/// store's superseding refresh. A snapshot carried by the operation itself
+/// would be a second writer with no ordering: the first download's read
+/// samples the transfer list before the second starts, stalls in the rest of
+/// `local_models_state`, and lands last — a list without the second transfer,
+/// after the second's slot had already cleared, so its row is gone and nothing
+/// stands in the way of a second press.
+///
+/// The stall is **staged, not hoped for**: a configured llamacpp backend's
+/// directory holds a model whose sidecar is a FIFO, and the scan opens every
+/// sidecar after the managed transfers are sampled. A read reaching it blocks
+/// until a writer opens it; the test opens it non-blocking (which succeeds only
+/// once a reader is there, so it doubles as the signal that the first read is
+/// stalled past its sample) and holds it open, so the read stays parked on the
+/// data. The FIFO is then unlinked from the directory — reached through a hard
+/// link outside it — so every later read scans past it, and released only once
+/// the second download has settled.
+#[gpui::test]
+fn two_downloads_started_together_both_keep_their_rows(cx: &mut TestAppContext) {
+    use eidola_app_core::LocalModelStatus;
+
+    cx.executor().allow_parking();
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().unwrap();
+    let core = std::sync::Arc::new(
+        AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
+    );
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    // The drain barrier. Everything that keeps a core-side task running — the
+    // FIFO a read parks on, the listener the transfers wait on — is declared
+    // after it, so on every exit, a failed assertion included, it is released
+    // before the barrier waits, and the wait stays bounded.
+    let _backing = Backing::new(core.clone(), dir);
+
+    /// The FIFO sidecar a scan parks on, and the write end that holds a parked
+    /// read on its data. Dropping it unparks every read, present and future:
+    /// the sidecar leaves the directory (a later open fails rather than
+    /// blocking), a held write end closes (the parked read sees end of file),
+    /// and a read still blocked opening the FIFO is let through by a writer
+    /// that opens and closes at once.
+    struct FifoGate {
+        sidecar: std::path::PathBuf,
+        link: std::path::PathBuf,
+        writer: Option<std::fs::File>,
+    }
+    impl FifoGate {
+        /// A write end, if a read is blocked opening the FIFO right now.
+        fn open_writer(&self) -> Option<std::fs::File> {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.link)
+                .ok()
+        }
+    }
+    impl Drop for FifoGate {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.sidecar);
+            self.writer = None;
+            drop(self.open_writer());
+        }
+    }
+
+    // The external directory with its stalling sidecar, and the hard link the
+    // test keeps hold of it by.
+    let external = tempfile::tempdir().unwrap();
+    let held = tempfile::tempdir().unwrap();
+    std::fs::write(external.path().join("slow.gguf"), b"").unwrap();
+    let sidecar = external.path().join("slow.gguf.meta.json");
+    let fifo = std::ffi::CString::new(sidecar.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+    let link = held.path().join("gate");
+    std::fs::hard_link(&sidecar, &link).unwrap();
+    let mut gate = FifoGate {
+        sidecar: sidecar.clone(),
+        link,
+        writer: None,
+    };
+    core.runtime()
+        .block_on(core.add_backend(eidola_app_core::NewBackend {
+            id: "shelf".into(),
+            kind: eidola_app_core::BackendKind::LlamaCpp,
+            display_name: "Shelf".into(),
+            base_url: None,
+            api_key: None,
+            models_dir: Some(external.path().to_str().unwrap().into()),
+            model_overrides: None,
+            engine_path: None,
+            auto_start: false,
+        }))
+        .expect("add the llamacpp backend");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let host = listener.local_addr().unwrap();
+    let first = format!("http://{host}/first.gguf");
+    let second = format!("http://{host}/second.gguf");
+    let pending = |cx: &mut TestAppContext, url: &str| {
+        stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(url))
+    };
+
+    // The first download, and a read after its acceptance that stalls on the
+    // FIFO once it has sampled the transfer list.
+    stores
+        .local_models
+        .update(cx, |s, cx| s.download(first.clone(), cx));
+    for _ in 0..400 {
+        cx.run_until_parked();
+        gate.writer = gate.open_writer();
+        if gate.writer.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        gate.writer.is_some(),
+        "a read after the first acceptance reaches the sidecar"
+    );
+    std::fs::remove_file(&sidecar).unwrap();
+    assert!(
+        pending(cx, &first),
+        "no snapshot showing the first transfer has landed, so its slot stands"
+    );
+
+    // The second download settles while the first read is still parked.
+    stores
+        .local_models
+        .update(cx, |s, cx| s.download(second.clone(), cx));
+    for _ in 0..400 {
+        cx.run_until_parked();
+        if !pending(cx, &second) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!pending(cx, &second), "the second download settles");
+
+    // Release the parked read and let anything it would land, land. Closing
+    // the listener resets the transfers' connections, so once the parked read
+    // has finished too the runtime goes idle — which is what establishes that
+    // every read has finished, and then the last park delivers whatever any of
+    // them would still land here.
+    drop(listener);
+    drop(gate);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while core.runtime().metrics().num_alive_tasks() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the released read and the reset transfers finish"
+        );
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    cx.run_until_parked();
+
+    let downloading: Vec<String> = stores.local_models.read_with(cx, |s, _| {
+        s.models()
+            .iter()
+            .filter(|m| matches!(m.status, LocalModelStatus::Downloading { .. }))
+            .map(|m| m.slug.clone())
+            .collect()
+    });
+    assert!(
+        downloading.contains(&"first".to_string()) && downloading.contains(&"second".to_string()),
+        "both accepted transfers keep their rows, whatever order the reads ran in: {downloading:?}"
+    );
+    assert!(!pending(cx, &first) && !pending(cx, &second));
+    assert!(
+        stores
+            .local_models
+            .read_with(cx, |s, _| s.op_error().is_none()),
+        "neither download was refused"
+    );
 }
 
 /// **One transfer is one transfer however its URL is spelled.** App-core keys
