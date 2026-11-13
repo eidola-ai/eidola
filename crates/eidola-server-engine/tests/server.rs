@@ -246,6 +246,12 @@ async fn gateway_token_is_required() {
         "ok; weights-storage=dev-writable"
     );
     assert_eq!(node.stats().submitted, 0);
+    let s = node.stats_after_one_more().await;
+    assert_eq!(
+        (s.submitted, s.rejected),
+        (1, 0),
+        "nothing before reached the engine"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -328,7 +334,11 @@ async fn weights_hash_mismatch_is_refused_before_admission() {
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 200);
-    assert_eq!(node.stats().submitted, 1);
+    // Read to its end, the request has been submitted, and every command before it
+    // handled: the engine publishes its counters before it steps.
+    r.bytes().await.unwrap();
+    let s = node.stats();
+    assert_eq!((s.submitted, s.rejected), (1, 0));
 }
 
 // ---------------------------------------------------------------------------------------
@@ -344,6 +354,12 @@ async fn wrong_model_is_refused() {
     assert_eq!(status, 404);
     assert_eq!(v["error"]["type"], "model_not_found");
     assert_eq!(node.stats(), Stats::default());
+    let s = node.stats_after_one_more().await;
+    assert_eq!(
+        (s.submitted, s.rejected),
+        (1, 0),
+        "nothing before reached the engine"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -432,6 +448,12 @@ async fn strict_schema_refuses_what_it_does_not_name() {
     }
     // A refused request never reaches the engine.
     assert_eq!(node.stats(), Stats::default());
+    let s = node.stats_after_one_more().await;
+    assert_eq!(
+        (s.submitted, s.rejected),
+        (1, 0),
+        "nothing before reached the engine"
+    );
 
     // The fields the gateway forwards today, explicit nulls included, are accepted.
     let ok = json!({
@@ -1391,6 +1413,12 @@ async fn tools_and_tool_history_render_and_parse() {
     let (status, v) = node.chat_json(&bad).await;
     assert_eq!(status, 400, "{v}");
     assert_eq!(node.stats().submitted, 1);
+    let s = node.stats_after_one_more().await;
+    assert_eq!(
+        (s.submitted, s.rejected),
+        (2, 0),
+        "the refused one never reached the engine"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1400,6 +1428,12 @@ async fn prompts_beyond_the_model_length_are_refused() {
     assert_eq!(status, 400);
     assert_eq!(v["error"]["type"], "context_length_exceeded");
     assert_eq!(node.stats().submitted, 0);
+    let s = node.stats_after_one_more().await;
+    assert_eq!(
+        (s.submitted, s.rejected),
+        (1, 0),
+        "nothing before reached the engine"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1751,6 +1785,12 @@ async fn multimodal_keys_in_text_parts_are_refused() {
         assert_eq!(status, 400, "{key} on an image part");
     }
     assert_eq!(node.stats(), Stats::default());
+    let s = node.stats_after_one_more().await;
+    assert_eq!(
+        (s.submitted, s.rejected),
+        (1, 0),
+        "nothing before reached the engine"
+    );
 }
 
 /// The cached dev model is rebuilt when its recorded input fingerprint does not match.

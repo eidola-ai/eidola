@@ -459,6 +459,10 @@ async fn a_prompt_past_its_budget_is_refused_before_submission() {
     let (status, v) = node.chat_json(&declaring(first.clone(), exact)).await;
     assert_eq!(status, 200, "{v}");
     assert!(cached(&v) >= 256);
+    // Counted once it was served, with every refusal before it: none was the engine's.
+    let s = node.stats();
+    assert_eq!(s.submitted, before.submitted + 1);
+    assert_eq!(s.rejected, before.rejected);
 }
 
 /// A declared prompt longer than the window is refused for its length, not for its
@@ -503,6 +507,11 @@ async fn a_declared_prompt_past_the_window_is_refused_for_its_length() {
         after.submitted, before.submitted,
         "nothing reached the engine"
     );
+    // The engine refuses a prompt past its length with the same error, without
+    // counting a submission: served after them, one more request shows it refused none.
+    let s = node.stats_after_one_more().await;
+    assert_eq!(s.submitted, before.submitted + 1);
+    assert_eq!(s.rejected, before.rejected);
 }
 
 /// A declaration reaching the prompt's final token can never hold (that token is always
@@ -567,6 +576,12 @@ async fn a_declaration_outside_the_shape_or_without_a_key_is_invalid() {
         assert_eq!(v["error"]["type"], "invalid_request_error", "{b}: {v}");
     }
     assert_eq!(node.stats().submitted, 0);
+    let s = node.stats_after_one_more().await;
+    assert_eq!(
+        (s.submitted, s.rejected),
+        (1, 0),
+        "nothing before reached the engine"
+    );
 }
 
 /// A request that declares nothing is answered exactly as before: `cached_prefix: null`
