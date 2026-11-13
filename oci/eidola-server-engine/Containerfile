@@ -40,6 +40,21 @@ FROM ghcr.io/eidola-ai/eidola-engine-kernels@sha256:fcb69a403d8104640a64265b3e40
 # link at /sysroot, which is also the glibc the image ships.
 FROM pallet-rust AS toolchain
 
+# oci/pallet-rust records the Rust this image ships, which
+# rust-toolchain.toml must name (scripts/check-rust-toolchain.sh); the record
+# is held to the image here.
+COPY oci/pallet-rust /pallet-rust
+RUN --network=none <<-'EOF'
+	set -eu
+	recorded="$(sed -n 's/^rust //p' /pallet-rust)"
+	actual="$(rustc --version | cut -d' ' -f2)"
+	if [ "$recorded" != "$actual" ]; then
+		echo "error: oci/pallet-rust records Rust $recorded, but the pinned pallet-rust is $actual" >&2
+		exit 1
+	fi
+	rm /pallet-rust
+EOF
+
 COPY --from=cross-gcc /opt/cross /opt/cross
 COPY --from=glibc / /sysroot/
 

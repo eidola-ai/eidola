@@ -215,6 +215,8 @@ check:
     rumdl check .
     cargo-deny check licenses bans sources
     ./scripts/check-manifest-determinism.sh
+    ./scripts/check-rust-toolchain.sh
+    ./scripts/test-check-rust-toolchain.sh
     ./scripts/artifact-manifest.sh check-complete
     ./scripts/test-release-assets.sh
     ./scripts/test-weights-hash.sh

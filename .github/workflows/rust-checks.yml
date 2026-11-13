@@ -135,6 +135,16 @@ jobs:
         # stopped catching anything fails here too.
         run: ./scripts/check-manifest-determinism.sh
 
+      - name: Check the Rust toolchain is StageX's
+        # Deliberately ungated: the toolchain, the StageX pin and its record
+        # are files the scope step does not all call Rust scope, and a drift
+        # between them means the cargo gates lint and test on a compiler the
+        # release images are not built with. The test runs the check's own
+        # mismatches, so a check that stopped catching anything fails here.
+        run: |
+          ./scripts/check-rust-toolchain.sh
+          ./scripts/test-check-rust-toolchain.sh
+
       - name: Check artifact-manifest completeness
         # The committed manifest must carry exactly the artifact set the
         # emitted schema requires. A schema change that forgets a row is
