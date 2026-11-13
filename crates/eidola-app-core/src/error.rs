@@ -127,6 +127,27 @@ pub enum AppError {
     #[error("insufficient balance: {required} credits required, {available} available")]
     InsufficientBalance { available: i64, required: i64 },
 
+    /// A request's worst-case charge is more than this client will pay
+    /// without issuing a credential sized to it. A just-in-time issuance is
+    /// always the denomination (`denomination`, `DEFAULT_ALLOCATION_CREDITS`)
+    /// or the whole remaining balance, never the request's own size, because
+    /// the amount issued is visible on the account surface and a request's
+    /// share is visible at its spend; so a request is paid only when what the
+    /// wallet holds, or one held credential drained beside one fresh
+    /// denomination, covers it (`docs/anonymous-credits.md` → Issuance
+    /// sizing). Refused before any credential is touched or anything is
+    /// issued, so nothing was charged. Distinct from
+    /// [`AppError::InsufficientBalance`]: adding credit does not lift it; a
+    /// smaller request does.
+    ///
+    /// `hold` is the request's worst case in credits, saturated at
+    /// `i64::MAX` for one too large to represent.
+    #[error(
+        "this request's worst case ({hold} credits) is more than one held credential and \
+         one fresh credential of {denomination} credits can pay together"
+    )]
+    HoldExceedsDenomination { hold: i64, denomination: i64 },
+
     /// The wallet-level ACT provisioning queue timed out waiting for an
     /// in-flight credential refund to free spendable balance for a concurrent
     /// turn. Distinct from [`AppError::InsufficientBalance`] (which is a true

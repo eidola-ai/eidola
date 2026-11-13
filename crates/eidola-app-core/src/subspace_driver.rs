@@ -344,6 +344,9 @@ impl DelegationFailure {
             | AppError::Credential { .. } => Self::Upstream,
             AppError::NoAccount
             | AppError::InsufficientBalance { .. }
+            // The turn could not be paid for: its hold is past what a held
+            // credential and one fresh denomination pay together.
+            | AppError::HoldExceedsDenomination { .. }
             | AppError::ProvisioningTimeout { .. }
             // A refused cached prefix the held credits could not resend.
             | AppError::UncachedRetryUnfunded
@@ -2220,6 +2223,20 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A turn refused for a hold past what one denomination pays could not
+    /// be paid for**, and the report says so as funding: the kind, not the
+    /// figures.
+    #[test]
+    fn a_hold_past_one_denomination_is_a_funding_failure() {
+        assert_eq!(
+            DelegationFailure::of(&AppError::HoldExceedsDenomination {
+                hold: 1_400_000,
+                denomination: 1_000_000,
+            }),
+            DelegationFailure::Funding
+        );
+    }
 
     /// The durable form round-trips, which is the whole of what makes it safe
     /// to store instead of a sentence.

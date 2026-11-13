@@ -28,7 +28,10 @@
 //!   inside it, text in and text out, no repeated modality);
 //! - the base price is finite and non-negative, per token or per request; a
 //!   per-token row may also state a cached-input price, no higher than its
-//!   input price;
+//!   input price, and **a token-priced row declares `max_output_tokens`**:
+//!   it is the top of the ladder of completion ceilings a request is held
+//!   at, so a row without one would be held and served at its whole
+//!   context window;
 //! - the lifecycle is consistent: `deprecated` carries `retire_after`
 //!   (`YYYY-MM-DD`), `current` does not.
 //!
@@ -339,6 +342,12 @@ pub fn parse(path: &str, bytes: &[u8]) -> Result<Row, String> {
             ));
         }
     };
+    if matches!(price, Price::PerToken { .. }) && caps.max_output_tokens.is_none() {
+        return Err(at(
+            "a token-priced row declares capabilities.max_output_tokens: its completion is held \
+             and served at that ceiling",
+        ));
+    }
 
     let lifecycle = match (raw.lifecycle.status.as_str(), raw.lifecycle.retire_after) {
         ("current", None) => Lifecycle::Current,

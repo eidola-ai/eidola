@@ -1864,25 +1864,27 @@ pub struct SpendTrailEntry {
     pub linkability: Option<String>,
 }
 
-/// Default number of credits to allocate into a fresh anonymous credential
-/// when a chat needs one and the account has balance available
-/// (auto-provisioning). The actual amount is
-/// `min(available, max(DEFAULT_ALLOCATION_CREDITS, required))` — see
-/// [`auto_allocation_amount`].
+/// **The denomination**: the one public size this client issues credentials
+/// in, ahead of need ([`Inner::provision_once`]) and just in time
+/// ([`auto_allocation_amount`]), the latter converting the whole remaining
+/// balance instead when that is less. Credits are micro-USD, so this is
+/// $1.00.
 ///
-/// Why 1,000,000: credits are micro-USD-denominated (the server's
-/// `PRICING_SCALE_FACTOR` is 1e6 — `usd_per_M_tokens × markup` becomes
-/// credits-per-token directly, e.g. output at $1.00/M × 1.5 markup
-/// = 1.5 credits/token). A single chat turn's worst-case hold is
-/// `chargeable_prompt_tokens(bytes, msgs) × prompt_rate + 4096 ×
-/// completion_rate` (the shared `eidola-common` contract): ≈6,200 credits
-/// at that rate, ≈32,000 for the most expensive catalog
-/// models (output 7.875 credits/token) — mostly refunded after the actual
-/// usage settles. 1,000,000 credits ($1.00 of balance) therefore covers
-/// ~30 worst-case holds or 100+ typical turns: small enough that only a
-/// sliver of the account balance is parked in one unlinkable credential
-/// at a time, large enough that re-allocation (an account-linked,
-/// timing-correlatable operation) stays infrequent.
+/// One size makes every issuance look like every other on the account
+/// surface, which is where the amount is visible; no issuance is ever sized
+/// to the request it pays for, since a request's share is visible at its
+/// spend and the two would match. The size is a trade: large enough that
+/// issuance, an account-linked and timed operation, is rare against what
+/// ordinary turns hold, and small enough that little of a customer's balance
+/// sits in anonymous credentials ahead of need, where it lapses with its key.
+/// What a turn holds is the shared pricing contract
+/// (`eidola_common::prompt_charge`) applied to the catalog row's rates and
+/// declared `max_output_tokens`, so how many turns one denomination carries
+/// is a property of the catalog, not of this constant. A request is paid
+/// when what the wallet holds, or one held credential drained beside one
+/// fresh denomination, covers its hold, and refused otherwise
+/// ([`AppError::HoldExceedsDenomination`]); `docs/anonymous-credits.md` →
+/// Issuance sizing.
 pub const DEFAULT_ALLOCATION_CREDITS: i64 = 1_000_000;
 
 // --- Ahead-of-need provisioning ---------------------------------------------
@@ -1896,13 +1898,12 @@ pub const DEFAULT_ALLOCATION_CREDITS: i64 = 1_000_000;
 /// for at least [`PROVISION_HORIZON`] fall below this, it issues credentials
 /// of [`DEFAULT_ALLOCATION_CREDITS`] ([`PROVISION_CREDENTIALS_PER_KEY`]).
 ///
-/// A quarter of an allocation: about eight worst-case holds of the most
-/// expensive catalogued model and forty of the default one, so the credential
-/// already held normally carries the requests made between the provisioner's
-/// looks, and the new one is first spent only once that runs out, at a time
-/// set by the reader's own use rather than by the issuance. Small, so what is
-/// held at once is at most this plus [`PROVISION_CREDENTIALS_PER_KEY`]
-/// allocations.
+/// A quarter of an allocation, so the credential already held normally
+/// carries the requests made between the provisioner's looks (how many is a
+/// property of the catalog's rates and declared ceilings), and the new one is
+/// first spent only once that runs out, at a time set by the reader's own use
+/// rather than by the issuance. Small, so what is held at once is at most this
+/// plus [`PROVISION_CREDENTIALS_PER_KEY`] allocations.
 pub const PROVISION_THRESHOLD_CREDITS: i64 = DEFAULT_ALLOCATION_CREDITS / 4;
 
 /// How many credentials of [`DEFAULT_ALLOCATION_CREDITS`] the provisioner
@@ -1951,8 +1952,8 @@ pub const PROVISION_CHECK_MAX: std::time::Duration = std::time::Duration::from_s
 /// is spendable for up to two epochs; one issued at its end, for one.
 pub const PROVISION_LATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
 
-/// See [`PROVISION_LATE_WINDOW`]: enough for a few worst-case holds of the
-/// most expensive model.
+/// See [`PROVISION_LATE_WINDOW`]: a tenth of an allocation, enough that what
+/// is held carries the requests of the hours until the next key.
 pub const PROVISION_DEFER_FLOOR_CREDITS: i64 = DEFAULT_ALLOCATION_CREDITS / 10;
 
 /// How old a pending issuance must be before it is asked for again. Longer
@@ -2125,22 +2126,38 @@ const PROVISION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Poll cadence while the provisioning queue waits on an in-flight refund.
 const PROVISION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Decide how many credits to auto-allocate, given the account's available
-/// balance and the credits required for the operation that triggered
-/// provisioning. Pure function so the decision logic is unit-testable
-/// without HTTP.
+/// What a just-in-time issuance converts, given the account's `available`
+/// balance and `need`, the least a new credential must hold for the request
+/// waiting on it to be paid.
 ///
-/// Returns [`AppError::InsufficientBalance`] when the balance cannot cover
-/// even the required amount; otherwise the chunk size:
-/// `min(available, max(DEFAULT_ALLOCATION_CREDITS, required))`.
-fn auto_allocation_amount(available: i64, required: i64) -> Result<i64, AppError> {
-    if available < required {
-        return Err(AppError::InsufficientBalance {
-            available,
-            required,
-        });
+/// **The amount is never a function of the request.** It is the denomination
+/// ([`DEFAULT_ALLOCATION_CREDITS`]), or the whole available balance when that
+/// is less. `need` decides only *whether* to issue: `None` when that amount
+/// would not cover it (an empty account, a balance below `need`, or a `need`
+/// past one denomination), and nothing is converted.
+fn auto_allocation_amount(available: i64, need: i64) -> Option<i64> {
+    let amount = available.min(DEFAULT_ALLOCATION_CREDITS);
+    (amount > 0 && amount >= need).then_some(amount)
+}
+
+/// The largest hold a request can be paid without issuing more than one
+/// credential, and that one only of the denomination: any two of the
+/// wallet's credentials (`held`, and `in_flight` at their face value, the
+/// most a successor can hold), or the largest of them drained beside one
+/// fresh [`DEFAULT_ALLOCATION_CREDITS`]. A request past it is refused
+/// ([`AppError::HoldExceedsDenomination`]) before anything is touched; this
+/// bounds what any wait or issuance could make payable, whatever the
+/// account's balance.
+pub(crate) fn largest_payable_hold(held: &[i64], in_flight: &[i64]) -> i64 {
+    let mut top = [0i64; 2];
+    for &balance in held.iter().chain(in_flight) {
+        if balance > top[0] {
+            top = [balance, top[0]];
+        } else if balance > top[1] {
+            top[1] = balance;
+        }
     }
-    Ok(available.min(DEFAULT_ALLOCATION_CREDITS.max(required)))
+    top[0].saturating_add(top[1].max(DEFAULT_ALLOCATION_CREDITS))
 }
 
 /// Incremental events emitted by `AppCore::chat_stream`. The terminal
@@ -7102,36 +7119,46 @@ impl Inner {
     ///
     /// Resolution order (retried in a bounded loop):
     /// 1. The wallet covers the hold, alone or as a drain and a fill → use it.
-    /// 2. Otherwise `need` is what is missing: the whole hold, or the hold
-    ///    less the first credential's balance when that one is to be drained.
-    ///    A stranded hold is asked for first
+    /// 2. The hold is past [`largest_payable_hold`] — more than any two of the
+    ///    wallet's credentials, held or in flight, or the largest of them
+    ///    beside one fresh denomination, can pay → refused with
+    ///    [`AppError::HoldExceedsDenomination`] before anything else: no
+    ///    recovery, no balance read, no issuance, no credential touched.
+    ///    Nothing is ever issued sized to the request.
+    /// 3. Otherwise `need` is what is missing: the whole hold, or the hold
+    ///    less the largest credential's balance, which a new credential
+    ///    filling beside its drain must cover. A stranded hold is asked for
+    ///    first
     ///    ([`Inner::recover_stranded_spends`], unlinked), and once more
     ///    during any wait below. No account configured →
     ///    [`AppError::NoAccount`] (the UI routes to account creation).
-    /// 3. An issuance of the account's is pending → nothing is converted, and
+    /// 4. An issuance of the account's is pending → nothing is converted, and
     ///    nothing is sent to the account surface: the pending issuance is
     ///    never asked for again from here (that is the provisioner's pass and
-    ///    the explicit doors'), and the request waits as in 4 with nothing
+    ///    the explicit doors'), and the request waits as in 5 with nothing
     ///    convertible; when the wait cannot help,
-    ///    [`AppError::ProvisioningTimeout`]. Otherwise the available balance
-    ///    covers `need` → allocate
-    ///    `min(available, max(DEFAULT_ALLOCATION_CREDITS, need))` (the pool)
-    ///    and choose again: the new credential is the fill, or the whole.
-    /// 4. Balance can't cover it but a mid-spend credential whose own
-    ///    `credits` cover `need` exists (a concurrent turn holds usable
-    ///    coverage) → wait bounded for its refund to write a successor, then
-    ///    retry. A mid-spend credential *smaller* than `need` is ignored — a
-    ///    successor is worth at most the original face value, and refunds
-    ///    don't top up balance, so waiting on it is futile.
-    ///
-    /// Under [`Funding::HeldOnly`] (the resend of a refused cached-prefix
-    /// declaration) steps 2 and 3 never run: after the stranded-hold ask, the
-    /// request waits only for a settlement in flight that could pay it, and
-    /// otherwise fails with [`AppError::UncachedRetryUnfunded`] — nothing is
-    /// converted and nothing is sent to the account surface.
-    /// 5. Bounded wait elapses with a covering credential still in flight →
+    ///    [`AppError::ProvisioningTimeout`]. Otherwise, when the amount a
+    ///    just-in-time issuance converts ([`auto_allocation_amount`]: the
+    ///    denomination, or the whole available balance when less) covers
+    ///    `need` → issue exactly that amount and choose again: the new
+    ///    credential is the fill, or the whole.
+    /// 5. No issuance covers it but a mid-spend credential could pay, alone
+    ///    or as one of two inputs ([`settlement_could_cover`]; a concurrent
+    ///    turn holds usable coverage) → wait bounded for its refund to write
+    ///    a successor, then retry. A mid-spend credential that could not is
+    ///    ignored — a successor is worth at most the original face value, and
+    ///    refunds don't top up balance, so waiting on it is futile.
+    /// 6. Bounded wait elapses with a covering credential still in flight →
     ///    [`AppError::ProvisioningTimeout`]; no covering credential in flight
     ///    (true shortfall) → [`AppError::InsufficientBalance`] *immediately*.
+    ///
+    /// Under [`Funding::HeldOnly`] (the resend of a refused cached-prefix
+    /// declaration) nothing past the stranded-hold ask of step 3 runs: the
+    /// request waits only for a settlement in flight that could pay it, and
+    /// otherwise fails with [`AppError::UncachedRetryUnfunded`] — nothing is
+    /// converted and nothing is sent to the account surface. Step 2 applies
+    /// to it as to any request, so a hold no later attempt could pay is told
+    /// apart from one an attempt that may convert would.
     async fn ensure_spend_inputs(
         &self,
         cfg: &Config,
@@ -7150,6 +7177,26 @@ impl Inner {
         loop {
             if let Ok(inputs) = chosen_inputs(db_conn, charge_credits).await? {
                 return Ok(inputs);
+            }
+
+            // Past what the wallet and one fresh denomination could ever pay:
+            // refused before a stranded hold is asked for, a balance read or
+            // anything issued, since none of them could make it payable.
+            let held: Vec<i64> = db::spendable_credentials(db_conn)
+                .await?
+                .into_iter()
+                .map(|c| c.credits)
+                .collect();
+            let in_flight: Vec<i64> = db::list_spending_credentials(db_conn)
+                .await?
+                .into_iter()
+                .map(|c| c.credits)
+                .collect();
+            if charge_credits > largest_payable_hold(&held, &in_flight) {
+                return Err(AppError::HoldExceedsDenomination {
+                    hold: charge_credits,
+                    denomination: DEFAULT_ALLOCATION_CREDITS,
+                });
             }
 
             if stranded_asks == 2 {
@@ -7211,10 +7258,10 @@ impl Inner {
                     (None, need)
                 } else {
                     let balances = self.account_balances_bounded().await?;
-                    if balances.available >= need {
-                        // Enough to allocate at least what is missing — grow
-                        // the pool, and choose again.
-                        let amount = auto_allocation_amount(balances.available, need)?;
+                    // The amount is the denomination or the whole balance,
+                    // whatever the request; what is missing decides only
+                    // whether it is issued.
+                    if let Some(amount) = auto_allocation_amount(balances.available, need) {
                         self.allocate_on_its_own_task(amount).await?;
                         continue;
                     }
@@ -7233,10 +7280,11 @@ impl Inner {
             // the account balance. So waiting
             // helps only when some in-flight credential, at its face value,
             // could pay alone or as one of two inputs ([`settlement_could_cover`]),
-            // the other being a held credential or one the available balance
-            // can still be converted into (the in-flight credential drained,
-            // the allocation filling the rest); otherwise this is a true
-            // shortfall.
+            // the other being a held credential or the one a just-in-time
+            // issuance would make from the available balance (the
+            // denomination, or the balance when less; the in-flight
+            // credential drained, the issuance filling the rest); otherwise
+            // this is a true shortfall.
             let in_flight: Vec<i64> = db::list_spending_credentials(db_conn)
                 .await?
                 .into_iter()
@@ -7246,7 +7294,9 @@ impl Inner {
                 .await?
                 .into_iter()
                 .map(|c| c.credits)
-                .chain(std::iter::once(available))
+                .chain(std::iter::once(
+                    available.clamp(0, DEFAULT_ALLOCATION_CREDITS),
+                ))
                 .collect();
             let recoverable = settlement_could_cover(&in_flight, &held, charge_credits);
             if recoverable && tokio::time::Instant::now() < deadline {
@@ -7291,7 +7341,11 @@ impl Inner {
             // is taken again rather than refused on the stale amount.
             match chosen_inputs(db_conn, charge_credits).await? {
                 Ok(inputs) => return Ok(inputs),
-                Err(missing) if missing < need && available >= missing => continue,
+                Err(missing)
+                    if missing < need && auto_allocation_amount(available, missing).is_some() =>
+                {
+                    continue;
+                }
                 Err(_) => {}
             }
             if recoverable {
@@ -8580,12 +8634,17 @@ impl Inner {
         // once can never both spend the same credential. The gate is held only
         // through `insert_spend_inputs` below (the point the inputs become
         // `spending`); the HTTP request runs outside it.
+        // A hold too large for the wallet's arithmetic is far past anything one
+        // denomination pays, and is refused as that, before anything is read.
+        let hold =
+            i64::try_from(charge_credits).map_err(|_| AppError::HoldExceedsDenomination {
+                hold: i64::MAX,
+                denomination: DEFAULT_ALLOCATION_CREDITS,
+            })?;
         let _spend_guard = self.spend_gate.lock().await;
         // Boxed: the provisioning queue's own future (with an issuance inside
         // it) is large, and it sits inside every turn's.
-        let chosen =
-            Box::pin(self.ensure_spend_inputs(cfg, db_conn, charge_credits as i64, funding))
-                .await?;
+        let chosen = Box::pin(self.ensure_spend_inputs(cfg, db_conn, hold, funding)).await?;
 
         let params = params_from_domain_separator(cfg.domain_separator())?;
         let mut inputs = Vec::with_capacity(chosen.len());
@@ -15370,8 +15429,10 @@ async fn chosen_inputs(
 ///    a later one is drained only when the first has no fill but another pair
 ///    covers `W`, so a wallet able to pay is never sent to allocation.
 /// 3. If no pair covers `W` (or the wallet is empty), a new credential is
-///    allocated to fill beside the first credential's drain (or to pay alone),
-///    and the rule runs again.
+///    allocated, and the rule runs again: it fills beside a drain (or pays
+///    alone). It must hold at least `W` less the largest balance; it is
+///    issued only at the denomination or the whole remaining balance, never
+///    at that size ([`auto_allocation_amount`]).
 ///
 /// Every share is `W`, a drained balance, or the rest of `W` after a drain,
 /// so the shares sum to exactly `W` and reveal nothing but the drained
@@ -15384,7 +15445,7 @@ pub(crate) enum InputChoice {
     /// the order) pays the rest.
     Two { drain: usize, fill: usize },
     /// No pair in the wallet covers the hold: a new credential must cover
-    /// `need`, the whole hold, or the hold less the first credential's
+    /// `need`, the whole hold, or the hold less the largest credential's
     /// balance.
     Allocate { need: i64 },
 }
@@ -15410,8 +15471,11 @@ pub(crate) fn choose_inputs(balances: &[i64], worst: i64) -> InputChoice {
             };
         }
     }
+    // Every balance is below the hold here; the largest is the drain a new
+    // credential needs the least beside.
+    let largest = balances.iter().copied().max().unwrap_or(first);
     InputChoice::Allocate {
-        need: worst - first,
+        need: worst - largest,
     }
 }
 
@@ -17467,7 +17531,7 @@ mod charge_pricing_tests {
 /// per iteration" the parameter was introduced for.
 fn check_turn_budget(charge_credits: u128, budget: Option<i64>) -> Result<(), AppError> {
     if let Some(b) = budget
-        && charge_credits as i64 > b
+        && i64::try_from(charge_credits).map_or(true, |charge| charge > b)
     {
         return Err(AppError::Credential {
             message: format!("estimated charge {charge_credits} exceeds the turn budget {b}"),
@@ -21151,7 +21215,8 @@ mod tests {
     /// **The input rule** (`docs/anonymous-credits.md` → Spending several tokens in one request), over a
     /// wallet already in its spend order: the first credential alone when it
     /// covers the hold; otherwise drained, with the first *later* credential
-    /// that covers the rest; otherwise a new credential for what is missing.
+    /// that covers the rest; otherwise a new credential for what is missing
+    /// beside the largest.
     #[test]
     fn inputs_are_the_first_credential_or_a_drain_and_the_first_fill() {
         use InputChoice::*;
@@ -21174,8 +21239,8 @@ mod tests {
         // Exactly the rest is enough.
         assert_eq!(choose_inputs(&[1, 6_199], w), Two { drain: 0, fill: 1 });
         // No pair covers the hold: a new credential, for the rest of the
-        // first credential's drain only.
-        assert_eq!(choose_inputs(&[3_000, 3_199], w), Allocate { need: 3_200 });
+        // largest credential's drain only.
+        assert_eq!(choose_inputs(&[3_000, 3_199], w), Allocate { need: 3_001 });
         assert_eq!(choose_inputs(&[3_000], w), Allocate { need: 3_200 });
         // The first has no fill, but a later pair covers the hold: that pair
         // pays, rather than allocation ($0.10, $0.60 and $0.60 against $1).
@@ -21227,7 +21292,7 @@ mod tests {
                 }
                 Allocate { need } => {
                     assert!(!first_covers && !pair_covers, "{wallet:?}");
-                    assert_eq!(need, worst - wallet.first().copied().unwrap_or(0));
+                    assert_eq!(need, worst - wallet.iter().copied().max().unwrap_or(0));
                 }
             }
         }
@@ -21966,34 +22031,129 @@ mod tests {
     // --- Auto-provisioning decision logic ---------------------------------
 
     #[test]
-    fn auto_allocation_uses_default_chunk_when_balance_is_plentiful() {
-        // Plenty of balance, small charge → allocate the default chunk,
-        // leaving the rest of the balance in the account.
-        let amount = auto_allocation_amount(10 * DEFAULT_ALLOCATION_CREDITS, 6_200).unwrap();
-        assert_eq!(amount, DEFAULT_ALLOCATION_CREDITS);
+    fn auto_allocation_issues_the_denomination_when_balance_is_plentiful() {
+        // Plenty of balance, small need → the denomination, leaving the rest
+        // of the balance in the account.
+        let amount = auto_allocation_amount(10 * DEFAULT_ALLOCATION_CREDITS, 6_200);
+        assert_eq!(amount, Some(DEFAULT_ALLOCATION_CREDITS));
     }
 
     #[test]
-    fn auto_allocation_is_capped_by_available_balance() {
-        // Balance covers the charge but is below the default chunk →
-        // allocate everything that's available.
-        let amount = auto_allocation_amount(50_000, 6_200).unwrap();
-        assert_eq!(amount, 50_000);
+    fn auto_allocation_issues_the_whole_balance_when_less_than_the_denomination() {
+        assert_eq!(auto_allocation_amount(50_000, 6_200), Some(50_000));
+        assert_eq!(auto_allocation_amount(6_200, 6_200), Some(6_200));
+    }
+
+    /// REGRESSION: **a need past the denomination is never issued to its own
+    /// size.** The amount issued is visible on the account surface and a
+    /// fill's share at its spend, so an issuance equal to the share links the
+    /// two. Nothing is issued instead, however large the balance.
+    #[test]
+    fn auto_allocation_never_grows_to_cover_a_large_need() {
+        let need = DEFAULT_ALLOCATION_CREDITS + 500_000;
+        assert_eq!(
+            auto_allocation_amount(10 * DEFAULT_ALLOCATION_CREDITS, need),
+            None
+        );
+        assert_eq!(auto_allocation_amount(i64::MAX, need), None);
     }
 
     #[test]
-    fn auto_allocation_grows_to_cover_a_large_charge() {
-        // A single charge larger than the default chunk must still fit in
-        // one credential (spends draw from exactly one credential).
-        let required = DEFAULT_ALLOCATION_CREDITS + 500_000;
-        let amount = auto_allocation_amount(10 * DEFAULT_ALLOCATION_CREDITS, required).unwrap();
-        assert_eq!(amount, required);
+    fn auto_allocation_issues_nothing_a_balance_cannot_cover() {
+        assert_eq!(auto_allocation_amount(1_000, 6_200), None);
+        assert_eq!(auto_allocation_amount(0, 1), None);
+        assert_eq!(auto_allocation_amount(-5, 1), None);
     }
 
+    /// **The amount issued is never a function of the need.** Over edge
+    /// values and a seeded sweep: whenever anything is issued, it is the
+    /// denomination or the whole balance when less, and it is issued exactly
+    /// when that amount covers the need.
     #[test]
-    fn auto_allocation_exact_balance_allocates_it_all() {
-        let amount = auto_allocation_amount(6_200, 6_200).unwrap();
-        assert_eq!(amount, 6_200);
+    fn the_issued_amount_never_depends_on_the_need() {
+        let d = DEFAULT_ALLOCATION_CREDITS;
+        let check = |available: i64, need: i64| {
+            let issuable = available.min(d);
+            match auto_allocation_amount(available, need) {
+                Some(amount) => {
+                    assert_eq!(amount, issuable, "available {available}, need {need}");
+                    assert!(
+                        amount >= need && amount > 0,
+                        "available {available}, need {need}"
+                    );
+                }
+                None => assert!(
+                    issuable < need || issuable <= 0,
+                    "available {available}, need {need}: an issuance would have paid"
+                ),
+            }
+        };
+        let edges = [
+            i64::MIN,
+            -1,
+            0,
+            1,
+            2,
+            d / 4,
+            d - 1,
+            d,
+            d + 1,
+            2 * d,
+            i64::from(u32::MAX),
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+        for &available in &edges {
+            for &need in &edges {
+                check(available, need);
+            }
+        }
+        // A fixed-seed splitmix64, so a failure names a reproducible case.
+        let mut state: u64 = 0x5eed_0fd3_0a11;
+        let mut next = move || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        for _ in 0..20_000 {
+            let available = (next() % (4 * d as u64)) as i64;
+            let need = 1 + (next() % (3 * d as u64)) as i64;
+            check(available, need);
+            // The same balance answers every need it covers with one amount.
+            if let (Some(a), Some(b)) = (
+                auto_allocation_amount(available, need),
+                auto_allocation_amount(available, 1),
+            ) {
+                assert_eq!(a, b, "available {available}");
+            }
+        }
+    }
+
+    /// The largest payable hold: any two credentials, held or in flight, or
+    /// the largest beside one fresh denomination.
+    #[test]
+    fn the_largest_payable_hold_is_two_credentials_or_one_beside_a_denomination() {
+        let d = DEFAULT_ALLOCATION_CREDITS;
+        assert_eq!(
+            largest_payable_hold(&[], &[]),
+            d,
+            "an empty wallet: one denomination"
+        );
+        assert_eq!(largest_payable_hold(&[1_000], &[]), 1_000 + d);
+        assert_eq!(
+            largest_payable_hold(&[1_000, 600_000, 3_000], &[]),
+            600_000 + d,
+            "the largest residual, not the first, is drained"
+        );
+        assert_eq!(largest_payable_hold(&[], &[700_000]), 700_000 + d);
+        assert_eq!(
+            largest_payable_hold(&[2 * d], &[3 * d]),
+            5 * d,
+            "two credentials larger than the denomination pay together"
+        );
+        assert_eq!(largest_payable_hold(&[i64::MAX], &[i64::MAX]), i64::MAX);
     }
 
     /// A required-document row as `current_terms` would hand it back. Only
@@ -22101,32 +22261,6 @@ mod tests {
             }
             other => panic!("expected TermsAcceptanceRequired, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn auto_allocation_fails_typed_when_balance_cannot_cover_charge() {
-        let err = auto_allocation_amount(1_000, 6_200).unwrap_err();
-        match err {
-            AppError::InsufficientBalance {
-                available,
-                required,
-            } => {
-                assert_eq!(available, 1_000);
-                assert_eq!(required, 6_200);
-            }
-            other => panic!("expected InsufficientBalance, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn auto_allocation_fails_typed_on_zero_balance() {
-        assert!(matches!(
-            auto_allocation_amount(0, 1),
-            Err(AppError::InsufficientBalance {
-                available: 0,
-                required: 1
-            })
-        ));
     }
 
     // -----------------------------------------------------------------

@@ -597,6 +597,52 @@ fn a_flat_priced_model_is_held_at_its_flat_price() {
     });
 }
 
+/// **A hold past what the wallet and one denomination pay is the request's
+/// problem, refused before anything is issued.** On the MiMo-priced row a long
+/// prompt holds about 1.4 denominations and the wallet is empty: paying it
+/// would need an issuance sized to the request. The tool is answered `400`
+/// with a code it can act on (a smaller request), not the funding refusal no
+/// balance would lift, and the figures stay home; nothing reached the account
+/// surface or the upstream, and the Record still keeps the refused request.
+#[test]
+fn a_hold_past_one_denomination_is_refused_as_the_requests_problem() {
+    run(|| {
+        let (mock, core, _dir) = core_for(MockConfig {
+            mimo_priced: true,
+            ..Default::default()
+        });
+        with_account(&core);
+        let key = armed(&core);
+        let core = Arc::new(core);
+        let prompt = "x".repeat(2_400_000);
+        let (status, body) = core.runtime().block_on(exchange(
+            &core,
+            &post(
+                "/v1/chat/completions",
+                &key,
+                &format!(
+                    r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"{prompt}"}}]}}"#
+                ),
+            ),
+        ));
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("request_too_large"), "{body}");
+        assert!(body.contains("invalid_request_error"), "{body}");
+        assert!(
+            !body.contains("1000000") && !body.contains("credits"),
+            "no figures reach the tool: {body}"
+        );
+        assert_eq!(mock.issuance_requests(), 0, "nothing was issued");
+        assert_eq!(mock.chat_hits(), 0, "nothing reached the upstream");
+        // The Record keeps the refusal; the long body is kept truncated, so
+        // the row is checked without reading it back.
+        let rows = completion_rows(&core);
+        assert_eq!(rows.len(), 1, "{rows:#?}");
+        assert_eq!(rows[0].response_status, None, "nothing was sent");
+        assert_eq!(rows[0].credential_nonce, None, "nothing was spent");
+    });
+}
+
 #[test]
 fn a_proxied_completion_pays_records_and_creates_no_conversation() {
     run(|| {
@@ -2466,6 +2512,11 @@ fn an_enormous_prompt_is_recorded_as_the_truncation_it_is() {
     run(|| {
         let (mock, core, _dir) = core_for(MockConfig::default());
         with_account(&core);
+        // The prompt holds more than one denomination, so the wallet starts
+        // with one: drained beside a fresh one, the two pay it.
+        core.runtime()
+            .block_on(core.account_allocate(eidola_app_core::DEFAULT_ALLOCATION_CREDITS))
+            .expect("an allocation");
         let key = armed(&core);
         let core = Arc::new(core);
         let runtime = core.runtime();

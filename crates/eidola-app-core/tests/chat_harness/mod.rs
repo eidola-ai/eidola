@@ -779,6 +779,12 @@ pub struct MockConfig {
     /// The `context_length` `GET /v1/models` declares for [`MODEL`]. `None` —
     /// the default — declares 8,192, which bounds every ceiling to it.
     pub context_length: Option<u64>,
+    /// Price and size [`MODEL`]'s row as the shipped MiMo-V2.6-Flash row is
+    /// served ([`MIMO_CONTEXT_LENGTH`], [`MIMO_MAX_OUTPUT_TOKENS`], and its
+    /// $0.50 / $2.00 per million at the gateway's 1.5 markup), so a long
+    /// prompt holds more than one denomination. `false` — the default —
+    /// keeps the one-credit-a-token row every other test pins.
+    pub mimo_priced: bool,
 }
 
 /// A one-shot refusal of the next declared request (see
@@ -793,6 +799,15 @@ pub const REQUEST_FEE: u128 = 1_000;
 /// The step a declared cached prefix is rounded down to, spelled here for the
 /// same reason.
 pub const CACHED_PREFIX_QUANTUM: u64 = 256;
+
+/// The context window [`MockConfig::mimo_priced`] declares.
+pub const MIMO_CONTEXT_LENGTH: u64 = 1_048_576;
+/// The `max_output_tokens` [`MockConfig::mimo_priced`] declares.
+pub const MIMO_MAX_OUTPUT_TOKENS: u64 = 65_536;
+/// [`MockConfig::mimo_priced`]'s rates, in credits per token at a scale of
+/// 1,000,000: $0.50 and $2.00 per million tokens, each times 1.5.
+pub const MIMO_PROMPT_RATE: u64 = 750_000;
+pub const MIMO_COMPLETION_RATE: u64 = 3_000_000;
 
 /// See [`MockConfig::key_swap`].
 #[derive(Clone, Default)]
@@ -1001,6 +1016,7 @@ impl Default for MockConfig {
             engine_prompt_tokens: None,
             refuse_next_declared: RefuseNextDeclared::default(),
             context_length: None,
+            mimo_priced: false,
         }
     }
 }
@@ -1156,6 +1172,11 @@ impl MockServer {
     /// The credits converted by every debiting issuance.
     pub fn issuance_debited_credits(&self) -> i64 {
         self.issuer.issuance_debited_credits.load(Ordering::SeqCst) as i64
+    }
+    /// The amount every debiting issuance converted, in the order they
+    /// debited: what the account surface saw of each.
+    pub fn issued_amounts(&self) -> Vec<i64> {
+        self.issuer.issued_amounts.lock().unwrap().clone()
     }
     /// Debit and store every issuance [`IssuanceKnobs::hold_next`] held, as
     /// a stalled original reaching its debit late would.
@@ -1566,6 +1587,8 @@ struct Issuer {
     issuance_debits: AtomicU64,
     /// The credits all those debits converted.
     issuance_debited_credits: AtomicU64,
+    /// The amount of every debiting issuance, in the order they debited.
+    issued_amounts: std::sync::Mutex<Vec<i64>>,
     /// A public key listed as the previous epoch's, for an epoch the mock
     /// never listed a current key for: stable for the mock's life.
     decoy_public_key: Vec<u8>,
@@ -1602,6 +1625,7 @@ impl Issuer {
         self.issuance_debits.fetch_add(1, Ordering::SeqCst);
         self.issuance_debited_credits
             .fetch_add(signed.credits.max(0) as u64, Ordering::SeqCst);
+        self.issued_amounts.lock().unwrap().push(signed.credits);
         issuances.insert(signed.idem, (signed.request_digest, signed.body));
     }
 
@@ -1630,6 +1654,7 @@ impl Issuer {
             issuance_requests: AtomicU64::new(0),
             issuance_debits: AtomicU64::new(0),
             issuance_debited_credits: AtomicU64::new(0),
+            issued_amounts: std::sync::Mutex::new(Vec::new()),
             decoy_public_key: PrivateKey::random(OsRng)
                 .public()
                 .to_cbor()
@@ -4428,6 +4453,14 @@ fn models_body(config: &MockConfig) -> String {
     }
     if let Some(ceiling) = config.declared_max_output {
         primary["max_output_tokens"] = serde_json::json!(ceiling);
+    }
+    if config.mimo_priced {
+        primary["context_length"] = serde_json::json!(MIMO_CONTEXT_LENGTH);
+        primary["max_output_tokens"] = serde_json::json!(MIMO_MAX_OUTPUT_TOKENS);
+        primary["pricing"] = serde_json::json!({
+            "per_prompt_token": { "value": MIMO_PROMPT_RATE, "scale_factor": 1_000_000u64 },
+            "per_completion_token": { "value": MIMO_COMPLETION_RATE, "scale_factor": 1_000_000u64 }
+        });
     }
     if let Some((value, scale_factor)) = config.cached_prompt_price {
         primary["pricing"]["per_cached_prompt_token"] =

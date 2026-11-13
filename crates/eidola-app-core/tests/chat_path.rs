@@ -734,6 +734,206 @@ fn a_new_credential_fills_what_the_wallet_cannot() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Issuance is never sized to the request (`docs/anonymous-credits.md` →
+// Issuance sizing)
+// ---------------------------------------------------------------------------
+
+/// A prompt whose hold on [`MockConfig::mimo_priced`]'s row is about
+/// 1,400,000 credits: past one denomination, so no single credential this
+/// client issues pays it. Each byte is about half a credit there (two thirds
+/// of a chargeable token at 0.75 credits a token), and the completion side
+/// holds 196,608.
+fn a_prompt_past_one_denomination() -> String {
+    "x".repeat(2_400_000)
+}
+
+/// Every credential's `(state, credits)`, in a stable order: what a refused
+/// request must leave exactly as it found it.
+fn wallet_states(core: &AppCore) -> Vec<(String, i64)> {
+    let mut states: Vec<(String, i64)> = core
+        .runtime()
+        .block_on(core.wallet_lifecycle())
+        .expect("lifecycle")
+        .into_iter()
+        .map(|c| (c.state, c.credits))
+        .collect();
+    states.sort();
+    states
+}
+
+/// REGRESSION: **a hold past one denomination is issued one denomination,
+/// never its own size, and is paid by a drain and a fill.** On the shipped
+/// MiMo row a long prompt holds about 1.4 denominations. The wallet holds
+/// 100,000 and 600,000: no pair of them pays, and a credential sized to fill
+/// beside the first (the hold less 100,000) would be issued for exactly the
+/// share its spend then shows, linking the account to the request by amount.
+/// Instead one denomination is issued and fills beside the largest residual,
+/// which is drained; the 100,000 is left for a later request.
+#[test]
+fn a_large_hold_is_issued_one_denomination_and_paid_by_a_drain_and_a_fill() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            mimo_priced: true,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        for amount in [100_000, 600_000] {
+            core.runtime()
+                .block_on(core.account_allocate(amount))
+                .expect("an allocation");
+        }
+
+        core.runtime()
+            .block_on(core.chat(a_prompt_past_one_denomination(), MODEL.into(), None))
+            .expect("a residual and one denomination pay it");
+        let worst = mock.chat_charges()[0].expect("a hold") as i64;
+        assert!(
+            worst > DEFAULT_ALLOCATION_CREDITS && worst <= 600_000 + DEFAULT_ALLOCATION_CREDITS,
+            "the hold is past one denomination and within the residual beside one: {worst}"
+        );
+        assert!(worst - 100_000 > DEFAULT_ALLOCATION_CREDITS);
+        assert_eq!(
+            mock.issued_amounts(),
+            vec![100_000, 600_000, DEFAULT_ALLOCATION_CREDITS],
+            "the just-in-time issuance is the denomination, not the request's share"
+        );
+        assert_eq!(
+            mock.chat_shares()[0],
+            vec![600_000, (worst - 600_000) as u128],
+            "the largest residual is drained and the new denomination fills"
+        );
+        assert!(
+            !mock
+                .issued_amounts()
+                .iter()
+                .any(|&issued| issued == worst - 600_000 || issued == worst),
+            "no issuance equals a share or the hold"
+        );
+        assert_eq!(mock.hold_mismatches(), 0);
+        assert!(spending_credentials(&core).is_empty());
+        assert!(
+            active_balances(&core).contains(&100_000),
+            "the smaller residual waits for a later request"
+        );
+    });
+}
+
+/// **Ordinary turns issue only the denomination**: an empty wallet's first
+/// turn converts exactly one, and the turns after it are paid from it with
+/// nothing more issued.
+#[test]
+fn ordinary_turns_issue_only_the_denomination() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        for turn in 0..3 {
+            core.runtime()
+                .block_on(core.chat(format!("turn {turn}"), MODEL.into(), None))
+                .expect("a turn");
+        }
+        assert_eq!(mock.chat_charges().len(), 3);
+        assert_eq!(mock.issued_amounts(), vec![DEFAULT_ALLOCATION_CREDITS]);
+    });
+}
+
+/// **A balance below the denomination is issued whole**, the one amount
+/// other than the denomination a just-in-time issuance converts.
+#[test]
+fn a_balance_below_the_denomination_is_issued_whole() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            balance: 50_000,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("the whole balance covers the turn");
+        assert_eq!(mock.issued_amounts(), vec![50_000]);
+    });
+}
+
+/// REGRESSION: **a hold past what a residual and one denomination can pay is
+/// refused before anything is issued or any credential touched.** The wallet
+/// holds 100,000 and the hold is about 1.4 denominations: paying it would need
+/// an issuance sized to the request. The turn fails with the typed refusal;
+/// no issuance is asked for, no chat request is sent, the wallet is exactly
+/// as it was, and only the post (which a turn persists first) is announced.
+#[test]
+fn a_hold_past_a_residual_and_one_denomination_is_refused_before_anything_is_issued() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            mimo_priced: true,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(100_000))
+            .expect("an allocation");
+        let issuance_requests = mock.issuance_requests();
+        let before = wallet_states(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat(a_prompt_past_one_denomination(), MODEL.into(), None))
+            .expect_err("no residual and one denomination pay it");
+        match err {
+            AppError::HoldExceedsDenomination { hold, denomination } => {
+                assert_eq!(denomination, DEFAULT_ALLOCATION_CREDITS);
+                assert!(hold > 100_000 + denomination, "{hold}");
+            }
+            other => panic!("expected HoldExceedsDenomination, got {other:?}"),
+        }
+        assert_eq!(
+            mock.issuance_requests(),
+            issuance_requests,
+            "nothing was asked of the account surface"
+        );
+        assert_eq!(mock.issued_amounts(), vec![100_000]);
+        assert_eq!(mock.chat_hits(), 0, "nothing was sent");
+        assert_eq!(wallet_states(&core), before, "no credential was touched");
+
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::SpaceIndex), "got {changes:?}");
+        assert!(
+            !changes.contains(&Change::Wallet) && !changes.contains(&Change::Record),
+            "no Wallet or Record on a refusal before the spend; got {changes:?}"
+        );
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(only_space(&core)))
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "the post survived the refusal");
+    });
+}
+
+/// **With an empty wallet the refusal comes at one denomination**: a hold
+/// past it is never converted to its own size, however large the balance.
+#[test]
+fn an_empty_wallets_hold_past_one_denomination_is_refused() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            mimo_priced: true,
+            balance: 100 * DEFAULT_ALLOCATION_CREDITS,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let err = core
+            .runtime()
+            .block_on(core.chat(a_prompt_past_one_denomination(), MODEL.into(), None))
+            .expect_err("one denomination cannot pay it");
+        assert!(
+            matches!(err, AppError::HoldExceedsDenomination { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(mock.issuance_requests(), 0);
+        assert!(mock.issued_amounts().is_empty());
+        assert_eq!(mock.chat_hits(), 0);
+    });
+}
+
 /// **Every exit of a two-input round settles every input**: a completed
 /// answer and a stream ending in its metadata event (one refund per input, in
 /// band), a refusal after recording (refunds of all but the request fee in its
@@ -10361,6 +10561,11 @@ fn an_enormous_prompt_is_recorded_as_the_truncation_it_is() {
     run(|| {
         let (mock, core, _dir) = setup(MockConfig::default());
         with_account(&core);
+        // The prompt holds more than one denomination, so the wallet starts
+        // with one: drained beside a fresh one, the two pay it.
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect("an allocation");
         let prompt = "x".repeat(2 * 1024 * 1024);
         core.runtime()
             .block_on(core.chat(prompt, MODEL.into(), None))
