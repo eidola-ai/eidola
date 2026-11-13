@@ -75,9 +75,13 @@ impl Harness {
     }
 
     pub fn check(&self) {
-        if !self.checks {
-            return;
+        if self.checks {
+            self.check_now();
         }
+    }
+
+    /// The full invariant scan, whatever `checks` says.
+    pub fn check_now(&self) {
         let kv = self.eng.kv();
         kv.check_invariants();
         kv.check_no_reservations();
