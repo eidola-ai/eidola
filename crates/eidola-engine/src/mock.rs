@@ -27,11 +27,17 @@
 
 use std::collections::HashMap;
 
+mod chain;
+
+pub use chain::Reference;
+
 use crate::executor::{Executor, ExecutorError, Maintenance, SeqEntry, StepInput, StepOutput};
 use crate::kv_cipher::{KvKeystream, KvNonce};
 use crate::sampling::{self, SamplingParams, Stream, mix64};
 use crate::secret::KvKey;
-use crate::spec::{AttentionKind, Bucket, KvGroupSpec, KvRole, ModelSpec, NULL_BLOCK};
+use crate::spec::{
+    AttentionKind, Bucket, Coverage, KvGroupSpec, KvRole, ModelSpec, NULL_BLOCK, WindowChain,
+};
 
 /// Mock model parameters.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -76,6 +82,9 @@ pub fn mimo_like_spec(
         head_dim_v: 128,
         num_blocks,
         host_blocks: 0,
+        ratio: 1,
+        device: 0,
+        coverage: Coverage::All,
     };
     ModelSpec {
         vocab_size: vocab,
@@ -115,6 +124,80 @@ pub fn mimo_like_spec(
                 max_tokens: 256,
             },
         ],
+        window_chain: None,
+        token_history: 0,
+    }
+}
+
+/// A small DeepSeek-V4.1-shaped spec, on two logical devices: the encoder's pooled
+/// global bank (`ratio` positions per entry) and its sliding window on device 0; on
+/// device 1 the decoder's per-position bank, its window chain of `depth` layers of
+/// `window`, and a drafter whose context window is `window + 1` (the `window` positions
+/// before a drafting row's own). Three token ids of history.
+#[allow(clippy::too_many_arguments)]
+pub fn deepseek_like_spec(
+    vocab: u32,
+    block_size: u32,
+    ratio: u32,
+    window: u32,
+    depth: u32,
+    num_blocks: u32,
+    slots: u32,
+    k: u32,
+) -> ModelSpec {
+    let group = |name: &str, role, attention, layers, ratio, device, coverage| KvGroupSpec {
+        name: name.into(),
+        role,
+        attention,
+        num_layers: layers,
+        num_kv_heads: 1,
+        head_dim_qk: 512,
+        head_dim_v: 512,
+        num_blocks,
+        host_blocks: 0,
+        ratio,
+        device,
+        coverage,
+    };
+    let (target, all) = (KvRole::Target, Coverage::All);
+    let sliding = |window| AttentionKind::Sliding { window };
+    ModelSpec {
+        kv_groups: vec![
+            group(
+                "encoder-bank",
+                target,
+                AttentionKind::Full,
+                1,
+                ratio,
+                0,
+                all,
+            ),
+            group("encoder-window", target, sliding(window), 1, 1, 0, all),
+            group("decoder-bank", target, AttentionKind::Full, 1, 1, 1, all),
+            group(
+                "decoder-window",
+                target,
+                sliding(window),
+                depth,
+                1,
+                1,
+                Coverage::Chain,
+            ),
+            group(
+                "drafter",
+                KvRole::Drafter,
+                sliding(window + 1),
+                1,
+                1,
+                1,
+                Coverage::Chain,
+            ),
+        ],
+        max_draft_tokens: k,
+        window_chain: Some(WindowChain { depth, window }),
+        token_history: 3,
+        max_model_len: 16384,
+        ..mimo_like_spec(vocab, block_size, window, window, num_blocks, slots, k)
     }
 }
 
@@ -163,6 +246,13 @@ fn logits_from_state(cfg: &MockConfig, vocab: u32, state: u64) -> Vec<f32> {
 /// The target logits for the token after position `q` given the full token history — the
 /// dense oracle the paged mock must reproduce.
 pub fn reference_logits(spec: &ModelSpec, cfg: &MockConfig, tokens: &[u32], q: u32) -> Vec<f32> {
+    if spec.window_chain.is_some() {
+        let mut dense = Reference::new(spec, cfg);
+        for &t in &tokens[..=q as usize] {
+            dense.push(t);
+        }
+        return dense.logits(q);
+    }
     let state = fold_state(spec, KvRole::Target, q, |g, p| {
         kv_value(cfg, tokens[p as usize], p, g)
     });
@@ -181,10 +271,23 @@ pub fn reference_generate(
 ) -> Vec<u32> {
     let mut tokens = prompt.to_vec();
     let mut out = Vec::new();
+    let mut dense = spec.window_chain.map(|_| {
+        let mut dense = Reference::new(spec, cfg);
+        for &t in prompt {
+            dense.push(t);
+        }
+        dense
+    });
     while (out.len() as u32) < max_tokens && (tokens.len() as u32) < spec.max_model_len {
         let q = tokens.len() as u32 - 1;
-        let logits = reference_logits(spec, cfg, &tokens, q);
+        let logits = match &dense {
+            Some(dense) => dense.logits(q),
+            None => reference_logits(spec, cfg, &tokens, q),
+        };
         let t = sampling::sample(spec.logits(&logits), params, q as u64 + 1);
+        if let Some(dense) = &mut dense {
+            dense.push(t);
+        }
         tokens.push(t);
         out.push(t);
         if stop.contains(&t) {
@@ -207,8 +310,19 @@ fn fingerprint(key: &KvKey) -> u64 {
 pub struct MockExecutor {
     spec: ModelSpec,
     cfg: MockConfig,
-    /// `[group][block * block_size + offset] = (value, position)`; value 0 means zeroed.
+    /// `[group][block * cells + cell] = (value, position)`; value 0 means zeroed or never
+    /// written. A block has one cell per entry and layer ([`MockExecutor::cells`]).
     memory: Vec<Vec<(u64, u32)>>,
+    /// `[group]`: cells per block.
+    cells: Vec<usize>,
+    /// The window-chain model's shape, when the spec has a chain.
+    chain: Option<chain::Shape>,
+    /// `[slot]`: the chain model's open pooled entries, as `(position, value)`.
+    pairs: Vec<Vec<(u32, u64)>>,
+    /// Every executed encrypt's nonce words as `(step, group, block, words)`.
+    nonce_log: Vec<(u64, u32, u32, [u32; 3])>,
+    /// Window KV cells the chain's layers wrote (layer-positions computed).
+    chain_writes: u64,
     /// `[slot][group][index]`.
     tables: Vec<Vec<Vec<u32>>>,
     /// `[group]`: block -> number of (slot, index) mappings.
@@ -234,15 +348,30 @@ pub struct MockExecutor {
 impl MockExecutor {
     /// A mock over `spec`.
     pub fn new(spec: ModelSpec, cfg: MockConfig) -> Self {
-        let bs = spec.block_size as usize;
         let width = spec.max_blocks_per_seq() as usize;
         let groups = spec.kv_groups.len();
+        let cells: Vec<usize> = spec
+            .kv_groups
+            .iter()
+            .map(|g| {
+                let layers = match (g.coverage, g.role) {
+                    (Coverage::Chain, KvRole::Target) => g.num_layers,
+                    _ => 1,
+                };
+                (spec.block_size / g.ratio * layers) as usize
+            })
+            .collect();
         Self {
             memory: spec
                 .kv_groups
                 .iter()
-                .map(|g| vec![(0, 0); g.num_blocks as usize * bs])
+                .zip(&cells)
+                .map(|(g, c)| vec![(0, 0); g.num_blocks as usize * c])
                 .collect(),
+            chain: spec.window_chain.map(|_| chain::Shape::of(&spec)),
+            pairs: vec![Vec::new(); spec.num_state_slots as usize],
+            nonce_log: Vec::new(),
+            chain_writes: 0,
             tables: vec![vec![vec![NULL_BLOCK; width]; groups]; spec.num_state_slots as usize],
             mapped: vec![HashMap::new(); groups],
             zero_log: Vec::new(),
@@ -255,8 +384,10 @@ impl MockExecutor {
             host_memory: spec
                 .kv_groups
                 .iter()
-                .map(|g| vec![(0, 0); g.host_blocks as usize * bs])
+                .zip(&cells)
+                .map(|(g, c)| vec![(0, 0); g.host_blocks as usize * c])
                 .collect(),
+            cells,
             host_encrypted: spec
                 .kv_groups
                 .iter()
@@ -293,6 +424,21 @@ impl MockExecutor {
         self.encrypted[group as usize][block as usize]
     }
 
+    /// Every executed encrypt's nonce words as `(step, group, block, words)`.
+    pub fn nonce_log(&self) -> &[(u64, u32, u32, [u32; 3])] {
+        &self.nonce_log
+    }
+
+    /// Layer-positions the window chain computed so far.
+    pub fn chain_writes(&self) -> u64 {
+        self.chain_writes
+    }
+
+    /// Whether the chain model holds no open pooled entry for `slot`.
+    pub fn slot_state_is_clear(&self, slot: u32) -> bool {
+        self.pairs[slot as usize].is_empty()
+    }
+
     /// Every executed demote (`true`) or promote as `(step, group, block, host, demote)`.
     pub fn transfer_log(&self) -> &[(u64, u32, u32, u32, bool)] {
         &self.transfer_log
@@ -318,14 +464,14 @@ impl MockExecutor {
 
     /// A host block's stored entries, `(value, position)` per offset, as they are.
     pub fn host_block(&self, group: u32, host: u32) -> &[(u64, u32)] {
-        let bs = self.spec.block_size as usize;
+        let bs = self.cells[group as usize];
         let start = host as usize * bs;
         &self.host_memory[group as usize][start..start + bs]
     }
 
     /// A device block's stored entries, `(value, position)` per offset, as they are.
     pub fn device_block(&self, group: u32, block: u32) -> &[(u64, u32)] {
-        let bs = self.spec.block_size as usize;
+        let bs = self.cells[group as usize];
         let start = block as usize * bs;
         &self.memory[group as usize][start..start + bs]
     }
@@ -347,9 +493,7 @@ impl MockExecutor {
 
     /// Whether every byte of a block is zero.
     pub fn block_is_zero(&self, group: u32, block: u32) -> bool {
-        let bs = self.spec.block_size as usize;
-        let start = block as usize * bs;
-        self.memory[group as usize][start..start + bs]
+        self.device_block(group, block)
             .iter()
             .all(|&(v, p)| v == 0 && p == 0)
     }
@@ -384,9 +528,13 @@ impl MockExecutor {
                 )));
             }
         }
-        let bs = self.spec.block_size as usize;
+        let bs = self.cells[group as usize];
         let start = block as usize * bs;
         let cells = &mut self.memory[group as usize][start..start + bs];
+        if encrypt {
+            self.nonce_log
+                .push((self.steps, group, block, nonce.words()));
+        }
         KvKeystream::new(key, nonce).range(3 * bs, |i, k| {
             let (v, p) = &mut cells[i / 3];
             match i % 3 {
@@ -453,6 +601,79 @@ impl MockExecutor {
         Ok(v)
     }
 
+    /// The cell of `layer` of the entry covering `pos` in the block `slot` maps there.
+    fn cell(&self, slot: u32, group: u32, layer: u32, pos: u32) -> Result<usize, ExecutorError> {
+        let gs = &self.spec.kv_groups[group as usize];
+        let bs = self.spec.block_size;
+        let block = self.tables[slot as usize][group as usize][(pos / bs) as usize];
+        if block == NULL_BLOCK {
+            return Err(ExecutorError(format!(
+                "slot {slot} group {group} position {pos}: unmapped block"
+            )));
+        }
+        let cells = self.cells[group as usize];
+        let layers = cells / (bs / gs.ratio) as usize;
+        Ok(block as usize * cells + (pos % bs / gs.ratio) as usize * layers + layer as usize)
+    }
+
+    /// Writes `layer`'s value for the entry completed at `pos`, from logical device `dev`.
+    fn put(
+        &mut self,
+        slot: u32,
+        group: u32,
+        layer: u32,
+        pos: u32,
+        value: u64,
+        dev: u32,
+    ) -> Result<(), ExecutorError> {
+        if self.spec.kv_groups[group as usize].device != dev {
+            return Err(ExecutorError(format!(
+                "group {group} written from device {dev}"
+            )));
+        }
+        let at = self.cell(slot, group, layer, pos)?;
+        let block =
+            self.tables[slot as usize][group as usize][(pos / self.spec.block_size) as usize];
+        if self.mapped[group as usize]
+            .get(&block)
+            .copied()
+            .unwrap_or(0)
+            != 1
+        {
+            return Err(ExecutorError(format!(
+                "slot {slot} group {group} position {pos}: write to a shared block"
+            )));
+        }
+        self.memory[group as usize][at] = (value, pos);
+        Ok(())
+    }
+
+    /// Reads `layer`'s value for the entry completed at `pos`, from logical device `dev`;
+    /// fails where that layer never wrote it.
+    fn get(
+        &self,
+        slot: u32,
+        group: u32,
+        layer: u32,
+        pos: u32,
+        dev: u32,
+    ) -> Result<u64, ExecutorError> {
+        if self.spec.kv_groups[group as usize].device != dev {
+            return Err(ExecutorError(format!(
+                "group {group} read from device {dev}"
+            )));
+        }
+        let at = self.cell(slot, group, layer, pos)?;
+        let (v, p) = self.memory[group as usize][at];
+        if v == 0 || p != pos {
+            return Err(ExecutorError(format!(
+                "slot {slot} group {group} layer {layer} position {pos}: read of KV that \
+                 was never computed, zeroed or foreign"
+            )));
+        }
+        Ok(v)
+    }
+
     fn state(&self, slot: u32, role: KvRole, q: u32) -> Result<u64, ExecutorError> {
         let mut err = None;
         let s = fold_state(&self.spec, role, q, |g, p| match self.read(slot, g, p) {
@@ -500,6 +721,12 @@ impl MockExecutor {
         } else {
             mix64(q as u64 ^ 0xabcdef)
         };
+        Ok(self.mix_draft(noise_state, target, params))
+    }
+
+    /// The drafter's distribution: the target's mixed with noise seeded by `noise_state`,
+    /// by the configured agreement; its argmax, one-hot, for a greedy row.
+    fn mix_draft(&self, noise_state: u64, target: &[f64], params: &SamplingParams) -> Vec<f64> {
         let noise_logits = logits_from_state(&self.cfg, self.spec.vocab_size, noise_state ^ 0x77);
         let noise = sampling::processed_probs(
             self.spec.logits(&noise_logits),
@@ -520,9 +747,9 @@ impl MockExecutor {
             }
             let mut one_hot = vec![0.0; mix.len()];
             one_hot[best] = 1.0;
-            Ok(one_hot)
+            one_hot
         } else {
-            Ok(mix)
+            mix
         }
     }
 }
@@ -541,8 +768,17 @@ impl Executor for MockExecutor {
         }
         self.buckets_used.push(step.bucket);
         self.rows_used.push(step.seqs.clone());
-        let bs = self.spec.block_size as usize;
         for m in &step.maintenance {
+            let bs = match *m {
+                Maintenance::Copy { group, .. }
+                | Maintenance::Zero { group, .. }
+                | Maintenance::Encrypt { group, .. }
+                | Maintenance::Decrypt { group, .. }
+                | Maintenance::Demote { group, .. }
+                | Maintenance::Promote { group, .. }
+                | Maintenance::ZeroHost { group, .. } => self.cells[group as usize],
+                Maintenance::ResetSlot { .. } => 0,
+            };
             match *m {
                 Maintenance::Zero { group, block } => {
                     let start = block as usize * bs;
@@ -615,6 +851,7 @@ impl Executor for MockExecutor {
                     self.host_zero_log.push((self.steps, group, host));
                 }
                 Maintenance::ResetSlot { slot } => {
+                    self.pairs[slot as usize].clear();
                     for g in 0..self.spec.kv_groups.len() {
                         for idx in 0..self.tables[slot as usize][g].len() {
                             if self.tables[slot as usize][g][idx] != NULL_BLOCK {
@@ -637,6 +874,16 @@ impl Executor for MockExecutor {
             logits: step.return_logits.then(Vec::new),
         };
         for (row, e) in step.seqs.iter().enumerate() {
+            if self.chain.is_some() {
+                let (produced, row_logits) = self.chain_row(step, row, e)?;
+                let base = row * stride as usize;
+                out.tokens[base..base + produced.len()].copy_from_slice(&produced);
+                out.num_tokens[row] = produced.len() as u32;
+                if let Some(l) = out.logits.as_mut() {
+                    l.push(row_logits);
+                }
+                continue;
+            }
             let toks =
                 &step.token_ids[e.token_start as usize..(e.token_start + e.num_tokens) as usize];
             for (i, &t) in toks.iter().enumerate() {
