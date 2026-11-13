@@ -2,7 +2,7 @@ name: CLA Check
 
 on:
   pull_request:
-    branches: [main, next, engine]
+    branches: [main, next, deepseek-v41-flash]
 
 # Cancel superseded runs when a PR branch is updated.
 concurrency:

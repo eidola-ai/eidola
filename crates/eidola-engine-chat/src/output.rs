@@ -25,11 +25,13 @@
 
 use std::ops::Range;
 
+use crate::ChatFormat;
 use crate::args::ToolSchemas;
+use crate::deepseek_v4_1::output::{DsmlParser, ReasoningSplitter};
 use crate::error::ChatError;
-use crate::reasoning::ReasoningParser;
-use crate::tokenizer::{Detokenizer, MimoTokenizer};
-use crate::tool_call::{CallIdSource, ToolCall, ToolCallParser};
+use crate::reasoning::{ReasoningDelta, ReasoningParser};
+use crate::tokenizer::{Detokenizer, Tokenizer};
+use crate::tool_call::{CallIdSource, ToolCall, ToolCallDelta, ToolCallParser};
 
 /// Why the engine stopped generating.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,15 +88,32 @@ pub struct OutputConfig {
     /// continues it: `reasoning_content` starts inside the reasoning, any other
     /// field in the answer. `None` for a new assistant turn.
     pub continuing: Option<&'static str>,
+    /// The format the output is written in.
+    pub format: ChatFormat,
 }
 
 impl OutputConfig {
+    /// The configuration for a MiMo response.
     pub fn new(enable_thinking: Option<bool>, tools: Option<ToolSchemas>) -> OutputConfig {
         OutputConfig {
             thinking: enable_thinking != Some(false),
             tools: tools.filter(|t| !t.is_empty()),
             skip_special_tokens: true,
             continuing: None,
+            format: ChatFormat::MimoV2_6,
+        }
+    }
+
+    /// The configuration for a DeepSeek-V4.1 response to a prompt encoded
+    /// with [`crate::deepseek_v4_1::EncodeOptions::thinking`] as `thinking`;
+    /// `tools` are the request's, from [`crate::deepseek_v4_1::tool_schemas`].
+    pub fn deepseek_v4_1(thinking: bool, tools: Option<ToolSchemas>) -> OutputConfig {
+        OutputConfig {
+            thinking,
+            tools: tools.filter(|t| !t.is_empty()),
+            skip_special_tokens: true,
+            continuing: None,
+            format: ChatFormat::DeepSeekV4_1,
         }
     }
 
@@ -148,11 +167,62 @@ impl ChatDelta {
     }
 }
 
+/// A format's reasoning splitter.
+enum Reasoning {
+    Mimo(ReasoningParser),
+    DeepSeek(ReasoningSplitter),
+}
+
+impl Reasoning {
+    fn push(&mut self, text: &str) -> ReasoningDelta {
+        match self {
+            Reasoning::Mimo(parser) => parser.push(text),
+            Reasoning::DeepSeek(splitter) => splitter.push(text),
+        }
+    }
+
+    fn finish(&mut self) -> ReasoningDelta {
+        match self {
+            Reasoning::Mimo(parser) => parser.finish(),
+            Reasoning::DeepSeek(splitter) => splitter.finish(),
+        }
+    }
+}
+
+/// A format's tool-call parser.
+enum Tools {
+    Mimo(ToolCallParser),
+    DeepSeek(DsmlParser),
+}
+
+impl Tools {
+    fn push(&mut self, text: &str) -> ToolCallDelta {
+        match self {
+            Tools::Mimo(parser) => parser.push(text),
+            Tools::DeepSeek(parser) => parser.push(text),
+        }
+    }
+
+    fn before_any_block(&self) -> bool {
+        match self {
+            Tools::Mimo(parser) => parser.before_any_block(),
+            Tools::DeepSeek(parser) => parser.before_any_block(),
+        }
+    }
+
+    fn finish(&mut self) -> ToolCallDelta {
+        match self {
+            Tools::Mimo(parser) => parser.finish(),
+            Tools::DeepSeek(parser) => parser.finish(),
+        }
+    }
+}
+
 /// The whole output pipeline for one response.
 pub struct OutputParser {
     detok: Detokenizer,
-    reasoning: ReasoningParser,
-    tools: Option<ToolCallParser>,
+    reasoning: Reasoning,
+    tools: Option<Tools>,
     tool_calls_emitted: bool,
     /// What [`OutputParser::resumes_exactly`] compares: the text fed in, the
     /// reasoning and content given out, whether the text lost bytes on the
@@ -179,13 +249,24 @@ impl OutputParser {
     pub fn new(config: OutputConfig, ids: impl CallIdSource + 'static) -> OutputParser {
         OutputParser {
             detok: Detokenizer::new(config.skip_special_tokens),
-            reasoning: match config.continuing {
-                None => ReasoningParser::new(config.thinking),
-                Some(field) => ReasoningParser::resuming(field == "reasoning_content"),
+            reasoning: match (config.format, config.continuing) {
+                (ChatFormat::MimoV2_6, None) => {
+                    Reasoning::Mimo(ReasoningParser::new(config.thinking))
+                }
+                (ChatFormat::MimoV2_6, Some(field)) => {
+                    Reasoning::Mimo(ReasoningParser::resuming(field == "reasoning_content"))
+                }
+                (ChatFormat::DeepSeekV4_1, None) => {
+                    Reasoning::DeepSeek(ReasoningSplitter::new(config.thinking))
+                }
+                (ChatFormat::DeepSeekV4_1, Some(field)) => {
+                    Reasoning::DeepSeek(ReasoningSplitter::new(field == "reasoning_content"))
+                }
             },
-            tools: config
-                .tools
-                .map(|schemas| ToolCallParser::new(schemas, ids)),
+            tools: config.tools.map(|schemas| match config.format {
+                ChatFormat::MimoV2_6 => Tools::Mimo(ToolCallParser::new(schemas, ids)),
+                ChatFormat::DeepSeekV4_1 => Tools::DeepSeek(DsmlParser::new(schemas, ids)),
+            }),
             tool_calls_emitted: false,
             raw: String::new(),
             emitted_reasoning: String::new(),
@@ -242,6 +323,11 @@ impl OutputParser {
     /// the template's own `<think>` and `</think>` are. `None` where no
     /// continuation would resume this parse.
     fn continued_text(&self) -> Option<(String, Vec<Range<usize>>)> {
+        // The DeepSeek-V4.1 encoder has no continued final message to resume
+        // from.
+        let Reasoning::Mimo(reasoning) = &self.reasoning else {
+            return None;
+        };
         if self.tool_calls_emitted || self.lossy || self.cut_in_delimiter {
             return None;
         }
@@ -253,9 +339,9 @@ impl OutputParser {
         // is a tag to strip, and with thinking off it is in the answer although
         // nothing has been said: neither is where a continuation would resume.
         let resumed_mode = if c.is_empty() {
-            self.reasoning.in_reasoning()
+            reasoning.in_reasoning()
         } else {
-            self.reasoning.in_content()
+            reasoning.in_content()
         };
         if !resumed_mode {
             return None;
@@ -286,11 +372,7 @@ impl OutputParser {
 
     /// Feeds one generated token. An id the tokenizer does not define is refused
     /// ([`ChatError::UnknownToken`]) and changes nothing.
-    pub fn push_token(
-        &mut self,
-        tokenizer: &MimoTokenizer,
-        id: u32,
-    ) -> Result<ChatDelta, ChatError> {
+    pub fn push_token(&mut self, tokenizer: &Tokenizer, id: u32) -> Result<ChatDelta, ChatError> {
         let text = self.detok.push(tokenizer, id)?;
         Ok(self.push_text(&text))
     }
