@@ -327,6 +327,20 @@ impl BackendsSettingsView {
         if self.local_models.read(cx).download_pending(&url) {
             return;
         }
+        // And only from a row that still offers it: the press answers to the
+        // predicate the render paints Retry by, so an activation reaching a row
+        // whose transfer has already been accepted (`Downloading`, its verb
+        // Cancel) starts nothing rather than handing app-core a duplicate to
+        // refuse over the transfer that is running.
+        let offers_retry = self
+            .local_models
+            .read(cx)
+            .models()
+            .iter()
+            .any(|m| m.id == id && failed_download_row(m, true));
+        if !offers_retry {
+            return;
+        }
         let held = self.row_focus(id, cx).contains_focused(window, cx);
         self.local_models.update(cx, |s, cx| s.download(url, cx));
         self.hand_back_focus(held, window, cx);

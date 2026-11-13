@@ -173,9 +173,11 @@ impl LocalModelsStore {
     /// op slot, which is what "in flight" means here (STATE.md: no shared busy
     /// flags; in-flight is the presence of the task).
     ///
-    /// It covers the initiating call only. Once app-core has accepted the
-    /// transfer the snapshot's own row carries it (`Downloading`, with Cancel),
-    /// which is the state every surface reads from there on.
+    /// It covers the initiating call and the read that follows it. Once app-core
+    /// has accepted the transfer the snapshot's own row carries it
+    /// (`Downloading`, with Cancel), which is the state every surface reads
+    /// from there on — and the slot clears in the same update that installs
+    /// that snapshot, so no frame sees neither (see [`Self::download`]).
     pub fn download_pending(&self, url: &str) -> bool {
         self.op_tasks.contains_key(&Self::download_key(url))
     }
@@ -229,18 +231,60 @@ impl LocalModelsStore {
     /// successor carries a newer value that must win, and here there is no
     /// newer value to carry.
     ///
-    /// It covers the initiating call only, which is all the slot knows about:
-    /// once it clears, the snapshot's own `Downloading` row (with Cancel) is
-    /// what stands in the way, and a press landing after that reaches
-    /// app-core's own honest refusal rather than superseding anything.
+    /// **The slot hands over to the snapshot without a gap.** Once it clears,
+    /// the snapshot's own `Downloading` row (with Cancel) is what stands in the
+    /// way of a second press — so the slot may only clear once the cell holds
+    /// a snapshot that shows the transfer. The bus's `Change::LocalModels`
+    /// cannot be what delivers it: that refresh is a second round trip issued
+    /// after the event crosses to this thread, so the initiating call's own
+    /// answer would land first, and the frames in between would paint the
+    /// failed row's Retry (or the catalog's Download) as a live control again
+    /// over a transfer app-core is already running — a press there publishing
+    /// "already downloading" over it. So the accepted call reads the snapshot
+    /// in the same `bridge` closure, after its own write, and the landing
+    /// installs that snapshot and clears the slot in one update. A refresh
+    /// still in flight at that moment may have read before the acceptance, so
+    /// it is re-issued rather than left to land over the newer snapshot.
+    ///
+    /// A refused download leaves the cell alone: app-core wrote nothing, so
+    /// there is nothing for a read to reconcile. An accepted download whose
+    /// read fails resolves the cell as any failed refresh does (`Failed`,
+    /// keeping its prior rows), and the next bus-driven refresh corrects it; a
+    /// press in that interval reaches app-core's own refusal.
     pub fn download(&mut self, url: String, cx: &mut Context<Self>) {
         if self.download_pending(&url) {
             return;
         }
+        self.op_error = None;
+        let Some(core) = self.app_core.clone() else {
+            cx.notify();
+            return;
+        };
         let key = Self::download_key(&url);
-        self.run_op(key, cx, move |c| async move {
-            c.download_local_model(url).await.map(|_| ())
+        let slot_key = key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = bridge(core, move |c| async move {
+                c.download_local_model(url).await?;
+                Ok::<_, eidola_app_core::error::AppError>(c.local_models_state().await)
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Err(e) => this.op_error = Some(e.to_string()),
+                    Ok(read) => {
+                        this.state = std::mem::take(&mut this.state).resolve(read);
+                        if this.task.is_some() {
+                            this.refresh(cx);
+                        }
+                    }
+                }
+                this.op_tasks.remove(&slot_key);
+                cx.notify();
+            });
         });
+        // Occupied before the notify, for `run_op`'s reason.
+        self.op_tasks.insert(key, task);
+        cx.notify();
     }
 
     /// Cancel an in-flight download.

@@ -18382,8 +18382,13 @@ fn backends_a_failed_download_verb_hands_the_keyboard_back(cx: &mut TestAppConte
 ///
 /// The assertion that pins it is the **control**, not the outcome: while the
 /// operation is pending the row paints no Retry at all, so there is nothing to
-/// press a second time — no tab stop, nothing to activate. The op-error
-/// assertion is the symptom the finding named, kept as the honest end state.
+/// press a second time — no tab stop, nothing to activate. And not only while
+/// it is pending: the slot clears when the initiating call lands, and if the
+/// snapshot showing the transfer arrived only by the bus refresh behind it,
+/// the frames between the two painted the failed row's Retry again over a
+/// transfer already running. So the test waits for the landing and asserts the
+/// row is the downloading one at once. The op-error assertion is the symptom
+/// the finding named, kept as the honest end state.
 #[gpui::test]
 fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext) {
     use eidola_app_core::{LocalModelInfo, LocalModelStatus};
@@ -18483,6 +18488,41 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
     assert!(
         !names.contains(&"settings/backends/local/installed/0/retry".to_string()),
         "a pending retry must not leave a second door onto itself: {names:?}"
+    );
+
+    // Let the initiating call land. The slot clears there, and the row has to
+    // be the downloading one by then — in the same update, not a bus refresh
+    // later. (These stores have no bus bridge, so nothing else could deliver
+    // that snapshot: the handover is the landing's own or it does not happen.)
+    for _ in 0..200 {
+        if !stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(&url))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        cx.run_until_parked();
+    }
+    assert!(
+        !stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(&url)),
+        "the initiating call lands while the transfer runs on"
+    );
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        !names.contains(&"settings/backends/local/installed/0/retry".to_string()),
+        "the slot hands over to the snapshot with no frame between them: {names:?}"
+    );
+    assert!(
+        names.contains(&"settings/backends/local/installed/0/cancel".to_string()),
+        "…which shows the accepted transfer, with its Cancel: {names:?}"
     );
 
     // The programmatic door is shut too, and nothing is published over the
