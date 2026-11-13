@@ -18,10 +18,10 @@
 #     (its first `FROM`), so manifest parsing uses the cargo the image build
 #     uses, not this checkout's `rust-toolchain.toml`.
 #
-# A Containerfile that builds through the repository flake instead (`nix
-# build`, the inference node's image) has the same blind spot in another
-# form: the flake reads files the Containerfile has to copy in, and a file it
-# reads but the image does not copy breaks only the image build. Such a
+# A Containerfile that builds through a Nix expression instead (`nix-build`,
+# the GPU kernel image) has the same blind spot in another form: the
+# expression reads files the Containerfile has to copy in, and a file it reads
+# but the image does not copy breaks only the image build. Such a
 # Containerfile must carry an `eval` stage that evaluates what it builds over
 # exactly the context it copies (a missing stage is an error, never a skip),
 # and that stage is built here, `.dockerignore` and all.
@@ -84,12 +84,12 @@ if [ "$found" -eq 0 ]; then
   exit 1
 fi
 
-flake_found=0
+nix_found=0
 for containerfile in oci/*/Containerfile; do
-  grep -Ev '^[[:space:]]*#' "$containerfile" | grep -Eq '(^|[^[:alnum:]_-])nix build' || continue
-  flake_found=$((flake_found + 1))
+  grep -Ev '^[[:space:]]*#' "$containerfile" | grep -Eq '(^|[^[:alnum:]_-])nix(-| )build' || continue
+  nix_found=$((nix_found + 1))
   if ! grep -Eq '^FROM [^[:space:]]+ AS eval$' "$containerfile"; then
-    echo "error: $containerfile builds through the flake but has no \`eval\` stage this check can build" >&2
+    echo "error: $containerfile builds through Nix but has no \`eval\` stage this check can build" >&2
     status=1
     continue
   fi
@@ -98,15 +98,15 @@ for containerfile in oci/*/Containerfile; do
       --file "$containerfile" . >/dev/null 2>"$err"; then
     echo "ok: $containerfile evaluates over the context it copies"
   else
-    echo "error: $containerfile: the flake does not evaluate over the context it copies:" >&2
+    echo "error: $containerfile: its Nix expression does not evaluate over the context it copies:" >&2
     tail -n 40 "$err" | sed 's/^/  /' >&2
     status=1
   fi
   rm -f "$err"
 done
 
-if [ "$flake_found" -eq 0 ]; then
-  echo "error: no Containerfile builds through the flake; this check's second half matched nothing" >&2
+if [ "$nix_found" -eq 0 ]; then
+  echo "error: no Containerfile builds through Nix; this check's second half matched nothing" >&2
   exit 1
 fi
 exit "$status"
