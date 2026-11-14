@@ -144,6 +144,48 @@ fn whole_model_against_the_reference_run_in_halves() {
     // layout (the reference's for one token per call).
     let prefill = run(Some(n));
     let canonical = run(None);
+    // The `reshaped` pattern is a prefill chunk of `first` tokens, then one
+    // token per call. When the chunk is at least a window long it has the
+    // layout of the whole-sequence prefill and the single tokens after it have
+    // full windows, where the two layouts coincide: the prefill run stands in.
+    // A shorter chunk has its own layout (`min(chunk, window)` window slots),
+    // which only a run of that chunk followed by canonical calls reproduces.
+    let reshaped_first = goldens
+        .iter()
+        .find(|(_, g)| g.contains("reshaped.logits"))
+        .map(|(_, g)| match g.contains("reshaped.first") {
+            true => ints(g, "reshaped.first")[0] as usize,
+            false => n.saturating_sub(64).max(1),
+        });
+    let reshaped_logits = match reshaped_first {
+        Some(first) if first < c.attention.window => {
+            println!(
+                "  (the reshaped pattern's {first}-token chunk is shorter than the window: running its layout)"
+            );
+            let began = std::time::Instant::now();
+            let mut state = model.new_state();
+            let chunk = DsForwardOptions {
+                reference_prefill: Some(first),
+                ..Default::default()
+            };
+            let mut logits = model
+                .forward(&mut state, &tokens[..first], &chunk)
+                .unwrap()
+                .logits
+                .data;
+            logits.extend(
+                model
+                    .forward(&mut state, &tokens[first..], &Default::default())
+                    .unwrap()
+                    .logits
+                    .data,
+            );
+            println!("  (a forward took {:.0} s)", began.elapsed().as_secs_f64());
+            Some(logits)
+        }
+        _ => None,
+    };
+    let reshaped_logits = reshaped_logits.as_ref().unwrap_or(&prefill.logits.data);
     let ours = compare_logits(&prefill.logits.data, &canonical.logits.data, v).unwrap();
     println!("our canonical layout against our reproduction of the prefill layout: {ours}");
 
@@ -158,23 +200,17 @@ fn whole_model_against_the_reference_run_in_halves() {
                 " (measurement only)"
             }
         );
-        for (pattern, mine) in [
-            ("prefill", &prefill),
-            ("reshaped", &prefill),
-            ("decode", &canonical),
+        for (pattern, mine, taps) in [
+            ("prefill", &prefill.logits.data, Some(&prefill.taps)),
+            ("reshaped", reshaped_logits, None),
+            ("decode", &canonical.logits.data, Some(&canonical.taps)),
         ] {
             if !golden.contains(&format!("{pattern}.logits")) {
                 continue;
             }
             let want = f32s(golden, &format!("{pattern}.logits"));
-            let a = compare_logits(&want, &mine.logits.data, v).unwrap();
-            let differing = mine
-                .logits
-                .data
-                .iter()
-                .zip(&want)
-                .filter(|(a, b)| a != b)
-                .count();
+            let a = compare_logits(&want, mine, v).unwrap();
+            let differing = mine.iter().zip(&want).filter(|(a, b)| a != b).count();
             println!(
                 "ours against its {pattern} pattern: {a}; {differing} of {} logits differ",
                 want.len()
@@ -182,11 +218,12 @@ fn whole_model_against_the_reference_run_in_halves() {
             if exact_expected && differing != 0 {
                 failures.push(format!("{name} {pattern}: {differing} logits differ"));
             }
+            let Some(taps) = taps else { continue };
             for l in (0..layers).filter(|l| golden.contains(&format!("{pattern}.layer.{l}"))) {
                 let want = f32s(golden, &format!("{pattern}.layer.{l}"));
                 println!(
                     "  streams after layer {l:>2}: relative error {:.3e}",
-                    relative(&mine.taps[l].data, &want)
+                    relative(&taps[l].data, &want)
                 );
             }
         }
@@ -203,6 +240,14 @@ fn whole_model_against_the_reference_run_in_halves() {
             }
         };
         pair("prefill", "decode");
+        // Only the shape of the calls differs between these two when the
+        // reshaped chunk fills the window; a shorter chunk also has another
+        // layout, and the line says which it is.
+        if reshaped_first.is_some_and(|first| first < c.attention.window) {
+            println!(
+                "(next line: the reshaped chunk is shorter than the window, so its layout differs too)"
+            );
+        }
         pair("prefill", "reshaped");
     }
     for (i, (a_name, a)) in goldens.iter().enumerate() {

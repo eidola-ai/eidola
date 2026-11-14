@@ -21,8 +21,11 @@ every position (`<pattern>.logits`):
 - `decode`: one token per call, the decode layout at every position. Every
   layer's streams are recorded too.
 - `reshaped`: a prefill chunk of all but the last 64 tokens, then one token
-  per call. Past the first window the prefill and decode layouts coincide, so
-  against `prefill` this differs in the shape of the calls and nothing else.
+  per call. When that chunk is at least a window long, the prefill and decode
+  layouts coincide past it and the chunk has `prefill`'s layout, so against
+  `prefill` this differs in the shape of the calls and nothing else. With
+  fewer tokens the chunk has its own layout; its length is recorded
+  (`reshaped.first`) so that a comparison reproduces it.
 
 Writes `<dir>/golden/reference-<tag>.safetensors`, tagged as `real_golden.py`
 tags its files (`gpu-native`, `gpu-pinned`, `native`, `pinned`), for
@@ -48,6 +51,7 @@ from ds_golden import halves, pinned_ops, st  # noqa: E402
 from ds_golden.reference import args_from_hf_config, load_reference_modules  # noqa: E402
 from ds_golden import truncated  # noqa: E402
 from real_golden import TEXT, TokenizerShim, log  # noqa: E402
+from real_golden import _rows_tensor as rows_tensor  # noqa: E402
 from real_golden import _stored_rows as stored_rows  # noqa: E402
 
 
@@ -64,8 +68,9 @@ def local_rows(directory: Path, ckpt, layer: int, ids: list[int], dim: int) -> t
         missing = [r for r in ids if r not in stored]
         assert not missing, f"Engram layer {layer}: {len(missing)} rows are neither in the checkpoint nor fetched"
         parts = [b"".join(stored[r][i] for r in ids) for i in range(2)]
-    weight = torch.frombuffer(bytearray(parts[0]), dtype=torch.uint8).view(len(ids), dim)
-    scale = torch.frombuffer(bytearray(parts[1]), dtype=torch.uint8).view(len(ids), dim // 32)
+    width = dim // 32
+    weight = rows_tensor([parts[0][i * dim : (i + 1) * dim] for i in range(len(ids))], dim)
+    scale = rows_tensor([parts[1][i * width : (i + 1) * width] for i in range(len(ids))], width)
     return weight.view(torch.float8_e4m3fn), scale.view(torch.float8_e8m0fnu)
 
 
@@ -120,7 +125,8 @@ def main() -> None:
     compact = torch.stack([torch.searchsorted(torch.tensor(u), rows[:, s].contiguous()) for s, u in enumerate(unique)], dim=1)
     log(f"{sum(len(u) for u in unique)} Engram rows read")
 
-    known = {"prefill": halves.prefill(n), "decode": halves.steps(n), "reshaped": halves.steps(n, first=max(n - 64, 1))}
+    reshaped_first = max(n - 64, 1)
+    known = {"prefill": halves.prefill(n), "decode": halves.steps(n), "reshaped": halves.steps(n, first=reshaped_first)}
     patterns = {name: known[name] for name in opts.patterns.split(",")}
     out = halves.run_halves(module, full, ckpt, tokens, opts.split, patterns, tokenizer, device, tables, compact, log=log)
 
@@ -128,6 +134,9 @@ def main() -> None:
         "tokens": st.entry(torch.tensor(tokens, dtype=torch.int32)),
         "engram.token_map": st.entry(hasher.token_map.cpu().to(torch.int32)),
     }
+    if "reshaped" in out:
+        # The length of that pattern's prefill chunk, which decides its layout.
+        golden["reshaped.first"] = st.entry(torch.tensor([reshaped_first], dtype=torch.int32))
     bad = []
     for name, tensors in out.items():
         keep = [k for k in tensors if k == "logits" or (name != "reshaped" and k.startswith("layer.")) or (name == "prefill" and k.startswith("route."))]
