@@ -66,6 +66,12 @@ pub const DT_F32: u32 = 1;
 pub const ORDER_POSITION: u32 = 0;
 pub const ORDER_RING: u32 = 1;
 
+/// [`AttnParams::layout`]: a slot's index in the row's `a_slots + b_slots` words is its place.
+pub const ATTN_FIXED: u32 = 0;
+/// [`AttnParams::layout`]: the row's `a` part ends after its last listed slot and the `b` slots
+/// follow it there.
+pub const ATTN_PACKED: u32 = 1;
+
 /// f32 words of one mix row ([`MhcMixParams::out`]).
 pub const fn mix_words(copies: u32) -> u32 {
     (2 + copies) * copies
@@ -389,7 +395,9 @@ layout!(GroupedDotParams, 56, {
 /// value is read from its codes and scales (`ds::dequant_*`). For a layer of the backbone `a` is
 /// its window plane (`a_slots` the window, position order, right-aligned) and `b` the global KV
 /// plane of the bank it reads (ascending entries); for a drafter block `a` is its window plane in
-/// ring order and `b` the draft slots' KV in scratch.
+/// ring order and `b` the draft slots' KV in scratch, under [`ATTN_PACKED`]: the reference lists a
+/// drafter's window without the slots a short sequence has not reached, so the draft slots follow
+/// the row's last listed window slot, whatever `a_slots` is.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AttnParams {
@@ -414,11 +422,11 @@ pub struct AttnParams {
     pub slot_stride: u32,
     /// `softmax_scale`.
     pub scale: f32,
-    /// 0.
-    pub reserved: u32,
+    /// `ATTN_*`.
+    pub layout: u32,
 }
 layout!(AttnParams, 160, {
-    q: 0, slots: 8, sink: 16, out: 24, a: 32, b: 80, rows: 128, heads: 132, head_dim: 136, a_slots: 140, b_slots: 144, slot_stride: 148, scale: 152, reserved: 156,
+    q: 0, slots: 8, sink: 16, out: 24, a: 32, b: 80, rows: 128, heads: 132, head_dim: 136, a_slots: 140, b_slots: 144, slot_stride: 148, scale: 152, layout: 156,
 });
 
 /// `DsLinearParams`. A plain product in the pinned order (`linear::linear_f32` / `linear_bf16`):

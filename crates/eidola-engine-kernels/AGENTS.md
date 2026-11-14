@@ -10,6 +10,8 @@ The engine's GPU kernels, compiled ahead of time from open source on a GPU-less 
 | `csrc/engine_ops_common.cuh` | Helpers `engine_ops.cu` and `engine_ops_reference.cu` share (conversions, warp reductions, the UE8M0 recipe, the packed scale layout, the fused-QKV parameter struct) |
 | `csrc/ds_numeric.cuh`, `csrc/ds_abi.cuh`, `csrc/ds_probe.cu`, `csrc/ds_probe_nodiv.cu` | DeepSeek-V4.1: the numerics every kernel of that model is written from, the kernels' parameter structs, and the numerics probe (*DeepSeek-V4.1 numerics and ABI*) |
 | `oracle/ds_numeric_host.cc`, `tests/data/ds_numeric.{vectors,exhaustive}` | The dev-only host check of `ds_numeric.cuh` and the Rust reference's vectors it checks against. Not a build input |
+| `csrc/ds_body.cuh`, `csrc/ds_attention.{cuh,cu}`, `csrc/ds_index.{cuh,cu}` | DeepSeek-V4.1: how a kernel body is written once for the device and the host, and the attention, window-slot, index-score and selection kernels (*DeepSeek-V4.1 attention, index and selection*) |
+| `oracle/ds_attention_host.cc`, `tests/data/ds_attention.vectors` | The dev-only host run of those kernel bodies, and the Rust reference's vectors it checks against. Not a build input |
 | `csrc/kernels.json` | The build matrix: kernels, target archs, flag profiles, and the `meta_aliases` binding mangled entries to their launch-contract records. The single place a kernel is added |
 | `nix/default.nix` | The derivation: pinned nixpkgs, CUDA 13.2, unfree allow-list, inputs → `$out/{cubin,fatbin,inspect,manifest.json}` |
 | `nix/sources.nix` | Upstream pins (commit + NAR hash) |
@@ -51,6 +53,8 @@ Never, in this crate or anything it feeds:
 | RMSNorm, BF16 | ours | `eidola_rmsnorm_bf16` | none |
 | The idle-KV cipher: ChaCha20 (RFC 8439) keystream XOR over a list of ranges | ours (`kv_cipher.cu`) | `eidola_kv_chacha20` | none |
 | The DeepSeek-V4.1 numerics probe: one function of `ds_numeric.cuh` per item, for the GPU tests only | ours (`ds_probe.cu`, and `ds_probe_nodiv.cu` without the dividing ops) | `eidola_ds_probe`, `eidola_ds_probe_nodiv` | none |
+| DeepSeek-V4.1 sparse attention over slot lists, and the window part of the lists | ours (`ds_attention.cu`) | `eidola_ds_attn`, `eidola_ds_window_slots` | none |
+| DeepSeek-V4.1 index scores, and the total-order selections over them (top-k, candidate blocks, the global part of the slot lists) | ours (`ds_index.cu`) | `eidola_ds_index_score`, `eidola_ds_select` | none |
 
 **Sampling never comes from upstream.** The serving core (`eidola-engine/src/sampling.rs`) defines what a sample is: draws from a SplitMix-based counter RNG keyed by `(seed, position, stream)`, with separate streams for target samples, drafts, speculative acceptance and the residual, its own filtering, CDF walk and chain acceptance, and pinned `f64` arithmetic (its own `exp`, sums in a fixed chunked order). Recompute preemption and the CPU oracle depend on those exact draws. FlashInfer's sampling kernels draw from Philox with a caller-supplied seed and offset and cannot reproduce them. `sampling.cu` performs the core's operations in the core's grouping with explicit round-to-nearest intrinsics (nvcc never contracts those into FMAs; the `DFMA`s in its SASS belong to the correctly rounded division routine), so it returns the same probabilities and tokens bit for bit given equal logits; `eidola-engine-cuda`'s `tests/sampler.rs` checks every probability and token against the core on both device images.
 
@@ -101,7 +105,7 @@ The executor picks the form by the step's token count (`eidola-engine-cuda`'s `e
 
 ## DeepSeek-V4.1 numerics and ABI
 
-The second model's kernels must equal `eidola-engine-model`'s DeepSeek reference bit for bit (that crate's `AGENTS.md` → Numerics contract). Three files carry what they share. No kernel of the forward exists yet; the probe is the only entry built from them.
+The second model's kernels must equal `eidola-engine-model`'s DeepSeek reference bit for bit (that crate's `AGENTS.md` → Numerics contract). Three files carry what they share. The kernels of the forward built from them so far are the attention, index and selection kernels (*DeepSeek-V4.1 attention, index and selection*).
 
 ### The numerics core (`csrc/ds_numeric.cuh`)
 
@@ -154,7 +158,7 @@ The by-value parameter struct of each kernel family of the forward, with every f
 | `DsLin8Params` | 56 | dense FP8 × FP8 GEMM (the scalar form's arguments, and the definition) |
 | `DsLin4Params` | 72 | routed-expert FP8 × FP4 GEMM over an expert-major layout |
 | `DsGroupedDotParams` | 56 | the attention output's grouped projection |
-| `DsAttnParams` | 160 | sparse attention over slot lists |
+| `DsAttnParams` | 160 | sparse attention over slot lists (`layout`: fixed, or packed for the drafter) |
 | `DsLinearParams` | 64 | plain pinned-order products: compressor, index keys, head weights, router logits, head, Markov head |
 | `DsPoolParams` | 48 | the ratio-2 compressor's pooling |
 | `DsIndexScoreParams` | 136 | index scores of every visible entry |
@@ -172,7 +176,8 @@ Decisions the structs fix:
 - **BF16 between kernels is 16 bits on the device**; f32 arrays are only what the reference keeps in f32. **A fake-quantised vector exists only as codes and scales**, in the pools and in scratch alike: a code times its scale is the reference's BF16 value exactly, so every consumer dequantises on load (`ds::dequant_*`) and no widened copy is kept.
 - **Rows are prefixes.** The executor orders a step's positions deepest-computed first, so the positions a layer computes are rows `0 .. rows` of every array and no kernel takes a row list. A window-chain layer runs its KV write over the rows it computes and its attention onward over the shorter prefix the next layer computes.
 - **KV blocks are contiguous**, each layer's (or bank source's) planes back to back in the order the header gives, which is also the order a block is zeroed, copied and enciphered. An entry is `block id · entries per block + offset`; `DsKvPlane` turns it into two addresses. Window entries are FP8 (`width` codes, a scale byte per 32), global KV entries FP4 with an E4M3 scale per 16, index keys FP4 with a power-of-two scale per 32.
-- **A slot list is data**: per query, `a_slots` entry indices into one plane then `b_slots` into another, `DS_SLOT_EMPTY` for an empty slot, a slot's index fixing its 64-slot block. The window words are the same for every layer of a group (built once a step, on the host or by the `DsWindowSlotsParams` kernel); the global words are rewritten only by a layer that selects (`DsSelectParams`) and reused by the layers after it. Unused trailing slots are empty, which changes nothing. A drafter block lists its window in ring order and then the draft slots' KV from scratch, through the same struct.
+- **A slot list is data**: per query, `a_slots` entry indices into one plane then `b_slots` into another, `DS_SLOT_EMPTY` for an empty slot, a slot's index fixing its 64-slot block. The window words are the same for every layer of a group (built once a step, on the host or by the `DsWindowSlotsParams` kernel); the global words are rewritten only by a layer that selects (`DsSelectParams`) and reused by the layers after it. Unused trailing slots are empty, which changes nothing. A drafter block lists its window in ring order and then the draft slots' KV from scratch, through the same struct under `DS_ATTN_PACKED`: the reference's drafter list has no slot for a position a short sequence has not reached, so the draft slots follow the last listed window slot, and a fixed place for them would put them in another 64-slot block until the window is full.
+- **A BF16 result that is NaN is stored as `0x7fc0`** (`ds::bf16_store`). Taking the top 16 bits of a NaN whose payload sits in the low 16 leaves an infinity, and which NaN an operation returns differs between processors, so the reference's NaN bits are not a function of its inputs either.
 - **The grouped projection (`wo_a`) keeps its stored FP8 weight** and dequantises it on load, like its input; the product is the pinned dot of the two.
 - **The router writes a row's experts in ascending id** with their weights, after normalising with the sum taken in selection order; placement, the SwiGLU's weights and the combine all read that order.
 - **The expert layout** is expert-major with each run started on a multiple of `row_align`; `DsPlaceParams` also scatters each pair's routing weight to its layout row. Activation codes and scales reach the layout through `eidola_copy_rows` (no new gather kernel). Gate and up outputs are two pointers and a stride, so the two weights may be stored fused or apart.
@@ -181,6 +186,43 @@ Decisions the structs fix:
 - **Pooling is ratio 2**: two members per entry, named by row index, so an open pair kept in per-slot state is one more row.
 - **Status bits** `DS_STATUS_BAD_TOKEN` (0x100) and `DS_STATUS_BAD_INDEX` (0x200) are apart from the sampler's and the row copy's, so one status word can serve a whole step.
 - **A tensor-core form of a GEMM** takes its own struct (its descriptors); `DsLin8Params` and `DsLin4Params` are the scalar forms' and state what such a form must equal.
+
+## DeepSeek-V4.1 attention, index and selection
+
+Four kernels, each bit-identical to a function of `eidola-engine-model`'s `deepseek::attention`: no tensor cores, every operation the reference's in the reference's order. The sources are the reference's steps transliterated; this section gives the structure, what makes each batch-invariant, and how they are checked.
+
+### One body for the device and the host (`csrc/ds_body.cuh`)
+
+A kernel whose threads cooperate is a function template over a phase runner: a sequence of `par.run([&](uint32_t t) { … })`, thread `t`'s share of one phase, with every value that crosses a phase kept in the block's shared struct. On the device each thread runs the body, executes a phase for its own index and meets a block barrier; on a host the runner calls the phase for every index. The device entries in the `.cu` files are a few lines; the bodies in the `.cuh` files compile unchanged for the host check, which therefore runs the kernels' real thread decomposition (lanes, per-thread runs, histograms), not a second implementation. The two agree when no thread reads in a phase what another writes in it, and when everything outside a phase is a function of the parameters and of shared memory read after a barrier. The host check runs every body in ascending and descending thread order over shared memory that starts as garbage, which exposes a read inside a phase or of unwritten memory; it cannot expose every race, so **keep phases free of cross-thread reads by construction** when editing.
+
+### The kernels
+
+| Entry | Reference | Geometry |
+|---|---|---|
+| `eidola_ds_attn` | `sparse_attend` of every row over its slot list | Grid `(x, rows)`, 512 threads, 96,408 bytes of dynamic shared memory. Block `(bx, row)` computes heads `bx · g ..` of the row, `g = ceil(heads / x)` at most 8. Per 64-slot block of the list: the entries' addresses (a thread per slot), their values dequantised into shared memory as BF16 bits (a thread per element, once for all the block's heads); then per head the scores (thread `t` adds lane `t % 16` of slots `t / 16` and `t / 16 + 32`, ascending, and a thread per slot runs the halving tree), the block's maximum, `exp32` and the BF16 weight per slot, and the value sum (a thread per element, the slots in order). `head_dim` a multiple of 16 up to 512 |
+| `eidola_ds_window_slots` | the canonical window of `forward.rs` (right-aligned, position order) and `drafter::ring_order` | Grid `(ceil(window / 128), rows)`, a thread per slot |
+| `eidola_ds_index_score` | `index_score` of every visible entry | Grid `(x, rows)`, 256 threads, 21,792 bytes of shared memory. A block dequantises its row's index queries once, then walks the passes `bx, bx + x, …`: 8 entries a pass, a warp per entry, a lane per index head running the whole pinned dot of that head, lane 0 the pinned sum over heads. At most 32 heads of at most 128 |
+| `eidola_ds_select` | `top_k` (score descending, index ascending), `candidate_mask`, and the selection appended ascending to the slot lists | Grid `rows`, 512 threads: one block per row. A BF16 score's rank key (`ds::topk_key`) has 16 significant bits, so two 256-bucket counting passes over the visible entries find the k-th best key; every candidate above it is selected and, of those equal to it, the first in index order. A third pass counts each thread's contiguous run, one thread prefixes the 512 counts, and a last pass writes each selected entry at its rank: the output is ascending with no sort. The candidate blocks run the same four passes over block scores (a block's best entry, +inf for the newest) and write a bit per block |
+
+**What the selection is defined by.** Only comparisons: `-0` and `+0` are one key, a NaN ranks as `f32::total_cmp` ranks it, a block of NaN or -inf alone scores -inf and is never kept, and fewer candidates than `k` selects them all and leaves the rest of the slots empty. The candidate source passes `mask_out` and no `mask_in` (it selects over everything it sees and only publishes the blocks); a later index source passes `mask_in`.
+
+**What the host must keep.** Slot words inside their planes; `visible` at most `score_stride` (past it the kernels clamp and raise `DS_STATUS_BAD_INDEX`); table rows covering what a row lists (a negative word raises the bit, giving an empty slot or a score of +0).
+
+### Batch invariance
+
+A step's launches have **data-independent geometry**: each grid is a function of the row count and of configuration (head counts, the window, the capacity of a score row), never of positions, visible entries, slot contents or scores, which are device data. That is what lets a decode step be captured once and replayed.
+
+- **Attention.** A (row, head)'s output is computed by one block from that row's query, slot words and the entries they name, by a fixed sequence of operations per slot block. The grid's width only decides how many heads share a block's dequantised entries; a head's operations do not depend on which other heads or rows are in the launch.
+- **Window slots.** A slot word is a function of its row's position, first position and table.
+- **Index scores.** An entry's score is computed by one warp from the row's queries and that entry's key; which block and pass reaches it depends on the grid, its arithmetic does not.
+- **Selection.** One block per row, reading only that row's scores, mask and table. The counts are integers, so the order the threads add them in cannot matter.
+
+### Verification without a device
+
+- `eidola-engine-model`'s `tests/deepseek_attention_vectors.rs` emits `tests/data/ds_attention.vectors` from the reference (attention over packed entries in every format and layout, window slots in both orders, index scores, selections with ties, signed zeros, NaNs and masks) and fails when the committed file is not what it emits (`EIDOLA_UPDATE_DS_VECTORS=1` rewrites it). `tests/ds_attention_host.rs` compiles `oracle/ds_attention_host.cc` with the system C++ compiler (as *The host check and the vectors*) and requires every record to match at `-O2` and `-O0`, at every grid width.
+- The same program runs **jobs**: `eidola-engine-cuda`'s `tests/ds_attention.rs` and `tests/ds_index.rs` build each GPU case as parameter structs over one buffer and, in a plain `cargo test`, run it through the host bodies, so the cases, the parameter structs and the expected bytes of the GPU tests are exercised without a GPU. Those tests carry the volume: seeded sweeps, the released shapes, 1 to 131,072 visible entries, and a layer's whole chain.
+- **The pinned orders need adversarial inputs.** The operands are BF16 values times 4-bit codes, so most products and many sums are exact and an implementation with another summation order passes ordinary inputs. The vectors and the sweeps therefore include cases whose large terms cancel exactly, within a lane and across lanes (`deepseek_attention_cases::cancelling`), leaving a score that is the rounding residue: another lane order, a sequential tree or a sequential head sum then changes the output (each was checked by mutation). For the same reason a fused multiply-add changes almost nothing here: only `den · r + block_sum` could differ, by one ulp of a value that reaches the output through a division and a BF16 rounding, and no test detects that. On the device it is held by the `exact` profile, not by the vectors.
+- `tests/ds_attention_manifest.rs`: both images are `exact`, hold their entries and no fused or unrounded operation in PTX; `ds_index` has no division and no fused multiply-add in its SASS at all; `ds_attention`'s 37 are its one division's expansion (five per inlined `values / normaliser` site, the rest the slow path).
 
 ## How a host uses the images
 

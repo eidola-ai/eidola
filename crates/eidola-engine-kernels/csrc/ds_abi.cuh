@@ -91,6 +91,12 @@ constexpr uint32_t DS_DT_F32 = 1;
 constexpr uint32_t DS_ORDER_POSITION = 0;
 constexpr uint32_t DS_ORDER_RING = 1;
 
+// `DsAttnParams::layout`.
+// A slot's index in the row's `a_slots + b_slots` words is its place in the list.
+constexpr uint32_t DS_ATTN_FIXED = 0;
+// The row's `a` part ends after its last listed slot, and the `b` slots follow it there.
+constexpr uint32_t DS_ATTN_PACKED = 1;
+
 // f32 words of one mix row (`DsMhcMixParams::out`).
 constexpr uint32_t ds_mix_words(uint32_t copies) { return (2 + copies) * copies; }
 
@@ -469,7 +475,10 @@ DS_ABI_FIELD(DsGroupedDotParams, k, 52);
 // codes and scales (`ds::dequant_*`). For a layer of the backbone `a` is its window plane
 // (`a_slots` the window, position order, right-aligned) and `b` the global KV plane of the bank it
 // reads (ascending entries); for a drafter block `a` is its window plane in ring order and `b` the
-// draft slots' KV in scratch.
+// draft slots' KV in scratch, under `DS_ATTN_PACKED`: the reference lists a drafter's window
+// without the slots a short sequence has not reached, so the draft slots follow the row's last
+// listed window slot (`drafter::ring_order`), whatever `a_slots` is. At most 8 heads per block of
+// the launch, `head_dim` a multiple of 16 and at most 512.
 struct DsAttnParams {
   // BF16 `[rows, heads · head_dim]`: rotated queries.
   const uint16_t* q;
@@ -492,8 +501,8 @@ struct DsAttnParams {
   uint32_t slot_stride;
   // `softmax_scale`.
   float scale;
-  // 0.
-  uint32_t reserved;
+  // `DS_ATTN_*`.
+  uint32_t layout;
 };
 DS_ABI_STRUCT(DsAttnParams, 160);
 DS_ABI_FIELD(DsAttnParams, q, 0);
@@ -509,7 +518,7 @@ DS_ABI_FIELD(DsAttnParams, a_slots, 140);
 DS_ABI_FIELD(DsAttnParams, b_slots, 144);
 DS_ABI_FIELD(DsAttnParams, slot_stride, 148);
 DS_ABI_FIELD(DsAttnParams, scale, 152);
-DS_ABI_FIELD(DsAttnParams, reserved, 156);
+DS_ABI_FIELD(DsAttnParams, layout, 156);
 
 // A plain product in the pinned order (`linear::linear_f32` / `linear_bf16`): `out[r][n] =
 // dot(x_row, w[n])`, plus `addend[r][n]` when given, rounded to BF16 when `out_dtype` says so. The
