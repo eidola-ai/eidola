@@ -89,6 +89,14 @@ def log(message: str) -> None:
     print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
 
 
+def _rows_tensor(blobs: list[bytes], width: int) -> torch.Tensor:
+    """`[len(blobs), width]` bytes; an explicitly shaped empty tensor for no
+    rows (`torch.frombuffer` refuses an empty buffer)."""
+    if not blobs:
+        return torch.zeros((0, width), dtype=torch.uint8)
+    return torch.frombuffer(bytearray(b"".join(blobs)), dtype=torch.uint8).view(len(blobs), width)
+
+
 def _stored_rows(path: Path, layer: int) -> dict[int, tuple[bytes, bytes]]:
     if not path.exists():
         return {}
@@ -96,6 +104,8 @@ def _stored_rows(path: Path, layer: int) -> dict[int, tuple[bytes, bytes]]:
     if f"layers.{layer}.rows" not in have:
         return {}
     ids = have[f"layers.{layer}.rows"].tensor().tolist()
+    if not ids:
+        return {}
     weight = have[f"layers.{layer}.weight"].tensor().view(torch.uint8)
     scale = have[f"layers.{layer}.scale"].tensor().view(torch.uint8)
     return {r: (bytes(weight[i].tolist()), bytes(scale[i].tolist())) for i, r in enumerate(ids)}
@@ -117,12 +127,12 @@ def fetch_engram_rows(directory: Path, layers: list[int], rows: list[list[int]],
     def save():
         tensors = {}
         for layer in layers:
+            # A layer whose rows have not been fetched yet is written as
+            # explicitly shaped empty tensors, and read back as no rows.
             ids = sorted(store[layer])
-            weight = torch.frombuffer(bytearray(b"".join(store[layer][r][0] for r in ids)), dtype=torch.uint8)
-            scale = torch.frombuffer(bytearray(b"".join(store[layer][r][1] for r in ids)), dtype=torch.uint8)
             tensors[f"layers.{layer}.rows"] = st.entry(torch.tensor(ids, dtype=torch.int64))
-            tensors[f"layers.{layer}.weight"] = st.entry(weight.view(len(ids), dim), "F8_E4M3")
-            tensors[f"layers.{layer}.scale"] = st.entry(scale.view(len(ids), dim // 32), "F8_E8M0")
+            tensors[f"layers.{layer}.weight"] = st.entry(_rows_tensor([store[layer][r][0] for r in ids], dim), "F8_E4M3")
+            tensors[f"layers.{layer}.scale"] = st.entry(_rows_tensor([store[layer][r][1] for r in ids], dim // 32), "F8_E8M0")
         st.write_file(path.with_suffix(".partial"), tensors)
         path.with_suffix(".partial").replace(path)
 
@@ -154,9 +164,9 @@ def fetch_engram_rows(directory: Path, layers: list[int], rows: list[list[int]],
     save()
     out = {}
     for layer, ids in zip(layers, rows):
-        weight = torch.frombuffer(bytearray(b"".join(store[layer][r][0] for r in ids)), dtype=torch.uint8)
-        scale = torch.frombuffer(bytearray(b"".join(store[layer][r][1] for r in ids)), dtype=torch.uint8)
-        out[layer] = (weight.view(len(ids), dim).view(torch.float8_e4m3fn), scale.view(len(ids), dim // 32).view(torch.float8_e8m0fnu))
+        weight = _rows_tensor([store[layer][r][0] for r in ids], dim)
+        scale = _rows_tensor([store[layer][r][1] for r in ids], dim // 32)
+        out[layer] = (weight.view(torch.float8_e4m3fn), scale.view(torch.float8_e8m0fnu))
     return out
 
 
@@ -278,7 +288,7 @@ def main() -> None:
     # written so that it can be inspected.
     bad = []
     for name, (dtype, shape, data) in sorted(golden.items()):
-        if dtype in ("BF16", "F32"):
+        if dtype in ("BF16", "F32") and data:
             values = torch.frombuffer(bytearray(data), dtype=st.TORCH_DTYPE[dtype]).float()
             count = values.numel() - int(torch.count_nonzero(torch.isfinite(values)))
             if count:
