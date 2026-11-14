@@ -18284,6 +18284,18 @@ fn backends_a_failed_download_verb_hands_the_keyboard_back(cx: &mut TestAppConte
     );
 }
 
+/// The pane lists the registry, so the seeded singletons have to be in it
+/// before the Local tab has anything to draw: refresh it and wait until the
+/// listing has landed.
+fn load_the_registry(cx: &mut TestAppContext, stores: &Stores) {
+    stores.backends.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the registry lists its seeded backends", |cx| {
+        stores
+            .backends
+            .read_with(cx, |b, _| b.get("eidola").is_some())
+    });
+}
+
 /// **Retry is not re-entrant while its own transfer is being started.** The two
 /// activations are one request twice, not alternatives — but the store's keyed
 /// op slot is keep-newest, so a second press superseded the first: either the
@@ -18323,7 +18335,7 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
     // The drain barrier, bound before the listener: the transfer runs until the
     // listener closes and resets its connection, and the listener — declared
     // after this — drops first on every exit, a failed assertion included.
-    let _backing = Backing::new(core.clone(), dir);
+    let _backing = Backing::with_app(core.clone(), dir, cx);
 
     // A listener that accepts and never answers, so the first transfer is
     // genuinely still in flight when the second press lands — a port that
@@ -18331,14 +18343,7 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let url = format!("http://{}/wisp.gguf", listener.local_addr().unwrap());
 
-    // The pane lists the registry, so the seeded singletons have to be in it
-    // before the Local tab has anything to draw.
-    stores.backends.update(cx, |s, cx| s.refresh(cx));
-    for _ in 0..8 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
+    load_the_registry(cx, &stores);
 
     // The row the reader is looking at: a failed download, remembering its URL.
     stores.local_models.update(cx, |s, _| {
@@ -18455,11 +18460,15 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
         });
     })
     .unwrap();
-    for _ in 0..12 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
+    // A download that starts occupies its slot in the same update, so a press
+    // that leaves the slot empty started nothing — there is no later answer
+    // to wait for.
+    assert!(
+        !stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(&url)),
+        "a press on a row whose transfer is running must start nothing"
+    );
     assert!(
         stores
             .local_models
@@ -18503,16 +18512,15 @@ fn backends_a_catalog_press_cannot_race_a_pending_retry(cx: &mut TestAppContext)
         AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
     );
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    // The drain barrier, bound before the listener: the transfer runs until the
+    // listener closes and resets its connection, and the listener — declared
+    // after this — drops first on every exit, a failed assertion included.
+    let _backing = Backing::with_app(core.clone(), dir, cx);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let url = format!("http://{}/wisp.gguf", listener.local_addr().unwrap());
 
-    stores.backends.update(cx, |s, cx| s.refresh(cx));
-    for _ in 0..8 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
+    load_the_registry(cx, &stores);
 
     stores.local_models.update(cx, |s, _| {
         s.set_state_for_test(eidola_app_core::LocalModelsState {
@@ -18573,14 +18581,16 @@ fn backends_a_catalog_press_cannot_race_a_pending_retry(cx: &mut TestAppContext)
             })
             .unwrap_or(false)
     };
+    // Ticking past the call's return is harmless: the call registers the
+    // transfer before it returns, so the first sample after the return sees it
+    // and stops the loop, and the one tick between can run only the
+    // continuation, which keeps the slot until a read lands.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut in_flight = false;
-    for _ in 0..8 {
+    while !in_flight && std::time::Instant::now() < deadline {
         cx.executor().tick();
-        std::thread::sleep(std::time::Duration::from_millis(60));
+        std::thread::sleep(std::time::Duration::from_millis(10));
         in_flight = running(cx);
-        if in_flight {
-            break;
-        }
     }
     assert!(
         in_flight,
@@ -18598,11 +18608,15 @@ fn backends_a_catalog_press_cannot_race_a_pending_retry(cx: &mut TestAppContext)
         pane.update(cx, |p, cx| p.download_catalog(&url, cx));
     })
     .unwrap();
-    for _ in 0..12 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
+    // Whichever press owns the slot at the end, it clears only once its
+    // answer has landed — a refusal clears it with `op_error` set, an
+    // acceptance once a read shows the transfer — so waiting for it is waiting
+    // for the outcome rather than for a while.
+    wait_until(cx, "the operation on this URL settles", |cx| {
+        !stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(&url))
+    });
 
     assert!(
         stores
@@ -18666,7 +18680,7 @@ fn two_downloads_started_together_both_keep_their_rows(cx: &mut TestAppContext) 
     // FIFO a read parks on, the listener the transfers wait on — is declared
     // after it, so on every exit, a failed assertion included, it is released
     // before the barrier waits, and the wait stays bounded.
-    let _backing = Backing::new(core.clone(), dir);
+    let _backing = Backing::with_app(core.clone(), dir, cx);
 
     /// The FIFO sidecar a scan parks on, and the write end that holds a parked
     /// read on its data. Dropping it unparks every read, present and future:
@@ -18842,6 +18856,10 @@ fn backends_an_equivalent_url_spelling_is_the_same_transfer(cx: &mut TestAppCont
         AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
     );
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    // The drain barrier, bound before the listener: the transfer runs until the
+    // listener closes and resets its connection, and the listener — declared
+    // after this — drops first on every exit, a failed assertion included.
+    let _backing = Backing::with_app(core.clone(), dir, cx);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let host = listener.local_addr().unwrap();
@@ -18851,12 +18869,7 @@ fn backends_an_equivalent_url_spelling_is_the_same_transfer(cx: &mut TestAppCont
     let resolve_url = format!("http://{host}/huggingface.co/wisp-gguf/resolve/main/wisp.gguf");
     let query_url = format!("{resolve_url}?download=true");
 
-    stores.backends.update(cx, |s, cx| s.refresh(cx));
-    for _ in 0..8 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
+    load_the_registry(cx, &stores);
 
     stores.local_models.update(cx, |s, _| {
         s.set_state_for_test(eidola_app_core::LocalModelsState {
@@ -18919,14 +18932,16 @@ fn backends_an_equivalent_url_spelling_is_the_same_transfer(cx: &mut TestAppCont
             })
             .unwrap_or(false)
     };
+    // Ticking past the call's return is harmless: the call registers the
+    // transfer before it returns, so the first sample after the return sees it
+    // and stops the loop, and the one tick between can run only the
+    // continuation, which keeps the slot until a read lands.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut in_flight = false;
-    for _ in 0..8 {
+    while !in_flight && std::time::Instant::now() < deadline {
         cx.executor().tick();
-        std::thread::sleep(std::time::Duration::from_millis(60));
+        std::thread::sleep(std::time::Duration::from_millis(10));
         in_flight = running(cx);
-        if in_flight {
-            break;
-        }
     }
     assert!(
         in_flight,
@@ -18945,11 +18960,13 @@ fn backends_an_equivalent_url_spelling_is_the_same_transfer(cx: &mut TestAppCont
         pane.update(cx, |p, cx| p.download_catalog(&query_url, cx));
     })
     .unwrap();
-    for _ in 0..12 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
+    // The slot clears only once the answer of whichever press owns it has
+    // landed (see the sibling above).
+    wait_until(cx, "the operation on this model settles", |cx| {
+        !stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(&resolve_url))
+    });
 
     assert!(
         stores
@@ -19011,13 +19028,11 @@ fn backends_a_catalog_row_stands_down_while_its_transfer_starts(cx: &mut TestApp
         AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
     );
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    // The drain barrier; it also runs the press this test never pumps, whose
+    // refusal of a file already on disk is what lets the runtime go idle.
+    let _backing = Backing::with_app(core, dir, cx);
 
-    stores.backends.update(cx, |s, cx| s.refresh(cx));
-    for _ in 0..8 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
+    load_the_registry(cx, &stores);
 
     // The reader's situation: this catalog entry's download failed and left
     // nothing behind, so the row remembers the entry's own URL — and the
