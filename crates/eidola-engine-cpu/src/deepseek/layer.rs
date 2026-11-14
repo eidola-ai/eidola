@@ -438,7 +438,7 @@ pub(crate) fn run_layer(
             continue;
         };
         let mut x = t.x;
-        mhc::expand(&mut x, ffn.row(row), &t.mixes);
+        mhc::expand(&mut x, ffn.0.row(row), &t.mixes);
         row += 1;
         let before = flows[i].take().expect("an emitting item had an input");
         let (selection, candidates) = match spec.kv_source {
