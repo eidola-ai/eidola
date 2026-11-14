@@ -39,9 +39,14 @@ const E4M3_POSITIVE: [f32; 127] = {
 const E2M1_POSITIVE: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
 
 /// Nearest code point of an ascending `table` to `|v|`, ties to the even code,
-/// with `v`'s sign. `|v|` must not exceed the table's last entry.
+/// with `v`'s sign. `|v|` must not exceed the table's last entry. A NaN gives
+/// `+0` whatever its sign and payload: which NaN an invalid operation returns
+/// differs between processors, and a cast may not carry that into a code.
 #[inline]
 fn round_to_codes(v: f32, table: &[f32]) -> f32 {
+    if v.is_nan() {
+        return 0.0;
+    }
     let a = v.abs();
     let hi = table.partition_point(|&t| t < a).min(table.len() - 1);
     let lo = hi.saturating_sub(1);
@@ -308,6 +313,11 @@ mod tests {
         for code in 0..127u8 {
             let v = fp8_e4m3_to_f32(code);
             assert_eq!(round_e4m3(v), v);
+        }
+        // A NaN of either sign and any payload casts to +0.
+        for bits in [0x7fc0_0000u32, 0xffc0_0000, 0x7f80_0001, 0xffa1_2345] {
+            assert_eq!(round_e4m3(f32::from_bits(bits)).to_bits(), 0);
+            assert_eq!(round_e2m1(f32::from_bits(bits)).to_bits(), 0);
         }
     }
 
