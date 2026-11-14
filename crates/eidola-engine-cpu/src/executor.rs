@@ -331,6 +331,9 @@ impl CpuExecutor {
                 head_dim_v: a.head_dim_v as u32,
                 num_blocks: cfg.num_blocks,
                 host_blocks: cfg.host_blocks,
+                ratio: 1,
+                device: 0,
+                coverage: eidola_engine::spec::Coverage::All,
             });
             pools.push(Pool::new(layout_of(a, group_layers[g], 0), bs, nb));
         }
@@ -346,6 +349,9 @@ impl CpuExecutor {
                 head_dim_v: a.head_dim_v as u32,
                 num_blocks: cfg.num_blocks,
                 host_blocks: cfg.host_blocks,
+                ratio: 1,
+                device: 0,
+                coverage: eidola_engine::spec::Coverage::All,
             });
             pools.push(Pool::new(
                 layout_of(a, depths, depths * mc.hidden_size),
@@ -364,6 +370,8 @@ impl CpuExecutor {
             max_draft_tokens: depths as u32,
             num_state_slots: cfg.num_state_slots,
             buckets: cfg.buckets.clone(),
+            window_chain: None,
+            token_history: 0,
         };
         spec.validate().expect("valid model spec");
         let host_pools: Vec<Pool> = if cfg.host_blocks > 0 {

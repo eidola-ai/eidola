@@ -680,6 +680,7 @@ fn step(
         token_ids,
         positions,
         return_logits: false,
+        aux: Default::default(),
     })
     .unwrap();
     ex.take_all_logits().unwrap()

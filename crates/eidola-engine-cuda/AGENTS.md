@@ -17,6 +17,7 @@ The CUDA executor for the MiMo-V2.6 engine: the serving core's `Executor` on one
 | `sampler.rs` | The device sampler and chain acceptance (host-plan and device-side launches). |
 | `engine_ops.rs` | Wrappers for our own kernels (`engine_ops.cu`), and the decode path's launch geometry (`RouterForm`, `executor_router` and its bound `ROUTER_PER_TOKEN_MAX`, the one-token form's `router_grid` and the split form's `router_scores_grid` and `router_select_grid`, `permute_grid`, `gather_grid`, `swiglu_grid` and the dense `swiglu_f32scale_grid`, `quant_grid`, `combine_grid`, `qkv_grid`, `copy_grid`). |
 | `support.rs` | `check_supported` and `check_drafting`: the one model configuration the kernels can run; `Unsupported` names the field. |
+| `ds/abi.rs` | DeepSeek-V4.1: the kernels' parameter structs (*DeepSeek-V4.1*). |
 | `tma.rs` | `cuTensorMapEncodeTiled` specs, CuTe's descriptor fix-up. |
 | `device.rs`, `module.rs`, `launch.rs`, `ops.rs`, `bf16.rs` | Device, verified image loading and launch, argument lists, the RMSNorm smoke kernel and DeepGEMM's grid, BF16 bits. |
 
@@ -33,6 +34,12 @@ The CUDA executor for the MiMo-V2.6 engine: the serving core's `Executor` on one
 - **A resolved `Kernel` shares ownership of its loaded image** with the `KernelModule` it came from; the image is unloaded when the last of them goes, so no function handle outlives it.
 - **Every driver call binds the context first.** The current context is per thread and the executor may run on a thread other than the one that loaded it. `Kernel::launch` binds its module's context, and the paths that make raw driver calls bind before them: descriptor encoding in the GEMM launches and KV maintenance. A plain launch happened to work without a current context on R580, but descriptor encoding fails with `CUDA_ERROR_INVALID_CONTEXT` (`tests/smoke.rs` launches all three from a fresh thread).
 - **Every launch wrapper checks its kernel's limits on the host** and returns an error instead of launching. The checks cover divisibility (128- and 512-wide quantization groups), the alignment of every operand a kernel reads or writes in vectors (the fused QKV's buffers, strides and offsets, the gather's, both SwiGLUs' and the f32-scale quantization's rows and codes, the combine's, the placement's scratch), row and stride coverage, at most 256 experts and 8 per token, a router row of at most 4096, an expert layout holding every routed pair, whole GQA groups, a vocabulary of at most 2^20 for both sampling and acceptance, and whole rows in every array (`tests/preconditions.rs`). Device-resident indices (block ids, logit rows) are the executor's to keep in range; it builds them from the host mirror. CC 10.0 runs `sm_100a`, 10.3 runs `sm_103a`, any other 10.x runs `sm_100f`; a foreign architecture's cubin is refused, never JIT-compiled. `CudaExecutorConfig::image` can force the family image.
+
+## DeepSeek-V4.1
+
+`src/ds/` is the second model's module tree, beside MiMo's files. It holds the kernel ABI and nothing else yet: no DeepSeek kernel is launched.
+
+`ds/abi.rs` mirrors `eidola-engine-kernels`' `csrc/ds_abi.cuh` (normative; that crate's `AGENTS.md` → *The ABI* lists the structs and the decisions they fix) as `repr(C)` structs with device addresses as `u64`, the header's names without their prefix. `layout!` asserts each mirror's size, 8-byte alignment and every field's offset at compile time against the numbers the header asserts, so `cargo check` fails on a mirror that drifts; a launch wrapper additionally checks its kernel's `params_bytes`, as MiMo's do. `ProbeParams` and the `PROBE_*` ops are the numerics probe's (`eidola_ds_probe`): a device test replays the host vectors of the numerics header through it.
 
 ## The dev-only oracle
 

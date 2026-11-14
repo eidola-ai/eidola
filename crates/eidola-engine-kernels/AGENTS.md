@@ -8,6 +8,8 @@ The engine's GPU kernels, compiled ahead of time from open source on a GPU-less 
 |---|---|
 | `csrc/*.cu`, `csrc/eidola_kernel.cuh` | Our translation units: one per kernel family, each instantiating upstream templates (or our own code) and exposing entry points |
 | `csrc/engine_ops_common.cuh` | Helpers `engine_ops.cu` and `engine_ops_reference.cu` share (conversions, warp reductions, the UE8M0 recipe, the packed scale layout, the fused-QKV parameter struct) |
+| `csrc/ds_numeric.cuh`, `csrc/ds_abi.cuh`, `csrc/ds_probe.cu`, `csrc/ds_probe_nodiv.cu` | DeepSeek-V4.1: the numerics every kernel of that model is written from, the kernels' parameter structs, and the numerics probe (*DeepSeek-V4.1 numerics and ABI*) |
+| `oracle/ds_numeric_host.cc`, `tests/data/ds_numeric.{vectors,exhaustive}` | The dev-only host check of `ds_numeric.cuh` and the Rust reference's vectors it checks against. Not a build input |
 | `csrc/kernels.json` | The build matrix: kernels, target archs, flag profiles, and the `meta_aliases` binding mangled entries to their launch-contract records. The single place a kernel is added |
 | `nix/default.nix` | The derivation: pinned nixpkgs, CUDA 13.2, unfree allow-list, inputs → `$out/{cubin,fatbin,inspect,manifest.json}` |
 | `nix/sources.nix` | Upstream pins (commit + NAR hash) |
@@ -48,6 +50,7 @@ Never, in this crate or anything it feeds:
 | Reference forms of the router, the f32-scale activation quantization, both SwiGLUs (f32 and UE8M0 scales), the UE8M0 gather, the fused-QKV RoPE + KV write and the combine, for the GPU tests and the kernel bench only (the executor never loads them) | ours (`engine_ops_reference.cu`) | `eidola_reference_{router_topk,quant_fp8_f32scale,swiglu_quant_fp8_f32scale,swiglu_quant_fp8_ue8m0,gather_quant_ue8m0,qkv_rope_kv,moe_combine}` | none |
 | RMSNorm, BF16 | ours | `eidola_rmsnorm_bf16` | none |
 | The idle-KV cipher: ChaCha20 (RFC 8439) keystream XOR over a list of ranges | ours (`kv_cipher.cu`) | `eidola_kv_chacha20` | none |
+| The DeepSeek-V4.1 numerics probe: one function of `ds_numeric.cuh` per item, for the GPU tests only | ours (`ds_probe.cu`, and `ds_probe_nodiv.cu` without the dividing ops) | `eidola_ds_probe`, `eidola_ds_probe_nodiv` | none |
 
 **Sampling never comes from upstream.** The serving core (`eidola-engine/src/sampling.rs`) defines what a sample is: draws from a SplitMix-based counter RNG keyed by `(seed, position, stream)`, with separate streams for target samples, drafts, speculative acceptance and the residual, its own filtering, CDF walk and chain acceptance, and pinned `f64` arithmetic (its own `exp`, sums in a fixed chunked order). Recompute preemption and the CPU oracle depend on those exact draws. FlashInfer's sampling kernels draw from Philox with a caller-supplied seed and offset and cannot reproduce them. `sampling.cu` performs the core's operations in the core's grouping with explicit round-to-nearest intrinsics (nvcc never contracts those into FMAs; the `DFMA`s in its SASS belong to the correctly rounded division routine), so it returns the same probabilities and tokens bit for bit given equal logits; `eidola-engine-cuda`'s `tests/sampler.rs` checks every probability and token against the core on both device images.
 
@@ -95,6 +98,90 @@ The executor picks the form by the step's token count (`eidola-engine-cuda`'s `e
 `eidola-engine-cuda`'s `tests/moe_ops.rs` checks the router (both forms), gather, SwiGLU and combine against the reference image bit for bit from 1 to 8,192 tokens (ties, NaN and infinite choices and rows, scale-range extremes), `tests/quant_ops.rs` the f32-scale quantization and dense SwiGLU, `tests/qkv_rope_kv.rs` checks the fused-QKV kernel's Q and every pool byte for both KV head counts, and the `moe_kernel_bench` example times each against its reference form, and the router in every form, per token count.
 
 `tests/manifest.rs` holds the SASS facts above as assertions on the manifest, so a source or toolkit change that silently drops a GEMM off tcgen05 fails `cargo test`.
+
+## DeepSeek-V4.1 numerics and ABI
+
+The second model's kernels must equal `eidola-engine-model`'s DeepSeek reference bit for bit (that crate's `AGENTS.md` → Numerics contract). Three files carry what they share. No kernel of the forward exists yet; the probe is the only entry built from them.
+
+### The numerics core (`csrc/ds_numeric.cuh`)
+
+Every rounding point, scale rule, exact block product, pinned order and transcendental of the reference, each function naming the Rust one it reproduces: `bf16_round`; the E4M3, E2M1 and E8M0 decodes; the casts to E4M3 and E2M1 as stored codes (nearest, ties to the even code, saturating; integer arithmetic on the f32's bits, not a table search); `round_scale` and the three block scales with their floors; the quantiser blocks; the FP8 × FP8 and FP8 × FP4 block dots as integer sums rounded once; the quantised GEMM's accumulation step; `pinned_dot` and `pinned_sum`; `det_exp`, `det_ln`, `det_sin_cos` and the f32 functions over them (`exp32`, `sigmoid32`, `silu32`, `softplus32`, `pow32`, `rsqrt32`) in f64 where the reference uses f64; RMS norm's factor, the RoPE rotations, the SwiGLU element; the top-k order as a key and a comparison.
+
+- **Plain C++, one source for device and host.** The arithmetic is IEEE `+ - * /`, `sqrtf`, `floor`, conversions and bit casts, with no rounding intrinsic, so the header compiles for a kernel and for the host check unchanged. It is right only if nothing fuses or reorders, which the `exact` profile holds on the device and `-ffp-contract=off` on a host.
+- **Do not use `engine_ops_common.cuh`'s casts or scale recipe** in a DeepSeek kernel: `f2e4m3` leaves ties to the toolkit and `ue8m0_for` calls `log2f`.
+- **Where it departs from the reference's expression, the result is the same and the vectors hold it.** A power-of-two quantiser multiplies by the scale's reciprocal (`act_scale_recip`) where the reference divides: both round the same real number once. The FP8 × FP8 block dot is an `i64` sum in units of 2^-18 where the reference adds f64 products, both exact.
+- **Activation scales are one byte**, the f32 scale's exponent field (`act_scale_byte`): E8M0 for every finite activation, and 255 for the infinite scale of a block holding an infinite activation (`act_scale_decode` returns infinity there; a weight's E8M0 has NaN at 255).
+- **A NaN casts to code `+0`**, whatever its sign and payload, in both casts, as in the reference: which NaN an invalid operation returns differs between processors (x86 returns a negative one where Arm returns a positive one), and a quantiser reaches one whenever a block holds an infinite activation (the infinite element times the infinite scale's zero reciprocal). A NaN that stays a NaN (`bf16_round`, a dequantised `0 · ∞`, a transcendental) has no specified sign or payload; the vectors record one canonically.
+- **Preconditions are the reference's**: `det_ln` takes a positive normal, `det_sin_cos` a magnitude under about 1.6e6, `softplus32` no NaN, and the block dots no NaN code (a loader refuses a weight holding one).
+
+### The `exact` profile
+
+`-std=c++17 -O3 --fmad=false`, for every translation unit that includes the numerics core.
+
+- `--fmad=false` stops nvcc contracting a multiply and an add or subtract into a fused multiply-add: every such operation reaches PTX with an explicit round-to-nearest mode (`mul.rn`, `add.rn`), which ptxas does not fuse.
+- No `-use_fast_math` and no other floating-point option: without one nvcc keeps IEEE division and square root, does not reassociate, and does not replace a division by a reciprocal multiply.
+- `-std=c++17 -O3` are the `own` profile's.
+
+**How it is held.** The build compiles each source of a profile carrying `--fmad=false` to PTX as well (`inspect/<name>.<arch>.ptx`) and records in the manifest, per cubin, `float_ops`: `fma` instructions in the PTX, floating-point multiplies, adds and subtracts without a rounding mode, those with one, and the `FFMA`/`DFMA` count of the SASS. `tests/manifest.rs` (`exact_profiles_fuse_no_multiply_add`) requires the first two to be zero for every such cubin. The SASS count alone cannot be required to be zero: ptxas expands a division, a reciprocal and a square root into fused multiply-adds of its own (the full probe's 179, from 17 f32 and 5 f64 divisions, two reciprocals and a square root). `ds_probe_nodiv` is the probe without those ops, and its SASS must hold none: 989 rounded operations (the exponential's and the sine's Horner steps, the pinned dot, the rotations, the GEMM accumulation), zero fused. A kernel of the forward that does not divide can be asserted the same way.
+
+**Control.** The two probe sources built with `--fmad=true` in place of `--fmad=false`, counted the same way: 334 and 219 `fma` in the PTX, 654 and 551 multiplies, adds and subtracts without a rounding mode and none with one, and 223 fused multiply-adds in the division-free probe's SASS (ptxas fuses four more than nvcc). Every other cubin of the set is byte-identical in that build. Repeat the control when the toolkit moves.
+
+### The host check and the vectors
+
+`eidola-engine-model`'s `tests/deepseek_numeric_vectors.rs` emits `tests/data/ds_numeric.vectors` from the reference's public functions and fails when the committed file is not what it emits (`EIDOLA_UPDATE_DS_VECTORS=1` rewrites it); its header documents the format. The file holds explicit cases (every decode; every E4M3 and E2M1 code point, tie and saturation edge with both neighbours and both signs; scales either side of every power of two and at the floors; quantiser blocks at the floors, with zeros of both signs, and with NaNs of both signs and several payloads beside finite and infinite elements; block dots at the extremes; the transcendentals at their pinned arguments, cut-offs and reduction boundaries; RoPE powers and table entries of the released configuration; pinned orders at every length around a chunk; top-k with ties, signed zeros and NaNs) and seeded sweeps as digests: 2^22 inputs for each one-argument function and `round_scale`, 2^20 to 2^21 for the others in f64 and the element-wise composites, 2^16 to 2^18 blocks for the quantisers (once plain and once with infinities, NaNs and zeros mixed in), block dots, pinned orders, RMS norm and top-k, and 2^13 whole `lin8` and `lin4` products of up to 40 rows and 4 blocks. `ds_numeric.exhaustive` holds a digest over all 2^32 f32 inputs of each one-argument function (`bf16_round`, both casts, `exp32`, `sigmoid32`, `silu32`, `softplus32`, `rsqrt32`), emitted by the ignored `exhaustive_digests_are_current`. A NaN result is recorded canonically, since processors differ in which NaN they return.
+
+`oracle/ds_numeric_host.cc` includes the two headers, mirrors the sweep generators, and checks every record:
+
+```sh
+cargo test -p eidola-engine-kernels --test ds_numeric_host                 # the vectors, at -O2 and -O0
+cargo test -p eidola-engine-kernels --test ds_numeric_host -- --ignored    # and every f32 (about two CPU-minutes)
+```
+
+`tests/ds_numeric_host.rs` compiles it with `$CXX`, else the system `c++`, at `-ffp-contract=off`, and passes with a message on stderr when there is no compiler. The system compiler was chosen over the pinned one of the Nix environment because the check has to run in a plain `cargo test` on a developer machine and in CI, where that environment exists only inside the kernel builder's container; nothing depends on which compiler or processor it is, since the header uses only operations IEEE fixes and lets no NaN's sign or payload reach a code (it passes under Apple clang on arm64 and GCC 13 on x86_64, at `-O0` and `-O2`). With contraction left on (`-ffp-contract=fast`) 28 records fail, so the vectors do detect a fused multiply-add. The check shows the header's arithmetic is the reference's. What nvcc emits for it is held by the profile above and, on a GPU, by replaying the same vectors through `eidola_ds_probe` (`DsProbeParams`: an item per thread, words laid out as the vector file's records).
+
+### The ABI (`csrc/ds_abi.cuh`)
+
+The by-value parameter struct of each kernel family of the forward, with every field's meaning, and the conventions they share; `eidola-engine-cuda`'s `src/ds/abi.rs` mirrors it. Both sides assert every struct's size, alignment and field offsets at compile time (the header's assertions also compile in the host check). The header is normative; change both files together.
+
+| Struct | Bytes | Kernel family |
+|---|---|---|
+| `DsKvPlane` | 48 | (shared) one plane of packed KV entries in a pool or a scratch buffer |
+| `DsEmbedParams` | 48 | embedding into the residual copies |
+| `DsQuantFp8Params` | 48 | FP8 activation quantiser, from BF16 or from stored FP8 rows |
+| `DsRotQuantParams` | 128 | RoPE rotate or unrotate, then a fake quantisation into packed codes, dense or as a pool entry |
+| `DsRmsNormParams` | 40 | RMS norm |
+| `DsMhcMixParams` | 72 | hyper-connection coefficients with the Sinkhorn steps |
+| `DsCollapseParams`, `DsExpandParams` | 40, 48 | hyper-connection collapse and expand |
+| `DsLin8Params` | 56 | dense FP8 × FP8 GEMM (the scalar form's arguments, and the definition) |
+| `DsLin4Params` | 72 | routed-expert FP8 × FP4 GEMM over an expert-major layout |
+| `DsGroupedDotParams` | 56 | the attention output's grouped projection |
+| `DsAttnParams` | 160 | sparse attention over slot lists |
+| `DsLinearParams` | 64 | plain pinned-order products: compressor, index keys, head weights, router logits, head, Markov head |
+| `DsPoolParams` | 48 | the ratio-2 compressor's pooling |
+| `DsIndexScoreParams` | 136 | index scores of every visible entry |
+| `DsSelectParams` | 104 | total-order top-k, candidate blocks, the global part of the slot lists |
+| `DsWindowSlotsParams` | 72 | the window part of the slot lists, in position or ring order |
+| `DsRouteParams`, `DsPlaceParams` | 56, 72 | router selection and weights; expert-major placement |
+| `DsSwigluParams` | 56 | SwiGLU with clamps and routing weight, quantised for the down-projection |
+| `DsCombineParams` | 48 | the feed-forward sum |
+| `DsEngramGatherParams`, `DsEngramInjectParams` | 72, 48 | Engram rows as stored; the gated injection |
+| `DsStreamMeanParams` | 32 | the mean of the residual copies |
+| `DsProbeParams` | 32 | the numerics probe |
+
+Decisions the structs fix:
+
+- **BF16 between kernels is 16 bits on the device**; f32 arrays are only what the reference keeps in f32. **A fake-quantised vector exists only as codes and scales**, in the pools and in scratch alike: a code times its scale is the reference's BF16 value exactly, so every consumer dequantises on load (`ds::dequant_*`) and no widened copy is kept.
+- **Rows are prefixes.** The executor orders a step's positions deepest-computed first, so the positions a layer computes are rows `0 .. rows` of every array and no kernel takes a row list. A window-chain layer runs its KV write over the rows it computes and its attention onward over the shorter prefix the next layer computes.
+- **KV blocks are contiguous**, each layer's (or bank source's) planes back to back in the order the header gives, which is also the order a block is zeroed, copied and enciphered. An entry is `block id · entries per block + offset`; `DsKvPlane` turns it into two addresses. Window entries are FP8 (`width` codes, a scale byte per 32), global KV entries FP4 with an E4M3 scale per 16, index keys FP4 with a power-of-two scale per 32.
+- **A slot list is data**: per query, `a_slots` entry indices into one plane then `b_slots` into another, `DS_SLOT_EMPTY` for an empty slot, a slot's index fixing its 64-slot block. The window words are the same for every layer of a group (built once a step, on the host or by the `DsWindowSlotsParams` kernel); the global words are rewritten only by a layer that selects (`DsSelectParams`) and reused by the layers after it. Unused trailing slots are empty, which changes nothing. A drafter block lists its window in ring order and then the draft slots' KV from scratch, through the same struct.
+- **The grouped projection (`wo_a`) keeps its stored FP8 weight** and dequantises it on load, like its input; the product is the pinned dot of the two.
+- **The router writes a row's experts in ascending id** with their weights, after normalising with the sum taken in selection order; placement, the SwiGLU's weights and the combine all read that order.
+- **The expert layout** is expert-major with each run started on a multiple of `row_align`; `DsPlaceParams` also scatters each pair's routing weight to its layout row. Activation codes and scales reach the layout through `eidola_copy_rows` (no new gather kernel). Gate and up outputs are two pointers and a stride, so the two weights may be stored fused or apart.
+- **Engram rows are gathered as stored** (codes and E8M0 scales), which is also what crosses between devices; the quantiser takes stored FP8 rows as an input format and dequantises them as the reference reads them.
+- **Candidate blocks** are a bit per block of `block_entries` entries.
+- **Pooling is ratio 2**: two members per entry, named by row index, so an open pair kept in per-slot state is one more row.
+- **Status bits** `DS_STATUS_BAD_TOKEN` (0x100) and `DS_STATUS_BAD_INDEX` (0x200) are apart from the sampler's and the row copy's, so one status word can serve a whole step.
+- **A tensor-core form of a GEMM** takes its own struct (its descriptors); `DsLin8Params` and `DsLin4Params` are the scalar forms' and state what such a form must equal.
 
 ## How a host uses the images
 
@@ -160,14 +247,17 @@ Inside the container Nix runs with `sandbox = false` and `filter-syscalls = fals
 - the pins agree with `nix/sources.nix`;
 - the kernel × arch matrix and flags agree with `kernels.json`;
 - the SASS facts above hold;
+- no cubin of a profile without contraction fuses a multiply-add (*The `exact` profile*);
 - every entry is bound to exactly one launch-contract record, and the aliases are exactly the bindings that differ from `<entry>_meta`.
 
 Editing a kernel or the build recipe without rebuilding fails here.
 
+`tests/ds_numeric_host.rs` is the one test that uses a compiler (the host's C++ compiler, skipped without one): *The host check and the vectors*.
+
 ## Adding a kernel
 
 1. Write `csrc/<name>.cu`. Give each entry point an `extern "C"` wrapper where the upstream code has a `__device__` body to call, or explicitly instantiate the upstream `__global__` template with its full signature. Add an `EIDOLA_KERNEL_META` record for each entry: `<entry>` for an `extern "C"` entry, a readable alias for a mangled one. Do not use `assert`-dependent or path-dependent constructs.
-2. Add it to `csrc/kernels.json` with a flag profile, and a `meta_aliases` entry (`"<alias>_meta": "<mangled symbol>"`) for every aliased record; the first build prints the mangled symbols if you do not have them yet. Add a new profile only when the upstream project's own build flags differ.
+2. Add it to `csrc/kernels.json` with a flag profile, and a `meta_aliases` entry (`"<alias>_meta": "<mangled symbol>"`) for every aliased record; the first build prints the mangled symbols if you do not have them yet. Add a new profile only when the upstream project's own build flags differ. A kernel that includes `ds_numeric.cuh` takes the `exact` profile.
 3. Run `scripts/build-in-docker.sh --check --update`, inspect `inspect/<name>.<arch>.sass` / `.res-usage` (register spills show as `STACK`), and commit the source and manifest together.
 4. If the kernel exists for a particular tensor-core path, assert it in `tests/manifest.rs`.
 

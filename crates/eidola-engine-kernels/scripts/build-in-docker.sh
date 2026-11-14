@@ -72,9 +72,10 @@ docker run --rm --platform "$platform" \
     printf '$nix_conf' >>/etc/nix/nix.conf
     nix-build /src/nix -o /tmp/result
     $check_cmd
+    cp -rL /tmp/result /tmp/stage
+    chmod -R u+w /tmp/stage
     rm -rf /out/cubin /out/fatbin /out/inspect /out/manifest.json
-    cp -rL /tmp/result/. /out/
-    chmod -R u+w /out
+    cp -r /tmp/stage/. /out/
     readlink -f /tmp/result > /out/store-path
   "
 echo "build output: $out"

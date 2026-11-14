@@ -213,6 +213,7 @@ fn main() {
         token_ids: tok.to_vec(),
         positions: pos.to_vec(),
         return_logits: false,
+        aux: Default::default(),
     };
     ex.set_decode_path(DecodePath::Eager);
     let start_token = |slot: u32| prompt.as_ref().map_or(1000 + slot, |p| p[p.len() - 1]);
@@ -245,6 +246,7 @@ fn main() {
                         token_ids: p[start as usize..(start + len) as usize].to_vec(),
                         positions: (start..start + len).collect(),
                         return_logits: false,
+                        aux: Default::default(),
                     })
                     .unwrap();
                 }

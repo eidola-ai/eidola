@@ -174,6 +174,55 @@ fn sass_uses_the_intended_tensor_core_path() {
     }
 }
 
+/// A profile that turns contraction off is held to it: every cubin built under
+/// one records its floating-point operations, its PTX holds no fused
+/// multiply-add and no multiply, add or subtract left for ptxas to fuse, and
+/// no other cubin carries the record. The numerics probe without division is
+/// what shows ptxas fuses none itself: hundreds of rounded operations (the
+/// exponential's Horner steps, the pinned dots, the rotations) and not one
+/// fused multiply-add in its SASS; the full probe's are its divisions'.
+#[test]
+fn exact_profiles_fuse_no_multiply_add() {
+    let manifest = Manifest::embedded();
+    let mut exact = 0;
+    for cubin in &manifest.kernels {
+        let flags = &manifest.compile.profiles[&cubin.profile].flags;
+        let unfused = flags.iter().any(|f| f == "--fmad=false");
+        assert!(
+            !flags.iter().any(|f| f.contains("fast")) || !unfused,
+            "{}: a profile without contraction takes no fast-math flag",
+            cubin.profile
+        );
+        let Some(ops) = &cubin.float_ops else {
+            assert!(!unfused, "{} {}: no float_ops", cubin.name, cubin.arch);
+            continue;
+        };
+        assert!(unfused, "{} {}", cubin.name, cubin.arch);
+        assert_eq!(ops.ptx_fma, 0, "{} {}", cubin.name, cubin.arch);
+        assert_eq!(ops.ptx_unrounded, 0, "{} {}", cubin.name, cubin.arch);
+        exact += 1;
+    }
+    assert!(exact > 0);
+    assert_eq!(
+        manifest.compile.profiles["exact"].flags,
+        ["-std=c++17", "-O3", "--fmad=false"]
+    );
+    for arch in ["sm_100a", "sm_103a", "sm_100f"] {
+        let nodiv = manifest.cubin("ds_probe_nodiv", arch).expect("probe");
+        let ops = nodiv.float_ops.as_ref().expect("float_ops");
+        assert!(ops.ptx_rounded > 500, "{arch}: {}", ops.ptx_rounded);
+        assert_eq!(ops.sass_fma, 0, "{arch}");
+        assert!(nodiv.mma_sass.is_empty(), "{arch}");
+        let full = manifest.cubin("ds_probe", arch).expect("probe");
+        assert!(
+            full.float_ops.as_ref().expect("float_ops").sass_fma > 0,
+            "{arch}"
+        );
+        assert_eq!(full.entries[0].symbol, "eidola_ds_probe");
+        assert_eq!(nodiv.entries[0].symbol, "eidola_ds_probe_nodiv");
+    }
+}
+
 /// Every kernel entry is bound to exactly one launch-contract record and every
 /// record to exactly one entry; entries we wrote ourselves keep their unmangled
 /// names and `<entry>_meta` records; mangled entries are bound by the aliases

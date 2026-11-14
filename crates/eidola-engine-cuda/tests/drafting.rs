@@ -738,6 +738,7 @@ fn graphs_and_eager_agree_with_drafting() {
             token_ids: toks[..c as usize].to_vec(),
             positions: (0..c).collect(),
             return_logits: false,
+            aux: Default::default(),
         };
         ex.execute(&step).unwrap();
     }
@@ -787,6 +788,7 @@ fn graphs_and_eager_agree_with_drafting() {
                 token_ids: slots.iter().map(|&s| next_tok[s as usize]).collect(),
                 positions: slots.iter().map(|&s| ctx[s as usize]).collect(),
                 return_logits: true,
+                aux: Default::default(),
             };
             let before = ex.decode_stats();
             let out = ex.execute(&step).unwrap();

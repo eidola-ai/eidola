@@ -7,6 +7,10 @@
       "flags": ["-std=c++17", "-O3"],
       "includes": []
     },
+    "exact": {
+      "flags": ["-std=c++17", "-O3", "--fmad=false"],
+      "includes": []
+    },
     "cutlass": {
       "flags": ["-std=c++17", "-O3", "--expt-relaxed-constexpr"],
       "includes": ["cutlass/include"]
@@ -41,6 +45,8 @@
     { "name": "engine_ops", "source": "engine_ops.cu", "profile": "own" },
     { "name": "engine_ops_reference", "source": "engine_ops_reference.cu", "profile": "own" },
     { "name": "kv_cipher", "source": "kv_cipher.cu", "profile": "own" },
+    { "name": "ds_probe", "source": "ds_probe.cu", "profile": "exact" },
+    { "name": "ds_probe_nodiv", "source": "ds_probe_nodiv.cu", "profile": "exact" },
     { "name": "cutlass_fp8_blockwise_gemm", "source": "cutlass_fp8_blockwise_gemm.cu", "profile": "cutlass" },
     { "name": "cutlass_bf16_gemm", "source": "cutlass_bf16_gemm.cu", "profile": "cutlass" },
     {

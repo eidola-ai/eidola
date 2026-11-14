@@ -1,7 +1,9 @@
-//! Chat layer for the MiMo-V2.6 model family (Flash and Pro): tokenizer,
-//! chat template, and streaming reasoning / tool-call output parsing.
+//! Chat layer of the inference engine: tokenizer, prompt rendering, and
+//! streaming reasoning / tool-call output parsing, for each model architecture
+//! the engine serves ([`ChatFormat`]): MiMo-V2.6 (Flash and Pro) and
+//! DeepSeek-V4.1.
 //!
-//! A request flows through it in this order:
+//! A MiMo request flows through it in this order:
 //!
 //! 1. [`ChatInput::from_json`] parses the request's `messages` and `tools`
 //!    (order-preserving, Python value semantics), and
@@ -21,9 +23,17 @@
 //! The model files (`chat_template.jinja`, `tokenizer.json`,
 //! `generation_config.json`) are read from the model directory; the template
 //! and tokenizer must match pinned SHA-256 hashes.
+//!
+//! A DeepSeek-V4.1 request takes the same steps through [`deepseek_v4_1`]:
+//! [`deepseek_v4_1::encode`] in place of the template (the format is compiled
+//! in, and takes tool-call arguments as the request sent them), a
+//! [`Tokenizer`] loaded with [`Tokenizer::for_format`], and an
+//! [`OutputParser`] configured with [`OutputConfig::deepseek_v4_1`].
 
 pub mod args;
+pub mod deepseek_v4_1;
 pub mod error;
+pub mod format;
 pub mod json;
 pub mod output;
 pub mod pysem;
@@ -34,7 +44,8 @@ pub mod tool_call;
 
 pub use args::{ArgumentTyping, ToolSchemas};
 pub use error::ChatError;
+pub use format::ChatFormat;
 pub use output::{ChatDelta, FinishReason, OutputConfig, OutputParser, StopCause};
 pub use template::{ChatInput, ChatTemplate, Prompt, RenderOptions};
-pub use tokenizer::{Detokenizer, MimoTokenizer};
+pub use tokenizer::{Detokenizer, MimoTokenizer, Tokenizer};
 pub use tool_call::{CallIdSource, PrefixedCallIds, ToolCall, UnparsedText};
