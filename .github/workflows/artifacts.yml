@@ -596,8 +596,17 @@ jobs:
           printf '%s\n' "$SERVER_ENCLAVE" > releases/trust/server-enclave.json
 
       - name: Install Nix
+        # Pinned, where the action would install the newest Nix. The macOS
+        # sandbox refuses a profile that compiles to more than 65535 bytes,
+        # Nix writes every input store path into that profile, and crane's
+        # vendor derivation takes one input per crate (about 1250). Nix
+        # 2.32.4 builds that derivation under `sandbox = true`; Nix 2.35.4
+        # fails it with "data object length 94456 exceeds maximum (65535)".
+        # Move the pin only with a macOS build of `.#eidola-cli-macos-universal`
+        # under the sandbox.
         uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
         with:
+          install_url: https://releases.nixos.org/nix/nix-2.32.4/install
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
           extra_nix_config: |
             sandbox = true
