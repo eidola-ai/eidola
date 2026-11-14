@@ -1471,6 +1471,7 @@ fn settings_asks_the_account_pane_for_its_live_reads_on_every_visit(cx: &mut Tes
     core.set_account_credentials("acct".into(), "secret".into())
         .unwrap();
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    let _backing = Backing::with_app(core, dir, cx);
     stores.config.update(cx, |s, cx| s.refresh(cx));
 
     let (_w, view) = open_view(cx, |window, cx| {
@@ -1524,13 +1525,6 @@ fn settings_asks_the_account_pane_for_its_live_reads_on_every_visit(cx: &mut Tes
              previous answer standing as current"
         );
     });
-
-    // Deterministic teardown — join the in-flight bridge tasks before `cx`
-    // drops the last `Arc<AppCore>` (see `record_refresh_supersedes_in_flight_fetch`
-    // for why the runtime must be idle first).
-    while core.runtime().metrics().num_alive_tasks() > 0 {
-        std::thread::yield_now();
-    }
 }
 
 #[gpui::test]
@@ -2065,6 +2059,7 @@ fn a_reset_disowns_a_pending_link_before_the_bus_catches_up(cx: &mut TestAppCont
     core.set_account_credentials("acct-a".into(), "secret-a".into())
         .unwrap();
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    let _backing = Backing::with_app(core.clone(), dir, cx);
     stores.config.update(cx, |s, cx| s.refresh(cx));
 
     let (window, view) = open_view(cx, |window, cx| {
@@ -2700,22 +2695,28 @@ fn record_marks_stale_on_record_change_and_refresh_clears(cx: &mut TestAppContex
 #[gpui::test]
 fn record_refresh_supersedes_in_flight_fetch(cx: &mut TestAppContext) {
     // A real `AppCore` over tempdirs (the Record queries are local-DB reads),
-    // mirroring `tests/stores.rs::test_core`. `_dir` keeps the tempdir alive.
-    // The RecordView's page fetches run as spawned tasks on the AppCore's own
-    // tokio runtime (each holding an `Arc<AppCore>`), so declare that
-    // cross-thread mixing to the test scheduler — the established idiom (see
-    // `tests/stores.rs`), which also lets us join those tasks below without the
-    // non-determinism detector flagging their cross-thread completion wakes.
+    // mirroring `tests/stores.rs::test_core`. The RecordView's page fetches run
+    // as spawned tasks on the AppCore's own tokio runtime (each holding an
+    // `Arc<AppCore>`), so declare that cross-thread mixing to the test
+    // scheduler — the established idiom (see `tests/stores.rs`), which also
+    // lets the drain barrier join those tasks without the non-determinism
+    // detector flagging their cross-thread completion wakes.
     cx.executor().allow_parking();
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
-    let _dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let core = std::sync::Arc::new(
-        AppCore::new(_dir.path().to_path_buf(), _dir.path().join("data")).expect("open core"),
+        AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
     );
     core.runtime()
         .block_on(core.set_base_url("https://127.0.0.1:1/v1".into()))
         .unwrap();
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    // The drain barrier. Each page fetch — including the one `refresh`
+    // supersedes, which is *orphaned* on the tokio side once its gpui receiver
+    // is dropped, so no `run_until_parked` ever drains it — holds an
+    // `Arc<AppCore>` until it finishes on a tokio worker; the guard waits for
+    // them all before the last `Arc` can drop (`tests/support/backing.rs`).
+    let _backing = Backing::with_app(core, dir, cx);
     let (_window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| RecordView::new(stores.clone(), window, cx))
     });
@@ -2741,23 +2742,6 @@ fn record_refresh_supersedes_in_flight_fetch(cx: &mut TestAppContext) {
              superseded task was cancelled at replacement"
         );
     });
-
-    // Deterministic teardown — join every in-flight bridge task before the test
-    // returns. Each page fetch (including the one `refresh` superseded, which is
-    // *orphaned* on the tokio side once its gpui receiver is dropped, so no
-    // `run_until_parked` ever drains it) holds an `Arc<AppCore>` until it
-    // finishes on a tokio worker. The store entities keep the AppCore alive
-    // until `cx` teardown on this thread, but if a bridge task is still running
-    // then, it becomes the *last* owner and drops the tokio runtime from within
-    // its own worker → "Cannot drop a runtime ... from within an asynchronous
-    // context" — the intermittent CI panic (Linux-scheduler-sensitive; a local
-    // DB read almost always finishes first on macOS, so this never reproduced
-    // here). Waiting until the runtime is idle guarantees the last `Arc` always
-    // drops on the test thread. This is a precise join on the runtime's live
-    // task count, not a timed sleep, and does not touch the assertions above.
-    while core.runtime().metrics().num_alive_tasks() > 0 {
-        std::thread::yield_now();
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8702,7 +8686,7 @@ fn space_title_band_press_does_not_select_the_post_beneath(cx: &mut TestAppConte
 /// created space (born from the default template: "You" + the seeded agent).
 fn participants_scene(
     cx: &mut TestAppContext,
-) -> (Stores, std::sync::Arc<AppCore>, tempfile::TempDir, String) {
+) -> (Stores, std::sync::Arc<AppCore>, Backing, String) {
     cx.executor().allow_parking();
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let dir = tempfile::tempdir().unwrap();
@@ -8718,13 +8702,8 @@ fn participants_scene(
         .expect("create space")
         .id;
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
-    (stores, core, dir, space)
-}
-
-fn drain_runtime(core: &std::sync::Arc<AppCore>) {
-    while core.runtime().metrics().num_alive_tasks() > 0 {
-        std::thread::yield_now();
-    }
+    let backing = Backing::with_app(core.clone(), dir, cx);
+    (stores, core, backing, space)
 }
 
 /// Poll `run_until_parked` until `pred` holds — a write-then-relist round-trips
@@ -8769,7 +8748,7 @@ fn open_participants_inspector(
 
 #[gpui::test]
 fn inspector_participants_add_and_remove(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
@@ -8828,8 +8807,6 @@ fn inspector_participants_add_and_remove(cx: &mut TestAppContext) {
     wait_until(cx, "participant removed", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
     });
-
-    drain_runtime(&core);
 }
 
 /// The system prompt is editable where the participant lives: open a member's
@@ -8841,7 +8818,7 @@ fn inspector_participants_add_and_remove(cx: &mut TestAppContext) {
 /// template when the window opened, not when a first message was sent.
 #[gpui::test]
 fn inspector_participants_work_on_a_fresh_space_with_no_posts(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _seeded) = participants_scene(cx);
+    let (stores, core, _backing, _seeded) = participants_scene(cx);
 
     // ⌘N — no space id; the window mints one and opens on it.
     let (window, view) = open_space(cx, &stores, None);
@@ -8918,7 +8895,7 @@ fn inspector_participants_work_on_a_fresh_space_with_no_posts(cx: &mut TestAppCo
 
 #[gpui::test]
 fn inspector_participant_system_prompt_round_trips(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
@@ -8976,8 +8953,6 @@ fn inspector_participant_system_prompt_round_trips(cx: &mut TestAppContext) {
         reopened.read_with(cx, |s, _| s.value().to_string()),
         "Answer only in questions."
     );
-
-    drain_runtime(&core);
 }
 
 const SWITCH_OLD: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -9019,7 +8994,7 @@ const SWITCH_CATALOG: &[eidola_app_core::model_catalog::CatalogRow] = &[
 #[gpui::test]
 fn a_save_racing_a_weights_switch_keeps_the_newer_pin(cx: &mut TestAppContext) {
     use eidola_app_core::model_catalog::ModelNotice;
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, core, _backing, space) = participants_scene(cx);
     core.test_set_model_catalog(SWITCH_CATALOG);
     let old_pin = format!("switch-fixture@sha256:{SWITCH_OLD}@eidola");
     let new_pin = format!("switch-fixture@sha256:{SWITCH_NEW}@eidola");
@@ -9111,8 +9086,6 @@ fn a_save_racing_a_weights_switch_keeps_the_newer_pin(cx: &mut TestAppContext) {
         Some(new_pin.as_str()),
         "the switch held"
     );
-
-    drain_runtime(&core);
 }
 
 /// **A Share while a switch to newer weights is in flight keeps the switch.**
@@ -9122,7 +9095,7 @@ fn a_save_racing_a_weights_switch_keeps_the_newer_pin(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_share_racing_a_weights_switch_keeps_the_newer_pin(cx: &mut TestAppContext) {
     use eidola_app_core::model_catalog::ModelNotice;
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, core, _backing, space) = participants_scene(cx);
     core.test_set_model_catalog(SWITCH_CATALOG);
     let old_pin = format!("switch-fixture@sha256:{SWITCH_OLD}@eidola");
     let new_pin = format!("switch-fixture@sha256:{SWITCH_NEW}@eidola");
@@ -9199,8 +9172,6 @@ fn a_share_racing_a_weights_switch_keeps_the_newer_pin(cx: &mut TestAppContext) 
         Some(new_pin.as_str()),
         "the switch held"
     );
-
-    drain_runtime(&core);
 }
 
 /// The headline fork: editing a **referenced global** ("You") writes either the
@@ -9208,7 +9179,7 @@ fn a_share_racing_a_weights_switch_keeps_the_newer_pin(cx: &mut TestAppContext) 
 /// view routes to the right store method per its mode.
 #[gpui::test]
 fn inspector_participants_override_vs_edit_everywhere(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
@@ -9286,8 +9257,6 @@ fn inspector_participants_override_vs_edit_everywhere(cx: &mut TestAppContext) {
                 .unwrap_or(false)
         })
     });
-
-    drain_runtime(&core);
 }
 
 /// The **promote affordance** (task 36): "Share this agent…" on a space-owned
@@ -9301,7 +9270,7 @@ fn inspector_participants_override_vs_edit_everywhere(cx: &mut TestAppContext) {
 /// code at all, since both are read off the store's own re-list.
 #[gpui::test]
 fn inspector_sharing_an_agent_promotes_it_in_place(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, backing, space) = participants_scene(cx);
     let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
@@ -9338,7 +9307,7 @@ fn inspector_sharing_an_agent_promotes_it_in_place(cx: &mut TestAppContext) {
     })
     .unwrap();
     assert!(!view.read_with(cx, |v, _| v.inspector_promote_confirming()));
-    cx.run_until_parked();
+    backing.settle();
     assert_eq!(
         stores.participants.read_with(cx, |s, _| {
             s.list(&space)
@@ -9393,8 +9362,6 @@ fn inspector_sharing_an_agent_promotes_it_in_place(cx: &mut TestAppContext) {
             .read_with(cx, |s, _| s.op_errors_for(&space).is_empty()),
         "the share was accepted"
     );
-
-    drain_runtime(&core);
 }
 
 /// **The confirmation is about the persona on screen.** "Share this agent…" is
@@ -9406,7 +9373,7 @@ fn inspector_sharing_an_agent_promotes_it_in_place(cx: &mut TestAppContext) {
 /// (Codex review, PR #279).
 #[gpui::test]
 fn inspector_sharing_a_dirty_editor_shares_the_persona_on_screen(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
@@ -9503,8 +9470,6 @@ fn inspector_sharing_a_dirty_editor_shares_the_persona_on_screen(cx: &mut TestAp
             .read_with(cx, |s, _| s.op_errors_for(&space).is_empty()),
         "the share was accepted"
     );
-
-    drain_runtime(&core);
 }
 
 /// The inspector's half of the handback rule (Codex review, PR #279): the
@@ -9514,7 +9479,7 @@ fn inspector_sharing_a_dirty_editor_shares_the_persona_on_screen(cx: &mut TestAp
 /// holding a dead handle.
 #[gpui::test]
 fn inspector_hands_the_keyboard_back_when_a_form_closes(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
@@ -9665,8 +9630,6 @@ fn inspector_hands_the_keyboard_back_when_a_form_closes(cx: &mut TestAppContext)
         view_holds_the_keyboard(cx),
         "the add form hands it back too"
     );
-
-    drain_runtime(&core);
 }
 
 /// **An open editor is valid only while its row still answers to the shape it
@@ -9683,7 +9646,7 @@ fn inspector_hands_the_keyboard_back_when_a_form_closes(cx: &mut TestAppContext)
 fn inspector_editor_retires_when_its_row_stops_being_what_it_was_seeded_as(
     cx: &mut TestAppContext,
 ) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, core, backing, space) = participants_scene(cx);
     let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
@@ -9749,15 +9712,13 @@ fn inspector_editor_retires_when_its_row_stops_being_what_it_was_seeded_as(
 
     // The verb the stale editor was still offering writes nothing now. Read the
     // database, not the cached roster: the claim is about what was durably
-    // published, and `drain_runtime` is what makes "no write was issued" and "a
-    // write landed" distinguishable in one bounded step.
+    // published, and settling is what makes "no write was issued" and "a write
+    // landed" distinguishable in one bounded step.
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| v.inspector_save_participant_edit(window, cx));
     })
     .unwrap();
-    cx.run_until_parked();
-    drain_runtime(&core);
-    cx.run_until_parked();
+    backing.settle();
     let durable = core
         .runtime()
         .block_on(core.list_space_participants(space.clone()))
@@ -9783,8 +9744,6 @@ fn inspector_editor_retires_when_its_row_stops_being_what_it_was_seeded_as(
         Some(EditMode::OverrideHere),
         "a referenced global opens in this-space-only"
     );
-
-    drain_runtime(&core);
 }
 
 /// A shared agent's **notebook** is a real space, and the Library is the list of
@@ -9793,7 +9752,7 @@ fn inspector_editor_retires_when_its_row_stops_being_what_it_was_seeded_as(
 /// end of that promise, read where a person would read it.
 #[gpui::test]
 fn a_shared_agents_notebook_stays_out_of_the_library(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (_window, _view) = open_view(cx, |window, cx| {
         cx.new(|cx| LibraryView::new(stores.clone(), window, cx))
     });
@@ -9844,8 +9803,6 @@ fn a_shared_agents_notebook_stays_out_of_the_library(cx: &mut TestAppContext) {
         vec![space],
         "the notebook created by the share is not a conversation"
     );
-
-    drain_runtime(&core);
 }
 
 /// Promote the seeded agent and hand back its id — the precondition of every
@@ -9894,7 +9851,7 @@ fn share_the_seeded_agent(cx: &mut TestAppContext, stores: &Stores, space: &str)
 /// notebook opens as an ordinary space window.
 #[gpui::test]
 fn agents_pane_lists_edits_and_opens_the_notebook(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
     });
@@ -9956,8 +9913,6 @@ fn agents_pane_lists_edits_and_opens_the_notebook(cx: &mut TestAppContext) {
         1,
         "the notebook opens as a space window"
     );
-
-    drain_runtime(&core);
 }
 
 /// **A form that closes hands the keyboard back** (Codex review, PR #279).
@@ -9971,7 +9926,7 @@ fn agents_pane_lists_edits_and_opens_the_notebook(cx: &mut TestAppContext) {
 /// since a dead input's handle is gone with it.
 #[gpui::test]
 fn agents_pane_hands_the_keyboard_back_when_its_editor_closes(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
     });
@@ -10177,8 +10132,6 @@ fn agents_pane_hands_the_keyboard_back_when_its_editor_closes(cx: &mut TestAppCo
         pane_holds_the_keyboard(cx),
         "and so did the keyboard it was holding"
     );
-
-    drain_runtime(&core);
 }
 
 /// **Retirement** asks first, then takes the agent out of the library and
@@ -10186,7 +10139,7 @@ fn agents_pane_hands_the_keyboard_back_when_its_editor_closes(cx: &mut TestAppCo
 /// the space it worked in still resolves it.
 #[gpui::test]
 fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, backing, space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
     });
@@ -10221,7 +10174,7 @@ fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
         view.update(cx, |v, cx| v.cancel_retire(window, cx));
     })
     .unwrap();
-    cx.run_until_parked();
+    backing.settle();
     assert!(
         stores.agents.read_with(cx, |s, _| s
             .list()
@@ -10244,7 +10197,7 @@ fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
     })
     .unwrap();
     assert!(view.read_with(cx, |v, _| v.retiring_agent().is_none()));
-    cx.run_until_parked();
+    backing.settle();
     assert_eq!(
         stores.agents.read_with(cx, |s, _| s.list().len()),
         1,
@@ -10298,8 +10251,6 @@ fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
         .participants
         .update(cx, |s, cx| s.refresh(space.clone(), cx));
     cx.run_until_parked();
-
-    drain_runtime(&core);
 }
 
 /// A failed *initial* read must not read as an empty library, and a refused
@@ -10334,7 +10285,7 @@ fn agents_pane_failed_load_and_refused_write_are_visible(cx: &mut TestAppContext
 
 #[gpui::test]
 fn templates_pane_crud_and_set_default(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (stores, _core, _backing, _space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
     });
@@ -10392,15 +10343,13 @@ fn templates_pane_crud_and_set_default(cx: &mut TestAppContext) {
             .templates
             .read_with(cx, |s, _| !s.list().iter().any(|t| t.title == "Research"))
     });
-
-    drain_runtime(&core);
 }
 
 /// The router picker writes through `set_template_router_model`, and **Off**
 /// round-trips back to NULL — the default is a real choice, not a one-way door.
 #[gpui::test]
 fn templates_pane_router_model_writes_through_and_off_round_trips(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (stores, _core, _backing, _space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
     });
@@ -10465,8 +10414,6 @@ fn templates_pane_router_model_writes_through_and_off_round_trips(cx: &mut TestA
                 .unwrap_or(false)
         })
     });
-
-    drain_runtime(&core);
 }
 
 /// Setting a template's router is a **second** core call after the create, and
@@ -10476,7 +10423,7 @@ fn templates_pane_router_model_writes_through_and_off_round_trips(cx: &mut TestA
 /// created with.
 #[gpui::test]
 fn a_stale_router_pick_refuses_before_creating_the_template(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (stores, core, _backing, _space) = participants_scene(cx);
     stores.templates.update(cx, |s, cx| s.refresh(cx));
     wait_until(cx, "templates load", |cx| {
         stores.templates.read_with(cx, |s, _| !s.list().is_empty())
@@ -10514,8 +10461,6 @@ fn a_stale_router_pick_refuses_before_creating_the_template(cx: &mut TestAppCont
         !titles.iter().any(|t| t == "Doomed"),
         "a refused router must leave no template behind: {titles:?}"
     );
-
-    drain_runtime(&core);
 }
 
 /// A `SpaceTemplateInfo` embeds its referenced globals' **effective** config, so
@@ -10523,7 +10468,7 @@ fn a_stale_router_pick_refuses_before_creating_the_template(cx: &mut TestAppCont
 /// `Change::Participants` — must reach the templates snapshot too.
 #[gpui::test]
 fn everywhere_edit_of_a_shared_participant_reaches_the_templates_snapshot(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, core, _backing, space) = participants_scene(cx);
     // A template projected from a space carries the shared "You" by reference.
     core.runtime()
         .block_on(core.template_from_space(space.clone(), "Projected".into()))
@@ -10575,8 +10520,6 @@ fn everywhere_edit_of_a_shared_participant_reaches_the_templates_snapshot(cx: &m
     wait_until(cx, "the templates snapshot follows", |cx| {
         referenced_label(cx).as_deref() == Some("Myself")
     });
-
-    drain_runtime(&core);
 }
 
 /// A new agent participant arrives with the shared default system prompt, and
@@ -10585,7 +10528,7 @@ fn everywhere_edit_of_a_shared_participant_reaches_the_templates_snapshot(cx: &m
 fn templates_pane_new_agent_carries_the_default_system_prompt(cx: &mut TestAppContext) {
     use eidola_gui::participants::DEFAULT_AGENT_SYSTEM_PROMPT;
 
-    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (stores, _core, _backing, _space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
     });
@@ -10639,14 +10582,12 @@ fn templates_pane_new_agent_carries_the_default_system_prompt(cx: &mut TestAppCo
         ],
         "the default prompt round-trips through the template update path"
     );
-
-    drain_runtime(&core);
 }
 
 /// An edited system prompt round-trips through the template update path.
 #[gpui::test]
 fn templates_pane_system_prompt_round_trips(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (stores, _core, _backing, _space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
     });
@@ -10691,8 +10632,6 @@ fn templates_pane_system_prompt_round_trips(cx: &mut TestAppContext) {
             .as_deref(),
         Some("Answer only in questions.")
     );
-
-    drain_runtime(&core);
 }
 
 /// A failed initial participant load must render Retry (not a phantom-empty
@@ -10700,7 +10639,7 @@ fn templates_pane_system_prompt_round_trips(cx: &mut TestAppContext) {
 /// cell exists, so `retry_load` is the only path back.
 #[gpui::test]
 fn inspector_participants_retry_refetches_after_failed_load(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (_window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
@@ -10721,15 +10660,13 @@ fn inspector_participants_retry_refetches_after_failed_load(cx: &mut TestAppCont
     wait_until(cx, "retry reloads", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
     });
-
-    drain_runtime(&core);
 }
 
 /// The per-space error keying: a failure on space A must not surface under
 /// space B, and starting B's op must not clear A's error.
 #[gpui::test]
 fn participants_store_op_error_is_per_space(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space_a) = participants_scene(cx);
+    let (stores, core, _backing, space_a) = participants_scene(cx);
     let space_b = core
         .runtime()
         .block_on(core.create_space(None))
@@ -10772,8 +10709,6 @@ fn participants_store_op_error_is_per_space(cx: &mut TestAppContext) {
             "starting B's op must not clear A's error (per-space keying)"
         );
     });
-
-    drain_runtime(&core);
 }
 
 /// P1: a "New Space from Template" failure is owned by the store (not detached)
@@ -10781,7 +10716,7 @@ fn participants_store_op_error_is_per_space(cx: &mut TestAppContext) {
 /// discarded.
 #[gpui::test]
 fn spaces_store_create_from_template_surfaces_error(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (stores, _core, _backing, _space) = participants_scene(cx);
     let stores_clone = stores.clone();
     stores.spaces.update(cx, move |s, cx| {
         s.create_from_template("does-not-exist".into(), stores_clone, cx);
@@ -10795,8 +10730,6 @@ fn spaces_store_create_from_template_surfaces_error(cx: &mut TestAppContext) {
             "a create has no space to tag, so no space's inspector claims it"
         );
     });
-
-    drain_runtime(&core);
 }
 
 #[gpui::test]
@@ -10807,7 +10740,7 @@ fn space_post_fans_out_one_turn_per_planned_responder(cx: &mut TestAppContext) {
     // keyed runner. With no account configured every turn fails (typed) — and
     // each failure completes *independently*, leaving the saved post intact
     // and the space recovered (never bricked).
-    let (stores, core, _dir, space_id) = participants_scene(cx);
+    let (stores, core, _backing, space_id) = participants_scene(cx);
     core.runtime()
         .block_on(core.add_space_participant(
             space_id.clone(),
@@ -10874,8 +10807,6 @@ fn space_post_fans_out_one_turn_per_planned_responder(cx: &mut TestAppContext) {
         );
         assert!(space.can_retry(), "a failed turn is recorded for Retry");
     });
-
-    drain_runtime(&core);
 }
 
 // ---------------------------------------------------------------------------
@@ -11908,7 +11839,7 @@ fn space_quote_survives_the_round_trip_into_the_ask_path(cx: &mut TestAppContext
     // the model will read (upstream expansion itself is pinned in app-core's
     // `upstream_context_expands_embed_markers_into_quotes`). `PostNode::
     // embed_map()` agreeing is the same guarantee on the render side.
-    let (stores, core, _dir, space_id) = participants_scene(cx);
+    let (stores, core, _backing, space_id) = participants_scene(cx);
 
     // A persisted post to quote from.
     let seed = core
@@ -12009,8 +11940,6 @@ fn space_quote_survives_the_round_trip_into_the_ask_path(cx: &mut TestAppContext
         "the persisted body carries the marker the edge's ordinal addresses: {text:?}"
     );
     assert!(text.contains("what did you mean by this?"));
-
-    drain_runtime(&core);
 }
 
 #[gpui::test]
@@ -14735,9 +14664,19 @@ fn retiring_leaves_the_control_socket_and_the_callers_on_it_answering(cx: &mut T
     );
     let path = eidola_app_core::ipc::socket_path(core.data_dir());
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    let _backing = Backing::with_app(core, dir, cx);
     // Held for the test's duration exactly as the shutdown hook holds it in
     // production; closing is that hook's first step, and a retire never runs it.
-    let _socket = eidola_gui::ipc::bind(&stores).expect("bind");
+    // The test closes it on its way out, whatever the exit: the accept loop owns
+    // an `Arc<AppCore>` for as long as it serves, so the drain barrier declared
+    // above could never finish while it did.
+    struct ClosedOnExit(eidola_gui::ipc::ControlSocket);
+    impl Drop for ClosedOnExit {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    let _socket = ClosedOnExit(eidola_gui::ipc::bind(&stores).expect("bind"));
     assert!(path.exists(), "the door is open to begin with");
 
     // A peer that was already connected when the retire happened.
@@ -15379,7 +15318,7 @@ fn space_inspector_removing_a_participant_takes_its_dropdown_with_it(cx: &mut Te
 /// its dropdown, and the keyboard its field was holding.
 #[gpui::test]
 fn space_inspector_a_participant_leaving_the_roster_retires_its_editor(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         !participant_labels(&stores, &space, cx).is_empty()
@@ -15447,7 +15386,6 @@ fn space_inspector_a_participant_leaving_the_roster_retires_its_editor(cx: &mut 
         view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
         "the press reached the conversation instead of a dead input"
     );
-    drain_runtime(&core);
 }
 
 /// Type-to-compose must yield to **every** field the panel paints, not just the
@@ -15534,7 +15472,7 @@ fn space_inspector_typing_in_a_system_prompt_does_not_jump_to_the_composer(
 /// settings load itself.
 #[gpui::test]
 fn space_inspector_repaints_when_its_settings_land(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_space(cx, &stores, Some(space.clone()));
     // Let the transcript load and every launch-time refresh settle, so nothing
     // else is in flight to repaint this window.
@@ -15574,8 +15512,6 @@ fn space_inspector_repaints_when_its_settings_land(cx: &mut TestAppContext) {
         "the settings landing must schedule a repaint — otherwise the panel \
          keeps rendering the spinner it drew before the load completed"
     );
-
-    drain_runtime(&core);
 }
 
 /// The empty-title rejection must leave the *field* honest too. Clearing the
@@ -15706,7 +15642,7 @@ fn space_inspector_a_refused_rename_restores_the_stored_title(cx: &mut TestAppCo
 /// first, and 4 + 1 + 1 persisted as 5.
 #[gpui::test]
 fn space_inspector_two_quick_cascade_steps_both_count(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, core, _backing, space) = participants_scene(cx);
     let (window, view) = open_space(cx, &stores, Some(space.clone()));
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
@@ -15746,8 +15682,6 @@ fn space_inspector_two_quick_cascade_steps_both_count(cx: &mut TestAppContext) {
         Some(target),
         "and the panel agrees with the row it wrote"
     );
-
-    drain_runtime(&core);
 }
 
 /// **Focus comes back from the panel** — the `RecordView::close_detail` rule
@@ -15886,7 +15820,7 @@ fn space_inspector_closing_leaves_a_composing_reader_alone(cx: &mut TestAppConte
 /// was the one that did not.
 #[gpui::test]
 fn space_inspector_repaints_when_a_model_catalog_lands(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_space(cx, &stores, Some(space.clone()));
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
@@ -15928,8 +15862,6 @@ fn space_inspector_repaints_when_a_model_catalog_lands(cx: &mut TestAppContext) 
         "a catalog landing must schedule a repaint — otherwise the open picker \
          keeps showing the options it drew before the fetch completed"
     );
-
-    drain_runtime(&core);
 }
 
 // ---------------------------------------------------------------------------
@@ -16738,7 +16670,7 @@ fn inspector_inviting_an_agent_from_another_space_shares_it_and_adds_it_here(
     // membership — one core call, so the irreversible half can never land
     // alone — and the sentence says both, including the part that can't be
     // undone.
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, core, _backing, space) = participants_scene(cx);
     let elsewhere = core
         .runtime()
         .block_on(core.create_space(Some("Tides".into())))
@@ -16827,7 +16759,6 @@ fn inspector_inviting_an_agent_from_another_space_shares_it_and_adds_it_here(
             })
         })
     });
-    drain_runtime(&core);
 }
 
 #[gpui::test]
@@ -16838,7 +16769,7 @@ fn inspector_the_invite_form_takes_the_keyboard_its_door_had(cx: &mut TestAppCon
     // `focusable()` + `tab_index(0)`), so a transition that mounts a surface
     // and focuses nothing leaves the window on a dead handle: keystrokes reach
     // nothing and Tab restarts from the window root (Codex review, PR #280).
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, core, _backing, space) = participants_scene(cx);
     let elsewhere = core
         .runtime()
         .block_on(core.create_space(Some("Tides".into())))
@@ -16902,7 +16833,6 @@ fn inspector_the_invite_form_takes_the_keyboard_its_door_had(cx: &mut TestAppCon
             .unwrap(),
         "arming the grant leaves the keyboard on the form it replaced a row in"
     );
-    drain_runtime(&core);
 }
 
 #[gpui::test]
@@ -17291,7 +17221,7 @@ fn inspector_a_notebook_offers_no_grant_door(cx: &mut TestAppContext) {
     // task 37 deliberately leaves open. Until it is made, the panel offers no
     // new door there — app-core's rules are untouched, so nothing is
     // foreclosed either way.
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, core, _backing, space) = participants_scene(cx);
     let agent = core
         .runtime()
         .block_on(core.list_space_participants(space.clone()))
@@ -17331,7 +17261,6 @@ fn inspector_a_notebook_offers_no_grant_door(cx: &mut TestAppContext) {
         "an ordinary conversation offers the grant"
     );
     let _ = window;
-    drain_runtime(&core);
 }
 
 #[gpui::test]
@@ -17455,7 +17384,7 @@ fn inspector_withholds_the_grant_door_until_the_settings_say_what_this_space_is(
     // open, which is exactly why the GUI's withholding is the only thing
     // standing between the reader and a notebook's whole history). Codex
     // review, PR #280.
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, core, _backing, space) = participants_scene(cx);
     let agent = core
         .runtime()
         .block_on(core.list_space_participants(space.clone()))
@@ -17509,7 +17438,6 @@ fn inspector_withholds_the_grant_door_until_the_settings_say_what_this_space_is(
         !view.read_with(cx, |v, cx| v.inspector_offers_grant_door_for_test(cx)),
         "…and the door stays withheld, now on evidence"
     );
-    drain_runtime(&core);
 }
 
 // ---------------------------------------------------------------------------
@@ -17533,15 +17461,6 @@ fn close_space_window(cx: &mut TestAppContext, window: AnyWindowHandle, view: En
     cx.run_until_parked();
 }
 
-/// Give a disposal that is *not* supposed to happen a real chance to happen.
-fn settle(cx: &mut TestAppContext) {
-    for _ in 0..8 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
-}
-
 /// ⌘N, then close without doing anything: the space goes with the window.
 ///
 /// A space is created when its window opens, so without this every abandoned
@@ -17551,7 +17470,7 @@ fn settle(cx: &mut TestAppContext) {
 /// worth keeping.
 #[gpui::test]
 fn a_new_space_nobody_touched_goes_with_its_window(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _seeded) = participants_scene(cx);
+    let (stores, core, _backing, _seeded) = participants_scene(cx);
 
     let (window, view) = open_space(cx, &stores, None);
     let space = view.read_with(cx, |v, cx| v.space().read(cx).id().to_string());
@@ -17563,7 +17482,6 @@ fn a_new_space_nobody_touched_goes_with_its_window(cx: &mut TestAppContext) {
     wait_until(cx, "the untouched space is disposed of", |_| {
         !space_exists(&core, &space)
     });
-    drain_runtime(&core);
 }
 
 /// The mirror, at the same seam: a conversation someone actually wrote in stays
@@ -17571,7 +17489,7 @@ fn a_new_space_nobody_touched_goes_with_its_window(cx: &mut TestAppContext) {
 /// reaped space costs the words in it.
 #[gpui::test]
 fn a_conversation_someone_wrote_in_survives_its_window(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _seeded) = participants_scene(cx);
+    let (stores, core, backing, _seeded) = participants_scene(cx);
 
     let (window, view) = open_space(cx, &stores, None);
     let entity = view.read_with(cx, |v, _| v.space().clone());
@@ -17586,12 +17504,11 @@ fn a_conversation_someone_wrote_in_survives_its_window(cx: &mut TestAppContext) 
     });
 
     close_space_window(cx, window, view);
-    settle(cx);
+    backing.settle();
     assert!(
         space_exists(&core, &space),
         "the conversation outlives the window that wrote it"
     );
-    drain_runtime(&core);
 }
 
 /// Two windows on one space: closing the first disposes of nothing, because the
@@ -17599,7 +17516,7 @@ fn a_conversation_someone_wrote_in_survives_its_window(cx: &mut TestAppContext) 
 /// untouched space goes then.
 #[gpui::test]
 fn closing_one_of_two_windows_disposes_of_nothing(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _seeded) = participants_scene(cx);
+    let (stores, core, backing, _seeded) = participants_scene(cx);
 
     let (first, view) = open_space(cx, &stores, None);
     let space = view.read_with(cx, |v, cx| v.space().read(cx).id().to_string());
@@ -17609,7 +17526,7 @@ fn closing_one_of_two_windows_disposes_of_nothing(cx: &mut TestAppContext) {
     let (second, other) = open_space(cx, &stores, Some(space.clone()));
 
     close_space_window(cx, first, view);
-    settle(cx);
+    backing.settle();
     assert!(
         space_exists(&core, &space),
         "a conversation still on screen is not abandoned"
@@ -17619,7 +17536,6 @@ fn closing_one_of_two_windows_disposes_of_nothing(cx: &mut TestAppContext) {
     wait_until(cx, "the last close disposes of it", |_| {
         !space_exists(&core, &space)
     });
-    drain_runtime(&core);
 }
 
 /// **A save still on its way to the database holds off the disposal.**
@@ -17640,7 +17556,7 @@ fn closing_one_of_two_windows_disposes_of_nothing(cx: &mut TestAppContext) {
 /// question, the store's refusal.
 #[gpui::test]
 fn a_save_still_in_flight_holds_off_the_disposal(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _seeded) = participants_scene(cx);
+    let (stores, core, backing, _seeded) = participants_scene(cx);
 
     let (window, view) = open_space(cx, &stores, None);
     let entity = view.read_with(cx, |v, _| v.space().clone());
@@ -17658,20 +17574,19 @@ fn a_save_still_in_flight_holds_off_the_disposal(cx: &mut TestAppContext) {
     drop(entity);
 
     close_space_window(cx, window, view);
-    settle(cx);
+    backing.settle();
     assert!(
         space_exists(&core, &space),
         "the space a write is still travelling to is kept, whatever else it \
          does or does not contain"
     );
-    drain_runtime(&core);
 }
 
 /// The mirror: with nothing outstanding, the same close disposes of the same
 /// untouched space — so the guard above is a guard and not a disabling.
 #[gpui::test]
 fn a_settled_space_is_still_disposed_of_at_the_same_close(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _seeded) = participants_scene(cx);
+    let (stores, core, _backing, _seeded) = participants_scene(cx);
 
     let (window, view) = open_space(cx, &stores, None);
     let space = view.read_with(cx, |v, cx| v.space().read(cx).id().to_string());
@@ -17683,7 +17598,6 @@ fn a_settled_space_is_still_disposed_of_at_the_same_close(cx: &mut TestAppContex
     wait_until(cx, "the untouched space is disposed of", |_| {
         !space_exists(&core, &space)
     });
-    drain_runtime(&core);
 }
 
 /// **A refusal a reader sees is copy, copy is localized, and a view renders it
@@ -19216,7 +19130,7 @@ fn backends_a_catalog_row_stands_down_while_its_transfer_starts(cx: &mut TestApp
 /// in-flight load can clear them instead of the press.
 #[gpui::test]
 fn space_a_transcript_retry_hands_the_keyboard_back(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space_id) = participants_scene(cx);
+    let (stores, _core, _backing, space_id) = participants_scene(cx);
     let (window, view) = open_space(cx, &stores, Some(space_id));
     cx.run_until_parked();
 
@@ -19316,8 +19230,6 @@ fn space_a_transcript_retry_hands_the_keyboard_back(cx: &mut TestAppContext) {
             .unwrap(),
         "a reader composing beside the strip keeps their caret"
     );
-
-    drain_runtime(&core);
 }
 
 // ---------------------------------------------------------------------------
