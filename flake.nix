@@ -1480,7 +1480,7 @@ with open(path, "wb") as f:
         # reaches both relative to itself, so nothing in the payload spells
         # its own store path and the payload's hash is a function of the
         # bytes it carries and the store paths it references (the shell,
-        # Mesa), never of the build's other inputs.
+        # coreutils' `readlink`, Mesa), never of the build's other inputs.
         #
         # Mesa stays a reference — the one deliberate exception, because
         # the device's GPU stack is pre-trusted. The host's own ICD
@@ -1514,20 +1514,18 @@ with open(path, "wb") as f:
                 # itself and never names $out: $out is input-addressed, so a
                 # launcher that spelled it would move this payload's hash
                 # with every input of the build, a test file included, while
-                # the bytes it launches stayed the same. `cd -P` resolves a
-                # linked directory (a profile's `bin`), and a profile that
-                # links file by file links the siblings too; a lone link to
-                # this one file finds nothing beside it and says so.
+                # the bytes it launches stayed the same. `readlink -f` follows
+                # every link on the way to the launcher's own file, so a
+                # linked directory (a profile's `bin`), a profile that links
+                # file by file and a lone link to this one file all arrive at
+                # the payload's own `bin`. bash cannot follow a linked file
+                # by itself, hence the reference to coreutils.
                 cat > $out/bin/eidola-gui <<'LAUNCHER'
                 #! @shell@ -e
-                src=''${BASH_SOURCE[0]}
-                case "$src" in
-                  */*) dir=''${src%/*} ;;
-                  *) dir=. ;;
-                esac
-                here=$(cd -P -- "''${dir:-/}" && pwd -P)
+                self=$(@readlink@ -f -- "''${BASH_SOURCE[0]}")
+                here=''${self%/*}
                 if [ ! -x "$here/.eidola-gui-wrapped" ]; then
-                  echo "eidola-gui: no .eidola-gui-wrapped beside this launcher in $here; run it from its own bin directory, or link that directory whole" >&2
+                  echo "eidola-gui: no .eidola-gui-wrapped beside this launcher in $here" >&2
                   exit 127
                 fi
                 export VK_ADD_DRIVER_FILES=''${VK_ADD_DRIVER_FILES-'@icds@'}
@@ -1536,6 +1534,7 @@ with open(path, "wb") as f:
                 LAUNCHER
                 substituteInPlace $out/bin/eidola-gui \
                   --replace-fail '@shell@' '${pkgs.runtimeShell}' \
+                  --replace-fail '@readlink@' '${pkgs.coreutils}/bin/readlink' \
                   --replace-fail '@icds@' "''${icds%:}"
                 chmod 555 $out/bin/eidola-gui
                 if grep -rqF "$out" $out/bin; then
