@@ -30,7 +30,7 @@ FROM stagex/user-jq:sx2026.09.0@sha256:e99ba7b4780fe0a17320a7813d19eb30d34d63ba7
 # and scripts/artifact-manifest.sh fails unless that build's digest is this
 # one. Whichever way it arrives, the assemble stage ships only files that
 # match the committed `kernels.manifest.json`.
-FROM ghcr.io/eidola-ai/eidola-engine-kernels@sha256:d45327151d3c585f6e7dd2b170dd03e163ee4447f4c203a3f35b6d67ec00a7d7 AS kernels
+FROM ghcr.io/eidola-ai/eidola-engine-kernels@sha256:abcfb959d446c8e6a172b5cb2fbd2169acca70ead950db2da56c8b75181e412c AS kernels
 
 # ── toolchain ──────────────────────────────────────────────────────────────────
 # rustc and cargo (musl-hosted), the x86_64-linux-gnu cross GCC and binutils
