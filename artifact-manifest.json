@@ -12,8 +12,8 @@
       "type": "nix"
     },
     "eidola-gui-linux-amd64": {
-      "archiveSha256": "sha256:759668e1b90f67886e228be7dbd87f0996ef85ce3787c875aba92ccc94725b81",
-      "narHash": "sha256-x4HxBPrAofXsB85chx7cNZV9h4S2Fs89BaJgF3AJ7jc=",
+      "archiveSha256": "sha256:1d847118371d7af9cb53da2720dff3f91ae800df0fcd04f661629116c02f3419",
+      "narHash": "sha256-RaARqRadTwSKMGjbCHlsdb3i58kEF1tU4G40L/4hTr0=",
       "platform": "linux/amd64",
       "type": "nix"
     },

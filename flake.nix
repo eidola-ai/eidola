@@ -1476,7 +1476,11 @@ with open(path, "wb") as f:
         # convention) so it stays a *sibling* of llama-server in $out/bin.
         # app-core resolves the engine from the running executable, which
         # after exec is the copy, so the sibling rule holds on its own;
-        # EIDOLA_LLAMA_SERVER is set anyway as an explicit pin.
+        # EIDOLA_LLAMA_SERVER is set anyway as an explicit pin. The launcher
+        # reaches both relative to itself, so nothing in the payload spells
+        # its own store path and the payload's hash is a function of the
+        # bytes it carries and the store paths it references (the shell,
+        # coreutils' `readlink`, Mesa), never of the build's other inputs.
         #
         # Mesa stays a reference — the one deliberate exception, because
         # the device's GPU stack is pre-trusted. The host's own ICD
@@ -1499,20 +1503,44 @@ with open(path, "wb") as f:
           if eidolaGuiLinux == null then
             null
           else
-            pkgs.runCommand "eidola-gui-linux-nix"
-              {
-                nativeBuildInputs = [ pkgs.makeWrapper ];
-              }
-              ''
+            pkgs.runCommand "eidola-gui-linux-nix" { } ''
                 mkdir -p $out/bin $out/share/applications
                 cp ${eidolaGuiLinux}/bin/eidola-gui "$out/bin/.eidola-gui-wrapped"
                 chmod u+w "$out/bin/.eidola-gui-wrapped"
                 cp ${llamaServer}/bin/llama-server "$out/bin/llama-server"
                 chmod u+w "$out/bin/llama-server"
                 icds=$(ls ${pkgs.mesa}/share/vulkan/icd.d/*.json | tr '\n' ':')
-                makeWrapper "$out/bin/.eidola-gui-wrapped" $out/bin/eidola-gui \
-                  --set-default VK_ADD_DRIVER_FILES "''${icds%:}" \
-                  --set-default EIDOLA_LLAMA_SERVER "$out/bin/llama-server"
+                # The launcher. It finds the binary and the sidecar beside
+                # itself and never names $out: $out is input-addressed, so a
+                # launcher that spelled it would move this payload's hash
+                # with every input of the build, a test file included, while
+                # the bytes it launches stayed the same. `readlink -f` follows
+                # every link on the way to the launcher's own file, so a
+                # linked directory (a profile's `bin`), a profile that links
+                # file by file and a lone link to this one file all arrive at
+                # the payload's own `bin`. bash cannot follow a linked file
+                # by itself, hence the reference to coreutils.
+                cat > $out/bin/eidola-gui <<'LAUNCHER'
+                #! @shell@ -e
+                self=$(@readlink@ -f -- "''${BASH_SOURCE[0]}")
+                here=''${self%/*}
+                if [ ! -x "$here/.eidola-gui-wrapped" ]; then
+                  echo "eidola-gui: no .eidola-gui-wrapped beside this launcher in $here" >&2
+                  exit 127
+                fi
+                export VK_ADD_DRIVER_FILES=''${VK_ADD_DRIVER_FILES-'@icds@'}
+                export EIDOLA_LLAMA_SERVER=''${EIDOLA_LLAMA_SERVER-"$here/llama-server"}
+                exec "$here/.eidola-gui-wrapped" "$@"
+                LAUNCHER
+                substituteInPlace $out/bin/eidola-gui \
+                  --replace-fail '@shell@' '${pkgs.runtimeShell}' \
+                  --replace-fail '@readlink@' '${pkgs.coreutils}/bin/readlink' \
+                  --replace-fail '@icds@' "''${icds%:}"
+                chmod 555 $out/bin/eidola-gui
+                if grep -rqF "$out" $out/bin; then
+                  echo "something in bin/ names the payload's own output path" >&2
+                  exit 1
+                fi
                 # Desktop entry — basename matches the Wayland app_id the
                 # binary sets (lib.rs APP_ID), which is what lets the shell
                 # resolve our windows to this entry. Strip the comment header
