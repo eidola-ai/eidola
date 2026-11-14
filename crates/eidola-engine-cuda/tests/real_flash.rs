@@ -150,6 +150,7 @@ fn step(
         token_ids: tokens.to_vec(),
         positions,
         return_logits: false,
+        aux: Default::default(),
     }
 }
 
