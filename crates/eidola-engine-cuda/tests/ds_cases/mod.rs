@@ -217,6 +217,11 @@ impl Case {
             .unwrap_or_else(|| panic!("no count {name}"))
     }
 
+    /// The count `name`, or 0 for a case that has none.
+    pub fn u_or_zero(&self, name: &str) -> u32 {
+        self.n.get(name).copied().unwrap_or(0)
+    }
+
     pub fn has(&self, name: &str) -> bool {
         self.inputs.contains_key(name)
     }

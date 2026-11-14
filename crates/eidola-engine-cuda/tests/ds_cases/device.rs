@@ -166,7 +166,11 @@ impl<'a> Prepared<'a> {
             c.kernel
         );
         assert!(!how.in_place || IN_PLACE_KERNELS.contains(&c.kernel));
-        let rows = if how.row.is_some() { 1 } else { u("rows") };
+        let rows = if how.row.is_some() {
+            1
+        } else {
+            c.u_or_zero("rows")
+        };
         // The address of array `name`, advanced `per_row` elements a row; 0
         // when the case has no such array.
         let at = |name: &str, per_row: u32| {
