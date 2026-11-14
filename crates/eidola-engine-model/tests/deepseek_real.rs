@@ -235,14 +235,32 @@ fn truncated_real_checkpoint_matches_the_reference() {
     );
     failures.extend((d.top1_rate() < 0.999 || d.kl_mean >= 1e-3).then(|| format!("drafter: {d}")));
 
-    let native = dir.join("golden/reference-native.safetensors");
-    if native.exists() {
-        let native = open(&native);
-        let want = f32s(&native, "prefill.logits");
+    // Every other reference golden present (PyTorch's own arithmetic, real
+    // kernels on a GPU, ...). Reported, not asserted: this truncation
+    // amplifies last-bit differences (see AGENTS.md), so an unpinned reference
+    // agrees with nothing bit-unequal to it, the pinned reference included.
+    let mut others: Vec<PathBuf> = std::fs::read_dir(dir.join("golden"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name().and_then(|f| f.to_str()).is_some_and(|f| {
+                f.starts_with("reference-")
+                    && f.ends_with(".safetensors")
+                    && f != "reference-pinned.safetensors"
+            })
+        })
+        .collect();
+    others.sort();
+    for path in others {
+        let other = open(&path);
+        let want = f32s(&other, "prefill.logits");
         let a = compare_logits(&want, &logits, v).unwrap();
-        println!("reference with PyTorch's own arithmetic and top-k (measurement only): {a}");
+        println!(
+            "{} (measurement only): {a}",
+            path.file_stem().unwrap().to_string_lossy()
+        );
         for (l, tap) in taps.iter().enumerate() {
-            let want = f32s(&native, &format!("prefill.layer.{l}"));
+            let want = f32s(&other, &format!("prefill.layer.{l}"));
             let (mut err, mut norm) = (0.0f64, 0.0f64);
             for (a, b) in tap.iter().zip(&want) {
                 err += ((a - b) as f64).powi(2);
@@ -253,9 +271,6 @@ fn truncated_real_checkpoint_matches_the_reference() {
                 (err / norm).sqrt()
             );
         }
-        // Reported, not asserted: this truncation amplifies last-bit
-        // differences (see AGENTS.md), so an unpinned reference agrees with
-        // nothing bit-unequal to it, the pinned reference included.
     }
     assert!(
         failures.is_empty(),
