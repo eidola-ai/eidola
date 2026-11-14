@@ -131,7 +131,7 @@
     },
     {
       "path": "csrc/ds_body.cuh",
-      "sha256": "fb097a862db899d31469d608e245d6ea442427bcc9562ecc21a0ace360a5b77e"
+      "sha256": "df9b15f2203f436abd24979f4649fc8e9f63f880b97e4b06397444a4e06a5a26"
     },
     {
       "path": "csrc/ds_head.cu",
@@ -478,8 +478,8 @@
       "source": "csrc/ds_attention.cu",
       "profile": "exact",
       "file": "cubin/ds_attention.sm_100a.cubin",
-      "sha256": "cd2af728f331dd3eb3bc41de0c29e9a8be71231a625fb60d5c6c77f063d90707",
-      "size": 54336,
+      "sha256": "da5c6776e833307529a3302de807a1fb653ae388f2f78c5c705375b9b24af876",
+      "size": 56144,
       "entries": [
         {
           "symbol": "eidola_ds_attn",
@@ -510,8 +510,8 @@
       "source": "csrc/ds_attention.cu",
       "profile": "exact",
       "file": "cubin/ds_attention.sm_100f.cubin",
-      "sha256": "32a7e84bfd74696ac525b66ee4fb3f309df0a1e43bd0beae90fa5519ee907a1e",
-      "size": 54336,
+      "sha256": "ab00d85a29d19800a8445180b8079c60b10c94e37129564a6a4ff7cf7c0daec1",
+      "size": 56144,
       "entries": [
         {
           "symbol": "eidola_ds_attn",
@@ -542,8 +542,8 @@
       "source": "csrc/ds_attention.cu",
       "profile": "exact",
       "file": "cubin/ds_attention.sm_103a.cubin",
-      "sha256": "239e6c4efed01e27ec918631fa770ae03f3d05cc2e11845551964ab5a1eeaedb",
-      "size": 62168,
+      "sha256": "38516ea001130e1115ef8a26b4e9c644bf83372f536b82a54d50223b88ef0cae",
+      "size": 64104,
       "entries": [
         {
           "symbol": "eidola_ds_attn",
@@ -652,8 +652,8 @@
       "source": "csrc/ds_index.cu",
       "profile": "exact",
       "file": "cubin/ds_index.sm_100a.cubin",
-      "sha256": "d0590495ecd0f328a9dea8ace762b441df45a28e1dacbd6a0ef81c385a658b2f",
-      "size": 99064,
+      "sha256": "a488ac0b6686dd79fbf93bab343d9ceaacd4d1b3fbbe233ed287c37705c60381",
+      "size": 107232,
       "entries": [
         {
           "symbol": "eidola_ds_index_score",
@@ -674,7 +674,7 @@
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 184,
+        "ptx_rounded": 217,
         "sass_fma": 0
       }
     },
@@ -684,8 +684,8 @@
       "source": "csrc/ds_index.cu",
       "profile": "exact",
       "file": "cubin/ds_index.sm_100f.cubin",
-      "sha256": "5a64d1bcb9e7b18358e91bfab26d7443553fd6cace43faa17022b8829eb99ea5",
-      "size": 99064,
+      "sha256": "59c36712a1b27343e7950119c87d3d92aee110a890e0546eec786da8bba05eba",
+      "size": 107232,
       "entries": [
         {
           "symbol": "eidola_ds_index_score",
@@ -706,7 +706,7 @@
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 184,
+        "ptx_rounded": 217,
         "sass_fma": 0
       }
     },
@@ -716,8 +716,8 @@
       "source": "csrc/ds_index.cu",
       "profile": "exact",
       "file": "cubin/ds_index.sm_103a.cubin",
-      "sha256": "718e7742a4a621dd9d4fa861260a81b2e92ea0052709660af43bf8334307b0b0",
-      "size": 99064,
+      "sha256": "32a672580c179f0301cf3161bec5b9a1ef9d3a97c6fc8c13ddb6835bebbd4ab9",
+      "size": 107232,
       "entries": [
         {
           "symbol": "eidola_ds_index_score",
@@ -738,7 +738,7 @@
       "float_ops": {
         "ptx_fma": 0,
         "ptx_unrounded": 0,
-        "ptx_rounded": 184,
+        "ptx_rounded": 217,
         "sass_fma": 0
       }
     },
@@ -2397,8 +2397,8 @@
     {
       "name": "ds_attention",
       "file": "fatbin/ds_attention.fatbin",
-      "sha256": "dc3a5913d168a0577f31a55cb14753f42589e21a76585b8de20b8ac188ab0db9",
-      "size": 116736,
+      "sha256": "075d13c0016d0f2d19bbe25353643b8b7ff12afe5635d450d53f7c22c66589c9",
+      "size": 120480,
       "archs": [
         "sm_100a",
         "sm_103a"
@@ -2417,8 +2417,8 @@
     {
       "name": "ds_index",
       "file": "fatbin/ds_index.fatbin",
-      "sha256": "0caf026ae2cfdd6a191c2cbb0add886ad16cdc19f42d760d607b18394392b278",
-      "size": 198360,
+      "sha256": "ce0bd1cf077b7341ebdadeeefc29e4ca48dfa07bddeeff216846fbfd80b2e047",
+      "size": 214696,
       "archs": [
         "sm_100a",
         "sm_103a"

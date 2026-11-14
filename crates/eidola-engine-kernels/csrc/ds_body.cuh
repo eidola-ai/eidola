@@ -51,14 +51,24 @@ inline void status_or(uint32_t* status, uint32_t bits) { *status |= bits; }
 inline void count_add(uint32_t* counter, uint32_t n) { *counter += n; }
 #endif
 
+// `ds_kv_code_bytes` and `ds_kv_scale_bytes` for device code: the header's are host `constexpr`
+// functions, and a device call of one compiles, without a diagnostic, to a trap that takes the
+// code after it with it.
+DS_FN uint32_t kv_code_bytes(uint32_t format, uint32_t width) {
+  return format == DS_KV_FP8 ? width : width / 2;
+}
+DS_FN uint32_t kv_scale_bytes(uint32_t format, uint32_t width) {
+  return format == DS_KV_FP4_E4M3 ? width / 16 : width / 32;
+}
+
 // Where entry `e` of a plane keeps its codes and its scales.
 DS_FN void kv_entry(const DsKvPlane& plane, uint32_t e, const uint8_t** codes,
                     const uint8_t** scales) {
   const uint32_t block = e / plane.entries_per_block;
   const uint64_t o = e % plane.entries_per_block;
   const uint8_t* at = plane.base + static_cast<uint64_t>(block) * plane.block_bytes;
-  *codes = at + plane.codes_offset + o * ds_kv_code_bytes(plane.format, plane.width);
-  *scales = at + plane.scales_offset + o * ds_kv_scale_bytes(plane.format, plane.width);
+  *codes = at + plane.codes_offset + o * kv_code_bytes(plane.format, plane.width);
+  *scales = at + plane.scales_offset + o * kv_scale_bytes(plane.format, plane.width);
 }
 
 // Element `d` of a packed entry, as the value the reference keeps

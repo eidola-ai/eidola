@@ -31,3 +31,26 @@ fn images_hold_their_entries_and_fuse_nothing() {
         assert!(attention.float_ops.as_ref().unwrap().sass_fma > 0, "{arch}");
     }
 }
+
+/// `ds_abi.cuh`'s `constexpr` helpers are host functions. A device call of one compiles without
+/// a diagnostic under the `exact` profile and becomes a trap, which removes the code after it
+/// (the stores behind a plane's address were dropped that way: on a device, zero scores and an
+/// illegal address; on a host, nothing). Device sources use their own (`ds::kv_code_bytes`).
+#[test]
+fn device_sources_call_no_host_constexpr_helper() {
+    let csrc = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("csrc");
+    for entry in std::fs::read_dir(&csrc).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name == "ds_abi.cuh" || !(name.ends_with(".cu") || name.ends_with(".cuh")) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        for helper in ["ds_kv_code_bytes(", "ds_kv_scale_bytes(", "ds_mix_words("] {
+            let called = text
+                .lines()
+                .any(|l| l.contains(helper) && !l.trim_start().starts_with("//"));
+            assert!(!called, "{name} calls the host function {helper}…)");
+        }
+    }
+}
