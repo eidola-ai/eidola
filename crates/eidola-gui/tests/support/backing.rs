@@ -1,9 +1,11 @@
 //! The drain barrier every backed test binds, shared by the test crates that
-//! build stores over a real `AppCore` (`tests/stores.rs`, `tests/behavior.rs`).
+//! run over a real `AppCore` (`tests/stores.rs`, `tests/behavior.rs`,
+//! `tests/probe.rs`, `tests/ipc.rs`, `tests/proxy.rs`).
 
 use std::sync::Arc;
 
 use eidola_app_core::AppCore;
+use gpui::TestAppContext;
 
 /// The keepalive every backed test binds, and the **drain barrier** at its
 /// teardown.
@@ -14,17 +16,27 @@ use eidola_app_core::AppCore;
 /// the *last* owner and drops the tokio runtime from within its own worker →
 /// "Cannot drop a runtime in a context where blocking is not allowed". Waiting
 /// for the runtime to go idle first guarantees the last `Arc` always drops on
-/// the test thread — the same barrier
-/// `record_refresh_supersedes_in_flight_fetch` (`tests/behavior.rs`) takes
-/// inline, here as a guard so every test that binds one gets it without a line
-/// of its own, on the unwinding path as on the passing one.
+/// the test thread. It is a guard so every test that binds one gets it without
+/// a line of its own, on the unwinding path as on the passing one.
 ///
-/// **Bounded, unlike the record test's.** These tasks include network-connect
-/// paths, so "the count reaches zero" is not as obviously bounded as a local-DB
-/// read; the unreachable base URL fails fast, and a wait that outlives the
-/// deadline is reported rather than hung on. The report is skipped while the
-/// thread is already panicking — a panic in `Drop` during unwinding aborts the
-/// process and would bury the assertion that actually failed.
+/// **Idle means the app too, when there is one.** `#[gpui::test]` runs the
+/// executor until parked once more *after* the test body returns, so a
+/// continuation still queued when the body ends — a bridge result that landed
+/// but was never polled, a press whose task was never run — would issue its
+/// core call after a runtime-only barrier had already passed, onto a runtime
+/// nothing waits for any more. A guard built with [`Backing::with_app`] runs
+/// the app until parked between its checks and stops only once two passes in a
+/// row found the runtime idle, so nothing is left for that last pass to start.
+/// The app is not run while the thread is already unwinding: the body failed,
+/// the macro's own teardown is skipped too, and running more of the app inside
+/// a panic risks a second one.
+///
+/// **Bounded.** These tasks include network-connect paths, so "the count
+/// reaches zero" is not as obviously bounded as a local-DB read; the
+/// unreachable base URL fails fast, and a wait that outlives the deadline is
+/// reported rather than hung on. The report is skipped while the thread is
+/// already panicking — a panic in `Drop` during unwinding aborts the process
+/// and would bury the assertion that actually failed.
 ///
 /// **And giving up on the wait leaks the core rather than releasing it.**
 /// Timing out is precisely the case where a task may still own an
@@ -54,6 +66,9 @@ pub struct Backing {
     /// minute — the only way this class is testable at all, since the hazard it
     /// prevents is a race nothing can schedule.
     pub drain_timeout: std::time::Duration,
+    /// The test's app, run until parked between the barrier's checks — see
+    /// [`Backing::with_app`]. `None` for a core no gpui app calls into.
+    pub app: Option<TestAppContext>,
 }
 
 /// How long teardown waits for the bridge tasks to drain. Generous: the tasks
@@ -64,14 +79,28 @@ pub const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 // Each test crate that includes this module uses a different subset of it.
 #[allow(dead_code)]
 impl Backing {
-    /// The guard over `core` with the standard deadline, keeping `dir` (the
-    /// core's profile) alive until the runtime has drained.
+    /// The guard over a core that no gpui app calls into, with the standard
+    /// deadline, keeping `dir` (the core's profile) alive until the runtime
+    /// has drained.
     pub fn new(core: Arc<AppCore>, dir: tempfile::TempDir) -> Self {
         Self {
             core,
             _dir: dir,
             ownerless: 0,
             drain_timeout: DRAIN_TIMEOUT,
+            app: None,
+        }
+    }
+
+    /// The guard over a core whose stores live in `cx`'s app: the barrier
+    /// settles the app together with the runtime.
+    pub fn with_app(core: Arc<AppCore>, dir: tempfile::TempDir, cx: &TestAppContext) -> Self {
+        Self {
+            core,
+            _dir: dir,
+            ownerless: 0,
+            drain_timeout: DRAIN_TIMEOUT,
+            app: Some(cx.clone()),
         }
     }
 
@@ -86,44 +115,77 @@ impl Backing {
     pub fn excuse_ownerless_tasks(&mut self, n: usize) {
         self.ownerless += n;
     }
+
+    /// Wait until everything the test has started has finished: the app has
+    /// nothing left to run and the runtime is idle, with neither waking the
+    /// other again. The positive half of a negative assertion — once this
+    /// returns, a write that was going to happen has happened, so "it did not"
+    /// is a fact rather than a matter of how long the test waited. Bounded by
+    /// the guard's deadline.
+    pub fn settle(&self) {
+        assert!(
+            self.quiesce(true),
+            "the app and the runtime did not settle within {:?}",
+            self.drain_timeout
+        );
+    }
+
+    /// Run the app (when `run_app`) and watch the runtime until both are idle
+    /// twice in a row; `false` if the deadline passed first.
+    fn quiesce(&self, run_app: bool) -> bool {
+        let app = self.app.as_ref().filter(|_| run_app);
+        let deadline = std::time::Instant::now() + self.drain_timeout;
+        let mut idle_before = false;
+        loop {
+            if let Some(app) = app {
+                app.run_until_parked();
+            }
+            let idle = self.core.runtime().metrics().num_alive_tasks() <= self.ownerless;
+            // A task that finished may have woken a continuation, which the
+            // next pass runs — and which may start another task. Only a pass
+            // that ran the app over an idle runtime and left it idle proves
+            // nothing more is coming.
+            if idle && (idle_before || app.is_none()) {
+                return true;
+            }
+            idle_before = idle;
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+    }
 }
 
 impl Drop for Backing {
     fn drop(&mut self) {
-        let deadline = std::time::Instant::now() + self.drain_timeout;
-        while self.core.runtime().metrics().num_alive_tasks() > self.ownerless {
-            if std::time::Instant::now() >= deadline {
-                // **The invariant, restored the only way still available: if
-                // this guard could not prove the runtime idle, nothing may
-                // ever drop it.**
-                //
-                // Giving up on the wait used to hand the hazard straight back
-                // — this guard's `Arc` drops, `Stores` drops at `cx` teardown,
-                // and the still-running task becomes the last owner and drops
-                // the runtime from inside its own worker. On the unwinding
-                // path that is a second panic during an unwind, which aborts
-                // the process and takes the assertion failure that actually
-                // matters with it (Codex review, PR #327).
-                //
-                // So leak one owner. The strong count can no longer reach
-                // zero, the runtime is never dropped, and the class of panic
-                // this guard exists to prevent is unreachable rather than
-                // merely unlikely. The cost is one abandoned runtime and its
-                // threads for the rest of the process — paid only on a path
-                // where a test has already failed or is about to, and the
-                // alternative is losing the reason it failed.
-                std::mem::forget(self.core.clone());
-                if !std::thread::panicking() {
-                    panic!(
-                        "bridge tasks did not drain within {:?} — the runtime has \
-                         been leaked so the wait's failure is what you see, rather than a \
-                         worker dropping it out from under this thread",
-                        self.drain_timeout
-                    );
-                }
-                return;
-            }
-            std::thread::yield_now();
+        if self.quiesce(!std::thread::panicking()) {
+            return;
+        }
+        // **The invariant, restored the only way still available: if this
+        // guard could not prove the runtime idle, nothing may ever drop it.**
+        //
+        // Giving up on the wait and releasing this guard's `Arc` would hand the
+        // hazard straight back — `Stores` drops at `cx` teardown, and the
+        // still-running task becomes the last owner and drops the runtime from
+        // inside its own worker. On the unwinding path that is a second panic
+        // during an unwind, which aborts the process and takes the assertion
+        // failure that actually matters with it (Codex review, PR #327).
+        //
+        // So leak one owner. The strong count can no longer reach zero, the
+        // runtime is never dropped, and the class of panic this guard exists to
+        // prevent is unreachable rather than merely unlikely. The cost is one
+        // abandoned runtime and its threads for the rest of the process — paid
+        // only on a path where a test has already failed or is about to, and
+        // the alternative is losing the reason it failed.
+        std::mem::forget(self.core.clone());
+        if !std::thread::panicking() {
+            panic!(
+                "bridge tasks did not drain within {:?} — the runtime has \
+                 been leaked so the wait's failure is what you see, rather than a \
+                 worker dropping it out from under this thread",
+                self.drain_timeout
+            );
         }
     }
 }

@@ -2270,7 +2270,10 @@ pub(crate) mod tests {
     #[test]
     fn generated_keys_sit_exactly_on_the_calendar() {
         let master_key = [7u8; 32];
-        let n = current_epoch();
+        // One reading of the clock: the epoch and the instant it must cover
+        // are the same moment, whichever side of a boundary the test runs on.
+        let now = SystemTime::now();
+        let n = epoch_at(now).unwrap();
         for epoch in [n, n + 1] {
             let row = generate_key(&master_key, epoch).unwrap();
             let secs = |t: SystemTime| t.duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -2286,7 +2289,6 @@ pub(crate) mod tests {
                 Some(epoch)
             );
         }
-        let now = SystemTime::now();
         let (from, until, _) = epoch_instants(n).unwrap();
         assert!(from <= now && now < until, "the current epoch covers now");
         // Sub-second instants are never on the calendar.

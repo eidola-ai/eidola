@@ -35,8 +35,32 @@ use std::sync::Arc;
 /// Run an async test body on a dedicated OS thread — `AppCore` owns its own
 /// tokio runtime and dropping it while another is active on the same thread
 /// panics. Mirrors `tests/chat_path.rs`.
+///
+/// Held under a shared [`DEADLINES`] guard: the proxy's deadline seams are
+/// process-wide, so a test that shortens one ([`run_with_short_deadlines`])
+/// runs while no other test does.
 fn run<F: FnOnce() + Send + 'static>(f: F) {
+    let _shared = DEADLINES.read().unwrap_or_else(|e| e.into_inner());
     std::thread::spawn(f).join().unwrap();
+}
+
+/// The proxy's deadline seams (`http::set_header_read_timeout_for_test`,
+/// `http::set_body_read_timeout_for_test`,
+/// `route::set_model_list_timeout_for_test`) move one process-wide value. A
+/// test that shortens one holds this exclusively, so the shortened deadline
+/// never meets another test's connection, and a deadline restored by one test
+/// never lands in the middle of another's.
+static DEADLINES: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// [`run`], alone in the process, for a test that shortens a deadline seam.
+/// Every seam is back at its default afterwards, the test's panic included.
+fn run_with_short_deadlines<F: FnOnce() + Send + 'static>(f: F) {
+    let _alone = DEADLINES.write().unwrap_or_else(|e| e.into_inner());
+    let outcome = std::thread::spawn(f).join();
+    http::set_header_read_timeout_for_test(0);
+    http::set_body_read_timeout_for_test(0);
+    eidola_app_core::proxy::route::set_model_list_timeout_for_test(0);
+    outcome.unwrap();
 }
 
 /// One HTTP exchange over an in-memory duplex.
@@ -1606,7 +1630,7 @@ fn a_latch_thrown_while_the_body_uploads_starts_no_work() {
 /// caller in.
 #[test]
 fn a_connection_that_says_nothing_is_reaped() {
-    run(|| {
+    run_with_short_deadlines(|| {
         let (_mock, core, _dir) = core_for(MockConfig::default());
         let core = Arc::new(core);
         let runtime = core.runtime();
@@ -2092,7 +2116,7 @@ fn a_proxied_completion_carries_no_user_agent() {
 /// forever — so they are asked at once, each with its own deadline.
 #[test]
 fn a_backend_that_never_answers_does_not_take_the_listing_with_it() {
-    run(|| {
+    run_with_short_deadlines(|| {
         // A listener that accepts and then says nothing, for ever.
         let wedged = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let wedged_port = wedged.local_addr().expect("addr").port();
@@ -2166,7 +2190,7 @@ fn a_backend_that_never_answers_does_not_take_the_listing_with_it() {
 /// being made.
 #[test]
 fn a_backend_that_stalls_on_pricing_does_not_hold_the_completion() {
-    run(|| {
+    run_with_short_deadlines(|| {
         // A listener that accepts and then says nothing, for ever.
         let wedged = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let wedged_port = wedged.local_addr().expect("addr").port();
@@ -2335,7 +2359,7 @@ fn a_proxied_completion_does_not_follow_a_redirect() {
 /// started nothing — every slot, given a key and a loop.
 #[test]
 fn a_body_that_stops_arriving_ends_the_request() {
-    run(|| {
+    run_with_short_deadlines(|| {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (_mock, core, _dir) = core_for(MockConfig::default());

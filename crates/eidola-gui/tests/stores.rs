@@ -59,7 +59,8 @@ fn backed_stores(cx: &mut TestAppContext) -> (Stores, Backing) {
     cx.executor().allow_parking();
     let (core, dir) = test_core();
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
-    (stores, Backing::new(core, dir))
+    let backing = Backing::with_app(core, dir, cx);
+    (stores, backing)
 }
 
 /// The wave-2 launch-order bug: the first window's model list never loaded
@@ -1192,11 +1193,12 @@ fn a_superseded_rename_leaves_no_optimism_behind(cx: &mut TestAppContext) {
 /// **The assertion has to be a stability one.** A batch's optimistic edits agree
 /// with the database the moment its writes commit, so comparing once passes long
 /// before the resolution lands — the defect is precisely a *later* read putting
-/// something staler on screen. So the comparison is held for a while after it
-/// first holds, and any drift fails.
+/// something staler on screen. So the comparison is taken again once everything
+/// the batch started has settled — the resolution included — and any drift
+/// fails.
 #[gpui::test]
 fn a_batch_of_renames_lands_on_a_listing_read_after_all_of_them(cx: &mut TestAppContext) {
-    let (stores, _backing) = backed_stores(cx);
+    let (stores, backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let a = core
         .runtime()
@@ -1250,13 +1252,11 @@ fn a_batch_of_renames_lands_on_a_listing_read_after_all_of_them(cx: &mut TestApp
             agrees(cx).is_ok()
         });
         // …and stays there. A resolution taken from a snapshot older than the
-        // batch's last write lands after this point and would drift back.
-        for _ in 0..40 {
-            cx.run_until_parked();
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            if let Err(drift) = agrees(cx) {
-                panic!("the index drifted after the batch settled: {drift}");
-            }
+        // batch's last write lands after this point and would drift back, and
+        // once the app and the runtime have settled it has landed.
+        backing.settle();
+        if let Err(drift) = agrees(cx) {
+            panic!("the index drifted after the batch settled: {drift}");
         }
     }
 }
@@ -2263,7 +2263,7 @@ fn a_first_post_into_a_brand_new_space_waits_out_its_insert(cx: &mut TestAppCont
 /// out to name.
 #[gpui::test]
 fn a_post_into_a_space_that_was_never_created_is_refused(cx: &mut TestAppContext) {
-    let (stores, _backing) = backed_stores(cx);
+    let (stores, backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let space = stores.spaces.update(cx, |s, cx| s.create(cx));
@@ -2297,13 +2297,9 @@ fn a_post_into_a_space_that_was_never_created_is_refused(cx: &mut TestAppContext
         )),
         "the draft is still accepted — the refusal is reported, not guessed at"
     );
-    for _ in 0..40 {
-        cx.run_until_parked();
-        if !space.read_with(cx, |s, _| s.is_busy()) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    // Everything the save started has finished — so a save still busy now is
+    // one waiting on something that will never come.
+    backing.settle();
     assert!(
         !space.read_with(cx, |s, _| s.is_busy()),
         "the save settles instead of waiting on a creation that already failed"
@@ -2594,7 +2590,7 @@ fn a_window_closed_over_its_own_insert_still_leaves_nothing_behind(cx: &mut Test
 /// reopening in one pass is what means the disposal's task has not.
 #[gpui::test]
 fn a_reopen_before_the_verdict_cancels_the_disposal(cx: &mut TestAppContext) {
-    let (stores, _backing) = backed_stores(cx);
+    let (stores, backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let entity = stores.spaces.update(cx, |s, cx| s.create(cx));
@@ -2627,7 +2623,7 @@ fn a_reopen_before_the_verdict_cancels_the_disposal(cx: &mut TestAppContext) {
         "and it has answered nothing, so no composer stands over it"
     );
 
-    settle(cx);
+    backing.settle();
     assert!(
         space_row_exists(&core, &space_id),
         "the conversation someone reopened is not an abandoned one"
@@ -2666,7 +2662,7 @@ fn a_reopen_before_the_verdict_cancels_the_disposal(cx: &mut TestAppContext) {
 fn a_window_waiting_on_a_verdict_never_writes_and_then_reports_it(cx: &mut TestAppContext) {
     use eidola_gui::space::Space;
 
-    let (stores, _backing) = backed_stores(cx);
+    let (stores, backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space_id = core
         .runtime()
@@ -2687,7 +2683,7 @@ fn a_window_waiting_on_a_verdict_never_writes_and_then_reports_it(cx: &mut TestA
     assert!(space.update(cx, |s, cx| {
         s.submit("The tide is the moon's doing.".into(), None, Vec::new(), cx)
     }));
-    settle(cx);
+    backing.settle();
     assert_eq!(
         core.runtime()
             .block_on(core.get_space_messages(space_id.clone()))
@@ -2713,7 +2709,7 @@ fn a_window_waiting_on_a_verdict_never_writes_and_then_reports_it(cx: &mut TestA
             cx,
         )
     });
-    settle(cx);
+    backing.settle();
 
     assert!(
         !space.read_with(cx, |s, _| s.row_undecided_for_test()),
@@ -2737,15 +2733,6 @@ fn a_window_waiting_on_a_verdict_never_writes_and_then_reports_it(cx: &mut TestA
     );
 }
 
-/// Give work that is *not* supposed to happen a real chance to happen.
-fn settle(cx: &mut TestAppContext) {
-    for _ in 0..8 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
-}
-
 /// **A write already on its way to the database outranks the disposal.**
 ///
 /// `bridge` cancels nothing core-side, so a save started a moment before the
@@ -2760,7 +2747,7 @@ fn settle(cx: &mut TestAppContext) {
 /// `a_save_still_in_flight_holds_off_the_disposal`.)
 #[gpui::test]
 fn the_store_never_disposes_over_an_outstanding_write(cx: &mut TestAppContext) {
-    let (stores, _backing) = backed_stores(cx);
+    let (stores, backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let entity = stores.spaces.update(cx, |s, cx| s.create(cx));
@@ -2773,7 +2760,7 @@ fn the_store_never_disposes_over_an_outstanding_write(cx: &mut TestAppContext) {
     stores
         .spaces
         .update(cx, |s, cx| s.window_closed(space_id.clone(), true, cx));
-    settle(cx);
+    backing.settle();
 
     assert!(
         space_row_exists(&core, &space_id),
@@ -2808,7 +2795,7 @@ fn the_store_never_disposes_over_an_outstanding_write(cx: &mut TestAppContext) {
 fn a_refused_creation_after_an_early_send_says_so_instead_of_spinning(cx: &mut TestAppContext) {
     use eidola_gui::loadable::Loadable;
 
-    let (stores, _backing) = backed_stores(cx);
+    let (stores, backing) = backed_stores(cx);
 
     let space = stores.spaces.update(cx, |s, cx| s.create(cx));
     let space_id = space.read_with(cx, |s, _| s.id().to_string());
@@ -2825,7 +2812,7 @@ fn a_refused_creation_after_an_early_send_says_so_instead_of_spinning(cx: &mut T
             cx,
         )
     });
-    settle(cx);
+    backing.settle();
 
     let cell = space.read_with(cx, |s, _| match s.transcript() {
         Loadable::Failed { error, .. } => format!("failed: {error}"),
@@ -2864,7 +2851,7 @@ fn a_refused_creation_after_an_early_send_says_so_instead_of_spinning(cx: &mut T
 fn a_failed_initial_transcript_load_can_be_retried(cx: &mut TestAppContext) {
     use eidola_gui::loadable::Loadable;
 
-    let (stores, _backing) = backed_stores(cx);
+    let (stores, backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space_id = eidola_app_core::new_space_id();
 
@@ -2883,7 +2870,7 @@ fn a_failed_initial_transcript_load_can_be_retried(cx: &mut TestAppContext) {
     // Retry, still with no row behind the id: the error stands, and the cell
     // is settled rather than left spinning.
     space.update(cx, |s, cx| s.retry_transcript_load(cx));
-    settle(cx);
+    backing.settle();
     let failure = space.read_with(cx, |s, _| {
         s.transcript_load_failure().map(|e| e.to_string())
     });
@@ -2932,14 +2919,14 @@ fn a_failed_initial_transcript_load_can_be_retried(cx: &mut TestAppContext) {
 fn a_failed_transcript_refresh_keeps_its_posts_and_can_be_retried(cx: &mut TestAppContext) {
     use eidola_gui::loadable::Loadable;
 
-    let (stores, _backing) = backed_stores(cx);
+    let (stores, backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space_id = eidola_app_core::new_space_id();
 
     let space = stores
         .spaces
         .update(cx, |s, cx| s.open(space_id.clone(), cx));
-    settle(cx);
+    backing.settle();
 
     // Posts on screen, and then a refresh over them that failed.
     space.update(cx, |s, cx| {
@@ -2977,7 +2964,7 @@ fn a_failed_transcript_refresh_keeps_its_posts_and_can_be_retried(cx: &mut TestA
         !space.read_with(cx, |s, _| matches!(s.transcript(), Loadable::Loading)),
         "`Failed {{ prior: Some }}` must go stale, never blank to Loading"
     );
-    settle(cx);
+    backing.settle();
     assert!(
         space.read_with(cx, |s, _| s.transcript_refresh_failure().is_some()),
         "a retry that failed again keeps saying so"
@@ -2996,7 +2983,7 @@ fn a_failed_transcript_refresh_keeps_its_posts_and_can_be_retried(cx: &mut TestA
     wait_until(cx, "the retried refresh answers", |cx| {
         space.read_with(cx, |s, _| s.transcript_refresh_failure().is_none())
     });
-    settle(cx);
+    backing.settle();
     assert!(
         space.read_with(cx, |s, _| s.transcript_refresh_failure().is_none()
             && matches!(s.transcript(), Loadable::Loaded { .. })),
@@ -3160,6 +3147,7 @@ fn a_drain_that_times_out_never_lets_go_of_the_runtime(cx: &mut TestAppContext) 
         _dir: dir,
         ownerless: 0,
         drain_timeout: std::time::Duration::from_millis(200),
+        app: None,
     };
     let complained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(backing)));
     assert!(
