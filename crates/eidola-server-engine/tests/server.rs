@@ -1210,14 +1210,31 @@ async fn reading_bodies_is_bounded_before_admission() {
     use std::io::Write;
     let node = TestNode::start(&[(env::MAX_REQUESTS, "1")]).await;
     let addr = node.base.strip_prefix("http://").unwrap();
-    let mut stalled = std::net::TcpStream::connect(addr).unwrap();
-    let head = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nhost: {addr}\r\nauthorization: Bearer {TOKEN}\r\n\
-         x-eidola-weights-sha256: {}\r\ncontent-type: application/json\r\n\
-         content-length: 1000000\r\n\r\n{{\"model\":",
-        weights_hash()
-    );
-    stalled.write_all(head.as_bytes()).unwrap();
+    // An upload that sends its head and a few body bytes, then nothing.
+    let stall = || {
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: {addr}\r\nauthorization: Bearer {TOKEN}\r\n\
+             x-eidola-weights-sha256: {}\r\ncontent-type: application/json\r\n\
+             content-length: 1000000\r\n\r\n{{\"model\":",
+            weights_hash()
+        );
+        s.write_all(head.as_bytes()).unwrap();
+        s.set_nonblocking(true).unwrap();
+        s
+    };
+    // Whether the server answered the stalled upload, which it does only when it
+    // refused it: an upload that reached the handler while a probe below held the read
+    // slot is refused at once, and then holds nothing.
+    let answered = |s: &mut std::net::TcpStream| {
+        let mut byte = [0u8; 1];
+        match std::io::Read::read(s, &mut byte) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(e) => panic!("reading the stalled upload: {e}"),
+        }
+    };
+    let mut stalled = stall();
 
     // Once the stalled upload holds the only read slot, a complete request is refused.
     let mut refused = None;
@@ -1226,6 +1243,9 @@ async fn reading_bodies_is_bounded_before_admission() {
         if status == 503 {
             refused = Some(v);
             break;
+        }
+        if answered(&mut stalled) {
+            stalled = stall();
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
