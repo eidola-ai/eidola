@@ -112,14 +112,21 @@ pub fn encode(text: &str, format: Format) -> Vec<u8> {
 /// An existing file's permissions and group carry over to its replacement,
 /// and the temporary file has both before it holds a byte, so a private note
 /// is never readable through its sibling, nor by a group the note was not
-/// shared with. A save that cannot keep the group is refused. A symlink is
-/// written *through* rather than replaced, so a note symlinked into a vault
-/// stays a symlink — even when the file it points at has gone, which the
-/// write then recreates.
+/// shared with. A save that cannot keep the group is refused. Access control
+/// lists are not carried across: a save is refused, before the temporary file
+/// holds a byte, when the note has one or the temporary file was given one
+/// (inherited from its folder), since who could read the replacement would
+/// then be more than its mode bits and group say. A symlink is written
+/// *through* rather than replaced, so a note symlinked into a vault stays a
+/// symlink — even when the file it points at has gone, which the write then
+/// recreates.
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let target = resolve_links(path);
     let existing_meta = fs::metadata(&target).ok();
     let existing = existing_meta.as_ref().map(|meta| meta.permissions());
+    if existing_meta.is_some() {
+        refuse_acl(acl::on_path(&target), AclSource::Note)?;
+    }
     let dir = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -131,6 +138,7 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let (temp, mut file) = create_temp(dir, &name, existing.as_ref())?;
 
     let result = (|| {
+        refuse_acl(acl::on_file(&file), AclSource::Folder)?;
         if let Some(meta) = &existing_meta {
             keep_group(&file, meta)?;
         }
@@ -203,6 +211,188 @@ fn keep_group(temp: &fs::File, target: &fs::Metadata) -> io::Result<()> {
 #[cfg(not(unix))]
 fn keep_group(_temp: &fs::File, _target: &fs::Metadata) -> io::Result<()> {
     Ok(())
+}
+
+/// Where an access control list that refuses a save was found.
+#[derive(Clone, Copy)]
+enum AclSource {
+    /// On the note being replaced.
+    Note,
+    /// On the fresh temporary file, which can only have inherited it from
+    /// the folder.
+    Folder,
+}
+
+/// Turn the answer of an ACL probe into the save's verdict: no list goes
+/// ahead; a list, or a probe that could not answer, refuses.
+fn refuse_acl(found: io::Result<bool>, source: AclSource) -> io::Result<()> {
+    let what = match source {
+        AclSource::Note => "This note has an access control list",
+        AclSource::Folder => "This note's folder gives new files an access control list",
+    };
+    match found {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "{what}, which this editor does not carry across a save, so the save was \
+                 refused rather than change who can read the note."
+            ),
+        )),
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!(
+                "Whether an access control list applies to this note could not be checked, \
+                 so the save was refused: {e}"
+            ),
+        )),
+    }
+}
+
+/// Whether a file carries an access control list beyond its mode bits. Each
+/// answers `Ok(false)` only when the system says there is none, or that the
+/// filesystem cannot hold one; any other failure is an error, never a pass.
+mod acl {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::ffi::CString;
+    use std::fs;
+    use std::io;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::os::unix::{ffi::OsStrExt, io::AsRawFd};
+    use std::path::Path;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn c_path(path: &Path) -> io::Result<CString> {
+        CString::new(path.as_os_str().as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+    }
+
+    // Linux: a POSIX access ACL is the `system.posix_acl_access` xattr, which
+    // the kernel stores only when the list says more than the mode bits do. A
+    // folder's default ACL reaches a new file as exactly that xattr.
+    #[cfg(target_os = "linux")]
+    const ACCESS_ACL: &std::ffi::CStr = c"system.posix_acl_access";
+
+    #[cfg(target_os = "linux")]
+    fn xattr_answer(size: libc::ssize_t) -> io::Result<bool> {
+        if size >= 0 {
+            return Ok(true);
+        }
+        let e = io::Error::last_os_error();
+        // ENODATA: no such xattr. EOPNOTSUPP (the same number as ENOTSUP on
+        // Linux): the filesystem holds no xattrs or no ACLs.
+        match e.raw_os_error() {
+            Some(libc::ENODATA) | Some(libc::EOPNOTSUPP) => Ok(false),
+            _ => Err(e),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn on_path(path: &Path) -> io::Result<bool> {
+        let path = c_path(path)?;
+        // SAFETY: both strings are NUL-terminated and outlive the call; a
+        // null buffer of size 0 asks only for the value's size.
+        let size =
+            unsafe { libc::getxattr(path.as_ptr(), ACCESS_ACL.as_ptr(), std::ptr::null_mut(), 0) };
+        xattr_answer(size)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn on_file(file: &fs::File) -> io::Result<bool> {
+        // SAFETY: the descriptor is open for the call's duration (borrowed
+        // from `file`); the name is NUL-terminated; a null buffer of size 0
+        // asks only for the value's size.
+        let size = unsafe {
+            libc::fgetxattr(
+                file.as_raw_fd(),
+                ACCESS_ACL.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        xattr_answer(size)
+    }
+
+    // macOS: extended ACLs, from <sys/acl.h>, which the `libc` crate does
+    // not bind. A file without one answers NULL with ENOENT.
+    #[cfg(target_os = "macos")]
+    mod sys {
+        use std::ffi::{c_char, c_int, c_void};
+
+        pub const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+        pub const ACL_FIRST_ENTRY: c_int = 0;
+
+        unsafe extern "C" {
+            pub fn acl_get_fd_np(fd: c_int, kind: c_int) -> *mut c_void;
+            pub fn acl_get_file(path: *const c_char, kind: c_int) -> *mut c_void;
+            pub fn acl_get_entry(
+                acl: *mut c_void,
+                entry_id: c_int,
+                entry: *mut *mut c_void,
+            ) -> c_int;
+            pub fn acl_free(obj: *mut c_void) -> c_int;
+        }
+    }
+
+    /// Whether `acl`, as `acl_get_*` returned it, holds at least one entry.
+    /// Takes ownership: the list is freed here.
+    #[cfg(target_os = "macos")]
+    fn acl_answer(acl: *mut std::ffi::c_void) -> io::Result<bool> {
+        if acl.is_null() {
+            let e = io::Error::last_os_error();
+            return match e.raw_os_error() {
+                // ENOENT: no extended ACL. ENOTSUP: the filesystem holds none.
+                Some(libc::ENOENT) | Some(libc::ENOTSUP) => Ok(false),
+                _ => Err(e),
+            };
+        }
+        let mut entry = std::ptr::null_mut();
+        // SAFETY: `acl` is a live list from `acl_get_*` and `entry` a valid
+        // out-pointer; the entry is only counted, never used after the free.
+        let first = unsafe { sys::acl_get_entry(acl, sys::ACL_FIRST_ENTRY, &mut entry) };
+        let answer = if first == 0 {
+            Ok(true)
+        } else {
+            let e = io::Error::last_os_error();
+            // EINVAL: there is no first entry, an empty list.
+            match e.raw_os_error() {
+                Some(libc::EINVAL) => Ok(false),
+                _ => Err(e),
+            }
+        };
+        // SAFETY: `acl` came from `acl_get_*`, is freed once, and is not used
+        // afterwards.
+        unsafe { sys::acl_free(acl) };
+        answer
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn on_path(path: &Path) -> io::Result<bool> {
+        // By path rather than descriptor: a note whose ACL denies its owner
+        // reading cannot be opened to ask.
+        let path = c_path(path)?;
+        // SAFETY: the path is NUL-terminated and outlives the call; the
+        // returned list is owned by `acl_answer`.
+        acl_answer(unsafe { sys::acl_get_file(path.as_ptr(), sys::ACL_TYPE_EXTENDED) })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn on_file(file: &fs::File) -> io::Result<bool> {
+        // SAFETY: the descriptor is open for the call's duration (borrowed
+        // from `file`); the returned list is owned by `acl_answer`.
+        acl_answer(unsafe { sys::acl_get_fd_np(file.as_raw_fd(), sys::ACL_TYPE_EXTENDED) })
+    }
+
+    // Elsewhere nothing is checked, as `keep_group` keeps nothing off Unix.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub fn on_path(_path: &Path) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub fn on_file(_file: &fs::File) -> io::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// The document's name as it appears in a temporary file's: enough to tell
@@ -478,6 +668,114 @@ mod tests {
         write_atomically(&path, b"still secret\n").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// Run an ACL tool on `target`, giving another principal read access:
+    /// `inherited` puts it on a folder for new files to inherit, otherwise on
+    /// the file itself. `Err` says why the system could not, which skips a
+    /// test only on Linux, where `setfacl` or ACL support may be missing; on
+    /// macOS `chmod +a` needs no privileges and always applies.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn grant_read(target: &Path, inherited: bool) -> Result<(), String> {
+        let mut command = if cfg!(target_os = "macos") {
+            let mut c = std::process::Command::new("chmod");
+            let ace = if inherited {
+                "everyone allow read,file_inherit"
+            } else {
+                "everyone allow read"
+            };
+            c.args(["+a", ace]);
+            c
+        } else {
+            let mut c = std::process::Command::new("setfacl");
+            if inherited {
+                c.arg("-d");
+            }
+            c.args(["-m", "u:nobody:r"]);
+            c
+        };
+        let out = command
+            .arg(target)
+            .output()
+            .map_err(|e| format!("{command:?} could not run: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{command:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn acl_applied(result: Result<(), String>) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(why) if cfg!(target_os = "linux") => {
+                eprintln!("skipped: this system cannot set an ACL here ({why})");
+                false
+            }
+            Err(why) => panic!("{why}"),
+        }
+    }
+
+    /// A refused save leaves the note as it was and nothing beside it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_refused(dir: &Path, path: &Path, result: io::Result<()>, because: &str) {
+        let error = result.expect_err("the save is refused");
+        assert!(
+            error.to_string().contains(because),
+            "the refusal says why: {error}"
+        );
+        assert_eq!(
+            fs::read(path).unwrap(),
+            b"secret\n",
+            "the note is untouched"
+        );
+        let names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            [path.file_name().unwrap()],
+            "no temporary file is left"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_save_into_a_folder_whose_acl_new_files_inherit_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private.md");
+        fs::write(&path, "secret\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        if !acl_applied(grant_read(dir.path(), true)) {
+            return;
+        }
+
+        let result = write_atomically(&path, b"new\n");
+
+        assert_refused(dir.path(), &path, result, "folder gives new files");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_save_over_a_note_with_an_acl_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.md");
+        fs::write(&path, "secret\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        if !acl_applied(grant_read(&path, false)) {
+            return;
+        }
+
+        let result = write_atomically(&path, b"new\n");
+
+        assert_refused(dir.path(), &path, result, "note has an access control list");
     }
 
     #[cfg(unix)]
