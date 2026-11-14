@@ -152,7 +152,7 @@ def probe_attention(kernel, device) -> dict:
     heads, d, window, n_window, n_global = 64, 512, 128, 100, 50
     q = torch.randn(1, 1, heads, d, generator=g).to(BF16)
     kv = torch.randn(1, n_window + n_global, d, generator=g).to(BF16)
-    sink = torch.randn(heads, generator=g)
+    sink = torch.randn(heads, generator=g, dtype=torch.float32)
     valid = list(range(n_window))
     glob = list(range(n_window, n_window + n_global))
     pad = [-1] * (window - n_window)
