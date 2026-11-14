@@ -190,6 +190,8 @@ pub struct LayerOutput {
     pub attention: Matrix,
     /// `[n, dim]`: the feed-forward sub-layer's output.
     pub ffn: Matrix,
+    /// Per row, the routed experts and their weights, best first.
+    pub routing: Vec<DsRouting>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -659,7 +661,7 @@ impl DsModel {
             .collect::<Result<_>>()?;
 
         let inputs: Vec<&[f32]> = attended.iter().map(|t| t.u.as_slice()).collect();
-        let ffn = moe_forward(&self.weights, &w.moe, &c.moe, &inputs)?;
+        let (ffn, routing) = moe_forward(&self.weights, &w.moe, &c.moe, &inputs)?;
 
         let mut out = Rows {
             start: rows.start + skip,
@@ -712,6 +714,7 @@ impl DsModel {
             entering_mean,
             attention,
             ffn,
+            routing,
         })
     }
 
@@ -994,7 +997,7 @@ pub fn moe_forward(
     w: &DsMoeWeights,
     spec: &DsMoeSpec,
     inputs: &[&[f32]],
-) -> Result<Matrix> {
+) -> Result<(Matrix, Vec<DsRouting>)> {
     let dim = weights.config.dim;
     let routing: Vec<DsRouting> = inputs
         .par_iter()
@@ -1035,5 +1038,5 @@ pub fn moe_forward(
             *a = bf16_round(*a + *b);
         }
     }
-    Ok(y)
+    Ok((y, routing))
 }

@@ -77,7 +77,7 @@ def entry(t: torch.Tensor | np.ndarray, dtype: str | None = None) -> tuple[str, 
     for byte-typed storage (`F8_E4M3`, `F8_E8M0`, `I8`)."""
     if isinstance(t, np.ndarray):
         t = torch.from_numpy(np.ascontiguousarray(t))
-    t = t.contiguous()
+    t = t.detach().cpu().contiguous()
     name = dtype or DTYPE_NAME[t.dtype]
     size = ELEMENT_SIZE[name]
     raw = t.view(torch.uint8) if t.dtype.itemsize == size and t.numel() else t

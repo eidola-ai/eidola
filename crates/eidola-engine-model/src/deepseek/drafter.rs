@@ -177,7 +177,7 @@ impl DsModel {
                 })
                 .collect();
             let inputs: Vec<&[f32]> = attended.iter().map(|t| t.2.as_slice()).collect();
-            let ffn = moe_forward(&self.weights, &block.moe, &spec.moe, &inputs)?;
+            let (ffn, _) = moe_forward(&self.weights, &block.moe, &spec.moe, &inputs)?;
             for (i, (x, mixes, _)) in attended.into_iter().enumerate() {
                 let mut x = x;
                 mhc::expand(&mut x, ffn.row(i), &mixes);
