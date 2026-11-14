@@ -8,3 +8,4 @@ If you are looking for conceptual or architectural docs, move one level up in [`
 
 - [`release-attestant-yubikey.md`](release-attestant-yubikey.md) — one-time provisioning of a fresh YubiKey 5 as the release attestation signing key.
 - [`release-apple-signing-yubikey.md`](release-apple-signing-yubikey.md) — policy and hand-off procedure for the distinct unattended Apple CI signing key.
+- [`rebuilding-platform-images.md`](rebuilding-platform-images.md) — rebuilding the hosting platform's boot images from source and comparing them with the pinned ones; the record of the last rebuild.

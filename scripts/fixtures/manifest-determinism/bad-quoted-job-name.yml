@@ -1,0 +1,30 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# The same graph with the quoting moved to the job key. A parser whose job
+# header pattern does not allow quotes never registers the job at all, so
+# the `apple-signing` environment it holds is attributed to whatever job
+# was parsed last — or, as here with the key-holder first, to nothing.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  "apple-envelope":
+    name: Wrap the macOS app
+    runs-on: self-hosted
+    environment: apple-signing
+    steps:
+      - name: Wrap
+        run: codesign --sign "Developer ID Application" Eidola.app
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs:
+      - apple-envelope
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full

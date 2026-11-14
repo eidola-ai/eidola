@@ -29,6 +29,8 @@
 //! private copy. Only the transient editing bits (which row is open, its input
 //! buffers, which picker is open) are view fields.
 
+use std::collections::HashMap;
+
 use eidola_app_core::{
     NewParticipant, ParticipantInfo, ParticipantOverride, ParticipantReference, ParticipantUpdate,
 };
@@ -38,7 +40,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme, StyledExt as _, h_flex,
-    input::{Input, InputState},
+    input::{Input, InputState, Textarea, TextareaState},
     v_flex,
 };
 
@@ -77,7 +79,7 @@ pub(crate) struct ParticipantEdit {
     is_referenced: bool,
     reference: Option<ParticipantReference>,
     label: Entity<InputState>,
-    system_prompt: Entity<InputState>,
+    system_prompt: Entity<TextareaState>,
     /// The working model selection (`None` = no model set).
     model_ref: Option<String>,
     notify_policy: String,
@@ -120,7 +122,7 @@ impl ParticipantEdit {
 pub(crate) struct ParticipantAdd {
     focus: gpui::FocusHandle,
     label: Entity<InputState>,
-    system_prompt: Entity<InputState>,
+    system_prompt: Entity<TextareaState>,
     model_ref: Option<String>,
     notify_policy: String,
 }
@@ -189,6 +191,16 @@ pub(crate) struct InviteForm {
 pub(crate) struct TemplateForm {
     focus: gpui::FocusHandle,
     title: Entity<InputState>,
+}
+
+/// A switch to newer weights sent from a notice, waiting to be seen in the
+/// roster (`SpaceView::inspector_pending_switches`, keyed by participant).
+#[derive(Clone, Debug)]
+pub(crate) struct PendingSwitch {
+    /// The participant's model the switch replaces.
+    previous: Option<String>,
+    /// The pin it writes, `tag@sha256:<hex>@eidola`.
+    newer: String,
 }
 
 /// Which model picker is open. At most one at a time — they share one scroll
@@ -333,6 +345,54 @@ impl SpaceView {
 
     // -- Test seams --------------------------------------------------------
 
+    /// The **text input** in this section that holds the keyboard, weakly.
+    ///
+    /// The companion to [`Self::inspector_participant_field_focused`], and
+    /// deliberately a different shape of question. That one is a *predicate*,
+    /// so it asks containment: a form is its fields, its chips, its verbs and
+    /// its dropdown, and a listed predicate would answer "not held" for
+    /// everything the list forgot. This one names a *destination*, where a
+    /// forgotten input is not a wrong answer but a fall-through to
+    /// [`SpaceView::keyboard_home`] — so listing them is safe here in the way
+    /// it is not there.
+    ///
+    /// **Weak, because that is the liveness answer a `FocusHandle` cannot
+    /// give.** A handle tracked on no element still reports itself focused
+    /// (this window's whole dead-slot family), while an input state entity
+    /// dies with the form that owns it — so a form retired while some other
+    /// surface held the keyboard simply fails to upgrade.
+    pub(crate) fn inspector_participant_focused_input(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Option<super::inspector::WeakField> {
+        use super::inspector::WeakField;
+        let held = |input: &Entity<InputState>| {
+            gpui::Focusable::focus_handle(input.read(cx), cx)
+                .is_focused(window)
+                .then(|| WeakField::Input(input.downgrade()))
+        };
+        let held_multi = |input: &Entity<TextareaState>| {
+            gpui::Focusable::focus_handle(input.read(cx), cx)
+                .is_focused(window)
+                .then(|| WeakField::Textarea(input.downgrade()))
+        };
+        let edit = self.inspector_participant_edit.as_ref();
+        let add = self.inspector_participant_add.as_ref();
+        edit.and_then(|e| held(&e.label))
+            .or_else(|| edit.and_then(|e| held_multi(&e.system_prompt)))
+            .or_else(|| add.and_then(|a| held(&a.label)))
+            .or_else(|| add.and_then(|a| held_multi(&a.system_prompt)))
+            .or_else(|| {
+                self.inspector_template_form
+                    .as_ref()
+                    .and_then(|t| held(&t.title))
+            })
+        // The invite form carries no text input — its rows and verbs are the
+        // whole of it — so a reader standing in it has no field to be put back
+        // into, and the caller falls through.
+    }
+
     /// Which participant's disclosure is open, if any.
     #[doc(hidden)]
     pub fn inspector_editing_participant(&self) -> Option<&str> {
@@ -362,7 +422,7 @@ impl SpaceView {
     }
 
     #[doc(hidden)]
-    pub fn inspector_editing_prompt_state(&self) -> Option<Entity<InputState>> {
+    pub fn inspector_editing_prompt_state(&self) -> Option<Entity<TextareaState>> {
         self.inspector_participant_edit
             .as_ref()
             .map(|e| e.system_prompt.clone())
@@ -444,7 +504,7 @@ impl SpaceView {
         // A reveal focuses what it revealed (the Settings idiom's rule).
         label.update(cx, |s, cx| s.focus(window, cx));
         let system_prompt = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(2, 8)
                 .placeholder(PROMPT_PLACEHOLDER)
                 .default_value(p.system_prompt.clone().unwrap_or_default())
@@ -588,6 +648,7 @@ impl SpaceView {
         let system_prompt = edit.system_prompt.read(cx).value().trim().to_string();
         let is_agent = edit.kind == "agent";
         let pid = edit.participant_id.clone();
+        let defer_model = self.defers_model_to_switch(&edit);
 
         if edit.is_referenced && edit.mode == EditMode::OverrideHere {
             // Per-membership overrides. An empty model/prompt on a referenced
@@ -600,14 +661,19 @@ impl SpaceView {
                 ..Default::default()
             };
             if is_agent {
-                ov.model_ref = Some(edit.model_ref.clone().filter(|s| !s.is_empty()));
+                if !defer_model {
+                    ov.model_ref = Some(edit.model_ref.clone().filter(|s| !s.is_empty()));
+                }
                 ov.system_prompt = Some((!system_prompt.is_empty()).then_some(system_prompt));
             }
             self.stores
                 .participants
                 .update(cx, |s, cx| s.set_override(space_id, pid, ov, cx));
         } else {
-            let update = edit.as_everywhere_update(cx);
+            let mut update = edit.as_everywhere_update(cx);
+            if defer_model {
+                update.model_ref = None;
+            }
             // The premise the editor was seeded on: an owned row belongs to this
             // space, a referenced one is a shared identity. Either can move
             // under an open editor (promotion), and the write is where that is
@@ -693,13 +759,35 @@ impl SpaceView {
     /// carries the everywhere-vs-here fork this one was seeded without. Nothing
     /// else is view work — the roster's "shared" tag falls out of the same
     /// re-list.
+    /// **A write from the editor while a switch to newer weights is in flight
+    /// leaves the model to the switch.** The editor still shows the model the
+    /// switch replaces (it follows only once the roster shows the switch
+    /// landed), and the store runs a Save or Share after the switch: writing
+    /// that model would put the old pin back. So where both write the same
+    /// place — an owned agent's row (Save, or the persona Share carries), a
+    /// shared agent's "This space" override — an unchanged model is left out;
+    /// a model the reader picked is still written, and a shared agent's
+    /// "Everyone" save writes its global config, which the switch does not
+    /// touch.
+    fn defers_model_to_switch(&self, edit: &ParticipantEdit) -> bool {
+        let writes_this_space = !(edit.is_referenced && edit.mode == EditMode::Everywhere);
+        writes_this_space
+            && self
+                .inspector_pending_switches
+                .get(&edit.participant_id)
+                .is_some_and(|p| edit.model_ref == p.previous)
+    }
+
     pub fn inspector_confirm_promote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let space_id = self.space_id(cx);
         let held = self.inspector_field_focused(window, cx);
         let Some(edit) = self.inspector_participant_edit.take() else {
             return;
         };
-        let update = edit.as_everywhere_update(cx);
+        let mut update = edit.as_everywhere_update(cx);
+        if self.defers_model_to_switch(&edit) {
+            update.model_ref = None;
+        }
         if update.label.as_deref().is_some_and(str::is_empty) {
             self.inspector_participant_edit = Some(edit);
             return;
@@ -752,7 +840,7 @@ impl SpaceView {
         // starting point the Templates pane offers, so the two surfaces don't
         // contradict each other on what "a new participant" begins as.
         let system_prompt = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(2, 8)
                 .placeholder(PROMPT_PLACEHOLDER)
                 .default_value(DEFAULT_AGENT_SYSTEM_PROMPT)
@@ -1144,6 +1232,7 @@ impl SpaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.apply_landed_switch(cx);
         let Some((pid, was_referenced)) = self
             .inspector_participant_edit
             .as_ref()
@@ -1171,6 +1260,68 @@ impl SpaceView {
         self.inspector_participant_edit = None;
         self.inspector_participant_picker = None;
         self.hand_back_inspector_focus(held, window, cx);
+    }
+
+    /// Apply a pending switch to newer weights to the open editor once the
+    /// roster shows it landed, and drop it once the roster shows it never
+    /// will. While the write is in flight (the row still on the model the
+    /// switch replaced) it waits.
+    ///
+    /// Landed: an editor writing to this space (an owned agent, or a shared
+    /// one's "This space" draft) whose selection is still the model the switch
+    /// replaced takes the newer pin, and a shared agent's cached per-space
+    /// source does too, so the mode fork re-seeds "This space" with it. A
+    /// shared agent's "Everyone" draft is its global config, which the switch
+    /// does not touch. Anything else — the row gone, or on a third model
+    /// (another window's write) — drops the pending switch and leaves the
+    /// editor alone. Each participant's switch settles on its own, so one
+    /// row's switch never discards another's.
+    fn apply_landed_switch(&mut self, cx: &mut Context<Self>) {
+        if self.inspector_pending_switches.is_empty() {
+            return;
+        }
+        let space_id = self.space_id(cx);
+        let row_models: HashMap<String, Option<String>> = {
+            let store = self.stores.participants.read(cx);
+            match store.participants(&space_id).value() {
+                Some(list) => list
+                    .iter()
+                    .filter(|p| self.inspector_pending_switches.contains_key(&p.id))
+                    .map(|p| (p.id.clone(), p.model_ref.clone()))
+                    .collect(),
+                None => return,
+            }
+        };
+        let ids: Vec<String> = self.inspector_pending_switches.keys().cloned().collect();
+        for participant_id in ids {
+            let Some(pending) = self.inspector_pending_switches.get(&participant_id) else {
+                continue;
+            };
+            match row_models.get(&participant_id) {
+                Some(model) if *model == pending.previous => {}
+                Some(model) if model.as_deref() == Some(pending.newer.as_str()) => {
+                    let Some(pending) = self.inspector_pending_switches.remove(&participant_id)
+                    else {
+                        continue;
+                    };
+                    if let Some(edit) = self.inspector_participant_edit.as_mut()
+                        && edit.participant_id == participant_id
+                    {
+                        if !(edit.is_referenced && edit.mode == EditMode::Everywhere)
+                            && edit.model_ref == pending.previous
+                        {
+                            edit.model_ref = Some(pending.newer.clone());
+                        }
+                        if let Some(reference) = edit.reference.as_mut() {
+                            reference.override_model_ref = Some(pending.newer);
+                        }
+                    }
+                }
+                _ => {
+                    self.inspector_pending_switches.remove(&participant_id);
+                }
+            }
+        }
     }
 
     pub(crate) fn inspector_toggle_participant_picker(
@@ -1499,7 +1650,14 @@ impl SpaceView {
                     )
                     .when_some(detail, |el, detail| {
                         el.child(div().text_xs().text_color(muted).truncate().child(detail))
-                    }),
+                    })
+                    // What the user should know about the model choice — an
+                    // updated tag, a newer model for a pin, a retirement — on
+                    // the row itself, open or closed: a notice found only by
+                    // opening the editor is not given.
+                    .children(p.model_notices.iter().enumerate().map(|(i, notice)| {
+                        self.render_model_notice(&pid, &display_name, i, notice, cx)
+                    })),
             )
             // The chevron says the row opens; its state is on the row's own node
             // (`aria_expanded`), so this is decoration.
@@ -1522,6 +1680,147 @@ impl SpaceView {
             wrap = wrap.child(self.render_inspector_participant_editor(p, cx));
         }
         wrap.into_any_element()
+    }
+
+    /// One model notice on a participant's row: the sentence, and its action
+    /// where it has one — **switch** a pin to the newer weights its tag names
+    /// now (in this conversation), or **dismiss** a followed tag's "model
+    /// updated" notice until the tag moves again. The action's click does not
+    /// reach the row behind it, which would open the editor. Its accessible
+    /// name carries the participant (`name`): the same verb repeats on every
+    /// row that has the notice.
+    fn render_model_notice(
+        &self,
+        pid: &str,
+        name: &str,
+        i: usize,
+        notice: &eidola_app_core::model_catalog::ModelNotice,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use eidola_app_core::model_catalog::ModelNotice;
+        let warning = cx.theme().warning;
+        let text = crate::participants::model_notice_text(notice, cx);
+        let line = div()
+            .id(SharedString::from(format!(
+                "space-inspector-p-{pid}-notice-{i}"
+            )))
+            .probe(
+                SharedString::from(format!("space/inspector/participants/{pid}/notice/{i}")),
+                gpui::Role::Label,
+                text.clone(),
+            )
+            .text_xs()
+            .text_color(warning)
+            .child(text);
+        let action = match notice {
+            ModelNotice::NewerAvailable { .. } => Some((
+                "switch",
+                crate::i18n::msg::participants_model_switch_newer(cx),
+                crate::i18n::msg::participants_model_switch_newer_for(cx, name.to_string()),
+            )),
+            ModelNotice::Updated { .. } => Some((
+                "dismiss",
+                crate::i18n::msg::participants_model_dismiss_update(cx),
+                crate::i18n::msg::participants_model_dismiss_update_for(cx, name.to_string()),
+            )),
+            _ => None,
+        };
+        let Some((verb, label, aria)) = action else {
+            return line.into_any_element();
+        };
+        let target = pid.to_string();
+        let notice = notice.clone();
+        let button = crate::participants::ghost_button_labeled(
+            SharedString::from(format!("space-inspector-p-{pid}-notice-{i}-{verb}")),
+            SharedString::from(format!(
+                "space/inspector/participants/{pid}/notice/{i}/{verb}"
+            )),
+            label,
+            aria,
+            false,
+            cx,
+            cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
+                cx.stop_propagation();
+                this.inspector_act_on_model_notice(&target, &notice, window, cx);
+            }),
+        );
+        h_flex()
+            .gap_2()
+            .items_center()
+            .flex_wrap()
+            .child(line)
+            .child(button)
+            .into_any_element()
+    }
+
+    /// Act on a model notice of `participant_id` — the Switch and Dismiss
+    /// buttons' one handler, `pub` so tests drive exactly what a click does.
+    ///
+    /// **An open editor over that participant follows a switch, once it has
+    /// landed.** The editor holds its own working model selection, and the
+    /// roster re-read does not retire it (only a vanished row or a changed
+    /// `source` does), so a Save of any other field would write the old pin
+    /// back over the switch. The switch is recorded as pending and applied to
+    /// the editor by [`Self::sync_inspector_participant_edit`] when the roster
+    /// shows the participant on the newer pin; a refused switch never touches
+    /// it.
+    pub fn inspector_act_on_model_notice(
+        &mut self,
+        participant_id: &str,
+        notice: &eidola_app_core::model_catalog::ModelNotice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use eidola_app_core::model_catalog::ModelNotice;
+        let space_id = self.space_id(cx);
+        let target = participant_id.to_string();
+        match notice {
+            ModelNotice::NewerAvailable { tag, newer_sha256 } => {
+                let current = self
+                    .inspector_participants(cx)
+                    .into_iter()
+                    .find(|p| p.id == participant_id)
+                    .and_then(|p| p.model_ref);
+                let newer = eidola_app_core::qualified_model_id(
+                    &eidola_app_core::model_reference::pinned(Some(tag), newer_sha256),
+                    eidola_app_core::EIDOLA_BACKEND_ID,
+                );
+                // The editor follows once the roster shows the switch landed,
+                // never here: a switch the core refuses leaves it as it was.
+                self.inspector_pending_switches.insert(
+                    participant_id.to_string(),
+                    PendingSwitch {
+                        previous: current,
+                        newer,
+                    },
+                );
+                self.stores.participants.update(cx, |store, cx| {
+                    store.switch_to_newer_weights(space_id, target, cx)
+                });
+            }
+            ModelNotice::Updated { .. } => {
+                self.stores.participants.update(cx, |store, cx| {
+                    store.dismiss_model_update(space_id, target, cx)
+                });
+            }
+            _ => return,
+        }
+        // The notice, and its control with it, goes when the roster re-reads,
+        // so the keyboard moves now, unless a field of the panel holds it. An
+        // inspector covering the pane keeps it (`inspector_focus`): nothing
+        // behind its scrim may take keys. Otherwise it goes home — the open
+        // draft or inline edit when there is one, else the view — so it is
+        // never left on an element that no longer exists, nor on a root that
+        // yields every key to a composing session.
+        if !self.inspector_field_focused(window, cx) {
+            if self.inspector_covers_pane(window) {
+                window.focus(&self.inspector_focus, cx);
+            } else {
+                let home = self.keyboard_home(cx);
+                window.focus(&home, cx);
+            }
+        }
+        cx.notify();
     }
 
     /// The open disclosure's body — the fork (when referenced), name, model,
@@ -1611,7 +1910,11 @@ impl SpaceView {
                     gpui::Role::TextInput,
                     "Name",
                 )
-                .child(Input::new(&edit.label).aria_label("Name")),
+                .child(
+                    Input::new(&edit.label)
+                        .aria_label("Name")
+                        .py(crate::theme::INPUT_PY),
+                ),
         );
 
         if is_agent {
@@ -1631,7 +1934,7 @@ impl SpaceView {
                             gpui::Role::TextInput,
                             "System prompt",
                         )
-                        .child(Input::new(&edit.system_prompt).aria_label("System prompt")),
+                        .child(Textarea::new(&edit.system_prompt).aria_label("System prompt")),
                 )
                 .child(field_label("Responds", cx))
                 .child(self.render_inspector_notify(&edit.notify_policy, "editor", true, cx));
@@ -1812,7 +2115,11 @@ impl SpaceView {
                         gpui::Role::TextInput,
                         "Name",
                     )
-                    .child(Input::new(&add.label).aria_label("Name")),
+                    .child(
+                        Input::new(&add.label)
+                            .aria_label("Name")
+                            .py(crate::theme::INPUT_PY),
+                    ),
             )
             .child(field_label("Model", cx))
             .child(self.render_inspector_participant_model(
@@ -1829,7 +2136,7 @@ impl SpaceView {
                         gpui::Role::TextInput,
                         "System prompt",
                     )
-                    .child(Input::new(&add.system_prompt).aria_label("System prompt")),
+                    .child(Textarea::new(&add.system_prompt).aria_label("System prompt")),
             )
             .child(field_label("Responds", cx))
             .child(self.render_inspector_notify(&add.notify_policy, "add", false, cx))
@@ -2247,7 +2554,11 @@ impl SpaceView {
                         gpui::Role::TextInput,
                         "Template name",
                     )
-                    .child(Input::new(&form.title).aria_label("Template name")),
+                    .child(
+                        Input::new(&form.title)
+                            .aria_label("Template name")
+                            .py(crate::theme::INPUT_PY),
+                    ),
             )
             .child(
                 h_flex()

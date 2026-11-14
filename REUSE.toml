@@ -19,7 +19,18 @@ SPDX-License-Identifier = "MIT OR Apache-2.0"
 
 # Server layer.
 [[annotations]]
-path = "crates/eidola-server/**"
+path = [
+    "crates/eidola-server-gateway/**",
+    "crates/eidola-billing/**",
+    "crates/eidola-billing-cli/**",
+    "crates/eidola-server-engine/**",
+    "crates/eidola-engine/**",
+    "crates/eidola-engine-model/**",
+    "crates/eidola-engine-chat/**",
+    "crates/eidola-engine-kernels/**",
+    "crates/eidola-engine-cpu/**",
+    "crates/eidola-engine-cuda/**",
+]
 precedence = "closest"
 SPDX-FileCopyrightText = "© Eidola, Inc. and contributors"
 SPDX-License-Identifier = "AGPL-3.0-only"
@@ -30,6 +41,7 @@ path = [
     "crates/eidola-app-core/**",
     "crates/eidola-cli/**",
     "crates/eidola-gui/**",
+    "crates/eidola-notepad/**",
 ]
 precedence = "closest"
 SPDX-FileCopyrightText = "© Eidola, Inc. and contributors"
@@ -62,3 +74,72 @@ path = [
 precedence = "closest"
 SPDX-FileCopyrightText = "© Eidola, Inc."
 SPDX-License-Identifier = "LicenseRef-Eidola-Legal"
+
+# Verbatim files from the MiMo-V2.6 model release (Hugging Face
+# XiaomiMiMo/MiMo-V2.6-Flash-MOPD, declared MIT), kept as test fixtures.
+[[annotations]]
+path = [
+    "crates/eidola-engine-chat/tests/fixtures/chat_template.jinja",
+    "crates/eidola-engine-chat/tests/fixtures/generation_config.json",
+    "crates/eidola-engine-chat/tests/fixtures/tokenizer.json.gz",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "© 2026 Xiaomi Corporation"
+SPDX-License-Identifier = "MIT"
+
+# Verbatim config.json files from the MiMo-V2.6 model releases (Hugging Face
+# XiaomiMiMo/MiMo-V2.6-Flash-MOPD and MiMo-V2.6-Pro-MOPD, declared MIT), kept as
+# test data.
+[[annotations]]
+path = [
+    "crates/eidola-engine-model/tests/data/flash-mopd.config.json",
+    "crates/eidola-engine-model/tests/data/pro-mopd.config.json",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "© 2026 Xiaomi Corporation"
+SPDX-License-Identifier = "MIT"
+
+# Test fixtures generated from the MiMo-V2.6 template and tokenizer.
+[[annotations]]
+path = [
+    "crates/eidola-engine-chat/tests/fixtures/template_cases.json",
+    "crates/eidola-engine-chat/tests/fixtures/template_token_ids.json",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = ["© Eidola, Inc. and contributors", "© 2026 Xiaomi Corporation"]
+SPDX-License-Identifier = "AGPL-3.0-only AND MIT"
+
+# Verbatim sample TDX quote and Intel collateral from the dcap-qvl crate
+# (declared MIT), kept as test fixtures; and the Intel SGX root certificate,
+# byte-identical to dcap-qvl's copy of Intel's published root.
+[[annotations]]
+path = [
+    "crates/tinfoil-verifier/tests/fixtures/dcap-qvl/tdx_quote",
+    "crates/tinfoil-verifier/tests/fixtures/dcap-qvl/tdx_quote_collateral.json",
+    "crates/tinfoil-verifier/src/intel_sgx_root_ca.der",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "© 2026 Phala Network"
+SPDX-License-Identifier = "MIT"
+
+# Verbatim release data of the platform provider (tinfoilsh/cvmimage, declared
+# AGPL-3.0): its signed platform endorsements and their Sigstore attestation
+# bundles, and the release manifests engine configs pin, vendored as trust
+# inputs and copied as test fixtures; and two of its attestation bundles kept
+# as test fixtures (one from tinfoilsh/confidential-model-router, declared
+# AGPL-3.0). Both repositories ship the AGPL-3.0 text with no version
+# statement, and the licence's section 14 lets the recipient then choose any
+# version, so "or later" is the accurate reading. These files are signed data
+# that our tooling verifies and reads, not code linked into any crate, so
+# they do not bind the licences of the crates that read them.
+[[annotations]]
+path = [
+    "releases/trust/platform-endorsements/**",
+    "releases/trust/cvm-releases/**",
+    "crates/measure-enclave/tests/fixtures/platform-endorsements/*.sigstore.json",
+    "crates/measure-enclave/tests/fixtures/platform-endorsements/platform-v*/**",
+    "crates/eidola-server-gateway/tests/fixtures/engine-trust/releases/trust/**",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "© Tinfoil contributors"
+SPDX-License-Identifier = "AGPL-3.0-or-later"

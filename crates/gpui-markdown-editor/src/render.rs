@@ -51,7 +51,7 @@ use std::ops::Range;
 
 use crate::render_spec::{
     BlockKind, Container, InlineRun, InlineStyle, ListItemKind, MarkerOverlay, RenderBlock,
-    RenderSpec,
+    RenderSpec, Substitution,
 };
 use crate::state::{EditorState, Selection};
 use crate::syntax::{ListKind, NodeKind, SyntaxNode};
@@ -96,7 +96,12 @@ use crate::syntax::{ListKind, NodeKind, SyntaxNode};
 ///    bytes line-by-line against the canonical prefix; matching
 ///    spans are added to `hidden_ranges`.
 ///
-/// 5. merge_hidden_ranges (per-block) — multiple hide passes (own
+/// 5. mark_cjk_emphasis (per-block) — emphasis asks for an italic no
+///    CJK face has, so the CJK sub-ranges of every italic run are
+///    marked for 着重号 dots instead. Additive: the Latin parts of a
+///    mixed span keep their italic.
+///
+/// 6. merge_hidden_ranges (per-block) — multiple hide passes (own
 ///    container, alternating chain, code-block fence, …) can produce
 ///    overlapping or duplicate entries. Normalize each block's
 ///    `hidden_ranges` into a sorted, non-overlapping list so the
@@ -133,9 +138,165 @@ fn render_with_cursor(state: &EditorState, tree: &[SyntaxNode], cursor: CursorRa
     for block in &mut blocks {
         hide_chain_continuation_prefix(block, bytes);
         apply_escapes_and_entities(block, &state.markdown, &verbatim, cursor);
+        mark_cjk_emphasis(block, &state.markdown);
         merge_hidden_ranges(&mut block.hidden_ranges);
     }
     RenderSpec { blocks }
+}
+
+/// Mark the CJK sub-ranges of every emphasized run for 着重号 dots.
+///
+/// Markdown emphasis asks for italic, and no CJK face has one (see
+/// [`crate::cjk`]) — the delimiters would vanish and the glyphs would
+/// render unchanged, telling the reader *less* than the raw asterisks
+/// did. So an emphasized span is split by script: Latin sub-runs keep
+/// true italic, CJK sub-runs take dots under their characters. One span
+/// may carry both renderings, which is correct rather than a
+/// compromise.
+///
+/// The marks are **added** over the existing italic runs rather than
+/// carving them up: styles merge per source byte in the element layer
+/// (`effective_inline_style`), so a CJK sub-range ends up with both
+/// flags and the element suppresses the italic face exactly there. That
+/// keeps every other consumer of `inlines` — nesting, dimming,
+/// strikethrough, the delimiter reveal — untouched.
+///
+/// Runs the element renders verbatim take no dots: inline code shapes in
+/// the mono face as literal source, and a dimmed run *is* the raw
+/// markdown revealed at the cursor.
+///
+/// **Classification follows what is displayed, not what is typed.** A
+/// backslash escape or an entity reference (`*&#x4E2D;*`) is ASCII in
+/// the buffer and a Han character on screen, so the pass runs *after*
+/// `apply_escapes_and_entities` and classifies the text the reader
+/// sees. It reconstructs that text for the whole run — literal bytes
+/// and substitution display spliced into one string — and segments
+/// *that*, because the segmentation rule spans characters: a variation
+/// selector or a Zhuyin tone mark attaches to the character before it,
+/// and either side of that pair may have arrived through a
+/// substitution. Classifying each piece on its own broke exactly those
+/// pairs apart.
+///
+/// Segments map back per piece. A literal piece maps byte for byte; a
+/// substitution maps to its **whole** source range as soon as a segment
+/// touches it, since every display byte of a substitution maps back to
+/// its source start and the element cannot mark a fraction of one.
+fn mark_cjk_emphasis(block: &mut RenderBlock, source: &str) {
+    // Coalesce first. A substitution splits the inline list at its own
+    // edges, so `*葛&#xE0100;*` arrives as two adjacent italic runs —
+    // and the segmentation rule reaches across characters, so the base
+    // and its selector must be classified in one sequence or the pair
+    // breaks apart exactly where the rule exists to hold it together.
+    let mut spans: Vec<Range<usize>> = block
+        .inlines
+        .iter()
+        .filter(|r| r.style.italic && !r.style.code && !r.style.dimmed)
+        .map(|r| r.source_range.clone())
+        .collect();
+    spans.sort_by_key(|r| r.start);
+    spans.dedup_by(|next, prev| {
+        let touching = next.start <= prev.end;
+        if touching {
+            prev.end = prev.end.max(next.end);
+        }
+        touching
+    });
+
+    let mut marks: Vec<InlineRun> = Vec::new();
+    for span in spans {
+        let Some((display, pieces)) = displayed_span_text(source, span, &block.substitutions)
+        else {
+            continue;
+        };
+        for seg in crate::cjk::cjk_segments(&display) {
+            for range in source_ranges_for(&pieces, &seg) {
+                match marks.last_mut() {
+                    Some(last) if last.source_range.end == range.start => {
+                        last.source_range.end = range.end;
+                    }
+                    _ => marks.push(InlineRun {
+                        source_range: range,
+                        style: InlineStyle {
+                            emphasis_dots: true,
+                            ..InlineStyle::default()
+                        },
+                    }),
+                }
+            }
+        }
+    }
+    block.inlines.append(&mut marks);
+}
+
+/// One stretch of a run's displayed text and the source bytes behind it.
+///
+/// A literal piece maps display byte to source byte; a substituted one
+/// maps its whole display span back to one source range, which is all
+/// the element can mark (see [`RenderBlock::substitutions`]).
+struct DisplayPiece {
+    display: Range<usize>,
+    source: Range<usize>,
+    substituted: bool,
+}
+
+/// Reconstruct what `span` displays — literal source bytes with each
+/// substitution's display text spliced in — together with the map back.
+fn displayed_span_text(
+    source: &str,
+    span: Range<usize>,
+    substitutions: &[Substitution],
+) -> Option<(String, Vec<DisplayPiece>)> {
+    let mut subs: Vec<&Substitution> = substitutions
+        .iter()
+        .filter(|s| s.source_range.start >= span.start && s.source_range.end <= span.end)
+        .collect();
+    subs.sort_by_key(|s| s.source_range.start);
+
+    let mut display = String::new();
+    let mut pieces: Vec<DisplayPiece> = Vec::new();
+    let mut cursor = span.start;
+    let mut push = |display: &mut String, source_range: Range<usize>, text: &str, sub: bool| {
+        if text.is_empty() {
+            return;
+        }
+        let start = display.len();
+        display.push_str(text);
+        pieces.push(DisplayPiece {
+            display: start..display.len(),
+            source: source_range,
+            substituted: sub,
+        });
+    };
+    for sub in subs {
+        if sub.source_range.start < cursor {
+            continue; // overlapping substitutions: first one wins
+        }
+        let gap = cursor..sub.source_range.start;
+        push(&mut display, gap.clone(), source.get(gap)?, false);
+        push(&mut display, sub.source_range.clone(), &sub.display, true);
+        cursor = sub.source_range.end;
+    }
+    let tail = cursor..span.end;
+    push(&mut display, tail.clone(), source.get(tail)?, false);
+    Some((display, pieces))
+}
+
+/// The source ranges a display-byte range covers, in order.
+fn source_ranges_for(pieces: &[DisplayPiece], seg: &Range<usize>) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    for piece in pieces {
+        if piece.display.end <= seg.start || piece.display.start >= seg.end {
+            continue;
+        }
+        if piece.substituted {
+            out.push(piece.source.clone());
+            continue;
+        }
+        let lo = seg.start.max(piece.display.start) - piece.display.start;
+        let hi = seg.end.min(piece.display.end) - piece.display.start;
+        out.push((piece.source.start + lo)..(piece.source.start + hi));
+    }
+    out
 }
 
 /// Promote each **top-level** `Paragraph` block whose entire source is a
@@ -4308,5 +4469,198 @@ mod tests {
         assert!(block.has_hidden_range(3..5));
         assert!(block.has_hidden_range(9..11));
         assert_eq!(first_substitution_for(block, 6..8), Some("*"));
+    }
+
+    /// Effective style at `offset` — every overlapping run merged, the
+    /// same way the element layer resolves a byte's style.
+    fn style_at(block: &RenderBlock, offset: usize) -> InlineStyle {
+        block
+            .inlines
+            .iter()
+            .filter(|r| r.source_range.contains(&offset))
+            .fold(InlineStyle::default(), |acc, r| acc.merge(r.style.clone()))
+    }
+
+    #[test]
+    fn cjk_emphasis_takes_dots_and_drops_the_italic_face() {
+        let src = "*中文*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let style = style_at(block, src.find('中').expect("han present"));
+        assert!(style.emphasis_dots, "emphasized CJK is marked for dots");
+        assert!(
+            style.italic,
+            "the emphasis run still covers it — the element suppresses the face"
+        );
+    }
+
+    #[test]
+    fn latin_emphasis_takes_no_dots() {
+        let src = "*latin*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let style = style_at(block, src.find('l').expect("latin present"));
+        assert!(style.italic);
+        assert!(!style.emphasis_dots);
+    }
+
+    #[test]
+    fn a_mixed_emphasis_run_splits_by_script() {
+        // One emphasized span carrying both renderings: the Latin word
+        // keeps true italic, the Han characters take dots.
+        let src = "*中文 latin 测试*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        for needle in ['中', '试'] {
+            let style = style_at(block, src.find(needle).expect("han present"));
+            assert!(style.emphasis_dots, "{needle} takes dots");
+        }
+        let latin = style_at(block, src.find('l').expect("latin present"));
+        assert!(
+            latin.italic && !latin.emphasis_dots,
+            "the Latin sub-run stays italic"
+        );
+    }
+
+    #[test]
+    fn cjk_punctuation_stays_inside_the_marked_sub_run() {
+        // The comma has no italic face either, so it belongs to the CJK
+        // sub-run; the element's per-character rule is what withholds a
+        // dot from it.
+        let src = "*中，文*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let comma = style_at(block, src.find('，').expect("comma present"));
+        assert!(comma.emphasis_dots);
+        assert!(!crate::cjk::takes_emphasis_dot('，'));
+    }
+
+    #[test]
+    fn strong_cjk_takes_no_dots() {
+        // `**strong**` works on CJK today — the fallback ships a bold
+        // face. Dots are the emphasis answer only.
+        let src = "**中文**\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let style = style_at(block, src.find('中').expect("han present"));
+        assert!(style.bold);
+        assert!(!style.emphasis_dots);
+    }
+
+    #[test]
+    fn strong_emphasis_cjk_is_bold_plus_dots() {
+        let src = "***中文***\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let style = style_at(block, src.find('中').expect("han present"));
+        assert!(style.bold && style.emphasis_dots);
+    }
+
+    #[test]
+    fn cjk_inline_code_takes_no_dots() {
+        // Code shapes as literal source in the mono face; a dot under it
+        // would claim an emphasis the span does not carry.
+        let src = "*`中文`*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let style = style_at(block, src.find('中').expect("han present"));
+        assert!(style.code);
+        assert!(!style.emphasis_dots);
+    }
+
+    #[test]
+    fn cjk_emphasis_keeps_its_dots_with_the_cursor_inside() {
+        // Entering a construct reveals its delimiters; it never restyles
+        // the content. The dots are the content's emphasis, so they stay
+        // exactly as the italic face would on Latin.
+        let src = "*\u{4e2d}\u{6587}*";
+        let spec = render_with_cursor(src, 2);
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        assert!(
+            block.has_dimmed_range(0..1),
+            "the opening delimiter reveals"
+        );
+        let style = style_at(block, src.find('\u{4e2d}').expect("han present"));
+        assert!(style.emphasis_dots);
+    }
+
+    #[test]
+    fn an_entity_that_decodes_to_cjk_takes_a_dot() {
+        // `&#x4E2D;` is ASCII in the buffer and a Han character on
+        // screen. Classifying the source bytes found no CJK, so the
+        // published view hid the delimiters and then showed neither an
+        // italic nor a dot — strictly less than the asterisks carried.
+        let src = "*&#x4E2D;*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        assert_eq!(first_substitution_for(block, 1..9), Some("中"));
+        assert!(
+            style_at(block, 1).emphasis_dots,
+            "the substituted range is marked ({:?})",
+            block.inlines
+        );
+    }
+
+    #[test]
+    fn a_variation_sequence_written_across_an_entity_stays_whole() {
+        // `*葛&#xE0100;*` — the base is literal, the selector arrives
+        // through a substitution. Classifying each piece on its own put
+        // the base in the upright sub-run and left the selector to the
+        // italic one, which is the same split shaping the segmentation
+        // rule exists to prevent.
+        let src = "*\u{845B}&#xE0100;*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let sel = src.find("&#x").expect("entity present");
+        assert!(
+            style_at(block, sel).emphasis_dots,
+            "the substituted selector rides its base ({:?})",
+            block.inlines
+        );
+
+        // The other order: the base arrives through the entity and the
+        // selector is literal.
+        let src = "*&#x845B;\u{E0100}*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let sel = src.find('\u{E0100}').expect("selector present");
+        assert!(
+            style_at(block, sel).emphasis_dots,
+            "the literal selector rides its substituted base ({:?})",
+            block.inlines
+        );
+    }
+
+    #[test]
+    fn an_escape_that_resolves_to_latin_still_takes_no_dot() {
+        // The mirror case: classification follows the display text, so a
+        // substitution that resolves to Latin must not be marked.
+        let src = r"*\*a\**".to_string() + "\n\nafter";
+        let spec = render_with_cursor(&src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        assert!(
+            block.inlines.iter().all(|r| !r.style.emphasis_dots),
+            "no CJK anywhere ({:?})",
+            block.inlines
+        );
+    }
+
+    #[test]
+    fn cjk_around_an_entity_is_marked_on_both_sides() {
+        // Literal source and substituted display text in one emphasized
+        // span: every Han character is marked, whichever form it took.
+        let src = "*中&#x6587;测*\n\nafter";
+        let spec = render_with_cursor(src, src.len());
+        let block = find_block(&spec, |b| matches!(b.kind, BlockKind::Paragraph));
+        let han = src.find('中').expect("han");
+        let entity = src.find("&#x6587;").expect("entity");
+        let tail = src.find('测').expect("han");
+        for offset in [han, entity, tail] {
+            assert!(
+                style_at(block, offset).emphasis_dots,
+                "offset {offset} is marked ({:?})",
+                block.inlines
+            );
+        }
     }
 }

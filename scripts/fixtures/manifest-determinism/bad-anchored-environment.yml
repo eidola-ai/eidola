@@ -1,0 +1,36 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# The protected environment factored through a YAML anchor. GitHub has
+# resolved aliases in workflows since September 2025, so this job really
+# does receive `apple-signing` — while a scanner that does not parse YAML
+# sees the literal `*signing_env` and nothing that looks like signing.
+# The rule is refusal, not resolution: an alias in a field this check
+# reads is a violation, because guessing what it meant is exactly what a
+# non-parser must not do.
+name: Build & Verify Artifacts (rejected fixture)
+
+env:
+  signing_environment: &signing_env apple-signing
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release-assets:
+    name: Publish release assets
+    runs-on: self-hosted
+    environment: *signing_env
+    steps:
+      - name: Build the macOS artifacts
+        run: ./scripts/artifact-manifest.sh build-macos
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs:
+      - release-assets
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full

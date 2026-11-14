@@ -1,9 +1,10 @@
 {
-  "cmdline": "readonly=on pci=realloc,nocrs modprobe.blacklist=nouveau nouveau.modeset=0 root=/dev/mapper/root roothash=027021244b67e32d69e295a03280e3813d176e94387fc9dcf0fc6c08c7126708 tinfoil-config-hash=06227009c142651b92cf5b3534c0f5975d4a57bf5733650dd291da08d86efafa",
-  "schema_version": 1,
-  "snp_measurement": "3d4bf3e5105d21ffc7078d52719644df09b5c942bf3d840e7f73c96f11da53aca7239876349ffbbae709784761de9a21",
-  "tdx_measurement": {
-    "rtmr1": "727f33421ba6f289eb5e2d4e27391cc8b0fcda181879dba38d87ce789dfad11927380ff32d016b6b7bc8733179b10753",
-    "rtmr2": "5f935649c7fbc57c9fa930def584520c1df54b646ae040caf0db46e24854575b182f40b8f88db4f70bc4a31f75d9d3cc"
+  "cvm_version": "0.15.3-rc.1@sha256:ddd2e76a629df1bd4ec507441a387ac5db010ebc1bda3e372756e095df8692eb",
+  "igvm_sha256": "8fe54c46ceb111b7cc41f12f60bd479211870c7bc5186c8566d71f286ad0d5ac",
+  "schema_version": 2,
+  "sev_snp": {
+    "guest_policy": "0x30133",
+    "host_data": "009180bb9482544f0dbbe1da624ff5ea077acdd7d10c31e0b58a91d4f5f60655",
+    "measurement": "d712705df47368b82a283ba74501c5cf807f5a099c67906a5e1d861037514b9efe382024d4eb6245bb8c9877c7fe6858"
   }
 }

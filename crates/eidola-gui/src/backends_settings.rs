@@ -55,11 +55,12 @@ use gpui::{
     InteractiveElement, IntoElement, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, px,
 };
+use gpui_component::RoleOverride;
 use gpui_component::{
     ActiveTheme, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, Textarea, TextareaState},
     label::Label,
     switch::Switch,
     tab::{Tab, TabBar},
@@ -169,12 +170,13 @@ pub struct BackendsSettingsView {
     /// ("Set custom certificate…" / "Replace…" revealed it). One at a time —
     /// the two rows share the edit-in-place shape with the base-URL row.
     editing_ca: Option<CaKind>,
-    /// The Eidola tab's add-a-measurement input (`<snp>:<rtmr1>:<rtmr2>`).
+    /// The Eidola tab's add-a-measurement input
+    /// (`<measurement>:<host_data>:<guest_policy>`).
     add_measurement_state: Entity<InputState>,
     /// The Eidola tab's hardware root-CA paste-PEM input.
-    root_ca_state: Entity<InputState>,
+    root_ca_state: Entity<TextareaState>,
     /// The Eidola tab's hardware intermediate-CA paste-PEM input.
-    intermediate_ca_state: Entity<InputState>,
+    intermediate_ca_state: Entity<TextareaState>,
     /// The inline add-backend form, while one is open.
     add_form: Option<AddForm>,
     /// The pane's own focus handle — where the keyboard goes when a verb
@@ -207,18 +209,19 @@ impl BackendsSettingsView {
             InputState::new(window, cx).placeholder("https://huggingface.co/…/model.gguf")
         });
         let base_url_state = cx.new(|cx| InputState::new(window, cx).placeholder("https://…"));
-        let add_measurement_state =
-            cx.new(|cx| InputState::new(window, cx).placeholder("<snp>:<rtmr1>:<rtmr2>"));
+        let add_measurement_state = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(eidola_app_core::config::TRUST_SPEC_FORM)
+        });
         // Hardware-CA overrides are full PEM blocks — multi-line textareas
         // that grow with the pasted certificate rather than a single-line
         // field that hides all but a sliver of it.
         let root_ca_state = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(4, 16)
                 .placeholder("-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----")
         });
         let intermediate_ca_state = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(4, 16)
                 .placeholder("-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----")
         });
@@ -324,6 +327,20 @@ impl BackendsSettingsView {
         if self.local_models.read(cx).download_pending(&url) {
             return;
         }
+        // And only from a row that still offers it: the press answers to the
+        // predicate the render paints Retry by, so an activation reaching a row
+        // whose transfer has already been accepted (`Downloading`, its verb
+        // Cancel) starts nothing rather than handing app-core a duplicate to
+        // refuse over the transfer that is running.
+        let offers_retry = self
+            .local_models
+            .read(cx)
+            .models()
+            .iter()
+            .any(|m| m.id == id && failed_download_row(m, true));
+        if !offers_retry {
+            return;
+        }
         let held = self.row_focus(id, cx).contains_focused(window, cx);
         self.local_models.update(cx, |s, cx| s.download(url, cx));
         self.hand_back_focus(held, window, cx);
@@ -402,7 +419,7 @@ impl BackendsSettingsView {
     /// A hardware-CA paste-PEM input entity (test seam — behavior tests seed a
     /// PEM before calling `submit_ca`).
     #[doc(hidden)]
-    pub fn ca_input(&self, kind: CaKind) -> Entity<InputState> {
+    pub fn ca_input(&self, kind: CaKind) -> Entity<TextareaState> {
         match kind {
             CaKind::Root => self.root_ca_state.clone(),
             CaKind::Intermediate => self.intermediate_ca_state.clone(),
@@ -494,7 +511,7 @@ impl BackendsSettingsView {
     }
 
     /// Add the trusted measurement in the add field (the CLI's
-    /// `<snp>:<rtmr1>:<rtmr2>` triple). A parse/validation failure surfaces in
+    /// `<measurement>:<host_data>:<guest_policy>` spec). A parse/validation failure surfaces in
     /// the config store's op-error banner and the input is kept so the user
     /// can fix it; a successful add clears the field.
     pub fn submit_add_measurement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -519,13 +536,13 @@ impl BackendsSettingsView {
 
     /// Untrust a single measurement (by its SNP key). Removing the last one
     /// reverts to the pin.
-    pub fn untrust_measurement(&mut self, snp: String, cx: &mut Context<Self>) {
+    pub fn untrust_measurement(&mut self, key: String, cx: &mut Context<Self>) {
         self.config
-            .update(cx, |c, cx| c.untrust_measurement(snp, cx));
+            .update(cx, |c, cx| c.untrust_measurement(key, cx));
         cx.notify();
     }
 
-    /// Trust a measurement from an explicit `<snp>:<rtmr1>:<rtmr2>` triple
+    /// Trust a measurement from an explicit `<measurement>:<host_data>:<guest_policy>` spec
     /// (not the add-field). Backs the pin card's "Trust" verb — re-adding the
     /// build pin to a trusted set that overrode it. Failures land in the
     /// config store's op-error banner.
@@ -679,6 +696,12 @@ impl BackendsSettingsView {
     pub fn cancel_add(&mut self, cx: &mut Context<Self>) {
         self.add_form = None;
         cx.notify();
+    }
+
+    /// The pending llama.cpp add-form's auto-start setting (tests).
+    #[doc(hidden)]
+    pub fn add_auto_start_for_test(&self) -> Option<bool> {
+        self.add_form.as_ref().map(|form| form.auto_start)
     }
 
     /// Flip the pending llama.cpp add-form's auto-start checkbox.
@@ -1287,7 +1310,11 @@ impl BackendsSettingsView {
                         )
                         .flex_1()
                         .min_w_0()
-                        .child(Input::new(&self.url_state).aria_label("Model URL")),
+                        .child(
+                            Input::new(&self.url_state)
+                                .aria_label("Model URL")
+                                .py(crate::theme::INPUT_PY),
+                        ),
                 )
                 .child(
                     quiet_verb("models-url-download", "Download", cx)
@@ -1404,9 +1431,9 @@ impl BackendsSettingsView {
 
     /// A llamacpp backend's auto-start toggle: a gpui-component `Switch` wired
     /// to `update_backend`. Auto-start gates *request-triggered* engine loads;
-    /// an explicit Load ignores it. The probed wrapper carries the a11y
-    /// role/label + selected state for the QA driver; the `Switch` owns the
-    /// interaction and its own focus/keyboard handling.
+    /// an explicit Load ignores it. `Switch` is a focus-bearing control — the
+    /// widget is the accessible node (role, toggled state, focus, activation)
+    /// and the wrapper is a bounds-only probe for the QA driver.
     fn auto_start_toggle(
         &self,
         backend_id: &str,
@@ -1414,44 +1441,21 @@ impl BackendsSettingsView {
         cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
         let id = backend_id.to_string();
-        let id_click = id.clone();
-        let id_key = id.clone();
         div()
             .id(SharedString::from(format!("autostart-{id}")))
-            .probe(
+            .probe_bounds(
                 format!("settings/backends/{id}/autostart"),
-                gpui::Role::CheckBox,
+                gpui::Role::Switch,
                 "Start an engine automatically on request",
             )
-            // A checkbox's state is `toggled`, not `selected`:
-            // `accesskit_macos` reads `accessibilityValue` from `toggled()`
-            // first and only falls through to `is_selected()` for `Role::Tab`,
-            // so a `CheckBox` carrying only `aria_selected` reports **no
-            // value at all** — VoiceOver announces the control and not whether
-            // it is on.
-            .aria_toggled(auto_start.into())
-            // The wrapper owns the **keyboard** activation. Unlike `Button` /
-            // `Checkbox`, `gpui_component::Switch` tracks no focus handle at
-            // our pin, so there is nothing inside for Tab to reach — see
-            // `probe_delegating`'s doc for the other half of the rule. This does
-            // not double-fire on a pointer click: `Switch` handles the press
-            // in `on_mouse_down` and calls `stop_propagation`, so the wrapper
-            // never arms a click of its own (gpui bubbles mouse listeners
-            // innermost-first).
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.set_auto_start(id_key.clone(), !auto_start, cx);
-            }))
             .child(
-                // Switch sets no AccessKit role/label at our gpui-component
-                // rev, so the probed wrapper is the only node; if Switch gains
-                // self-annotation upstream, this site must join the
-                // `.role(None)` opt-out.
                 Switch::new(SharedString::from(format!("autostart-switch-{id}")))
+                    .accessibility_label("Start an engine automatically on request")
                     .small()
                     .checked(auto_start)
                     .label("Start an engine automatically when a request needs one")
                     .on_click(cx.listener(move |this, checked: &bool, _, cx| {
-                        this.set_auto_start(id_click.clone(), *checked, cx);
+                        this.set_auto_start(id.clone(), *checked, cx);
                     })),
             )
     }
@@ -1540,26 +1544,17 @@ impl BackendsSettingsView {
                         h_flex().pl(px(132.)).child(
                             div()
                                 .id("add-autostart")
-                                .probe(
+                                // The widget is the node; see `auto_start_toggle`.
+                                .probe_bounds(
                                     "settings/backends/add/autostart",
-                                    gpui::Role::CheckBox,
+                                    gpui::Role::Switch,
                                     "Start an engine automatically on request",
                                 )
-                                // See `autostart_row`: a checkbox's state is
-                                // `toggled`, which is what the adapter reads.
-                                .aria_toggled(form.auto_start.into())
-                                // The wrapper owns the keyboard activation —
-                                // see `autostart_row` for why.
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.toggle_add_auto_start(cx)),
-                                )
                                 .child(
-                                    // Switch sets no AccessKit role/label at
-                                    // our gpui-component rev (wrapper is the
-                                    // only node); if Switch gains
-                                    // self-annotation upstream, join the
-                                    // `.role(None)` opt-out.
                                     Switch::new("add-autostart-switch")
+                                        .accessibility_label(
+                                            "Start an engine automatically on request",
+                                        )
                                         .small()
                                         .checked(form.auto_start)
                                         .label("Start an engine automatically on request")
@@ -1821,6 +1816,7 @@ impl BackendsSettingsView {
                         .child(
                             Input::new(&self.base_url_state)
                                 .aria_label("Base URL")
+                                .py(crate::theme::INPUT_PY)
                                 .flex_1(),
                         ),
                 )
@@ -1839,7 +1835,7 @@ impl BackendsSettingsView {
                                 .on_click(cx.listener(|this, _, _, cx| this.save_base_url(cx)))
                                 .child(
                                     Button::new("eidola-save-base-url")
-                                        .role(None)
+                                        .role(RoleOverride::Presentational)
                                         .primary()
                                         .small()
                                         .label("Save")
@@ -1859,7 +1855,7 @@ impl BackendsSettingsView {
                                 )
                                 .child(
                                     Button::new("eidola-cancel-base-url")
-                                        .role(None)
+                                        .role(RoleOverride::Presentational)
                                         .ghost()
                                         .small()
                                         .label("Cancel")
@@ -2019,7 +2015,7 @@ impl BackendsSettingsView {
             let pin_trusted = trust
                 .trusted_measurements
                 .iter()
-                .any(|m| m.snp.eq_ignore_ascii_case(&pin.snp));
+                .any(|m| m.key() == pin.key());
             if !pin_trusted {
                 value = value.child(self.measurement_line(pin, MeasurementRole::PinNotTrusted, cx));
             }
@@ -2079,6 +2075,7 @@ impl BackendsSettingsView {
                         .child(
                             Input::new(&self.add_measurement_state)
                                 .aria_label("Add a trusted measurement")
+                                .py(crate::theme::INPUT_PY)
                                 .flex_1(),
                         ),
                 )
@@ -2139,8 +2136,9 @@ impl BackendsSettingsView {
         trust_row("Trusted measurements", cx, value).into_any_element()
     }
 
-    /// One compact measurement line: the middle-truncated SNP launch digest
-    /// (mono — the full `<snp>:<rtmr1>:<rtmr2>` triple travels via the Copy
+    /// One compact measurement line: the middle-truncated SEV-SNP launch
+    /// digest and HOST_DATA (mono — the full
+    /// `<measurement>:<host_data>:<guest_policy>` spec travels via the Copy
     /// verb and the a11y labels), a role tag, and the role's verbs. Copy is
     /// always offered; Untrust only on user-override entries (the build pin
     /// is never untrustable — `untrust_measurement` edits the *override*
@@ -2153,7 +2151,7 @@ impl BackendsSettingsView {
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         let theme = cx.theme();
-        let triple = measurement_triple(m);
+        let triple = m.spec();
         let slug = match role {
             MeasurementRole::Override(idx) => format!("{idx}"),
             MeasurementRole::Pinned | MeasurementRole::PinNotTrusted => "pin".to_string(),
@@ -2170,18 +2168,18 @@ impl BackendsSettingsView {
         let mut verbs = h_flex().gap_3().flex_none().text_xs().child(copy_verb(
             SharedString::from(format!("eidola-measurement-{slug}-copy")),
             format!("settings/backends/eidola/measurements/{slug}/copy"),
-            format!("Copy measurement {}", hex_summary(&m.snp)),
+            format!("Copy measurement {}", measurement_summary(m)),
             triple.clone(),
             cx,
         ));
         match role {
             MeasurementRole::Pinned => {}
             MeasurementRole::Override(idx) => {
-                let snp = m.snp.clone();
+                let key = m.key();
                 // Short in the name, whole in the value: a 64-character hex
                 // string as an accessible *name* is read out character by
                 // character every time the element is focused.
-                let aria = format!("Untrust measurement {}", hex_summary(&snp));
+                let aria = format!("Untrust measurement {}", measurement_summary(m));
                 verbs =
                     verbs.child(
                         quiet_verb(
@@ -2195,9 +2193,9 @@ impl BackendsSettingsView {
                             gpui::Role::Button,
                             aria,
                         )
-                        .aria_value(m.snp.clone())
+                        .aria_value(key.clone())
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.untrust_measurement(snp.clone(), cx)
+                            this.untrust_measurement(key.clone(), cx)
                         })),
                     );
             }
@@ -2227,7 +2225,7 @@ impl BackendsSettingsView {
                     .text_xs()
                     .font_family("Menlo")
                     .text_color(theme.muted_foreground)
-                    .child(SharedString::from(hex_summary(&m.snp))),
+                    .child(SharedString::from(measurement_summary(m))),
             )
             .when_some(tag, |line, tag| {
                 line.child(
@@ -2293,7 +2291,7 @@ impl BackendsSettingsView {
                         .w_full()
                         .flex()
                         .child(
-                            Input::new(state)
+                            Textarea::new(state)
                                 .aria_label(format!("Paste {label} PEM"))
                                 .flex_1(),
                         ),
@@ -2457,11 +2455,14 @@ fn hex_summary(hex: &str) -> String {
     }
 }
 
-/// The re-addable `<snp>:<rtmr1>:<rtmr2>` triple form of a measurement — the
-/// format the add field / CLI accept, and what the Copy verbs place on the
-/// clipboard.
-fn measurement_triple(m: &MeasurementInfo) -> String {
-    format!("{}:{}:{}", m.snp, m.tdx_rtmr1, m.tdx_rtmr2)
+/// A launch identity, short: the digest names the release image, HOST_DATA
+/// which deployment of it (the digest alone is the same for every one).
+fn measurement_summary(m: &MeasurementInfo) -> String {
+    format!(
+        "{} · {}",
+        hex_summary(&m.measurement),
+        hex_summary(&m.host_data)
+    )
 }
 
 /// A quiet "Copy" text verb that places `value` on the clipboard. Mirrors the
@@ -2628,7 +2629,11 @@ fn labeled_input(
                     .probe_bounds(probe_name.to_string(), gpui::Role::TextInput, label)
                     .flex_1()
                     .min_w_0()
-                    .child(Input::new(state).aria_label(label)),
+                    .child(
+                        Input::new(state)
+                            .aria_label(label)
+                            .py(crate::theme::INPUT_PY),
+                    ),
             ),
     );
     if !hint.is_empty() {

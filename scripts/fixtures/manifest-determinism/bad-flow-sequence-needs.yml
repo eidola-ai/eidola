@@ -1,0 +1,30 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# A flow sequence broken across lines. Everything the scanner needs is
+# below the key rather than after it, so a reader that only looks at the
+# key's own line finds an empty dependency list.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release-assets:
+    name: Publish release assets
+    runs-on: self-hosted
+    environment: apple-signing
+    steps:
+      - name: Publish
+        run: codesign --sign "Developer ID Application" Eidola.app
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs: [
+      release-assets
+    ]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full

@@ -1,0 +1,36 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# A merge key splices a mapping into the job, so `environment:` never
+# appears as a key in the job body at all. This form needs no anchor —
+# `<<:` takes an inline mapping — which is why the refusal is on the merge
+# key itself rather than on aliases alone.
+#
+# GitHub rejects `<<:` today (anchors shipped in 2025 without merge keys),
+# so this exact file would not run there. It is refused anyway: actions
+# that expand merge keys *before* GitHub parses the workflow exist, and a
+# shape that grants a protected environment invisibly should never sit in
+# this repo unremarked.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release-assets:
+    name: Publish release assets
+    runs-on: self-hosted
+    <<: {environment: apple-signing}
+    steps:
+      - name: Build the macOS artifacts
+        run: ./scripts/artifact-manifest.sh build-macos
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs:
+      - release-assets
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full

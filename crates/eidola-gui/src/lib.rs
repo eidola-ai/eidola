@@ -11,6 +11,11 @@ pub mod chrome;
 pub mod focus;
 pub mod general;
 pub mod i18n;
+/// The local control socket. Unix-only: the transport is a Unix domain socket,
+/// and the platforms this app ships on are macOS and Linux (a Windows port
+/// would answer on a named pipe with a DACL, which is a different door).
+#[cfg(unix)]
+pub mod ipc;
 pub mod library;
 pub mod lifecycle;
 pub mod loadable;
@@ -20,6 +25,11 @@ pub mod overlay;
 pub mod participants;
 mod plans;
 pub mod probe;
+/// The local inference proxy's listener — the second door this process opens.
+/// TCP rather than a Unix socket, because the point is that another tool
+/// reaches it the way it reaches any OpenAI-compatible server.
+pub mod proxy;
+pub mod proxy_settings;
 pub mod record;
 pub mod scrollbar;
 pub mod settings;
@@ -41,14 +51,14 @@ use gpui::{
     WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px, size,
 };
 use gpui_component::Root;
-use gpui_component_assets::Assets;
+use gpui_kit_assets::Assets;
 
 use crate::about::AboutView;
 use crate::actions::{
-    About, ActualSize, CheckForUpdates, CloseWindow, GetStarted, Hide, HideOthers, Minimize,
-    NewSpace, NewSpaceFromTemplate, OpenLibrary, OpenRecord, OpenSettings, Quit, QuitApp, Quote,
-    QuoteElsewhere, QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector, Zoom, ZoomIn,
-    ZoomOut,
+    About, ActualSize, CheckForUpdates, CloseWindow, FindInSpace, GetStarted, Hide, HideOthers,
+    Minimize, NewSpace, NewSpaceFromTemplate, OpenLibrary, OpenRecord, OpenSettings, Quit, QuitApp,
+    Quote, QuoteElsewhere, QuoteInReply, ShowAll, ToggleElementInspector, ToggleInspector,
+    ToggleProxy, Zoom, ZoomIn, ZoomOut,
 };
 use crate::library::LibraryView;
 use crate::lifecycle::LaunchOptions;
@@ -143,6 +153,11 @@ pub fn run_with(opts: LaunchOptions) {
 
     application.run(move |cx: &mut App| {
         gpui_component::init(cx);
+        // `chrome.rs` draws this app's client-side decorations; gpui-component's
+        // window border would stack a second set under them. On a
+        // server-decorated window (every macOS window) that border is a
+        // pass-through, so the opt-out needs no platform gate.
+        gpui_component::set_window_border_enabled(false, cx);
         theme::install(cx);
         // The source locale until `i18n::wire_config` below resolves the real
         // one — the same install-then-wire shape the theme uses.
@@ -177,6 +192,10 @@ pub fn run_with(opts: LaunchOptions) {
         stores.local_models.update(cx, |s, cx| s.refresh(cx));
         stores.spaces.update(cx, |s, cx| s.refresh(cx));
         stores.templates.update(cx, |s, cx| s.refresh(cx));
+        // The proxy's own refresh **is** what starts it: the store reconciles
+        // its listener against whatever the settings say, so a profile that
+        // left the proxy on comes back listening without a second mechanism.
+        stores.proxy.update(cx, |s, cx| s.refresh(cx));
 
         // Best-effort recovery of any in-flight credentials left over from a
         // previous run that crashed mid-spend. Owned by the WalletStore; the
@@ -203,12 +222,41 @@ pub fn run_with(opts: LaunchOptions) {
         // the next time one opens — no banners in chat windows.
         stores.update.read(cx).start_polling();
 
+        // The door another process knocks on. Bound in both launch modes and
+        // deliberately not tied to windows: ⌘Q retires the app and keeps this
+        // socket answering, because a process that still holds the database
+        // lock is exactly the process a command-line invocation needs to
+        // reach. A bind failure is a diagnostic, not a startup failure — see
+        // `crate::ipc`.
+        //
+        // **Closing it is not registered here.** It is the first step of the
+        // full shutdown, and the order between it and the engine teardown is a
+        // correctness property, so both live in one hook rather than in the
+        // sequence of two calls on this page (`lifecycle::install_shutdown`).
+        // **Both doors close together**, in the one closure the shutdown hook
+        // runs first. The proxy is the second thing in this process a peer can
+        // reach, and it can start billed work exactly as the control socket
+        // can, so "everything after this is teardown" has to be true of both.
+        let proxy_door = stores.proxy.read(cx).handle();
+        #[cfg(unix)]
+        let close_door = {
+            let socket = ipc::bind(&stores);
+            move || {
+                if let Some(socket) = &socket {
+                    socket.close();
+                }
+                proxy_door.retire();
+            }
+        };
+        #[cfg(not(unix))]
+        let close_door = move || proxy_door.retire();
+
         // The *full* shutdown drains the engines — and on macOS this hook
         // is the only thing that delivers it. ⌘Q no longer reaches it (it
         // retires the app instead, keeping the engines up, which is the
         // point); the status menu's Quit and a windowless SIGTERM do. See
-        // `lifecycle::install_engine_shutdown`.
-        lifecycle::install_engine_shutdown(&stores, bus_bridge, cx);
+        // `lifecycle::install_shutdown`.
+        lifecycle::install_shutdown(&stores, bus_bridge, close_door, cx);
 
         // Order matters: `cx.set_menus` snapshots the keymap when it builds
         // NSMenuItems and attaches each item's `keyEquivalent` from
@@ -350,6 +398,8 @@ fn install_menus(cx: &mut App) {
                 MenuItem::Separator,
                 MenuItem::action("Library…", OpenLibrary),
                 MenuItem::action("Record…", OpenRecord),
+                MenuItem::separator(),
+                MenuItem::action("Start/Stop Proxy", ToggleProxy),
                 MenuItem::Separator,
                 MenuItem::action("Hide Eidola", Hide),
                 MenuItem::action("Hide Others", HideOthers),
@@ -402,6 +452,11 @@ fn install_menus(cx: &mut App) {
                     gpui_component::input::SelectAll,
                     OsAction::SelectAll,
                 ),
+                MenuItem::Separator,
+                // Find acts on the focused conversation, like the standard
+                // Edit-menu Find of any document app. Registered
+                // per-`SpaceView`, so macOS greys it with no space window.
+                MenuItem::action("Find in Conversation", FindInSpace),
                 MenuItem::Separator,
                 // Quoting is an Edit-menu verb because it acts on the
                 // *selection*, like Cut/Copy. Both handlers are registered
@@ -511,6 +566,9 @@ pub fn install_keybindings(cx: &mut App) {
         // ⌥⌘I shows/hides the space window's inspector (Xcode/Finder); the
         // development overlay uses the shifted variant instead.
         KeyBinding::new("secondary-alt-i", ToggleInspector, None),
+        // ⌘F opens the conversation's find bar (unclaimed by the editor's own
+        // keymap, so nothing has to give it up).
+        KeyBinding::new("secondary-f", FindInSpace, None),
         KeyBinding::new("secondary-alt-shift-i", ToggleElementInspector, None),
         // View → type size. ⌘0 / Ctrl+0 resets; ⌘=/⌘+ zooms in (both the bare
         // `=` and the shifted `+` that shares the key, so either keypress
@@ -649,6 +707,22 @@ fn install_action_handlers(cx: &mut App) {
             return;
         }
         open_library_window(cx);
+    });
+
+    // Start/Stop Proxy. **A toggle over stored intent, never over the socket.**
+    // The listener is reconciled against the settings wherever they moved, so
+    // this writes the same `enabled` the pane's switch writes and every window
+    // — and every surface — sees one answer.
+    cx.on_action(|_: &ToggleProxy, cx: &mut App| {
+        let proxy = cx.global::<AppGlobal>().stores.proxy.clone();
+        proxy.update(cx, |s, cx| {
+            // A settings read that has not answered says nothing about what
+            // the reader wants, so the press is a no-op rather than a guess.
+            let Some(enabled) = s.settings().value().map(|v| v.enabled) else {
+                return;
+            };
+            s.set_enabled(!enabled, cx);
+        });
     });
 
     cx.on_action(|_: &OpenRecord, cx: &mut App| {
@@ -810,7 +884,7 @@ fn try_focus_existing_onboarding(cx: &mut App) -> bool {
 /// tree's otherwise-anonymous root node. It paints nothing: gpui_macos pairs
 /// `titlebarAppearsTransparent` with `NSWindowTitleHidden`, so the string
 /// never reaches the title bar.
-fn transparent_titlebar() -> TitlebarOptions {
+pub fn transparent_titlebar() -> TitlebarOptions {
     TitlebarOptions {
         title: None,
         appears_transparent: true,
@@ -884,6 +958,12 @@ fn retitle_windows(cx: &mut App) {
     }
     if let Some(handle) = cx.global::<AppGlobal>().about_window {
         let title = i18n::msg::about_window_title(cx);
+        handle
+            .update(cx, |_, window, _| window.set_window_title(&title))
+            .ok();
+    }
+    if let Some(handle) = cx.global::<AppGlobal>().onboarding_window {
+        let title = i18n::msg::onboarding_window_title(cx);
         handle
             .update(cx, |_, window, _| window.set_window_title(&title))
             .ok();
@@ -966,7 +1046,7 @@ pub fn open_new_space_window(cx: &mut App, stores: Stores) {
 /// the page isn't lost in the middle of a 4K display. Both fall back to fixed
 /// values with no primary display (rare; offscreen render contexts), and the
 /// width yields to a display too narrow to show it.
-fn writing_surface_size(cx: &mut App) -> (f32, f32) {
+pub fn writing_surface_size(cx: &mut App) -> (f32, f32) {
     let width = (space_view::layout::full_measure_page_width()
         + chrome::opening_content_inset() * 2.)
         .as_f32();
@@ -1112,7 +1192,7 @@ fn open_onboarding_window(cx: &mut App) {
 
     let handle = cx.open_window(opts, |window, cx| {
         theme::observe_window_appearance(window);
-        window.set_window_title("Get Started");
+        window.set_window_title(&i18n::msg::onboarding_window_title(cx));
         let view = cx.new(|cx| OnboardingView::new(stores.clone(), window, cx));
         let view = chrome::ChromeRoot::wrap(view.into(), cx);
         cx.new(|cx| chrome::themed_root(view, window, cx))

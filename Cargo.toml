@@ -61,6 +61,17 @@ publish = false
 [profile.dev.package."*"]
 opt-level = 2
 
+# The engine's f32 reference numerics are the exception among our own crates:
+# their tests run real (if tiny) model forwards, and unoptimized they dominate
+# `cargo test` — the CPU executor's suite alone took 6 min wall / ~2,900 CPU-s
+# at opt-level 0, and the model + CPU executor suites together take 18 s at 3
+# (M4 Max). Their tests still run under debug assertions.
+[profile.dev.package.eidola-engine-model]
+opt-level = 3
+
+[profile.dev.package.eidola-engine-cpu]
+opt-level = 3
+
 [profile.docker-dev]
 inherits = "dev"
 opt-level = 1
@@ -85,3 +96,16 @@ opt-level = 3
 strip = true
 # Explicit overflow check setting
 overflow-checks = false
+
+# gpui-component's `eidola-0.7` branch: the 0.7.0 release plus one commit,
+# an app-level opt-out for its window border
+# (`set_window_border_enabled`), so the GUI's own Linux client-side
+# decorations stay the only ones. Every crate published from that repo that
+# we resolve is patched, so the lock holds one copy of each. The members
+# keep their `=0.7.0` requirements; remove this block when a released
+# gpui-component carries the opt-out.
+[patch.crates-io]
+gpui-component = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola-0.7" }
+gpui-base = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola-0.7" }
+gpui-component-macros = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola-0.7" }
+gpui-kit-assets = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola-0.7" }

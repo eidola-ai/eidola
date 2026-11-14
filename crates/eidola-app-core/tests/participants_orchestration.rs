@@ -854,11 +854,10 @@ fn post_reply_rejects_reply_to_from_another_space() {
     });
 }
 
-/// The default label the seeded agent gets from `DEFAULT_MODEL` (mirrors
-/// `db::default_agent_label`). MODEL == DEFAULT_MODEL in the harness.
+/// The label of the harness profile's default agent, which `core_for` seats
+/// on the mock's `MODEL` (`chat_harness::DEFAULT_AGENT_LABEL`).
 fn default_agent_label() -> String {
-    // `gemma4-31b` → `Gemma4 31b` (see db::default_agent_label).
-    "Gemma4 31b".to_string()
+    chat_harness::DEFAULT_AGENT_LABEL.to_string()
 }
 
 // ===========================================================================
@@ -1384,6 +1383,143 @@ fn a_remote_routers_hold_is_settled_when_the_body_read_fails() {
     });
 }
 
+/// **A remote router's hold is the request fee and the byte contract's
+/// prompt and ceiling, and it never declares a cached prefix**: a chore is a
+/// one-shot prompt with no lineage, so it carries no key and has nothing to
+/// claim. The mock recomputes the hold and would refuse any other.
+#[test]
+fn a_remote_routers_hold_carries_the_fee_and_no_declaration() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            router: chat_harness::RouterBehavior::Reply(r#"{"notify": []}"#.into()),
+            cached_prompt_price: Some((1, 4)),
+            engine_prompt_tokens: Some(0),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let (space, post) = space_with_two_candidates(&core);
+        core.runtime()
+            .block_on(core.set_space_router_model(
+                space.clone(),
+                Some(chat_harness::ROUTER_REMOTE_MODEL.into()),
+            ))
+            .expect("set remote router model");
+        let _ = planned(&core, &space, &post);
+
+        let bodies = mock.chat_bodies();
+        let charges = mock.chat_charges();
+        let (body, charge) = bodies
+            .iter()
+            .zip(&charges)
+            .find(|(b, _)| b["model"] == chat_harness::ROUTER_REMOTE_MODEL)
+            .expect("the router was asked");
+        assert!(body.get("cached_prefix").is_none() && body.get("cache_key").is_none());
+        let messages = body["messages"].as_array().unwrap();
+        let prompt = eidola_common::prompt_charge(messages, None).chargeable_prompt_tokens();
+        let ceiling = body["max_completion_tokens"].as_u64().unwrap();
+        assert_eq!(
+            *charge,
+            Some(chat_harness::REQUEST_FEE + u128::from(prompt + ceiling))
+        );
+        assert_eq!(mock.hold_mismatches(), 0);
+    });
+}
+
+/// **A remote router's answer cut short at the gateway is no routing
+/// decision, and its hold settles on the refund the stream carried.** The
+/// chore asks the Eidola gateway for a stream; one that ends without finishing
+/// degrades the refinement like any router failure, and the in-band refund —
+/// the only copy, under `NotStored` — settles the hold.
+#[test]
+fn a_remote_routers_answer_cut_short_degrades_and_settles_in_band() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::StreamingCutShortWithRefund,
+            refund: chat_harness::RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let (space, post) = space_with_two_candidates(&core);
+        core.runtime()
+            .block_on(core.set_space_router_model(
+                space.clone(),
+                Some(chat_harness::ROUTER_REMOTE_MODEL.into()),
+            ))
+            .expect("set remote router model");
+
+        let mechanical = mechanical_turns(&core, &space, &post);
+        assert_eq!(
+            planned(&core, &space, &post),
+            NotificationPlan::Turns(mechanical),
+            "a cut answer degrades like any other router failure"
+        );
+        assert_eq!(mock.blocking_asks(), 0, "the chore asked for a stream");
+        assert_eq!(mock.refund_hits(), 0, "settled from the refund in band");
+        let lifecycle = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("wallet lifecycle");
+        assert!(
+            !lifecycle.iter().any(|c| c.state == "spending"),
+            "no credential is left stranded; got {lifecycle:?}"
+        );
+    });
+}
+
+/// A space's router model can go stale exactly as a participant's can — the
+/// catalog stops listing the row and nothing un-picks the space.
+///
+/// **The router's answer to that is its answer to every failure: degrade,
+/// never block, and never substitute.** A post is not worth blocking on a
+/// routing decision, so the mechanical candidate set stands unrefined; what
+/// must not happen is the refinement quietly running against some *other*
+/// model, which would let a retired row silently change who answers. Asserted
+/// by the request log: not one chat request was sent.
+#[test]
+fn a_router_whose_model_left_the_catalog_degrades_without_substituting() {
+    run(|| {
+        let omissions = chat_harness::catalog_omissions();
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            catalog_omits: omissions.clone(),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let (space, post) = space_with_two_candidates(&core);
+        // A *remote* router: the eidola backend, whose catalog is the one that
+        // can lose a row.
+        core.runtime()
+            .block_on(core.set_space_router_model(
+                space.clone(),
+                Some(chat_harness::ROUTER_REMOTE_MODEL.into()),
+            ))
+            .expect("set remote router model");
+        omissions
+            .lock()
+            .expect("omissions")
+            .push(chat_harness::ROUTER_REMOTE_MODEL.into());
+
+        let mechanical = mechanical_turns(&core, &space, &post);
+        assert_eq!(
+            planned(&core, &space, &post),
+            NotificationPlan::Turns(mechanical),
+            "a stale router model degrades like any other router failure"
+        );
+        assert!(
+            mock.chat_bodies().is_empty(),
+            "no model was asked to route in its place; got {:?}",
+            mock.chat_bodies()
+        );
+        let lifecycle = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("wallet lifecycle");
+        assert!(
+            lifecycle.iter().all(|c| c.state != "spending"),
+            "the refusal lands before any hold; got {lifecycle:?}"
+        );
+    });
+}
+
 /// The router picks *who answers*, so a post whose meaning lives in a quoted
 /// passage has to reach it as that passage — the same `post_body` rendering
 /// `read_thread` gives a model, not the literal `{{ embed N }}` marker (which
@@ -1565,8 +1701,14 @@ fn the_decline_name_alone_is_not_a_decline_without_the_tool_registered() {
         // Same scripted `decline` call, but the registry never got the tool:
         // the model gets an ordinary unknown-tool result and the turn goes on
         // to answer normally.
+        // **The SSE twin, because the turn below is a streaming one.** Pointed
+        // at the blocking body this asked `respond_stream_as` to read a
+        // completion as a stream: no `data:` frames, so no tool call, so no
+        // loop — and the assertion passed vacuously on an empty answer,
+        // exercising none of what it names. The unterminated-stream rule is
+        // what made that visible.
         let (_mock, core, _dir) = chat_harness::core_for(MockConfig {
-            chat: ChatBehavior::DeclineBlocking,
+            chat: ChatBehavior::DeclineStreaming,
             ..MockConfig::default()
         });
         with_account(&core);

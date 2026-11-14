@@ -1,0 +1,36 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# A composition: the escape from one refusal inside the mapping form of
+# another. Neither construct is new — an escaped scalar is refused, and the
+# mapping form of `environment:` is read — but a checker with a rule per
+# parse site examines the mapping's whole text, sees it start with `name:`,
+# and never asks the escape question about the scalar inside it.
+#
+# This is why values reach one classifier: whichever spelling of
+# `environment:` a job uses, the scalar inside it is read by the same gate.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release-assets:
+    name: Publish release assets
+    runs-on: self-hosted
+    environment:
+      name: "apple\u002dsigning"
+      url: https://example.invalid/deployment
+    steps:
+      - name: Build the macOS artifacts
+        run: ./scripts/artifact-manifest.sh build-macos
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs:
+      - release-assets
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full

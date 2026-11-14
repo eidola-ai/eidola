@@ -49,6 +49,8 @@ pub fn fixture_post(
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
+        continuable: false,
     }
 }
 
@@ -460,7 +462,11 @@ pub fn delegation_report_posts() -> Vec<PostNode> {
             range_start: Some(0),
             range_end: Some(66),
             annotation: None,
-            delegation_end: Some(DelegationEnd::Paused { depth: 2, limit: 2 }),
+            delegation_end: Some(DelegationEnd::Paused {
+                depth: 2,
+                limit: 2,
+                truncated: false,
+            }),
             snippet: Some("high water is 06:12 and 18:40; the evening one is the spring".into()),
             antecedent_author_label: "Surveyor".into(),
             antecedent_author_kind: "agent".into(),
@@ -472,7 +478,11 @@ pub fn delegation_report_posts() -> Vec<PostNode> {
             range_start: Some(0),
             range_end: Some(58),
             annotation: None,
-            delegation_end: Some(DelegationEnd::Paused { depth: 2, limit: 2 }),
+            delegation_end: Some(DelegationEnd::Paused {
+                depth: 2,
+                limit: 2,
+                truncated: false,
+            }),
             snippet: Some("we would be crossing the bar on the ebb, which I would not".into()),
             antecedent_author_label: "Pilot".into(),
             antecedent_author_kind: "agent".into(),
@@ -844,6 +854,7 @@ pub fn destination_spaces() -> Vec<eidola_app_core::SpaceInfo> {
         last_activity_at: ts,
         message_count: 6,
         archived_at: None,
+        parent: None,
     };
     vec![
         space("demo", "Thrasymachus and the shepherd", 3),

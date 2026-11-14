@@ -1,0 +1,11 @@
+# Dev-only tooling for regenerating test fixtures (never a build input).
+# Python 3.12.
+transformers==5.19.0
+jinja2==3.1.6
+tokenizers==0.23.2
+# SGLang's function_call sources are executed from a checkout of
+# sgl-project/sglang at commit 0b635266d4a09f8db2d12bdcb793b085199faa8f;
+# these are the packages those modules import.
+orjson==3.13.0
+partial-json-parser==0.2.1.1.post7
+pydantic==2.13.5

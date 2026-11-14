@@ -19,6 +19,10 @@
 //! `backed_stores` therefore calls `cx.executor().allow_parking()`, the
 //! upstream idiom for tests that intentionally mix real OS threads; it
 //! disables the detector without changing what these tests assert.
+//!
+//! Teardown is a barrier, not a hope: the keepalive each test binds is a
+//! [`Backing`], whose `Drop` waits for the core's runtime to go idle before the
+//! last `Arc<AppCore>` can be dropped by a tokio worker.
 
 use std::sync::Arc;
 
@@ -26,6 +30,7 @@ use eidola_app_core::changes::{Change, ChangeOrigin};
 use eidola_app_core::{AppCore, SpaceMessage};
 use gpui::{AppContext, TestAppContext};
 
+use eidola_gui::stores::proxy::{Landing, ProxyOp, SettingsEdit};
 use eidola_gui::stores::{self, SpacesStore, Stores};
 
 /// A real `AppCore` over tempdirs with an unreachable base URL. Its async
@@ -45,12 +50,17 @@ fn test_core() -> (Arc<AppCore>, tempfile::TempDir) {
     (Arc::new(core), dir)
 }
 
-fn backed_stores(cx: &mut TestAppContext) -> (Stores, tempfile::TempDir) {
+#[path = "support/backing.rs"]
+mod backing;
+use backing::Backing;
+
+fn backed_stores(cx: &mut TestAppContext) -> (Stores, Backing) {
     // Declare the real tokio runtime to the test scheduler (see module docs).
     cx.executor().allow_parking();
     let (core, dir) = test_core();
-    let stores = cx.update(|cx| Stores::for_test(core, cx));
-    (stores, dir)
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    let backing = Backing::with_app(core, dir, cx);
+    (stores, backing)
 }
 
 /// The wave-2 launch-order bug: the first window's model list never loaded
@@ -65,7 +75,7 @@ fn backed_stores(cx: &mut TestAppContext) -> (Stores, tempfile::TempDir) {
 /// without running the (unreachable) network task.
 #[gpui::test]
 fn launch_order_does_not_starve_models(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     // Launch sequence, in the order `lib.rs::run()` issues it: startup wallet
     // recovery first, then the first chat window triggers the models refresh.
@@ -99,7 +109,7 @@ fn launch_order_does_not_starve_models(cx: &mut TestAppContext) {
 /// exercises). A `Lagged` (`None`) refreshes everything.
 #[gpui::test]
 fn bus_bridge_dispatches_wallet_change(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     // Idle to start: nothing refreshed yet.
     stores.wallet.read_with(cx, |w, _| assert!(!w.is_loading()));
@@ -141,7 +151,7 @@ fn bus_bridge_dispatches_wallet_change(cx: &mut TestAppContext) {
 /// open Record window never learned the trail grew (codex finding, PR #179).
 #[gpui::test]
 fn bus_bridge_routes_record_change_to_record_store(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     assert_eq!(stores.record.read_with(cx, |r, _| r.epoch()), 0);
 
@@ -168,7 +178,7 @@ fn bus_bridge_routes_record_change_to_record_store(cx: &mut TestAppContext) {
 /// asserted — the tasks' results need no network.
 #[gpui::test]
 fn bus_bridge_routes_backends_change(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     stores.backends.read_with(cx, |b, _| {
         assert!(
@@ -202,7 +212,7 @@ fn bus_bridge_routes_backends_change(cx: &mut TestAppContext) {
 /// one drives the (purely local-DB) tasks to completion by polling.
 #[gpui::test]
 fn backends_op_failure_refreshes_registry(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     // Load the real registry (a local DB read — no network involved).
     stores.backends.update(cx, |b, cx| b.refresh(cx));
@@ -306,7 +316,7 @@ fn spaces_registry_joins_existing_and_new_spaces_are_distinct(cx: &mut TestAppCo
 fn space_mutation_failure_restarts_superseded_load(cx: &mut TestAppContext) {
     use eidola_app_core::error::AppError;
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     // Opening an existing space kicks the initial transcript load — a live
     // task in the load slot (this also stands in for a bus-driven refresh,
@@ -358,7 +368,7 @@ fn space_mutation_failure_restarts_superseded_load(cx: &mut TestAppContext) {
 /// a cancelled predecessor.
 #[gpui::test]
 fn refresh_supersede_cancels_predecessor(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     // First refresh starts a task and enters Loading.
     stores.account.update(cx, |s, cx| s.refresh_balances(cx));
@@ -392,7 +402,7 @@ fn refresh_supersede_cancels_predecessor(cx: &mut TestAppContext) {
 fn config_store_circadian_settings_write_through(cx: &mut TestAppContext) {
     use eidola_app_core::config::{AppearanceSetting, LightCharacter, TimeOfDayTint};
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     stores.config.read_with(cx, |c, _| {
         let s = c.state().expect("backed store seeds a snapshot");
@@ -424,7 +434,7 @@ fn config_store_circadian_settings_write_through(cx: &mut TestAppContext) {
 fn config_store_zoom_ladder_writes_through(cx: &mut TestAppContext) {
     use eidola_app_core::config::{FONT_SCALE_DEFAULT, FONT_SCALE_MAX, FONT_SCALE_MIN};
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     // Fresh backed store opens at Actual Size.
     stores.config.read_with(cx, |c, _| {
@@ -484,9 +494,14 @@ fn config_store_zoom_ladder_writes_through(cx: &mut TestAppContext) {
 /// is being asserted.
 #[gpui::test]
 fn a_quiesced_bus_bridge_dispatches_nothing(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, mut backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores have a core");
     let bridge = cx.update(|cx| stores::install_bus_bridge(&stores, cx));
+    // The bridge's tokio half is a forwarding loop that outlives this body —
+    // it ends with its gpui counterpart, at `cx` teardown. It captures only a
+    // `broadcast::Receiver` and an mpsc `Sender`, so it holds no
+    // `Arc<AppCore>` and the drain barrier has nothing to wait for.
+    backing.excuse_ownerless_tasks(1);
 
     // A real write on the core emits `Change::SpaceIndex`; the bridge should
     // carry it into the SpacesStore without anyone asking.
@@ -537,7 +552,7 @@ fn a_quiesced_bus_bridge_dispatches_nothing(cx: &mut TestAppContext) {
 /// would have left behind.
 #[gpui::test]
 fn template_router_write_survives_a_refresh_landing_mid_op(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     stores.templates.update(cx, |s, cx| {
@@ -616,7 +631,7 @@ fn wait_until(
 /// op's future has been polled even once.
 #[gpui::test]
 fn a_refresh_landing_mid_write_keeps_the_templates_ops_error(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     stores.templates.update(cx, |s, cx| s.refresh(cx));
@@ -669,7 +684,7 @@ fn a_refresh_landing_mid_write_keeps_the_templates_ops_error(cx: &mut TestAppCon
 /// drove `refresh_all` into their slot.
 #[gpui::test]
 fn a_refresh_landing_mid_write_keeps_the_participants_ops_error(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space = core
         .runtime()
@@ -728,7 +743,7 @@ fn a_refresh_landing_mid_write_keeps_the_participants_ops_error(cx: &mut TestApp
 /// correct even on a bus-less run.
 #[gpui::test]
 fn space_settings_write_through_and_reread(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space = core
         .runtime()
@@ -789,7 +804,7 @@ fn space_settings_write_through_and_reread(cx: &mut TestAppContext) {
 /// re-read.
 #[gpui::test]
 fn a_refresh_landing_mid_write_keeps_the_space_settings_op_error(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space = core
         .runtime()
@@ -836,7 +851,7 @@ fn a_refresh_landing_mid_write_keeps_the_space_settings_op_error(cx: &mut TestAp
 /// looking at should pay for a re-read.
 #[gpui::test]
 fn a_space_change_re_reads_only_cached_settings(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     cx.update(|cx| {
         stores::dispatch_change_for_test(&stores, Some(Change::Space("unseen".into())), cx)
@@ -866,6 +881,7 @@ fn stale_row(id: &str) -> eidola_app_core::SpaceInfo {
         last_activity_at: ts,
         message_count: 2,
         archived_at: None,
+        parent: None,
     }
 }
 
@@ -878,7 +894,7 @@ fn stale_row(id: &str) -> eidola_app_core::SpaceInfo {
 /// exit, reconciling the cached index back to what the database holds.
 #[gpui::test]
 fn a_refused_rename_reconciles_the_index_and_surfaces_the_refusal(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let real = core
         .runtime()
@@ -935,7 +951,7 @@ fn a_refused_rename_reconciles_the_index_and_surfaces_the_refusal(cx: &mut TestA
 /// is what the re-list has to take back.
 #[gpui::test]
 fn an_archive_that_changed_nothing_says_so(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space = core
         .runtime()
@@ -980,7 +996,7 @@ fn an_archive_that_changed_nothing_says_so(cx: &mut TestAppContext) {
 /// never did — a refused rename indistinguishable from an accepted one.
 #[gpui::test]
 fn a_refresh_landing_mid_rename_keeps_the_spaces_ops_error(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let real = core
         .runtime()
@@ -1022,7 +1038,7 @@ fn a_refresh_landing_mid_rename_keeps_the_spaces_ops_error(cx: &mut TestAppConte
 /// here, which is the narrowest form of it (the first has not run at all).
 #[gpui::test]
 fn two_renames_on_two_spaces_both_land(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let a = core
         .runtime()
@@ -1078,7 +1094,7 @@ fn two_renames_on_two_spaces_both_land(cx: &mut TestAppContext) {
 /// the **last** mutation, not eat either one's continuation.
 #[gpui::test]
 fn two_refused_mutations_each_keep_their_own_refusal(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let real = core
         .runtime()
@@ -1130,7 +1146,7 @@ fn two_refused_mutations_each_keep_their_own_refusal(cx: &mut TestAppContext) {
 /// — never either optimistic one.
 #[gpui::test]
 fn a_superseded_rename_leaves_no_optimism_behind(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let real = core
         .runtime()
@@ -1177,11 +1193,12 @@ fn a_superseded_rename_leaves_no_optimism_behind(cx: &mut TestAppContext) {
 /// **The assertion has to be a stability one.** A batch's optimistic edits agree
 /// with the database the moment its writes commit, so comparing once passes long
 /// before the resolution lands — the defect is precisely a *later* read putting
-/// something staler on screen. So the comparison is held for a while after it
-/// first holds, and any drift fails.
+/// something staler on screen. So the comparison is taken again once everything
+/// the batch started has settled — the resolution included — and any drift
+/// fails.
 #[gpui::test]
 fn a_batch_of_renames_lands_on_a_listing_read_after_all_of_them(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let a = core
         .runtime()
@@ -1235,13 +1252,11 @@ fn a_batch_of_renames_lands_on_a_listing_read_after_all_of_them(cx: &mut TestApp
             agrees(cx).is_ok()
         });
         // …and stays there. A resolution taken from a snapshot older than the
-        // batch's last write lands after this point and would drift back.
-        for _ in 0..40 {
-            cx.run_until_parked();
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            if let Err(drift) = agrees(cx) {
-                panic!("the index drifted after the batch settled: {drift}");
-            }
+        // batch's last write lands after this point and would drift back, and
+        // once the app and the runtime have settled it has landed.
+        backing.settle();
+        if let Err(drift) = agrees(cx) {
+            panic!("the index drifted after the batch settled: {drift}");
         }
     }
 }
@@ -1252,7 +1267,7 @@ fn a_batch_of_renames_lands_on_a_listing_read_after_all_of_them(cx: &mut TestApp
 /// the dispatcher is what makes one signal answer for two domains.
 #[gpui::test]
 fn a_participants_change_reaches_the_agent_library(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     stores
         .agents
         .read_with(cx, |a, _| assert!(!a.agents().is_loading()));
@@ -1267,7 +1282,7 @@ fn a_participants_change_reaches_the_agent_library(cx: &mut TestAppContext) {
 
     // A templates change is not one of its signals — the library holds no
     // template rows.
-    let (other, _dir2) = backed_stores(cx);
+    let (other, _backing2) = backed_stores(cx);
     cx.update(|cx| stores::dispatch_change_for_test(&other, Some(Change::Templates), cx));
     other.agents.read_with(cx, |a, _| {
         assert!(
@@ -1317,7 +1332,7 @@ fn two_shared_agents(cx: &mut TestAppContext, stores: &Stores) -> (String, Strin
 /// independent — and the resolving read is taken once the **last** one settles.
 #[gpui::test]
 fn two_writes_on_two_agents_both_land(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let (a, b) = two_shared_agents(cx, &stores);
 
@@ -1362,7 +1377,7 @@ fn two_writes_on_two_agents_both_land(cx: &mut TestAppContext) {
 /// row the reader was looking at.
 #[gpui::test]
 fn two_refused_agent_writes_each_keep_their_own_refusal(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let (a, b) = two_shared_agents(cx, &stores);
 
     // An invalid notify policy is refused before any write (zero trace).
@@ -1411,7 +1426,7 @@ fn two_refused_agent_writes_each_keep_their_own_refusal(cx: &mut TestAppContext)
 /// the persona back with it and the refusal leaves zero trace.
 #[gpui::test]
 fn a_share_that_loses_the_race_writes_no_persona(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space = core
         .runtime()
@@ -1485,7 +1500,7 @@ fn a_share_that_loses_the_race_writes_no_persona(cx: &mut TestAppContext) {
 /// wants and lets one transaction decide the verb.
 #[gpui::test]
 fn a_grant_that_loses_the_race_to_a_promotion_still_adds_the_membership(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let home = core
         .runtime()
@@ -1537,7 +1552,7 @@ fn a_grant_that_loses_the_race_to_a_promotion_still_adds_the_membership(cx: &mut
 /// settles.
 #[gpui::test]
 fn two_writes_on_two_participants_of_one_space_both_land(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space = core
         .runtime()
@@ -1606,7 +1621,7 @@ fn two_writes_on_two_participants_of_one_space_both_land(cx: &mut TestAppContext
 /// never learn their other action was refused too.
 #[gpui::test]
 fn two_refused_participant_writes_each_keep_their_own_refusal(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space = core
         .runtime()
@@ -1679,7 +1694,7 @@ fn two_refused_participant_writes_each_keep_their_own_refusal(cx: &mut TestAppCo
 /// to ride the write.
 #[gpui::test]
 fn a_stale_owned_save_refuses_once_the_row_is_shared(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space = core
         .runtime()
@@ -1754,7 +1769,7 @@ fn a_stale_owned_save_refuses_once_the_row_is_shared(cx: &mut TestAppContext) {
 /// ran last).
 #[gpui::test]
 fn two_saves_on_one_agent_are_sequenced(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let (agent, _b) = two_shared_agents(cx, &stores);
 
@@ -1813,7 +1828,7 @@ fn two_saves_on_one_agent_are_sequenced(cx: &mut TestAppContext) {
 /// an override is written per space), so the answer is **every** live space.
 #[gpui::test]
 fn a_participants_change_re_reads_a_live_transcript(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let posted = core
@@ -1866,7 +1881,7 @@ fn a_participants_change_re_reads_a_live_transcript(cx: &mut TestAppContext) {
 /// the recovery claimed to have refreshed all state.
 #[gpui::test]
 fn a_lagged_bus_re_reads_a_live_transcript(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let posted = core
@@ -1914,7 +1929,7 @@ fn a_lagged_bus_re_reads_a_live_transcript(cx: &mut TestAppContext) {
 /// recorded and replayed once the last mutation or turn settles.
 #[gpui::test]
 fn a_participants_change_arriving_mid_operation_is_replayed(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let posted = core
@@ -1972,7 +1987,7 @@ fn a_participants_change_arriving_mid_operation_is_replayed(cx: &mut TestAppCont
 /// report into the conversation the reader is mid-turn in.
 #[gpui::test]
 fn an_unattended_space_change_arriving_mid_operation_is_replayed(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let posted = core
@@ -2026,7 +2041,7 @@ fn an_unattended_space_change_arriving_mid_operation_is_replayed(cx: &mut TestAp
 /// announces the room it closed); a post is what makes the loss observable.
 #[gpui::test]
 fn a_caller_space_change_from_another_window_is_replayed(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let posted = core
@@ -2075,7 +2090,7 @@ fn a_caller_space_change_from_another_window_is_replayed(cx: &mut TestAppContext
 /// the property the ownership test was protecting, without its false premise.
 #[gpui::test]
 fn a_caller_space_change_the_read_already_covers_costs_no_re_read(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let posted = core
@@ -2132,7 +2147,7 @@ fn a_caller_space_change_the_read_already_covers_costs_no_re_read(cx: &mut TestA
 /// announced is absent. Rejecting the older read holds both halves.
 #[gpui::test]
 fn a_transcript_read_that_lands_out_of_order_is_rejected(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let posted = core
@@ -2214,7 +2229,7 @@ fn a_transcript_read_that_lands_out_of_order_is_rejected(cx: &mut TestAppContext
 /// has not reached the runtime when the post's does.
 #[gpui::test]
 fn a_first_post_into_a_brand_new_space_waits_out_its_insert(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let space = stores.spaces.update(cx, |s, cx| s.create(cx));
@@ -2248,7 +2263,7 @@ fn a_first_post_into_a_brand_new_space_waits_out_its_insert(cx: &mut TestAppCont
 /// out to name.
 #[gpui::test]
 fn a_post_into_a_space_that_was_never_created_is_refused(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let space = stores.spaces.update(cx, |s, cx| s.create(cx));
@@ -2282,13 +2297,9 @@ fn a_post_into_a_space_that_was_never_created_is_refused(cx: &mut TestAppContext
         )),
         "the draft is still accepted — the refusal is reported, not guessed at"
     );
-    for _ in 0..40 {
-        cx.run_until_parked();
-        if !space.read_with(cx, |s, _| s.is_busy()) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    // Everything the save started has finished — so a save still busy now is
+    // one waiting on something that will never come.
+    backing.settle();
     assert!(
         !space.read_with(cx, |s, _| s.is_busy()),
         "the save settles instead of waiting on a creation that already failed"
@@ -2315,7 +2326,7 @@ fn a_post_into_a_space_that_was_never_created_is_refused(cx: &mut TestAppContext
 /// gate defers rather than discards, and the save's exit replays it.
 #[gpui::test]
 fn a_participants_change_reaches_a_brand_new_space_mid_save(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     // ⌘N: the id is minted here and the row commits behind the window.
@@ -2406,7 +2417,7 @@ fn an_identity_switch_drops_the_previous_accounts_subscription(cx: &mut TestAppC
     use eidola_app_core::{SubscriptionInfo, SubscriptionState};
     use eidola_gui::loadable::Loadable;
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     stores.account.update(cx, |s, cx| {
         s.set_subscription_for_test(
@@ -2450,7 +2461,7 @@ fn a_refused_account_operation_leaves_the_subscription_alone(cx: &mut TestAppCon
     use eidola_app_core::{SubscriptionInfo, SubscriptionState};
     use eidola_gui::loadable::Loadable;
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
 
     stores.account.update(cx, |s, cx| {
         s.set_subscription_for_test(
@@ -2468,7 +2479,7 @@ fn a_refused_account_operation_leaves_the_subscription_alone(cx: &mut TestAppCon
     // is an identity change.
     let _create = stores
         .account
-        .read_with(cx, |s, _| s.request_account_create());
+        .read_with(cx, |s, _| s.request_account_create(Vec::new()));
     let _verify = stores.account.read_with(cx, |s, _| {
         s.request_verify_account("acct".into(), "secret".into())
     });
@@ -2516,7 +2527,7 @@ fn space_row_exists(core: &std::sync::Arc<AppCore>, space: &str) -> bool {
 /// row that existed and was pristine can produce.
 #[gpui::test]
 fn a_window_closed_over_its_own_insert_still_leaves_nothing_behind(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, _backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let entity = stores.spaces.update(cx, |s, cx| s.create(cx));
@@ -2579,7 +2590,7 @@ fn a_window_closed_over_its_own_insert_still_leaves_nothing_behind(cx: &mut Test
 /// reopening in one pass is what means the disposal's task has not.
 #[gpui::test]
 fn a_reopen_before_the_verdict_cancels_the_disposal(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let entity = stores.spaces.update(cx, |s, cx| s.create(cx));
@@ -2612,7 +2623,7 @@ fn a_reopen_before_the_verdict_cancels_the_disposal(cx: &mut TestAppContext) {
         "and it has answered nothing, so no composer stands over it"
     );
 
-    settle(cx);
+    backing.settle();
     assert!(
         space_row_exists(&core, &space_id),
         "the conversation someone reopened is not an abandoned one"
@@ -2651,7 +2662,7 @@ fn a_reopen_before_the_verdict_cancels_the_disposal(cx: &mut TestAppContext) {
 fn a_window_waiting_on_a_verdict_never_writes_and_then_reports_it(cx: &mut TestAppContext) {
     use eidola_gui::space::Space;
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space_id = core
         .runtime()
@@ -2672,7 +2683,7 @@ fn a_window_waiting_on_a_verdict_never_writes_and_then_reports_it(cx: &mut TestA
     assert!(space.update(cx, |s, cx| {
         s.submit("The tide is the moon's doing.".into(), None, Vec::new(), cx)
     }));
-    settle(cx);
+    backing.settle();
     assert_eq!(
         core.runtime()
             .block_on(core.get_space_messages(space_id.clone()))
@@ -2698,7 +2709,7 @@ fn a_window_waiting_on_a_verdict_never_writes_and_then_reports_it(cx: &mut TestA
             cx,
         )
     });
-    settle(cx);
+    backing.settle();
 
     assert!(
         !space.read_with(cx, |s, _| s.row_undecided_for_test()),
@@ -2722,15 +2733,6 @@ fn a_window_waiting_on_a_verdict_never_writes_and_then_reports_it(cx: &mut TestA
     );
 }
 
-/// Give work that is *not* supposed to happen a real chance to happen.
-fn settle(cx: &mut TestAppContext) {
-    for _ in 0..8 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
-}
-
 /// **A write already on its way to the database outranks the disposal.**
 ///
 /// `bridge` cancels nothing core-side, so a save started a moment before the
@@ -2745,7 +2747,7 @@ fn settle(cx: &mut TestAppContext) {
 /// `a_save_still_in_flight_holds_off_the_disposal`.)
 #[gpui::test]
 fn the_store_never_disposes_over_an_outstanding_write(cx: &mut TestAppContext) {
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
 
     let entity = stores.spaces.update(cx, |s, cx| s.create(cx));
@@ -2758,7 +2760,7 @@ fn the_store_never_disposes_over_an_outstanding_write(cx: &mut TestAppContext) {
     stores
         .spaces
         .update(cx, |s, cx| s.window_closed(space_id.clone(), true, cx));
-    settle(cx);
+    backing.settle();
 
     assert!(
         space_row_exists(&core, &space_id),
@@ -2793,7 +2795,7 @@ fn the_store_never_disposes_over_an_outstanding_write(cx: &mut TestAppContext) {
 fn a_refused_creation_after_an_early_send_says_so_instead_of_spinning(cx: &mut TestAppContext) {
     use eidola_gui::loadable::Loadable;
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, backing) = backed_stores(cx);
 
     let space = stores.spaces.update(cx, |s, cx| s.create(cx));
     let space_id = space.read_with(cx, |s, _| s.id().to_string());
@@ -2810,7 +2812,7 @@ fn a_refused_creation_after_an_early_send_says_so_instead_of_spinning(cx: &mut T
             cx,
         )
     });
-    settle(cx);
+    backing.settle();
 
     let cell = space.read_with(cx, |s, _| match s.transcript() {
         Loadable::Failed { error, .. } => format!("failed: {error}"),
@@ -2849,7 +2851,7 @@ fn a_refused_creation_after_an_early_send_says_so_instead_of_spinning(cx: &mut T
 fn a_failed_initial_transcript_load_can_be_retried(cx: &mut TestAppContext) {
     use eidola_gui::loadable::Loadable;
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space_id = eidola_app_core::new_space_id();
 
@@ -2868,7 +2870,7 @@ fn a_failed_initial_transcript_load_can_be_retried(cx: &mut TestAppContext) {
     // Retry, still with no row behind the id: the error stands, and the cell
     // is settled rather than left spinning.
     space.update(cx, |s, cx| s.retry_transcript_load(cx));
-    settle(cx);
+    backing.settle();
     let failure = space.read_with(cx, |s, _| {
         s.transcript_load_failure().map(|e| e.to_string())
     });
@@ -2917,14 +2919,14 @@ fn a_failed_initial_transcript_load_can_be_retried(cx: &mut TestAppContext) {
 fn a_failed_transcript_refresh_keeps_its_posts_and_can_be_retried(cx: &mut TestAppContext) {
     use eidola_gui::loadable::Loadable;
 
-    let (stores, _dir) = backed_stores(cx);
+    let (stores, backing) = backed_stores(cx);
     let core = stores.app_core().expect("backed stores carry a core");
     let space_id = eidola_app_core::new_space_id();
 
     let space = stores
         .spaces
         .update(cx, |s, cx| s.open(space_id.clone(), cx));
-    settle(cx);
+    backing.settle();
 
     // Posts on screen, and then a refresh over them that failed.
     space.update(cx, |s, cx| {
@@ -2962,7 +2964,7 @@ fn a_failed_transcript_refresh_keeps_its_posts_and_can_be_retried(cx: &mut TestA
         !space.read_with(cx, |s, _| matches!(s.transcript(), Loadable::Loading)),
         "`Failed {{ prior: Some }}` must go stale, never blank to Loading"
     );
-    settle(cx);
+    backing.settle();
     assert!(
         space.read_with(cx, |s, _| s.transcript_refresh_failure().is_some()),
         "a retry that failed again keeps saying so"
@@ -2981,10 +2983,850 @@ fn a_failed_transcript_refresh_keeps_its_posts_and_can_be_retried(cx: &mut TestA
     wait_until(cx, "the retried refresh answers", |cx| {
         space.read_with(cx, |s, _| s.transcript_refresh_failure().is_none())
     });
-    settle(cx);
+    backing.settle();
     assert!(
         space.read_with(cx, |s, _| s.transcript_refresh_failure().is_none()
             && matches!(s.transcript(), Loadable::Loaded { .. })),
         "a read that answered leaves no failure surface standing"
     );
+}
+
+/// REGRESSION (Codex review, PR #327): **the reverse index resolves names at
+/// read time, so it answers to every signal that moves one.**
+///
+/// An `IncomingReference` carries the *referring* post's author identity and
+/// its conversation's title — both joined by `db::references_to` at read time
+/// and never re-derived, which is exactly the shape the transcript's own
+/// bylines have. Neither signal that moves them reached the cache: a rename
+/// emits `Change::SpaceIndex`, which refreshed only the Library, and a
+/// participant rename emits `Change::Participants`, whose handler re-read only
+/// transcripts. So an open window's backlinks — the highlight picker's rows
+/// above all, where a title is what tells one author's two of them apart —
+/// went on naming both as they were when the window loaded, until an unrelated
+/// `Change::Space` happened past.
+///
+/// Both halves on one cached index: the quoting conversation is renamed, then
+/// its author is.
+#[gpui::test]
+fn a_rename_re_reads_the_cached_reverse_index(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    // The quoted passage, and a second conversation quoting it.
+    let source = core
+        .runtime()
+        .block_on(core.post("The tide is the moon's doing.".into(), None))
+        .expect("source post");
+    let block = core
+        .runtime()
+        .block_on(core.get_space_tree(source.space_id.clone()))
+        .expect("tree")
+        .into_iter()
+        .find(|n| n.action_id == source.action_id)
+        .expect("the post")
+        .blocks
+        .remove(0);
+    let elsewhere = core
+        .runtime()
+        .block_on(core.post("A different conversation.".into(), None))
+        .expect("second conversation");
+    core.runtime()
+        .block_on(core.post_with_references(
+            "Quoting:\n\n{{ embed 1 }}".into(),
+            Some(elsewhere.space_id.clone()),
+            Some(elsewhere.action_id.clone()),
+            vec![eidola_app_core::ReferenceSpec {
+                antecedent_action_id: source.action_id.clone(),
+                content_block_id: Some(block.id.clone()),
+                range_start: Some(4),
+                range_end: Some(8),
+                annotation: None,
+            }],
+        ))
+        .expect("the quote");
+
+    // A window on the *quoted* conversation caches the backlink.
+    let space = stores
+        .spaces
+        .update(cx, |s, cx| s.open(source.space_id.clone(), cx));
+    space.update(cx, |s, cx| {
+        s.ensure_incoming_references(&source.action_id, cx)
+    });
+    let carried = |cx: &mut TestAppContext| {
+        space.read_with(cx, |s, _| {
+            s.incoming_references(&source.action_id)
+                .first()
+                .map(|r| (r.space_title.clone(), r.author_label.clone()))
+        })
+    };
+    wait_until(cx, "the reverse index loads", |cx| carried(cx).is_some());
+    assert_eq!(
+        carried(cx),
+        Some((Some("A different conversation.".into()), "User".into())),
+        "the referring conversation's title and its author, as that space names them"
+    );
+
+    // Another window renames the quoting conversation. `rename_space` emits
+    // `Change::SpaceIndex` and nothing else.
+    core.runtime()
+        .block_on(core.rename_space(elsewhere.space_id.clone(), "Spring tides".into()))
+        .expect("rename");
+    space.update(cx, |s, cx| {
+        s.ensure_incoming_references(&source.action_id, cx)
+    });
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::SpaceIndex), cx));
+    wait_until(cx, "the index re-reads the title", |cx| {
+        space.update(cx, |s, cx| {
+            s.ensure_incoming_references(&source.action_id, cx)
+        });
+        carried(cx).is_some_and(|(title, _)| title.as_deref() == Some("Spring tides"))
+    });
+
+    // …and then its author, which emits `Change::Participants` and nothing
+    // else.
+    core.runtime()
+        .block_on(core.set_space_participant_override(
+            elsewhere.space_id.clone(),
+            eidola_app_core::HUMAN_PARTICIPANT_ID.to_string(),
+            eidola_app_core::ParticipantOverride {
+                label: Some(Some("Skipper".into())),
+                model_ref: None,
+                system_prompt: None,
+                notify_policy: None,
+            },
+        ))
+        .expect("override");
+    cx.update(|cx| stores::dispatch_change_for_test(&stores, Some(Change::Participants), cx));
+    wait_until(cx, "the index re-reads the author", |cx| {
+        space.update(cx, |s, cx| {
+            s.ensure_incoming_references(&source.action_id, cx)
+        });
+        carried(cx).is_some_and(|(_, author)| author == "Skipper")
+    });
+}
+
+/// REGRESSION (Codex review, PR #327): **a barrier that gives up must not hand
+/// the hazard back.**
+///
+/// Timing out is precisely the case where a task may still own an
+/// `Arc<AppCore>`. Releasing this guard's own reference there makes that task
+/// the last owner, so the runtime is dropped from inside one of its own workers
+/// — the panic the barrier exists to prevent, arriving on the path where it
+/// does the most damage: during an unwind, a second panic aborts the process
+/// and the assertion that actually failed is never printed.
+///
+/// So the give-up path leaks one owner and the invariant becomes structural —
+/// *if idleness could not be proven, nothing may ever drop the runtime*. That
+/// is what this asserts, by counting owners across the drop: the guard's
+/// reference is retained rather than released, so the strong count does not
+/// fall. The panic is expected on this path (nothing is unwinding yet) and is
+/// caught, because what is under test is what the guard did with its `Arc`, not
+/// how loudly it complained.
+#[gpui::test]
+fn a_drain_that_times_out_never_lets_go_of_the_runtime(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let (core, dir) = test_core();
+    let weak = Arc::downgrade(&core);
+
+    // A task that owns the core and outlives any barrier — the shape the
+    // guard cannot wait out and must therefore never race.
+    let held = core.clone();
+    core.runtime().handle().spawn(async move {
+        let _core_owned_by_this_task = held;
+        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+    });
+    while core.runtime().metrics().num_alive_tasks() == 0 {
+        std::thread::yield_now();
+    }
+
+    let owners_before = weak.strong_count();
+    assert_eq!(owners_before, 2, "the guard's reference and the task's");
+
+    let backing = Backing {
+        core,
+        _dir: dir,
+        ownerless: 0,
+        drain_timeout: std::time::Duration::from_millis(200),
+        app: None,
+    };
+    let complained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(backing)));
+    assert!(
+        complained.is_err(),
+        "a drain that could not finish says so rather than passing quietly"
+    );
+
+    assert_eq!(
+        weak.strong_count(),
+        owners_before,
+        "the guard released its owner after failing to prove the runtime idle, so the task is \
+         now the last one and will drop the runtime from its own worker"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The local inference proxy's store
+// ---------------------------------------------------------------------------
+
+/// A free loopback port, chosen by binding one and letting it go.
+///
+/// The stored binding cannot be port 0 — a config file whose address changes on
+/// every restart is one that lies — so a test that wants the *store* to bind
+/// something has to name a port. Asking the OS for one and releasing it is the
+/// nearest thing to ephemeral that a durable setting allows.
+fn a_free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    listener.local_addr().expect("addr").port()
+}
+
+/// REGRESSION: **the invariant is "no live row whose secret was never shown."**
+///
+/// A proxy key's value exists for exactly one render — app-core stores a digest
+/// and nothing else — so a second generation started while one was pending
+/// inserted a second live row and then replaced the banner: one of the two keys
+/// authenticates requests forever and nobody holds it, nobody can recognise it,
+/// and revoking it is guesswork. The same is true of a press made while a
+/// minted key is still standing unread.
+///
+/// The cure is a predicate rather than a courtesy: `can_create_key` decides the
+/// press *and* whether the pane paints the verb at all, so an accepted press
+/// and an offered verb cannot disagree.
+#[gpui::test]
+fn a_second_key_generation_waits_for_the_first_to_be_read(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    stores.proxy.update(cx, |s, cx| {
+        s.create_key("first".into(), cx);
+        // The press a reader makes while the first is still travelling.
+        s.create_key("second".into(), cx);
+    });
+
+    wait_until(cx, "the first key is minted", |cx| {
+        stores.proxy.read_with(cx, |s, _| s.minted().is_some())
+    });
+    let keys = core
+        .runtime()
+        .block_on(core.proxy_keys())
+        .expect("the listing");
+    assert_eq!(
+        keys.len(),
+        1,
+        "a second generation while one is pending would leave a live key nobody ever saw: {keys:?}"
+    );
+
+    // And a press made while the minted key stands unread is refused for the
+    // same reason — the banner can only show one.
+    stores
+        .proxy
+        .update(cx, |s, cx| s.create_key("third".into(), cx));
+    cx.run_until_parked();
+    assert_eq!(
+        core.runtime()
+            .block_on(core.proxy_keys())
+            .expect("the listing")
+            .len(),
+        1,
+        "the standing banner is the reason, and it is still standing"
+    );
+
+    // **The listing the new row belongs in is read after the batch, not by the
+    // write that made it.** No operation here carries a listing — each adopts
+    // or reports its own outcome — and the resolving read is issued once
+    // nothing is still writing, so what the pane shows is the database after
+    // every press rather than after whichever one settled last.
+    wait_until(cx, "the listing catches up with the key", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.key_list().iter().any(|k| k.label == "first"))
+    });
+
+    // Acknowledging it is what gives the verb back.
+    stores.proxy.update(cx, |s, cx| s.dismiss_minted(cx));
+    assert!(stores.proxy.read_with(cx, |s, _| s.can_create_key()));
+    stores
+        .proxy
+        .update(cx, |s, cx| s.create_key("fourth".into(), cx));
+    wait_until(cx, "the second key is minted", |_cx| {
+        core.runtime()
+            .block_on(core.proxy_keys())
+            .map(|k| k.len() == 2)
+            .unwrap_or(false)
+    });
+}
+
+/// REGRESSION: **a superseded write settles nothing, and takes no slot away.**
+///
+/// Two presses of one control are one keyboard's work apart — a reader turning
+/// the proxy on and immediately off, a binding corrected a beat after it was
+/// typed — and they land in the same keyed slot. The successor chains behind
+/// the predecessor so the two writes reach the database in the order they were
+/// made; what this pins is the other half. The predecessor settles *first*, and
+/// if it is allowed to settle it removes the slot — which by then belongs to
+/// its successor, whose `Task` is dropped and whose write therefore never
+/// happens. The reader's last press is silently lost, and the store adopts the
+/// value they took back.
+///
+/// Only the current generation settles, so the predecessor returns quietly.
+#[gpui::test]
+fn the_second_press_of_a_proxy_control_is_the_one_that_stands(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    stores.proxy.update(cx, |s, cx| {
+        s.set_enabled(true, cx);
+        s.set_enabled(false, cx);
+    });
+
+    // Waiting on the *store* rather than on the database: the write lands
+    // first and its continuation a moment later, so a wait on the row would
+    // read the store mid-settle and say nothing about either.
+    wait_until(cx, "the batch settles", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.any_op_error() || !s.writing())
+    });
+    assert_eq!(
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().map(|v| v.enabled)),
+        Some(false),
+        "the store shows what the reader last asked for"
+    );
+    assert!(
+        !core
+            .runtime()
+            .block_on(core.proxy_settings())
+            .expect("the stored settings")
+            .enabled,
+        "and so does the database — the second press is what was written last"
+    );
+}
+
+/// REGRESSION: **the next press derives from what this one is writing.**
+///
+/// Every control in the Proxy pane computes its next value from what it renders
+/// — the switch writes `!enabled` — so a snapshot that stays at the stored
+/// value until the round trip settles makes two presses one press: both
+/// handlers read the same stale `false`, both write `true`, and a
+/// start-then-stop persists as start. Sequencing the writes never touched that,
+/// because the two carried the same value; what has to move is the value the
+/// second press is derived *from*. The test derives its second press exactly as
+/// the pane does rather than passing an explicit `false`, which is what the
+/// sequencing test above cannot see.
+#[gpui::test]
+fn two_presses_of_the_proxy_switch_derive_from_each_other(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let core = stores.app_core().expect("backed stores carry a core");
+
+    // Production refreshes at launch; a bare store has not read anything yet,
+    // and the pane derives its presses from a snapshot it renders.
+    stores.proxy.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the settings load", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().is_some())
+    });
+    let enabled = |cx: &mut TestAppContext| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().map(|v| v.enabled))
+            .expect("a loaded snapshot")
+    };
+    assert!(!enabled(cx), "a fresh profile serves nothing");
+
+    // The first press, derived from the render — and read back at once, which
+    // is the whole property: the pane's next frame has to see it.
+    let next = !enabled(cx);
+    stores.proxy.update(cx, |s, cx| s.set_enabled(next, cx));
+    assert!(
+        enabled(cx),
+        "the snapshot advances as the write leaves, so the next press can derive from it"
+    );
+
+    // The second press, derived the same way the pane derives it.
+    let next = !enabled(cx);
+    stores.proxy.update(cx, |s, cx| s.set_enabled(next, cx));
+
+    wait_until(cx, "the batch settles", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.any_op_error() || !s.writing())
+    });
+    assert!(
+        !core
+            .runtime()
+            .block_on(core.proxy_settings())
+            .expect("the stored settings")
+            .enabled,
+        "start then stop persists as stopped"
+    );
+}
+
+/// REGRESSION: **a settling write does not revert a sibling's pending edit.**
+///
+/// An answer is a whole snapshot of the database at the moment *that* write
+/// committed, so adopting one while a differently-keyed sibling is still
+/// travelling overwrites the sibling's optimistic delta with a row that
+/// predates it — an exposure checkbox goes back to unchecked while its own
+/// write is on its way to making it true. Worse than a flicker, because the
+/// pane derives its next press from what it renders: taking the choice back
+/// then reads the reverted checkbox and writes `true` a second time, so the
+/// reader's undo leaves it exposed.
+///
+/// Two spawned writes cannot be made to interleave on demand, so the landing is
+/// driven directly — the decision under test is what a settle does while
+/// another slot is genuinely occupied.
+#[gpui::test]
+fn a_settling_write_leaves_a_pending_siblings_edit_alone(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+
+    stores.proxy.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the settings load", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().is_some())
+    });
+    let exposed = |cx: &mut TestAppContext| {
+        stores.proxy.read_with(cx, |s, _| {
+            s.settings()
+                .value()
+                .expect("a loaded snapshot")
+                .exposed_ids
+                .iter()
+                .any(|b| b == "eidola")
+        })
+    };
+    assert!(!exposed(cx), "a fresh profile exposes nothing");
+
+    // The checkbox's press: its slot is occupied and its delta is on screen.
+    stores
+        .proxy
+        .update(cx, |s, cx| s.set_backend_exposed("eidola".into(), true, cx));
+    assert!(exposed(cx), "the press shows what it is writing");
+
+    // A sibling write lands with the database as it was *before* that press —
+    // which is exactly what its own round trip would have answered with.
+    let stale = stores
+        .proxy
+        .read_with(cx, |s, _| s.settings().value().cloned())
+        .map(|mut settings| {
+            settings.exposed_ids.retain(|b| b != "eidola");
+            settings.backends.retain(|b| b != "eidola");
+            settings.enabled = true;
+            settings
+        })
+        .expect("a snapshot to age");
+    stores.proxy.update(cx, |s, cx| {
+        s.settle_for_test(
+            ProxyOp::Enabled,
+            SettingsEdit::Enabled(true),
+            Landing::Current,
+            Ok(stale),
+            cx,
+        )
+    });
+
+    assert!(
+        exposed(cx),
+        "the pending choice is still what the reader sees, so their next press \
+         derives from it rather than from a row that predates it"
+    );
+
+    // And once nothing is writing, the batch-end read is what resolves the
+    // cell — the honest answer, taken after the last write.
+    wait_until(cx, "the batch settles", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.any_op_error() || !s.writing())
+    });
+    assert!(exposed(cx), "and the database agrees");
+}
+
+/// Load the proxy settings into a backed store and wait until nothing about
+/// them is still moving — no write in flight and no read on its way — so a
+/// test can stage a landing without a real one arriving behind it.
+fn settle_proxy(stores: &Stores, cx: &mut TestAppContext) {
+    stores.proxy.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the proxy settings stand still", |cx| {
+        stores.proxy.read_with(cx, |s, _| {
+            !s.writing() && s.settings().value().is_some() && !s.settings().is_stale()
+        })
+    });
+}
+
+fn a_refusal() -> eidola_app_core::error::AppError {
+    eidola_app_core::error::AppError::ProxyRefused {
+        refusal: eidola_app_core::proxy::ProxyRefusal::NoPort,
+    }
+}
+
+/// REGRESSION: **a refused enable is taken back before the resolving read, so
+/// a read that fails too cannot start the listener on it.**
+///
+/// The switch advances the cached settings as its write leaves, and the
+/// resolving read was trusted to put a refusal right. But that read can fail,
+/// and `Failed { prior }` keeps whatever the cell held — the refused `true` —
+/// and the reconcile then acts on the value the cell holds: a listener bound
+/// against the database's old intent, standing until something unrelated
+/// re-read. The refused op now restores what it displaced before the read is
+/// taken, so the kept value is the database's.
+///
+/// The interleaving is staged: a real core neither refuses an enable nor fails
+/// a read on demand. The listener half is real — the reconcile has a core, and
+/// a free port to bind if it is wrongly told to.
+#[gpui::test]
+fn a_refused_enable_does_not_start_the_listener_when_the_read_fails_too(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let port = a_free_port();
+    stores
+        .proxy
+        .update(cx, |s, cx| s.set_binding("127.0.0.1".into(), port, cx));
+    settle_proxy(&stores, cx);
+    assert!(!stores.proxy.read_with(cx, |s, _| s.is_running()));
+
+    stores.proxy.update(cx, |s, _| {
+        s.begin_settings_edit_for_test(ProxyOp::Enabled, SettingsEdit::Enabled(true))
+    });
+    assert_eq!(
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().map(|v| v.enabled)),
+        Some(true),
+        "the press shows what it is writing"
+    );
+
+    stores.proxy.update(cx, |s, cx| {
+        s.settle_for_test(
+            ProxyOp::Enabled,
+            SettingsEdit::Enabled(true),
+            Landing::Current,
+            Err(a_refusal()),
+            cx,
+        );
+        s.land_settings_read_for_test(
+            Err(eidola_app_core::error::AppError::Database {
+                message: "database is locked".into(),
+            }),
+            cx,
+        );
+    });
+
+    let (running, enabled, failed, refused, handle) = stores.proxy.read_with(cx, |s, _| {
+        (
+            s.is_running(),
+            s.settings().value().map(|v| v.enabled),
+            s.settings().error().is_some(),
+            s.op_error(&ProxyOp::Enabled).is_some(),
+            s.handle(),
+        )
+    });
+    // Teardown first, so a failing assertion leaves no accept loop holding the
+    // core for the drain barrier to wait on.
+    handle.stop();
+    cx.run_until_parked();
+    assert!(failed, "the resolving read really failed");
+    assert!(refused, "the refusal is reported under the switch");
+    assert!(
+        !running,
+        "a refused enable must not start the listener against the database's intent"
+    );
+    assert_eq!(
+        enabled,
+        Some(false),
+        "the kept value is what the database holds, not the refused press"
+    );
+}
+
+/// REGRESSION: **a refused write restores what the database holds for its
+/// key — its accepted predecessor's value — and nothing of a sibling's.**
+///
+/// Two presses on one control are chained, and the first can land accepted
+/// while the second is refused. The database then holds the *first* press, so
+/// that is what the rollback restores to; the value from before the chain began
+/// would be a guess, and a wrong one. And the restore is this key's columns
+/// alone: a differently-keyed sibling's pending edit is still what will be true,
+/// and a snapshot restore would take it back too.
+#[gpui::test]
+fn a_refused_proxy_write_restores_its_keys_confirmed_value_and_nothing_else(
+    cx: &mut TestAppContext,
+) {
+    let (stores, _backing) = backed_stores(cx);
+    settle_proxy(&stores, cx);
+
+    stores.proxy.update(cx, |s, _| {
+        // A sibling still travelling: its edit is on screen.
+        s.begin_settings_edit_for_test(
+            ProxyOp::Backend("eidola".into()),
+            SettingsEdit::Backend {
+                id: "eidola".into(),
+                exposed: true,
+            },
+        );
+        // Two presses of the switch, chained.
+        s.begin_settings_edit_for_test(ProxyOp::Enabled, SettingsEdit::Enabled(true));
+        s.begin_settings_edit_for_test(ProxyOp::Enabled, SettingsEdit::Enabled(false));
+    });
+    let any = stores
+        .proxy
+        .read_with(cx, |s, _| s.settings().value().cloned())
+        .expect("a loaded snapshot");
+    stores.proxy.update(cx, |s, cx| {
+        // The first press lands accepted, superseded by the second…
+        s.settle_for_test(
+            ProxyOp::Enabled,
+            SettingsEdit::Enabled(true),
+            Landing::Superseded,
+            Ok(any.clone()),
+            cx,
+        );
+        // …which is refused.
+        s.settle_for_test(
+            ProxyOp::Enabled,
+            SettingsEdit::Enabled(false),
+            Landing::Current,
+            Err(a_refusal()),
+            cx,
+        );
+    });
+
+    let (enabled, exposed) = stores.proxy.read_with(cx, |s, _| {
+        let v = s.settings().value().expect("a loaded snapshot");
+        (v.enabled, v.exposed_ids.iter().any(|b| b == "eidola"))
+    });
+    assert!(
+        enabled,
+        "the database holds the accepted first press, so that is what is restored"
+    );
+    assert!(
+        exposed,
+        "a sibling's pending edit is not this refusal's to take back"
+    );
+}
+
+/// REGRESSION: **two refused controls each keep their own refusal, and a write
+/// clears only its own.**
+///
+/// One `op_error` slot served the whole pane: the second refusal erased the
+/// first, and the opening of *any* write — a press anywhere in the pane — took
+/// every standing report off the screen. Keyed by control, like the slots.
+#[gpui::test]
+fn two_refused_proxy_controls_each_keep_their_own_refusal(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    settle_proxy(&stores, cx);
+    let backend = ProxyOp::Backend("eidola".into());
+
+    stores.proxy.update(cx, |s, cx| {
+        s.settle_for_test(
+            ProxyOp::Enabled,
+            SettingsEdit::Enabled(true),
+            Landing::Current,
+            Err(a_refusal()),
+            cx,
+        );
+        s.settle_for_test(
+            backend.clone(),
+            SettingsEdit::Backend {
+                id: "eidola".into(),
+                exposed: true,
+            },
+            Landing::Current,
+            Err(a_refusal()),
+            cx,
+        );
+    });
+    let standing = |cx: &mut TestAppContext| {
+        stores.proxy.read_with(cx, |s, _| {
+            (
+                s.op_error(&ProxyOp::Enabled).is_some(),
+                s.op_error(&backend).is_some(),
+            )
+        })
+    };
+    assert_eq!(standing(cx), (true, true), "both refusals stand");
+
+    // A write to a third control says nothing about either.
+    stores.proxy.update(cx, |s, cx| {
+        s.set_local_exposure(eidola_app_core::proxy::LocalExposure::Downloaded, cx)
+    });
+    assert_eq!(
+        standing(cx),
+        (true, true),
+        "another control's write clears neither"
+    );
+
+    // A write to one of them clears its own report only.
+    stores.proxy.update(cx, |s, cx| s.set_enabled(false, cx));
+    assert_eq!(
+        standing(cx),
+        (false, true),
+        "the switch's write clears the switch's"
+    );
+    wait_until(cx, "the batch settles", |cx| {
+        stores.proxy.read_with(cx, |s, _| !s.writing())
+    });
+    assert_eq!(standing(cx), (false, true));
+
+    // And each is dismissed on its own.
+    stores
+        .proxy
+        .update(cx, |s, cx| s.clear_op_error(&backend, cx));
+    assert_eq!(standing(cx), (false, false));
+}
+
+/// REGRESSION: **a listener that gave up says why, and is started again.**
+///
+/// The accept loop stops after sixteen consecutive refused accepts. Nothing
+/// pushes that fact anywhere — it happens on the core's runtime — so the store
+/// has to *derive* it: `listen_error` asks the handle rather than reporting only
+/// the last bind failure it recorded, and the reconcile finds no address where
+/// the settings want one and starts the socket again. Neither half is a special
+/// case; both fall out of the handle answering with what the loop learned.
+#[gpui::test]
+fn a_proxy_that_stopped_accepting_says_why_and_is_reconciled_again(cx: &mut TestAppContext) {
+    let (stores, _backing) = backed_stores(cx);
+    let port = a_free_port();
+
+    stores.proxy.update(cx, |s, cx| {
+        s.set_binding("127.0.0.1".into(), port, cx);
+    });
+    wait_until(cx, "the binding lands", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().map(|v| v.bind_port))
+            == Some(port)
+    });
+    stores.proxy.update(cx, |s, cx| s.set_enabled(true, cx));
+    wait_until(cx, "the reconcile binds the socket", |cx| {
+        stores.proxy.read_with(cx, |s, _| s.is_running())
+    });
+    assert!(
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.listen_error())
+            .is_none()
+    );
+
+    let handle = stores.proxy.read_with(cx, |s, _| s.handle());
+    handle.fail_accepting_for_test("too many open files");
+
+    assert!(
+        !stores.proxy.read_with(cx, |s, _| s.is_running()),
+        "a socket that admits nobody is not somewhere to point a tool"
+    );
+    assert!(
+        matches!(
+            stores.proxy.read_with(cx, |s, _| s.listen_error()),
+            Some(eidola_gui::stores::proxy::ListenFailure::StoppedAccepting(reason))
+                if reason == "too many open files"
+        ),
+        "no write failed, so only the loop's own reason can explain this"
+    );
+
+    // Reconcilable: the settings still want a listener and nothing is bound, so
+    // an ordinary refresh starts it. It may take more than one — the socket the
+    // dead loop held is released when its aborted task is dropped, which is the
+    // runtime's business and not this thread's — and that is exactly why the
+    // recovery is a *reconcile* rather than a one-shot repair.
+    let mut restarted = false;
+    for _ in 0..80 {
+        stores.proxy.update(cx, |s, cx| s.refresh(cx));
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+        if stores.proxy.read_with(cx, |s, _| s.is_running()) {
+            restarted = true;
+            break;
+        }
+    }
+    assert!(restarted, "a reconcile starts a listener that gave up");
+    assert!(
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.listen_error())
+            .is_none()
+    );
+
+    // Teardown: an accept loop is a task holding the core, so the drain barrier
+    // would wait on it forever. Stopping the handle is what the disable path
+    // does asynchronously, taken directly because the test is over.
+    handle.stop();
+    cx.run_until_parked();
+}
+
+/// REGRESSION: **a correct IPv6 listener is not restarted on every refresh.**
+///
+/// The reconcile asked "is what is bound what the settings describe" by
+/// comparing a `host:port` join against `SocketAddr`'s own `Display`, which
+/// brackets an IPv6 host — `::1:11437` versus `[::1]:11437` — so the answer was
+/// always *no* however correct the listener. And a restart closes before it
+/// binds: the old socket is still open when the new bind is attempted on the
+/// same address, so the refresh did not merely churn, it **stopped the proxy**
+/// on the door a reader had pointed a tool at.
+///
+/// `::1` is an explicitly supported binding (`parse_bind_address` accepts it,
+/// `is_loopback` calls it safe), so this is an ordinary configuration.
+#[gpui::test]
+fn a_refresh_leaves_a_correct_ipv6_listener_alone(cx: &mut TestAppContext) {
+    // A machine without IPv6 loopback has nothing to say about this rule.
+    let Ok(probe) = std::net::TcpListener::bind("[::1]:0") else {
+        return;
+    };
+    let port = probe.local_addr().expect("addr").port();
+    drop(probe);
+
+    let (stores, _backing) = backed_stores(cx);
+    stores.proxy.update(cx, |s, cx| {
+        s.set_binding("::1".into(), port, cx);
+    });
+    wait_until(cx, "the binding lands", |cx| {
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.settings().value().map(|v| v.bind_port))
+            == Some(port)
+    });
+    stores.proxy.update(cx, |s, cx| s.set_enabled(true, cx));
+    wait_until(cx, "the reconcile binds the socket", |cx| {
+        stores.proxy.read_with(cx, |s, _| s.is_running())
+    });
+    let bound = stores.proxy.read_with(cx, |s, _| s.address());
+    assert!(
+        bound.is_some_and(|a| a.is_ipv6()),
+        "bound where the reader asked: {bound:?}"
+    );
+
+    let handle = stores.proxy.read_with(cx, |s, _| s.handle());
+    let bound_once = handle.binds_for_test();
+    assert_eq!(bound_once, 1, "one socket, bound once");
+
+    // The refresh a bus event, a settings write, or the launch reconcile all
+    // arrive as. Nothing about the configuration moved, so nothing about the
+    // socket may — and *that* is the assertion, not the address it reports:
+    // a restart rebinds the same address, so whether the endpoint survives it
+    // is a race with the old socket's release rather than a property.
+    for _ in 0..3 {
+        stores.proxy.update(cx, |s, cx| s.refresh(cx));
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        handle.binds_for_test(),
+        bound_once,
+        "a listener that already matches is not closed and rebound"
+    );
+    assert!(
+        stores
+            .proxy
+            .read_with(cx, |s, _| s.listen_error())
+            .is_none(),
+        "so nothing could have failed to come back"
+    );
+    assert_eq!(
+        stores.proxy.read_with(cx, |s, _| s.address()),
+        bound,
+        "and it is still answering where it was"
+    );
+
+    handle.stop();
+    cx.run_until_parked();
 }

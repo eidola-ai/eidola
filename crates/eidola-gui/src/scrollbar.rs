@@ -2,7 +2,7 @@
 //!
 //! Every scrollable surface that isn't the space page (whose minimap *is* its
 //! scroll indicator) shares one presentation: a right-edge
-//! [`gpui_component::scroll::Scrollbar`] in [`ScrollbarShow::Scrolling`] mode —
+//! [`gpui_component::scroll::Scrollbar`] in [`ScrollbarMode::Scrolling`] mode —
 //! it appears while scrolling and fades out, the macOS overlay idiom, matching
 //! the calm design voice. It never reserves a permanent gutter and never
 //! shifts layout: the strip is an `absolute` overlay, so a surface that never
@@ -32,9 +32,18 @@
 //!   clearance — corner clearance keys off the window's decorations, not the
 //!   element's position, so applying it here would wrongly inset a mid-window
 //!   dropdown's thumb on Linux. Needs no `Window`.
+//!
+//! **And one horizontal twin**, [`horizontal_floating`], for the rare surface
+//! that scrolls on both axes: a bottom-edge strip, same bounded reasoning as
+//! its vertical sibling. It **yields the corner** — its right end insets by the
+//! strip width — because two overlays meeting there would put two thumbs on one
+//! point, and the vertical one is the axis every surface in this app scrolls.
+//! Only a surface with real horizontal overflow wants it: gpui does not
+//! redirect a vertical-only wheel to the other axis once both are scrollable,
+//! so without a thumb an ordinary mouse has no path to what is clipped there.
 
 use gpui::{Div, InteractiveElement, ParentElement, Pixels, Stateful, Styled, Window, div, px};
-use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarShow};
+use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 
 /// Width of the overlay strip that houses the thumb. Matches the onboarding
 /// window's original inline value.
@@ -42,6 +51,8 @@ const STRIP_WIDTH: Pixels = px(14.);
 
 /// The shared positioned strip: an `absolute` right-edge overlay carrying the
 /// scrolling-mode [`Scrollbar`], inset at both ends by `clearance`.
+///
+/// Its horizontal twin is [`horizontal_floating`].
 fn overlay<H>(id: &'static str, handle: &H, clearance: Pixels) -> Stateful<Div>
 where
     H: ScrollbarHandle + Clone,
@@ -55,7 +66,7 @@ where
         .pt(clearance)
         .pb(clearance)
         .w(STRIP_WIDTH)
-        .child(Scrollbar::vertical(handle).scrollbar_show(ScrollbarShow::Scrolling))
+        .child(Scrollbar::vertical(handle).mode(ScrollbarMode::Scrolling))
 }
 
 /// A right-edge vertical scroll indicator for a **window-edge** scroll body,
@@ -66,7 +77,7 @@ where
 ///
 /// Drop the returned element as a sibling of the scroll container; see the
 /// module docs for placement and corner-duty notes.
-pub(crate) fn vertical<H>(id: &'static str, handle: &H, window: &Window) -> Stateful<Div>
+pub fn vertical<H>(id: &'static str, handle: &H, window: &Window) -> Stateful<Div>
 where
     H: ScrollbarHandle + Clone,
 {
@@ -82,4 +93,27 @@ where
     H: ScrollbarHandle + Clone,
 {
     overlay(id, handle, px(0.))
+}
+
+/// A bottom-edge **horizontal** scroll indicator for a bounded overlay that
+/// really does scroll on both axes.
+///
+/// Same placement rule as the vertical constructors — a sibling of the scroll
+/// container inside a `relative` ancestor — and the same bounded reasoning, so
+/// no corner clearance. It **yields the bottom-right corner** to the vertical
+/// strip (`right(STRIP_WIDTH)`), which is the axis every scrollable surface in
+/// this app has: two overlays meeting there would stack two thumbs on one
+/// point, and only one of them can win the press.
+pub(crate) fn horizontal_floating<H>(id: &'static str, handle: &H) -> Stateful<Div>
+where
+    H: ScrollbarHandle + Clone,
+{
+    div()
+        .id(id)
+        .absolute()
+        .left_0()
+        .right(STRIP_WIDTH)
+        .bottom_0()
+        .h(STRIP_WIDTH)
+        .child(Scrollbar::horizontal(handle).mode(ScrollbarMode::Scrolling))
 }

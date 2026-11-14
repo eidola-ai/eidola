@@ -33,7 +33,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme, StyledExt as _, h_flex,
-    input::{Input, InputState},
+    input::{Input, InputState, Textarea, TextareaState},
     v_flex,
 };
 
@@ -57,7 +57,7 @@ const RETIRE_NOTE: &str = "Retiring takes this agent out of the library and arch
 struct AgentDraft {
     participant_id: String,
     label: Entity<InputState>,
-    system_prompt: Entity<InputState>,
+    system_prompt: Entity<TextareaState>,
     model_ref: Option<String>,
     notify_policy: String,
     /// The editor subtree's own focus handle — what the handback question is
@@ -168,7 +168,7 @@ impl AgentsSettingsView {
     }
 
     #[doc(hidden)]
-    pub fn editing_prompt_state(&self) -> Option<Entity<InputState>> {
+    pub fn editing_prompt_state(&self) -> Option<Entity<TextareaState>> {
         self.draft.as_ref().map(|d| d.system_prompt.clone())
     }
 
@@ -203,7 +203,7 @@ impl AgentsSettingsView {
         // A reveal focuses what it revealed (the Settings idiom's rule).
         label.update(cx, |s, cx| s.focus(window, cx));
         let system_prompt = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(2, 8)
                 .placeholder(PROMPT_PLACEHOLDER)
                 .default_value(agent.system_prompt.clone().unwrap_or_default())
@@ -388,6 +388,16 @@ impl Render for AgentsSettingsView {
         let mut col = v_flex()
             .id("agents-pane")
             .track_focus(&self.focus_handle)
+            // **The handback target has to be a node, and a node needs a
+            // role.** [`Self::hand_back_focus`] sends the keyboard here when a
+            // form that was holding it goes away, and gpui registers an element
+            // with a tracked handle and an id as focusable — but `set_focus`
+            // only reports a node the tree actually has, and an element with no
+            // role never got one, so focus fell back to the window root and the
+            // reader lost the pane. The same fix the Backends pane carries,
+            // whose shape this borrowed: a landmark it was owed anyway.
+            // `Region` is a container role, so it adds no tab stop.
+            .probe("settings/agents/pane", gpui::Role::Region, "Agents")
             .px_6()
             .py_5()
             .gap_3()
@@ -774,7 +784,11 @@ impl AgentsSettingsView {
                 div()
                     .id("agent-name-wrap")
                     .probe_bounds("settings/agents/editor/name", gpui::Role::TextInput, "Name")
-                    .child(Input::new(&draft.label).aria_label("Name")),
+                    .child(
+                        Input::new(&draft.label)
+                            .aria_label("Name")
+                            .py(crate::theme::INPUT_PY),
+                    ),
             )
             .child(field_label("Model", cx))
             .child(model_field(
@@ -796,7 +810,7 @@ impl AgentsSettingsView {
                         gpui::Role::TextInput,
                         "Charter",
                     )
-                    .child(Input::new(&draft.system_prompt).aria_label("Charter")),
+                    .child(Textarea::new(&draft.system_prompt).aria_label("Charter")),
             )
             .child(field_label("Responds", cx))
             .child(self.render_notify(&draft.notify_policy, cx))

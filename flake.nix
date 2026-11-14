@@ -2,7 +2,7 @@
   description = "Eidola";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
     # Utilities for multi-system support
     flake-utils.url = "github:numtide/flake-utils";
@@ -168,6 +168,131 @@
             [ pname ] ++ getAllDeps pname ++ builtins.concatMap (d: [ d ] ++ getAllDeps d) devDeps
           );
 
+        # Which workspace crate (if any) a path belongs to; `relPath` is
+        # relative to the repository root, with a leading `/`.
+        getCrateForPath =
+          relPath:
+          pkgs.lib.findFirst (
+            name:
+            let
+              p = cratePaths.${name};
+            in
+            relPath == "/${p}" || pkgs.lib.hasPrefix "/${p}/" relPath
+          ) null workspaceCrates;
+
+        # The non-Cargo inputs a build or its tests read, which
+        # `craneLib.filterCargoSources` would drop because they are not Rust
+        # or Cargo files. One predicate for both source filters
+        # (`mkFilteredSrc`, scoped to a crate set, and `fullSrc`, the whole
+        # workspace), so they cannot diverge: a new input is added here once.
+        # `crateInSet name` says whether crate `name` is being built;
+        # `wholeWorkspace` is set for the workspace-wide checks only.
+        keepNonCargoInput =
+          { crateInSet, wholeWorkspace }:
+          relPath: path: type:
+          let
+            matchingCrate = getCrateForPath relPath;
+            # Both `eidola-app-core/build.rs` and `eidola-server-gateway/build.rs`
+            # consume pinned trust data from `releases/`:
+            #   * eidola-app-core → all of `releases/trust/*.json` +
+            #     `releases/schema/*.json` (client trust root)
+            #   * eidola-server-gateway → `releases/trust/engine-enclaves.json`
+            #     (the engine pins), the platform endorsements and Sigstore
+            #     trusted root their machine policy is re-derived from, and the
+            #     platform release manifests their MRTD is checked against
+            # Included only when either crate is built, so unrelated crates
+            # do not cache-bust on every manifest regeneration.
+            # `artifact-manifest.json` (at the root, not under `releases/`)
+            # is deliberately excluded — it records the eidola-cli narHash
+            # itself, so including it would create a self-reference that
+            # prevents the build from reaching a fixed point.
+            isTrustRootPath = relPath == "/releases" || pkgs.lib.hasPrefix "/releases/" relPath;
+            # The vendored platform endorsements, from which the gateway's
+            # build re-derives each engine pin's machine policy. Only the
+            # gateway reads them, so app-core-only packages leave them out
+            # and do not rebuild when a new release is vendored.
+            isPlatformEndorsementsPath =
+              relPath == "/releases/trust/platform-endorsements"
+              || pkgs.lib.hasPrefix "/releases/trust/platform-endorsements/" relPath;
+            # The vendored platform release manifests, likewise the gateway's
+            # alone.
+            isCvmReleasesPath =
+              relPath == "/releases/trust/cvm-releases"
+              || pkgs.lib.hasPrefix "/releases/trust/cvm-releases/" relPath;
+            # `eidola-server-gateway/build.rs` also checks every engine pin in
+            # `releases/trust/engine-enclaves.json` against the committed
+            # deployment configs it names.
+            isEngineDeployPath =
+              relPath == "/deploy"
+              || relPath == "/deploy/engine"
+              || pkgs.lib.hasPrefix "/deploy/engine/" relPath;
+            # ... and compiles in the model catalog, one file per set of
+            # weights under `models/`, bound to those pins by weights hash.
+            isModelCatalogPath = relPath == "/models" || pkgs.lib.hasPrefix "/models/" relPath;
+          in
+          (
+            crateInSet "eidola-app-core"
+            && isTrustRootPath
+            && !isPlatformEndorsementsPath
+            && !isCvmReleasesPath
+          )
+          || (crateInSet "eidola-server-gateway" && isTrustRootPath)
+          || (crateInSet "eidola-server-gateway" && isEngineDeployPath)
+          || (crateInSet "eidola-server-gateway" && isModelCatalogPath)
+          # app-core compiles the same catalog in, to tell a user what a model
+          # choice resolves to, when a tag has moved and when weights retire.
+          || (crateInSet "eidola-app-core" && isModelCatalogPath)
+          # Test fixtures and data of a crate being built: a package build
+          # runs that crate's tests (`doCheck`), and the workspace checks run
+          # every crate's; fixtures are rarely Rust source (the gateway's
+          # engine-trust fixtures are YAML and JSON, the engine crates' test
+          # data JSON).
+          || (
+            matchingCrate != null
+            && crateInSet matchingCrate
+            && (
+              pkgs.lib.hasInfix "/tests/fixtures/" relPath || pkgs.lib.hasInfix "/tests/data/" relPath
+            )
+          )
+          # The kernel crate whole: its library embeds the committed
+          # `kernels.manifest.json`, and its tests hash every input of the
+          # kernel build the manifest lists (CUDA sources, Nix expressions,
+          # scripts) against it.
+          || (matchingCrate == "eidola-engine-kernels" && crateInSet matchingCrate)
+          # eidola-apple's tests read the synthetic universal app the
+          # round-trip checks use. Only the workspace checks run those tests
+          # (the desktop packages compile eidola-apple but test only
+          # themselves), so the desktop sources stay as they are.
+          || (
+            wholeWorkspace
+            && (
+              relPath == "/scripts"
+              || relPath == "/scripts/fixtures"
+              || relPath == "/scripts/fixtures/apple-roundtrip"
+              || pkgs.lib.hasPrefix "/scripts/fixtures/apple-roundtrip/" relPath
+            )
+          )
+          # The committed `artifact-manifest.json`, which app-core's tests
+          # hold to the claim set this build expects. Only the workspace
+          # checks take it: a package source that included it would be an
+          # input to the very hashes the manifest records (see above).
+          || (wholeWorkspace && relPath == "/artifact-manifest.json")
+          # .sql files (include_str! in the CLI), .ttf font files
+          # (include_bytes! in the GUI), .ftl localization files (read by the
+          # GUI's build.rs, which emits them as string literals — every
+          # shipped string is a build input inside the measured artifact,
+          # never loaded at runtime), and .der certificates (tinfoil-verifier's
+          # pinned Intel SGX root, include_bytes!).
+          || (
+            type == "regular"
+            && (
+              pkgs.lib.hasSuffix ".sql" path
+              || pkgs.lib.hasSuffix ".ttf" path
+              || pkgs.lib.hasSuffix ".ftl" path
+              || pkgs.lib.hasSuffix ".der" path
+            )
+          );
+
         # Create filtered source that only includes specific crates
         mkFilteredSrc =
           crates:
@@ -182,16 +307,6 @@
                 value = true;
               }) crates
             );
-            # Find which crate (if any) a path belongs to
-            getCrateForPath =
-              relPath:
-              pkgs.lib.findFirst (
-                name:
-                let
-                  p = cratePaths.${name};
-                in
-                relPath == "/${p}" || pkgs.lib.hasPrefix "/${p}/" relPath
-              ) null workspaceCrates;
             # Check if path is a parent directory of any workspace crate
             isParentOfCrate =
               relPath: pkgs.lib.any (path: pkgs.lib.hasPrefix "${relPath}/" "/${path}") workspaceMemberPaths;
@@ -208,32 +323,16 @@
                   matchingCrate = getCrateForPath relPath;
                   # Is this an irrelevant crate? (in a crate dir but not in our set)
                   isIrrelevantCrate = matchingCrate != null && !(crateSet ? ${matchingCrate});
-                  # Both `eidola-app-core/build.rs` and `eidola-server/build.rs`
-                  # consume pinned trust data from `releases/`:
-                  #   * eidola-app-core → all of `releases/trust/*.json` +
-                  #     `releases/schema/*.json` (client trust root)
-                  #   * eidola-server → just `releases/trust/sigstore-trusted-root.json`
-                  #     (pinned Sigstore root; the runtime measurement resolver
-                  #     verifies Tinfoil release attestations against it)
-                  # Include `releases/` when either crate is in the set, but
-                  # only for those crates — unrelated crates shouldn't
-                  # cache-bust on every manifest regeneration.
-                  # `artifact-manifest.json` is deliberately excluded — it
-                  # records the eidola-cli narHash itself, so including it
-                  # would create a self-reference that prevents the build
-                  # from reaching a fixed point.
-                  trustRootFiles =
-                    crateSet ? "eidola-app-core"
-                    || crateSet ? "eidola-server";
-                  isTrustRootPath =
-                    relPath == "/releases"
-                    || pkgs.lib.hasPrefix "/releases/" relPath;
                 in
                 # Exclude irrelevant crate directories entirely
                 if isIrrelevantCrate then
                   false
-                # Trust-root build inputs for `eidola-app-core/build.rs`.
-                else if trustRootFiles && isTrustRootPath then
+                else if
+                  keepNonCargoInput {
+                    crateInSet = name: crateSet ? ${name};
+                    wholeWorkspace = false;
+                  } relPath path type
+                then
                   true
                 # Keep only root-level files that affect Cargo resolution/builds.
                 # This avoids generated files like artifact-manifest.json from
@@ -242,19 +341,6 @@
                   builtins.hasAttr baseName rootBuildFiles
                 # Keep directories that are parents of crate paths
                 else if type == "directory" && isParentOfCrate relPath then
-                  true
-                # Include .sql files (used by include_str! in the CLI), .ttf
-                # font files (used by include_bytes! in the GUI), and .ftl
-                # localization files (read by the GUI's build.rs, which emits
-                # them as string literals — every shipped string is a build
-                # input inside the measured artifact, never loaded at runtime).
-                # All three feed compile-time inputs; craneLib.filterCargoSources
-                # discards them by default because they aren't Rust source.
-                else if type == "regular" && (
-                  pkgs.lib.hasSuffix ".sql" path
-                  || pkgs.lib.hasSuffix ".ttf" path
-                  || pkgs.lib.hasSuffix ".ftl" path
-                ) then
                   true
                 # For everything else, use crane's filter (which handles .rs, Cargo.toml, etc.)
                 else
@@ -328,22 +414,19 @@
         # Full repo source for checks that compare committed vs generated files
         repoSrc = craneLib.path ./.;
 
-        # Full source for workspace-wide operations. Carries the same `.ftl`
-        # exception as `filteredSrc`: craneLib's filter keeps only Rust and
-        # Cargo files, and the GUI's build script reads `locales/` to generate
-        # its typed accessors, so the workspace-wide clippy/test derivations
-        # cannot compile it without them.
+        # Full source for workspace-wide operations (`checks.clippy`,
+        # `checks.tests`, `checks.rust-formatting`): every crate is built, so
+        # every crate's non-Cargo inputs are kept, by the same predicate the
+        # per-package sources use.
         fullSrc = pkgs.lib.cleanSourceWith {
           src = ./.;
           filter =
             path: type:
             craneLib.filterCargoSources path type
-            || (type == "regular" && pkgs.lib.hasSuffix ".ftl" path)
-            # .ttf and .sql feed include_bytes!/include_str! the same way .ftl
-            # feeds the localization build script; without them the workspace
-            # check derivations cannot compile eidola-gui or eidola-app-core.
-            || (type == "regular" && pkgs.lib.hasSuffix ".ttf" path)
-            || (type == "regular" && pkgs.lib.hasSuffix ".sql" path);
+            || keepNonCargoInput {
+              crateInSet = _: true;
+              wholeWorkspace = true;
+            } (pkgs.lib.removePrefix (toString ./.) (toString path)) path type;
         };
 
         # Base RUSTFLAGS for deterministic builds (extended per-target in mkTargetConfig)
@@ -566,8 +649,8 @@
           nixCrossSystem = null;
         };
 
-        # Generate OpenAPI specification from the server code
-        serverOpenApiSpec =
+        # Generate OpenAPI specification from the gateway code
+        gatewayOpenApiSpec =
           pkgs.runCommand "eidola-openapi-spec"
             {
               nativeBuildInputs = [ generateOpenapiBin ];
@@ -578,31 +661,123 @@
               generate-openapi > $out/openapi.json
             '';
 
-        # Statically-linked llama.cpp `llama-server`, shipped as the `local`
-        # backend's on-device inference engine sidecar. Bundled inside the
-        # macOS .app (Contents/MacOS), next to the CLI binary, and in
-        # the Linux GUI closure (exposed via EIDOLA_LLAMA_SERVER by the
-        # wrapper). App-core resolves the engine without ever scanning $PATH,
-        # so no system llama.cpp install is required.
+        # ── ELF assertions for the shipped Linux executables ────────────────
+        #
+        # Both live *inside* the derivation that produces the binary, so a
+        # nixpkgs bump that changes linkage or raises a symbol requirement
+        # fails the build. Asserting either of these outside the build — in a
+        # script or a workflow step — would let a raised requirement reach a
+        # user, who would meet it as a loader error at launch.
+        #
+        # readelf is called by absolute path rather than added to
+        # nativeBuildInputs: the sidecar's static build is a cross build
+        # (build gnu → host musl), where an unprefixed binutils on PATH would
+        # shadow the cross toolchain's own linker wrappers.
+        readelfBin = "${pkgs.binutils-unwrapped}/bin/readelf";
+
+        # No PT_INTERP (which would name a loader, and a store-built binary's
+        # loader is a /nix/store path) and no DT_NEEDED (which would name
+        # libraries the host must supply). This is the property that lets a
+        # binary be copied out of the store into a host-distro package with
+        # nothing following it.
+        assertFullyStatic = binary: ''
+          echo "checking static linkage: ${binary}"
+          if ${readelfBin} -lW "${binary}" | grep -q INTERP; then
+            echo "error: ${binary} has a PT_INTERP program header, so it is dynamically linked" >&2
+            ${readelfBin} -lW "${binary}" | grep -A1 INTERP >&2
+            exit 1
+          fi
+          if ${readelfBin} -dW "${binary}" 2>/dev/null | grep -q NEEDED; then
+            echo "error: ${binary} declares DT_NEEDED entries, so it is dynamically linked" >&2
+            ${readelfBin} -dW "${binary}" | grep NEEDED >&2
+            exit 1
+          fi
+        '';
+
+        # The oldest glibc a shipped Linux executable may demand, expressed as
+        # the highest `GLIBC_` symbol version it is allowed to reference.
+        # 2.39 is Ubuntu 24.04 LTS and Debian 13; a host older than that
+        # cannot run the binary at all, so this number *is* the supported
+        # floor and moving it is a product decision, not a build detail.
+        glibcSymbolFloor = "2.39";
+
+        # Versioned-symbol requirements are what actually bind a glibc binary
+        # to a minimum host, and they move on their own: a nixpkgs bump can
+        # raise one without a line of our code changing.
+        #
+        # `GLIBCXX_`/`CXXABI_` are asserted absent rather than floored. No
+        # shipped executable links libstdc++ today (the sidecar is static,
+        # the GUI is Rust), and the two families version independently of
+        # glibc, so there is no honest single floor to compare them against.
+        # If C++ ever enters the link, this fails and someone picks a floor
+        # for it deliberately.
+        assertGlibcFloor = binary: ''
+          echo "checking symbol-version floor (GLIBC_${glibcSymbolFloor}): ${binary}"
+          symbolVersions="$(
+            ${readelfBin} --dyn-syms -W "${binary}" \
+              | grep -oE '@@?(GLIBC|GLIBCXX|CXXABI)_[0-9][0-9.]*' \
+              | tr -d '@' | sort -u
+          )"
+          maxGlibc="$(
+            printf '%s\n' "$symbolVersions" | grep '^GLIBC_' \
+              | cut -d_ -f2 | sort -V | tail -1
+          )"
+          if [ -n "$maxGlibc" ] \
+            && [ "$(printf '%s\n%s\n' "$maxGlibc" "${glibcSymbolFloor}" | sort -V | tail -1)" != "${glibcSymbolFloor}" ]; then
+            echo "error: ${binary} requires GLIBC_$maxGlibc, above the supported floor GLIBC_${glibcSymbolFloor}" >&2
+            ${readelfBin} --dyn-syms -W "${binary}" | grep -E "@GLIBC_$maxGlibc\$" >&2
+            exit 1
+          fi
+          cxxVersions="$(printf '%s\n' "$symbolVersions" | grep -E '^(GLIBCXX|CXXABI)_' || true)"
+          if [ -n "$cxxVersions" ]; then
+            echo "error: ${binary} requires libstdc++ symbol versions, which no shipped executable is expected to:" >&2
+            printf '%s\n' "$cxxVersions" >&2
+            echo "pick a libstdc++ floor deliberately before shipping this." >&2
+            exit 1
+          fi
+          echo "symbol-version floor ok (max GLIBC_''${maxGlibc:-none})"
+        '';
+
+        # llama.cpp `llama-server`, shipped as the `local` backend's on-device
+        # inference engine sidecar. Bundled inside the macOS .app
+        # (Contents/MacOS), next to the CLI binary, and in the Linux GUI
+        # closure (exposed via EIDOLA_LLAMA_SERVER by the wrapper). App-core
+        # resolves the engine without ever scanning $PATH, so no system
+        # llama.cpp install is required.
+        #
+        # Linkage differs per platform, and the difference is load-bearing:
+        #
+        #   * Darwin: llama.cpp's own libraries are linked in, leaving only
+        #     the system frameworks (Metal/Accelerate/libc++/libSystem). That
+        #     is as static as an Apple platform gets — libSystem is never
+        #     statically linked — and it is what makes the binary relocatable
+        #     out of the store into the .app.
+        #   * Linux: fully static against musl (`pkgsStatic`), no PT_INTERP
+        #     and no DT_NEEDED at all. `assertFullyStatic` checks that in
+        #     the derivation, because the property is what lets the
+        #     sidecar be copied into a host-distro package: a dynamic sidecar
+        #     carries a /nix/store interpreter and a glibc/libstdc++ symbol
+        #     floor that would follow the artifact onto every user's machine.
         #
         # The base package fn hardcodes LLAMA_CURL and BUILD_SHARED_LIBS to ON
         # and exposes no curlSupport arg; we flip both OFF via *appended*
         # cmakeFlags (later -D wins), which drops the libcurl runtime dep and
-        # statically links llama.cpp's own libs into the one binary we ship —
-        # leaving only system frameworks (Metal/Accelerate/libc++/libSystem on
-        # Darwin) so the binary is fully relocatable. On aarch64-darwin
-        # metalSupport is ON by default and the Metal library is *embedded*
-        # (LLAMA_METAL_EMBED_LIBRARY), compiled at runtime — no Xcode, no
-        # external .metallib, works inside the sandbox.
+        # folds llama.cpp's own libs into the one binary we ship. On
+        # aarch64-darwin metalSupport is ON by default and the Metal library
+        # is *embedded* (LLAMA_METAL_EMBED_LIBRARY), compiled at runtime — no
+        # Xcode, no external .metallib, works inside the sandbox.
         #
-        # Linux is CPU-only for now (default BLAS backend). A Vulkan build
-        # (`pkgs.llama-cpp.override { vulkanSupport = true; }`, shaderc compiles
-        # SPIR-V at build time) is coherent to *build*, but usable GPU
-        # inference also needs Vulkan ICD driver files at runtime, and the
-        # Linux wrapper hands app-core the bare EIDOLA_LLAMA_SERVER path
-        # (unwrapped, so it inherits none of the GUI wrapper's
-        # VK_ADD_DRIVER_FILES). Wiring that is the follow-up; CPU-only ships a
-        # working engine on every Linux host today.
+        # Linux is CPU-only for now, and with BLAS off: nixpkgs' default BLAS
+        # backend is a shared `libblas.so.3`, which a static binary cannot
+        # carry — and measured on a small model it slowed prompt processing
+        # by an order of magnitude anyway. OpenMP stays on; the static
+        # toolchain has libgomp.a. A Vulkan build (`vulkanSupport = true`,
+        # shaderc compiles SPIR-V at build time) is coherent to *build*, but
+        # usable GPU inference also needs Vulkan ICD driver files at runtime
+        # and a loader to dlopen, which a static binary cannot do. Wiring
+        # that is the follow-up; CPU-only ships a working engine on every
+        # Linux host today.
+        #
         # The pinned nixpkgs ships llama.cpp build 6981, which predates the
         # `gemma4` GGUF architecture the curated catalog uses ("unknown model
         # architecture: 'gemma4'"), so the source is bumped to release b9960
@@ -613,7 +788,12 @@
         # the known commit directly is equivalent and more reproducible.
         llamaServerVersion = "9960";
         llamaServerCommit = "a935fbff"; # short rev of tag b9960
-        llamaServer = pkgs.llama-cpp.overrideAttrs (o: {
+        llamaServerBase =
+          if pkgs.stdenv.hostPlatform.isDarwin then
+            pkgs.llama-cpp
+          else
+            pkgs.pkgsStatic.llama-cpp.override { blasSupport = false; };
+        llamaServer = llamaServerBase.overrideAttrs (o: {
           version = llamaServerVersion;
           src = pkgs.fetchFromGitHub {
             owner = "ggml-org";
@@ -621,10 +801,21 @@
             tag = "b${llamaServerVersion}";
             hash = "sha256-FheVvdqpF3pqxmovFXBh65iNAH+lSM+jqGrM8CpLHF8=";
           };
-          # python3 is only for the Darwin LC_UUID zeroing in postInstall.
-          nativeBuildInputs = (o.nativeBuildInputs or [ ]) ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
-            pkgs.python3
-          ];
+          # The base recipe builds the tools/ui web app with npm, from
+          # dependencies hashed against its own llama.cpp source, so they
+          # cannot be fetched for this one. The server is all we ship and it
+          # builds without them, so the npm hooks are dropped and the deps
+          # are never fetched. python3 is only for the Darwin LC_UUID zeroing
+          # in postInstall and the linkage check in postFixup.
+          nativeBuildInputs =
+            pkgs.lib.filter (
+              d:
+              !(pkgs.lib.hasPrefix "nodejs" (d.name or "")) && (d.name or "") != "npm-config-hook"
+            ) (o.nativeBuildInputs or [ ])
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+              pkgs.python3
+            ];
+          npmDeps = null;
           preConfigure = ''
             prependToVar cmakeFlags "-DLLAMA_BUILD_COMMIT:STRING=${llamaServerCommit}"
             # $NIX_BUILD_TOP is only knowable at sandbox runtime
@@ -645,23 +836,43 @@
           cmakeFlags = o.cmakeFlags ++ [
             "-DLLAMA_CURL=OFF"
             "-DBUILD_SHARED_LIBS=OFF"
-            # The server auto-detects OpenSSL for httplib TLS; we speak plain
-            # HTTP over loopback only, and a libssl dep would pin the binary
-            # to nix-store paths (not relocatable on user machines).
+            # The vendored cpp-httplib links OpenSSL under this option, which
+            # the base recipe turns on. We speak plain HTTP over loopback
+            # only; a libssl dependency would pin the Darwin binary to
+            # nix-store paths (not relocatable on user machines) and drag a
+            # TLS stack's CA-path assumptions into a binary that must run on
+            # any host.
+            "-DLLAMA_OPENSSL=OFF"
+            # The pre-b9960 spelling of the same switch, inert at this
+            # llama.cpp revision.
             "-DLLAMA_SERVER_SSL=OFF"
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            # Left on deliberately: the static toolchain has libgomp.a, so
+            # OpenMP costs nothing in linkage, and dropping it for ggml's own
+            # threadpool measured ~35% slower token generation.
+            "-DGGML_OPENMP=ON"
+            # tools/ui builds an asset-embedding generator that has to run on
+            # the *build* machine; a static build is a cross build, so CMake
+            # cannot reuse the target compiler for it.
+            "-DHOST_CXX_COMPILER=${pkgs.buildPackages.stdenv.cc}/bin/c++"
           ];
-          # curl is unused with LLAMA_CURL=OFF, and its presence propagates
-          # OpenSSL into the server's auto-detection — drop it entirely.
-          buildInputs = pkgs.lib.filter (d: (d.pname or "") != "curl") o.buildInputs;
+          # Neither TLS library is used (LLAMA_CURL and LLAMA_OPENSSL are
+          # off), so neither is left where CMake's auto-detection could find
+          # it. Matched by prefix because a static build's package names
+          # carry a `-static-<triple>` suffix.
+          buildInputs = pkgs.lib.filter (
+            d: !(pkgs.lib.hasPrefix "curl" (d.pname or "")) && !(pkgs.lib.hasPrefix "openssl" (d.pname or ""))
+          ) o.buildInputs;
           # Trim the closure to just the one tool we ship. The static build
           # embeds llama.cpp's libs into the binary, so the sibling llama-*
-          # tools, the `llama` symlink, and the installed headers/archives are
-          # all dead weight for a sidecar.
+          # tools, the installed headers/archives and the shell completion
+          # are all dead weight for a sidecar.
           postInstall =
             (o.postInstall or "")
             + ''
               find "$out/bin" -mindepth 1 ! -name llama-server -delete
-              rm -rf "$out/include" "$out/lib"
+              rm -rf "$out/include" "$out/lib" "$out/share"
             ''
             + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
               # ld64's LC_UUID includes nondeterministic linker state even
@@ -700,6 +911,45 @@
                   f.write(data)
               ' "$out/bin/llama-server"
             '';
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          # Darwin's counterpart of the Linux static assertion below: every
+          # dylib the shipped binary loads must be a system one, so a base
+          # recipe that adds a library input fails here instead of shipping
+          # a nix-store reference that does not exist on a user's machine.
+          postFixup = (o.postFixup or "") + ''
+            python3 -c '
+            import struct, sys
+            LOAD_CMDS = {0xC, 0x20, 0x80000018, 0x8000001F, 0x80000023}
+            def dylibs(data, offset):
+                magic = struct.unpack_from("<I", data, offset)[0]
+                assert magic == 0xFEEDFACF, f"bad Mach-O magic at {offset:#x}"
+                ncmds = struct.unpack_from("<I", data, offset + 16)[0]
+                pos = offset + 32
+                for _ in range(ncmds):
+                    cmd, cmdsize, name = struct.unpack_from("<III", data, pos)
+                    if cmd in LOAD_CMDS:
+                        yield data[pos + name : pos + cmdsize].split(b"\0")[0].decode()
+                    pos += cmdsize
+
+            data = open(sys.argv[1], "rb").read()
+            if struct.unpack_from(">I", data, 0)[0] == 0xCAFEBABE:
+                nfat = struct.unpack_from(">I", data, 4)[0]
+                offsets = [struct.unpack_from(">I", data, 8 + i * 20 + 8)[0] for i in range(nfat)]
+            else:
+                offsets = [0]
+            bad = [d for o in offsets for d in dylibs(data, o) if not d.startswith(("/usr/lib/", "/System/Library/"))]
+            if bad:
+                sys.exit("llama-server loads non-system libraries: " + ", ".join(bad))
+            ' "$out/bin/llama-server"
+          '';
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          # The build-platform compiler tools/ui's generator needs.
+          depsBuildBuild = (o.depsBuildBuild or [ ]) ++ [ pkgs.buildPackages.stdenv.cc ];
+          # postFixup, not postInstall: fixupPhase strips and rewrites RPATHs,
+          # so this reads the bytes that actually ship.
+          postFixup = assertFullyStatic "$out/bin/llama-server";
         });
 
         # signapple — the independent `apply` our own reattach is checked
@@ -1052,7 +1302,7 @@ with open(path, "wb") as f:
         # DT_NEEDED, so the built binary stays X11-free at runtime.
         #
         # The artifact recorded in artifact-manifest.json is the *wrapped*
-        # derivation below (eidolaGuiLinuxWrapped), which bundles Mesa; this
+        # derivation below (eidolaGuiLinuxNix), which bundles Mesa; this
         # unwrapped build is the bare binary + library RUNPATH. End-user
         # packaging (AppImage/tarball/deb) is still a ship-time step on top.
         #
@@ -1117,32 +1367,152 @@ with open(path, "wb") as f:
               };
             };
 
-        # The shippable Linux GUI: the binary above plus bundled Mesa Vulkan
-        # drivers. The host's own ICD manifests are useless to a Nix binary —
-        # distros reference drivers by bare soname (`libvulkan_radeon.so`),
-        # which the loader resolves through the dynamic linker's search path,
+        # Canonical byte-stream of a Nix payload for `archiveSha256`. GNU
+        # tar POSIX/pax + gzip -n, timestamps/owners pinned, so the file
+        # hash is a function of the payload tree rather than of the packer
+        # host. `$out` is the `.tar.gz` itself (not a directory). See
+        # docs/verification.md.
+        #
+        # pax, not ustar: ustar caps member names at 100 bytes (155-byte
+        # prefix, splittable only at `/`) and — with no extension mechanism
+        # — symlink targets at 100 bytes flat. A payload symlink pointing
+        # into /nix/store blows that on its own. pax has no such limit.
+        # The two pax options are what make it deterministic: the default
+        # extended-header member name embeds tar's PID (`PaxHeaders.%p`),
+        # and atime/ctime are packer-run state rather than payload content.
+        # mtime is not deleted — --mtime=@0 already pins it, in both the
+        # ustar-compatible header and the pax header.
+        #
+        # `--mode=u=rwX,go=rX` normalizes permissions to exactly the
+        # information a NAR records (the executable bit and nothing else),
+        # so the archive and narHash cannot disagree about modes.
+        #
+        # gzip's DEFLATE output is stable for a given implementation, so
+        # the *gzip version* pinned by flake.lock is an input to
+        # archiveSha256: a nixpkgs bump can move the archive hash with an
+        # unchanged payload. That is exactly the divergence narHash exists
+        # to isolate (see docs/verification.md).
+        mkReproducibleArchive =
+          {
+            pname,
+            payload,
+          }:
+          pkgs.runCommand "${pname}.tar.gz"
+            {
+              nativeBuildInputs = [
+                pkgs.gnutar
+                pkgs.gzip
+              ];
+            }
+            ''
+              export LC_ALL=C
+              tar --format=posix \
+                --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+                --sort=name \
+                --mtime=@0 \
+                --owner=0 --group=0 --numeric-owner \
+                --mode=u=rwX,go=rX \
+                -C ${payload} -cf - . \
+              | gzip -n -9 > "$out"
+            '';
+
+        # The macOS shipping container: a deterministic zip of the payload,
+        # in the shape a browser download and Gatekeeper expect. Distinct
+        # from mkReproducibleArchive's `.tar.gz` and not a replacement for
+        # it — `archiveSha256` stays the payload's canonical identity. What
+        # this adds is a *published recipe* for the container itself, which
+        # is what makes `apply(archive, envelope) = installable` checkable:
+        # reconstructing the signed bundle only reproduces a tree, and the
+        # shipped file is a zip, so re-zipping has to land on the same bytes
+        # CI produced or the comparison has nothing to compare.
+        #
+        # The recipe itself lives in `scripts/pack-shipping-zip.sh`, which
+        # this runs rather than restates. That is the whole point of the
+        # split: a verifier has a tree this attribute cannot pack — some
+        # other directory, usually on Linux, reconstructed by
+        # `just verify-apple` — and two copies of a byte-exact recipe would
+        # be two recipes. The script carries the reasoning for each flag,
+        # including why Info-ZIP and never `ditto`.
+        #
+        # The copy is made here because the store path is read-only and the
+        # script normalizes modes in place; `u+w` only makes the copy
+        # writable, and the script then sets the exact mode set.
+        mkShippingZip =
+          {
+            pname,
+            payload,
+          }:
+          pkgs.runCommand "${pname}.zip"
+            {
+              nativeBuildInputs = [ pkgs.zip ];
+            }
+            ''
+              cp -R ${payload} tree
+              chmod -R u+w tree
+              ${./scripts/pack-shipping-zip.sh} tree "$out"
+            '';
+
+        # The Nix Linux installable: a *copied* GUI binary, a *copied*
+        # llama-server sidecar (both sets of bytes in this NAR — same
+        # measurement rule as macOS), and a *referenced* nixpkgs Mesa ICD
+        # set. It is one of two Linux installables — the `.deb` below is
+        # the other — which is why the attribute names the packaging
+        # rather than claiming the platform.
+        #
+        # Both executables are copied rather than symlinked/wrapped-by-
+        # reference on purpose. A makeWrapper over `${eidolaGuiLinux}/bin/
+        # eidola-gui` would leave the application itself outside $out: the
+        # payload would measure a wrapper script whose only claim on the
+        # binary is a store *path*. Store paths here are input-addressed,
+        # so that binds the build's inputs but not its output bytes — a
+        # non-reproducible build or a compromised builder yields the same
+        # path, therefore the same narHash/archiveSha256, while the user
+        # resolves different bytes from their own substituter. Copying puts
+        # the ELF in the measured tree, which is the rule docs/verification.md
+        # states: functional bytes that ship inside the installable are in
+        # the payload.
+        #
+        # The copy lands at `.eidola-gui-wrapped` (the nixpkgs wrapper
+        # convention) so it stays a *sibling* of llama-server in $out/bin.
+        # app-core resolves the engine from the running executable, which
+        # after exec is the copy, so the sibling rule holds on its own;
+        # EIDOLA_LLAMA_SERVER is set anyway as an explicit pin.
+        #
+        # Mesa stays a reference — the one deliberate exception, because
+        # the device's GPU stack is pre-trusted. The host's own ICD
+        # manifests are useless to a Nix binary — distros
+        # reference drivers by bare soname (`libvulkan_radeon.so`), which
+        # the loader resolves through the dynamic linker's search path,
         # i.e. our RUNPATH, never /usr/lib; and dlopening host Mesa into a
-        # Nix glibc invites symbol-version mismatches. Bundling Mesa (whose
-        # Nix ICD manifests carry absolute store paths) makes the artifact's
-        # host surface kernel + compositor socket + /dev/dri, at the cost of
-        # Mesa's closure (~1 GB, LLVM for the llvmpipe fallback included).
-        # VK_ADD_DRIVER_FILES is *additive* and set only as a default, so a
-        # NixOS host's /run/opengl-driver drivers coexist and a user can
-        # override outright.
-        eidolaGuiLinuxWrapped =
+        # Nix glibc invites symbol-version mismatches. Bundling Mesa
+        # (whose Nix ICD manifests carry absolute store paths) makes the
+        # artifact's host surface kernel + compositor socket + /dev/dri,
+        # at the cost of Mesa's closure (~1 GB, LLVM for the llvmpipe
+        # fallback included). Those Mesa bytes are *not* copied into
+        # $out: VK_ADD_DRIVER_FILES points at the store, so they sit
+        # outside archiveSha256. A Flatpak against the Freedesktop GL
+        # runtime is how an Ubuntu-shaped installable leaves Mesa out of
+        # our payload entirely. VK_ADD_DRIVER_FILES is *additive* and set
+        # only as a default, so a NixOS host's /run/opengl-driver drivers
+        # coexist and a user can override outright.
+        eidolaGuiLinuxNix =
           if eidolaGuiLinux == null then
             null
           else
-            pkgs.runCommand "eidola-gui-linux"
+            pkgs.runCommand "eidola-gui-linux-nix"
               {
                 nativeBuildInputs = [ pkgs.makeWrapper ];
               }
               ''
                 mkdir -p $out/bin $out/share/applications
+                cp ${eidolaGuiLinux}/bin/eidola-gui "$out/bin/.eidola-gui-wrapped"
+                chmod u+w "$out/bin/.eidola-gui-wrapped"
+                cp ${llamaServer}/bin/llama-server "$out/bin/llama-server"
+                chmod u+w "$out/bin/llama-server"
                 icds=$(ls ${pkgs.mesa}/share/vulkan/icd.d/*.json | tr '\n' ':')
-                makeWrapper ${eidolaGuiLinux}/bin/eidola-gui $out/bin/eidola-gui \
+                makeWrapper "$out/bin/.eidola-gui-wrapped" $out/bin/eidola-gui \
                   --set-default VK_ADD_DRIVER_FILES "''${icds%:}" \
-                  --set-default EIDOLA_LLAMA_SERVER ${llamaServer}/bin/llama-server
+                  --set-default EIDOLA_LLAMA_SERVER "$out/bin/llama-server"
                 # Desktop entry — basename matches the Wayland app_id the
                 # binary sets (lib.rs APP_ID), which is what lets the shell
                 # resolve our windows to this entry. Strip the comment header
@@ -1161,15 +1531,298 @@ with open(path, "wb") as f:
                   $out/share/icons/
               '';
 
+        # ── The host-generic Linux payload and its .deb envelope ────────────
+        #
+        # The Nix installable above hands the GUI a complete userland out of
+        # the store. This one does the opposite: it keeps only our own bytes
+        # and resolves everything else from the host distro, which is what
+        # lets the host's Vulkan loader and its Mesa or proprietary NVIDIA
+        # drivers — all built against the host's glibc — load into our
+        # process. The Nix-glibc/host-driver mismatch the wrapped build works
+        # around by bundling Mesa does not arise here.
+        #
+        # Two pieces of post-link metadata are all that bind the release
+        # binary to the store, and patchelf removes both:
+        #
+        #   * RUNPATH, which points every lookup at the store. Dropping it is
+        #     safe because the only DT_NEEDED library outside glibc is
+        #     libxkbcommon; the Wayland client, the Vulkan loader and EGL are
+        #     dlopened by bare soname, and a bare soname is resolved through
+        #     the loader's default search path.
+        #   * PT_INTERP, the store's ld.so, rewritten to the path the
+        #     filesystem hierarchy standard gives glibc's loader.
+        #
+        # Nothing else changes: same source, same release profile, same
+        # linker output.
+        fdoInterpreter =
+          {
+            "x86_64-linux" = "/lib64/ld-linux-x86-64.so.2";
+            "aarch64-linux" = "/lib/ld-linux-aarch64.so.1";
+          }
+          .${system} or null;
+
+        eidolaGuiLinuxFdo =
+          if eidolaGuiLinux == null then
+            null
+          else
+            pkgs.runCommand "eidola-gui-linux-fdo"
+              {
+                nativeBuildInputs = [ pkgs.patchelf ];
+              }
+              ''
+                mkdir -p $out/bin
+                cp ${eidolaGuiLinux}/bin/eidola-gui $out/bin/eidola-gui
+                chmod u+w $out/bin/eidola-gui
+                patchelf --remove-rpath $out/bin/eidola-gui
+                patchelf --set-interpreter ${fdoInterpreter} $out/bin/eidola-gui
+                ${assertGlibcFloor "$out/bin/eidola-gui"}
+                chmod a-w $out/bin/eidola-gui
+              '';
+
+        # Debian dependencies, grouped by how each one is discovered, because
+        # only the first group can be checked against the artifact.
+        #
+        # DT_NEEDED — resolved eagerly by the loader. `assertDebNeededCovered`
+        # below fails the build if the shipped binary names a soname this
+        # table does not, so the package can never declare less than it links.
+        # The glibc entry carries the version floor, which turns an
+        # unsupported host into an apt refusal instead of a loader error.
+        debNeededPackages = {
+          "libc.so.6" = "libc6 (>= ${glibcSymbolFloor})";
+          "libm.so.6" = "libc6 (>= ${glibcSymbolFloor})";
+          # aarch64 links the loader itself; x86-64 does not, but both are
+          # libc6 and listing both keeps this table arch-independent.
+          "ld-linux-aarch64.so.1" = "libc6 (>= ${glibcSymbolFloor})";
+          "ld-linux-x86-64.so.2" = "libc6 (>= ${glibcSymbolFloor})";
+          "libgcc_s.so.1" = "libgcc-s1";
+          "libxkbcommon.so.0" = "libxkbcommon0";
+        };
+
+        # dlopened by bare soname, so absent from the ELF header and not
+        # derivable from it. Read out of the binary's string table:
+        # libwayland-client.so.0, libwayland-egl.so.1, libEGL.so.1,
+        # libvulkan.so.1. Note what is *not* here — fontconfig and freetype
+        # are Rust reimplementations in this build (`fontconfig_parser`), so
+        # neither library is loaded.
+        debDlopenPackages = [
+          "libwayland-client0"
+          "libwayland-egl1"
+          "libegl1"
+          "libvulkan1"
+        ];
+
+        # Not dependencies: a Vulkan ICD is a property of the machine's GPU
+        # (a host with proprietary NVIDIA drivers must not be made to install
+        # Mesa), and the font files the pure-Rust text stack reads off disk
+        # are supplied by any desktop install. Both are needed for the app to
+        # be useful, which is what Recommends means, and apt installs
+        # Recommends by default.
+        debRecommendsPackages = [
+          "mesa-vulkan-drivers"
+          "fonts-dejavu-core"
+        ];
+
+        assertDebNeededCovered = binary: ''
+          echo "checking that every DT_NEEDED soname has a declared package: ${binary}"
+          for soname in $(
+            ${readelfBin} -dW "${binary}" \
+              | grep NEEDED | tr -d '[]' | tr -s ' ' '\n' | grep '\.so'
+          ); do
+            case " ${pkgs.lib.concatStringsSep " " (builtins.attrNames debNeededPackages)} " in
+              *" $soname "*) ;;
+              *)
+                echo "error: ${binary} needs $soname, which no Debian package is declared for" >&2
+                echo "add it to debNeededPackages in flake.nix" >&2
+                exit 1
+                ;;
+            esac
+          done
+        '';
+
+        debArchitecture =
+          {
+            "x86_64-linux" = "amd64";
+            "aarch64-linux" = "arm64";
+          }
+          .${system} or null;
+
+        debVersion = workspaceCargoToml.workspace.package.version;
+
+        # The installed tree, exactly as it lands on the host.
+        #
+        # Both executables sit in /usr/libexec/eidola and /usr/bin/eidola-gui
+        # is a symlink to the GUI. That layout is not cosmetic: app-core
+        # resolves the inference engine as a `llama-server` sibling of the
+        # running executable, and /proc/self/exe reports the symlink's target,
+        # so a launch through /usr/bin lands in /usr/libexec/eidola and finds
+        # the sidecar there. The engine rule is unchanged on every platform.
+        eidolaLinuxDebTree =
+          if eidolaGuiLinuxFdo == null then
+            null
+          else
+            pkgs.runCommand "eidola-deb-tree"
+              {
+                nativeBuildInputs = [
+                  pkgs.appstream
+                  pkgs.desktop-file-utils
+                ];
+              }
+              ''
+                install -Dm755 ${eidolaGuiLinuxFdo}/bin/eidola-gui \
+                  $out/usr/libexec/eidola/eidola-gui
+                install -Dm755 ${llamaServer}/bin/llama-server \
+                  $out/usr/libexec/eidola/llama-server
+                mkdir -p $out/usr/bin
+                ln -s ../libexec/eidola/eidola-gui $out/usr/bin/eidola-gui
+
+                # Desktop entry — see the Nix installable above for why the
+                # comment header is stripped and why the basename is fixed.
+                mkdir -p $out/usr/share/applications
+                grep -v '^#' ${./releases/linux/ai.eidola.app.desktop} \
+                  > $out/usr/share/applications/ai.eidola.app.desktop
+
+                mkdir -p $out/usr/share/icons
+                cp -r --no-preserve=mode ${./releases/linux/icons}/. \
+                  $out/usr/share/icons/
+
+                # App-centre metadata. GNOME Software and KDE Discover render
+                # an installed app's page from this file.
+                install -Dm644 ${./releases/linux/ai.eidola.app.metainfo.xml} \
+                  $out/usr/share/metainfo/ai.eidola.app.metainfo.xml
+
+                # Both files are read by software nobody here controls, on
+                # machines we never see, so they are validated where a
+                # mistake is still cheap.
+                desktop-file-validate \
+                  $out/usr/share/applications/ai.eidola.app.desktop
+                appstreamcli validate --no-net --pedantic \
+                  $out/usr/share/metainfo/ai.eidola.app.metainfo.xml
+              '';
+
+        # The .deb: an `ar` archive of three members in a fixed order, the
+        # last two of which are tarballs of the control and data trees.
+        #
+        # Everything here is spelled out rather than delegated to dpkg-deb so
+        # the byte stream is a function of the tree: `ar -D` zeroes member
+        # timestamps, uids and modes, and the two tars carry the same
+        # discipline as `mkReproducibleArchive` above — sorted members, pinned
+        # mtime, no owner names, modes normalized. GNU tar format rather than
+        # that function's pax, because dpkg's extractor reads ustar plus the
+        # GNU long-name extensions and nothing else. dpkg-deb is still
+        # present, as the check that what we assembled is a package dpkg
+        # agrees with.
+        eidolaLinuxDeb =
+          if eidolaLinuxDebTree == null then
+            null
+          else
+            pkgs.runCommand "eidola_${debVersion}_${debArchitecture}.deb"
+              {
+                nativeBuildInputs = [
+                  pkgs.gnutar
+                  pkgs.gzip
+                  pkgs.binutils
+                  pkgs.dpkg
+                ];
+              }
+              ''
+                export LC_ALL=C
+                tree=${eidolaLinuxDebTree}
+
+                ${assertDebNeededCovered "$tree/usr/libexec/eidola/eidola-gui"}
+                ${assertGlibcFloor "$tree/usr/libexec/eidola/eidola-gui"}
+                ${assertFullyStatic "$tree/usr/libexec/eidola/llama-server"}
+
+                tarFlags="--format=gnu --sort=name --mtime=@0 \
+                  --owner=0 --group=0 --numeric-owner --mode=u=rwX,go=rX"
+
+                # data.tar.gz — the installed tree, rooted at `./`.
+                # shellcheck disable=SC2086
+                tar $tarFlags -C "$tree" -cf - . | gzip -n -9 > data.tar.gz
+
+                mkdir control
+
+                # md5sums, over every regular file in the payload. dpkg reads
+                # it for `dpkg --verify` and for conffile-less integrity
+                # checks; the symlink has no entry because it has no content.
+                ( cd "$tree" && find . -type f | sort | \
+                  while read -r f; do
+                    md5sum "$f"
+                  done ) | sed 's|\./||' > control/md5sums
+
+                installedSize=$(du -s -k --apparent-size "$tree" | cut -f1)
+
+                cat > control/control <<EOF
+                Package: eidola
+                Version: ${debVersion}
+                Architecture: ${debArchitecture}
+                Maintainer: Eidola, Inc. <hello@eidola.ai>
+                Installed-Size: $installedSize
+                Section: utils
+                Priority: optional
+                Homepage: https://www.eidola.ai
+                Depends: ${
+                  pkgs.lib.concatStringsSep ", " (
+                    pkgs.lib.naturalSort (
+                      pkgs.lib.unique (builtins.attrValues debNeededPackages ++ debDlopenPackages)
+                    )
+                  )
+                }
+                Recommends: ${pkgs.lib.concatStringsSep ", " debRecommendsPackages}
+                Description: private AI chat client
+                 A personal AI client whose privacy rests on verifiable architecture
+                 and open code rather than on a policy taken on faith. Conversations
+                 run against models in confidential-computing enclaves that the app
+                 verifies on every connection, or entirely on this device.
+                 .
+                 The bundled inference engine and the application binary are the only
+                 files this package installs beyond its desktop metadata; the Wayland,
+                 Vulkan and GPU stacks come from the host.
+                EOF
+
+                # shellcheck disable=SC2086
+                tar $tarFlags -C control -cf - . | gzip -n -9 > control.tar.gz
+
+                echo "2.0" > debian-binary
+
+                # `ar -D`: deterministic mode, which zeroes each member's
+                # timestamp, uid, gid and mode. Member order is dpkg's
+                # requirement, not ar's.
+                ar rcD "$out" debian-binary control.tar.gz data.tar.gz
+
+                echo "── dpkg-deb --info ──"
+                dpkg-deb --info "$out"
+                echo "── dpkg-deb --contents ──"
+                dpkg-deb --contents "$out"
+              '';
+
+        # ── The inference engine's GPU kernels ──────────────────────────────
+        #
+        # The kernel build, imported unchanged and given this flake's nixpkgs,
+        # so the toolchain record it writes into its manifest is the one
+        # `kernels.manifest.json` holds. Built for the one platform a node runs
+        # on (x86_64 Linux, Blackwell GPUs). The node's image takes the kernels
+        # from `oci/eidola-engine-kernels/Containerfile`, which runs the same
+        # expression.
+        engineKernelsPlatform = system == "x86_64-linux";
+        engineKernels =
+          if !engineKernelsPlatform then
+            null
+          else
+            import ./crates/eidola-engine-kernels/nix {
+              nixpkgsSrc = nixpkgs;
+              nixpkgsRev = nixpkgs.rev;
+              inherit system;
+            };
+
       in
       {
         packages = {
-          server = mkPackage {
-            pname = "eidola-server";
+          gateway = mkPackage {
+            pname = "eidola-server-gateway";
             rustTarget = nativeRustTarget;
             nixCrossSystem = null;
           };
-          server-openapi-spec = serverOpenApiSpec;
+          gateway-openapi-spec = gatewayOpenApiSpec;
           # Static llama.cpp `llama-server` — the bundled on-device inference
           # engine sidecar. Buildable on its own (`nix build .#llama-server`)
           # for the dev-path `just engine` recipe.
@@ -1179,13 +1832,40 @@ with open(path, "wb") as f:
         }
         // pkgs.lib.optionalAttrs (eidolaCliMacosUniversal != null) {
           eidola-cli-macos-universal = eidolaCliMacosUniversal;
+          eidola-cli-macos-universal-archive = mkReproducibleArchive {
+            pname = "eidola-cli-macos-universal";
+            payload = eidolaCliMacosUniversal;
+          };
         }
         // pkgs.lib.optionalAttrs (eidolaGuiMacosUniversal != null) {
           eidola-gui-macos-universal = eidolaGuiMacosUniversal;
+          eidola-gui-macos-universal-archive = mkReproducibleArchive {
+            pname = "eidola-gui-macos-universal";
+            payload = eidolaGuiMacosUniversal;
+          };
+          # The unsigned shipping container. Signing happens outside Nix
+          # (it needs a key), so this is the *unsigned* zip: the recipe a
+          # signed release's zip is produced by, exercised on every build.
+          eidola-gui-macos-universal-zip = mkShippingZip {
+            pname = "eidola-gui-macos-universal";
+            payload = eidolaGuiMacosUniversal;
+          };
         }
         // pkgs.lib.optionalAttrs (eidolaGuiLinux != null) {
-          eidola-gui-linux = eidolaGuiLinuxWrapped;
+          eidola-gui-linux-nix = eidolaGuiLinuxNix;
           eidola-gui-linux-unwrapped = eidolaGuiLinux;
+          eidola-gui-linux-nix-archive = mkReproducibleArchive {
+            pname = "eidola-gui-linux-nix";
+            payload = eidolaGuiLinuxNix;
+          };
+          # The host-generic GUI binary, and the Debian package built over it.
+          eidola-gui-linux-fdo = eidolaGuiLinuxFdo;
+          eidola-linux-deb-tree = eidolaLinuxDebTree;
+          eidola-linux-deb = eidolaLinuxDeb;
+        }
+        // pkgs.lib.optionalAttrs engineKernelsPlatform {
+          # The inference engine's GPU kernels.
+          eidola-engine-kernels = engineKernels;
         };
 
         # Development shell (lightweight — daily Rust dev uses rustup)
@@ -1251,12 +1931,12 @@ with open(path, "wb") as f:
               ''
                 echo "Checking if committed OpenAPI spec matches generated one..."
 
-                GENERATED="${self.packages.${system}.server-openapi-spec}/openapi.json"
-                COMMITTED="${repoSrc}/crates/eidola-server/openapi.json"
+                GENERATED="${self.packages.${system}.gateway-openapi-spec}/openapi.json"
+                COMMITTED="${repoSrc}/crates/eidola-server-gateway/openapi.json"
 
                 if [ ! -f "$COMMITTED" ]; then
-                  echo "ERROR: No committed OpenAPI spec found at crates/eidola-server/openapi.json"
-                  echo "Run: nix run '.#update-server-openapi'"
+                  echo "ERROR: No committed OpenAPI spec found at crates/eidola-server-gateway/openapi.json"
+                  echo "Run: nix run '.#update-gateway-openapi'"
                   echo "Then commit the generated file."
                   exit 1
                 fi
@@ -1266,7 +1946,7 @@ with open(path, "wb") as f:
                   echo "ERROR: Committed OpenAPI spec doesn't match generated one!"
                   echo ""
                   echo "To fix this:"
-                  echo "  1. Run: nix run '.#update-server-openapi'"
+                  echo "  1. Run: nix run '.#update-gateway-openapi'"
                   echo "  2. Review the changes"
                   echo "  3. Commit the updated spec"
                   echo ""
@@ -1280,22 +1960,22 @@ with open(path, "wb") as f:
         };
 
         apps = {
-          update-server-openapi = {
+          update-gateway-openapi = {
             type = "app";
             meta.description = "Update committed OpenAPI spec from generated sources";
             program = "${
               pkgs.writeShellApplication {
-                name = "update-server-openapi";
+                name = "update-gateway-openapi";
                 runtimeInputs = [
                   pkgs.coreutils
                   pkgs.git
                 ];
 
                 text = ''
-                  ${./scripts/update-server-openapi.sh} "${self.packages.${system}.server-openapi-spec}/openapi.json"
+                  ${./scripts/update-gateway-openapi.sh} "${self.packages.${system}.gateway-openapi-spec}/openapi.json"
                 '';
               }
-            }/bin/update-server-openapi";
+            }/bin/update-gateway-openapi";
           };
 
           format-rust = {

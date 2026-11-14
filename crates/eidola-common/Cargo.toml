@@ -16,3 +16,38 @@ license = "MIT OR Apache-2.0"
 # `preserve_order` cannot skew the measure, and the crate docs for the rule
 # that governs any future dependency here.
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# The Argon2id rule of `engine_deployment` (`parse_gateway_token_hash`). Optional,
+# so it enters only the graphs of the two consumers that enable it — the node
+# and the gateway — and both already depend on `argon2 0.6` themselves.
+argon2 = { version = "0.6", optional = true }
+
+# `engine_deployment::deployment`: one engine deployment's config and sidecar,
+# checked whole. Optional, enabled only by the gateway's build and tests and by
+# `measure-enclave`, each of which already reads YAML deployment configs.
+serde_yaml = { version = "0.9", optional = true }
+# The typed mirror of Tinfoil's config schema in the same module.
+serde = { version = "1", features = ["derive"], optional = true }
+# The parser `serde_yaml` is built on, read for its event stream (anchors,
+# aliases, tags, key styles) in the same module; already in the graph of every
+# consumer of `serde_yaml`.
+unsafe-libyaml = { version = "0.2.11", optional = true }
+# `spend_credentials`: the one spelling of a request's `credentials` member
+# (padded base64url Tokens, RFC 4648) and the strict shape of each element.
+# Optional, enabled only by the two sides of that member, app-core and the
+# gateway, both of which depend on `base64 0.23` and `serde` (derive)
+# themselves.
+base64 = { version = "0.23", optional = true }
+# `model_catalog`: the model catalog's source files (`models/`), read by the
+# gateway's and the client's build scripts alike. Optional, enabled only by
+# those two build scripts and their tests, each of which already depends on
+# `toml 1` and `sha2 0.11`. `engine_deployment::deployment` hashes a vendored
+# platform release manifest with it too; the gateway's build and
+# `measure-enclave`, its only readers, depend on `sha2 0.11` themselves.
+toml = { version = "1", optional = true }
+sha2 = { version = "0.11", optional = true }
+
+[features]
+argon2 = ["dep:argon2"]
+deployment = ["argon2", "dep:serde_yaml", "dep:serde", "dep:unsafe-libyaml", "dep:sha2"]
+spend-credentials = ["dep:base64", "dep:serde"]
+catalog = ["dep:toml", "dep:sha2", "dep:serde"]

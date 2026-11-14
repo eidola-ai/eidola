@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 # E2E webhook smoke tests.
 #
-# Validates the full pipeline: Stripe CLI → HTTP → server → signature
-# verification → event parsing → handler dispatch → DB lookup.
+# Validates Stripe CLI → receiver → durable inbox → independent worker.
 #
 # All triggers create fixture objects with Stripe-generated customer IDs that
-# don't exist in our DB, so every handler hits the "orphan customer" path.
-# Assertions verify: events received (log grep), no crashes/panics, server
-# stays healthy. The unit integration tests already cover happy-path ledger
-# mutations.
+# don't exist in our DB, so jobs remain visible for review. Assertions inspect
+# durable inbox state and receiver health. Local fixture-driven integration
+# tests cover ledger mutations without contacting Stripe.
 #
 # Requires: STRIPE_API_KEY (sk_test_...) set in environment or .env.
 
@@ -18,9 +16,8 @@ set -euo pipefail
 
 cleanup() {
     echo "==> Cleaning up..."
-    docker compose --profile server --profile stripe down --volumes --remove-orphans 2>/dev/null || true
+    docker compose --profile billing --profile stripe down --volumes --remove-orphans 2>/dev/null || true
 }
-trap cleanup EXIT
 
 # ── Preflight ────────────────────────────────────────────────────────────────
 
@@ -29,11 +26,18 @@ if [ -z "${STRIPE_API_KEY:-}" ]; then
     echo "Usage: STRIPE_API_KEY=sk_test_xxx just test-webhook-smoke" >&2
     exit 1
 fi
+case "$STRIPE_API_KEY" in
+    sk_test_* | rk_test_*) ;;
+    *) echo "ERROR: this smoke test requires a Stripe test-mode key." >&2; exit 1 ;;
+esac
+# Never tear down the developer's existing Compose project.
+export COMPOSE_PROJECT_NAME="eidola-webhook-smoke-$$"
+trap cleanup EXIT
 
 # ── Build images ─────────────────────────────────────────────────────────────
 
 echo "==> Building images (docker-dev profile)..."
-CARGO_PROFILE=docker-dev docker buildx bake
+CARGO_PROFILE=docker-dev docker buildx bake postgres billing stripe-cli
 
 # ── Start postgres, wait healthy, apply schema ───────────────────────────────
 
@@ -77,24 +81,24 @@ if [ -z "$STRIPE_WEBHOOK_SECRET" ]; then
 fi
 
 export STRIPE_WEBHOOK_SECRET
-echo "    secret: ${STRIPE_WEBHOOK_SECRET:0:12}..."
+echo "    webhook signing secret captured"
 
-# ── Start server + stripe-cli ────────────────────────────────────────────────
+# ── Start receiver, worker and stripe-cli ────────────────────────────────────
 
-echo "==> Starting server and stripe-cli..."
-docker compose --profile server --profile stripe up -d server shim stripe-cli
+echo "==> Starting billing processes and stripe-cli..."
+docker compose --profile billing --profile stripe up -d billing-receiver billing-worker stripe-cli
 
-# ── Poll /health ─────────────────────────────────────────────────────────────
+# ── Poll receiver health ────────────────────────────────────────────────────
 
-echo "==> Waiting for server /health..."
+echo "==> Waiting for receiver /healthz..."
 for i in $(seq 1 30); do
-    if curl -sf http://localhost:8080/health >/dev/null 2>&1; then
-        echo "    server healthy"
+    if curl -sf http://localhost:8081/healthz >/dev/null 2>&1; then
+        echo "    receiver healthy"
         break
     fi
     if [ "$i" -eq 30 ]; then
-        echo "ERROR: server did not become healthy in 30s" >&2
-        docker compose --profile server --profile stripe logs server
+        echo "ERROR: receiver did not become healthy in 30s" >&2
+        docker compose --profile billing --profile stripe logs billing-receiver
         exit 1
     fi
     sleep 1
@@ -104,13 +108,13 @@ done
 
 echo "==> Waiting for stripe-cli to be ready..."
 for i in $(seq 1 30); do
-    if docker compose --profile server --profile stripe logs stripe-cli 2>&1 | grep -q "Ready!"; then
+    if docker compose --profile billing --profile stripe logs stripe-cli 2>&1 | grep -q "Ready!"; then
         echo "    stripe-cli ready"
         break
     fi
     if [ "$i" -eq 30 ]; then
         echo "ERROR: stripe-cli did not become ready in 30s" >&2
-        docker compose --profile server --profile stripe logs stripe-cli
+        docker compose --profile billing --profile stripe logs stripe-cli
         exit 1
     fi
     sleep 1
@@ -141,27 +145,30 @@ sleep 5
 
 echo "==> Running assertions..."
 FAILED=0
-SERVER_LOGS=$(docker compose --profile server --profile stripe logs server 2>&1)
+BILLING_LOGS=$(docker compose --profile billing --profile stripe logs billing-receiver billing-worker 2>&1)
 
-# Server is still running
-if ! curl -sf http://localhost:8080/health >/dev/null 2>&1; then
-    echo "FAIL: server is no longer healthy"
+# Receiver is still running
+if ! curl -sf http://localhost:8081/healthz >/dev/null 2>&1; then
+    echo "FAIL: receiver is no longer healthy"
     FAILED=1
 fi
 
-# Each event type appears in server logs
+# Every fixture event is durable and has reached the separate worker. These
+# event names are fixed literals above, never user/provider input in SQL.
 for event in "${EVENTS[@]}"; do
-    if echo "$SERVER_LOGS" | grep -q "webhook: received $event"; then
-        echo "  OK: $event received"
+    observed=$(docker compose exec -T postgres psql -U eidola -d eidola -tAc \
+        "SELECT EXISTS(SELECT 1 FROM billing_event WHERE kind='$event' AND attempts>0 AND last_error='requires_review' AND completed_at IS NULL)")
+    if [ "$observed" = "t" ]; then
+        echo "  OK: $event durably received and processed for review"
     else
-        echo "FAIL: $event not found in server logs"
+        echo "FAIL: $event has not reached review in the durable inbox"
         FAILED=1
     fi
 done
 
 # No panics
-if echo "$SERVER_LOGS" | grep -qi "panic"; then
-    echo "FAIL: panic detected in server logs"
+if echo "$BILLING_LOGS" | grep -qi "panic"; then
+    echo "FAIL: panic detected in billing logs"
     FAILED=1
 else
     echo "  OK: no panics"
@@ -175,7 +182,7 @@ if [ "$FAILED" -eq 0 ]; then
 else
     echo "Some webhook smoke tests FAILED." >&2
     echo ""
-    echo "==> Server logs:"
-    echo "$SERVER_LOGS"
+    echo "==> Billing logs:"
+    echo "$BILLING_LOGS"
     exit 1
 fi

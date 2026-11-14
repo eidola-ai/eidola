@@ -1,0 +1,65 @@
+# A synthetic catalog row, used by the gateway's model-catalog tests. Laid
+# out as a real one is: models/<family>/<label>.toml. The files it lists are
+# in weights/ beside it: not real weights, but a real weights directory, which
+# the gateway's tests and scripts/test-weights-hash.sh both hash.
+sha256 = "a13d92b1d4bdf20dcffe052429ac50ca86b8423b8cea5682ae55f90b286072cf"
+architecture = "MimoV26Flash"
+tags = ["fixture-flash", "fixture-latest"]
+name = "Fixture Flash"
+description = "A synthetic reasoning model with tool calling"
+
+[source]
+repo = "example/fixture-flash"
+revision = "4444444444444444444444444444444444444444"
+
+[[files]]
+path = "chat_template.jinja"
+size = 15
+sha256 = "7f3de14b4a359865a98f84be7a9314754b7e14e8e23524e2553e4effaa9d18e1"
+
+[[files]]
+path = "config.json"
+size = 40
+sha256 = "d4273628b85f44c92eafc2fee6a76d17aa408efd9bb23cf8ee7927d0ce5088fc"
+
+[[files]]
+path = "generation_config.json"
+size = 20
+sha256 = "5e753aa26f4e7e55a650fccdabe8cd6e6fa5169bee2413f6d8f6c79fda1cdc8e"
+
+[[files]]
+path = "model-00001-of-00002.safetensors"
+size = 9
+sha256 = "96af8b4933b944bc61107844c9cd0e6986f4add076f2db54982e868cf0630c96"
+
+[[files]]
+path = "model-00002-of-00002.safetensors"
+size = 9
+sha256 = "0fea3322e99e4fd7c9c9ca6a6bded8163add6b14de3380ee6ac335857c29682e"
+
+[[files]]
+path = "model.safetensors.index.json"
+size = 18
+sha256 = "418863b9669afab00f578b07d76f8db77ebc7f5ce98ccb2a7b086815d13e2838"
+
+[[files]]
+path = "tokenizer.json"
+size = 13
+sha256 = "050bcb14539abaa0da17e134224915592512eaa3851addb7ebe8986f8012f37e"
+
+[capabilities]
+context_length = 1048576
+tool_calling = true
+reasoning = true
+input_modalities = ["text"]
+output_modalities = ["text"]
+max_output_tokens = 32768
+output_budget_class = "reasoning"
+
+[price]
+input_per_m = 1.80
+output_per_m = 5.75
+cached_input_per_m = 0.45
+
+[lifecycle]
+status = "current"

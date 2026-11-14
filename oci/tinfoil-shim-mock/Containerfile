@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/src/target \
     cargo build --release -p tinfoil-shim-mock \
     && install -D target/release/tinfoil-shim-mock /out/tinfoil-shim-mock
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 WORKDIR /src
 COPY --from=build /out/tinfoil-shim-mock /usr/local/bin/
 EXPOSE 8443

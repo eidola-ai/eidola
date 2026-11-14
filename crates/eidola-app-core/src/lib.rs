@@ -5,9 +5,16 @@ pub mod db;
 pub mod decline;
 pub mod discovery;
 pub mod error;
+pub mod ipc;
 pub mod local_models;
 pub mod memory;
+pub mod model_catalog;
+mod peer_read;
+mod prefix_cache;
+pub mod proxy;
+mod recorded;
 pub mod router;
+pub mod search;
 pub mod subspace_driver;
 pub mod subspaces;
 pub mod summaries;
@@ -16,6 +23,7 @@ pub mod trust_root;
 pub mod updater;
 pub mod updates;
 pub mod utility;
+mod whole_answer;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -27,6 +35,9 @@ use anonymous_credit_tokens::{
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use eidola_common::engine_protocol::ContinueField;
+use eidola_common::issuer_calendar::{ISSUER_CALENDAR, IssuerCalendar, rfc3339_utc};
+use eidola_common::spend_credentials::ACT_L;
 use rand_core::OsRng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -40,10 +51,14 @@ use changes::{BroadcastSource, Change, ChangeSource};
 use config::Config;
 pub use config::DEFAULT_TEMPLATE_ID;
 pub use db::HUMAN_PARTICIPANT_ID;
-use error::AppError;
+/// The Eidola model reference grammar (`tag`, `tag@sha256:<hex>`,
+/// `sha256:<hex>`), shared with the gateway.
+pub use eidola_common::model_reference;
+use error::{AppError, IssuerKeyRefusal};
 pub use local_models::{
     ExternalEngineBackend, LOCAL_MODEL_CATALOG, LocalCatalogEntry, LocalModelInfo,
-    LocalModelStatus, LocalModelsState, ModelDownloadTarget, RunningEngine, resolve_model_download,
+    LocalModelStatus, LocalModelsState, ModelDownloadTarget, RunningEngine,
+    catalog_entry_for_model_ref, resolve_model_download,
 };
 pub use subspace_driver::{
     ANCHOR_WAIT_GRACE, DelegationEnd, DelegationFailure, MAX_ATTEMPTS_PER_TAIL,
@@ -138,11 +153,31 @@ pub struct EidolaTrust {
     pub hardware_intermediate_ca_pem: Option<String>,
 }
 
+/// One trusted server launch identity (SEV-SNP, IGVM launch model).
 #[derive(Clone, Debug)]
 pub struct MeasurementInfo {
-    pub snp: String,
-    pub tdx_rtmr1: String,
-    pub tdx_rtmr2: String,
+    /// The launch digest of the release image (96 hex).
+    pub measurement: String,
+    /// HOST_DATA: the SHA-256 of the server's config (64 hex).
+    pub host_data: String,
+    /// The guest policy a launch must carry (`0x30133`).
+    pub guest_policy: String,
+}
+
+impl MeasurementInfo {
+    /// The key it is untrusted by: `<measurement>:<host_data>`.
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.measurement, self.host_data)
+    }
+
+    /// Its trust spec, `<measurement>:<host_data>:<guest_policy>`, the form
+    /// `trust_measurement` reads back.
+    pub fn spec(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.measurement, self.host_data, self.guest_policy
+        )
+    }
 }
 
 // --- Participants & space templates (Participants v1) ----------------------
@@ -161,6 +196,10 @@ pub struct ParticipantInfo {
     pub kind: String,
     pub label: String,
     pub model_ref: Option<String>,
+    /// What the user should be told about `model_ref` in this space
+    /// (`model_catalog::notices`): filled by `list_space_participants` for an
+    /// Eidola model, empty everywhere else.
+    pub model_notices: Vec<model_catalog::ModelNotice>,
     pub system_prompt: Option<String>,
     pub notify_policy: String,
     /// `owner`/`member`/`observer`.
@@ -202,6 +241,7 @@ impl ParticipantInfo {
             kind: r.kind,
             label: r.label,
             model_ref: r.model_ref,
+            model_notices: Vec::new(),
             system_prompt: r.system_prompt,
             notify_policy: r.notify_policy,
             role: r.role,
@@ -217,6 +257,7 @@ impl ParticipantInfo {
             kind: r.kind,
             label: r.label,
             model_ref: r.model_ref,
+            model_notices: Vec::new(),
             system_prompt: r.system_prompt,
             notify_policy: r.notify_policy,
             role: r.role,
@@ -505,6 +546,7 @@ fn validate_persona(
 ) -> Result<db::PersonaWrite, AppError> {
     Ok(db::PersonaWrite {
         premise,
+        model_premise: None,
         role: None,
         label: match &update.label {
             Some(l) => Some(validate_label(l, "participant label")?),
@@ -574,16 +616,107 @@ pub struct AccountCreateResult {
     /// is no other API to recover it (losing it means creating a new account).
     pub secret: String,
     pub created_at: i64,
+    /// Where the new account stands with the terms gate, read back from the
+    /// server rather than inferred from the recording having succeeded.
+    ///
+    /// Recording acceptance is best-effort here — the account exists either
+    /// way, and failing the call would strand it — so this is how the outcome
+    /// is reported instead of swallowed. Anything but
+    /// [`TermsAcceptance::Complete`] means the caller should say so: the
+    /// server's 428 gate will otherwise refuse the first purchase with no
+    /// warning having been given.
+    pub terms: TermsAcceptance,
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AccountShowResult {
     pub id: String,
     pub stripe_customer_id: Option<String>,
     pub created_at: i64,
 }
 
+/// A minted checkout link, and the credentials the mint actually ran under.
+///
+/// **The identity is read where the request is signed, not where it is
+/// asked for.** A checkout is a network round trip, and the account can be
+/// replaced and replaced back inside it — so a caller comparing what it saw
+/// before with what it sees after can find them equal and still be holding a
+/// link minted for a third thing in between. Only the process that signed
+/// the request knows which credentials it used, so it says.
 #[derive(Clone, Debug)]
+pub struct CheckoutMint {
+    /// The URL to open.
+    pub url: String,
+    /// [`config::account_fingerprint`] of the credentials this link was
+    /// minted under, taken at the moment the request was signed.
+    pub minted_for: String,
+}
+
+/// A minted billing-portal session link, and the credentials the mint
+/// actually ran under.
+///
+/// The portal door is the same hazard as checkout wearing a different label:
+/// a network round trip the reader can outrun, and a session opened for the
+/// previous identity puts one account's billing history in front of someone
+/// holding another's credentials. So it answers the same way — see
+/// [`CheckoutMint`] for why the *signing* side is the only one that can.
+#[derive(Clone, Debug)]
+pub struct PortalMint {
+    /// The URL to open.
+    pub url: String,
+    /// [`config::account_fingerprint`] of the credentials this session was
+    /// minted under, taken at the moment the request was signed.
+    pub minted_for: String,
+}
+
+/// How often a price is charged, as data rather than words.
+///
+/// The GUI localizes the cadence it shows, and app-core is locale-free by the
+/// layering rule — so what crosses the boundary is the interval Stripe names
+/// and how many of them, never a rendered `/month`.
+///
+/// **Serialized by the local control protocol** ([`crate::ipc`]).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PriceCadence {
+    /// Charged once.
+    OneTime,
+    /// Charged every `count` × `interval`, where `interval` is the upstream's
+    /// own name for it (`day` / `week` / `month` / `year`) and is passed
+    /// through unread — a name this build does not know is a cadence the reader
+    /// is still owed, so the presentation layer answers for one it cannot spell.
+    Every { interval: String, count: i64 },
+}
+
+/// What a price costs, as data rather than words. `None` is free — the case
+/// [`PriceInfo::amount_display`] spells as a word.
+///
+/// **Serialized by the local control protocol** ([`crate::ipc`]).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PriceAmount {
+    /// The charge in the currency's minor units, exactly as the upstream states
+    /// it (cents for USD).
+    pub minor_units: i64,
+    /// ISO 4217, upper-cased.
+    pub currency: String,
+}
+
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+///
+/// **`amount_display` and `recurrence` are rendered English, kept for the
+/// callers that want exactly that** — the CLI's `account prices` listing, which
+/// is English by doctrine. A surface that localizes reads [`PriceInfo::amount`]
+/// and [`PriceInfo::cadence`] instead and words them itself. The two are
+/// derived from the same upstream fields in one place, so they cannot disagree.
+///
+/// The structured pair was **added** rather than replacing the strings, because
+/// this type is on the wire: a caller built against an older shape must keep
+/// deserializing (hence `serde(default)`), and one built against a newer shape
+/// must keep reading a result an older process produced.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PriceInfo {
     pub id: String,
     pub product_name: String,
@@ -591,6 +724,20 @@ pub struct PriceInfo {
     pub amount_display: String,
     pub recurrence: String,
     pub credits: i64,
+    /// `None` is free.
+    #[serde(default)]
+    pub amount: Option<PriceAmount>,
+    #[serde(default = "PriceCadence::one_time")]
+    pub cadence: PriceCadence,
+}
+
+impl PriceCadence {
+    /// The default a payload from a build that predates this field decodes to.
+    /// One-time is the safe reading: it is what an empty `recurrence` has always
+    /// meant, and it offers no cadence a reader could be misinformed about.
+    fn one_time() -> Self {
+        Self::OneTime
+    }
 }
 
 /// Whether the account has a subscription in force, as the server answers
@@ -627,27 +774,35 @@ pub struct SubscriptionInfo {
     pub current_period_end: Option<i64>,
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BalancesResult {
     pub available: i64,
     pub pools: Vec<BalancePoolInfo>,
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BalancePoolInfo {
     pub amount: i64,
     pub source: String,
     pub expires_at: Option<i64>,
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CredentialInfo {
     pub nonce: String,
     pub credits: i64,
     pub generation: i64,
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct InFlightCredentialInfo {
     pub nonce: String,
     pub credits: i64,
@@ -660,6 +815,18 @@ pub struct AllocateResult {
     pub nonce: String,
     pub credits: i64,
     pub issuer_key_id: String,
+}
+
+/// What asking again for this account's pending issuances did
+/// ([`AppCore::recover_pending_issuances`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IssuanceRecovery {
+    /// The nonces of the credentials the gateway answered with.
+    pub recovered: Vec<String>,
+    /// Issuances too recent to be asked for again yet.
+    pub waiting: usize,
+    /// Issuances asked for again and still unanswered.
+    pub unresolved: usize,
 }
 
 /// A document (terms of service / privacy policy) whose current version the
@@ -680,7 +847,82 @@ pub struct TermsDocument {
     pub sha256: String,
 }
 
+/// Whether an account's terms acceptance is **complete** — as established by
+/// reading the server back after recording acceptance, never assumed from the
+/// recording having succeeded.
+///
+/// The distinction is the whole reason this is not a boolean. Acceptance is
+/// recorded one document at a time and each submission is judged on its own,
+/// so "every document I submitted was accepted" says nothing about a document
+/// that became required *after* the snapshot was taken — including the case
+/// where the snapshot was empty because the gate had not been switched on yet.
+/// The server's purchase gate asks a different question ("has this account
+/// accepted everything currently required?"), and that is the question a
+/// caller needs answered before it promises the user there is nothing to do.
 #[derive(Clone, Debug)]
+pub enum TermsAcceptance {
+    /// Every document the server requires is covered. Nothing to do.
+    ///
+    /// Also the answer when the server requires nothing at all: for the
+    /// caller those are the same standing, and the sentence to say about
+    /// them is the same one.
+    Complete,
+    /// These documents (by name) are **not established as accepted**, so the
+    /// server's gate will refuse a purchase until they are.
+    ///
+    /// Two situations reach here. One is a document that became required
+    /// between the snapshot being taken and acceptance being recorded — the
+    /// account is genuinely missing it. The other is a submission that
+    /// failed, where nothing is known to have been recorded and so
+    /// everything currently required is listed. Deliberately named
+    /// "outstanding" rather than "missing": the second case may over-list,
+    /// and re-accepting a document already accepted is a no-op, whereas
+    /// staying quiet about one is a purchase that fails later with no
+    /// warning.
+    Outstanding { documents: Vec<String> },
+    /// The standing could not be established — the server could not be read
+    /// back. Nothing is claimed either way.
+    Unknown { error: AppError },
+}
+
+impl TermsAcceptance {
+    /// Whether the caller can tell the user there is nothing outstanding.
+    /// False for [`TermsAcceptance::Unknown`], which is not a claim of
+    /// completeness.
+    pub fn is_complete(&self) -> bool {
+        matches!(self, TermsAcceptance::Complete)
+    }
+}
+
+/// Which of `required` is **not** covered by `recorded`, by document name.
+///
+/// The rule mirrors the server's purchase gate exactly, and it is a *version*
+/// comparison rather than a hash one: accepting version N satisfies any
+/// requirement at or below N (see [`TermsDocument`]), so a snapshot recorded a
+/// moment before a version bump still covers the older requirement it was
+/// taken against. What it cannot cover is a document that is not in it at all
+/// — which is the case a per-document "every submission succeeded" can never
+/// notice, and the reason this comparison exists.
+///
+/// **Answers with names, never documents.** See [`Inner::terms_standing`]:
+/// the narrowing is what stops a verification read from turning back into a
+/// submission.
+fn documents_not_covered(required: &[TermsDocument], recorded: &[TermsDocument]) -> Vec<String> {
+    required
+        .iter()
+        .filter(|d| {
+            !recorded
+                .iter()
+                .any(|r| r.document == d.document && r.version >= d.version)
+        })
+        .map(|d| d.document.clone())
+        .collect()
+}
+
+/// **Serialized by the local control protocol** ([`crate::ipc`]) as the `end`
+/// payload of a turn run over the socket, so a field rename here is a wire
+/// change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ChatResult {
     pub space_id: String,
     pub content: String,
@@ -704,10 +946,27 @@ pub struct ChatResult {
     /// bow out, and **no post was written** — `content` is empty and
     /// `response_action_id` is `None`. `None` on every ordinary turn.
     pub declined: Option<DeclineOutcome>,
+    /// The upstream reported `finish_reason: "length"` — the answer stops
+    /// where the completion ceiling bound it, not where the model was done.
+    ///
+    /// The turn is otherwise ordinary: the partial answer is real text a reader
+    /// wants, so it is kept and persisted like any other — and so is a turn cut
+    /// off before any answer text, whose reasoning is the work a continuation
+    /// resumes. What must not happen is calling it finished, which is why this
+    /// rides the result rather than being inferred by a surface counting
+    /// tokens.
+    pub truncated: bool,
+    /// The answer this turn wrote can be continued ([`AppCore::continue_stream`])
+    /// — decided by the predicate the door applies, the one
+    /// [`PostNode::continuable`] reads, so a caller that suggests continuing
+    /// never suggests what the door refuses. Defaulted on the wire, so an older
+    /// app's result reads as not continuable.
+    #[serde(default)]
+    pub continuable: bool,
 }
 
 /// A turn that ended at the agent-side decline checkpoint (see [`decline`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DeclineOutcome {
     /// The reason the agent stated, or empty when it gave none. The *act* of
     /// declining is the datum; the reason is commentary.
@@ -743,6 +1002,14 @@ pub enum ResponseMode {
     /// A new *generation* of the target's item (regenerate / agent revise):
     /// shares the target's `item_id`, supersedes it, replicates its reply edge.
     Revise,
+    /// A new generation of the target's item that **continues** it: attached
+    /// exactly as a `Revise` is, with the context a `Revise` is given, but the
+    /// request ends with the target's own reasoning and answer as a partial
+    /// assistant message the model is asked to continue
+    /// (`continue_final_message`), and the generation written is the target's
+    /// text followed by what the model added. The target is an answer that
+    /// stopped at its completion ceiling ([`AppCore::continue_stream`]).
+    Continue,
 }
 
 /// Which participant should respond in a turn — the Participants-v1 input that
@@ -814,7 +1081,9 @@ pub struct SubmitResult {
     pub plan: NotificationPlan,
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SpaceInfo {
     pub id: String,
     pub title: Option<String>,
@@ -830,6 +1099,22 @@ pub struct SpaceInfo {
     /// When the space was archived, if it has been. Always `None` unless
     /// listing was asked to include archived spaces.
     pub archived_at: Option<i64>,
+    /// The conversation this one was delegated from (see [`subspaces`]) —
+    /// `None` for an ordinary conversation. A listing row is where a reader
+    /// meets a delegated room, and without this it is a conversation they never
+    /// started with no way to see what it belongs to.
+    pub parent: Option<SpaceParent>,
+}
+
+/// The conversation a delegated room was opened from, as a listing row carries
+/// it: enough to name it and to open it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SpaceParent {
+    pub space_id: String,
+    /// `None` for a conversation that was never named — the presentation layer
+    /// chooses what to say instead, because this crate ships no user-facing
+    /// strings.
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1035,6 +1320,15 @@ pub(crate) struct AttachedReference {
 pub struct IncomingReference {
     /// The referring post (a current generation).
     pub action_id: String,
+    /// The referring post's **item** — its identity across generations, and
+    /// the only half of it that survives an edit.
+    ///
+    /// A reverse index reports current generations, and editing a referring
+    /// post replicates its quote onto a new one: the backlink is unchanged and
+    /// [`Self::action_id`] is a different string. A surface holding a
+    /// selection of these rows across a reload — the highlight picker — must
+    /// key on this or lose the row to an edit that changed nothing about it.
+    pub item_id: String,
     /// The referring post's space (references may cross spaces).
     pub space_id: String,
     /// The edge's ordinal within the referring post.
@@ -1044,6 +1338,31 @@ pub struct IncomingReference {
     pub range_end: Option<i64>,
     pub annotation: Option<String>,
     pub created_at: i64,
+    /// How the **referring** post's own space names its author.
+    ///
+    /// Carried rather than looked up for the reason the outgoing direction
+    /// carries [`PostReference::antecedent_author_label`]: a referrer in
+    /// another space cannot be attributed from anything the quoted space
+    /// knows, and a surface that lists backlinks is exactly the surface that
+    /// meets one. May be blank — a per-space override of `''` is "override to
+    /// empty" under the schema's NULL-inherits rule, which is why the pair is
+    /// only ever read through the presentation layer's shared byline rule.
+    pub author_label: String,
+    /// The referring post's author's participant **kind**, from the same join
+    /// — `human`, `agent`, `system`. The label is not renderable on its own
+    /// (an unnamed author's fallback depends entirely on the kind), so the two
+    /// travel together.
+    pub author_kind: String,
+    /// The referring space's title; `None` for a conversation never named.
+    ///
+    /// **An author does not identify a post.** The same participant can quote
+    /// one passage from two conversations, and a chooser offered two rows that
+    /// read alike cannot say which window each opens — so the identity pair is
+    /// not enough on its own and the place travels with it. It is the *place*
+    /// rather than the referring post's content on purpose: a title names where
+    /// the click goes, while lifting a post's prose out of a space the reader
+    /// may not be in would make this read a disclosure channel.
+    pub space_title: Option<String>,
 }
 
 /// One turn's operational trace, as a space UI discloses it (task 34): the
@@ -1259,6 +1578,18 @@ pub struct PostNode {
     pub is_current: bool,
     pub model: Option<String>,
     pub credits_consumed: Option<i64>,
+    /// This generation stopped at the model's completion ceiling rather than
+    /// because it was done — the durable fact a render marks the post with.
+    /// Never true for a post that was not inferred.
+    pub truncated: bool,
+    /// This generation can be continued ([`AppCore::continue_stream`]) — by
+    /// the predicate the door itself applies (`continuation_basis`: it stopped
+    /// at its ceiling, its model is one whose server honours a continuation,
+    /// its author still answers in this space with that model, and the request
+    /// it was written to is in the Record whole), so a surface offers the verb
+    /// exactly where it would work. Settled by `get_space_tree`; the pure tree
+    /// build sets only the row-level half.
+    pub continuable: bool,
     /// Edge relation to the structural parent (`reply`); `None` for a root.
     pub relation: Option<String>,
     /// Indent level: `0` is the spine; `> 0` is an indented branch.
@@ -1308,10 +1639,28 @@ pub fn quote_snippet(block_text: &str, range_start: i64, range_end: i64) -> Opti
     Some(&block_text[start..end])
 }
 
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ModelInfo {
     pub id: String,
+    /// For an Eidola model, its weights hash (`docs/model-identity.md`), when
+    /// the gateway's catalog publishes one; `None` on every other backend.
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// For an Eidola model, every tag that names `sha256`.
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub context_length: u64,
+    /// The largest completion the backend says this model may be asked for.
+    /// `None` when nothing was declared — see [`ModelCapabilities`] for why
+    /// that is never read as a zero.
+    pub max_output_tokens: Option<u64>,
+    /// Which public output-budget ladder the model draws from, if the backend
+    /// names one.
+    pub output_budget_class: Option<OutputBudgetClass>,
+    /// What the backend declares this model can do.
+    pub capabilities: ModelCapabilities,
     /// Credits charged per prompt token. Credits are micro-USD-denominated,
     /// so this is numerically the same as USD per million prompt tokens.
     /// Zero for per-request-priced models.
@@ -1324,11 +1673,90 @@ pub struct ModelInfo {
     pub request_credits: Option<f64>,
 }
 
+/// What a backend declares a model can do.
+///
+/// **Every field is three-state, and absence is never `false`.** Most backends
+/// this client talks to declare nothing at all and structurally cannot: a
+/// local model is an arbitrary `.gguf` a person supplied, whose tool support
+/// is a property of the chat template inside that file, and a generic
+/// OpenAI-compatible listing publishes only ids. Undeclared is therefore the
+/// *common* case rather than an edge, and reading it as "no" would take tools
+/// away from every model on every such backend at once — a metadata rollout
+/// that looks exactly like a fleet-wide outage. `unwrap_or(false)` on any of
+/// these is a bug, not a shortcut.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelCapabilities {
+    /// Whether the model accepts a `tools` request field.
+    pub tool_calling: Option<bool>,
+    /// Whether the model produces reasoning content before its answer.
+    pub reasoning: Option<bool>,
+    /// The content kinds the model accepts.
+    pub input_modalities: Option<Vec<Modality>>,
+    /// The content kinds the model produces.
+    pub output_modalities: Option<Vec<Modality>>,
+}
+
+/// A kind of content a model accepts or produces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Modality {
+    Text,
+    Image,
+    Audio,
+    /// A modality this build does not know. Kept rather than refused: the
+    /// model list is parsed on every turn, so a backend that grows a new
+    /// modality name must not be able to fail the parse and with it every
+    /// conversation on the machine.
+    Unknown,
+}
+
+impl Modality {
+    fn from_wire(name: &str) -> Self {
+        match name {
+            "text" => Modality::Text,
+            "image" => Modality::Image,
+            "audio" => Modality::Audio,
+            _ => Modality::Unknown,
+        }
+    }
+}
+
+/// Which public output-budget ladder a model draws from.
+///
+/// A *class* rather than a number, and public per model rather than chosen per
+/// person: what a request asks for must be a function of the model and the
+/// turn's own structure, never of anything this installation happens to know
+/// about its user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum OutputBudgetClass {
+    /// A model that answers directly.
+    Standard,
+    /// A model that thinks before it answers, and so needs a materially
+    /// larger budget to produce the same answer.
+    Reasoning,
+}
+
+impl OutputBudgetClass {
+    /// A class name this build does not know reads as *undeclared*, which is
+    /// the same thing the field's absence means — a consumer falls back to
+    /// whatever default it already applies either way.
+    fn from_wire(name: &str) -> Option<Self> {
+        match name {
+            "standard" => Some(OutputBudgetClass::Standard),
+            "reasoning" => Some(OutputBudgetClass::Reasoning),
+            _ => None,
+        }
+    }
+}
+
 /// One credential row with its lifecycle state, as computed by the local
 /// `credential_lifecycle` view: `active` (spendable), `spending` (a spend
 /// proof is in flight / unsettled), `spent` (settled into a successor), or
-/// `expired` (issuer key past its expiry).
-#[derive(Clone, Debug)]
+/// `expired` (an unspent credential past its key's spend deadline, or any
+/// credential past the key's acceptance deadline — see
+/// [`CREDENTIAL_SPEND_MARGIN`]).
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CredentialLifecycleInfo {
     pub nonce: String,
     pub credits: i64,
@@ -1380,7 +1808,9 @@ pub struct RequestInfo {
 }
 
 /// The full recorded request/response pair, raw bodies included. This is
-/// the user's own traffic on their own machine — nothing is redacted.
+/// the user's own traffic on their own machine, kept as sent with one
+/// exception: a request's prefix-cache key, a secret no surface shows, is
+/// recorded as withheld (`recorded::recorded_request`).
 #[derive(Clone, Debug)]
 pub struct RequestDetail {
     pub id: String,
@@ -1434,26 +1864,260 @@ pub struct SpendTrailEntry {
     pub linkability: Option<String>,
 }
 
-/// Default number of credits to allocate into a fresh anonymous credential
-/// when a chat needs one and the account has balance available
-/// (auto-provisioning). The actual amount is
-/// `min(available, max(DEFAULT_ALLOCATION_CREDITS, required))` — see
-/// [`auto_allocation_amount`].
+/// **The denomination**: the one public size this client issues credentials
+/// in, ahead of need ([`Inner::provision_once`]) and just in time
+/// ([`auto_allocation_amount`]), the latter converting the whole remaining
+/// balance instead when that is less. Credits are micro-USD, so this is
+/// $1.00.
 ///
-/// Why 1,000,000: credits are micro-USD-denominated (the server's
-/// `PRICING_SCALE_FACTOR` is 1e6 — `usd_per_M_tokens × markup` becomes
-/// credits-per-token directly, e.g. gemma4-31b output $1.00/M × 1.5 markup
-/// = 1.5 credits/token). A single chat turn's worst-case hold is
-/// `chargeable_prompt_tokens(bytes, msgs) × prompt_rate + 4096 ×
-/// completion_rate` (the shared `eidola-common` contract): ≈6,200 credits
-/// for the default gemma4-31b, ≈32,000 for the most expensive catalog
-/// models (output 7.875 credits/token) — mostly refunded after the actual
-/// usage settles. 1,000,000 credits ($1.00 of balance) therefore covers
-/// ~30 worst-case holds or 100+ typical turns: small enough that only a
-/// sliver of the account balance is parked in one unlinkable credential
-/// at a time, large enough that re-allocation (an account-linked,
-/// timing-correlatable operation) stays infrequent.
+/// One size makes every issuance look like every other on the account
+/// surface, which is where the amount is visible; no issuance is ever sized
+/// to the request it pays for, since a request's share is visible at its
+/// spend and the two would match. The size is a trade: large enough that
+/// issuance, an account-linked and timed operation, is rare against what
+/// ordinary turns hold, and small enough that little of a customer's balance
+/// sits in anonymous credentials ahead of need, where it lapses with its key.
+/// What a request holds is the shared pricing contract
+/// (`eidola_common::pricing`): the request fee, its prompt at the catalog
+/// row's rates (counted by its bytes, or declared cached), and the completion
+/// ceiling it names. So how many requests one denomination carries is a
+/// property of the catalog and of the requests, not of this constant. The
+/// ceiling an Eidola turn names is lowered while the hold would pass this
+/// constant ([`ladder_ceiling`]), so only a prompt can take a hold past it.
+/// A request is paid when what the wallet holds, or one held credential
+/// drained beside one fresh denomination, covers its hold, and refused
+/// otherwise ([`AppError::HoldExceedsDenomination`]);
+/// `docs/anonymous-credits.md` → Issuance sizing.
 pub const DEFAULT_ALLOCATION_CREDITS: i64 = 1_000_000;
+
+// --- Ahead-of-need provisioning ---------------------------------------------
+//
+// Every value below is a public constant of the client: an observer of the
+// account surface learns from an issuance only what these already say, never
+// anything about the request that will follow it. See
+// `AppCore::start_credential_provisioner` and docs/anonymous-credits.md.
+
+/// The buffer the provisioner keeps: when the credits the wallet can spend
+/// for at least [`PROVISION_HORIZON`] fall below this, it issues credentials
+/// of [`DEFAULT_ALLOCATION_CREDITS`] ([`PROVISION_CREDENTIALS_PER_KEY`]).
+///
+/// A quarter of an allocation, so the credential already held normally
+/// carries the requests made between the provisioner's looks (how many is a
+/// property of the catalog's rates and declared ceilings), and the new one is
+/// first spent only once that runs out, at a time set by the reader's own use
+/// rather than by the issuance. Small, so what is held at once is at most this
+/// plus [`PROVISION_CREDENTIALS_PER_KEY`] allocations.
+pub const PROVISION_THRESHOLD_CREDITS: i64 = DEFAULT_ALLOCATION_CREDITS / 4;
+
+/// How many credentials of [`DEFAULT_ALLOCATION_CREDITS`] the provisioner
+/// sees this account issued under each key it provisions under: when it
+/// issues under a key, it issues until the account holds this many issuances
+/// under it (one more, once it has), in one pass.
+///
+/// A request presenting two inputs under one key shows that its client was
+/// issued at least two credentials under that key, which narrows its
+/// anonymity set to the accounts issued that many. Two per key makes that
+/// every account that provisioned, not the heavy users: a drain-and-fill
+/// request is then as anonymous as a single spend among provisioning
+/// accounts. Both are the one public denomination, so no new amount appears
+/// on the issuance surface. With at most two inputs per request
+/// (`eidola_common::spend_credentials::MAX_CREDENTIALS_PER_REQUEST`), nothing
+/// a request presents can tell two issuances from more.
+pub const PROVISION_CREDENTIALS_PER_KEY: i64 = 2;
+
+/// What still counts toward the buffer: credentials whose key lets a spend
+/// begin at least this far ahead. One about to lapse cannot carry the next
+/// day's requests, so it is replaced while there is still time to replace it
+/// ahead of need.
+pub const PROVISION_HORIZON: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// How recently the wallet must have begun a spend for the provisioner to keep
+/// a buffer at all. A credential's value dies with its key at most two epochs
+/// after issuance, so issuing ahead for a profile nobody is using converts
+/// credit that will most likely lapse unspent. Only *whether* a buffer is kept
+/// reads this local history; when and how much is issued never does.
+pub const PROVISION_ACTIVITY_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The provisioner looks at the wallet at intervals drawn uniformly from
+/// `[PROVISION_CHECK_MIN, PROVISION_CHECK_MAX]`, fresh each time, starting one
+/// such interval after it is started (never at launch, which a first request
+/// often follows within seconds). It does not watch for spends: an issuance
+/// happens at the first look after the buffer runs low, so its time is a
+/// random draw, not a reaction to any request.
+pub const PROVISION_CHECK_MIN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// See [`PROVISION_CHECK_MIN`].
+pub const PROVISION_CHECK_MAX: std::time::Duration = std::time::Duration::from_secs(50 * 60);
+
+/// Late in a key's issuing window — within this of `issue_until` — the
+/// provisioner waits for the next key while what is held is at least
+/// [`PROVISION_DEFER_FLOOR_CREDITS`]. A credential issued early in a window
+/// is spendable for up to two epochs; one issued at its end, for one.
+pub const PROVISION_LATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+
+/// See [`PROVISION_LATE_WINDOW`]: a tenth of an allocation, enough that what
+/// is held carries the requests of the hours until the next key.
+pub const PROVISION_DEFER_FLOOR_CREDITS: i64 = DEFAULT_ALLOCATION_CREDITS / 10;
+
+/// How old a pending issuance must be before it is asked for again. Longer
+/// than any issuance request can take on the server, so a retry never races an
+/// original attempt still being processed there (the server would serialize
+/// the two, but a retry refused while the original is still signing would
+/// abandon a row the original then pays for).
+const ISSUANCE_SETTLE_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The deadline on each request for a stranded hold's refund, connection to
+/// last byte: one that stalls leaves its hold `spending`, to be asked for
+/// again.
+const SPEND_RECOVERY_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The deadline on every request an issuance makes (the key listing, the
+/// balance read, the issuance itself), connection to last byte. The attesting
+/// client bounds only the connect, so without this a server that accepts and
+/// then stalls would hold [`Inner::issuance_gate`] — and through a turn
+/// waiting on it under `spend_gate`, every paid turn after it — for as long as
+/// it liked. A request cut off here leaves its pending issuance to be asked
+/// for again, so nothing is lost by giving up.
+const ISSUANCE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The backstop on a whole provisioner pass, the gate included: a pass that
+/// recovers several pending issuances makes several requests, each bounded by
+/// [`ISSUANCE_REQUEST_TIMEOUT`], and this bounds their sum.
+const PROVISION_PASS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// What one pass of the provisioner did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProvisionOutcome {
+    /// Issued credentials of [`DEFAULT_ALLOCATION_CREDITS`]: as many as bring
+    /// the account to [`PROVISION_CREDENTIALS_PER_KEY`] issuances under the
+    /// key, or one once it has them, as far as the balance covers.
+    Issued { nonces: Vec<String> },
+    /// The wallet already holds at least [`PROVISION_THRESHOLD_CREDITS`]
+    /// spendable past [`PROVISION_HORIZON`].
+    Covered,
+    /// No spend began within [`PROVISION_ACTIVITY_WINDOW`]; no buffer is kept.
+    Idle,
+    /// No account is configured.
+    NoAccount,
+    /// The available balance is below one standard allocation.
+    LowBalance,
+    /// The current key lapses within [`PROVISION_HORIZON`], so a credential
+    /// issued under it would not count toward the buffer.
+    NoUsableKey,
+    /// An earlier issuance for this account has not resolved — its response
+    /// was lost and it has not been answered on a retry yet — so it may
+    /// already have been paid for. Nothing new is issued until it resolves.
+    Unresolved,
+    /// The Eidola backend is disabled or removed: nothing is sent to it, and
+    /// no balance is converted for a service the reader has turned off.
+    BackendDisabled,
+    /// Late in the key's issuing window with enough still held; the next key
+    /// will be issued under instead.
+    Deferred,
+}
+
+/// How long before an issuer key's acceptance deadline (`accept_until`) the
+/// client stops *beginning* spends under it.
+///
+/// The server honours a key's credentials until `accept_until` — one epoch
+/// after the key stops issuing — so that, not `issue_until`, is what bounds a
+/// credential's spendable life. A spend chosen at the very edge of that window
+/// still has to reach the server inside it: a connection and attested TLS
+/// handshake, a transport retry or two, and whatever disagreement there is
+/// between this machine's clock and the server's. Ten minutes covers all of
+/// that with room for a clock that has drifted by minutes, and costs about a
+/// thousandth of the default seven-day acceptance window. A spend already in
+/// flight when the margin begins is unaffected: it stays recoverable until
+/// `accept_until` itself (see the `credential_lifecycle` view).
+pub const CREDENTIAL_SPEND_MARGIN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The local lifecycle deadlines for an issuer key the server stops accepting
+/// at `accept_until_ms`: new spends may begin until [`CREDENTIAL_SPEND_MARGIN`]
+/// before it, and an in-flight spend stays recoverable until it.
+pub fn issuer_key_deadlines(accept_until_ms: i64) -> db::IssuerKeyDeadlines {
+    let margin_ms = i64::try_from(CREDENTIAL_SPEND_MARGIN.as_millis()).unwrap_or(i64::MAX);
+    db::IssuerKeyDeadlines {
+        spend_until: accept_until_ms.saturating_sub(margin_ms),
+        accept_until: accept_until_ms,
+    }
+}
+
+/// The epoch of the public issuer calendar a listed key's windows are
+/// exactly, or `None` if they are not one epoch's windows.
+///
+/// "Exactly" is byte for byte: each instant must be the calendar's one
+/// spelling of its epoch's instant (`issuer_calendar::rfc3339_utc`, which
+/// the gateway serves). A parse is used only to find which epoch to compare
+/// against, never to decide; so a fraction of a second, an offset, a missing
+/// `Z` or a normalized date (a February 30th) cannot round a key onto the
+/// calendar.
+fn listed_key_epoch(calendar: &IssuerCalendar, key: &IssuerKeyResponse) -> Option<u64> {
+    let from_ms = iso_to_ms(&key.issue_from).ok()?;
+    let epoch = calendar.epoch_at(u64::try_from(from_ms.div_euclid(1000)).ok()?)?;
+    let w = calendar.windows(epoch)?;
+    let spelled = |secs: u64, listed: &str| rfc3339_utc(secs) == listed;
+    (spelled(w.issue_from, &key.issue_from)
+        && spelled(w.issue_until, &key.issue_until)
+        && spelled(w.accept_until, &key.accept_until))
+    .then_some(epoch)
+}
+
+/// Whether a listed key's id is the hash of its public key.
+fn listed_key_is_its_hash(key: &IssuerKeyResponse) -> bool {
+    URL_SAFE_NO_PAD
+        .decode(&key.public_key)
+        .is_ok_and(|pk| issuer_key_id_of(&pk) == key.id)
+}
+
+/// How many epochs of the per-epoch key record are kept: a year's. Rows are
+/// one per epoch per server, and a longer memory is what lets the client
+/// notice a key it already saw for one epoch being offered for another.
+const ISSUER_KEY_RECORD_EPOCHS: u64 = 52;
+
+/// The keys a `/v1/keys` listing offers under `ds`, each with its epoch, in
+/// epoch order — **once the whole listing is one an honest gateway could
+/// have served**. An honest gateway lists only keys on the calendar, each
+/// named by the hash of its public key, one key per epoch and a distinct key
+/// for every epoch. A listing that breaks any of that is refused whole,
+/// whichever entry breaks it: an entry that escaped the check (a next
+/// epoch's key off the calendar, or with a mislabelled id, or listed twice)
+/// would escape being recorded, and the record is what holds the server to
+/// its keys later. Keys under another domain separator are not this
+/// deployment's and are ignored.
+fn checked_listing<'a>(
+    calendar: &IssuerCalendar,
+    keys: &'a [IssuerKeyResponse],
+    ds: &str,
+) -> Result<Vec<(u64, &'a IssuerKeyResponse)>, AppError> {
+    let refused = |refusal| AppError::IssuerKeyRefused { refusal };
+    let mut by_epoch: std::collections::BTreeMap<u64, &IssuerKeyResponse> =
+        std::collections::BTreeMap::new();
+    let mut epoch_of_id: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for key in keys.iter().filter(|k| k.domain_separator == ds) {
+        let epoch =
+            listed_key_epoch(calendar, key).ok_or(refused(IssuerKeyRefusal::NotOnCalendar))?;
+        if !listed_key_is_its_hash(key) {
+            return Err(AppError::Credential {
+                message: "the server listed an issuer key whose id is not the hash of its \
+                          public key"
+                    .into(),
+            });
+        }
+        if by_epoch.get(&epoch).is_some_and(|k| k.id != key.id) {
+            return Err(refused(IssuerKeyRefusal::SecondKeyForEpoch { epoch }));
+        }
+        if let Some(&other) = epoch_of_id.get(key.id.as_str())
+            && other != epoch
+        {
+            return Err(refused(IssuerKeyRefusal::OneKeyForSeveralEpochs {
+                epoch: other.max(epoch),
+            }));
+        }
+        by_epoch.insert(epoch, key);
+        epoch_of_id.insert(&key.id, epoch);
+    }
+    Ok(by_epoch.into_iter().collect())
+}
 
 /// How long the ACT provisioning queue waits for an in-flight credential
 /// refund (a concurrent turn's recovery) to free spendable balance before
@@ -1465,28 +2129,49 @@ const PROVISION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Poll cadence while the provisioning queue waits on an in-flight refund.
 const PROVISION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Decide how many credits to auto-allocate, given the account's available
-/// balance and the credits required for the operation that triggered
-/// provisioning. Pure function so the decision logic is unit-testable
-/// without HTTP.
+/// What a just-in-time issuance converts, given the account's `available`
+/// balance and `need`, the least a new credential must hold for the request
+/// waiting on it to be paid.
 ///
-/// Returns [`AppError::InsufficientBalance`] when the balance cannot cover
-/// even the required amount; otherwise the chunk size:
-/// `min(available, max(DEFAULT_ALLOCATION_CREDITS, required))`.
-fn auto_allocation_amount(available: i64, required: i64) -> Result<i64, AppError> {
-    if available < required {
-        return Err(AppError::InsufficientBalance {
-            available,
-            required,
-        });
+/// **The amount is never a function of the request.** It is the denomination
+/// ([`DEFAULT_ALLOCATION_CREDITS`]), or the whole available balance when that
+/// is less. `need` decides only *whether* to issue: `None` when that amount
+/// would not cover it (an empty account, a balance below `need`, or a `need`
+/// past one denomination), and nothing is converted.
+fn auto_allocation_amount(available: i64, need: i64) -> Option<i64> {
+    let amount = available.min(DEFAULT_ALLOCATION_CREDITS);
+    (amount > 0 && amount >= need).then_some(amount)
+}
+
+/// The largest hold a request can be paid without issuing more than one
+/// credential, and that one only of the denomination: any two of the
+/// wallet's credentials (`held`, and `in_flight` at their face value, the
+/// most a successor can hold), or the largest of them drained beside one
+/// fresh [`DEFAULT_ALLOCATION_CREDITS`]. A request past it is refused
+/// ([`AppError::HoldExceedsDenomination`]) before anything is touched; this
+/// bounds what any wait or issuance could make payable, whatever the
+/// account's balance.
+pub(crate) fn largest_payable_hold(held: &[i64], in_flight: &[i64]) -> i64 {
+    let mut top = [0i64; 2];
+    for &balance in held.iter().chain(in_flight) {
+        if balance > top[0] {
+            top = [balance, top[0]];
+        } else if balance > top[1] {
+            top[1] = balance;
+        }
     }
-    Ok(available.min(DEFAULT_ALLOCATION_CREDITS.max(required)))
+    top[0].saturating_add(top[1].max(DEFAULT_ALLOCATION_CREDITS))
 }
 
 /// Incremental events emitted by `AppCore::chat_stream`. The terminal
 /// outcome is the function's `Result<ChatResult, AppError>` return value;
 /// senders close their channel when the function returns.
-#[derive(Clone, Debug)]
+///
+/// **The serde shape is the local control protocol's chunk vocabulary**
+/// ([`crate::ipc`]): a turn streamed to another process sends these, so
+/// renaming a variant is a wire change, not a refactor.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "text", rename_all = "snake_case")]
 pub enum ChatStreamEvent {
     /// A piece of the model's reasoning ("thinking") output. Append to a
     /// running buffer; treat empty events as no-ops.
@@ -1516,6 +2201,63 @@ impl ToolEndpoint {
     }
 }
 
+/// On whose authority this turn decides whether its endpoint can carry a
+/// `tools` field.
+///
+/// **Declaration where a declaration can exist; discovery where it cannot.**
+/// The two are not alternatives to pick between — they cover disjoint ground:
+///
+/// * A backend that publishes per-model capabilities, reached at the trust
+///   root this binary was built with, has already answered the question. Its
+///   answer is [`ToolPolicy::Declared`], and it is believed in both
+///   directions: a declared *no* withholds the field without paying for a
+///   round that can only fail, and a declared *yes* means a failure is a
+///   failure.
+/// * Everywhere else there is no fact in this build to consult, and not for
+///   want of effort. A local model is an arbitrary `.gguf` a person supplied,
+///   and whether it does tools is a property of the chat template inside that
+///   file — "llama.cpp supports tools" is false as a blanket claim, since it
+///   answers 500 without `--jinja` and, with it, still 500s on templates whose
+///   filters it lacks. A generic OpenAI-compatible endpoint publishes only
+///   ids. Those are [`ToolPolicy::Learned`]: offer, and remember a rejection.
+///
+/// The line is drawn by **provenance, not by backend kind**. An eidola backend
+/// reached through a base-URL or measurement override is not the catalog this
+/// binary pinned — it may be a development stack mid-iteration, or someone
+/// else's server whose catalog we cannot vouch for — so its declaration is
+/// only a hint and the learned path stays armed, exactly as it is today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolPolicy {
+    /// The pinned backend declares the answer.
+    Declared(bool),
+    /// Nothing authoritative to consult: offer, and learn from a rejection.
+    Learned,
+}
+
+impl ToolPolicy {
+    /// The policy for an endpoint whose declaration this client may act on:
+    /// a stated capability is [`ToolPolicy::Declared`]; a silent one falls
+    /// back to discovery, which is the safe floor rather than a "no".
+    fn from_declaration(declared: Option<bool>) -> Self {
+        match declared {
+            Some(supported) => ToolPolicy::Declared(supported),
+            None => ToolPolicy::Learned,
+        }
+    }
+
+    /// May a round-1 failure be retried with the turn's own tools withdrawn?
+    ///
+    /// Only where the answer was never declared. A declared-capable model
+    /// answers the question the probe existed to ask, so a 500 from one is a
+    /// genuine failure and must surface as one — treating it as a capability
+    /// verdict is how a transient upstream error silently costs a model its
+    /// tools for the rest of the process, after charging twice for the
+    /// privilege.
+    fn probes_on_failure(self) -> bool {
+        matches!(self, ToolPolicy::Learned)
+    }
+}
+
 // ============================================================================
 // Inner — shared state used by AppCore, wrapped in Arc so it can move into
 // spawned futures on the owned tokio runtime.
@@ -1528,15 +2270,29 @@ struct Inner {
     /// a strong self-reference would leak the database lock forever.
     self_ref: std::sync::Weak<Inner>,
     config_path: PathBuf,
+    /// Serializes every read-modify-write of `config.toml`, from the strict
+    /// load through the rename that publishes the save (see
+    /// [`Inner::update_config`]).
+    config_write: Mutex<()>,
     data_dir: PathBuf,
     db: tokio::sync::OnceCell<turso::Database>,
-    /// Cached update-check state (last result + accepted-claims choice),
-    /// lazily loaded from `<data_dir>/update-state.json` on first access.
-    update_state: Mutex<Option<updates::UpdateState>>,
+    /// Cached update-check state and the ordering that governs writes to it
+    /// (see [`UpdateStateCell`]), lazily loaded from
+    /// `<data_dir>/update-state.json` on first access.
+    update_state: Mutex<UpdateStateCell>,
+    /// Hands each check a number as it **starts**, so a completion can tell
+    /// whether a check begun after it has already answered. Process-local and
+    /// meaningless anywhere else, which is why it is not persisted.
+    update_checks_started: std::sync::atomic::AtomicU64,
     /// Latch so `start_update_polling` spawns at most one poll loop.
     update_polling: std::sync::atomic::AtomicBool,
     /// Invalidation bus — emits a [`Change`] after every durable commit.
     bus: BroadcastSource,
+    /// The Eidola model catalog this core reads (notices, identity, the
+    /// newer-weights switch): the one compiled into this build. Only a test
+    /// replaces it (`test_set_model_catalog`), because the shipped catalog is
+    /// empty until the first model is pinned.
+    model_catalog: std::sync::RwLock<&'static [model_catalog::CatalogRow]>,
     /// Runtime local-inference state (downloads in flight, running
     /// llama.cpp engines). `Arc` so core-owned transfer/supervisor tasks
     /// can hold it beyond the initiating call.
@@ -1550,6 +2306,43 @@ struct Inner {
     /// pool), or waits bounded for an in-flight refund. Held only around the
     /// provisioning step in `prepare_turn`; the HTTP request runs outside it.
     spend_gate: tokio::sync::Mutex<()>,
+    /// Serializes every issuance this process makes — the explicit
+    /// `account_allocate`, the just-in-time path inside the provisioning queue,
+    /// the ahead-of-need provisioner, and the recovery of lost issuance
+    /// responses — so two of them never convert credit for the same need, and
+    /// a pending issuance is never retried while this process still has it in
+    /// flight. Never held across a spend; the just-in-time path takes it under
+    /// `spend_gate`, nothing takes them in the other order.
+    issuance_gate: tokio::sync::Mutex<()>,
+    /// Serializes recovery of stranded holds
+    /// ([`Inner::recover_stranded_spends`]), so two callers never ask for,
+    /// and settle, the same hold at once.
+    spend_recovery_gate: tokio::sync::Mutex<()>,
+    /// Latch so `start_credential_provisioner` spawns at most one loop.
+    provisioner_started: std::sync::atomic::AtomicBool,
+    /// The provisioner's look interval bounds in milliseconds (see
+    /// [`PROVISION_CHECK_MIN`]); only a test moves them.
+    provision_check_ms: Mutex<(u64, u64)>,
+    /// [`ISSUANCE_SETTLE_AGE`] in milliseconds; only a test moves it.
+    issuance_settle_ms: std::sync::atomic::AtomicU64,
+    /// [`ISSUANCE_REQUEST_TIMEOUT`] in milliseconds; only a test moves it.
+    issuance_request_timeout_ms: std::sync::atomic::AtomicU64,
+    /// [`PROVISION_WAIT_TIMEOUT`] in milliseconds — how long anything waits
+    /// for [`Inner::issuance_gate`] or an in-flight refund; only a test moves it.
+    provision_wait_ms: std::sync::atomic::AtomicU64,
+    /// The holds this process has a request in flight for — see
+    /// [`LiveSpends`]. Recovery consults it so it never refunds a credential
+    /// that is `spending` because it is *being spent right now*.
+    live_spends: LiveSpends,
+    /// Serializes each backend's configuration writes with the cleanup that
+    /// belongs to them (`backends::Inner::lock_backend_config`). Keyed by
+    /// backend id, so unrelated backends never wait on each other.
+    backend_config_gates: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Test-only pause between a backend configuration write and the cleanup
+    /// that belongs to it (see `backends::Inner::retire_engines_for`), so a
+    /// test can drive a second configuration write into that window.
+    #[cfg(feature = "test-support")]
+    backend_config_pause: Mutex<Option<std::time::Duration>>,
     /// Serializes background branch-summary passes (see [`summaries`]). One
     /// pass at a time, and each re-reads the cache inside the gate, so a burst
     /// of posts collapses into one generation per branch.
@@ -1571,6 +2364,17 @@ struct Inner {
     /// so these are exactly the rooms the sweep's licence is false about — see
     /// `Inner::note_room_spawned_here`.
     rooms_spawned_here: Mutex<Option<std::collections::HashSet<String>>>,
+    /// The **items** a regeneration is currently running against, process-wide
+    /// — the guard that keeps one post from being revised twice at once (see
+    /// [`RegenerationGuard`]).
+    ///
+    /// Process-wide rather than per-caller because a regeneration outlives the
+    /// surface that asked for it: the core-side future runs to completion even
+    /// if its consumer drops the receiving end, so a window closed and reopened
+    /// mid-regeneration meets a fresh view with no memory of the one still in
+    /// flight. `Arc` so the guard can release the key from its `Drop` without
+    /// borrowing `Inner`.
+    regenerating_items: RegenerationRegistry,
     /// How many delegated rooms may be walked at once, process-wide — see
     /// `subspace_driver::MAX_CONCURRENT_WALKS`.
     walk_permits: Arc<tokio::sync::Semaphore>,
@@ -1626,6 +2430,44 @@ struct Inner {
     #[cfg(feature = "test-support")]
     persist_window:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only rendezvous **immediately before a regeneration claims its
+    /// item**, after the target has been resolved and the space's gate has
+    /// passed. Whether the claim actually prevents a paid duplicate turns on
+    /// what is read on each side of it, and that is not observable from
+    /// outside: this lets one stop a regeneration in the window, run another
+    /// one of the same post to completion, and let the first go. Same shape and
+    /// same reason as [`Inner::anchor_window`].
+    #[cfg(feature = "test-support")]
+    claim_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only rendezvous **between a proxied request's settings snapshot
+    /// and the read that authorizes it**. A backend removed and re-added in
+    /// that gap keeps its id and loses its exposure, so what the authorization
+    /// is *about* is the thing that can change — and the gap is a whole
+    /// request's latency wide, which no test can hit by racing. Same shape and
+    /// same reason as [`Inner::anchor_window`].
+    #[cfg(feature = "test-support")]
+    proxy_resolve_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only rendezvous **between the read that authorized a proxy action
+    /// and the action it permits** — an engine start, or a catalog scan. The
+    /// resolve window above stages what happens when the row moves *before*
+    /// the authorizing read; this stages the other side of that read, where the
+    /// caller already holds an authorized incarnation and the id behind it is
+    /// replaced. Only an action taken on the row it was handed can tell the two
+    /// apart, and the gap is again far too wide to race. Same shape and same
+    /// reason as [`Inner::anchor_window`].
+    #[cfg(feature = "test-support")]
+    proxy_authorized_window:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>>,
+    /// Test-only handshake to plant in the next proxied Eidola route **after
+    /// its catalog fetch has been recorded** — the observation the completion's
+    /// own connection would make. The plain test client never invokes an
+    /// attestation observer, so without this the one case that matters (the
+    /// completion riding a connection the catalog fetch never opened) cannot
+    /// occur in a test at all.
+    #[cfg(feature = "test-support")]
+    proxy_planted_handshake: Mutex<Option<String>>,
     /// Space ids established not to be live delegated rooms — the driver's
     /// negative cache. Sound because neither `parent_space_id` nor archival can
     /// turn back (see `Inner::is_ordinary_space`).
@@ -1685,6 +2527,31 @@ struct Inner {
     /// builds contain no bypass path at all.
     #[cfg(feature = "test-support")]
     http_override: Option<reqwest::Client>,
+    /// **Test-only seam.** Makes the eidola backend's declarations count as
+    /// authoritative even though the harness reaches it through a base-URL
+    /// override.
+    ///
+    /// The compiled-in pin is an `https://` origin with a fixed enclave
+    /// measurement, which no in-process mock can be reached at — so without
+    /// this the declared-capability half of [`ToolPolicy`] would be
+    /// unreachable from any test, and only the override half could be
+    /// exercised. Same shape and same justification as `http_override`: it
+    /// exists only under the non-default `test-support` feature, so a release
+    /// build contains no path that widens what counts as our own catalog.
+    #[cfg(feature = "test-support")]
+    trust_declared_capabilities: std::sync::atomic::AtomicBool,
+    /// The clock the prefix-cache rotation rule reads ([`CacheClock`]).
+    cache_clock: CacheClock,
+    /// Make the key cleanup inside an eidola configuration write fail, so a
+    /// test can hold the write and its cleanup to one transaction.
+    #[cfg(feature = "test-support")]
+    fail_cache_key_cleanup: std::sync::atomic::AtomicBool,
+    /// The calendar issuer key windows are checked against. A release build
+    /// has no field here and reads [`ISSUER_CALENDAR`], the one the gateway
+    /// uses; under `test-support` a test may stand a boundary seconds from
+    /// now ([`AppCore::test_set_issuer_calendar`]).
+    #[cfg(feature = "test-support")]
+    issuer_calendar: Mutex<IssuerCalendar>,
     /// The process-lifetime exclusive advisory lock on the local database
     /// (`<data_dir>/eidola.db.lock`). Taken in [`AppCore::build`] — a second
     /// opener is refused *there* with [`AppError::DatabaseInUse`] rather than
@@ -1696,9 +2563,94 @@ struct Inner {
 
 // --- Config helpers (sync) ---------------------------------------------------
 
+/// The mechanical notify set, with the **brief floor kept separable**.
+///
+/// Two things want the same computation and want different halves of it. The
+/// mechanical door ([`Inner::mechanical_plan`], and `AppCore`'s inspection
+/// seam over it) wants the set the rule answers with — floor folded in. The
+/// door that actually drives turns ([`Inner::plan_and_refine`]) wants the floor
+/// *after* the may-decline router has spoken, because the router legitimately
+/// answers "nobody" and over a `brief` that answer is the delegated room doing
+/// no work at all and reporting its own untouched brief as concluded — the
+/// silent no-work delegation the floor exists to make unrepresentable.
+///
+/// Carrying the floor beside the plan is what lets one derivation serve both:
+/// the reads happen once, `applied()` is the mechanical answer, and the
+/// refining door still holds the turn the router is not allowed to erase.
+struct MechanicalOutcome {
+    /// The set the notify policies produced, before the floor.
+    plan: NotificationPlan,
+    /// The turn a `brief` falls back to when nothing else answers it — the
+    /// room's owner, which is its author. `None` for any other post, for an
+    /// owner that cannot respond, and for a plan that never got that far.
+    floor: Option<PlannedTurn>,
+}
+
+impl MechanicalOutcome {
+    /// Nothing to notify and no floor — the shape every early exit takes.
+    fn nothing() -> Self {
+        Self {
+            plan: NotificationPlan::Turns(Vec::new()),
+            floor: None,
+        }
+    }
+
+    /// The cascade guard spoke. It is not a set the floor may fill: a pause is
+    /// the room being told to stop, and the report says so.
+    fn paused(depth: i64, limit: i64) -> Self {
+        Self {
+            plan: NotificationPlan::Paused { depth, limit },
+            floor: None,
+        }
+    }
+
+    /// The mechanical answer: the floor applies exactly when nothing else does.
+    fn applied(self) -> NotificationPlan {
+        match (self.plan, self.floor) {
+            (NotificationPlan::Turns(t), Some(floor)) if t.is_empty() => {
+                NotificationPlan::Turns(vec![floor])
+            }
+            (plan, _) => plan,
+        }
+    }
+}
+
 impl Inner {
     fn load_config(&self) -> Config {
         Config::load_from(&self.config_path)
+    }
+
+    /// The config a setter is about to rewrite whole: see
+    /// [`Config::load_for_update`] (an unreadable file refuses the write
+    /// rather than reading as defaults the save would then persist).
+    fn load_config_for_update(&self) -> Result<Config, AppError> {
+        Config::load_for_update(&self.config_path)
+    }
+
+    /// Rewrite the config: load it strictly, apply `change`, save it whole —
+    /// under this core's config lock for the whole span. The lock is per
+    /// `AppCore`, which is per profile: the database's exclusive lock refuses
+    /// a second core on the same profile. Each save already publishes only its
+    /// own bytes, but a setter that loaded the file before a background
+    /// account create saved its credentials, and renamed after, would publish
+    /// a whole, well-formed snapshot with no account in it: the only copy of
+    /// the secret, lost to a zoom step. Every setter holds the lock from load
+    /// through rename, so the snapshot it saves is the file it read. The lock
+    /// is held across no `.await`: every caller loads, changes and saves
+    /// synchronously, and the account flows do their network work before
+    /// calling in.
+    ///
+    /// Holding it is also what makes this the moment to remove temporaries a
+    /// crashed save left behind: no save of the file can be in flight.
+    fn update_config(
+        &self,
+        change: impl FnOnce(&mut Config) -> Result<(), AppError>,
+    ) -> Result<(), AppError> {
+        let _serialized = self.config_write.lock().unwrap_or_else(|e| e.into_inner());
+        config::sweep_stale_temporaries(&self.config_path);
+        let mut cfg = Config::load_for_update(&self.config_path)?;
+        change(&mut cfg)?;
+        cfg.save_to(&self.config_path)
     }
 
     fn require_credentials<'a>(&self, cfg: &'a Config) -> Result<(&'a str, &'a str), AppError> {
@@ -1749,52 +2701,142 @@ impl Inner {
 
 // --- Update checking ----------------------------------------------------------
 
+/// The update state, and the one fact that decides who may write it.
+///
+/// `applied_check` is not part of the persisted state and never travels with
+/// it: it numbers *this process's* checks, and a number from another process
+/// or another run would be a comparison between two things that were never
+/// ordered. It lives here rather than beside here because it is read and
+/// written in the same breath as the state it orders, under the same lock —
+/// an ordering rule kept in a second lock is an ordering rule waiting to be
+/// taken in the wrong order.
+#[derive(Default)]
+struct UpdateStateCell {
+    /// Lazily loaded from disk on first access.
+    state: Option<updates::UpdateState>,
+    /// The newest check, by start order, whose completion has been recorded.
+    /// `0` before any check has completed.
+    applied_check: u64,
+}
+
 impl Inner {
     /// Cached-or-loaded copy of the persisted update state.
     fn update_state_snapshot(&self) -> updates::UpdateState {
         let mut guard = self.update_state.lock().expect("update_state lock");
         guard
+            .state
             .get_or_insert_with(|| updates::load_state(&self.data_dir))
             .clone()
     }
 
-    /// Replace the cached state and persist it. A disk write failure is
-    /// logged, not fatal — the in-memory state stays authoritative for the
-    /// rest of the run.  Emits [`Change::UpdateState`] after the write.
-    fn store_update_state(&self, state: updates::UpdateState) {
-        if let Err(e) = updates::save_state(&self.data_dir, &state) {
-            eprintln!("warning: failed to persist update-check state: {e}");
-        }
-        *self.update_state.lock().expect("update_state lock") = Some(state);
+    /// Change the persisted update state, **under the lock, in place**.
+    ///
+    /// The one way this state is written, and that is the point rather than
+    /// tidiness. Every interesting mutation here is a read-modify-write, and
+    /// the rule the state exists to keep — *a standing security alert
+    /// survives later failures* ([`updates::UpdateState::absorb`]) — is a
+    /// decision about what is there **now**. Read a copy, do slow work, write
+    /// the copy back, and that decision is made against a past that another
+    /// writer has already moved on from: the alert it could not see is the
+    /// alert it silently clears. So `f` is handed the current state and its
+    /// answer is persisted before the lock is released, and no caller
+    /// topology — a poll and a manual check, an app and a command-line
+    /// client, an acceptance landing mid-check — can interleave into a lost
+    /// write. A disk failure is logged, not fatal: the in-memory state stays
+    /// authoritative for the rest of the run.
+    ///
+    /// [`Change::UpdateState`] is emitted after the lock is released, so a
+    /// subscriber that reads back cannot deadlock against the write that
+    /// woke it.
+    fn update_state_with<T>(&self, f: impl FnOnce(&mut updates::UpdateState, &mut u64) -> T) -> T {
+        let answer = {
+            let mut guard = self.update_state.lock().expect("update_state lock");
+            let cell = &mut *guard;
+            let state = cell
+                .state
+                .get_or_insert_with(|| updates::load_state(&self.data_dir));
+            let answer = f(state, &mut cell.applied_check);
+            if let Err(e) = updates::save_state(&self.data_dir, state) {
+                eprintln!("warning: failed to persist update-check state: {e}");
+            }
+            answer
+        };
         self.bus.emit(Change::UpdateState);
+        answer
     }
 
     /// Run one check and fold it into the persisted state (a `CheckFailed`
     /// never clears a standing security state — see
     /// [`updates::UpdateState::absorb`]). Returns the *effective* snapshot:
     /// what the UI should now show.
+    ///
+    /// **A verdict applies only if no check begun after it has already
+    /// observed the feed.** Completion order is not start order — two checks
+    /// can observe genuinely different, genuinely valid feed states, and the
+    /// slower request's picture is the older one.
+    /// [`updates::UpdateState::absorb`] holds an alert against a later
+    /// *failure*; it cannot hold one against a stale `UpToDate`, which is not
+    /// wrong, merely from before. So each check takes a number as it starts,
+    /// and a completion is ignored outright if a higher-numbered one has
+    /// landed — but **only a check that reached the feed raises that mark**,
+    /// because a failure saw nothing and so makes nothing older.
+    ///
+    /// **Nothing about the state crosses the network wait — not even one
+    /// field of it.** The round trip ends in a decision-free
+    /// [`updates::CheckOutcome`], and both decisions that depend on state are
+    /// made under the lock at the end: whether the release's claims count as
+    /// accepted ([`updates::classify`]) and whether this verdict may replace
+    /// the standing one ([`updates::UpdateState::absorb`]). A check that
+    /// carried either answer across its round trip would be answering about a
+    /// moment the user has since moved on from — accepting "treat as update"
+    /// while the request reporting on that very manifest is in the air is one
+    /// keystroke, and the reward used to be the warning coming straight back.
     async fn run_update_check(&self) -> updates::UpdateCheckSnapshot {
-        let mut state = self.update_state_snapshot();
+        let started = self
+            .update_checks_started
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         let feed_url = self.load_config().update_feed_url();
 
-        let result = match updater::build_http_client() {
+        let outcome = match updater::build_http_client() {
             Ok(client) => {
-                let mut ctx = updates::CheckContext::new(feed_url, env!("CARGO_PKG_VERSION"));
-                ctx.accepted = state.accepted.clone();
-                updates::check_for_update(&client, &ctx).await
+                let ctx = updates::CheckContext::new(feed_url, env!("CARGO_PKG_VERSION"));
+                updates::check_outcome(&client, &ctx).await
             }
-            Err(e) => updates::UpdateCheckResult::CheckFailed {
+            Err(e) => updates::CheckOutcome::Settled(updates::UpdateCheckResult::CheckFailed {
                 message: format!("constructing HTTPS client: {e}"),
-            },
+            }),
         };
 
-        state.absorb(updates::UpdateCheckSnapshot {
-            checked_at_ms: now_ms(),
-            result,
-        });
-        let effective = state.last.clone().expect("absorb always leaves a snapshot");
-        self.store_update_state(state);
-        effective
+        let checked_at_ms = now_ms();
+        self.update_state_with(|state, applied| {
+            if started < *applied {
+                // A check begun after this one has already answered, so this
+                // one is describing the feed as it was before that. Not a
+                // failure and not wrong — just superseded, and the caller is
+                // told what stands rather than what it happened to see.
+                return state
+                    .last
+                    .clone()
+                    .expect("a check has applied, so a snapshot stands");
+            }
+            let result = updates::classify(outcome, state.accepted.as_ref());
+            // **A failed request made no observation, so it makes nothing
+            // older.** It reached no feed and drew no conclusion; recording
+            // it as the newest thing known would let a quick failure silence
+            // a slower check that actually saw something — a real security
+            // alert discarded for having started first, which is a strictly
+            // worse outcome than the staleness the marker exists to prevent.
+            // Only a verdict drawn from a feed advances it.
+            if !matches!(result, updates::UpdateCheckResult::CheckFailed { .. }) {
+                *applied = started;
+            }
+            state.absorb(updates::UpdateCheckSnapshot {
+                checked_at_ms,
+                result,
+            });
+            state.last.clone().expect("absorb always leaves a snapshot")
+        })
     }
 
     fn accept_changed_claims(
@@ -1802,29 +2844,29 @@ impl Inner {
         version: String,
         manifest_sha256: String,
     ) -> Result<(), AppError> {
-        let mut state = self.update_state_snapshot();
-        state.accepted = Some(updates::AcceptedClaims {
-            version: version.clone(),
-            manifest_sha256: manifest_sha256.clone(),
-            accepted_at_ms: now_ms(),
+        let accepted_at_ms = now_ms();
+        self.update_state_with(|state, _applied| {
+            state.accepted = Some(updates::AcceptedClaims {
+                version: version.clone(),
+                manifest_sha256: manifest_sha256.clone(),
+                accepted_at_ms,
+            });
+
+            // If the standing result is the claims-changed release being
+            // accepted, rewrite it as an available update so UIs reflect the
+            // choice without waiting for the next poll.
+            if let Some(snapshot) = state.last.as_mut()
+                && let updates::UpdateCheckResult::ClaimsChanged { release, .. } = &snapshot.result
+                && release.version == version
+                && release
+                    .manifest_sha256
+                    .eq_ignore_ascii_case(&manifest_sha256)
+            {
+                let mut release = release.clone();
+                release.claims_accepted = true;
+                snapshot.result = updates::UpdateCheckResult::UpdateAvailable { release };
+            }
         });
-
-        // If the standing result is the claims-changed release being
-        // accepted, rewrite it as an available update so UIs reflect the
-        // choice without waiting for the next poll.
-        if let Some(snapshot) = state.last.as_mut()
-            && let updates::UpdateCheckResult::ClaimsChanged { release, .. } = &snapshot.result
-            && release.version == version
-            && release
-                .manifest_sha256
-                .eq_ignore_ascii_case(&manifest_sha256)
-        {
-            let mut release = release.clone();
-            release.claims_accepted = true;
-            snapshot.result = updates::UpdateCheckResult::UpdateAvailable { release };
-        }
-
-        self.store_update_state(state);
         Ok(())
     }
 }
@@ -1832,11 +2874,20 @@ impl Inner {
 // --- Async infrastructure ----------------------------------------------------
 
 impl Inner {
+    /// The Eidola model catalog this core reads ([`Inner::model_catalog`]).
+    fn catalog(&self) -> &'static [model_catalog::CatalogRow] {
+        *self
+            .model_catalog
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     async fn db_conn(&self) -> Result<turso::Connection, AppError> {
         let database = self
             .db
             .get_or_try_init(|| async {
                 let database = db::open(&self.data_dir).await?;
+                self.forget_other_domains_cache_keys(&database).await;
                 self.sweep_pristine_spaces(&database).await;
                 Ok::<_, AppError>(database)
             })
@@ -1844,6 +2895,50 @@ impl Inner {
         // FK enforcement is per-connection (turso defaults it OFF), and the
         // scope-owned schema depends on it — enable it on every connection.
         db::connect(database).await
+    }
+
+    /// Forget every prefix-cache key minted under a trust domain other than
+    /// the one this process resolves, once per process — inside the
+    /// `OnceCell` initializer, before any turn can claim.
+    ///
+    /// **The trust domain can change with no write to the eidola row**: a
+    /// build with another compiled-in server URL or measurement resolves
+    /// another domain from the same NULL columns, so the configuration door's
+    /// cleanup (`backends::update_backend`) never runs for it. Each lineage
+    /// would still rotate at its next claim, and a lineage never used again
+    /// would keep its key on disk; this overwrites and deletes them all, and
+    /// empties the log, exactly as that door does.
+    ///
+    /// **A failed cleanup is never a failed open**: no key crosses domains
+    /// either way (the claim mints under a mismatch), so it is warned about,
+    /// naming no key, and left to the next open.
+    async fn forget_other_domains_cache_keys(&self, database: &turso::Database) {
+        let forgotten = async {
+            let conn = db::connect(database).await?;
+            let row = db::get_backend(&conn, backends::EIDOLA_BACKEND_ID).await?;
+            let domain = EidolaResolved::from_row(row.as_ref())?.cache_trust_domain();
+            db::begin_write(&conn).await?;
+            let forgotten = match db::forget_cache_keys_outside(&conn, &domain).await {
+                Ok(n) => {
+                    conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+                    n
+                }
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(e);
+                }
+            };
+            if forgotten > 0 {
+                db::truncate_log_after_forgetting_keys(&conn).await;
+            }
+            Ok::<_, AppError>(())
+        }
+        .await;
+        if let Err(e) = forgotten {
+            eprintln!(
+                "warning: could not forget prefix-cache keys of other trust configurations: {e}"
+            );
+        }
     }
 
     /// The startup sweep, run exactly once per process — inside the `OnceCell`
@@ -1886,10 +2981,10 @@ impl Inner {
     /// override-vs-pin honesty flags the UIs render.
     async fn eidola_trust(&self) -> Result<EidolaTrust, AppError> {
         let resolved = self.eidola_resolved().await?;
-        let to_info = |m: &tinfoil_verifier::EnclaveMeasurement| MeasurementInfo {
-            snp: m.snp_measurement.clone(),
-            tdx_rtmr1: m.tdx_measurement.rtmr1.clone(),
-            tdx_rtmr2: m.tdx_measurement.rtmr2.clone(),
+        let to_info = |m: &tinfoil_verifier::SevSnpPin| MeasurementInfo {
+            measurement: m.measurement.to_ascii_lowercase(),
+            host_data: m.host_data.to_ascii_lowercase(),
+            guest_policy: m.guest_policy.clone(),
         };
         Ok(EidolaTrust {
             base_url: resolved.base_url.clone(),
@@ -1910,7 +3005,7 @@ impl Inner {
     /// is NULL — the read-modify-write base for trust/untrust.
     async fn eidola_measurement_overrides(
         &self,
-    ) -> Result<Vec<tinfoil_verifier::EnclaveMeasurement>, AppError> {
+    ) -> Result<Vec<tinfoil_verifier::SevSnpPin>, AppError> {
         let conn = self.db_conn().await?;
         let row = db::get_backend(&conn, backends::EIDOLA_BACKEND_ID).await?;
         match row.and_then(|r| r.trusted_measurements) {
@@ -1924,16 +3019,16 @@ impl Inner {
     }
 
     /// Add a measurement to the eidola row's override list (idempotent by
-    /// SNP measurement). Returns whether it was newly added.
+    /// launch identity, digest and HOST_DATA). Returns whether it was newly
+    /// added; an entry for the same identity under another guest policy is
+    /// not added beside it.
     async fn trust_measurement(
         &self,
-        entry: tinfoil_verifier::EnclaveMeasurement,
+        entry: tinfoil_verifier::SevSnpPin,
     ) -> Result<bool, AppError> {
         let mut list = self.eidola_measurement_overrides().await?;
-        if list.iter().any(|m| {
-            m.snp_measurement
-                .eq_ignore_ascii_case(&entry.snp_measurement)
-        }) {
+        let key = config::measurement_key(&entry);
+        if list.iter().any(|m| config::measurement_key(m) == key) {
             return Ok(false);
         }
         list.push(entry);
@@ -1951,15 +3046,12 @@ impl Inner {
         Ok(true)
     }
 
-    /// Remove a measurement (by SNP key) from the eidola row's override list.
-    /// Clears the column back to NULL (= pin) when the list empties. Returns
-    /// whether a measurement was removed.
+    /// Remove a measurement (by its `<measurement>:<host_data>` key) from the
+    /// eidola row's override list. Clears the column back to NULL (= pin)
+    /// when the list empties. Returns whether a measurement was removed.
     async fn untrust_measurement(&self, key: String) -> Result<bool, AppError> {
         let mut list = self.eidola_measurement_overrides().await?;
-        let Some(pos) = list
-            .iter()
-            .position(|m| m.snp_measurement.eq_ignore_ascii_case(&key))
-        else {
+        let Some(pos) = list.iter().position(|m| config::measurement_key(m) == key) else {
             return Ok(false);
         };
         list.remove(pos);
@@ -2035,8 +3127,16 @@ impl Inner {
             "hardware_intermediate_ca",
         )?;
 
+        // The server is pinned on SEV-SNP only (launch digest, HOST_DATA and
+        // guest policy): the client path accepts no TDX evidence.
+        let allowed: Vec<tinfoil_verifier::AllowedMeasurement> = eidola
+            .measurements
+            .iter()
+            .cloned()
+            .map(tinfoil_verifier::AllowedMeasurement::sev_snp)
+            .collect();
         tinfoil_verifier::attesting_client(tinfoil_verifier::AttestingClientConfig {
-            allowed_measurements: &eidola.measurements,
+            allowed_measurements: &allowed,
             inference_base_url: &eidola.base_url,
             trusted_ark_der: hardware_root_der.as_deref(),
             trusted_ask_der: hardware_intermediate_der.as_deref(),
@@ -2062,6 +3162,59 @@ impl Inner {
         }
         local_models::plain_http_client()
     }
+
+    /// The client a chat turn's or a chore's completion goes out on, to an
+    /// engine or an external backend: [`Inner::plain_client`] **without
+    /// following redirects**, so the conversation reaches the origin the
+    /// reader configured or nowhere. See
+    /// [`local_models::completion_http_client`]. Under the `test-support`
+    /// feature an injected test client takes its place, so a test of the
+    /// policy itself runs on an ordinary core.
+    fn completion_client(&self) -> Result<reqwest::Client, AppError> {
+        #[cfg(feature = "test-support")]
+        if let Some(client) = &self.http_override {
+            return Ok(client.clone());
+        }
+        local_models::completion_http_client()
+    }
+
+    /// The client a **proxied** completion goes out on: [`Inner::plain_client`]
+    /// without the identifying `User-Agent`, because the proxy's upstream
+    /// header set is an allowlist the Record repeats back to the reader and a
+    /// header the builder adds would travel outside it. See
+    /// [`local_models::proxy_http_client`].
+    fn proxy_client(&self) -> Result<reqwest::Client, AppError> {
+        #[cfg(feature = "test-support")]
+        if let Some(client) = &self.http_override {
+            return Ok(client.clone());
+        }
+        local_models::proxy_http_client()
+    }
+
+    /// Is what this eidola connection says about its models a fact this
+    /// client may act on, or merely a hint?
+    ///
+    /// **Provenance, not backend kind.** A declaration is authoritative when —
+    /// and only when — the client is talking to the trust root it was built
+    /// with: no base-URL override, no measurement override. Anything reached
+    /// through an override is, for capability purposes, an unknown external
+    /// endpoint. It may be a development stack being iterated on, or another
+    /// operator's server whose catalog is theirs and not ours; either way a
+    /// wrong `true` there would suppress the fallback that recovers from it
+    /// and turn every branched turn into an unrecoverable failure.
+    ///
+    /// Both predicates are already computed on the path a turn takes, so the
+    /// rule costs no new state.
+    fn declarations_are_authoritative(&self, eidola: &EidolaResolved) -> bool {
+        #[cfg(feature = "test-support")]
+        if self
+            .trust_declared_capabilities
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return true;
+        }
+        !eidola.base_url_is_override && !eidola.measurements_are_override
+    }
 }
 
 /// The `eidola` backend's resolved connection + trust bundle. Overrides come
@@ -2071,19 +3224,33 @@ impl Inner {
 struct EidolaResolved {
     base_url: String,
     base_url_is_override: bool,
-    measurements: Vec<tinfoil_verifier::EnclaveMeasurement>,
+    measurements: Vec<tinfoil_verifier::SevSnpPin>,
     measurements_are_override: bool,
     hardware_root_ca: Option<String>,
     hardware_intermediate_ca: Option<String>,
 }
 
 impl EidolaResolved {
+    /// The trust domain a prefix-cache key minted for this connection belongs
+    /// to ([`prefix_cache::trust_domain`]): the resolved base URL and every
+    /// member of the trust bundle, pinned or overridden alike.
+    fn cache_trust_domain(&self) -> String {
+        let measurements =
+            serde_json::to_string(&self.measurements).unwrap_or_else(|_| String::new());
+        prefix_cache::trust_domain(
+            &self.base_url,
+            &measurements,
+            self.hardware_root_ca.as_deref(),
+            self.hardware_intermediate_ca.as_deref(),
+        )
+    }
+
     fn from_row(row: Option<&db::BackendRow>) -> Result<Self, AppError> {
         let base_url_override = row.and_then(|r| r.base_url.clone());
         let base_url_is_override = base_url_override.is_some();
         let base_url = base_url_override.unwrap_or_else(|| trust_root::SERVER_URL.to_string());
 
-        let measurements_override: Vec<tinfoil_verifier::EnclaveMeasurement> =
+        let measurements_override: Vec<tinfoil_verifier::SevSnpPin> =
             match row.and_then(|r| r.trusted_measurements.as_deref()) {
                 Some(json) if !json.trim().is_empty() => {
                     serde_json::from_str(json).map_err(|e| AppError::Database {
@@ -2158,8 +3325,11 @@ impl Inner {
         })
     }
 
-    async fn account_create(&self) -> Result<AccountCreateResult, AppError> {
-        let cfg = self.load_config();
+    async fn account_create(
+        &self,
+        accepted_terms: Vec<TermsDocument>,
+    ) -> Result<AccountCreateResult, AppError> {
+        let cfg = self.load_config_for_update()?;
 
         if cfg.account_id.is_some() || cfg.account_secret.is_some() {
             return Err(AppError::Config {
@@ -2184,24 +3354,90 @@ impl Inner {
                 message: format!("failed to parse response: {e}"),
             })?;
 
-        let mut cfg = self.load_config();
-        cfg.account_id = Some(created.account_id.to_string());
-        cfg.account_secret = Some(created.secret.clone());
-        cfg.save_to(&self.config_path)?;
-        self.bus.emit(Change::Config);
+        // From here the server holds only the secret's hash: a failure to
+        // keep it must hand it back, never drop it with an ordinary error.
+        // The preflight above ran before the request; an account linked
+        // while it was in flight is seen only under the write lock, and is
+        // never overwritten (its secret would be the one lost).
+        let saved = self.update_config(|cfg| {
+            if cfg.account_id.is_some() || cfg.account_secret.is_some() {
+                return Err(AppError::Config {
+                    message: "an account was configured while this one was being created".into(),
+                });
+            }
+            cfg.account_id = Some(created.account_id.to_string());
+            cfg.account_secret = Some(created.secret.clone());
+            Ok(())
+        });
+        if saved.is_ok() {
+            self.bus.emit(Change::Config);
+        }
+        // Not kept: write the credential to a file of its own beside the
+        // profile, now, before any more network. The returned error carries it
+        // too, but a caller can drop that (a window closed mid-create, a
+        // process quitting during the terms round trip) and it is the only
+        // copy. Same `save_to` as the profile: whole-file, owner-only, synced.
+        // A separate file because the profile is exactly what could not be
+        // written (unreadable, or another account's).
+        let recovery_file = if saved.is_err() {
+            let path = self
+                .config_path
+                .with_file_name(format!("account-recovery-{}.toml", created.account_id));
+            let recovery = Config {
+                account_id: Some(created.account_id.to_string()),
+                account_secret: Some(created.secret.clone()),
+                ..Config::default()
+            };
+            recovery.save_to(&path).ok().map(|()| path)
+        } else {
+            None
+        };
 
-        // Record acceptance of the currently required terms/privacy versions
-        // against the new account. The caller is responsible for having
-        // presented the documents first (the GUI's consent checkbox, the
-        // CLI's --accept-terms flag). Best-effort: if this fails, the
-        // server's 428 gate re-prompts at the first purchase or conversion,
-        // so a network blip here must not fail the already-created account.
-        let _ = self.accept_current_terms().await;
+        // Record the user's acceptance of exactly the documents the caller
+        // presented — never a freshly fetched set, which would record consent
+        // for text nobody read if a version advanced between the two.
+        // Passing the pairs through makes that impossible: the server only
+        // records a `(document, sha256)` pair it still requires, and answers
+        // a stale one with a conflict.
+        //
+        // Best-effort by design: the account exists either way, and failing
+        // the call would strand a created account. So the outcome is
+        // *reported* rather than swallowed — and reported as the standing the
+        // server would gate on, not as "my submissions succeeded". When
+        // nothing is known to have been recorded, nothing is assumed: the
+        // standing is read with an empty recorded set, which lists everything
+        // currently required.
+        //
+        // Submitted as the account just created, whether or not the profile
+        // kept it: the reader accepted this snapshot for *this* account, and an
+        // unsaved one linked later would otherwise come back gated, with
+        // nothing on the onboarding path that could accept for it again.
+        let account_id = created.account_id.to_string();
+        let terms = match self
+            .submit_terms_as(&account_id, &created.secret, &accepted_terms)
+            .await
+        {
+            Ok(()) => self.terms_standing(&accepted_terms).await,
+            Err(_) => self.terms_standing(&[]).await,
+        };
+
+        if let Err(e) = saved {
+            return Err(AppError::AccountNotSaved {
+                account: Box::new(crate::error::UnsavedAccount {
+                    account_id,
+                    secret: crate::error::AccountSecret::new(created.secret),
+                    terms,
+                    recovery_file,
+                }),
+                reason: e.to_string(),
+            });
+        }
 
         Ok(AccountCreateResult {
             id: created.account_id.to_string(),
             secret: created.secret,
             created_at: iso_to_ms(&created.created_at)?,
+            terms,
         })
     }
 
@@ -2239,24 +3475,60 @@ impl Inner {
             .collect())
     }
 
-    /// Record acceptance of every currently required document version
-    /// against the configured account, returning what was accepted.
+    /// Record acceptance of `presented`, then report where the account
+    /// stands with the gate.
     ///
-    /// Callers are responsible for having *presented* the documents to the
-    /// user first — this method transmits consent, it does not obtain it.
-    async fn accept_current_terms(&self) -> Result<Vec<TermsDocument>, AppError> {
-        let docs = self.current_terms().await?;
-        if docs.is_empty() {
-            return Ok(docs);
+    /// Two acts, deliberately kept apart (see [`Inner::submit_terms`] and
+    /// [`Inner::terms_standing`]): what gets *submitted* is only ever what
+    /// the caller presented, and the read that follows only ever *reports*.
+    /// An `Err` here is a failed submission; an `Ok` carries the standing,
+    /// which may still be [`TermsAcceptance::Outstanding`].
+    async fn accept_terms(
+        &self,
+        presented: Vec<TermsDocument>,
+    ) -> Result<TermsAcceptance, AppError> {
+        self.submit_terms(&presented).await?;
+        Ok(self.terms_standing(&presented).await)
+    }
+
+    /// **The only path that records anything.** Submits exactly the documents
+    /// `presented` — the snapshot the caller obtained from `current_terms`
+    /// and showed the user.
+    ///
+    /// The snapshot is an *input*, deliberately: this method transmits
+    /// consent, it does not obtain it, and re-reading the current documents
+    /// here would transmit consent for whatever the server requires now
+    /// rather than for what the user read. The server accepts a
+    /// `(document, sha256)` pair only while it is still required, so a
+    /// version that advanced mid-flow surfaces as a conflict instead of a
+    /// silent acceptance.
+    async fn submit_terms(&self, presented: &[TermsDocument]) -> Result<(), AppError> {
+        if presented.is_empty() {
+            return Ok(());
+        }
+        let cfg = self.load_config();
+        let (id, secret) = self.require_credentials(&cfg)?;
+        self.submit_terms_as(id, secret, presented).await
+    }
+
+    /// [`Self::submit_terms`] for named credentials rather than the
+    /// profile's: account creation submits as the account it just created,
+    /// which the profile may have been unable to keep.
+    async fn submit_terms_as(
+        &self,
+        id: &str,
+        secret: &str,
+        presented: &[TermsDocument],
+    ) -> Result<(), AppError> {
+        if presented.is_empty() {
+            return Ok(());
         }
 
-        let cfg = self.load_config();
         let eidola = self.eidola_resolved().await?;
         let base_url = eidola.base_url.as_str();
-        let (id, secret) = self.require_credentials(&cfg)?;
         let client = self.build_client(&eidola, None).await?;
 
-        for d in &docs {
+        for d in presented {
             let resp = client
                 .post(format!("{base_url}/v1/account/terms"))
                 .basic_auth(id, Some(secret))
@@ -2272,7 +3544,38 @@ impl Inner {
             check_status(status, &body)?;
         }
 
-        Ok(docs)
+        Ok(())
+    }
+
+    /// Where the account stands with the terms gate, given what is known to
+    /// have been `recorded`. **Read-only, and structurally so.**
+    ///
+    /// This re-reads `GET /v1/terms`, which is the read this contract removed
+    /// from the acceptance path — but for the opposite purpose, and the
+    /// difference is what keeps it safe. There it *decided what was
+    /// submitted*, which is how consent for unread text got recorded. Here it
+    /// only reports, and it cannot become the other thing: what it hands back
+    /// is [`documents_not_covered`]'s answer, which is document **names**,
+    /// and [`Inner::submit_terms`] takes `TermsDocument`s. A name carries no
+    /// hash, so there is nothing in this function's output that the
+    /// submitting path could accept. Keep it that way — widening the return
+    /// type to documents is what would re-open the hole.
+    ///
+    /// Never fails: an unreadable server is [`TermsAcceptance::Unknown`],
+    /// because "I could not check" is an answer and `Complete` would be a
+    /// lie.
+    async fn terms_standing(&self, recorded: &[TermsDocument]) -> TermsAcceptance {
+        match self.current_terms().await {
+            Ok(required) => {
+                let documents = documents_not_covered(&required, recorded);
+                if documents.is_empty() {
+                    TermsAcceptance::Complete
+                } else {
+                    TermsAcceptance::Outstanding { documents }
+                }
+            }
+            Err(error) => TermsAcceptance::Unknown { error },
+        }
     }
 
     async fn account_prices(&self) -> Result<Vec<PriceInfo>, AppError> {
@@ -2298,22 +3601,40 @@ impl Inner {
             .data
             .into_iter()
             .map(|p| {
-                let amount_display = p
-                    .unit_amount
-                    .map(|a| format!("{}.{:02} {}", a / 100, a % 100, p.currency.to_uppercase()))
+                // The typed halves are what a localizing surface reads; the two
+                // strings beside them are these same values already worded in
+                // English, for the callers that want exactly that.
+                let amount = p.unit_amount.map(|a| PriceAmount {
+                    minor_units: a,
+                    currency: p.currency.to_uppercase(),
+                });
+                let cadence = match p.recurring.as_ref() {
+                    Some(r) => PriceCadence::Every {
+                        interval: r.interval.clone(),
+                        count: r.interval_count,
+                    },
+                    None => PriceCadence::OneTime,
+                };
+
+                let amount_display = amount
+                    .as_ref()
+                    .map(|a| {
+                        format!(
+                            "{}.{:02} {}",
+                            a.minor_units / 100,
+                            a.minor_units % 100,
+                            a.currency
+                        )
+                    })
                     .unwrap_or_else(|| "free".to_string());
 
-                let recurrence = p
-                    .recurring
-                    .as_ref()
-                    .map(|r| {
-                        if r.interval_count == 1 {
-                            format!("/{}", r.interval)
-                        } else {
-                            format!("/{}x{}", r.interval_count, r.interval)
-                        }
-                    })
-                    .unwrap_or_default();
+                let recurrence = match &cadence {
+                    PriceCadence::OneTime => String::new(),
+                    PriceCadence::Every { interval, count } if *count == 1 => {
+                        format!("/{interval}")
+                    }
+                    PriceCadence::Every { interval, count } => format!("/{count}x{interval}"),
+                };
 
                 PriceInfo {
                     id: p.id,
@@ -2322,16 +3643,23 @@ impl Inner {
                     amount_display,
                     recurrence,
                     credits: p.credits,
+                    amount,
+                    cadence,
                 }
             })
             .collect())
     }
 
-    async fn account_checkout(&self, price_id: &str) -> Result<String, AppError> {
+    async fn account_checkout(&self, price_id: &str) -> Result<CheckoutMint, AppError> {
         let cfg = self.load_config();
         let eidola = self.eidola_resolved().await?;
         let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
+        // Taken from the very config the request is about to be signed with,
+        // so what comes back is bound to the credentials that produced it
+        // rather than to whatever a caller happened to read.
+        let minted_for = config::account_fingerprint(&cfg)
+            .expect("credentials just required are credentials to name");
 
         let client = self.build_client(&eidola, None).await?;
         let resp = client
@@ -2350,7 +3678,10 @@ impl Inner {
                 message: format!("failed to parse response: {e}"),
             })?;
 
-        Ok(checkout.checkout_url)
+        Ok(CheckoutMint {
+            url: checkout.checkout_url,
+            minted_for,
+        })
     }
 
     /// The account's subscription standing, read live from the server.
@@ -2411,11 +3742,15 @@ impl Inner {
     /// Its own call, matching its own endpoint: the session is a write the
     /// payment processor performs and it expires quickly, so it is asked
     /// for at the moment the reader is about to open it and never held.
-    async fn account_portal(&self) -> Result<String, AppError> {
+    async fn account_portal(&self) -> Result<PortalMint, AppError> {
         let cfg = self.load_config();
         let eidola = self.eidola_resolved().await?;
         let base_url = eidola.base_url.as_str();
         let (id, secret) = self.require_credentials(&cfg)?;
+        // Taken from the very config the request is about to be signed with,
+        // for the reason [`PortalMint`] gives.
+        let minted_for = config::account_fingerprint(&cfg)
+            .expect("credentials just required are credentials to name");
 
         let client = self.build_client(&eidola, None).await?;
         let resp = client
@@ -2432,7 +3767,10 @@ impl Inner {
             serde_json::from_str(&body).map_err(|e| AppError::Network {
                 message: format!("failed to parse response: {e}"),
             })?;
-        Ok(portal.portal_url)
+        Ok(PortalMint {
+            url: portal.portal_url,
+            minted_for,
+        })
     }
 
     async fn account_balances(&self) -> Result<BalancesResult, AppError> {
@@ -2474,195 +3812,490 @@ impl Inner {
         })
     }
 
+    fn issuance_request_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.issuance_request_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    fn provision_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.provision_wait_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// [`ISSUANCE_SETTLE_AGE`] in milliseconds.
+    fn issuance_settle_age_ms(&self) -> i64 {
+        i64::try_from(
+            self.issuance_settle_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .unwrap_or(i64::MAX)
+    }
+
+    /// Take [`Inner::issuance_gate`], waiting no later than `deadline`. Every
+    /// holder's network requests are bounded ([`ISSUANCE_REQUEST_TIMEOUT`]), so
+    /// a wait this long means something is wrong, and the caller is told so
+    /// rather than left waiting — a turn waits here holding `spend_gate`.
+    async fn lock_issuance_gate(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, AppError> {
+        tokio::time::timeout_at(deadline, self.issuance_gate.lock())
+            .await
+            .map_err(|_| AppError::ProvisioningTimeout {
+                message: "timed out waiting for another credential issuance to finish".into(),
+            })
+    }
+
+    /// The account balance, read under the issuance deadline.
+    async fn account_balances_bounded(&self) -> Result<BalancesResult, AppError> {
+        tokio::time::timeout(self.issuance_request_timeout(), self.account_balances())
+            .await
+            .map_err(|_| AppError::Network {
+                message: "timed out reading the account balance".into(),
+            })?
+    }
+
+    /// Whether the Eidola backend is configured to be used at all.
+    async fn eidola_enabled(&self) -> Result<bool, AppError> {
+        let conn = self.db_conn().await?;
+        Ok(db::get_backend(&conn, backends::EIDOLA_BACKEND_ID)
+            .await?
+            .is_some_and(|row| row.enabled && row.removed_at.is_none()))
+    }
+
+    /// The calendar issuer key windows are checked against: the production
+    /// [`ISSUER_CALENDAR`], the gateway's own, in every release build.
+    fn issuer_calendar(&self) -> IssuerCalendar {
+        #[cfg(feature = "test-support")]
+        {
+            *self
+                .issuer_calendar
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            ISSUER_CALENDAR
+        }
+    }
+
+    /// Convert `credits` from the account into a new credential: the explicit
+    /// `account allocate` door. Serialized with every other issuance in this
+    /// process by [`Inner::issuance_gate`]. An earlier issuance of the
+    /// account's still pending is asked for again first, and nothing new is
+    /// converted in a call that finds one: repeating a conversion whose
+    /// answer was lost would otherwise debit once per attempt.
     async fn account_allocate(&self, credits: i64) -> Result<AllocateResult, AppError> {
+        let _issuing = self
+            .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
+            .await?;
+        let recovered = Box::pin(self.resolve_pending_issuances_locked()).await?;
+        if !recovered.is_empty() {
+            return Err(AppError::Credential {
+                message: format!(
+                    "an earlier conversion whose answer was lost has now been answered: \
+                     recovered {} credential(s). Nothing new was converted; run this again \
+                     to convert more",
+                    recovered.len()
+                ),
+            });
+        }
+        Box::pin(self.allocate_locked(credits)).await
+    }
+
+    /// [`Inner::account_allocate`] for a caller already holding
+    /// [`Inner::issuance_gate`].
+    async fn allocate_locked(&self, credits: i64) -> Result<AllocateResult, AppError> {
         if credits <= 0 {
             return Err(AppError::Credential {
                 message: "credits must be greater than 0".into(),
             });
         }
-
         let cfg = self.load_config();
         let eidola = self.eidola_resolved().await?;
-        let base_url = eidola.base_url.as_str();
-        let (account_id, secret) = self.require_credentials(&cfg)?;
         let client = self.build_client(&eidola, None).await?;
+        let key = current_issuer_key(
+            &client,
+            &eidola.base_url,
+            cfg.domain_separator(),
+            self.issuance_request_timeout(),
+            &self.issuer_calendar(),
+            &self.db_conn().await?,
+        )
+        .await?;
+        Box::pin(self.allocate_with_key(&cfg, &client, &eidola.base_url, &key, credits)).await
+    }
 
-        // 1. Fetch issuer keys
-        let resp = client
-            .get(format!("{base_url}/v1/keys"))
-            .send()
+    /// [`Inner::allocate_locked`] on a task of its own, for the just-in-time
+    /// path inside a turn. A turn's future is deep already, and an issuance
+    /// builds and checks its credential's proofs on the stack, so it runs from the
+    /// top of a worker's stack rather than from the bottom of the turn's. It
+    /// also finishes if the turn is dropped meanwhile, so a request the server
+    /// may have debited for is never abandoned half-sent.
+    async fn allocate_on_its_own_task(&self, credits: i64) -> Result<AllocateResult, AppError> {
+        let Some(inner) = self.self_ref.upgrade() else {
+            return Err(AppError::Credential {
+                message: "the core is shutting down".into(),
+            });
+        };
+        tokio::spawn(async move { inner.allocate_locked(credits).await })
             .await
-            .map_err(AppError::from_request)?;
-        let (status, body) = read_response(resp).await?;
-        check_status(status, &body)?;
+            .map_err(join_err)?
+    }
 
-        let keys: ListKeysResponse =
-            serde_json::from_str(&body).map_err(|e| AppError::Network {
-                message: format!("failed to parse keys response: {e}"),
-            })?;
-
-        let expected_ds = cfg.domain_separator();
+    /// Issue a credential of `credits` under `key`, which the caller has just
+    /// read as the current issuing key. The caller holds
+    /// [`Inner::issuance_gate`].
+    ///
+    /// **Everything a retry needs is written before the request is sent**: the
+    /// client's secret issuance state, the request exactly as it goes out (its
+    /// proof is randomized, so it could not be rebuilt), a random idempotency
+    /// key, and the account it is for. A response that never arrives therefore
+    /// leaves a pending issuance [`Inner::recover_pending_issuances_locked`]
+    /// can ask for again, and the server answers that retry from what it stored
+    /// rather than debiting twice. An answer meaning nothing was debited
+    /// abandons the row; a dropped connection or a server error leaves it.
+    async fn allocate_with_key(
+        &self,
+        cfg: &Config,
+        client: &reqwest::Client,
+        base_url: &str,
+        key: &CurrentIssuerKey,
+        credits: i64,
+    ) -> Result<AllocateResult, AppError> {
+        let (account_id, secret) = self.require_credentials(cfg)?;
         let now = now_ms();
-        // Every issuer key shares the same domain separator — rotation mints
-        // new keys, never new separators — so the separator alone does not
-        // identify a single key. `/v1/keys` lists all still-accepted keys
-        // oldest-first, which during a rotation grace window includes the
-        // just-rotated-out key whose accept window has not yet closed.
-        // Issuance always signs with the *current* key (the server's
-        // `get_current_issuer_key`, newest by `issue_from`), so we must verify
-        // against that same key: select the key whose issuing window covers
-        // now (`issue_from <= now < issue_until`), preferring the newest such
-        // key. Selecting the first separator match (the old behavior) grabbed
-        // the oldest accepted key and failed proof verification whenever an
-        // out-of-issuance-but-still-accepted key preceded the current one.
-        let key = keys
-            .data
-            .iter()
-            .filter(|k| k.domain_separator == expected_ds)
-            .filter_map(|k| {
-                let issue_from = iso_to_ms(&k.issue_from).ok()?;
-                let issue_until = iso_to_ms(&k.issue_until).ok()?;
-                (issue_from <= now && now < issue_until).then_some((issue_from, k))
-            })
-            .max_by_key(|(issue_from, _)| *issue_from)
-            .map(|(_, k)| k)
-            .ok_or_else(|| {
-                let server_ds: Vec<&str> = keys
-                    .data
-                    .iter()
-                    .map(|k| k.domain_separator.as_str())
-                    .collect();
-                AppError::Credential {
-                    message: format!(
-                        "no issuer key currently valid for issuance matches expected \
-                         domain separator \"{expected_ds}\"\n\
-                         server advertised: {server_ds:?}"
-                    ),
-                }
-            })?;
+        // The account is debited at issuance, so a credential that would be
+        // born past its own spend deadline is value thrown away. The server's
+        // grace window is a full epoch, so this is only reachable against a
+        // misconfigured (or hostile) server; refuse before any debit.
+        if key.deadlines.spend_until <= now {
+            return Err(AppError::Credential {
+                message: format!(
+                    "the current issuer key stops being accepted at {}, too soon for a new \
+                     credential to be spent under it",
+                    key.listed.accept_until
+                ),
+            });
+        }
 
-        let public_key_cbor =
-            URL_SAFE_NO_PAD
-                .decode(&key.public_key)
-                .map_err(|e| AppError::Credential {
-                    message: format!("invalid base64 public key: {e}"),
-                })?;
-
-        let public_key =
-            PublicKey::from_cbor(&public_key_cbor).map_err(|e| AppError::Credential {
-                message: format!("invalid public key CBOR: {e}"),
-            })?;
-
-        let params = params_from_domain_separator(expected_ds)?;
-
-        // 2. Open DB and store issuer key
         let db_conn = self.db_conn().await?;
-        let params_hash = blake3::hash(key.domain_separator.as_bytes())
-            .to_hex()
-            .to_string();
-        let expires_at = iso_to_ms(&key.issue_until)?;
-
         db::upsert_issuer_key(
             &db_conn,
-            &key.id,
-            &params_hash,
-            &public_key_cbor,
-            key.domain_separator.as_bytes(),
-            expires_at,
+            &key.listed.id,
+            blake3::hash(key.listed.domain_separator.as_bytes())
+                .to_hex()
+                .as_str(),
+            &key.public_key_cbor,
+            key.listed.domain_separator.as_bytes(),
+            key.deadlines,
             now,
         )
         .await?;
 
-        // 3. Create PreIssuance checkpoint
         let pre_issuance = PreIssuance::random(OsRng);
         let pre_issuance_cbor = pre_issuance.to_cbor().map_err(|e| AppError::Credential {
             message: format!("failed to encode pre_issuance: {e}"),
         })?;
-        let pre_credential_id = Uuid::now_v7().to_string();
-        db::insert_pre_credential_issuance(
-            &db_conn,
-            &pre_credential_id,
-            &key.id,
-            &pre_issuance_cbor,
-            credits,
-            now,
-        )
-        .await?;
-
-        // 4. Send issuance request
-        let issuance_request = pre_issuance.request(&params, OsRng);
+        let issuance_request = pre_issuance.request(&key.params, OsRng);
         let request_cbor = issuance_request
             .to_cbor()
             .map_err(|e| AppError::Credential {
                 message: format!("failed to encode issuance request: {e}"),
             })?;
-
-        let resp = client
-            .post(format!("{base_url}/v1/account/credentials"))
-            .basic_auth(account_id, Some(secret))
-            .json(&serde_json::json!({
-                "issuance_request": URL_SAFE_NO_PAD.encode(&request_cbor),
-                "credits": credits,
-            }))
-            .send()
-            .await
-            .map_err(AppError::from_request)?;
-        let (status, body) = read_response(resp).await?;
-        check_status(status, &body)?;
-
-        let issued: IssueCredentialsResponse =
-            serde_json::from_str(&body).map_err(|e| AppError::Network {
-                message: format!("failed to parse issuance response: {e}"),
-            })?;
-
-        // 5. Construct CreditToken
-        let response_cbor = URL_SAFE_NO_PAD
-            .decode(&issued.issuance_response)
-            .map_err(|e| AppError::Credential {
-                message: format!("invalid issuance response base64: {e}"),
-            })?;
-        let issuance_response =
-            IssuanceResponse::from_cbor(&response_cbor).map_err(|e| AppError::Credential {
-                message: format!("invalid issuance response CBOR: {e}"),
-            })?;
-        let credit_token = pre_issuance
-            .to_credit_token::<128>(&params, &public_key, &issuance_request, &issuance_response)
-            .map_err(|e| AppError::Credential {
-                message: format!("failed to construct credit token: {e}"),
-            })?;
-
-        // 6. Store credential
-        let token_cbor = credit_token.to_cbor().map_err(|e| AppError::Credential {
-            message: format!("failed to encode credit token: {e}"),
-        })?;
-        let nonce_hex = hex_encode(&credit_token.nullifier().to_bytes());
-        let token_credits =
-            scalar_to_credit::<128>(&credit_token.credits()).map_err(|e| AppError::Credential {
-                message: format!("invalid credit amount in token: {e}"),
-            })?;
-
-        db::insert_credential(
+        let mut idempotency_key = [0u8; 32];
+        rand_core::RngCore::fill_bytes(&mut OsRng, &mut idempotency_key);
+        let pre_credential_id = Uuid::now_v7().to_string();
+        db::insert_pre_credential_issuance(
             &db_conn,
-            &nonce_hex,
-            &pre_credential_id,
-            &issued.issuer_key_id,
-            &token_cbor,
-            token_credits as i64,
-            0,
-            now,
+            &db::PreIssuanceRecord {
+                id: &pre_credential_id,
+                issuer_key_id: &key.listed.id,
+                data: &pre_issuance_cbor,
+                credits,
+                idempotency_key: &idempotency_key,
+                issuance_request: &request_cbor,
+                account_id,
+                created_at: now,
+            },
         )
         .await?;
 
-        // Allocation moves credits from the account balance into a credential:
-        // both the wallet and account domains changed.
-        self.bus.emit(Change::Wallet);
-        self.bus.emit(Change::Account);
+        let pending = PendingIssuanceRef {
+            id: &pre_credential_id,
+            issuer_key_id: &key.listed.id,
+            pre_issuance: Box::new(pre_issuance),
+            issuance_request: Box::new(issuance_request),
+            request_cbor: &request_cbor,
+            credits,
+            idempotency_key: &idempotency_key,
+            public_key: &key.public_key,
+            params: &key.params,
+        };
+        let answer = send_issuance(
+            client,
+            base_url,
+            account_id,
+            secret,
+            &pending,
+            self.issuance_request_timeout(),
+            IssuanceAttempt::First,
+        )
+        .await;
+        Box::pin(self.settle_issuance(&db_conn, pending, answer, now)).await
+    }
 
-        Ok(AllocateResult {
-            nonce: nonce_hex,
-            credits: issued.credits,
-            issuer_key_id: issued.issuer_key_id,
-        })
+    /// Act on the server's answer to an issuance request: build and store the
+    /// credential from a response, or abandon the pre-credential when the
+    /// answer means nothing was debited for it. A response that was debited
+    /// but does not verify is abandoned too — a retry would only be answered
+    /// with the same stored response.
+    async fn settle_issuance(
+        &self,
+        db_conn: &turso::Connection,
+        pending: PendingIssuanceRef<'_>,
+        answer: IssuanceAnswer,
+        now: i64,
+    ) -> Result<AllocateResult, AppError> {
+        let issued = match answer {
+            IssuanceAnswer::Issued(issued) => issued,
+            IssuanceAnswer::Refused(e) => {
+                db::abandon_pre_credential_issuance(db_conn, pending.id, now_ms()).await?;
+                return Err(e);
+            }
+            IssuanceAnswer::Unknown(e) => return Err(e),
+        };
+        match complete_issuance(db_conn, &pending, &issued, now).await {
+            Ok(result) => {
+                // Allocation moves credits from the account balance into a
+                // credential: both the wallet and account domains changed.
+                self.bus.emit(Change::Wallet);
+                self.bus.emit(Change::Account);
+                Ok(result)
+            }
+            Err(e @ AppError::Credential { .. }) => {
+                db::abandon_pre_credential_issuance(db_conn, pending.id, now_ms()).await?;
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Ask again for every issuance whose response never landed, and store the
+    /// credentials the server answers with. The caller holds
+    /// [`Inner::issuance_gate`], so no issuance of this process's is in flight;
+    /// a row younger than [`ISSUANCE_SETTLE_AGE`] is still left alone, so an
+    /// original attempt the server may still be processing is never raced by
+    /// its retry. Only the account each row was sent for is asked. With
+    /// nothing pending, nothing is sent. Returns the recovered nonces.
+    async fn recover_pending_issuances_locked(&self) -> Result<Vec<String>, AppError> {
+        let cfg = self.load_config();
+        let Ok((account_id, secret)) = self.require_credentials(&cfg) else {
+            return Ok(Vec::new());
+        };
+        let db_conn = self.db_conn().await?;
+        let now = now_ms();
+        let settle_ms = self.issuance_settle_age_ms();
+        let rows: Vec<db::PendingIssuance> = db::list_pending_issuances(&db_conn, now)
+            .await?
+            .into_iter()
+            .filter(|r| r.account_id == account_id && r.created_at <= now - settle_ms)
+            .collect();
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let eidola = self.eidola_resolved().await?;
+        let client = self.build_client(&eidola, None).await?;
+        let params = params_from_domain_separator(cfg.domain_separator())?;
+        let mut recovered = Vec::new();
+        for row in rows {
+            let Ok(idempotency_key) = <[u8; 32]>::try_from(row.idempotency_key.as_slice()) else {
+                continue;
+            };
+            let (Ok(pre_issuance), Ok(issuance_request), Ok(public_key)) = (
+                PreIssuance::from_cbor(&row.data),
+                anonymous_credit_tokens::IssuanceRequest::from_cbor(&row.issuance_request),
+                PublicKey::from_cbor(&row.public_key_data),
+            ) else {
+                continue;
+            };
+            let pending = PendingIssuanceRef {
+                id: &row.id,
+                issuer_key_id: &row.issuer_key_id,
+                pre_issuance: Box::new(pre_issuance),
+                issuance_request: Box::new(issuance_request),
+                request_cbor: &row.issuance_request,
+                credits: row.credits,
+                idempotency_key: &idempotency_key,
+                public_key: &public_key,
+                params: &params,
+            };
+            let answer = send_issuance(
+                &client,
+                &eidola.base_url,
+                account_id,
+                secret,
+                &pending,
+                self.issuance_request_timeout(),
+                IssuanceAttempt::Retry,
+            )
+            .await;
+            if let Ok(result) = Box::pin(self.settle_issuance(&db_conn, pending, answer, now)).await
+            {
+                recovered.push(result.nonce);
+            }
+        }
+        Ok(recovered)
+    }
+
+    /// One pass of the **ahead-of-need provisioner** (see
+    /// [`AppCore::start_credential_provisioner`]): recover any issuance whose
+    /// response was lost, then decide whether to issue credentials of the
+    /// standard size now: enough to bring the account to
+    /// [`PROVISION_CREDENTIALS_PER_KEY`] issuances under the current key, or
+    /// one more once it has them. Every rule here is a public constant or a fact about
+    /// the wallet; nothing about a request that is about to be made enters it.
+    async fn provision_once(&self) -> Result<ProvisionOutcome, AppError> {
+        let _issuing = self
+            .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
+            .await?;
+        // A disabled backend is asked for nothing, not even a recovery: the
+        // reader has turned the service off, and nothing unattended converts
+        // balance for it.
+        if !self.eidola_enabled().await? {
+            return Ok(ProvisionOutcome::BackendDisabled);
+        }
+        let cfg = self.load_config();
+        let Ok((account_id, _)) = self.require_credentials(&cfg) else {
+            return Ok(ProvisionOutcome::NoAccount);
+        };
+        let _ = Box::pin(self.recover_pending_issuances_locked()).await;
+
+        let db_conn = self.db_conn().await?;
+        let now = now_ms();
+        let horizon_until = now.saturating_add(duration_ms(PROVISION_HORIZON));
+        // An issuance whose response was lost may already have been paid for,
+        // so it counts toward the buffer — and while one is unresolved nothing
+        // new is issued beside it, retry hold-off included. Otherwise every
+        // pass whose recovery failed would convert another allocation, and
+        // what is held would no longer be bounded by the threshold plus
+        // [`PROVISION_CREDENTIALS_PER_KEY`] allocations.
+        let pending: Vec<db::PendingIssuance> = db::list_pending_issuances(&db_conn, now)
+            .await?
+            .into_iter()
+            .filter(|r| r.account_id == account_id)
+            .collect();
+        let held = db::spendable_credits_until(&db_conn, now, horizon_until)
+            .await?
+            .saturating_add(pending.iter().map(|r| r.credits).sum::<i64>());
+        // A pair left unfinished under the current key (its second issuance
+        // never made, say because the first one's response was lost and only
+        // recovered on a later pass) is finished even when the buffer is
+        // covered, so the account still ends up with two issuances under the
+        // key. Only while one more allocation keeps what is held within the
+        // threshold plus two.
+        let eidola = self.eidola_resolved().await?;
+        let unfinished_pair = match u64::try_from(now.div_euclid(1000))
+            .ok()
+            .and_then(|secs| self.issuer_calendar().epoch_at(secs))
+        {
+            Some(epoch) => match db::issuer_key_for_epoch(&db_conn, &eidola.base_url, epoch).await?
+            {
+                Some(key_id) => {
+                    let issued = db::issuances_under_key(&db_conn, account_id, &key_id).await?;
+                    (1..PROVISION_CREDENTIALS_PER_KEY).contains(&issued)
+                }
+                None => false,
+            },
+            None => false,
+        };
+        if held >= PROVISION_THRESHOLD_CREDITS
+            && !(unfinished_pair && held < PROVISION_THRESHOLD_CREDITS + DEFAULT_ALLOCATION_CREDITS)
+        {
+            return Ok(ProvisionOutcome::Covered);
+        }
+        if !pending.is_empty() {
+            return Ok(ProvisionOutcome::Unresolved);
+        }
+        // A wallet that has not spent lately keeps no buffer: a credential
+        // issued for it would most likely lapse unspent.
+        let active_since = now.saturating_sub(duration_ms(PROVISION_ACTIVITY_WINDOW));
+        if !db::last_spend_at(&db_conn)
+            .await?
+            .is_some_and(|at| at >= active_since)
+        {
+            return Ok(ProvisionOutcome::Idle);
+        }
+
+        let client = self.build_client(&eidola, None).await?;
+        let key = current_issuer_key(
+            &client,
+            &eidola.base_url,
+            cfg.domain_separator(),
+            self.issuance_request_timeout(),
+            &self.issuer_calendar(),
+            &self.db_conn().await?,
+        )
+        .await?;
+        // A credential that would not count toward the buffer once issued is
+        // never issued for it — under a key that lapses within the horizon it
+        // could not carry the days ahead, and would leave the next pass just
+        // as short.
+        if key.deadlines.spend_until <= horizon_until {
+            return Ok(ProvisionOutcome::NoUsableKey);
+        }
+        // Prefer a key's early life: late in its issuing window, while what is
+        // held still covers the next while, wait for the next key, whose
+        // credentials live a full epoch longer.
+        let issue_until = iso_to_ms(&key.listed.issue_until)?;
+        if issue_until.saturating_sub(now) < duration_ms(PROVISION_LATE_WINDOW)
+            && held >= PROVISION_DEFER_FLOOR_CREDITS
+        {
+            return Ok(ProvisionOutcome::Deferred);
+        }
+        // Background issuance is always the standard size. A balance that
+        // cannot cover it is left for the just-in-time path to convert when a
+        // request needs it.
+        let balances = self.account_balances_bounded().await?;
+        if balances.available < DEFAULT_ALLOCATION_CREDITS {
+            return Ok(ProvisionOutcome::LowBalance);
+        }
+        // Two issuances under each key this account provisions under, so a
+        // request draining one credential and filling from another under the
+        // key is placed among every provisioning account, not the heavy users
+        // ([`PROVISION_CREDENTIALS_PER_KEY`]). Issuances this account already
+        // has under the key, just-in-time and unresolved ones included, count.
+        let already = db::issuances_under_key(&db_conn, account_id, &key.listed.id).await?;
+        let wanted = (PROVISION_CREDENTIALS_PER_KEY - already)
+            .max(1)
+            .min(balances.available / DEFAULT_ALLOCATION_CREDITS);
+        let mut nonces = Vec::new();
+        for _ in 0..wanted {
+            match Box::pin(self.allocate_with_key(
+                &cfg,
+                &client,
+                &eidola.base_url,
+                &key,
+                DEFAULT_ALLOCATION_CREDITS,
+            ))
+            .await
+            {
+                Ok(issued) => nonces.push(issued.nonce),
+                // The first issuance's error is the pass's; a later one's
+                // leaves what was issued standing (a lost response stays
+                // pending, to be asked for again).
+                Err(e) if nonces.is_empty() => return Err(e),
+                Err(e) => {
+                    eprintln!("warning: a background issuance did not complete: {e}");
+                    break;
+                }
+            }
+        }
+        Ok(ProvisionOutcome::Issued { nonces })
     }
 
     async fn wallet_credentials(&self) -> Result<Vec<CredentialInfo>, AppError> {
@@ -2819,22 +4452,59 @@ impl Inner {
             .collect())
     }
 
-    async fn recover_spending_credentials(&self) -> Result<Vec<String>, AppError> {
+    /// Ask the gateway again for the refund of every **stranded hold**: a
+    /// credential left `spending` that no turn in this process is flying with
+    /// ([`LiveSpends`]). Each is an unlinked `POST /v1/credentials/refund`,
+    /// named by the spend alone; nothing here is account-authenticated, and
+    /// nothing account-authenticated is sent beside it. A hold whose request
+    /// the gateway is still serving answers provisionally and stays
+    /// `spending` for a later ask ([`recover_refund`]). With nothing
+    /// stranded, nothing is sent. Returns the nonces settled.
+    ///
+    /// Who asks, and when: a turn for its own hold as it ends
+    /// ([`TurnPrep::try_refund_recovery`]); a request the wallet cannot pay,
+    /// before it converts or fails ([`Inner::ensure_spend_inputs`]); the
+    /// long-lived process at random times
+    /// ([`AppCore::start_credential_provisioner`]); and the reader, through
+    /// [`AppCore::recover_spending_credentials`].
+    async fn recover_stranded_spends(&self) -> Result<Vec<String>, AppError> {
+        let _recovering = self.spend_recovery_gate.lock().await;
+        let db_conn = self.db_conn().await?;
+        let rows = db::list_spending_credentials(&db_conn).await?;
+
+        // **A hold a request is still flying with is not a stranded hold.**
+        // Recovery asks the server to refund a spend it has no record of, and
+        // the server takes an unrecorded nullifier as proof the request never
+        // arrived: it records it and refunds. Do that to a turn that is about
+        // to arrive and the turn's own request is then refused as a replay —
+        // the answer lost, and lost *because* somebody asked for their money
+        // back on its behalf. Read after the rows: a spend claims its place
+        // here before its row is written.
+        let live = self
+            .live_spends
+            .lock()
+            .expect("live spends lock poisoned")
+            .clone();
+        let rows: Vec<db::SpendingCredentialRow> = rows
+            .into_iter()
+            .filter(|row| !live.contains(&row.pre_credential_id))
+            .collect();
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let cfg = self.load_config();
         let eidola = self.eidola_resolved().await?;
         let base_url = eidola.base_url.as_str();
         let client = self.build_client(&eidola, None).await?;
-        let db_conn = self.db_conn().await?;
         let params = params_from_domain_separator(cfg.domain_separator())?;
         let now = now_ms();
-
-        let rows = db::list_spending_credentials(&db_conn).await?;
         let mut recovered = Vec::new();
 
         for row in rows {
             let spend_proof_cbor = row.spend_proof_data;
 
-            let spend_proof = match SpendProof::<128>::from_cbor(&spend_proof_cbor) {
+            let spend_proof = match SpendProof::<ACT_L>::from_cbor(&spend_proof_cbor) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
@@ -2852,17 +4522,15 @@ impl Inner {
                 Err(_) => continue,
             };
 
-            // Reconstruct the PrivateToken auth header
-            let challenge_digest = compute_challenge_digest();
-            let mut token_bytes = Vec::new();
-            token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
-            token_bytes.extend_from_slice(&challenge_digest);
-            token_bytes.extend_from_slice(&issuer_key_hash);
-            token_bytes.extend_from_slice(&spend_proof_cbor);
-            let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
-            let auth_value = format!("PrivateToken token=\"{token_b64}\"");
-
-            if let Ok(refund_obj) = recover_refund(&client, base_url, &auth_value).await
+            // The spend exactly as it was presented.
+            let presented =
+                PresentedSpend::new(&issuer_key_hash, &spend_proof_cbor, &row.pre_refund_data);
+            let answer = tokio::time::timeout(
+                SPEND_RECOVERY_REQUEST_TIMEOUT,
+                recover_refund(&client, base_url, &presented, Some(row.spend_until)),
+            )
+            .await;
+            if let Ok(Ok(refund_obj)) = answer
                 && process_refund(
                     &refund_obj,
                     &params,
@@ -2877,28 +4545,113 @@ impl Inner {
                 .await
                 .is_ok()
             {
+                // Each successor is durable at its own write.
+                self.bus.emit(Change::Wallet);
                 recovered.push(row.nonce);
             }
-        }
-
-        if !recovered.is_empty() {
-            self.bus.emit(Change::Wallet);
         }
 
         Ok(recovered)
     }
 
+    /// [`Inner::recover_stranded_spends`] for the unattended loop: nothing is
+    /// sent for a backend the reader has turned off.
+    async fn sweep_stranded_spends(&self) -> Result<Vec<String>, AppError> {
+        if !self.eidola_enabled().await? {
+            return Ok(Vec::new());
+        }
+        self.recover_stranded_spends().await
+    }
+
+    /// Ask again for every issuance of this account whose response never
+    /// landed: the explicit door to
+    /// [`Inner::recover_pending_issuances_locked`], for a process with no
+    /// provisioner. Account-authenticated, so it is never run beside a spend
+    /// or its recovery except on the reader's own instruction.
+    async fn recover_pending_issuances(&self) -> Result<IssuanceRecovery, AppError> {
+        let _issuing = self
+            .lock_issuance_gate(tokio::time::Instant::now() + self.provision_wait())
+            .await?;
+        let recovered = Box::pin(self.recover_pending_issuances_locked()).await?;
+        let (waiting, unresolved) = self.pending_issuance_counts().await?;
+        Ok(IssuanceRecovery {
+            recovered,
+            waiting,
+            unresolved,
+        })
+    }
+
+    /// This account's pending issuances at this instant: how many are too
+    /// young to be asked for again ([`ISSUANCE_SETTLE_AGE`]), and how many
+    /// are old enough and still unanswered.
+    async fn pending_issuance_counts(&self) -> Result<(usize, usize), AppError> {
+        let cfg = self.load_config();
+        let Ok((account_id, _)) = self.require_credentials(&cfg) else {
+            return Ok((0, 0));
+        };
+        let db_conn = self.db_conn().await?;
+        let now = now_ms();
+        let settled_before = now.saturating_sub(self.issuance_settle_age_ms());
+        let (mut waiting, mut unresolved) = (0, 0);
+        for row in db::list_pending_issuances(&db_conn, now).await? {
+            if row.account_id != account_id {
+                continue;
+            }
+            if row.created_at > settled_before {
+                waiting += 1;
+            } else {
+                unresolved += 1;
+            }
+        }
+        Ok((waiting, unresolved))
+    }
+
+    /// Before a conversion the reader asked for: ask again for
+    /// this account's pending issuances, and refuse to convert beside one
+    /// that stays unresolved. A pending issuance may already have been paid
+    /// for, and each is asked for again until it is answered, so converting
+    /// beside it would debit once per attempt. The caller holds
+    /// [`Inner::issuance_gate`]. Returns the nonces recovered.
+    async fn resolve_pending_issuances_locked(&self) -> Result<Vec<String>, AppError> {
+        let recovered = Box::pin(self.recover_pending_issuances_locked()).await?;
+        if !recovered.is_empty() {
+            return Ok(recovered);
+        }
+        let (waiting, unresolved) = self.pending_issuance_counts().await?;
+        if waiting + unresolved > 0 {
+            return Err(AppError::ProvisioningTimeout {
+                message: "an earlier credit conversion has not been answered yet, and it is                           asked for again before another is made; try again in a few minutes"
+                    .into(),
+            });
+        }
+        Ok(recovered)
+    }
+
     async fn available_models(&self) -> Result<Vec<ModelInfo>, AppError> {
         let eidola = self.eidola_resolved().await?;
-        let client = self.build_client(&eidola, None).await?;
+        self.eidola_models(&eidola).await
+    }
+
+    /// The catalog of exactly the Eidola configuration handed in — the
+    /// row-honouring half of [`Self::available_models`], for a caller that
+    /// authorized a specific row and must not read the id again.
+    async fn eidola_models(&self, eidola: &EidolaResolved) -> Result<Vec<ModelInfo>, AppError> {
+        let client = self.build_client(eidola, None).await?;
 
         let models = fetch_models(&client, &eidola.base_url).await?;
         Ok(models
             .data
             .into_iter()
             .map(|m| ModelInfo {
-                id: m.id,
+                sha256: m
+                    .sha256
+                    .clone()
+                    .filter(|h| eidola_common::model_reference::is_digest_hex(h)),
+                tags: m.tags.clone(),
                 context_length: m.context_length,
+                max_output_tokens: m.max_output_tokens,
+                output_budget_class: m.declared_budget_class(),
+                capabilities: m.declared_capabilities(),
                 prompt_credits_per_token: m.pricing.per_prompt_token.credits_per_unit(),
                 completion_credits_per_token: m.pricing.per_completion_token.credits_per_unit(),
                 request_credits: m
@@ -2906,6 +4659,7 @@ impl Inner {
                     .per_request
                     .as_ref()
                     .map(ScaledPriceInfo::credits_per_unit),
+                id: m.id,
             })
             .collect())
     }
@@ -2927,6 +4681,10 @@ impl Inner {
                 last_activity_at: r.last_activity_at,
                 message_count: r.message_count,
                 archived_at: r.archived_at,
+                parent: r.parent.map(|p| SpaceParent {
+                    space_id: p.space_id,
+                    title: p.title,
+                }),
             });
         }
         Ok(spaces)
@@ -2955,7 +4713,18 @@ impl Inner {
                 message: format!("space not found: {space_id}"),
             })?;
         let data = db::get_space_tree_data(&db_conn, space_id).await?;
-        Ok(build_post_tree(data))
+        let mut tree = build_post_tree(data);
+        // `continuable` as the door decides it: the tree's own rows say which
+        // posts are candidates (truncated answers from Eidola's models), and
+        // the door's predicate settles each — its author still answering here
+        // with that model, its request in the Record whole. Only candidates are
+        // asked, so a tree with no cut-off answer reads nothing more.
+        for node in tree.iter_mut().filter(|n| n.continuable) {
+            node.continuable = continuation_basis(&db_conn, space_id, &node.action_id)
+                .await?
+                .is_some();
+        }
+        Ok(tree)
     }
 
     /// [`Self::references_to`], filtered to the referring posts
@@ -3005,6 +4774,10 @@ impl Inner {
                 range_end: r.range_end,
                 annotation: r.annotation,
                 created_at: r.created_at,
+                author_label: r.author_label,
+                author_kind: r.author_kind,
+                space_title: r.space_title,
+                item_id: r.item_id,
             });
         }
         Ok(out)
@@ -3032,6 +4805,10 @@ impl Inner {
                 range_end: r.range_end,
                 annotation: r.annotation,
                 created_at: r.created_at,
+                author_label: r.author_label,
+                author_kind: r.author_kind,
+                space_title: r.space_title,
+                item_id: r.item_id,
             })
             .collect())
     }
@@ -3607,6 +5384,107 @@ impl Inner {
 
     // --- Participant CRUD (per-space) -----------------------------------
 
+    /// The participant `participant_id` of `space_id` and its current model
+    /// notices, or [`AppError::ModelNoticeStale`] when it is not a member.
+    async fn participant_with_notices(
+        &self,
+        space_id: &str,
+        participant_id: &str,
+    ) -> Result<ParticipantInfo, AppError> {
+        self.list_space_participants(space_id)
+            .await?
+            .into_iter()
+            .find(|p| p.id == participant_id)
+            .ok_or_else(|| AppError::ModelNoticeStale {
+                participant_id: participant_id.to_string(),
+            })
+    }
+
+    async fn switch_to_newer_weights(
+        &self,
+        space_id: &str,
+        participant_id: &str,
+    ) -> Result<String, AppError> {
+        let participant = self
+            .participant_with_notices(space_id, participant_id)
+            .await?;
+        let stale = || AppError::ModelNoticeStale {
+            participant_id: participant_id.to_string(),
+        };
+        let pin = model_catalog::newer_pin(&participant.model_notices).ok_or_else(stale)?;
+        let selection = backends::qualified_model_id(&pin, backends::EIDOLA_BACKEND_ID);
+        // The notice was read from the model the participant had then; the
+        // write is conditioned on that model still being there, in its own
+        // statement, so a choice made elsewhere since is never overwritten
+        // by a notice that no longer applies.
+        let conn = self.db_conn().await?;
+        let changed = if participant.source == "referenced" {
+            db::update_space_participant_override_if(
+                &conn,
+                space_id,
+                participant_id,
+                None,
+                Some(Some(&selection)),
+                None,
+                None,
+                Some(participant.model_ref.as_deref()),
+                now_ms(),
+            )
+            .await?
+        } else {
+            let mut persona = validate_persona(
+                &ParticipantUpdate {
+                    label: None,
+                    model_ref: Some(Some(selection.clone())),
+                    system_prompt: None,
+                    notify_policy: None,
+                },
+                ExpectedScope::SpaceOwned {
+                    space_id: space_id.to_string(),
+                },
+            )?;
+            persona.model_premise = Some(participant.model_ref.clone());
+            persona.apply(&conn, participant_id, now_ms()).await?
+        };
+        if !changed {
+            return Err(stale());
+        }
+        // The schema's trigger forgot this lineage's key in the write's own
+        // statement; empty the log of its history too.
+        db::truncate_log_after_forgetting_keys(&conn).await;
+        self.bus.emit(Change::Participants);
+        Ok(selection)
+    }
+
+    async fn dismiss_model_update(
+        &self,
+        space_id: &str,
+        participant_id: &str,
+    ) -> Result<(), AppError> {
+        let participant = self
+            .participant_with_notices(space_id, participant_id)
+            .await?;
+        let stale = || AppError::ModelNoticeStale {
+            participant_id: participant_id.to_string(),
+        };
+        let sha256 = model_catalog::updated_to(&participant.model_notices).ok_or_else(stale)?;
+        let selection = participant.model_ref.as_deref().ok_or_else(stale)?;
+        let mref = backends::parse_model_ref(selection);
+        let canonical = backends::qualified_model_id(&mref.model, &mref.backend_id);
+        let conn = self.db_conn().await?;
+        db::acknowledge_model_update(
+            &conn,
+            space_id,
+            participant_id,
+            &canonical,
+            sha256,
+            now_ms(),
+        )
+        .await?;
+        self.bus.emit(Change::Participants);
+        Ok(())
+    }
+
     async fn list_space_participants(
         &self,
         space_id: &str,
@@ -3619,6 +5497,14 @@ impl Inner {
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let mut info = ParticipantInfo::from_effective(r);
+            info.model_notices = model_notices_for(
+                &conn,
+                space_id,
+                &info.id,
+                info.model_ref.as_deref(),
+                self.catalog(),
+            )
+            .await?;
             if info.source == "referenced"
                 && let Some(base) = db::get_participant(&conn, &info.id).await?
             {
@@ -3685,6 +5571,11 @@ impl Inner {
         )
         .await?;
         if changed {
+            if ov.model_ref.is_some() {
+                // The schema's trigger forgot this lineage's key in the
+                // write's own statement; empty the log of its history too.
+                db::truncate_log_after_forgetting_keys(&conn).await;
+            }
             self.bus.emit(Change::Participants);
             return Ok(());
         }
@@ -3735,15 +5626,22 @@ impl Inner {
     /// conversation they never joined. Oversight is looking; this is the line
     /// it stops at.
     ///
-    /// **Every door that acts *as the human* asks this**, and that is exactly
-    /// the set: `post` (and `chat`/`chat_stream`/`submit` through it), which
-    /// hard-codes the human as author, and `edit_post`, `regenerate` and
+    /// **Every door that acts *as the human* on something already here asks
+    /// this**, and that is exactly the set: `edit_post`, `regenerate` and
     /// `respond_stream`, which the human's own picker and per-post verbs drive.
-    /// `respond_stream_as` deliberately does **not** — it names the participant
-    /// it acts as, is already gated on *that* participant's membership
-    /// (`resolve_explicit_participant`), and is the door a turn driver uses, so
-    /// a human-membership test there would refuse the sub-space's own agents
-    /// working in their own room.
+    /// `post` is the one that is not gated but *satisfies* the rule instead —
+    /// speaking is how a reader joins, and the join rides the post's own
+    /// transaction (`db::PostPlan::join_author`), so the roster is true of the
+    /// transcript from that post onward rather than from a separate step
+    /// somebody has to take first. The distinction is not a softening: the
+    /// three doors that remain are the ones that act on *another* participant's
+    /// work or spend the reader's credits, and none of them is a way to say
+    /// something.
+    /// `respond_stream_as` deliberately does **not** ask — it names the
+    /// participant it acts as, is already gated on *that* participant's
+    /// membership (`resolve_explicit_participant`), and is the door a turn
+    /// driver uses, so a human-membership test there would refuse the
+    /// sub-space's own agents working in their own room.
     ///
     /// Asked before any write and before any spend, so a refusal is zero-trace.
     /// A **notebook** is deliberately untouched — the human has always been
@@ -3765,10 +5663,17 @@ impl Inner {
     }
 
     /// Combined post-and-turn (`chat` / `chat_stream`) is a cascade, and a
-    /// live sub-space's cascade belongs to the driver. Membership is asked
-    /// first so an unjoined reader still sees [`AppError::NotJoined`]; a
-    /// joined one is refused here before any write, rather than posting and
-    /// then driving the same notify-all seat the driver's arm will take.
+    /// live sub-space's cascade belongs to the driver. Refused here before any
+    /// write, rather than posting and then driving the same notify-all seat the
+    /// driver's arm will take.
+    ///
+    /// **The refusal is the same whoever asks.** It used to ask membership
+    /// first, so an unjoined reader read [`AppError::NotJoined`] — the honest
+    /// answer while posting meant joining first. Now that posting *is* joining,
+    /// a membership question in front of this one would demand a step for a
+    /// verb that is refused either way, and would name the wrong obstacle:
+    /// what stands in the way is the driver, not the roster. `post` remains,
+    /// and takes the reader in with it.
     async fn refuse_combined_ask_in_subspace(
         &self,
         space_id: Option<&str>,
@@ -3778,7 +5683,6 @@ impl Inner {
         };
         let conn = self.db_conn().await?;
         if db::is_live_subspace(&conn, space_id).await? {
-            self.require_human_joined(&conn, space_id).await?;
             return Err(AppError::DrivenConversation {
                 space_id: space_id.to_string(),
             });
@@ -3873,6 +5777,11 @@ impl Inner {
         let persona = validate_persona(&update, expected)?;
         let conn = self.db_conn().await?;
         if persona.apply(&conn, participant_id, now_ms()).await? {
+            if update.model_ref.is_some() {
+                // The schema's trigger forgot the participant's keys in the
+                // write's own statement; empty the log of their history too.
+                db::truncate_log_after_forgetting_keys(&conn).await;
+            }
             self.bus.emit(Change::Participants);
             return Ok(());
         }
@@ -4816,6 +6725,10 @@ impl Inner {
             last_activity_at: now,
             message_count: 0,
             archived_at: None,
+            // Every creation door here mints an ordinary conversation; the one
+            // that mints a delegated room is `spawn_subspace`, which answers
+            // with a `SubspaceInfo` of its own.
+            parent: None,
         })
     }
 
@@ -4848,6 +6761,10 @@ impl Inner {
             last_activity_at: now,
             message_count: 0,
             archived_at: None,
+            // Every creation door here mints an ordinary conversation; the one
+            // that mints a delegated room is `spawn_subspace`, which answers
+            // with a `SubspaceInfo` of its own.
+            parent: None,
         })
     }
 
@@ -4969,22 +6886,32 @@ impl Inner {
                 .await?;
         }
 
-        let (space_id, space_title, is_new_space) = if let Some(sid) = space_id {
+        // **Speaking in a delegated room joins you to it.** Those rooms have no
+        // human member by construction, and a post by somebody the roster omits
+        // makes that roster a lie to every model in the room — so the join is
+        // part of the post rather than a step in front of it (`PostPlan::
+        // join_author`, written in the post's own transaction). Reading it here
+        // races nothing: `parent_space_id` is written once, at creation, and
+        // there is no door that makes an ordinary conversation into a delegated
+        // one — the same fact the driver's negative cache rests on. The
+        // *membership* is deliberately **not** read here; the insert-or-revive
+        // decides that inside the transaction.
+        let (space_id, space_title, is_new_space, join_author) = if let Some(sid) = space_id {
             let row =
                 db::get_space(&db_conn, sid)
                     .await?
                     .ok_or_else(|| AppError::NotConfigured {
                         message: format!("space not found: {sid}"),
                     })?;
-            self.require_human_joined(&db_conn, sid).await?;
-            (sid.to_string(), row.title, false)
+            let subspace = db::subspace(&db_conn, sid).await?.is_some();
+            (sid.to_string(), row.title, false, subspace)
         } else {
             // A new space is instantiated from the default template, so it has
             // its participants (You + the template agents) from birth.
             let sid = new_space_id();
             self.instantiate_default_space(&db_conn, &sid, None, now)
                 .await?;
-            (sid, None, true)
+            (sid, None, true, false)
         };
 
         // No prior terminal action ⇒ this is the space's first post: eligible
@@ -5017,7 +6944,10 @@ impl Inner {
         // and billing a turn against an empty post. See `db::post_tx`. The
         // validations above stay in front of it, where a refusal belongs: they
         // are reads, and now they leave neither a trace nor a fragment.
-        let auto_titled = db::post_tx(
+        let db::PostOutcome {
+            auto_titled,
+            joined,
+        } = db::post_tx(
             &db_conn,
             &db::PostPlan {
                 space_id: &space_id,
@@ -5028,6 +6958,7 @@ impl Inner {
                 auto_title: auto_title.as_deref(),
                 reply_to: reply_ante.as_deref(),
                 references,
+                join_author,
                 created_at: now,
             },
         )
@@ -5036,6 +6967,12 @@ impl Inner {
         self.bus.emit(Change::Space(space_id.clone()));
         if is_new_space || auto_titled {
             self.bus.emit(Change::SpaceIndex);
+        }
+        // A roster changed, so every surface that renders one has to re-read.
+        // Only when the join actually wrote: saying it on every post into a
+        // room the reader is already in would be an invalidation about nothing.
+        if joined {
+            self.bus.emit(Change::Participants);
         }
         // The post is committed and emitted; anything a grown branch needs
         // summarized happens behind it, never in front of it.
@@ -5175,120 +7112,297 @@ impl Inner {
         })
     }
 
-    /// Find a credential that can cover `charge_credits`, auto-provisioning
-    /// one from the account balance when none exists — the pooled body of the
-    /// **ACT provisioning queue**.
+    /// Choose the credentials that pay for a request whose worst case is
+    /// `charge_credits`, by the input rule ([`choose_inputs`]), provisioning
+    /// one from the account balance when the wallet cannot cover it — the
+    /// pooled body of the **ACT provisioning queue**. Returns each input and
+    /// its share, in presentation order: one credential with the whole hold,
+    /// or a drain (its whole balance) and a fill (the rest).
     ///
     /// **The caller must hold [`Inner::spend_gate`]** across this call *and* the
-    /// spend-proof + `insert_pre_credential_refund` that follow, so the whole
+    /// spend proofs + `insert_spend_inputs` that follow, so the whole
     /// acquire→spend→flip-to-`spending` step is atomic per wallet. Two
     /// concurrent turns therefore never both grab the same active credential:
-    /// the first flips it to `spending` inside the lock; the second, entering
-    /// next, no longer sees it as spendable.
+    /// the first flips its inputs to `spending` inside the lock; the second,
+    /// entering next, no longer sees them as spendable.
     ///
     /// Resolution order (retried in a bounded loop):
-    /// 1. An active local credential with enough credits → use it.
-    /// 2. No usable credential and no account configured →
+    /// 1. The wallet covers the hold, alone or as a drain and a fill → use it.
+    /// 2. The hold is past [`largest_payable_hold`] — more than any two of the
+    ///    wallet's credentials, held or in flight, or the largest of them
+    ///    beside one fresh denomination, can pay → refused with
+    ///    [`AppError::HoldExceedsDenomination`] before anything else: no
+    ///    recovery, no balance read, no issuance, no credential touched.
+    ///    Nothing is ever issued sized to the request.
+    /// 3. Otherwise `need` is what is missing: the whole hold, or the hold
+    ///    less the largest credential's balance, which a new credential
+    ///    filling beside its drain must cover. A stranded hold is asked for
+    ///    first
+    ///    ([`Inner::recover_stranded_spends`], unlinked), and once more
+    ///    during any wait below. No account configured →
     ///    [`AppError::NoAccount`] (the UI routes to account creation).
-    /// 3. Account exists and the available balance covers a fresh allocation →
-    ///    allocate `min(available, max(DEFAULT_ALLOCATION_CREDITS, charge))`
-    ///    (the pool) and retry.
-    /// 4. Balance can't cover another allocation but a mid-spend credential
-    ///    whose own `credits` cover the charge exists (a concurrent turn holds
-    ///    usable coverage) → wait bounded for its refund recovery to write a
-    ///    successor, then retry. A mid-spend credential *smaller* than the
-    ///    charge is ignored — its refund can never yield a covering successor
-    ///    (a successor is worth at most the original face value) and refunds
-    ///    don't top up balance, so waiting on it is futile.
-    /// 5. Bounded wait elapses with a covering credential still in flight →
+    /// 4. An issuance of the account's is pending → nothing is converted, and
+    ///    nothing is sent to the account surface: the pending issuance is
+    ///    never asked for again from here (that is the provisioner's pass and
+    ///    the explicit doors'), and the request waits as in 5 with nothing
+    ///    convertible; when the wait cannot help,
+    ///    [`AppError::ProvisioningTimeout`]. Otherwise, when the amount a
+    ///    just-in-time issuance converts ([`auto_allocation_amount`]: the
+    ///    denomination, or the whole available balance when less) covers
+    ///    `need` → issue exactly that amount and choose again: the new
+    ///    credential is the fill, or the whole.
+    /// 5. No issuance covers it but a mid-spend credential could pay, alone
+    ///    or as one of two inputs ([`settlement_could_cover`]; a concurrent
+    ///    turn holds usable coverage) → wait bounded for its refund to write
+    ///    a successor, then retry. A mid-spend credential that could not is
+    ///    ignored — a successor is worth at most the original face value, and
+    ///    refunds don't top up balance, so waiting on it is futile.
+    /// 6. Bounded wait elapses with a covering credential still in flight →
     ///    [`AppError::ProvisioningTimeout`]; no covering credential in flight
     ///    (true shortfall) → [`AppError::InsufficientBalance`] *immediately*.
-    async fn ensure_spendable_credential(
+    ///
+    /// Under [`Funding::HeldOnly`] (the resend of a refused cached-prefix
+    /// declaration) nothing past the stranded-hold ask of step 3 runs: the
+    /// request waits only for a settlement in flight that could pay it, and
+    /// otherwise fails with [`AppError::UncachedRetryUnfunded`] — nothing is
+    /// converted and nothing is sent to the account surface. Step 2 applies
+    /// to it as to any request, so a hold no later attempt could pay is told
+    /// apart from one an attempt that may convert would.
+    async fn ensure_spend_inputs(
         &self,
         cfg: &Config,
         db_conn: &turso::Connection,
         charge_credits: i64,
-    ) -> Result<db::SpendableCredential, AppError> {
-        let deadline = tokio::time::Instant::now() + PROVISION_WAIT_TIMEOUT;
+        funding: Funding,
+    ) -> Result<Vec<(db::SpendableCredential, i64)>, AppError> {
+        let wait = self.provision_wait();
+        let deadline = tokio::time::Instant::now() + wait;
+        // A hold no turn in this process is flying with settles only when
+        // somebody asks for it: once before anything is converted for this
+        // request, and once more while it waits, with the last quarter of
+        // the wait kept for that ask's answer.
+        let last_ask_at = deadline - wait / 4;
+        let mut stranded_asks = 2;
         loop {
-            if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
-                return Ok(cred);
+            if let Ok(inputs) = chosen_inputs(db_conn, charge_credits).await? {
+                return Ok(inputs);
+            }
+
+            // Past what the wallet and one fresh denomination could ever pay:
+            // refused before a stranded hold is asked for, a balance read or
+            // anything issued, since none of them could make it payable.
+            //
+            // In flight is read first. A settlement is not under
+            // `spend_gate`, so one can land between the two reads; it moves
+            // a credential out of `spending` and writes its successor in one
+            // insert. Read in this order, such a credential is counted in
+            // flight and its successor as held, which can only raise the
+            // bound; read the other way it would be in neither list, and a
+            // payable request would be refused for good.
+            let in_flight: Vec<i64> = db::list_spending_credentials(db_conn)
+                .await?
+                .into_iter()
+                .map(|c| c.credits)
+                .collect();
+            let held: Vec<i64> = db::spendable_credentials(db_conn)
+                .await?
+                .into_iter()
+                .map(|c| c.credits)
+                .collect();
+            if charge_credits > largest_payable_hold(&held, &in_flight) {
+                return Err(AppError::HoldExceedsDenomination {
+                    hold: charge_credits,
+                    denomination: DEFAULT_ALLOCATION_CREDITS,
+                });
+            }
+
+            if stranded_asks == 2 {
+                stranded_asks = 1;
+                if self.recover_stranded_spends_by(deadline).await {
+                    continue;
+                }
+            }
+
+            if funding == Funding::HeldOnly {
+                // Nothing is converted: what the wallet holds pays, or what a
+                // settlement in flight returns to it, or nothing does.
+                let in_flight: Vec<i64> = db::list_spending_credentials(db_conn)
+                    .await?
+                    .into_iter()
+                    .map(|c| c.credits)
+                    .collect();
+                let held: Vec<i64> = db::spendable_credentials(db_conn)
+                    .await?
+                    .into_iter()
+                    .map(|c| c.credits)
+                    .collect();
+                if settlement_could_cover(&in_flight, &held, charge_credits)
+                    && tokio::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
+                    continue;
+                }
+                return match chosen_inputs(db_conn, charge_credits).await? {
+                    Ok(inputs) => Ok(inputs),
+                    Err(_) => Err(AppError::UncachedRetryUnfunded),
+                };
             }
 
             if cfg.account_id.is_none() || cfg.account_secret.is_none() {
                 return Err(AppError::NoAccount);
             }
 
-            let balances = self.account_balances().await?;
-            if balances.available >= charge_credits {
-                // Enough to allocate at least the charge — grow the pool.
-                let amount = auto_allocation_amount(balances.available, charge_credits)?;
-                self.account_allocate(amount).await?;
-                continue;
-            }
+            // The just-in-time fallback. It takes the issuance gate, so it
+            // never converts beside the ahead-of-need provisioner, and looks
+            // again once it has it: a background issuance that landed while it
+            // waited covers this turn without a second conversion.
+            let (convertible, need) = {
+                // Bounded by the queue's own deadline: this wait happens with
+                // `spend_gate` held, so an unbounded one would stall every
+                // paid turn behind it.
+                let _issuing = self.lock_issuance_gate(deadline).await?;
+                let need = match chosen_inputs(db_conn, charge_credits).await? {
+                    Ok(inputs) => return Ok(inputs),
+                    Err(need) => need,
+                };
+                // An issuance still pending may already have been paid for,
+                // so nothing is converted beside it. Nor is it asked for
+                // again from here: that request is account-authenticated,
+                // and this pass may just have asked for a stranded hold. The
+                // request can still be paid by what is in flight.
+                let (waiting, unresolved) = self.pending_issuance_counts().await?;
+                if waiting + unresolved > 0 {
+                    (None, need)
+                } else {
+                    let balances = self.account_balances_bounded().await?;
+                    // The amount is the denomination or the whole balance,
+                    // whatever the request; what is missing decides only
+                    // whether it is issued.
+                    if let Some(amount) = auto_allocation_amount(balances.available, need) {
+                        self.allocate_on_its_own_task(amount).await?;
+                        continue;
+                    }
+                    (Some(balances.available), need)
+                }
+            };
+            // What the account could still be converted into: nothing while
+            // an issuance is pending.
+            let available = convertible.unwrap_or(0);
 
             // Balance can't cover a fresh allocation. Waiting only helps if a
             // concurrent turn holds coverage this turn could actually use once
-            // its refund lands. A refund recovers a *wallet successor* worth at
-            // most the original credential's face value (a full refund on a
-            // failed turn) — it never tops up the account balance, and a spend
-            // consumes one credential (no combining balance + a credential, or
-            // two credentials, to fund one turn). So an in-flight credential can
-            // only become spendable for THIS turn if its own `credits` already
-            // cover the charge; a smaller one — even fully refunded — never
-            // will, and no allocation is possible either. Wait only when such a
-            // credential exists; otherwise this is a true shortfall.
-            let recoverable = db::list_spending_credentials(db_conn)
+            // its refunds land. A refund recovers a *wallet successor* worth at
+            // most the original credential's face value (less the request fee
+            // a refused or failed request is still charged) — it never tops up
+            // the account balance. So waiting
+            // helps only when some in-flight credential, at its face value,
+            // could pay alone or as one of two inputs ([`settlement_could_cover`]),
+            // the other being a held credential or the one a just-in-time
+            // issuance would make from the available balance (the
+            // denomination, or the balance when less; the in-flight
+            // credential drained, the issuance filling the rest); otherwise
+            // this is a true shortfall.
+            let in_flight: Vec<i64> = db::list_spending_credentials(db_conn)
                 .await?
                 .into_iter()
-                .any(|c| c.credits >= charge_credits);
+                .map(|c| c.credits)
+                .collect();
+            let held: Vec<i64> = db::spendable_credentials(db_conn)
+                .await?
+                .into_iter()
+                .map(|c| c.credits)
+                .chain(std::iter::once(
+                    available.clamp(0, DEFAULT_ALLOCATION_CREDITS),
+                ))
+                .collect();
+            let recoverable = settlement_could_cover(&in_flight, &held, charge_credits);
             if recoverable && tokio::time::Instant::now() < deadline {
+                if stranded_asks == 1 && tokio::time::Instant::now() >= last_ask_at {
+                    stranded_asks = 0;
+                    if self.recover_stranded_spends_by(deadline).await {
+                        continue;
+                    }
+                }
                 tokio::time::sleep(PROVISION_POLL_INTERVAL).await;
                 continue;
             }
 
-            // Before any terminal verdict, re-check for a spendable credential.
-            // This closes the split-read window between the top-of-iteration
-            // `find_spendable_credential` and the `list_spending_credentials`
-            // above: a sibling credential can *settle* (spending → spent) in
-            // that gap, and settlement is a single atomic insert that flips the
-            // original out of `spending` AND makes an active successor
-            // queryable at the same instant — so mid-settle both prior reads
-            // are stale (successor not yet active, original no longer spending)
-            // and `recoverable` reads false even though funding just landed.
-            // The re-read observes the successor.
+            // Before any terminal verdict, choose once more. This closes the
+            // split-read window between the top-of-iteration choice and the
+            // `list_spending_credentials` above: a sibling credential can
+            // *settle* (spending → spent) in that gap, and settlement is a
+            // single atomic insert that flips the original out of `spending`
+            // AND makes an active successor queryable at the same instant — so
+            // mid-settle both prior reads are stale (successor not yet active,
+            // original no longer spending) and `recoverable` reads false even
+            // though funding just landed. The re-read observes the successor.
             //
             // This makes the terminal verdict *instant-consistent*. We hold
             // `spend_gate` across this whole function, and the only active →
-            // `spending` flip (`insert_pre_credential_refund`) is under that
-            // same gate, so no credential can enter `spending` while we run:
-            // the covering-`spending` set only shrinks (via settlement) from
-            // the `list_spending` read to this re-read. Hence a terminal
+            // `spending` flip (`insert_spend_inputs`) is under that same gate,
+            // so no credential can enter `spending` while we run: the
+            // covering-`spending` set only shrinks (via settlement) from the
+            // `list_spending` read to this re-read. Hence a terminal
             // `InsufficientBalance`/`ProvisioningTimeout` reflects a real
             // instant with no covering credential in any state — it can NOT be
-            // a false negative from an in-flight sibling refund (the property
-            // the original bug violated). It does NOT promise to see funding
-            // that arrives *after* this re-read from a write exogenous to the
-            // turn machinery (an explicit `account_allocate`, startup
-            // recovery); that is an ordinary post-read TOCTOU no non-serialized
-            // check can exclude, and the recoverable error routes the caller to
-            // retry, which finds it.
-            if let Some(cred) = db::find_spendable_credential(db_conn, charge_credits).await? {
-                return Ok(cred);
+            // a false negative from an in-flight sibling refund. It does NOT
+            // promise to see funding that arrives *after* this re-read from a
+            // write exogenous to the turn machinery (an explicit
+            // `account_allocate`, a recovery outside the turn); that is an ordinary
+            // post-read TOCTOU no non-serialized check can exclude, and the
+            // recoverable error routes the caller to retry, which finds it.
+            //
+            // A sibling that settled in that gap can also have made the missing
+            // amount smaller (its successor is now the drain), so small that
+            // the balance read above covers it: then the allocation decision
+            // is taken again rather than refused on the stale amount.
+            match chosen_inputs(db_conn, charge_credits).await? {
+                Ok(inputs) => return Ok(inputs),
+                Err(missing)
+                    if missing < need && auto_allocation_amount(available, missing).is_some() =>
+                {
+                    continue;
+                }
+                Err(_) => {}
             }
             if recoverable {
                 return Err(AppError::ProvisioningTimeout {
                     message: format!(
                         "timed out waiting for an in-flight credential refund to free \
-                         {charge_credits} credits for this turn"
+                         {need} credits for this turn"
                     ),
                 });
             }
+            let Some(available) = convertible else {
+                return Err(AppError::ProvisioningTimeout {
+                    message: "an earlier credit conversion has not been answered yet, and \
+                              nothing is converted beside it; it is asked for again \
+                              separately, so try again later"
+                        .into(),
+                });
+            };
             return Err(AppError::InsufficientBalance {
-                available: balances.available,
-                required: charge_credits,
+                available,
+                required: need,
             });
         }
+    }
+
+    /// [`Inner::recover_stranded_spends`] for a request waiting to be paid:
+    /// given up on at `deadline`, since the caller holds
+    /// [`Inner::spend_gate`]. Whether any hold settled.
+    ///
+    /// On a task of its own: a turn's future is deep already, and settling a
+    /// refund checks its proof on the stack.
+    async fn recover_stranded_spends_by(&self, deadline: tokio::time::Instant) -> bool {
+        let Some(inner) = self.self_ref.upgrade() else {
+            return false;
+        };
+        let recovery = tokio::spawn(async move { inner.recover_stranded_spends().await });
+        matches!(
+            tokio::time::timeout_at(deadline, recovery).await,
+            Ok(Ok(Ok(recovered))) if !recovered.is_empty()
+        )
     }
 
     /// Rename a space. **The existence check is the write's own**: a space can
@@ -5333,7 +7447,6 @@ impl Inner {
         budget: Option<i64>,
         directive: &TurnDirective,
     ) -> Result<TurnPrep, AppError> {
-        let cfg = self.load_config();
         let now = now_ms();
 
         let db_conn = self.db_conn().await?;
@@ -5424,49 +7537,58 @@ impl Inner {
         // the two coincide there (as they do for eidola, where canonical is
         // the bare model); openai backends get the bare model.
         let canonical_model = backends::qualified_model_id(&mref.model, &backend.id);
-        let wire_model = match backend_kind {
-            BackendKind::OpenAi => mref.model.clone(),
+        // An Eidola model reference goes on the wire bare, without its
+        // `@eidola` qualifier: a pin's canonical spelling is qualified
+        // (`qualified_model_id`), and the gateway resolves the reference
+        // alone.
+        let mut wire_model = match backend_kind {
+            BackendKind::OpenAi | BackendKind::Eidola => mref.model.clone(),
             _ => canonical_model.clone(),
         };
+        // The weights hash an Eidola turn resolved to, recorded on the
+        // actions it writes (`action.model_sha256`).
+        let mut resolved_sha256: Option<String> = None;
         let model = canonical_model.as_str();
 
-        // Whether this turn's endpoint can be offered a `tools` field at all.
-        //
-        // **Capability is *learned*, never assumed from the backend's kind.**
-        // Nothing about a kind establishes tool-calling support, and this is
-        // not hypothetical: llama.cpp returns HTTP 500 `tools param requires
-        // --jinja flag` without `--jinja`, and *with* `--jinja` still 500s with
-        // a template-render crash when the model's tool block uses Jinja
-        // filters it lacks (a mainstream case — Qwen3 Coder does exactly
-        // this). A generic OpenAI-compatible endpoint may reject the field
-        // outright, and a deployed enclave older than the server's tool wire
-        // types refuses it as an unknown member. Since this turn attaches tools
-        // *automatically* the moment a space branches, assuming capability
-        // would mean "branching your conversation breaks every turn on this
-        // model", with no opt-out and triggered by a core UX action. So an
-        // endpoint that has rejected a `tools` field this process is remembered
-        // and simply not offered them again (the turn that discovered it
-        // degraded and carried on — see the round loop).
-        //
-        // **The memo is per (backend, wire model)**, because one backend serves
-        // many models: eidola's catalog and a llama.cpp install both do. A
-        // single tool-incapable model must cost only itself its tools, not
-        // every sibling on the same host.
-        //
-        // Deliberately in-process and not persisted: it is an *observation*,
-        // not configuration. No column, no setting to get wrong, nothing to
-        // migrate, and an endpoint that gains tool support (a rebuilt engine, a
-        // redeployed enclave, an upgraded proxy) is re-probed on the next
-        // restart rather than being written off forever. The real per-model
-        // capability metadata stays genuinely deferred.
-        //
-        // Note this gates only the tools *this turn attaches*. A consumer's own
-        // `AppCore::register_tool` registrations are untouched — that surface's
-        // wire compatibility is the consumer's call, exactly as task 20 left it.
-        // The **map** rides the messages array and is never gated by any of
-        // this, so a branched space keeps its whole structural view even where
-        // the descend-further affordance is withdrawn.
-        let backend_accepts_tools = !self.model_rejects_tools(&backend.id, &wire_model);
+        // **A continuation is asked of the model that wrote what it continues,
+        // and refused before anything acts if it cannot be.** The generation is
+        // read here, beside the model the turn resolved to, so every refusal
+        // costs one query: the request it would send ends inside that model's
+        // own output, which only means something to that model, and only an
+        // Eidola engine is known to honour `continue_final_message` (a server
+        // that ignored it would answer the partial message with a new turn,
+        // written after it as though it were part of the same answer).
+        // The predicate is `continuation_basis`, the one `PostNode::continuable`
+        // reads, so a refusal here is never a verb a surface offered.
+        let continuation_basis = match mode {
+            ResponseMode::Continue => {
+                let basis = continuation_basis(&db_conn, space_id, target_action_id)
+                    .await?
+                    .filter(|b| backend_kind == BackendKind::Eidola && b.model == model)
+                    .ok_or_else(|| AppError::WrongPostKind {
+                        message: "this answer cannot be continued: only an answer that stopped \
+                                  at its length limit, from one of Eidola's models, whose author \
+                                  still answers here with that model and whose request the \
+                                  Record kept whole, can be"
+                            .into(),
+                    })?;
+                Some(basis)
+            }
+            ResponseMode::Reply | ResponseMode::Revise => None,
+        };
+        // **A continuation is asked of the weights that wrote what it
+        // continues**, not of whatever its followed tag names now: the
+        // generation's recorded hash (`action.model_sha256`) pins the
+        // continuation, so a tag that moved since cannot finish another
+        // model's partial answer. Weights no longer served are refused by
+        // name below, like any selection the catalog no longer lists.
+        if continuation_basis.is_some()
+            && let Some(sha256) = db::action_model_sha256(&db_conn, target_action_id).await?
+            && let Ok(reference) =
+                eidola_common::model_reference::ModelReference::parse(&wire_model)
+        {
+            wire_model = eidola_common::model_reference::pinned(reference.tag(), &sha256);
+        }
 
         let mut engine_lease: Option<local_models::EngineLease> = None;
         let (
@@ -5477,6 +7599,9 @@ impl Inner {
             context_length,
             remote_pricing,
             external_auth,
+            tool_policy,
+            cache_scope,
+            declared_max_output,
         ) = match backend_kind {
             BackendKind::Local | BackendKind::LlamaCpp => {
                 // A request *is* the load trigger: an unloaded engine is
@@ -5518,13 +7643,16 @@ impl Inner {
                 engine_lease = Some(lease);
                 let provider_id =
                     db::ensure_provider(&db_conn, &backend.id, "inference", now).await?;
-                let client = self.plain_client()?;
+                let client = self.completion_client()?;
                 (
                     provider_id,
                     client,
                     engine_url,
                     None,
                     context_tokens as u64,
+                    None,
+                    None,
+                    ToolPolicy::Learned,
                     None,
                     None,
                 )
@@ -5538,11 +7666,22 @@ impl Inner {
                     })?;
                 let provider_id =
                     db::ensure_provider(&db_conn, &backend.id, "inference", now).await?;
-                let client = self.plain_client()?;
+                let client = self.completion_client()?;
                 let auth = backend.api_key.as_ref().map(|k| format!("Bearer {k}"));
                 // Context length is unknown for a generic server — 0
-                // resolves to the 4096 completion default below.
-                (provider_id, client, base_url, None, 0u64, None, auth)
+                // resolves to the fallback completion ceiling below.
+                (
+                    provider_id,
+                    client,
+                    base_url,
+                    None,
+                    0u64,
+                    None,
+                    auth,
+                    ToolPolicy::Learned,
+                    None,
+                    None,
+                )
             }
             BackendKind::Eidola => {
                 // The eidola row was already fetched by `require_backend`
@@ -5567,19 +7706,44 @@ impl Inner {
                     flush_attestations(&attestation_log, &db_conn, &provider_id, &base_url, now)
                         .await?;
 
+                // The catalog is allowed to shrink, and removing a row does not
+                // un-pick the participant, router or recorded model that names
+                // it. A stale selection is refused **by name**, here — ahead of
+                // the credential and ahead of any completion request — because
+                // the only thing worse than this failure is quietly answering
+                // with a different model. See [`AppError::ModelUnavailable`].
                 let model_entry =
-                    models
-                        .data
-                        .iter()
-                        .find(|m| m.id == wire_model)
-                        .ok_or_else(|| AppError::NotConfigured {
-                            message: format!("model not found: {model}"),
-                        })?;
-                let pricing = (
-                    model_entry.pricing.per_prompt_token.value as u128,
-                    model_entry.pricing.per_completion_token.value as u128,
-                    model_entry.pricing.per_prompt_token.scale_factor as u128,
-                );
+                    find_catalog_entry(&models.data, &wire_model).ok_or_else(|| {
+                        AppError::ModelUnavailable {
+                            model: model.to_string(),
+                        }
+                    })?;
+                // **Every request of the turn names the weights the turn
+                // resolved to.** A followed tag is pinned here to the hash the
+                // catalog gives it now, so a tool round or continuation later
+                // in the turn cannot land on other weights if a release moves
+                // the tag mid-turn; a pin stays the pin it was.
+                if let Some(sha256) = model_entry.sha256.as_deref()
+                    && eidola_common::model_reference::is_digest_hex(sha256)
+                    && let Ok(reference) =
+                        eidola_common::model_reference::ModelReference::parse(&wire_model)
+                {
+                    wire_model = eidola_common::model_reference::pinned(reference.tag(), sha256);
+                    resolved_sha256 = Some(sha256.to_string());
+                }
+                let pricing = ChargePricing::from_catalog(&model_entry.pricing);
+                // Whose catalog is this? Declarations are acted on only when
+                // the client is talking to the trust root it was built with:
+                // an overridden base URL or measurement set means some other
+                // server, whose catalog this binary cannot vouch for, and
+                // there the declaration is a hint and discovery stays armed.
+                // The two predicates are already computed on the path this
+                // turn took, so the rule costs nothing.
+                let tool_policy = if self.declarations_are_authoritative(&eidola) {
+                    ToolPolicy::from_declaration(model_entry.declared_capabilities().tool_calling)
+                } else {
+                    ToolPolicy::Learned
+                };
                 (
                     provider_id,
                     client,
@@ -5588,15 +7752,60 @@ impl Inner {
                     model_entry.context_length,
                     Some(pricing),
                     None,
+                    tool_policy,
+                    // Whether this model's engine reuses a prompt prefix, and
+                    // for how long — the only input deciding whether the turn
+                    // sends a prefix-cache key (see [`prefix_cache`]). Read
+                    // whoever's catalog this is: it shapes the request and
+                    // vouches for nothing, and the server it describes already
+                    // reads every prompt it would link.
+                    model_entry
+                        .declared_prompt_cache()
+                        .map(|policy| prefix_cache::CacheScope {
+                            policy,
+                            trust_domain: eidola.cache_trust_domain(),
+                        }),
+                    // The largest completion the catalog says this model may
+                    // be asked for — what the turn's ceiling is, below.
+                    model_entry.max_output_tokens,
                 )
             }
         };
 
-        let max_completion_tokens = if context_length == 0 {
-            4096
-        } else {
-            context_length.min(4096) as u32
+        // Whether this turn's endpoint can be offered a `tools` field at all.
+        //
+        // Two mechanisms, over disjoint ground — see [`ToolPolicy`] for why a
+        // declaration cannot exist for a local `.gguf` and why discovery must
+        // therefore survive. A declared answer is believed; an undeclared one
+        // falls back to the memo of endpoints that have rejected a
+        // `tools`-bearing request during this process's lifetime.
+        //
+        // **The memo is per (backend, wire model)**, because one backend serves
+        // many models: eidola's catalog and a llama.cpp install both do. A
+        // single tool-incapable model must cost only itself its tools, not
+        // every sibling on the same host.
+        //
+        // Deliberately in-process and not persisted: it is an *observation*,
+        // not configuration. No column, no setting to get wrong, nothing to
+        // migrate, and an endpoint that gains tool support (a rebuilt engine,
+        // an upgraded proxy) is re-probed on the next restart rather than
+        // being written off forever. Persisting it would also make the shape
+        // of a request a function of *this device's history*, so a fresh
+        // install and a long-lived one would send structurally different
+        // requests for the same model.
+        //
+        // Note this gates only the tools *this turn attaches*. A consumer's own
+        // `AppCore::register_tool` registrations are untouched — that surface's
+        // wire compatibility is the consumer's call, exactly as task 20 left it.
+        // The **map** rides the messages array and is never gated by any of
+        // this, so a branched space keeps its whole structural view even where
+        // the descend-further affordance is withdrawn.
+        let backend_accepts_tools = match tool_policy {
+            ToolPolicy::Declared(supported) => supported,
+            ToolPolicy::Learned => !self.model_rejects_tools(&backend.id, &wire_model),
         };
+
+        let max_completion_tokens = completion_ceiling(declared_max_output, context_length);
 
         // The target (the post being replied to / the generation being revised)
         // must belong to this space — otherwise a caller could splice another
@@ -5661,7 +7870,7 @@ impl Inner {
                 None,
                 Some(target_action_id.to_string()),
             ),
-            ResponseMode::Revise => {
+            ResponseMode::Revise | ResponseMode::Continue => {
                 let (item_id, _sp) = db::action_item_and_space(&db_conn, target_action_id)
                     .await?
                     .ok_or_else(|| AppError::NotConfigured {
@@ -5686,12 +7895,15 @@ impl Inner {
         // thread, exactly the target's branch on a branched space (sibling
         // branches never leak into the context); a Revise (regenerate) walks
         // from the generation being replaced *exclusive*, so the model never
-        // sees its own prior output or anything downstream of it.
+        // sees its own prior output or anything downstream of it. A Continue
+        // walks the same thread a Revise does — the conversation the target
+        // answered — and gets the target back as the partial message it
+        // continues, below, rather than as a post in the transcript.
         let mut context_rows: Vec<db::SpaceActionRow> = match mode {
             ResponseMode::Reply => {
                 db::get_upstream_context(&db_conn, target_action_id, true).await?
             }
-            ResponseMode::Revise => {
+            ResponseMode::Revise | ResponseMode::Continue => {
                 db::get_upstream_context(&db_conn, target_action_id, false).await?
             }
         };
@@ -5740,8 +7952,10 @@ impl Inner {
         // withholds the generation being replaced from the context, so without
         // this the model would be asked to re-word a report on a finding it was
         // never shown.
+        // A continuation carries them forward for the same reasons: it is the
+        // same answer, finished.
         let mut attached = directive.attached.clone();
-        if mode == ResponseMode::Revise {
+        if matches!(mode, ResponseMode::Revise | ResponseMode::Continue) {
             for r in db::reference_antecedents(&db_conn, target_action_id).await? {
                 attached.push(AttachedReference {
                     // The ordinal it already had — stable across generations,
@@ -5804,8 +8018,10 @@ impl Inner {
         // A Revise turn must not learn about the generation it replaces (nor
         // anything downstream of it) — the same rule `get_upstream_context`
         // applies to the messages, applied to the map.
+        // A Continue is shown the map its target was shown, which did not yet
+        // hold the target.
         let map_exclude = match mode {
-            ResponseMode::Revise => Some(target_action_id),
+            ResponseMode::Revise | ResponseMode::Continue => Some(target_action_id),
             ResponseMode::Reply => None,
         };
         let forks = thread.spine_forks(&spine, map_exclude);
@@ -5896,6 +8112,36 @@ impl Inner {
         // path resolves or mints one), so the scope is the whole test.
         let spaces_tool = model_participant_scope == "global" && backend_accepts_tools;
 
+        // ---- Delegation ---------------------------------------------------
+        //
+        // `delegate` opens a sub-space owned by the responding agent (see
+        // [`subspaces`]). Its gate is the **same structural one**, and that is
+        // not a coincidence: the rule that lets a global agent be referenced
+        // into another space is the rule that lets it own one, so a
+        // space-owned participant fails both for one reason rather than two.
+        // The guards themselves — depth, live rooms per owner, seats — are the
+        // spawn door's and are decided inside its transaction; the tool adds
+        // none of its own, so it cannot be a way around any of them.
+        let delegate_tool = model_participant_scope == "global" && backend_accepts_tools;
+        // The seats a delegation may name are exactly the agents this turn's
+        // roster carries — read off the same participant snapshot the roster
+        // renders from, so what a model can name is what it was shown, and no
+        // second query can disagree with the first. The human is not a
+        // candidate (a delegated room has no human member by construction) and
+        // neither is the responder, which the spawn seats itself.
+        let seat_candidates: Vec<subspaces::SeatCandidate> = if delegate_tool {
+            members
+                .iter()
+                .filter(|m| m.kind == "agent" && m.participant_id != model_participant_id)
+                .map(|m| subspaces::SeatCandidate {
+                    participant_id: m.participant_id.clone(),
+                    label: m.label.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Render the rows from the *responding participant's* point of view:
         // only its own prior posts are `assistant`, everyone else's are `user`,
         // and every message carries its uniform `#<handle> · <label>` header
@@ -5978,6 +8224,13 @@ impl Inner {
         // and is byte-stable thereafter.
         if spaces_tool {
             notes.push(discovery::GLOBAL_AGENT_NOTE);
+        }
+        // The delegation note flips at the same moment for the same reason,
+        // and says the three things the schema cannot: the brief is a
+        // contract, the answer comes back as a post rather than a return
+        // value, and the guards are bounded.
+        if delegate_tool {
+            notes.push(subspaces::DELEGATE_NOTE);
         }
         let mut system_content = match system_prompt
             .as_deref()
@@ -6072,6 +8325,53 @@ impl Inner {
             messages.push(serde_json::json!({"role": "user", "content": trailing}));
         }
 
+        // ---- The continued answer ------------------------------------------
+        //
+        // **A continuation sends the request its target was written to, as it
+        // was sent**, followed by the target's own output as the final message
+        // (`continuation_basis`). Not the conversation as it stands now: an
+        // edit to a post the answer answered, a renamed participant, a new
+        // branch on the map or a changed charter would have the model continue
+        // an answer to one prompt while reading another, and would lose the
+        // prefix the engine cached for that request. The context assembled
+        // above is therefore not what this turn sends; it still supplies the
+        // tools a continued round can call, and the attached references the
+        // new generation carries forward. The record of what was fed is the
+        // target's own, plus the target.
+        //
+        // The partial message is the model's own text, exactly: no header line,
+        // nothing quoted. The answer is continued once there is any; before
+        // there is, the reasoning is, and the prompt ends inside an open
+        // reasoning block. Reasoning is otherwise never sent upstream — this is
+        // the one message whose reasoning the model reads, because it is the
+        // model's own unfinished thought.
+        let mut continued_tools: Option<Vec<serde_json::Value>> = None;
+        let continuation = match continuation_basis {
+            None => None,
+            Some(basis) => {
+                messages = basis.messages;
+                context_action_ids = basis.context_action_ids;
+                continued_tools = Some(basis.tools);
+                let field = if basis.text.is_empty() {
+                    ContinueField::ReasoningContent
+                } else {
+                    ContinueField::Content
+                };
+                messages.push(prefix_cache::continuation_message(
+                    &basis.thinking,
+                    &basis.text,
+                ));
+                if !context_action_ids.iter().any(|id| id == target_action_id) {
+                    context_action_ids.push(target_action_id.to_string());
+                }
+                Some(Continuation {
+                    field,
+                    reasoning: basis.thinking,
+                    content: basis.text,
+                })
+            }
+        };
+
         // Snapshot the tool registry for this turn (see `tools`). An empty
         // registry sends no `tools` field at all, so today's requests stay
         // byte-identical.
@@ -6113,7 +8413,7 @@ impl Inner {
         // vanish. Done at the snapshot, so the model never sees the schema and
         // `declined_reason` (which keys on the registry, not the name) cannot
         // fire even if it guesses the name.
-        let auto_tools = nav_tools || memory_tool || spaces_tool;
+        let auto_tools = nav_tools || memory_tool || spaces_tool || delegate_tool;
         let tool_registry = if auto_tools {
             let mut registry = (*consumer_tools).clone();
             if nav_tools {
@@ -6145,6 +8445,30 @@ impl Inner {
                     space_id.clone(),
                 )));
             }
+            if delegate_tool {
+                // The anchor is this turn's own reply target — the post the
+                // work is being asked for on. Only the turn knows it, which is
+                // the whole reason the spawn door takes it from its caller: a
+                // delegation opened here reports back beneath this agent's
+                // answer to *this* post, rather than beneath wherever it
+                // happened to speak last.
+                registry.register(Arc::new(subspaces::DelegateTool::new(
+                    self.self_ref.clone(),
+                    model_participant_id.clone(),
+                    space_id.clone(),
+                    inf_reply_to.clone(),
+                    // **Which turn this is.** The answer a delegation reports
+                    // beneath is this turn's, and the same agent can have two
+                    // turns running against the same post (two explicit asks,
+                    // a regeneration beside a reply) — so the room records the
+                    // item this turn's answer will be written under, which is
+                    // minted here, before the first request, precisely because
+                    // the answer's own action id does not exist yet and may
+                    // never exist at all.
+                    inf_item_id.clone(),
+                    seat_candidates.clone(),
+                )));
+            }
             Arc::new(registry)
         } else {
             consumer_tools.clone()
@@ -6155,39 +8479,21 @@ impl Inner {
         // rejects the tools field, `withdraw_auto_tools` re-derives this
         // array from the restored registry so the retry's estimate and body
         // agree again.
-        let tool_schemas = tool_registry.schemas();
+        // A continuation offers the tools its target's request offered, as
+        // that request spelled them, so its prefix is that request's.
+        let tool_schemas = continued_tools.unwrap_or_else(|| tool_registry.schemas());
 
         // The spend side runs only for eidola turns. Local and external
         // turns carry no charge estimate, no credential, and no ACT header
         // (an openai backend's bearer key rides in `external_auth` instead)
         // — which also means non-eidola inference needs no account or
         // onboarding.
-        let (charge_credits, spend, auth_value) = match remote_pricing {
-            None => (0u128, None, external_auth),
-            Some(pricing) => {
-                let charge_credits = estimate_charge_credits(
-                    &messages,
-                    &tool_schemas,
-                    max_completion_tokens,
-                    pricing,
-                );
-                if charge_credits == 0 {
-                    return Err(AppError::Credential {
-                        message: "computed charge is zero — model pricing may be missing".into(),
-                    });
-                }
-                // Spend budget ceiling — checked *per round*, so a tool loop's
-                // later rounds re-check it against their own (grown) estimate.
-                check_turn_budget(charge_credits, budget)?;
-                let (spend, auth_value) = self
-                    .acquire_spend(&cfg, &db_conn, charge_credits, now)
-                    .await?;
-                (charge_credits, Some(spend), Some(auth_value))
-            }
+        let auth_value = match remote_pricing {
+            None => external_auth,
+            Some(_) => None,
         };
-        let spend_is_none = spend.is_none();
 
-        Ok(TurnPrep {
+        let mut prep = TurnPrep {
             db_conn,
             provider_id,
             backend_id: backend.id,
@@ -6200,8 +8506,17 @@ impl Inner {
             space_id,
             model: model.to_string(),
             wire_model,
+            resolved_sha256,
+            weights_moved: false,
             model_participant_id,
             max_completion_tokens,
+            output_limit: max_completion_tokens,
+            continues_automatically: backend_kind == BackendKind::Eidola
+                && can_continue(Some(model))
+                && remote_pricing.is_some(),
+            answer: AnswerSoFar::default(),
+            continues: continuation.is_some(),
+            continuation,
             inf_item_id,
             inf_supersedes,
             inf_reply_to,
@@ -6216,17 +8531,28 @@ impl Inner {
             tool_schemas,
             consumer_tools,
             auto_tools,
+            tool_policy,
+            cache_scope,
+            cache_clock: self.cache_clock.clone(),
+            claimed_key: Arc::new(Mutex::new(None)),
+            declared: None,
+            context_length,
             remote_pricing,
             budget,
-            charge_credits,
-            total_credits: charge_credits,
-            spend,
-            // The turn's first hold is unsettled until its round processes a
-            // refund; a turn with no spend at all has nothing to settle.
-            spend_settled: spend_is_none,
-            auth_value,
+            charge_credits: 0,
+            total_credits: 0,
+            spend: None,
+            external_auth: auth_value,
+            plain_route: backend_kind != BackendKind::Eidola,
+            whole: whole_answer::WholeAnswer::for_backend(backend_kind),
             bus: self.bus.clone(),
-        })
+        };
+        // The spend side runs only for eidola turns (a no-op otherwise): the
+        // first round's hold, priced by a declared cached prefix where the
+        // lineage has one to declare.
+        self.fund_round(&mut prep, Funding::MayConvert, true)
+            .await?;
+        Ok(prep)
     }
 
     /// The **agent-side decline checkpoint** (see [`decline`]).
@@ -6281,6 +8607,8 @@ impl Inner {
             // No post was written: the decision travels in `declined` so no
             // caller can mistake it for one and cascade off it.
             response_action_id: None,
+            truncated: false,
+            continuable: false,
             declined: Some(DeclineOutcome {
                 reason,
                 action_id: decision_id,
@@ -6289,8 +8617,9 @@ impl Inner {
     }
 
     /// Acquire the credential spend for one request: the ACT provisioning
-    /// queue's acquire → spend-proof → flip-to-`spending` step, plus the
-    /// `Authorization` header value it produces.
+    /// queue's acquire → spend-proof → flip-to-`spending` step, with the
+    /// inputs as they will be presented in the request body
+    /// ([`PresentedSpend`]): one credential, or a drain and a fill.
     ///
     /// Factored out of `prepare_turn` because a tool loop needs it **once per
     /// round**: the ACT protocol consumes a credential per request (the spend
@@ -6300,92 +8629,121 @@ impl Inner {
     /// discipline therefore applies per round too, which is exactly what this
     /// keeps intact.
     ///
-    /// Emits `Change::Wallet` after `insert_pre_credential_refund` — the
-    /// credential is in `spending` state from that instant regardless of
-    /// whether the rest of the round succeeds.
+    /// **Every input is taken at once.** Each input's proof is made, and then
+    /// every input is marked `spending` with its `PreRefund` in one local
+    /// transaction (`insert_spend_inputs`), all under `spend_gate`: a crash
+    /// cannot leave one input marked and another not, and a concurrent turn
+    /// can pick neither.
+    ///
+    /// Emits `Change::Wallet` after `insert_spend_inputs` — the inputs are in
+    /// `spending` state from that instant regardless of whether the rest of
+    /// the round succeeds.
     async fn acquire_spend(
         &self,
         cfg: &Config,
         db_conn: &turso::Connection,
         charge_credits: u128,
         now: i64,
-    ) -> Result<(SpendPrep, String), AppError> {
+        funding: Funding,
+    ) -> Result<SpendPrep, AppError> {
         // ACT provisioning queue: serialize acquire → spend-proof →
         // flip-to-`spending` across concurrent turns so two turns fired at
         // once can never both spend the same credential. The gate is held only
-        // through `insert_pre_credential_refund` below (the point the
-        // credential becomes `spending`); the HTTP request runs outside it.
+        // through `insert_spend_inputs` below (the point the inputs become
+        // `spending`); the HTTP request runs outside it.
+        // A hold too large for the wallet's arithmetic is far past anything one
+        // denomination pays, and is refused as that, before anything is read.
+        let hold =
+            i64::try_from(charge_credits).map_err(|_| AppError::HoldExceedsDenomination {
+                hold: i64::MAX,
+                denomination: DEFAULT_ALLOCATION_CREDITS,
+            })?;
         let _spend_guard = self.spend_gate.lock().await;
-        let cred = self
-            .ensure_spendable_credential(cfg, db_conn, charge_credits as i64)
-            .await?;
-
-        let credit_token =
-            CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
-                message: format!("failed to decode credential: {e}"),
-            })?;
-        let public_key =
-            PublicKey::from_cbor(&cred.public_key_data).map_err(|e| AppError::Credential {
-                message: format!("failed to decode public key: {e}"),
-            })?;
+        // Boxed: the provisioning queue's own future (with an issuance inside
+        // it) is large, and it sits inside every turn's.
+        let chosen = Box::pin(self.ensure_spend_inputs(cfg, db_conn, hold, funding)).await?;
 
         let params = params_from_domain_separator(cfg.domain_separator())?;
-
-        let charge_scalar =
-            credit_to_scalar::<128>(charge_credits).map_err(|e| AppError::Credential {
-                message: format!("invalid charge amount: {e:?}"),
+        let mut inputs = Vec::with_capacity(chosen.len());
+        let mut proofs = Vec::with_capacity(chosen.len());
+        for (cred, share) in chosen {
+            let credit_token =
+                CreditToken::from_cbor(&cred.data).map_err(|e| AppError::Credential {
+                    message: format!("failed to decode credential: {e}"),
+                })?;
+            let public_key =
+                PublicKey::from_cbor(&cred.public_key_data).map_err(|e| AppError::Credential {
+                    message: format!("failed to decode public key: {e}"),
+                })?;
+            let share = u128::try_from(share).map_err(|_| AppError::Credential {
+                message: "a negative share".into(),
             })?;
-        let (spend_proof, pre_refund) = credit_token
-            .prove_spend::<128>(&params, charge_scalar, OsRng)
-            .map_err(|e| AppError::Credential {
-                message: format!("failed to create spend proof: {e:?}"),
+            let charge_scalar =
+                credit_to_scalar::<ACT_L>(share).map_err(|e| AppError::Credential {
+                    message: format!("invalid charge amount: {e:?}"),
+                })?;
+            let (spend_proof, pre_refund) = credit_token
+                .prove_spend::<ACT_L>(&params, charge_scalar, OsRng)
+                .map_err(|e| AppError::Credential {
+                    message: format!("failed to create spend proof: {e:?}"),
+                })?;
+            let pre_refund_cbor = pre_refund.to_cbor().map_err(|e| AppError::Credential {
+                message: format!("failed to encode pre_refund: {e}"),
             })?;
-
-        let pre_refund_cbor = pre_refund.to_cbor().map_err(|e| AppError::Credential {
-            message: format!("failed to encode pre_refund: {e}"),
-        })?;
-        let spend_proof_cbor = spend_proof.to_cbor().map_err(|e| AppError::Credential {
-            message: format!("failed to encode spend proof: {e}"),
-        })?;
-        let pre_cred_id = Uuid::now_v7().to_string();
-        db::insert_pre_credential_refund(
-            db_conn,
-            &pre_cred_id,
-            &cred.nonce,
-            &cred.issuer_key_id,
-            &pre_refund_cbor,
-            charge_credits as i64,
-            &spend_proof_cbor,
-            now,
-        )
-        .await?;
-        // Credential flipped to "spending" — wallet state changed regardless
-        // of whether the rest of the operation succeeds.
-        self.bus.emit(Change::Wallet);
-
-        let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
-        let challenge_digest = compute_challenge_digest();
-
-        let mut token_bytes = Vec::new();
-        token_bytes.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
-        token_bytes.extend_from_slice(&challenge_digest);
-        token_bytes.extend_from_slice(&issuer_key_hash);
-        token_bytes.extend_from_slice(&spend_proof_cbor);
-
-        let token_b64 = URL_SAFE_NO_PAD.encode(&token_bytes);
-        let auth_value = format!("PrivateToken token=\"{token_b64}\"");
-
-        Ok((
-            SpendPrep {
+            let spend_proof_cbor = spend_proof.to_cbor().map_err(|e| AppError::Credential {
+                message: format!("failed to encode spend proof: {e}"),
+            })?;
+            let pre_cred_id = Uuid::now_v7().to_string();
+            // Claimed **before** the rows that make these credentials
+            // `spending`, so there is no instant where the database says "in
+            // flight" and this process has not yet said whose flight it is.
+            // Recovery reads the two in the other order, so the overlap can
+            // only ever protect a live hold, never expose one.
+            self.live_spends
+                .lock()
+                .expect("live spends lock poisoned")
+                .insert(pre_cred_id.clone());
+            let live = LiveSpend {
+                set: Arc::clone(&self.live_spends),
+                pre_cred_id: pre_cred_id.clone(),
+            };
+            let issuer_key_hash = hex_decode(&cred.issuer_key_id)?;
+            let presented =
+                PresentedSpend::new(&issuer_key_hash, &spend_proof_cbor, &pre_refund_cbor);
+            proofs.push((pre_refund_cbor, spend_proof_cbor));
+            inputs.push(SpendInput {
                 cred,
                 public_key,
-                params,
                 spend_proof,
                 pre_refund,
+                presented,
                 pre_cred_id,
-            },
-            auth_value,
-        ))
+                share,
+                settled: None,
+                _live: live,
+            });
+        }
+        let records: Vec<db::SpendInputRecord<'_>> = inputs
+            .iter()
+            .zip(&proofs)
+            .map(
+                |(input, (pre_refund_cbor, spend_proof_cbor))| db::SpendInputRecord {
+                    id: &input.pre_cred_id,
+                    credential_nonce: &input.cred.nonce,
+                    issuer_key_id: &input.cred.issuer_key_id,
+                    data: pre_refund_cbor,
+                    spend_amount: input.share as i64,
+                    spend_proof_data: spend_proof_cbor,
+                },
+            )
+            .collect();
+        let spend_group = Uuid::now_v7().to_string();
+        db::insert_spend_inputs(db_conn, &spend_group, &records, now).await?;
+        // Inputs flipped to "spending" — wallet state changed regardless of
+        // whether the rest of the operation succeeds.
+        self.bus.emit(Change::Wallet);
+
+        Ok(SpendPrep { params, inputs })
     }
 
     /// Begin the next round of a turn's tool loop: re-estimate the charge over
@@ -6396,49 +8754,127 @@ impl Inner {
     /// Non-spend turns (local / llamacpp / openai backends) fall through
     /// untouched — they have no pricing, so a round costs nothing to start.
     async fn begin_next_round(&self, prep: &mut TurnPrep) -> Result<(), AppError> {
-        let Some(pricing) = prep.remote_pricing else {
+        if prep.remote_pricing.is_none() {
             return Ok(());
-        };
+        }
         // **A hold is never abandoned to take another one.** Acquiring below
         // overwrites `prep.spend`, which is the only in-memory handle to the
         // materials that settle the current one — so an unsettled hold would be
         // dropped mid-turn and its credential left `spending`, its face value
-        // locked out of the wallet until the next startup recovery sweep. The
+        // locked out of the wallet until a later recovery asks for it. The
         // round that took it normally settles it (inline refund, or recovery
         // when the response carries none); this is the last chance, and a
         // failure here ends the turn rather than spending a second credential
         // against an endpoint that has not settled the first. The guard lives
         // here, at the one place `spend` is replaced, so no present or future
         // caller has to remember it.
-        if prep.spend.is_some() && !prep.spend_settled && !prep.try_refund_recovery().await {
+        if prep.spend.as_ref().is_some_and(|s| !s.all_settled())
+            && !prep.try_refund_recovery().await
+        {
             return Err(AppError::Credential {
                 message: "the previous round's credential could not be settled — its hold is \
                           recoverable with `eidola wallet credentials recover`"
                     .into(),
             });
         }
-        let cfg = self.load_config();
-        let charge_credits = estimate_charge_credits(
-            &prep.messages,
-            &prep.tool_schemas,
-            prep.max_completion_tokens,
-            pricing,
-        );
+        self.fund_round(prep, Funding::MayConvert, true).await
+    }
+
+    /// Price and pay for the next request of a turn: decide its declared
+    /// cached prefix (when `declare` and the lineage has one to declare —
+    /// [`TurnPrep::declarable_prefix`]), compute its hold from that or from
+    /// the byte contract, check the per-turn `budget` against it, and acquire
+    /// the hold under `funding`. The one place a turn's hold is sized, so
+    /// every round is priced by the rule its body states. A no-op for the
+    /// non-spend backends.
+    async fn fund_round(
+        &self,
+        prep: &mut TurnPrep,
+        funding: Funding,
+        declare: bool,
+    ) -> Result<(), AppError> {
+        let Some(pricing) = prep.remote_pricing else {
+            prep.declared = None;
+            return Ok(());
+        };
+        prep.declared = if declare {
+            prep.declarable_prefix(pricing).await
+        } else {
+            None
+        };
+        let prompt = match prep.declared {
+            Some(prefix) => eidola_common::pricing::Prompt::Declared {
+                cached_tokens: u64::from(prefix.cached_tokens),
+                new_tokens: u64::from(prefix.new_tokens),
+            },
+            None => counted_prompt(&prep.messages, &prep.tool_schemas),
+        };
+        // The declaration is decided first: it does not depend on the
+        // ceiling, and the rung is a function of the prompt it prices.
+        if prep.continues_automatically {
+            prep.max_completion_tokens =
+                ladder_ceiling(prep.output_limit, prompt, &pricing, prep.answer.generated);
+        }
+        let charge_credits = pricing.hold(prompt, prep.max_completion_tokens);
         if charge_credits == 0 {
             return Err(AppError::Credential {
                 message: "computed charge is zero — model pricing may be missing".into(),
             });
         }
+        // Spend budget ceiling — checked *per round*, so a tool loop's later
+        // rounds re-check it against their own (grown) estimate.
         check_turn_budget(charge_credits, prep.budget)?;
-        let (spend, auth_value) = self
-            .acquire_spend(&cfg, &prep.db_conn, charge_credits, prep.now)
+        let cfg = self.load_config();
+        let spend = self
+            .acquire_spend(&cfg, &prep.db_conn, charge_credits, prep.now, funding)
             .await?;
         prep.charge_credits = charge_credits;
         prep.total_credits += charge_credits;
         prep.spend = Some(spend);
-        prep.spend_settled = false;
-        prep.auth_value = Some(auth_value);
         Ok(())
+    }
+
+    /// Send a round again **without its declared cached prefix**, after the
+    /// engine refused the declaration (`409 cached_prefix_missing` or
+    /// `prompt_budget_exceeded`): the lineage's resume point is forgotten,
+    /// the refused request's hold is settled (it was charged the request
+    /// fee), and a fresh hold is taken for the undeclared request.
+    ///
+    /// **That hold never converts account credit** ([`Funding::HeldOnly`]):
+    /// it is paid from what the wallet holds, or what a settlement in flight
+    /// returns, or the turn fails with [`AppError::UncachedRetryUnfunded`].
+    /// Whoever can empty an engine's cache can cause this retry, and it must
+    /// not let them choose the moment this client converts.
+    async fn resend_undeclared(&self, prep: &mut TurnPrep) -> Result<(), AppError> {
+        if let Err(e) =
+            db::forget_prefix_resume(&prep.db_conn, &prep.space_id, &prep.model_participant_id)
+                .await
+        {
+            eprintln!("warning: a lineage's cache resume point could not be forgotten: {e}");
+        }
+        if prep.spend.as_ref().is_some_and(|s| !s.all_settled())
+            && !prep.try_refund_recovery().await
+        {
+            return Err(AppError::Credential {
+                message: "the refused request's credential could not be settled — its hold is \
+                          recoverable with `eidola wallet credentials recover`"
+                    .into(),
+            });
+        }
+        self.fund_round(prep, Funding::HeldOnly, false).await
+    }
+
+    /// [`ChatResult::continuable`], from the door's own predicate: only an
+    /// answer that stopped at its ceiling is asked about, so an ordinary turn
+    /// reads nothing more.
+    async fn settle_continuable(&self, mut result: ChatResult) -> Result<ChatResult, AppError> {
+        if let (true, Some(id)) = (result.truncated, result.response_action_id.as_deref()) {
+            let db_conn = self.db_conn().await?;
+            result.continuable = continuation_basis(&db_conn, &result.space_id, id)
+                .await?
+                .is_some();
+        }
+        Ok(result)
     }
 
     /// Has this endpoint rejected a request carrying a `tools` field during
@@ -6482,8 +8918,18 @@ impl Inner {
     /// on 4xx alone would miss the common case; the cost of guessing wrong is
     /// one extra request, and `remember_tool_incapable` is not reached unless
     /// the retry actually succeeds.
+    ///
+    /// **Learned policies only.** Where the endpoint declared its answer the
+    /// probe has nothing left to discover, and running it anyway is actively
+    /// wrong: a transient upstream 500 on round 1 gets read as "this model
+    /// rejects `tools`", and if the toolless retry then succeeds the model
+    /// silently loses its tools for the rest of the process — having been
+    /// charged for both attempts. See [`ToolPolicy`].
     fn should_degrade_tools(&self, prep: &TurnPrep, round: usize, err: &AppError) -> bool {
-        round == 1 && prep.auto_tools && matches!(err, AppError::Server { .. })
+        round == 1
+            && prep.auto_tools
+            && prep.tool_policy.probes_on_failure()
+            && matches!(err, AppError::Server { .. })
     }
 
     /// `Reply` → a new child item replying to the target; `Revise` → a new
@@ -6545,8 +8991,33 @@ impl Inner {
         // per-round future (request, SSE-free body read, refund, persistence)
         // is by far the largest state machine in the crate, and keeping it on
         // the heap keeps the turn off the worker stack.
-        for round in 1..=MAX_TURN_ROUNDS {
+        //
+        // A round is one answer: the requests that continue an answer that
+        // stopped at its ceiling belong to the round whose answer they
+        // extend, bounded by the model's declared output limit rather than
+        // by `MAX_TURN_ROUNDS`.
+        let mut round = 1;
+        loop {
             let mut outcome = Box::pin(self.run_turn_round(&mut prep, round)).await;
+            // A refused declaration is sent once more, undeclared.
+            if matches!(outcome, Ok(RoundOutcome::PrefixRefused(_))) {
+                if let Err(e) = self.resend_undeclared(&mut prep).await {
+                    if prep.carries_answer() {
+                        return self.write_carried_answer(&mut prep, e).await;
+                    }
+                    self.bus.emit(Change::Space(prep.space_id.clone()));
+                    return Err(e);
+                }
+                outcome = Box::pin(self.run_turn_round(&mut prep, round)).await;
+            }
+            // **A continuation that fails loses nothing**: the answer it was
+            // continuing is written as it stood, at its ceiling, and the turn
+            // ends as a ceiling ending does.
+            if prep.carries_answer()
+                && let Err(e) = outcome
+            {
+                return self.write_carried_answer(&mut prep, e).await;
+            }
             // Degrade-on-rejection: a backend that refuses the `tools` field
             // gets one toolless retry of this round rather than turning "the
             // user branched their conversation" into a broken turn. The map is
@@ -6568,20 +9039,94 @@ impl Inner {
                 }
             }
             match outcome? {
-                RoundOutcome::Final(result) => {
-                    // The turn is committed and emitted; a branch that grew by
-                    // this response is summarized behind it (see [`summaries`]).
-                    self.spawn_branch_summaries(&result.space_id);
-                    return Ok(result);
+                RoundOutcome::Final(result) => return self.finish_turn(result).await,
+                // The round cap is asked inside the round, before it returns
+                // this, so `round` never passes `MAX_TURN_ROUNDS`.
+                RoundOutcome::ToolRound => round += 1,
+                RoundOutcome::Continued => {
+                    if let Err(e) = self.begin_next_round(&mut prep).await {
+                        return self.write_carried_answer(&mut prep, e).await;
+                    }
                 }
-                RoundOutcome::ToolRound => continue,
+                // Only a resend that declared again can be refused here,
+                // and no resend declares.
+                RoundOutcome::PrefixRefused(refused) => {
+                    if prep.carries_answer() {
+                        return self.write_carried_answer(&mut prep, refused).await;
+                    }
+                    self.bus.emit(Change::Space(prep.space_id.clone()));
+                    return Err(refused);
+                }
             }
         }
+    }
 
-        // Unreachable: the last round either returns a final result or exits
-        // with `AppError::ToolLoop` (the `round == MAX_TURN_ROUNDS` guard), so
-        // the loop never runs out.
-        unreachable!("the tool loop returns on its last round")
+    /// The end of a turn that wrote its answer: a branch that grew by it is
+    /// summarized behind it (see [`summaries`]), and an answer that stopped at
+    /// its ceiling says whether the reader can continue it.
+    async fn finish_turn(&self, result: ChatResult) -> Result<ChatResult, AppError> {
+        self.spawn_branch_summaries(&result.space_id);
+        self.settle_continuable(result).await
+    }
+
+    /// Write the answer a turn was continuing **as it stood** when the
+    /// request continuing it could not be paid, was refused, or failed
+    /// (`cause`, which the turn does not return): the generation every
+    /// earlier request of the answer produced, at its ceiling and continuable
+    /// exactly, carrying their request rows. The failed request's own row, if
+    /// it got one, stays attached to nothing. Then the turn ends as a ceiling
+    /// ending does.
+    async fn write_carried_answer(
+        &self,
+        prep: &mut TurnPrep,
+        cause: AppError,
+    ) -> Result<ChatResult, AppError> {
+        eprintln!(
+            "warning: an answer's continuation did not complete; the answer is written as it \
+             stood: {cause}"
+        );
+        let continuation = prep
+            .continuation
+            .take()
+            .expect("a carried answer has its continuation");
+        prep.messages.pop();
+        let input_tokens = prep.answer.input_tokens;
+        let output_tokens = prep.answer.output_tokens;
+        let response_action_id = prep
+            .persist_turn(
+                "complete",
+                true,
+                true,
+                input_tokens,
+                output_tokens,
+                &continuation.reasoning,
+                &continuation.content,
+                None,
+            )
+            .await?;
+        if response_action_id.is_some() {
+            self.bus.emit(Change::Space(prep.space_id.clone()));
+            if prep.spend.is_some() {
+                self.bus.emit(Change::Wallet);
+            }
+        }
+        self.bus.emit(Change::Record);
+        let result = ChatResult {
+            space_id: prep.space_id.clone(),
+            content: continuation.content,
+            model: prep.model.clone(),
+            input_tokens,
+            output_tokens,
+            credits_charged: prep.total_credits as i64,
+            response_action_id,
+            declined: None,
+            truncated: true,
+            continuable: false,
+        };
+        if result.response_action_id.is_none() {
+            return Ok(result);
+        }
+        self.finish_turn(result).await
     }
 
     /// One round of the blocking turn loop: send the request, read the JSON
@@ -6607,36 +9152,67 @@ impl Inner {
             self.bus.emit(Change::Space(space_for_emit.clone()));
         };
 
-        let request_body_json = prep.request_body(false);
+        // A backend that answers chat only as a stream is asked for one, and
+        // its answer is assembled into the body this round reads
+        // (`whole_answer`).
+        let request_body_json = prep.request_body(prep.whole.streams());
         let request_at = now_ms();
 
         // Send the chat request. On failure, attempt refund recovery before
         // propagating the error so the credential isn't abandoned. Local
         // turns carry no Authorization header — there is nothing to spend.
-        let mut request = prep
+        let mut post = prep
             .client
-            .post(format!("{}/v1/chat/completions", prep.base_url))
-            .json(&request_body_json);
-        if let Some(auth_value) = &prep.auth_value {
-            request = request.header("Authorization", auth_value);
+            .post(format!("{}/v1/chat/completions", prep.base_url));
+        if prep.whole.streams() {
+            post = post.header("Accept", "text/event-stream");
         }
-        let chat_result = request.send().await;
-        let response_at = now_ms();
+        let mut request = prep.with_body(post, &request_body_json);
+        request = with_authorization(request, prep.external_auth.as_deref());
+        let chat_result = prep.send(request).await;
+        let response_at;
 
-        let (status, response_text, body) = match chat_result {
+        let (status, response_text, body, response_record) = match chat_result {
             Ok(resp) => {
                 prep.flush_new_attestations()
                     .await
                     .inspect_err(|_| emit_user_turn())?;
 
                 let status = resp.status();
-                let text = resp
-                    .text()
-                    .await
-                    .map_err(|e| AppError::Network {
-                        message: format!("failed to read response: {e}"),
-                    })
-                    .inspect_err(|_| emit_user_turn())?;
+                // **Bounded as it arrives** (`peer_read`'s class rule), and an
+                // answer that did not arrive whole — a read that failed, or a
+                // stream cut short — is a failure of an exchange that
+                // happened: the hold settles on the refunds it delivered (or
+                // recovery for their absence) and the Record keeps the row,
+                // with the failure as its error, as the streaming twin keeps a
+                // cut stream's.
+                let whole = prep
+                    .whole
+                    .read(resp, peer_read::MAX_RESPONSE_BYTES, &prep.backend_id)
+                    .await;
+                // The answer has arrived only now: an assembled one opens
+                // when generation starts and is read for as long as it runs.
+                response_at = now_ms();
+                let (answer, response_record) = match whole {
+                    Ok(whole_answer::Answer { body, record }) => (body, record),
+                    Err(failure) => {
+                        let e = failure.error;
+                        prep.settle(failure.refund.as_ref()).await;
+                        prep.insert_unattached_request(
+                            &request_body_json,
+                            request_at,
+                            now_ms(),
+                            status.as_u16(),
+                            failure.record,
+                            Some(e.to_string()),
+                        )
+                        .await?;
+                        self.bus.emit(Change::Space(prep.space_id.clone()));
+                        self.bus.emit(Change::Record);
+                        return Err(e);
+                    }
+                };
+                let text = answer.text().into_owned();
                 // **The status classifies the response, not the body shape.**
                 // A non-2xx body is an error document and is never required to
                 // parse: a rejection raised by the endpoint's own body
@@ -6651,19 +9227,49 @@ impl Inner {
                 // A **2xx** that is not JSON is a genuine protocol failure with
                 // no completion to read, and still fails as `Network` — with a
                 // refund recovery first, since nothing below this point runs to
-                // settle the hold this round took.
-                let parsed: serde_json::Value = match serde_json::from_str(&text) {
-                    Ok(parsed) => parsed,
-                    Err(_) if !status.is_success() => serde_json::Value::Null,
-                    Err(e) => {
-                        let _ = prep.try_refund_recovery().await;
-                        emit_user_turn();
-                        return Err(AppError::Network {
+                // settle the hold this round took, and the exchange recorded
+                // with the refusal as its error.
+                //
+                // **And a body the ceiling stopped is refused whatever it parses
+                // as.** A complete object followed by enough whitespace to cross
+                // the ceiling parses perfectly, so `over_ceiling` — this app's own
+                // decision to stop reading — is asked *before* the parse rather
+                // than inferred from it (the `whole_text` rule, `peer_read`).
+                //
+                // The ceiling decides **whatever the status**: the lenient
+                // reading of a non-2xx error document below is for a body that
+                // arrived whole, and a fragment is not one.
+                let parsed = if answer.over_ceiling {
+                    Err(peer_read::answer_past_ceiling(&prep.backend_id))
+                } else {
+                    serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+                        AppError::Network {
                             message: format!("failed to parse response JSON: {e}"),
-                        });
+                        }
+                    })
+                };
+                let parsed: serde_json::Value = match parsed {
+                    Ok(parsed) => parsed,
+                    Err(_) if !status.is_success() && !answer.over_ceiling => {
+                        serde_json::Value::Null
+                    }
+                    Err(refusal) => {
+                        prep.settle(None).await;
+                        prep.insert_unattached_request(
+                            &request_body_json,
+                            request_at,
+                            response_at,
+                            status.as_u16(),
+                            response_record,
+                            Some(refusal.to_string()),
+                        )
+                        .await?;
+                        self.bus.emit(Change::Space(prep.space_id.clone()));
+                        self.bus.emit(Change::Record);
+                        return Err(refusal);
                     }
                 };
-                (status, text, parsed)
+                (status, text, parsed, response_record)
             }
             Err(e) => {
                 // Network error — the server may or may not have received the
@@ -6685,7 +9291,7 @@ impl Inner {
         // spend, hence nothing to refund. A tool round settles its own hold
         // here, before the next round acquires a fresh one.
         if prep.spend.is_some() {
-            match body.get("refund") {
+            match inline_refund(&body) {
                 Some(refund_obj) => {
                     prep.process_refund_obj(refund_obj)
                         .await
@@ -6695,6 +9301,27 @@ impl Inner {
                     let _ = prep.try_refund_recovery().await;
                 }
             }
+        }
+
+        // **A refused declaration is not an answer.** The engine computed
+        // nothing; the exchange is recorded, the hold settled above, and the
+        // loop sends the round again without the declaration. Nothing is
+        // written at the semantic layer, so the retry can still write the
+        // turn's answer.
+        if !status.is_success()
+            && let Some(refused) = prep.declared_prefix_refusal(status, &body, &response_text)
+        {
+            prep.insert_unattached_request(
+                &request_body_json,
+                request_at,
+                response_at,
+                status.as_u16(),
+                response_record,
+                None,
+            )
+            .await?;
+            self.bus.emit(Change::Record);
+            return Ok(RoundOutcome::PrefixRefused(refused));
         }
 
         let usage = body.get("usage");
@@ -6711,16 +9338,25 @@ impl Inner {
             .and_then(|arr| arr.first())
             .and_then(|c| c.get("message"));
 
+        // Why the turn ended, as the upstream reported it — the one signal that
+        // separates "the model finished" from "the ceiling bound it".
+        let finish_reason = choice_finish_reason(&body).map(str::to_string);
+
         // Strip-on-receipt: a model that mimicked the per-message header
         // scaffolding gets that line removed before it is persisted or
-        // reported (see `strip_leading_header`).
-        let response_content = strip_leading_header(
-            message
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or(""),
-        )
-        .to_string();
+        // reported (see `strip_leading_header`). Not from the rest of an
+        // answer a continuation resumes: its first line is mid-answer.
+        let raw_content = message
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        let response_content = if prep.continues_an_answer() {
+            raw_content.to_string()
+        } else {
+            strip_leading_header(raw_content).to_string()
+        };
+        // The stored text is the generated text only if the strip took nothing.
+        let text_is_generated = response_content == raw_content;
 
         // The blocking twin of the streaming path's reasoning capture: the
         // same two non-standard spellings, on the aggregated `message` object
@@ -6749,7 +9385,8 @@ impl Inner {
                         request_at,
                         response_at,
                         status.as_u16(),
-                        response_text.as_bytes().to_vec(),
+                        response_record.clone(),
+                        None,
                     )
                     .await?;
                     self.bus.emit(Change::Space(prep.space_id.clone()));
@@ -6763,6 +9400,11 @@ impl Inner {
 
         if !tool_calls.is_empty() {
             // --- a tool round -------------------------------------------
+            // A continuation that turned into a tool call wrote its narration
+            // after the text it continued, so that is the round's narration.
+            let (response_reasoning, response_content) =
+                prep.round_text(&response_reasoning, &response_content);
+            prep.note_answered(&request_body_json, input_tokens).await;
             prep.persist_tool_call_action(
                 &tool_calls,
                 &response_reasoning,
@@ -6773,7 +9415,7 @@ impl Inner {
                 request_at,
                 response_at,
                 status.as_u16(),
-                response_text.as_bytes().to_vec(),
+                response_record.clone(),
             )
             .await?;
 
@@ -6828,13 +9470,17 @@ impl Inner {
                 status: status.as_u16(),
                 message: parse_server_error_message(&response_text),
             };
-            if self.should_degrade_tools(prep, round, &rejected) {
+            // Nor when the request continued an answer this turn is
+            // carrying: the loop writes that answer as it stood, under the
+            // turn's item.
+            if self.should_degrade_tools(prep, round, &rejected) || prep.carries_answer() {
                 prep.insert_unattached_request(
                     &request_body_json,
                     request_at,
                     response_at,
                     status.as_u16(),
-                    response_text.as_bytes().to_vec(),
+                    response_record.clone(),
+                    None,
                 )
                 .await?;
                 self.bus.emit(Change::Space(prep.space_id.clone()));
@@ -6842,6 +9488,63 @@ impl Inner {
                 return Err(rejected);
             }
         }
+
+        // The turn's ceiling verdict, read once. Reaching here means tool
+        // assembly is behind us — a round that requested tools returned above —
+        // so this is the point where the ceiling, the content and the absence
+        // of tool calls are all known and the ending can be classified. The one
+        // value answers both readers: it is written onto the `inference` row
+        // (so a reopened space still shows the mark) and returned on
+        // `ChatResult` (so the window marking the live turn cannot disagree
+        // with the row it will reload).
+        //
+        // **Every ending at the ceiling is written, whatever it holds.** An
+        // answer cut off mid-sentence, reasoning that never reached an answer,
+        // and output with nothing visible in it are one fact — the model was
+        // still going — and each is a generation a reader can continue,
+        // regenerate, or switch away from (the generation it superseded stays
+        // one step back in the switcher).
+        let truncated = stopped_at_ceiling(finish_reason.as_deref());
+        // **Continuable only when the text written is exactly what the model
+        // generated**: the engine says so of its own output (`continuable` on
+        // the ending — a parser that dropped an unfinished construct or a lossy
+        // final character makes it false, and a server that does not say so is
+        // never trusted), and this side's header strip must have taken nothing.
+        let resumable = truncated && choice_continuable(&body) == Some(true) && text_is_generated;
+        // The generation a successful continuation writes is the continued
+        // text; a refused one wrote nothing of it.
+        let (response_reasoning, response_content) = if status.is_success() {
+            prep.round_text(&response_reasoning, &response_content)
+        } else {
+            (response_reasoning, response_content)
+        };
+        if status.is_success() {
+            prep.note_answered(&request_body_json, input_tokens).await;
+            // **An answer that stopped at its ceiling is continued at once**,
+            // where the engine says it can be continued exactly and the
+            // answer is still under the model's limit.
+            if resumable && prep.continues_answer(output_tokens) {
+                prep.carry_answer(
+                    Exchange {
+                        request_body_json: &request_body_json,
+                        request_at,
+                        response_at,
+                        http_status: status.as_u16(),
+                        response_body: response_record,
+                    },
+                    input_tokens,
+                    output_tokens,
+                    response_reasoning,
+                    response_content,
+                )
+                .await?;
+                self.bus.emit(Change::Record);
+                return Ok(RoundOutcome::Continued);
+            }
+        }
+        // The answer's tokens are every request it took.
+        let input_tokens = sum_tokens(prep.answer.input_tokens, input_tokens);
+        let output_tokens = sum_tokens(prep.answer.output_tokens, output_tokens);
 
         #[cfg(feature = "test-support")]
         if prep.mechanical {
@@ -6854,15 +9557,19 @@ impl Inner {
                 } else {
                     "error"
                 },
+                truncated,
+                resumable,
                 input_tokens,
                 output_tokens,
                 &response_reasoning,
                 &response_content,
-                &request_body_json,
-                request_at,
-                response_at,
-                status.as_u16(),
-                response_text.as_bytes().to_vec(),
+                Some(Exchange {
+                    request_body_json: &request_body_json,
+                    request_at,
+                    response_at,
+                    http_status: status.as_u16(),
+                    response_body: response_record.clone(),
+                }),
             )
             .await?;
         if response_action_id.is_none() {
@@ -6879,6 +9586,8 @@ impl Inner {
                 credits_charged: prep.total_credits as i64,
                 response_action_id: None,
                 declined: None,
+                truncated,
+                continuable: false,
             }));
         }
 
@@ -6921,6 +9630,8 @@ impl Inner {
             credits_charged: prep.total_credits as i64,
             response_action_id,
             declined: None,
+            truncated,
+            continuable: false,
         }))
     }
 
@@ -6983,27 +9694,56 @@ impl Inner {
         .await
     }
 
-    /// Regenerate an inference: append a new generation of its item (agent
-    /// revise). `action_id` is any generation of the target item. Uses the
-    /// model-picker compat path (`TurnSelector::Model`), so the same agent
-    /// participant (matched by model) authors the new generation.
-    async fn regenerate(&self, action_id: &str, model: &str) -> Result<ChatResult, AppError> {
+    /// The shared front half of a regeneration, whichever transport runs it:
+    /// resolve the target item, apply the two gates (**the human's verb, on an
+    /// agent's inferred answer**), and claim the item so a second regeneration
+    /// of the same post cannot start.
+    ///
+    /// It exists so the blocking and streaming doors cannot drift: the target
+    /// resolution, the gates and the `Revise` context rule are the regeneration
+    /// contract, and a transport is only a choice of how the bytes arrive.
+    /// Returns the space, the tip to revise, and the claim — which the caller
+    /// must hold for the whole turn.
+    ///
+    /// **The tip is read under the claim, and that ordering is the whole point
+    /// of the claim.** The claim is what makes one regeneration of an item run
+    /// at a time; the tip is the thing a regeneration of that item moves. Read
+    /// before the claim, it can be superseded by the regeneration the claim is
+    /// waiting behind — and this door would then go on to acquire a credential
+    /// and spend it on a turn whose successor the durable single-successor
+    /// index (`idx_one_successor_per_action`) is already certain to reject.
+    /// That is exactly the paid loser the guard was introduced to eliminate, so
+    /// nothing that names the item's current generation may be read outside it.
+    async fn begin_regeneration(
+        &self,
+        action_id: &str,
+        refusal: &str,
+    ) -> Result<(String, String, RegenerationGuard), AppError> {
         let db_conn = self.db_conn().await?;
         let (item_id, space_id) = db::action_item_and_space(&db_conn, action_id)
             .await?
             .ok_or_else(|| AppError::NotConfigured {
                 message: format!("action not found: {action_id}"),
             })?;
-        let tip = db::current_tip_of_item(&db_conn, &space_id, &item_id)
-            .await?
-            .ok_or_else(|| AppError::Internal {
-                message: format!("item has no current generation: {item_id}"),
-            })?;
         // A regeneration is the human's verb — their picker chooses the model —
         // and it *spends*, so it takes the same gate as `post`, before any of
         // that. Reading a delegated conversation must not come with a button
         // that drives one.
         self.require_human_joined(&db_conn, &space_id).await?;
+
+        // Claimed as soon as the item is known and the space's own gate has
+        // passed. Everything below reads the item's *current* state, so it
+        // belongs on this side of the claim; both refusals below still cost
+        // nothing, and the guard's `Drop` releases the item on either.
+        #[cfg(feature = "test-support")]
+        self.pause_in_regeneration_claim_window().await;
+        let guard = RegenerationGuard::claim(&self.regenerating_items, &item_id)?;
+
+        let tip = db::current_tip_of_item(&db_conn, &space_id, &item_id)
+            .await?
+            .ok_or_else(|| AppError::Internal {
+                message: format!("item has no current generation: {item_id}"),
+            })?;
 
         // **Regeneration is "that agent, again", and it is destructive**: it
         // supersedes the tip with a fresh `inference`, and `Revise` withholds
@@ -7015,14 +9755,91 @@ impl Inner {
         // renders in the assistant slot, so a surface offering Regenerate by
         // role would offer it): the brief is the contract the room is working
         // from, and there is no attempt to repeat.
-        require_post_kind(
-            &db_conn,
-            &tip,
-            "inference",
-            "only an agent's answer can be regenerated",
-        )
-        .await?;
+        require_post_kind(&db_conn, &tip, "inference", refusal).await?;
         drop(db_conn);
+
+        Ok((space_id, tip, guard))
+    }
+
+    /// Continue an answer that stopped at its completion ceiling: a new
+    /// generation of its item, written by the participant that wrote it, whose
+    /// text is the answer's followed by what the model adds when asked to pick
+    /// up exactly where it stopped ([`ResponseMode::Continue`]).
+    ///
+    /// **It is a regeneration in everything but its context**, and takes
+    /// regeneration's door: the same target resolution (any generation of the
+    /// item names its current one), the same human gate, the same process-wide
+    /// claim — a continuation supersedes the tip as a regeneration does, so the
+    /// two must not run against one item at once, and a second press is
+    /// [`AppError::RegenerationInFlight`] before it spends — and the same kind
+    /// gate. What it adds is decided where the generation is read
+    /// (`prepare_turn`): the tip must have stopped at its ceiling, on Eidola's
+    /// backend, and its author must still answer with the model that wrote it.
+    async fn continue_stream(
+        &self,
+        action_id: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, AppError> {
+        let (space_id, tip, author, _guard) = self.begin_continuation(action_id).await?;
+        self.run_turn_stream(
+            &space_id,
+            TurnSelector::Participant(author),
+            &tip,
+            ResponseMode::Continue,
+            None,
+            &TurnDirective::default(),
+            sender,
+        )
+        .await
+    }
+
+    /// The blocking twin of [`Self::continue_stream`], as [`Self::regenerate`]
+    /// is of its streaming door: the same gates and the same context, one
+    /// JSON body.
+    async fn continue_answer(&self, action_id: &str) -> Result<ChatResult, AppError> {
+        let (space_id, tip, author, _guard) = self.begin_continuation(action_id).await?;
+        self.run_turn(
+            &space_id,
+            TurnSelector::Participant(author),
+            &tip,
+            ResponseMode::Continue,
+            None,
+            &TurnDirective::default(),
+        )
+        .await
+    }
+
+    /// Regeneration's door ([`Self::begin_regeneration`]), plus the author
+    /// of the generation it found: a continuation is written by whoever wrote
+    /// what it continues.
+    async fn begin_continuation(
+        &self,
+        action_id: &str,
+    ) -> Result<(String, String, String, RegenerationGuard), AppError> {
+        let (space_id, tip, guard) = self
+            .begin_regeneration(action_id, "only an agent's answer can be continued")
+            .await?;
+        // Asked here as well as in `prepare_turn`, so an author who has left
+        // the space is refused as what it is — an answer this door cannot
+        // continue — rather than as a participant resolution failing later.
+        let db_conn = self.db_conn().await?;
+        let author = continuation_basis(&db_conn, &space_id, &tip)
+            .await?
+            .ok_or_else(|| AppError::WrongPostKind {
+                message: "this answer cannot be continued".into(),
+            })?
+            .participant_id;
+        Ok((space_id, tip, author, guard))
+    }
+
+    /// Regenerate an inference: append a new generation of its item (agent
+    /// revise). `action_id` is any generation of the target item. Uses the
+    /// model-picker compat path (`TurnSelector::Model`), so the same agent
+    /// participant (matched by model) authors the new generation.
+    async fn regenerate(&self, action_id: &str, model: &str) -> Result<ChatResult, AppError> {
+        let (space_id, tip, _guard) = self
+            .begin_regeneration(action_id, "only an agent's answer can be regenerated")
+            .await?;
         self.run_turn(
             &space_id,
             TurnSelector::Model(model.to_string()),
@@ -7030,6 +9847,61 @@ impl Inner {
             ResponseMode::Revise,
             None,
             &TurnDirective::default(),
+        )
+        .await
+    }
+
+    /// Wait until no regeneration is running against `item_id` — the other half
+    /// of the claim, read from outside.
+    ///
+    /// Resolves immediately when the item is not claimed, so a caller that asks
+    /// after the release has already happened is not left waiting for an event
+    /// that is over. Otherwise it holds until the guard drops, **however the
+    /// turn ended**: the sender's liveness is the claim, so a success, a
+    /// network error, a refusal and a panicked task all release and announce in
+    /// the same act.
+    async fn regeneration_settled(&self, item_id: &str) {
+        let subscription = {
+            let registry = self
+                .regenerating_items
+                .lock()
+                .expect("regeneration registry lock poisoned");
+            registry.get(item_id).map(|tx| tx.subscribe())
+        };
+        if let Some(mut rx) = subscription {
+            // `Ok` cannot happen — nothing ever sends on this channel — so the
+            // wait ends exactly when the sender is dropped.
+            let _ = rx.changed().await;
+        }
+    }
+
+    /// Streaming twin of [`Self::regenerate`] — the same target resolution, the
+    /// same gates, the same claim and the same `Revise` context rule, sending
+    /// `stream: true` and forwarding each delta to `sender`.
+    ///
+    /// It exists because a regeneration is a *model request*, and a model
+    /// request that shows nothing until it lands is indistinguishable from a
+    /// button that does nothing — a reasoning model can spend twenty minutes
+    /// there. Every visible affordance a surface can offer while a turn runs
+    /// (the thinking disclosure, the arriving answer) needs the deltas, and
+    /// only this door has them.
+    async fn regenerate_stream(
+        &self,
+        action_id: &str,
+        model: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, AppError> {
+        let (space_id, tip, _guard) = self
+            .begin_regeneration(action_id, "only an agent's answer can be regenerated")
+            .await?;
+        self.run_turn_stream(
+            &space_id,
+            TurnSelector::Model(model.to_string()),
+            &tip,
+            ResponseMode::Revise,
+            None,
+            &TurnDirective::default(),
+            sender,
         )
         .await
     }
@@ -7042,7 +9914,7 @@ impl Inner {
     /// Reasoning shape: we accept both `delta.reasoning_content` (OpenAI-style
     /// extension used by some providers) and `delta.reasoning` (vLLM's
     /// extension). Either form is forwarded as `ReasoningDelta`. Unknown
-    /// fields are ignored — if Tinfoil's upstream uses a third spelling, the
+    /// fields are ignored — if an endpoint uses a third spelling, the
     /// thinking section will simply stay empty until we adapt.
     ///
     /// Tool-call shape: `delta.tool_calls` arrives in pieces (id and function
@@ -7060,11 +9932,14 @@ impl Inner {
     /// the v1 simplification.
     ///
     /// Refund handling differs from `run_turn` only in *where* the refund
-    /// token comes from: SSE responses have no inline body to carry it, so we
-    /// always go through the `/v1/credentials/refund` recovery endpoint
-    /// after each round's stream ends. The credential is left in
-    /// `pre_credential` state until that recovery completes, same as the
-    /// network-error path.
+    /// token comes from: the Eidola server closes a stream with a metadata
+    /// event (`eidola.chat.completion.metadata`) carrying it, ahead of
+    /// `[DONE]`, and a stream that never opened carries it in its error body.
+    /// Whichever arm the round ended on, the token the server handed over
+    /// settles the hold and the `/v1/credentials/refund` recovery endpoint is
+    /// asked only when none arrived ([`TurnPrep::settle`]) — the server's own
+    /// persistence of that token is best-effort, so the in-band copy can be
+    /// the only one there is.
     #[allow(clippy::too_many_arguments)]
     async fn run_turn_stream(
         &self,
@@ -7094,8 +9969,48 @@ impl Inner {
         ))
         .await?;
 
-        for round in 1..=MAX_TURN_ROUNDS {
+        // **A continuation's stream begins with the text it continues.** The
+        // generation being written is the target's text followed by what the
+        // model adds, so a consumer that accumulates the stream — a window
+        // drawing it in place, a terminal printing it — ends holding exactly
+        // that generation without having to find the target's text itself.
+        if let Some(continuation) = &prep.continuation {
+            if !continuation.reasoning.is_empty() {
+                let _ = sender.send(ChatStreamEvent::ReasoningDelta(
+                    continuation.reasoning.clone(),
+                ));
+            }
+            if !continuation.content.is_empty() {
+                let _ = sender.send(ChatStreamEvent::ContentDelta(continuation.content.clone()));
+            }
+        }
+
+        // A round is one answer, its continuations included (see the
+        // blocking twin).
+        let mut round = 1;
+        loop {
             let mut outcome = Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await;
+            // A refused declaration is sent once more, undeclared — answered
+            // before any stream opened, so the caller saw nothing of it.
+            if matches!(outcome, Ok(RoundOutcome::PrefixRefused(_))) {
+                if let Err(e) = self.resend_undeclared(&mut prep).await {
+                    if prep.carries_answer() {
+                        return self.write_carried_answer(&mut prep, e).await;
+                    }
+                    self.bus.emit(Change::Space(prep.space_id.clone()));
+                    return Err(e);
+                }
+                outcome = Box::pin(self.run_turn_stream_round(&mut prep, round, &sender)).await;
+            }
+            // A continuation that fails loses nothing (see the blocking twin).
+            // The caller holds every delta of the answer as written, and
+            // perhaps some of the failed request's: the result's content is
+            // the answer as written.
+            if prep.carries_answer()
+                && let Err(e) = outcome
+            {
+                return self.write_carried_answer(&mut prep, e).await;
+            }
             // Degrade-on-rejection — see the blocking twin. A rejected request
             // is answered before any SSE body, so nothing was streamed to the
             // caller and the retry is invisible to it.
@@ -7110,22 +10025,29 @@ impl Inner {
                 }
             }
             match outcome? {
-                RoundOutcome::Final(result) => {
-                    // The turn is committed and emitted; a branch that grew by
-                    // this response is summarized behind it (see [`summaries`]).
-                    self.spawn_branch_summaries(&result.space_id);
-                    return Ok(result);
+                RoundOutcome::Final(result) => return self.finish_turn(result).await,
+                RoundOutcome::ToolRound => round += 1,
+                RoundOutcome::Continued => {
+                    if let Err(e) = self.begin_next_round(&mut prep).await {
+                        return self.write_carried_answer(&mut prep, e).await;
+                    }
                 }
-                RoundOutcome::ToolRound => continue,
+                // Only a resend that declared again can be refused here,
+                // and no resend declares.
+                RoundOutcome::PrefixRefused(refused) => {
+                    if prep.carries_answer() {
+                        return self.write_carried_answer(&mut prep, refused).await;
+                    }
+                    self.bus.emit(Change::Space(prep.space_id.clone()));
+                    return Err(refused);
+                }
             }
         }
-
-        unreachable!("the tool loop returns on its last round")
     }
 
     /// One round of the streaming turn loop: send the request, pump the SSE
     /// body (forwarding content/reasoning deltas and assembling any
-    /// `tool_calls`), recover the refund, and either persist the round as a
+    /// `tool_calls`), settle the refund, and either persist the round as a
     /// tool round or persist the `inference` and finish.
     async fn run_turn_stream_round(
         &self,
@@ -7133,8 +10055,6 @@ impl Inner {
         round: usize,
         sender: &tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
     ) -> Result<RoundOutcome, AppError> {
-        use futures_util::StreamExt;
-
         // post already emitted the user turn's Space(id) + SpaceIndex; on an
         // error exit we re-signal the space (idempotent refresh). SpaceIndex is
         // post's concern, not re-emitted here.
@@ -7152,15 +10072,14 @@ impl Inner {
         let request_body_json = prep.request_body(true);
         let request_at = now_ms();
 
-        let mut request = prep
-            .client
-            .post(format!("{}/v1/chat/completions", prep.base_url))
-            .header("Accept", "text/event-stream")
-            .json(&request_body_json);
-        if let Some(auth_value) = &prep.auth_value {
-            request = request.header("Authorization", auth_value);
-        }
-        let chat_result = request.send().await;
+        let mut request = prep.with_body(
+            prep.client
+                .post(format!("{}/v1/chat/completions", prep.base_url))
+                .header("Accept", "text/event-stream"),
+            &request_body_json,
+        );
+        request = with_authorization(request, prep.external_auth.as_deref());
+        let chat_result = prep.send(request).await;
 
         let resp = match chat_result {
             Ok(resp) => {
@@ -7180,42 +10099,127 @@ impl Inner {
 
         let status = resp.status();
 
-        // Non-2xx: server returned an error body (typically JSON, not SSE).
-        // Read it normally so we can surface a useful message. (Unlike the
-        // blocking twin there is no inference action to attach — the stream
-        // never produced one — so the request row stands alone.)
-        if !status.is_success() {
-            let response_text = resp.text().await.unwrap_or_default();
-            let _ = prep.try_refund_recovery().await;
+        // **Two arms answer before any stream exists, and each can carry the
+        // round's refund in its body.** A non-2xx is an error document — the
+        // server spends the credential before it dispatches, so a stream that
+        // fails to open after the nullifier is recorded answers with a
+        // refund-bearing JSON error body (`eidola-server-gateway`'s
+        // `error_response_with_refund`). A **2xx that is not server-sent
+        // events** is a backend that ignored `stream: true` and answered a
+        // whole completion, refund and all, or an intermediary's page; parsed
+        // as SSE it yields no events, ends without `[DONE]`, and its refund is
+        // never read. Both are read whole (bounded), settle from the token
+        // their body carried, fall back to recovery for its absence, and are
+        // recorded — the shape refusal with this app's verdict as the row's
+        // error, since the upstream's `200` does not describe it. (There is no
+        // inference to attach either to — no stream produced one.)
+        //
+        // The shape check is strict when `Content-Type` is present and
+        // permissive when it is absent — see [`is_event_stream`].
+        if !status.is_success() || !is_event_stream(resp.headers()) {
+            let answer = match peer_read::read_bounded(resp, peer_read::MAX_RESPONSE_BYTES).await {
+                Ok(answer) => answer,
+                // **A body that could not be read is a read failure, not
+                // an empty answer** — defaulting it would report the
+                // upstream's status (or a shape refusal about bytes that
+                // never arrived) for what was a transport failure.
+                Err(failure) => {
+                    let e = failure.error;
+                    prep.settle(None).await;
+                    prep.insert_unattached_request(
+                        &request_body_json,
+                        request_at,
+                        now_ms(),
+                        status.as_u16(),
+                        recorded::recorded_cut_answer(&failure.partial),
+                        Some(e.to_string()),
+                    )
+                    .await?;
+                    self.bus.emit(Change::Space(prep.space_id.clone()));
+                    self.bus.emit(Change::Record);
+                    return Err(e);
+                }
+            };
+            let response_text = answer.text().into_owned();
+            // A body the ceiling stopped is never parsed (the `whole_text`
+            // rule): its refund is unreadable and recovery answers for it.
+            let inline = (!answer.over_ceiling)
+                .then(|| serde_json::from_str::<serde_json::Value>(&response_text).ok())
+                .flatten()
+                .and_then(|body| inline_refund(&body).cloned());
+            prep.settle(inline.as_ref()).await;
+            // A refused declaration is not an answer (see the blocking twin):
+            // recorded, settled, and sent again undeclared by the loop.
+            if !status.is_success() && !answer.over_ceiling {
+                let body = serde_json::from_str::<serde_json::Value>(&response_text)
+                    .unwrap_or(serde_json::Value::Null);
+                if let Some(refused) = prep.declared_prefix_refusal(status, &body, &response_text) {
+                    prep.insert_unattached_request(
+                        &request_body_json,
+                        request_at,
+                        now_ms(),
+                        status.as_u16(),
+                        recorded::recorded_answer(&answer),
+                        None,
+                    )
+                    .await?;
+                    self.bus.emit(Change::Record);
+                    return Ok(RoundOutcome::PrefixRefused(refused));
+                }
+            }
+            // The ceiling decides first, whatever the status
+            // (`peer_read::answer_past_ceiling`).
+            let failure = if answer.over_ceiling {
+                peer_read::answer_past_ceiling(&prep.backend_id)
+            } else if status.is_success() {
+                whole_answer::not_an_event_stream(&prep.backend_id, status.as_u16())
+            } else {
+                AppError::Server {
+                    status: status.as_u16(),
+                    message: parse_server_error_message(&response_text),
+                }
+            };
             prep.insert_unattached_request(
                 &request_body_json,
                 request_at,
                 now_ms(),
                 status.as_u16(),
-                response_text.as_bytes().to_vec(),
+                recorded::recorded_answer(&answer),
+                // A non-2xx read whole needs no error column: its status
+                // already says what happened, and nothing of this app's was
+                // refused. A body the ceiling stopped was refused, whatever
+                // its status.
+                (status.is_success() || answer.over_ceiling).then(|| failure.to_string()),
             )
             .await?;
             // Request row committed; Wallet was emitted at spend start (and
-            // again if refund recovery succeeded). post owns the user-turn
+            // again when the hold settled). post owns the user-turn
             // SpaceIndex.
             self.bus.emit(Change::Space(prep.space_id.clone()));
             self.bus.emit(Change::Record);
-            return Err(AppError::Server {
-                status: status.as_u16(),
-                message: parse_server_error_message(&response_text),
-            });
+            return Err(failure);
         }
 
-        // Consume the SSE body. We accumulate bytes in a small buffer and
-        // split on the SSE event boundary `\n\n`. Each event is a sequence
-        // of `field: value\n` lines; we only care about `data:` lines (the
-        // chunk JSON) and the sentinel `[DONE]`.
-        let mut byte_stream = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
+        // Consume the SSE body through the one stream reader
+        // (`whole_answer::read_events`): its bounds are the Record's
+        // retention cap, the frame ceiling, and `MAX_ASSEMBLED_STREAM_BYTES`
+        // on the stream's envelope, which is read and not held. What the
+        // deltas below assemble in memory — content, reasoning and tool calls
+        // — is held to `MAX_RESPONSE_BYTES`, as the blocking twin holds its
+        // assembled answer (`whole_answer::AnswerHold`): past it nothing more
+        // is kept or forwarded, and the stream is read to its end, where its
+        // refunds are.
+        let mut answer_hold = whole_answer::AnswerHold::under(peer_read::MAX_RESPONSE_BYTES);
         let mut full_content = String::new();
         // Strip-on-receipt for the *live* stream: what the caller watches
-        // arrive is what will be persisted (see `LeadingHeaderFilter`).
-        let mut header_filter = LeadingHeaderFilter::default();
+        // arrive is what will be persisted (see `LeadingHeaderFilter`). The
+        // rest of an answer a continuation resumes has no first line to judge.
+        let continues_an_answer = prep.continues_an_answer();
+        let mut header_filter = if continues_an_answer {
+            LeadingHeaderFilter::passing()
+        } else {
+            LeadingHeaderFilter::default()
+        };
         let mut full_reasoning = String::new();
         let mut tool_call_acc: std::collections::BTreeMap<u64, StreamingToolCall> =
             std::collections::BTreeMap::new();
@@ -7226,119 +10230,158 @@ impl Inner {
         let mut tool_call_shape_error: Option<AppError> = None;
         let mut input_tokens: Option<i64> = None;
         let mut output_tokens: Option<i64> = None;
-        let mut response_buf: Vec<u8> = Vec::new();
-        let mut finished = false;
+        // Why the stream ended, as the upstream reported it. It rides a chunk
+        // rather than a body, and providers put it on the last content-bearing
+        // chunk or on a trailing one with an empty delta — so it is read off
+        // every chunk, before the delta gate, and the last one named wins.
+        let mut finish_reason: Option<String> = None;
+        // The engine's verdict on a `length` ending (see the blocking twin).
+        let mut continuable: Option<bool> = None;
 
-        while let Some(chunk) = byte_stream.next().await {
-            let bytes = chunk
-                .map_err(|e| AppError::Network {
-                    message: format!("stream read failed: {e}"),
-                })
-                // Mid-stream read failure: the user turn is committed (the
-                // request row is not yet) — emit the user turn so other windows
-                // see it, then wrap with the space id for blank-space adoption.
-                .inspect_err(|_| emit_user_turn())?;
-            // Keep the raw bytes for the request log so we can debug
-            // upstream behaviour the same way as the non-streaming path.
-            response_buf.extend_from_slice(&bytes);
-            buf.extend_from_slice(&bytes);
-
-            while let Some(pos) = find_event_boundary(&buf) {
-                let event_bytes = buf.drain(..pos).collect::<Vec<u8>>();
-                // Drop the boundary itself (\n\n or \r\n\r\n).
-                let boundary_len = if buf.starts_with(b"\r\n\r\n") { 4 } else { 2 };
-                if buf.len() >= boundary_len {
-                    buf.drain(..boundary_len);
+        // **The refund the server closed the stream with**, if it sent one —
+        // the terminal `eidola.chat.completion.metadata` event, emitted before
+        // `[DONE]` even when the server's own persistence of that token failed
+        // (the one case recovery can never answer) — is the reader's to find.
+        let whole_answer::EventsRead {
+            raw,
+            read_error,
+            finished,
+            refund: inline_refund,
+        } = whole_answer::read_events(
+            resp,
+            &prep.backend_id,
+            peer_read::MAX_ASSEMBLED_STREAM_BYTES,
+            |json| {
+                if answer_hold.past_ceiling() {
+                    return;
                 }
-                let event_str = match std::str::from_utf8(&event_bytes) {
-                    Ok(s) => s,
-                    Err(_) => continue,
+                if let Some(usage) = json.get("usage") {
+                    if let Some(v) = usage.get("prompt_tokens").and_then(|v| v.as_i64()) {
+                        input_tokens = Some(v);
+                    }
+                    if let Some(v) = usage.get("completion_tokens").and_then(|v| v.as_i64()) {
+                        output_tokens = Some(v);
+                    }
+                }
+
+                if let Some(reason) = choice_finish_reason(json) {
+                    finish_reason = Some(reason.to_string());
+                }
+                if let Some(c) = choice_continuable(json) {
+                    continuable = Some(c);
+                }
+
+                let Some(delta) = json
+                    .get("choices")
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|c| c.get("delta"))
+                else {
+                    return;
                 };
-                for line in event_str.lines() {
-                    let line = line.trim_end_matches('\r');
-                    let Some(payload) = line.strip_prefix("data:") else {
-                        continue;
-                    };
-                    let payload = payload.trim_start();
-                    if payload == "[DONE]" {
-                        finished = true;
-                        continue;
+                if !delta.is_null() && !answer_hold.take(delta) {
+                    return;
+                }
+
+                if let Some(text) = delta.get("content").and_then(|v| v.as_str())
+                    && !text.is_empty()
+                {
+                    full_content.push_str(text);
+                    let visible = header_filter.feed(text);
+                    if !visible.is_empty() {
+                        let _ = sender.send(ChatStreamEvent::ContentDelta(visible));
                     }
-                    let json: serde_json::Value = match serde_json::from_str(payload) {
-                        Ok(v) => v,
-                        Err(_) => continue, // ignore comments/heartbeats
-                    };
+                }
 
-                    if let Some(usage) = json.get("usage") {
-                        if let Some(v) = usage.get("prompt_tokens").and_then(|v| v.as_i64()) {
-                            input_tokens = Some(v);
-                        }
-                        if let Some(v) = usage.get("completion_tokens").and_then(|v| v.as_i64()) {
-                            output_tokens = Some(v);
-                        }
-                    }
-
-                    let Some(delta) = json
-                        .get("choices")
-                        .and_then(|c| c.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|c| c.get("delta"))
-                    else {
-                        continue;
-                    };
-
-                    if let Some(text) = delta.get("content").and_then(|v| v.as_str())
+                // OpenAI o1-style ("reasoning_content") and vLLM-style
+                // ("reasoning"). Either form is forwarded as a ReasoningDelta;
+                // we tolerate providers that emit one, both, or neither.
+                for key in ["reasoning_content", "reasoning"] {
+                    if let Some(text) = delta.get(key).and_then(|v| v.as_str())
                         && !text.is_empty()
                     {
-                        full_content.push_str(text);
-                        let visible = header_filter.feed(text);
-                        if !visible.is_empty() {
-                            let _ = sender.send(ChatStreamEvent::ContentDelta(visible));
-                        }
-                    }
-
-                    // OpenAI o1-style ("reasoning_content") and vLLM-style
-                    // ("reasoning"). Either form is forwarded as a
-                    // ReasoningDelta; we tolerate providers that emit one,
-                    // both, or neither.
-                    for key in ["reasoning_content", "reasoning"] {
-                        if let Some(text) = delta.get(key).and_then(|v| v.as_str())
-                            && !text.is_empty()
-                        {
-                            full_reasoning.push_str(text);
-                            let _ = sender.send(ChatStreamEvent::ReasoningDelta(text.to_string()));
-                        }
-                    }
-
-                    // Tool calls stream in pieces; fold each delta into the
-                    // per-index accumulator (nothing is forwarded to the
-                    // caller — tool rounds are invisible pauses in v1).
-                    // Absent/null is "no calls in this chunk"; anything
-                    // non-array is structurally unusable and fails the turn
-                    // (see `read_tool_calls`), never silently ignored.
-                    match delta.get("tool_calls") {
-                        None | Some(serde_json::Value::Null) => {}
-                        Some(serde_json::Value::Array(deltas)) => {
-                            accumulate_tool_call_deltas(&mut tool_call_acc, deltas);
-                        }
-                        Some(other) => {
-                            tool_call_shape_error.get_or_insert_with(|| AppError::ToolLoop {
-                                message: format!(
-                                    "the model streamed a `tool_calls` delta that is not an \
-                                     array ({})",
-                                    json_type_name(other)
-                                ),
-                            });
-                        }
+                        full_reasoning.push_str(text);
+                        let _ = sender.send(ChatStreamEvent::ReasoningDelta(text.to_string()));
                     }
                 }
-            }
 
-            if finished {
-                break;
-            }
-        }
+                // Tool calls stream in pieces; fold each delta into the
+                // per-index accumulator (nothing is forwarded to the caller —
+                // tool rounds are invisible pauses in v1). Absent/null is "no
+                // calls in this chunk"; anything non-array is structurally
+                // unusable and fails the turn (see `read_tool_calls`), never
+                // silently ignored.
+                match delta.get("tool_calls") {
+                    None | Some(serde_json::Value::Null) => {}
+                    Some(serde_json::Value::Array(deltas)) => {
+                        accumulate_tool_call_deltas(&mut tool_call_acc, deltas);
+                    }
+                    Some(other) => {
+                        tool_call_shape_error.get_or_insert_with(|| AppError::ToolLoop {
+                            message: format!(
+                                "the model streamed a `tool_calls` delta that is not an array \
+                                 ({})",
+                                json_type_name(other)
+                            ),
+                        });
+                    }
+                }
+            },
+        )
+        .await;
         let response_at = now_ms();
+
+        // **The in-band token first, recovery only for its absence** — see
+        // [`TurnPrep::settle`]. A tool round settles its hold here, before the
+        // next round's; the final `Wallet` emission below covers a successor.
+        prep.settle(inline_refund.as_ref()).await;
+
+        // A read this app stopped — a transport failure, or a ceiling — knows
+        // how far it got and not how large the response was; the seal says
+        // which.
+        let response_buf = raw.seal_response(read_error.is_none());
+
+        // **A stream whose read failed is a failure of an exchange that
+        // happened**: the deltas already forwarded are partial data from a
+        // connection that died (or that this app refused to read further), the
+        // hold has settled above, and the Record keeps the raw exchange with
+        // the failure as its error. No `inference` — the upstream never claimed
+        // a completion.
+        if let Some(e) = read_error {
+            prep.insert_unattached_request(
+                &request_body_json,
+                request_at,
+                response_at,
+                status.as_u16(),
+                response_buf,
+                Some(e.to_string()),
+            )
+            .await?;
+            self.bus.emit(Change::Space(prep.space_id.clone()));
+            self.bus.emit(Change::Record);
+            return Err(e);
+        }
+
+        // **An answer past the ceiling is refused once its stream has been
+        // read to the end**, as the blocking twin refuses its assembled one:
+        // the hold has settled above from the refunds at that end, the Record
+        // keeps what its cap allows of the whole stream with the refusal as
+        // its error, and no answer is written from what was taken in.
+        if answer_hold.past_ceiling() {
+            let e = peer_read::answer_past_ceiling(&prep.backend_id);
+            prep.insert_unattached_request(
+                &request_body_json,
+                request_at,
+                response_at,
+                status.as_u16(),
+                response_buf,
+                Some(e.to_string()),
+            )
+            .await?;
+            self.bus.emit(Change::Space(prep.space_id.clone()));
+            self.bus.emit(Change::Record);
+            return Err(e);
+        }
 
         // Release whatever the live filter still held (a stream that ended
         // mid-first-line), so the caller's accumulated text ends up equal to
@@ -7353,12 +10396,60 @@ impl Inner {
         // this is the same strip applied to the accumulated text at persist
         // time — what lands in the durable trail (and in `ChatResult`) is what
         // the reader watched arrive.
-        let full_content = strip_leading_header(&full_content).to_string();
+        let (full_content, text_is_generated) = if continues_an_answer {
+            (full_content, true)
+        } else {
+            let stripped = strip_leading_header(&full_content).to_string();
+            let same = stripped == full_content;
+            (stripped, same)
+        };
 
-        // SSE carries no inline refund — always consult the recovery endpoint
-        // (best-effort; the final Wallet emission below covers a successor).
-        // A tool round settles its hold here, before the next round's.
-        let _ = prep.try_refund_recovery().await;
+        // **A stream that stopped without ever saying it was over is a
+        // transport failure, not an answer.** The body ended: no `[DONE]`, and
+        // no terminal `finish_reason` on any chunk. Nothing about that is a
+        // *completion* — the upstream never claimed one — and nothing about it
+        // is a truncation either, since no ceiling was reached; it is partial
+        // data from a connection that died, and the loop's `finished` flag was
+        // read only to break early, so the text fell through and persisted as
+        // whole.
+        //
+        // **One rule for both modes, and the revision is why it has to be this
+        // one.** `Revise` supersedes an intact answer with what it writes, so
+        // keeping transport-cut text there destroys a real answer and puts a
+        // severed one in its place. An ordinary turn could in principle keep
+        // the text behind a marker, and one is now durable (`action.truncated`)
+        // — but it is not this ending's to set. That flag records the
+        // *upstream's own* ceiling verdict, and a connection that died issued
+        // no verdict at all; writing it here would say "the model reached its
+        // length limit" about a dropped socket — and offer to continue an
+        // answer from a point the model never stopped at. Two rules would also
+        // mean the classification depended on who asked rather than on what
+        // happened.
+        //
+        // Reported as `Network` because that is what it is, which also puts it
+        // in `DelegationFailure::Upstream` for a delegated room and leaves it
+        // retryable for a window — re-asking is the right remedy for a dropped
+        // connection. The blocking twin reads a stream it asked for through
+        // `whole_answer`, which takes this same ending for no answer; a body
+        // that ends early fails in its bounded read.
+        //
+        // `finish_reason` is checked beside `[DONE]` so a provider that ends a
+        // stream without the sentinel — the spec does not require it — is not
+        // punished for saying it was done in the other place.
+        if !finished && finish_reason.is_none() {
+            prep.insert_unattached_request(
+                &request_body_json,
+                request_at,
+                response_at,
+                status.as_u16(),
+                response_buf,
+                None,
+            )
+            .await?;
+            self.bus.emit(Change::Space(prep.space_id.clone()));
+            self.bus.emit(Change::Record);
+            return Err(whole_answer::stream_ended_unfinished());
+        }
 
         let assembled = match tool_call_shape_error {
             Some(e) => Err(e),
@@ -7373,6 +10464,7 @@ impl Inner {
                     response_at,
                     status.as_u16(),
                     response_buf,
+                    None,
                 )
                 .await?;
                 self.bus.emit(Change::Space(prep.space_id.clone()));
@@ -7383,6 +10475,10 @@ impl Inner {
 
         if !tool_calls.is_empty() {
             // --- a tool round -------------------------------------------
+            // As the blocking twin: a continued round's narration is the
+            // continued text.
+            let (full_reasoning, full_content) = prep.round_text(&full_reasoning, &full_content);
+            prep.note_answered(&request_body_json, input_tokens).await;
             prep.persist_tool_call_action(
                 &tool_calls,
                 &full_reasoning,
@@ -7425,6 +10521,44 @@ impl Inner {
         }
 
         // --- the final round ---------------------------------------------
+        // The turn's ceiling verdict, read once. Reaching here means tool
+        // assembly is behind us — a round that requested tools returned above —
+        // so this is the point where the ceiling, the content and the absence
+        // of tool calls are all known and the ending can be classified. The one
+        // value answers both readers: it is written onto the `inference` row
+        // (so a reopened space still shows the mark) and returned on
+        // `ChatResult` (so the window marking the live turn cannot disagree
+        // with the row it will reload).
+        // Every ending at the ceiling is written, whatever it holds (see the
+        // blocking twin).
+        let truncated = stopped_at_ceiling(finish_reason.as_deref());
+        let resumable = truncated && continuable == Some(true) && text_is_generated;
+        let (full_reasoning, full_content) = prep.round_text(&full_reasoning, &full_content);
+        prep.note_answered(&request_body_json, input_tokens).await;
+        // An answer that stopped at its ceiling is continued at once (see
+        // the blocking twin). The caller has every delta so far, and the next
+        // request's deltas follow them.
+        if resumable && prep.continues_answer(output_tokens) {
+            prep.carry_answer(
+                Exchange {
+                    request_body_json: &request_body_json,
+                    request_at,
+                    response_at,
+                    http_status: status.as_u16(),
+                    response_body: response_buf,
+                },
+                input_tokens,
+                output_tokens,
+                full_reasoning,
+                full_content,
+            )
+            .await?;
+            self.bus.emit(Change::Record);
+            return Ok(RoundOutcome::Continued);
+        }
+        let input_tokens = sum_tokens(prep.answer.input_tokens, input_tokens);
+        let output_tokens = sum_tokens(prep.answer.output_tokens, output_tokens);
+
         #[cfg(feature = "test-support")]
         if prep.mechanical {
             self.pause_in_report_persist_window().await;
@@ -7432,15 +10566,19 @@ impl Inner {
         let response_action_id = prep
             .persist_turn(
                 "complete",
+                truncated,
+                resumable,
                 input_tokens,
                 output_tokens,
                 &full_reasoning,
                 &full_content,
-                &request_body_json,
-                request_at,
-                response_at,
-                status.as_u16(),
-                response_buf,
+                Some(Exchange {
+                    request_body_json: &request_body_json,
+                    request_at,
+                    response_at,
+                    http_status: status.as_u16(),
+                    response_body: response_buf,
+                }),
             )
             .await?;
         if response_action_id.is_none() {
@@ -7454,6 +10592,8 @@ impl Inner {
                 credits_charged: prep.total_credits as i64,
                 response_action_id: None,
                 declined: None,
+                truncated,
+                continuable: false,
             }));
         }
 
@@ -7475,6 +10615,8 @@ impl Inner {
             credits_charged: prep.total_credits as i64,
             response_action_id,
             declined: None,
+            truncated,
+            continuable: false,
         }))
     }
 
@@ -7516,14 +10658,32 @@ impl Inner {
     /// → only when the post's author is human; `explicit` → never (only an
     /// explicit ask reaches them).
     ///
+    /// **A brief is never left unanswered** — the one floor under that set.
+    /// A `brief` is the opening post of a delegated room, written by the agent
+    /// that owns it, and it is the one post whose entire purpose is to be
+    /// worked on. The rules above would answer it with nobody in the room the
+    /// tool advertises most plainly: a delegation that seats no sub-agent
+    /// holds its owner alone, the owner authored the brief and an author is
+    /// excluded from its own post's notify set, so the driver would report an
+    /// untouched brief as a concluded delegation and the room would do no work
+    /// at all. So when the set over a brief comes back empty, the brief's
+    /// author takes the turn. It fires **only** when nobody else would, which
+    /// is what keeps a panel unchanged (its sub-agents are seated `all`, so
+    /// the set is never empty there, and the owner is deliberately quiet among
+    /// its helpers), and it is bounded by the shape of a brief rather than by
+    /// a counter: there is exactly one per room, written at the spawn, and
+    /// neither editable nor regenerable — so the floor can schedule at most
+    /// one turn per room, and the owner's own answer is an `inference` that
+    /// gets no floor of its own.
+    ///
     /// A **pure read** — no network, no commits, no emissions. Production
     /// callers go through [`Inner::plan_and_refine`], which additionally
     /// filters this set through the space's may-decline router.
-    async fn mechanical_plan(
+    async fn mechanical_outcome(
         &self,
         space_id: &str,
         post_action_id: &str,
-    ) -> Result<NotificationPlan, AppError> {
+    ) -> Result<MechanicalOutcome, AppError> {
         let conn = self.db_conn().await?;
 
         // The post must belong to this space: the notify set + cascade limit come
@@ -7542,10 +10702,10 @@ impl Inner {
         // depth behind `ChatResult::response_action_id` being `None` on a
         // declined turn (see [`decline`]); the guard is cheap and the failure
         // it prevents is silent.
-        match db::action_type(&conn, post_action_id).await? {
-            Some(t) if db::is_post_action_type(&t) => {}
-            _ => return Ok(NotificationPlan::Turns(Vec::new())),
-        }
+        let action_type = match db::action_type(&conn, post_action_id).await? {
+            Some(t) if db::is_post_action_type(&t) => t,
+            _ => return Ok(MechanicalOutcome::nothing()),
+        };
 
         // **An archived conversation plans no turns**, and the same read that
         // answers that carries the cascade budget — one statement for the
@@ -7557,35 +10717,36 @@ impl Inner {
         // hidden or refused a reader — it is the end of new work.
         let space = db::get_space(&conn, space_id).await?;
         if space.as_ref().is_some_and(|s| s.archived_at.is_some()) {
-            return Ok(NotificationPlan::Turns(Vec::new()));
+            return Ok(MechanicalOutcome::nothing());
         }
         let limit = space
             .map(|s| s.cascade_limit)
             .unwrap_or(DEFAULT_CASCADE_LIMIT);
         let depth = db::agent_cascade_depth(&conn, post_action_id).await?;
         if depth >= limit {
-            return Ok(NotificationPlan::Paused { depth, limit });
+            return Ok(MechanicalOutcome::paused(depth, limit));
         }
 
         // The post's author (excluded from the notify set; its kind resolves the
         // `human` predicate).
         let (author_id, author_kind) = match db::action_author(&conn, post_action_id).await? {
             Some((id, _scope, kind)) => (id, kind),
-            None => return Ok(NotificationPlan::Turns(Vec::new())),
+            None => return Ok(MechanicalOutcome::nothing()),
         };
 
+        // An agent with no model can't respond — never plan a turn for it.
+        let can_respond = |m: &db::EffectiveParticipantRow| {
+            m.kind == "agent"
+                && m.model_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|s| !s.is_empty())
+        };
+
+        let members = db::space_participants(&conn, space_id).await?;
         let mut turns = Vec::new();
-        for m in db::space_participants(&conn, space_id).await? {
-            if m.kind != "agent" || m.participant_id == author_id {
-                continue;
-            }
-            // An agent with no model can't respond — never plan a turn for it.
-            if m.model_ref
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .is_none()
-            {
+        for m in &members {
+            if !can_respond(m) || m.participant_id == author_id {
                 continue;
             }
             let fires = match m.notify_policy.as_str() {
@@ -7595,13 +10756,57 @@ impl Inner {
             };
             if fires {
                 turns.push(PlannedTurn {
-                    participant_id: m.participant_id,
+                    participant_id: m.participant_id.clone(),
                     target_action_id: post_action_id.to_string(),
                     cascade_depth: depth + 1,
                 });
             }
         }
-        Ok(NotificationPlan::Turns(turns))
+
+        // **The floor: a brief is never left unanswered.** See this method's
+        // doc comment for why — a solo delegation is a room whose only agent
+        // wrote the post, and the author exclusion above would leave it with
+        // nothing to do. The owner's own notify policy is deliberately not
+        // consulted: `spawn_subspace_tx` writes it as `human` so the agent
+        // answerable for a delegation stays quiet among its helpers, and a
+        // floor that a policy could switch off would be no floor. Everything
+        // that makes a participant unable to answer still applies.
+        //
+        // **Computed whether or not it fires**, because the set it stands aside
+        // for is not the last word: the may-decline router runs after this,
+        // "nobody" is a valid answer from it, and over a brief that answer is
+        // the room doing no work at all. So the floor travels beside the plan
+        // rather than only inside it — see [`MechanicalOutcome`].
+        let floor = (action_type == db::BRIEF_ACTION_TYPE)
+            .then(|| {
+                members
+                    .iter()
+                    .find(|m| m.participant_id == author_id && m.role == "owner" && can_respond(m))
+            })
+            .flatten()
+            .map(|owner| PlannedTurn {
+                participant_id: owner.participant_id.clone(),
+                target_action_id: post_action_id.to_string(),
+                cascade_depth: depth + 1,
+            });
+        Ok(MechanicalOutcome {
+            plan: NotificationPlan::Turns(turns),
+            floor,
+        })
+    }
+
+    /// The mechanical notify set as the rule answers it, floor folded in — see
+    /// [`Inner::mechanical_outcome`], the same computation with the floor still
+    /// separable.
+    async fn mechanical_plan(
+        &self,
+        space_id: &str,
+        post_action_id: &str,
+    ) -> Result<NotificationPlan, AppError> {
+        Ok(self
+            .mechanical_outcome(space_id, post_action_id)
+            .await?
+            .applied())
     }
 
     /// The notification plan production drives: the mechanical set
@@ -7625,7 +10830,7 @@ impl Inner {
         if planner == Planner::Driver
             && self
                 .plan_faults
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |n| n.checked_sub(1),
@@ -7657,10 +10862,34 @@ impl Inner {
                 return Ok(NotificationPlan::Turns(Vec::new()));
             }
         }
-        let plan = self.mechanical_plan(space_id, post_action_id).await?;
-        Ok(self
-            .refine_notifications(space_id, post_action_id, plan)
-            .await)
+        // **The brief floor is re-asserted after refinement, because the
+        // router can empty what the floor stood aside for.** A delegated room
+        // inherits its parent's `router_model`, and a room that seats helpers
+        // has a non-empty mechanical set — so the floor does not fire, and the
+        // router is then handed a real choice. `{"notify": []}` is a *valid*
+        // answer from it ("nobody responds"), and over a `brief` that answer is
+        // the room taking no turn at all: the driver walks a room where nothing
+        // happened and reports the untouched brief as a concluded delegation.
+        // That is precisely the silent no-work delegation the floor exists to
+        // make unrepresentable, arriving by the one door the floor did not
+        // cover.
+        //
+        // So the floor binds the *refined* plan too. It is still a floor and
+        // not a veto: the router's selection stands whenever it selected
+        // anybody, and this only replaces "nobody" with the one agent
+        // answerable for the delegation. A router cannot switch it off for the
+        // same reason a notify policy cannot.
+        let outcome = self.mechanical_outcome(space_id, post_action_id).await?;
+        let floor = outcome.floor.clone();
+        let refined = self
+            .refine_notifications(space_id, post_action_id, outcome.applied())
+            .await;
+        Ok(match (refined, floor) {
+            (NotificationPlan::Turns(t), Some(floor)) if t.is_empty() => {
+                NotificationPlan::Turns(vec![floor])
+            }
+            (refined, _) => refined,
+        })
     }
 
     /// The composer CTA path: save a post (`post`), then plan + refine over it
@@ -7688,19 +10917,172 @@ impl Inner {
     }
 }
 
-/// Find the byte offset of the next SSE event boundary (`\n\n` or
-/// `\r\n\r\n`) in `buf`, if any. Returns the position *before* the boundary
-/// — i.e. the length of the next event's body.
-fn find_event_boundary(buf: &[u8]) -> Option<usize> {
+/// The length of the SSE line terminator starting at `i`, or `None` if none
+/// starts there.
+///
+/// The event-stream format takes three line endings — `\r\n`, `\n` and a bare
+/// `\r` — and treats any two in a row as the blank line that ends an event.
+///
+/// **A `\r` at the very end of `buf` is read as a terminator, and the residual
+/// is stated rather than avoided.** It is genuinely ambiguous — it may be the
+/// first half of a `\r\n` the next chunk carries, the classic split-across-
+/// chunk-edges trap — but the two ways of resolving it are not symmetric.
+/// Waiting for the byte that decides it strands the **last** event of any
+/// `\r`-terminated stream, which is exactly `[DONE]`: the read reaches EOF with
+/// the terminator still unresolved and the turn reports a stream that ended
+/// without finishing. Reading it eagerly splits `\r\r` out of a stream that
+/// really said `\r\r\n` and leaves a stray `\n` heading the next event — which
+/// **both** consumers already tolerate: the proxy forwards each event with the
+/// terminator it consumed, so the bytes a downstream parser sees are unchanged
+/// in total, and the turn path's field walk skips a line carrying no `data:`
+/// prefix. A harmless mis-split beats a lost completion.
+fn terminator_len(buf: &[u8], i: usize) -> Option<usize> {
+    match buf.get(i)? {
+        b'\r' if buf.get(i + 1) == Some(&b'\n') => Some(2),
+        b'\r' | b'\n' => Some(1),
+        _ => None,
+    }
+}
+
+/// Find the next SSE event boundary in `buf`: the offset *before* it (the
+/// length of the next event's body) and the boundary's own length.
+///
+/// **Every valid line ending, not the two that are common.** Recognising only
+/// `\n\n` and `\r\n\r\n` meant a backend emitting bare-`\r` SSE — valid, and
+/// what the format explicitly allows — never split at all: its events piled
+/// into one frame until the per-event ceiling rejected the stream or EOF
+/// forwarded the whole tail at once, so nothing streamed and no per-event
+/// rewriting happened. The boundary's length is returned rather than
+/// re-derived, since it is now 2, 3 or 4 bytes depending on which pair of
+/// terminators was found.
+fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
     for i in 0..buf.len() {
-        if buf[i..].starts_with(b"\r\n\r\n") {
-            return Some(i);
-        }
-        if buf[i..].starts_with(b"\n\n") {
-            return Some(i);
-        }
+        let Some(first) = terminator_len(buf, i) else {
+            continue;
+        };
+        let Some(second) = terminator_len(buf, i + first) else {
+            continue;
+        };
+        return Some((i, first + second));
     }
     None
+}
+
+/// Split one SSE event's text into its fields: each line with the terminator
+/// that ended it, `""` for a final line the event ended without one.
+///
+/// **The same scanner that separates events separates their fields.** An event
+/// is a run of lines, and the format's line endings are the format's line
+/// endings in both places — but `str::lines()` knows only `\n` and `\r\n`, so a
+/// bare-`\r` event arrived as a single line: `id: 1\rdata: {…}` has no `data:`
+/// prefix, so the payload inside it was invisible to both consumers. Splitting
+/// events correctly and then parsing their fields the old way cures half a
+/// defect and hides the other half, because the failure is now silent instead
+/// of loud — the proxy stops rewriting the model name and, worse, stops finding
+/// the refund that settles a spent credential; the turn path drops the deltas
+/// and never sees `[DONE]`.
+///
+/// Terminators are returned rather than normalized so a caller rebuilding an
+/// event emits the bytes the sender chose. Every terminator byte is ASCII, so
+/// the slice boundaries are always char boundaries.
+fn split_event_lines(text: &str) -> Vec<(&str, &str)> {
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let (mut start, mut i) = (0, 0);
+    while i < bytes.len() {
+        match terminator_len(bytes, i) {
+            Some(len) => {
+                lines.push((&text[start..i], &text[i..i + len]));
+                i += len;
+                start = i;
+            }
+            None => i += 1,
+        }
+    }
+    if start < bytes.len() {
+        lines.push((&text[start..], ""));
+    }
+    lines
+}
+
+/// The value of one `data:` field line, or `None` for any other field.
+///
+/// The format strips exactly **one** space after the colon, and a bare `data`
+/// line (no colon at all) is a data field with an empty value.
+fn sse_data_field(line: &str) -> Option<&str> {
+    if line == "data" {
+        return Some("");
+    }
+    let value = line.strip_prefix("data:")?;
+    Some(value.strip_prefix(' ').unwrap_or(value))
+}
+
+/// An SSE event's data: every `data:` field's value, **joined with `\n`**, or
+/// `None` when the event has no data field at all.
+///
+/// **An event has one data value, not one per line.** The format says so — a
+/// sender may split a payload across as many `data:` fields as it likes and the
+/// receiver joins them back — so parsing each field on its own read a valid
+/// split JSON payload as several fragments that are each not JSON. Nothing
+/// failed loudly: the turn path dropped the delta, and the proxy forwarded the
+/// event untouched, which skipped the model rewrite and, on the metadata event,
+/// lost the refund that settles a spent credential. Both consumers assemble the
+/// value here once and parse it once.
+fn sse_event_data(event: &str) -> Option<String> {
+    let mut data: Option<String> = None;
+    for (line, _) in split_event_lines(event) {
+        let Some(value) = sse_data_field(line) else {
+            continue;
+        };
+        match data.as_mut() {
+            Some(joined) => {
+                joined.push('\n');
+                joined.push_str(value);
+            }
+            None => data = Some(value.to_string()),
+        }
+    }
+    data
+}
+
+/// Whether a server-sent event is **padding**: nothing but comment lines
+/// (`:` …) and empty lines, so it dispatches nothing and names nothing.
+///
+/// The Eidola server fills the fixed-size frames it streams with such events
+/// (and axum's keep-alive is one). They are already ignored by every reader
+/// here — no `data:` field, no payload — and this names them so the Record and
+/// the read ceiling can leave them out ([`recorded::RecordedBody::push_event`]).
+/// An event carrying any other field (`id:`, `event:`, `retry:`) is not padding.
+pub(crate) fn is_padding_event(event: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(event) else {
+        return false;
+    };
+    split_event_lines(text)
+        .iter()
+        .all(|(line, _)| line.is_empty() || line.starts_with(':'))
+}
+
+/// Whether a response's own headers say it is server-sent events.
+///
+/// The media type only — parameters (`; charset=utf-8`) are the sender's
+/// business — and an **absent** header answers `true`, which is the permissive
+/// half of the rule each streaming transport states at its shape check: the
+/// shapes it exists for (a JSON completion, an HTML error page) both name a
+/// content type, while a compliant SSE server always sets one.
+pub(crate) fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
+    let Some(value) = headers.get(reqwest::header::CONTENT_TYPE) else {
+        return true;
+    };
+    value
+        .to_str()
+        .map(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        })
+        .unwrap_or(false)
 }
 
 // ============================================================================
@@ -7720,6 +11102,35 @@ pub struct AppCore {
 impl AppCore {
     pub fn runtime(&self) -> &tokio::runtime::Runtime {
         &self.runtime
+    }
+
+    /// The data directory this core opened — where the database, its lockfile
+    /// and anything else belonging to *this* profile live.
+    ///
+    /// Exposed because the process holding the single-writer lock is also the
+    /// one that answers for the profile ([`crate::ipc`]), and the socket it
+    /// listens on has to be the one belonging to the profile it actually
+    /// opened, not one recomputed from configuration that may have moved.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.inner.data_dir
+    }
+
+    /// The config root this core composes its profile from — the directory
+    /// holding `config.toml`.
+    ///
+    /// A profile is the *pair* of roots, and the two are resolved from
+    /// independent environment variables, so the data directory alone does
+    /// not name it. Exposed for the same reason as [`AppCore::data_dir`]: the
+    /// process answering for the profile ([`crate::ipc`]) has to be able to
+    /// state which profile that is.
+    pub fn config_dir(&self) -> &std::path::Path {
+        // Always `<config_dir>/config.toml`, so the parent always exists as a
+        // path; the fallback keeps the accessor total rather than panicking
+        // over a shape this type constructs itself.
+        self.inner
+            .config_path
+            .parent()
+            .unwrap_or(&self.inner.config_path)
     }
 
     /// Register a tool the turn loop may call (see [`tools`]).
@@ -8175,6 +11586,90 @@ impl AppCore {
         Self::build(config_dir, data_dir, Some(client))
     }
 
+    /// **Test-only seam.** Treat the eidola backend as though it were reached
+    /// at this build's compiled-in pin, so its published capabilities count as
+    /// a declaration rather than a hint.
+    ///
+    /// A test necessarily points the client at a mock over a base-URL
+    /// override, and an override is exactly what makes a declaration
+    /// untrustworthy in production. Without this seam the declared half of the
+    /// precedence rule could never be exercised end to end. Feature-gated like
+    /// the attestation bypass beside it, for the same reason: a release build
+    /// must contain no way to widen what counts as our own catalog.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn trust_declared_capabilities_for_test(&self, trusted: bool) {
+        self.inner
+            .trust_declared_capabilities
+            .store(trusted, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// **Test-only seam.** Every lineage that holds a prefix-cache key, as
+    /// `(space, participant, generation, created_at, last_used_at)` — the row's
+    /// lifecycle without the secret, which no seam hands out.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub async fn test_prefix_cache_lineages(
+        &self,
+    ) -> Result<Vec<(String, String, i64, i64, i64)>, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                let conn = inner.db_conn().await?;
+                db::prefix_cache_lineages(&conn).await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// **Test-only seam.** Move the clock the prefix-cache rotation rule reads
+    /// by `delta_ms` (negative sets it back). Cumulative. Nothing else reads
+    /// this offset, so posts, requests and every other stamp keep real time.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_advance_cache_clock(&self, delta_ms: i64) {
+        self.inner
+            .cache_clock
+            .offset_ms
+            .fetch_add(delta_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// **Test-only seam.** Make the prefix-cache key cleanup that rides an
+    /// eidola configuration write fail (`true`) or succeed again (`false`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_fail_cache_key_cleanup(&self, fail: bool) {
+        self.inner
+            .fail_cache_key_cleanup
+            .store(fail, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// **Test-only seam.** Check issuer key windows against `calendar` instead
+    /// of the production one, so a test can put a key's deadlines seconds
+    /// from now and still be on a calendar.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_set_issuer_calendar(&self, calendar: IssuerCalendar) {
+        *self
+            .inner
+            .issuer_calendar
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = calendar;
+    }
+
+    /// **Test-only seam.** Advance the prefix-cache clock by `delta_ms` each
+    /// time a turn hands a request to the transport — after the request is
+    /// built, before the connection is set up — modelling a slow connection,
+    /// a slow attestation, or a process suspended in between. `0` stops it.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_delay_cache_clock_at_each_send(&self, delta_ms: i64) {
+        self.inner
+            .cache_clock
+            .delay_at_send_ms
+            .store(delta_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn build(
         config_dir: PathBuf,
         data_dir: PathBuf,
@@ -8199,17 +11694,42 @@ impl AppCore {
             inner: Arc::new_cyclic(|self_ref| Inner {
                 self_ref: self_ref.clone(),
                 config_path: config_dir.join("config.toml"),
+                config_write: Mutex::new(()),
                 data_dir,
                 db: tokio::sync::OnceCell::new(),
-                update_state: Mutex::new(None),
+                update_state: Mutex::new(UpdateStateCell::default()),
+                update_checks_started: std::sync::atomic::AtomicU64::new(0),
                 update_polling: std::sync::atomic::AtomicBool::new(false),
                 bus,
                 local: Arc::new(local_models::LocalRuntime::default()),
                 spend_gate: tokio::sync::Mutex::new(()),
+                issuance_gate: tokio::sync::Mutex::new(()),
+                spend_recovery_gate: tokio::sync::Mutex::new(()),
+                provisioner_started: std::sync::atomic::AtomicBool::new(false),
+                provision_check_ms: Mutex::new((
+                    duration_ms(PROVISION_CHECK_MIN) as u64,
+                    duration_ms(PROVISION_CHECK_MAX) as u64,
+                )),
+                issuance_request_timeout_ms: std::sync::atomic::AtomicU64::new(duration_ms(
+                    ISSUANCE_REQUEST_TIMEOUT,
+                )
+                    as u64),
+                provision_wait_ms: std::sync::atomic::AtomicU64::new(duration_ms(
+                    PROVISION_WAIT_TIMEOUT,
+                ) as u64),
+                issuance_settle_ms: std::sync::atomic::AtomicU64::new(duration_ms(
+                    ISSUANCE_SETTLE_AGE,
+                ) as u64),
+                live_spends: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                backend_config_gates: Mutex::new(std::collections::HashMap::new()),
+                #[cfg(feature = "test-support")]
+                backend_config_pause: Mutex::new(None),
+                model_catalog: std::sync::RwLock::new(model_catalog::CATALOG),
                 subspace_driver_started: std::sync::atomic::AtomicBool::new(false),
                 subspace_drivers: Mutex::new(std::collections::HashMap::new()),
                 subspace_walks: Mutex::new(std::collections::HashMap::new()),
                 rooms_spawned_here: Mutex::new(Some(std::collections::HashSet::new())),
+                regenerating_items: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 walk_permits: Arc::new(tokio::sync::Semaphore::new(
                     subspace_driver::MAX_CONCURRENT_WALKS,
                 )),
@@ -8224,6 +11744,14 @@ impl AppCore {
                 entry_window: Mutex::new(None),
                 #[cfg(feature = "test-support")]
                 persist_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                claim_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                proxy_resolve_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                proxy_authorized_window: Mutex::new(None),
+                #[cfg(feature = "test-support")]
+                proxy_planted_handshake: Mutex::new(None),
                 ordinary_spaces: Mutex::new(std::collections::HashSet::new()),
                 #[cfg(feature = "test-support")]
                 plan_faults: std::sync::atomic::AtomicU32::new(0),
@@ -8239,6 +11767,13 @@ impl AppCore {
                 tool_incapable_models: std::sync::RwLock::new(std::collections::HashSet::new()),
                 #[cfg(feature = "test-support")]
                 http_override,
+                #[cfg(feature = "test-support")]
+                trust_declared_capabilities: std::sync::atomic::AtomicBool::new(false),
+                cache_clock: CacheClock::default(),
+                #[cfg(feature = "test-support")]
+                fail_cache_key_cleanup: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(feature = "test-support")]
+                issuer_calendar: Mutex::new(ISSUER_CALENDAR),
                 _db_lock: db_lock,
             }),
         })
@@ -8336,6 +11871,24 @@ impl AppCore {
         }
     }
 
+    /// The name of the credential pair this profile holds **right now**, or
+    /// `None` when no account is configured
+    /// ([`config::account_fingerprint`]).
+    ///
+    /// Read from the config file on every call, because the question it
+    /// answers is about *now*: anything checking whether a minted link still
+    /// belongs here has to read past every cached copy, since a cache
+    /// refreshed after the fact is the stale answer the check exists to
+    /// catch. Synchronous and lock-free, so a caller landing a round trip on
+    /// its own thread can take it on the spot.
+    ///
+    /// The **pair**, not the account id: a profile can be reset and
+    /// reconfigured with the same id under a different secret, and an
+    /// id-only answer calls those two the same thing.
+    pub fn account_fingerprint(&self) -> Option<String> {
+        config::account_fingerprint(&self.inner.load_config())
+    }
+
     /// The transitional resolved default inference model (see the
     /// `default_model` note in the docs): the default template's first agent
     /// participant's `model_ref`, falling back to [`config::DEFAULT_MODEL`].
@@ -8396,9 +11949,10 @@ impl AppCore {
                 message: "default template id must not be empty".into(),
             });
         }
-        let mut cfg = self.inner.load_config();
-        cfg.default_template_override = Some(template_id);
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            cfg.default_template_override = Some(template_id);
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         self.bus.emit(Change::Templates);
         Ok(())
@@ -8408,9 +11962,10 @@ impl AppCore {
     /// override): `system` tracks the OS appearance, `day`/`night` pin one
     /// palette family, `auto` switches on the system clock.
     pub fn set_appearance(&self, appearance: config::AppearanceSetting) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.appearance_override = Some(appearance);
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            cfg.appearance_override = Some(appearance);
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         Ok(())
     }
@@ -8419,9 +11974,10 @@ impl AppCore {
     /// config override): whether the palette takes on the character of the
     /// light at the current hour, or stays on the neutral palettes.
     pub fn set_time_of_day_tint(&self, tint: config::TimeOfDayTint) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.time_of_day_tint_override = Some(tint);
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            cfg.time_of_day_tint_override = Some(tint);
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         Ok(())
     }
@@ -8430,9 +11986,10 @@ impl AppCore {
     /// override) the palettes render under while the time-of-day axis is
     /// `off`.
     pub fn set_light_character(&self, character: config::LightCharacter) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.light_character_override = Some(character);
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            cfg.light_character_override = Some(character);
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         Ok(())
     }
@@ -8444,9 +12001,10 @@ impl AppCore {
     /// pre-validating. Emits [`Change::Config`] so every window's theme
     /// re-applies.
     pub fn set_font_scale(&self, scale: f32) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.font_scale_override = Some(config::clamp_font_scale(scale));
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            cfg.font_scale_override = Some(config::clamp_font_scale(scale));
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         Ok(())
     }
@@ -8458,11 +12016,12 @@ impl AppCore {
     /// what a tag resolves to and what an unrecognized one falls back to.
     /// Emits [`Change::Config`] so every window re-reads it.
     pub fn set_language(&self, language: Option<String>) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.language_override = language
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty());
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            cfg.language_override = language
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty());
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         Ok(())
     }
@@ -8471,9 +12030,10 @@ impl AppCore {
     /// used for local inference. When unset, the binary is discovered on
     /// `PATH` and in the usual install locations.
     pub fn set_llama_server_path(&self, path: Option<String>) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.llama_server_path_override = path.filter(|p| !p.trim().is_empty());
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            cfg.llama_server_path_override = path.filter(|p| !p.trim().is_empty());
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         Ok(())
     }
@@ -8546,15 +12106,16 @@ impl AppCore {
     }
 
     /// Add a trusted enclave measurement to the eidola backend row's override
-    /// list. Returns whether it was newly added (idempotent by SNP
-    /// measurement). Emits [`Change::Backends`] when it writes.
+    /// list: a SEV-SNP launch digest, the HOST_DATA (config hash) beside it,
+    /// and the guest policy. Returns whether it was newly added (idempotent
+    /// by digest and HOST_DATA). Emits [`Change::Backends`] when it writes.
     pub async fn trust_measurement(
         &self,
-        snp: String,
-        tdx_rtmr1: String,
-        tdx_rtmr2: String,
+        measurement: String,
+        host_data: String,
+        guest_policy: String,
     ) -> Result<bool, AppError> {
-        let spec = format!("{snp}:{tdx_rtmr1}:{tdx_rtmr2}");
+        let spec = format!("{measurement}:{host_data}:{guest_policy}");
         let entry = config::parse_trust_measurement(&spec)?;
         let inner = self.inner.clone();
         self.runtime
@@ -8563,11 +12124,12 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    /// Remove a trusted measurement (by SNP key) from the eidola backend
-    /// row's override list. Returns whether one was removed; clearing the
-    /// last reverts to the pin. Emits [`Change::Backends`] when it writes.
-    pub async fn untrust_measurement(&self, snp: String) -> Result<bool, AppError> {
-        let key = config::parse_untrust_key(&snp)?;
+    /// Remove a trusted measurement (by its `<measurement>:<host_data>` key,
+    /// or its whole trust spec) from the eidola backend row's override list.
+    /// Returns whether one was removed; clearing the last reverts to the
+    /// pin. Emits [`Change::Backends`] when it writes.
+    pub async fn untrust_measurement(&self, key: String) -> Result<bool, AppError> {
+        let key = config::parse_untrust_key(&key)?;
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.untrust_measurement(key).await })
@@ -8601,25 +12163,26 @@ impl AppCore {
     }
 
     pub fn set_account_credentials(&self, id: String, secret: String) -> Result<(), AppError> {
-        let cfg = self.inner.load_config();
-        if cfg.account_id.is_some() || cfg.account_secret.is_some() {
-            return Err(AppError::Config {
-                message: "account credentials already configured — reset first".into(),
-            });
-        }
-        let mut cfg = cfg;
-        cfg.account_id = Some(id);
-        cfg.account_secret = Some(secret);
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            if cfg.account_id.is_some() || cfg.account_secret.is_some() {
+                return Err(AppError::Config {
+                    message: "account credentials already configured — reset first".into(),
+                });
+            }
+            cfg.account_id = Some(id);
+            cfg.account_secret = Some(secret);
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         Ok(())
     }
 
     pub fn reset_account(&self) -> Result<(), AppError> {
-        let mut cfg = self.inner.load_config();
-        cfg.account_id = None;
-        cfg.account_secret = None;
-        cfg.save_to(&self.inner.config_path)?;
+        self.inner.update_config(|cfg| {
+            cfg.account_id = None;
+            cfg.account_secret = None;
+            Ok(())
+        })?;
         self.bus.emit(Change::Config);
         Ok(())
     }
@@ -8717,6 +12280,139 @@ impl AppCore {
             .spawn(async move { subspace_driver::supervise(inner, bus).await });
     }
 
+    /// Start the **ahead-of-need credential provisioner** in this process.
+    ///
+    /// When a request needs a credential and none covers it, the provisioning
+    /// queue converts one just in time and spends it at once — so the
+    /// issuance, which the server sees with its account, is followed a moment
+    /// later by that credential's first spend, linking the two. This keeps a
+    /// small buffer instead, issued at times unrelated to any request: at
+    /// random intervals ([`PROVISION_CHECK_MIN`]..[`PROVISION_CHECK_MAX`], the
+    /// first one interval after start) it recovers any issuance whose response
+    /// was lost, and issues credentials of [`DEFAULT_ALLOCATION_CREDITS`]
+    /// ([`PROVISION_CREDENTIALS_PER_KEY`] under a key the account has not been
+    /// issued under, one more once it has them) when what the wallet can spend
+    /// past [`PROVISION_HORIZON`] is below [`PROVISION_THRESHOLD_CREDITS`]. It keeps no buffer for a wallet that
+    /// has not spent within [`PROVISION_ACTIVITY_WINDOW`], issues nothing
+    /// without an account, below a standard allocation of balance, or under a
+    /// key that would lapse within the horizon, and prefers a key's early life
+    /// ([`PROVISION_LATE_WINDOW`]). The just-in-time path stays as the
+    /// fallback when nothing held covers a request.
+    ///
+    /// **The same loop asks again for stranded holds**
+    /// ([`Inner::recover_stranded_spends`]): once inside each interval, at a
+    /// random point of its middle half, so the unlinked recovery of a spend
+    /// and the account-authenticated pass are never adjacent.
+    ///
+    /// **For the long-lived process only** — the app, which holds the profile
+    /// and answers for it over the control socket. A one-shot CLI invocation
+    /// does not start it: it would exit before its first look. **On by
+    /// default, with no setting**: the amounts and times are public constants,
+    /// what is held at once is bounded by the threshold plus
+    /// [`PROVISION_CREDENTIALS_PER_KEY`] allocations, an idle wallet is left alone, and turning it off would only restore the
+    /// linkable default. Idempotent — at most one loop is ever spawned.
+    pub fn start_credential_provisioner(&self) {
+        if self
+            .inner
+            .provisioner_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let inner = self.inner.clone();
+        self.runtime.spawn(async move {
+            loop {
+                let (min, max) = *inner
+                    .provision_check_ms
+                    .lock()
+                    .expect("provision timing lock poisoned");
+                let interval = provision_delay(
+                    std::time::Duration::from_millis(min),
+                    std::time::Duration::from_millis(max),
+                );
+                // The look for stranded holds is an unlinked request and the
+                // provisioner's pass an account-authenticated one, so they
+                // are kept at least a quarter of the interval apart.
+                let before_sweep = provision_delay(interval / 4, interval * 3 / 4);
+                tokio::time::sleep(before_sweep).await;
+                let _ = tokio::time::timeout(
+                    PROVISION_PASS_DEADLINE,
+                    changes::with_origin(
+                        changes::ChangeOrigin::Unattended,
+                        Box::pin(inner.sweep_stranded_spends()),
+                    ),
+                )
+                .await;
+                tokio::time::sleep(interval.saturating_sub(before_sweep)).await;
+                // Offline, signed out, a server error: each is simply another
+                // look later. Nothing here is the reader's to see.
+                // Nobody is waiting on these writes.
+                let _ = tokio::time::timeout(
+                    PROVISION_PASS_DEADLINE,
+                    changes::with_origin(
+                        changes::ChangeOrigin::Unattended,
+                        Box::pin(inner.provision_once()),
+                    ),
+                )
+                .await;
+            }
+        });
+    }
+
+    /// **Test-only seam.** One provisioner pass, now, rather than at the next
+    /// random look.
+    #[cfg(feature = "test-support")]
+    pub async fn test_provision_once(&self) -> Result<ProvisionOutcome, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { Box::pin(inner.provision_once()).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// **Test-only seam.** How old a pending issuance must be before it is
+    /// asked for again ([`ISSUANCE_SETTLE_AGE`]), so a test can recover one
+    /// without waiting ten minutes.
+    #[cfg(feature = "test-support")]
+    pub fn test_set_issuance_settle_age(&self, age: std::time::Duration) {
+        self.inner.issuance_settle_ms.store(
+            duration_ms(age) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// **Test-only seam.** The deadline on each issuance request
+    /// ([`ISSUANCE_REQUEST_TIMEOUT`]) and how long anything waits for the
+    /// issuance gate ([`PROVISION_WAIT_TIMEOUT`]), so a test can stall the
+    /// server without waiting half a minute.
+    #[cfg(feature = "test-support")]
+    pub fn test_set_issuance_timeouts(
+        &self,
+        request: std::time::Duration,
+        gate_wait: std::time::Duration,
+    ) {
+        self.inner.issuance_request_timeout_ms.store(
+            duration_ms(request) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.inner.provision_wait_ms.store(
+            duration_ms(gate_wait) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// **Test-only seam.** The bounds the provisioner draws its look interval
+    /// from, so a test can watch the loop act inside a short window.
+    #[cfg(feature = "test-support")]
+    pub fn test_set_provision_interval(&self, min: std::time::Duration, max: std::time::Duration) {
+        *self
+            .inner
+            .provision_check_ms
+            .lock()
+            .expect("provision timing lock poisoned") =
+            (duration_ms(min) as u64, duration_ms(max) as u64);
+    }
+
     // -----------------------------------------------------------------------
     // Async methods — spawn onto the owned tokio runtime
     // -----------------------------------------------------------------------
@@ -8729,10 +12425,17 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    pub async fn account_create(&self) -> Result<AccountCreateResult, AppError> {
+    /// Create an anonymous account and record its acceptance of
+    /// `accepted_terms` — the snapshot [`AppCore::current_terms`] returned
+    /// and the caller **presented to the user**. Pass an empty list only
+    /// when nothing was required to present.
+    pub async fn account_create(
+        &self,
+        accepted_terms: Vec<TermsDocument>,
+    ) -> Result<AccountCreateResult, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.account_create().await })
+            .spawn(async move { inner.account_create(accepted_terms).await })
             .await
             .map_err(join_err)?
     }
@@ -8748,14 +12451,29 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    /// Record the user's acceptance of every currently required document
-    /// version, returning what was accepted. Callers must have presented
-    /// the documents to the user first — this transmits consent, it does
-    /// not obtain it. Routes here after [`AppError::TermsAcceptanceRequired`].
-    pub async fn accept_current_terms(&self) -> Result<Vec<TermsDocument>, AppError> {
+    /// Record the user's acceptance of `presented` — the snapshot
+    /// [`AppCore::current_terms`] returned and the caller showed the user —
+    /// and report where the account then stands with the gate.
+    ///
+    /// The snapshot travels as an argument so that consent is transmitted for
+    /// the text that was read: a document version advancing between the two
+    /// calls is answered by the server as a conflict, which the
+    /// [`AppError::TermsAcceptanceRequired`] gate then re-prompts for with
+    /// the new text. Routes here after that error.
+    ///
+    /// **`Ok` is not "nothing left to do".** Acceptance is recorded one
+    /// document at a time, so a document that became required after the
+    /// snapshot was taken is accepted by nobody and refused by no submission.
+    /// The returned [`TermsAcceptance`] is read back from the server and is
+    /// the answer to the question the purchase gate actually asks; an `Err`
+    /// means the submission itself failed.
+    pub async fn accept_terms(
+        &self,
+        presented: Vec<TermsDocument>,
+    ) -> Result<TermsAcceptance, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.accept_current_terms().await })
+            .spawn(async move { inner.accept_terms(presented).await })
             .await
             .map_err(join_err)?
     }
@@ -8768,7 +12486,7 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    pub async fn account_checkout(&self, price_id: String) -> Result<String, AppError> {
+    pub async fn account_checkout(&self, price_id: String) -> Result<CheckoutMint, AppError> {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.account_checkout(&price_id).await })
@@ -8786,9 +12504,10 @@ impl AppCore {
             .map_err(join_err)?
     }
 
-    /// A billing-portal URL to open in a browser. Minted on demand and
-    /// never held — see [`Inner::account_portal`].
-    pub async fn account_portal(&self) -> Result<String, AppError> {
+    /// A billing-portal session to open in a browser, with the identity the
+    /// mint ran under. Minted on demand and never held — see
+    /// [`Inner::account_portal`] and [`PortalMint`].
+    pub async fn account_portal(&self) -> Result<PortalMint, AppError> {
         let inner = self.inner.clone();
         self.runtime
             .spawn(async move { inner.account_portal().await })
@@ -8840,10 +12559,27 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// Ask the gateway again for the refund of every stranded hold (a
+    /// credential left `spending` that no turn here is flying with), and
+    /// return the nonces settled. Unlinked requests only: a lost issuance
+    /// response is [`Self::recover_pending_issuances`]'s, and the
+    /// provisioner's.
     pub async fn recover_spending_credentials(&self) -> Result<Vec<String>, AppError> {
         let inner = self.inner.clone();
         self.runtime
-            .spawn(async move { inner.recover_spending_credentials().await })
+            .spawn(async move { inner.recover_stranded_spends().await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// Ask again for every issuance of this account whose response never
+    /// arrived. Account-authenticated: the provisioner does this at its own
+    /// random times, and this door is for the reader's explicit instruction
+    /// in a process that runs no provisioner.
+    pub async fn recover_pending_issuances(&self) -> Result<IssuanceRecovery, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.recover_pending_issuances().await })
             .await
             .map_err(join_err)?
     }
@@ -9134,6 +12870,17 @@ impl AppCore {
     #[cfg(feature = "test-support")]
     pub fn test_register_loaded_local_model(&self, backend_id: &str, slug: &str, port: u16) {
         self.inner.local.register_for_test(backend_id, slug, port);
+    }
+
+    /// Test-only seam: register an engine that is **still warming** for
+    /// `backend_id`'s current incarnation — a load in flight, as another
+    /// caller would find it.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_register_warming_local_model(&self, backend_id: &str, slug: &str, port: u16) {
+        self.inner
+            .local
+            .register_warming_for_test(backend_id, slug, port);
     }
 
     /// Test-only seam: register a fake ready engine with explicit
@@ -9436,6 +13183,65 @@ impl AppCore {
         rx
     }
 
+    /// Test-only seam: stop the next proxied request between its settings
+    /// snapshot and the read that authorizes it (see
+    /// `Inner::proxy_resolve_window`).
+    ///
+    /// The exposure a request is authorized by is a permission over a backend
+    /// *incarnation*, and the row behind an id can be replaced while a request
+    /// is in flight — which is exactly the interleaving nothing outside can
+    /// stage. Each request that reaches the window sends a resume handle down
+    /// the returned channel and blocks until it is used.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_proxy_resolve_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .proxy_resolve_window
+            .lock()
+            .expect("proxy resolve window lock poisoned") = Some(tx);
+        rx
+    }
+
+    /// Test-only seam: stop the next proxy action between the read that
+    /// authorized it and what that read permits — an engine start or a catalog
+    /// scan (see `Inner::proxy_authorized_window`).
+    ///
+    /// The twin of the resolve window, on the other side of the same read: here
+    /// the caller is holding an authorized backend row and the id behind it is
+    /// replaced, so what is under test is whether the action uses the row it
+    /// was handed or resolves the name all over again.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_proxy_authorized_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .proxy_authorized_window
+            .lock()
+            .expect("proxy authorized window lock poisoned") = Some(tx);
+        rx
+    }
+
+    /// Test-only seam: the next proxied Eidola route observes one more
+    /// handshake, named `attestation_hash`, after its catalog fetch was
+    /// recorded — as though the completion opened a fresh connection (see
+    /// `Inner::proxy_planted_handshake`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_plant_proxy_completion_handshake(&self, attestation_hash: &str) {
+        *self
+            .inner
+            .proxy_planted_handshake
+            .lock()
+            .expect("planted handshake lock poisoned") = Some(attestation_hash.to_string());
+    }
+
     /// Test-only seam: shorten how long an anchor wait holds out before its own
     /// alarm comes due (see `subspace_driver::ANCHOR_WAIT_GRACE`). What is
     /// worth exercising is what happens when it does, not the waiting.
@@ -9554,6 +13360,22 @@ impl AppCore {
         rx
     }
 
+    /// Test-only seam: stop the next regeneration immediately before it claims
+    /// its item (see `Inner::claim_window`).
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_open_regeneration_claim_window(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .inner
+            .claim_window
+            .lock()
+            .expect("claim window lock poisoned") = Some(tx);
+        rx
+    }
+
     /// Test-only seam: drive one delegated room to a stop and deliver its
     /// report, awaited to completion.
     ///
@@ -9604,6 +13426,45 @@ impl AppCore {
     #[cfg(feature = "test-support")]
     pub fn test_set_memory_budget(&self, budget: u64) {
         self.inner.local.set_memory_budget_for_test(budget);
+    }
+
+    /// Test-only seam: pause between a backend configuration write and the
+    /// cleanup that belongs to it, so a test can drive a second configuration
+    /// write into that window.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_pause_before_backend_cleanup(&self, pause: std::time::Duration) {
+        *self
+            .inner
+            .backend_config_pause
+            .lock()
+            .expect("backend config pause") = Some(pause);
+    }
+
+    /// Test-only seam: how many `llama-server` processes this core has
+    /// started — the witness for "nothing was executed", which a child killed
+    /// microseconds after `fork` cannot provide from outside.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_engine_spawn_count(&self) -> u64 {
+        self.inner.local.engine_spawn_count()
+    }
+
+    /// Test-only seam: pause every engine load at each of its hand-off points
+    /// — before it reserves, and before its supervisor starts the child — so a
+    /// test can drive the races a retirement has with an in-flight load.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_pause_at_load_checkpoints(&self, pause: std::time::Duration) {
+        self.inner.local.set_load_pause_for_test(pause);
+    }
+
+    /// Test-only seam: shorten the engine readiness budget (five minutes in
+    /// production) so a test can watch the load deadline fire.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_set_engine_ready_timeout(&self, timeout: std::time::Duration) {
+        self.inner.local.set_ready_timeout_for_test(timeout);
     }
 
     /// List spaces, most recently active first. Archived spaces are
@@ -9695,6 +13556,18 @@ impl AppCore {
     /// caller with no turn behind it (a test, a direct API use); the report
     /// then falls back to the conversation's own last word.
     ///
+    /// **`answer_item_id` is which *turn* is asking**, and it is the caller's
+    /// for the same reason: the anchor says which post the work was asked on,
+    /// and one post can have two answers from one agent (a second explicit ask,
+    /// a regeneration running beside a reply), so only the turn knows which of
+    /// them the report belongs beneath. It is the item that turn will write its
+    /// answer under — minted before the turn's first request, because a capped
+    /// or budget-stopped turn writes no inference at all and so has no answer
+    /// id yet to give. Captured durably (`space.parent_answer_item_id`), so it
+    /// outlives the process that opened the room. `None` for a caller with no
+    /// turn behind it, which falls back to the owner's newest answer on the
+    /// anchor.
+    ///
     /// Refusals arrive as [`AppError::SpawnRefused`] carrying a
     /// [`SpawnRefusal`], and leave nothing behind. On success:
     /// [`Change::SpaceIndex`] (the Library lists sub-spaces like any other
@@ -9710,6 +13583,7 @@ impl AppCore {
         capabilities: Vec<String>,
         title: Option<String>,
         parent_action_id: Option<String>,
+        answer_item_id: Option<String>,
     ) -> Result<SpawnedSubspace, AppError> {
         let inner = self.inner.clone();
         self.runtime
@@ -9723,6 +13597,7 @@ impl AppCore {
                         &capabilities,
                         title.as_deref(),
                         parent_action_id.as_deref(),
+                        answer_item_id.as_deref(),
                     )
                     .await
             })
@@ -10021,6 +13896,90 @@ impl AppCore {
             .map_err(join_err)?
     }
 
+    /// **Streaming** regeneration — the same door as [`Self::regenerate`],
+    /// pushing incremental [`ChatStreamEvent`]s through `sender` as they
+    /// arrive. This is the one a surface with a reader in front of it should
+    /// use: it is what lets a regeneration show reasoning and answer text while
+    /// it runs, instead of a still frame until it lands.
+    ///
+    /// A second regeneration of the same post is refused
+    /// ([`AppError::RegenerationInFlight`]) **before it spends** — the claim is
+    /// process-wide and outlives any one window, so closing and reopening a
+    /// conversation mid-regeneration cannot start a paid duplicate.
+    pub async fn regenerate_stream(
+        &self,
+        action_id: String,
+        model: String,
+        sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.regenerate_stream(&action_id, &model, sender).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// **Continue an answer that stopped at its length limit** — a new
+    /// generation of its post, written by the participant and the model that
+    /// wrote it, that picks up exactly where it stopped (mid-reasoning
+    /// included) instead of starting over. `action_id` is any generation of
+    /// the post; its current one must be an answer that stopped at its
+    /// completion ceiling ([`PostNode::continuable`] says which can be).
+    ///
+    /// The stream **begins with the text being continued** and then carries
+    /// what the model adds, so what a consumer accumulates is the generation
+    /// that will be written: the old text, then the new. The result may stop
+    /// at the ceiling again ([`ChatResult::truncated`]), and continue again.
+    ///
+    /// It is a paid request like any turn, held and settled per round, under
+    /// the post's own prefix-cache lineage, and it shares regeneration's
+    /// process-wide claim on the post ([`AppError::RegenerationInFlight`]).
+    /// Refused with [`AppError::WrongPostKind`], before anything is spent,
+    /// for a post that did not stop at its ceiling or cannot be continued.
+    pub async fn continue_stream(
+        &self,
+        action_id: String,
+        sender: tokio::sync::mpsc::UnboundedSender<ChatStreamEvent>,
+    ) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.continue_stream(&action_id, sender).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// The blocking twin of [`Self::continue_stream`].
+    pub async fn continue_answer(&self, action_id: String) -> Result<ChatResult, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.continue_answer(&action_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// **When the regeneration of `item_id` ends** — the other half of the fact
+    /// [`AppError::RegenerationInFlight`] reports. Resolves immediately if
+    /// nothing is running against that item.
+    ///
+    /// A surface refused by the claim has to be able to stop saying so, and
+    /// nothing durable can tell it when: a regeneration that *succeeds* leaves
+    /// a new generation to notice, but one that fails leaves no trace a
+    /// transcript read can see — no action row, at most a Record entry
+    /// attached to nothing. So the end is published rather than
+    /// inferred, from the one place that knows it. It is a wait, not a poll:
+    /// the claim's own `Drop` wakes it.
+    ///
+    /// The window this cannot close is a *later* regeneration of the same item
+    /// claiming between the release and the ask — the answer is then honestly
+    /// "one is running", which is what the caller wanted to know.
+    pub async fn regeneration_settled(&self, item_id: String) {
+        let inner = self.inner.clone();
+        let _ = self
+            .runtime
+            .spawn(async move { inner.regeneration_settled(&item_id).await })
+            .await;
+    }
+
     // -----------------------------------------------------------------------
     // Participants & space templates (Participants v1)
     // -----------------------------------------------------------------------
@@ -10036,6 +13995,96 @@ impl AppCore {
             .spawn(async move { inner.list_space_participants(&space_id).await })
             .await
             .map_err(join_err)?
+    }
+
+    /// The identity of the Eidola model a selection names
+    /// (`model_catalog::identity`): its weights hash, tags, source repository
+    /// and revision, per-file manifest and lifecycle, with the page that says
+    /// how to check them independently. `None` for a selection on another
+    /// backend, or one this build's catalog does not know. Reads only the
+    /// catalog compiled into this build.
+    pub fn model_identity(&self, selection: &str) -> Option<model_catalog::ModelIdentity> {
+        model_identity_in(self.inner.catalog(), selection)
+    }
+
+    /// The pinned selection and the hash for each Eidola model this build's
+    /// catalog knows and serves: what a picker offers as "pin to these
+    /// weights" beside following a tag. `(tag, pin)` per tag, where `pin` is
+    /// `tag@sha256:<hex>@eidola`.
+    pub fn model_pins(&self) -> Vec<(String, String)> {
+        self.inner
+            .catalog()
+            .iter()
+            .filter(|row| !matches!(row.lifecycle, model_catalog::Lifecycle::Retired { .. }))
+            .flat_map(|row| {
+                row.tags.iter().map(move |tag| {
+                    (
+                        (*tag).to_string(),
+                        backends::qualified_model_id(
+                            &eidola_common::model_reference::pinned(Some(tag), row.sha256),
+                            backends::EIDOLA_BACKEND_ID,
+                        ),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// **Switch a pinned participant to the newer weights its tag now names**
+    /// — the one-click answer to a `NewerAvailable` notice. Writes the new pin
+    /// (`tag@sha256:<newer>@eidola`) where the participant's model is set in
+    /// this space: its own row when the space owns it, this space's override
+    /// when it is a shared agent (the switch is a decision about this
+    /// conversation, never every space the agent is in). Refused with
+    /// [`AppError::ModelNoticeStale`] when the participant has no such notice
+    /// any more, or its model changed after the notice was read. Emits
+    /// [`Change::Participants`]. Returns the new selection.
+    pub async fn switch_to_newer_weights(
+        &self,
+        space_id: String,
+        participant_id: String,
+    ) -> Result<String, AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move {
+                inner
+                    .switch_to_newer_weights(&space_id, &participant_id)
+                    .await
+            })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// **Dismiss a followed tag's "model updated" notice** for this
+    /// participant in this space. The notice stays dismissed while the tag
+    /// names the weights it named when dismissed, and returns when the tag
+    /// moves again (`model_update_ack`). Refused with
+    /// [`AppError::ModelNoticeStale`] when there is no such notice any more.
+    /// Emits [`Change::Participants`].
+    pub async fn dismiss_model_update(
+        &self,
+        space_id: String,
+        participant_id: String,
+    ) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        self.runtime
+            .spawn(async move { inner.dismiss_model_update(&space_id, &participant_id).await })
+            .await
+            .map_err(join_err)?
+    }
+
+    /// **Test-only seam.** Replace the Eidola model catalog this core reads
+    /// (notices, identity, pins, the newer-weights switch) with `rows`. The
+    /// shipped catalog never moves a tag or retires weights within one build,
+    /// so this is how those paths are exercised end to end. Emits nothing.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn test_set_model_catalog(&self, rows: &'static [model_catalog::CatalogRow]) {
+        *self
+            .inner
+            .model_catalog
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rows;
     }
 
     /// Add a new agent participant to a space. Emits [`Change::Participants`].
@@ -10559,14 +14608,13 @@ struct ListKeysResponse {
     data: Vec<IssuerKeyResponse>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct IssuerKeyResponse {
     id: String,
     public_key: String,
     domain_separator: String,
     issue_from: String,
     issue_until: String,
-    #[allow(dead_code)]
     accept_until: String,
 }
 
@@ -10582,6 +14630,10 @@ struct IssueCredentialsResponse {
 #[derive(Deserialize)]
 struct ModelPricingInfo {
     per_prompt_token: ScaledPriceInfo,
+    /// A prompt token declared cached (`cached_prefix`), where the model sells
+    /// one; absent otherwise, and then no request to it declares one.
+    #[serde(default)]
+    per_cached_prompt_token: Option<ScaledPriceInfo>,
     per_completion_token: ScaledPriceInfo,
     /// Present only for models priced per request (e.g. transcription).
     #[serde(default)]
@@ -10612,11 +14664,301 @@ struct ModelsResponseInfo {
     data: Vec<ModelListEntry>,
 }
 
+/// The catalog row a model reference names, as the Eidola gateway resolves
+/// it (`eidola_common::model_reference`): a reference carrying a digest
+/// names the row with that weights hash, whatever its tag says; a bare tag
+/// names the row listing it (or listed under it). A string that is no
+/// reference matches a row's id exactly, as every other catalog is read.
+pub(crate) fn find_catalog_entry<'a>(
+    models: &'a [ModelListEntry],
+    reference: &str,
+) -> Option<&'a ModelListEntry> {
+    use eidola_common::model_reference::ModelReference;
+    match ModelReference::parse(reference) {
+        Ok(parsed) => match parsed.digest() {
+            Some(sha256) => models.iter().find(|m| m.sha256.as_deref() == Some(sha256)),
+            None => models
+                .iter()
+                .find(|m| m.id == reference || m.tags.iter().any(|t| t == reference)),
+        },
+        Err(_) => models.iter().find(|m| m.id == reference),
+    }
+}
+
+/// One row of `GET /v1/models`, parsed **leniently on purpose**.
+///
+/// Every field beyond the three the client cannot work without carries
+/// `#[serde(default)]`, and the capability leaves are optional all the way
+/// down. The list is fetched on every eidola-backed turn and one unreadable
+/// row fails the whole response, so a server that adds a modality name, omits
+/// a leaf, or ships a capability object this build has never heard of must
+/// degrade to "undeclared" rather than take every conversation down with it.
 #[derive(Deserialize)]
-struct ModelListEntry {
-    id: String,
+pub(crate) struct ModelListEntry {
+    pub(crate) id: String,
+    /// The model's weights hash (`docs/model-identity.md`), when the catalog
+    /// publishes one.
+    #[serde(default)]
+    sha256: Option<String>,
+    /// Every tag that resolves to `sha256`.
+    #[serde(default)]
+    tags: Vec<String>,
     context_length: u64,
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
+    #[serde(default)]
+    output_budget_class: Option<String>,
+    #[serde(default)]
+    capabilities: Option<ModelCapabilitiesInfo>,
     pricing: ModelPricingInfo,
+}
+
+#[derive(Deserialize, Default)]
+struct ModelCapabilitiesInfo {
+    #[serde(default)]
+    tool_calling: Option<CapabilityInfo>,
+    #[serde(default)]
+    reasoning: Option<CapabilityInfo>,
+    #[serde(default)]
+    input_modalities: Option<Vec<String>>,
+    #[serde(default)]
+    output_modalities: Option<Vec<String>>,
+    /// Kept raw: [`prefix_cache::PromptCachePolicy::from_catalog`] reads it,
+    /// and a leaf of a shape this build does not expect then means "no key"
+    /// rather than an unreadable catalog.
+    #[serde(default)]
+    prompt_cache: Option<serde_json::Value>,
+}
+
+/// A capability leaf. An object rather than a bare boolean so the wire can
+/// grow a sibling key without a deployed client having to change type.
+#[derive(Deserialize)]
+struct CapabilityInfo {
+    #[serde(default)]
+    supported: Option<bool>,
+}
+
+impl ModelListEntry {
+    /// The declaration this row carries, in the client's three-state shape.
+    fn declared_capabilities(&self) -> ModelCapabilities {
+        let Some(caps) = &self.capabilities else {
+            return ModelCapabilities::default();
+        };
+        ModelCapabilities {
+            tool_calling: caps.tool_calling.as_ref().and_then(|c| c.supported),
+            reasoning: caps.reasoning.as_ref().and_then(|c| c.supported),
+            input_modalities: caps
+                .input_modalities
+                .as_ref()
+                .map(|m| m.iter().map(|s| Modality::from_wire(s)).collect()),
+            output_modalities: caps
+                .output_modalities
+                .as_ref()
+                .map(|m| m.iter().map(|s| Modality::from_wire(s)).collect()),
+        }
+    }
+
+    /// The engine prefix cache this row declares, if it declares a complete one.
+    fn declared_prompt_cache(&self) -> Option<prefix_cache::PromptCachePolicy> {
+        prefix_cache::PromptCachePolicy::from_catalog(
+            self.capabilities.as_ref()?.prompt_cache.as_ref(),
+        )
+    }
+
+    fn declared_budget_class(&self) -> Option<OutputBudgetClass> {
+        self.output_budget_class
+            .as_deref()
+            .and_then(OutputBudgetClass::from_wire)
+    }
+}
+
+/// The clock the prefix-cache rotation rule reads: this client's own wall
+/// clock. Under the test-support feature a test can offset it, or advance it
+/// at each send to stand a request's setup past a retention bound; see
+/// [`prefix_cache::decide`] for what a clock that moves backwards does.
+#[derive(Clone, Default)]
+struct CacheClock {
+    #[cfg(feature = "test-support")]
+    offset_ms: Arc<std::sync::atomic::AtomicI64>,
+    #[cfg(feature = "test-support")]
+    delay_at_send_ms: Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl CacheClock {
+    fn now_ms(&self) -> i64 {
+        #[cfg(feature = "test-support")]
+        {
+            now_ms().saturating_add(self.offset_ms.load(std::sync::atomic::Ordering::Relaxed))
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            now_ms()
+        }
+    }
+
+    /// The test seam's simulated setup delay, applied as a request is handed
+    /// to the transport. Nothing in a release build.
+    fn at_send(&self) {
+        #[cfg(feature = "test-support")]
+        {
+            let delay = self
+                .delay_at_send_ms
+                .load(std::sync::atomic::Ordering::Relaxed);
+            self.offset_ms
+                .fetch_add(delay, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// What a keyed request body carries in its `cache_key` member until the
+/// transport starts writing it: a well-formed key (32 zero bytes) of exactly a
+/// real key's length, so the body's length — and its `Content-Length` — is
+/// fixed before the key is chosen. Never sent: [`keyed_body`] replaces it.
+const CACHE_KEY_PLACEHOLDER: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+/// A keyed request's body, as the transport will write it: the serialized body
+/// with the lineage's key **claimed at the moment the transport first asks for
+/// the body's bytes** — after the connection is open, TLS is up and the peer's
+/// attestation has passed, which is when anything in the body can first be
+/// observed.
+///
+/// That is the one invariant the rotation rule needs: **a key is judged at the
+/// instant it becomes observable.** Judged earlier — when the request was
+/// prepared or built — a slow connection, a slow attestation, or a process
+/// suspended in between could carry a key past its idle TTL or maximum age
+/// before anyone saw it. And the claim stamps the lineage's use only then, so
+/// a request whose connection never opened (DNS, refused, a failed handshake
+/// or attestation) never asks for its body, claims nothing, and leaves the
+/// lineage's idle clock where it was; one that asked may have been delivered,
+/// and is counted at that instant.
+///
+/// The body is one chunk of a length known up front ([`CACHE_KEY_PLACEHOLDER`]
+/// is a key's length), so it is sent with a `Content-Length` exactly as the
+/// unkeyed body is. If the lineage can no longer send
+/// ([`db::ClaimOutcome::Unsendable`]) or its key cannot be read or written,
+/// the body carries a fresh random key that is stored nowhere and used once —
+/// exactly as unlinkable as no key, and the same length. Only if the OS cannot
+/// supply randomness at all does the body fail, and the request with it.
+fn keyed_body(prep: &TurnPrep, body: &serde_json::Value) -> (reqwest::Body, usize) {
+    let mut bytes = serde_json::to_vec(body).expect("a JSON value serializes");
+    // Object members serialize sorted, and `cache_key` sorts first among the
+    // body's members, so the first unescaped occurrence is the member itself
+    // (a message's text holding the same characters is escaped).
+    let needle = format!("\"cache_key\":\"{CACHE_KEY_PLACEHOLDER}\"");
+    let at = bytes
+        .windows(needle.len())
+        .position(|w| w == needle.as_bytes())
+        .expect("a keyed body carries the placeholder")
+        + "\"cache_key\":\"".len();
+    let len = bytes.len();
+    let conn = prep.db_conn.clone();
+    let space_id = prep.space_id.clone();
+    let participant_id = prep.model_participant_id.clone();
+    let model = prep.model.clone();
+    let weights = prep.resolved_sha256.clone();
+    let scope = prep
+        .cache_scope
+        .clone()
+        .expect("only a keyed turn builds a keyed body");
+    let clock = prep.cache_clock.clone();
+    let claimed_key = Arc::clone(&prep.claimed_key);
+    *claimed_key.lock().expect("claimed key lock poisoned") = None;
+    let chunk = async move {
+        let claimed = db::claim_prefix_cache_key(
+            &conn,
+            &space_id,
+            &participant_id,
+            &model,
+            weights.as_deref(),
+            &scope,
+            clock.now_ms(),
+        )
+        .await;
+        let key = match claimed {
+            Ok(db::ClaimOutcome::Claimed(key, identity)) => {
+                *claimed_key.lock().expect("claimed key lock poisoned") = Some(identity);
+                key
+            }
+            Ok(db::ClaimOutcome::Unsendable) => one_use_key()?,
+            Err(_) => {
+                eprintln!(
+                    "warning: a turn's prefix-cache key could not be claimed; sending a one-use key"
+                );
+                one_use_key()?
+            }
+        };
+        bytes[at..at + CACHE_KEY_PLACEHOLDER.len()].copy_from_slice(key.as_str().as_bytes());
+        Ok::<_, std::io::Error>(bytes::Bytes::from(bytes))
+    };
+    (
+        reqwest::Body::wrap_stream(futures_util::stream::once(chunk)),
+        len,
+    )
+}
+
+/// A key stored nowhere and sent once: what a keyed body carries when its
+/// lineage cannot (or can no longer) hold one.
+fn one_use_key() -> Result<prefix_cache::CacheKey, std::io::Error> {
+    prefix_cache::mint()
+        .map(|bytes| prefix_cache::CacheKey::from_bytes(&bytes))
+        .ok_or_else(|| std::io::Error::other("the operating system supplied no randomness"))
+}
+
+/// The answer a continuation extends, and how the request asks for it.
+#[derive(Debug)]
+struct Continuation {
+    /// Which field of the partial message the prompt ends inside.
+    field: ContinueField,
+    /// The target's reasoning and answer, exactly as persisted.
+    reasoning: String,
+    content: String,
+}
+
+impl Continuation {
+    /// The continued generation: what the target wrote, followed by what the
+    /// round that continued it returned.
+    fn extend(&self, reasoning: &str, content: &str) -> (String, String) {
+        (
+            format!("{}{reasoning}", self.reasoning),
+            format!("{}{content}", self.content),
+        )
+    }
+}
+
+/// The requests an answer took before the one now in flight, when the turn
+/// is continuing it automatically: each stopped at its ceiling with the
+/// engine saying it could be continued exactly, and each is in the Record,
+/// attached to nothing until the answer is written.
+#[derive(Debug, Default)]
+struct AnswerSoFar {
+    /// Their request rows, attached to the action the answer is written as.
+    request_ids: Vec<String>,
+    /// The prompt and completion tokens they reported, summed.
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    /// Their holds, summed.
+    credits: u128,
+    /// The output counted against the model's declared limit: for each
+    /// request, the ceiling it stopped at or the completion it reported,
+    /// whichever is larger.
+    generated: u64,
+}
+
+/// Two optional token counts summed: `None` only when neither is known.
+fn sum_tokens(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+    }
+}
+
+/// One request's exchange as a request row records it.
+struct Exchange<'a> {
+    request_body_json: &'a serde_json::Value,
+    request_at: i64,
+    response_at: i64,
+    http_status: u16,
+    response_body: Vec<u8>,
 }
 
 // ============================================================================
@@ -10625,7 +14967,7 @@ struct ModelListEntry {
 
 /// Extract a refund token from a JSON object and store the resulting credential.
 ///
-/// `refund_obj` is the `"refund"` value from a server response (either a chat
+/// `refund_obj` is the one element of a server response's `refunds` (either a chat
 /// completion or the recovery endpoint). Returns `true` if the credential was
 /// successfully stored.
 #[allow(clippy::too_many_arguments)]
@@ -10648,9 +14990,18 @@ struct TurnPrep {
     engine_lease: Option<local_models::EngineLease>,
     attestation_log: Arc<Mutex<Vec<tinfoil_verifier::VerifiedAttestation>>>,
     client: reqwest::Client,
-    /// Connection row adopted from the most recent attestation flush; the
-    /// request row records it.
+    /// The `connection` row the request rows record: adopted from the most
+    /// recent attestation flush on an attested route, or written once before
+    /// the first send on a plain one ([`Self::attach_plain_connection`]).
     connection_id: Option<String>,
+    /// Whether this turn's route is one **no enclave vouches for** — an
+    /// engine or an external backend — so its destination is recorded by a
+    /// plain `connection` row rather than by a handshake.
+    plain_route: bool,
+    /// How this turn's blocking rounds get one whole answer from its backend
+    /// (`whole_answer`): the completion itself, or a stream assembled into
+    /// one.
+    whole: whole_answer::WholeAnswer,
     base_url: String,
     /// The preparation timestamp — spend/refund rows key off it.
     now: i64,
@@ -10659,14 +15010,49 @@ struct TurnPrep {
     /// actions, shown in UIs, returned in `ChatResult`.
     model: String,
     /// The model id the backend's HTTP API expects in the request body.
-    /// Equals `model` except for openai backends (bare wire model).
+    /// Equals `model` except for openai backends (bare wire model) and
+    /// Eidola references, which go bare and, once the catalog has resolved
+    /// them, pinned to the weights hash (`tag@sha256:<hex>`), so every round
+    /// of the turn names the same weights.
     wire_model: String,
+    /// The weights hash an Eidola turn resolved to; `None` for every other
+    /// backend, and for a catalog that does not publish hashes.
+    resolved_sha256: Option<String>,
+    /// Set by [`Self::record_resolved_hash`] when this turn's answer is the
+    /// first from new weights after an answer from other ones, and taken by
+    /// [`Self::announce_moved_weights`] once the write has committed.
+    weights_moved: bool,
+    /// Whether this is a [`ResponseMode::Continue`] turn, for all of its
+    /// rounds: its requests are pinned to the weights of the answer it
+    /// continues, and its actions say so ([`db::INTENT_CONTINUE`]).
+    continues: bool,
     /// The acting agent participant. Deliberately **no** scope alongside it:
     /// a turn spans HTTP round trips, and task 36's promotion can flip that
     /// scope mid-flight — so the pinned echo is derived from this id inside
     /// `db::insert_action`'s own statement rather than carried here.
     model_participant_id: String,
+    /// The completion ceiling the current request asks for: a rung of the
+    /// ceiling ladder ([`ladder_ceiling`]) on a turn whose answers continue
+    /// automatically, chosen each time a request is priced; the model's
+    /// whole declared limit everywhere else.
     max_completion_tokens: u32,
+    /// The model's declared output limit, within its window
+    /// ([`completion_ceiling`]): the most one answer of this turn produces,
+    /// however many requests it takes.
+    output_limit: u32,
+    /// Whether this turn's ceilings come from the ladder and an answer that
+    /// stops at one is continued at once: an Eidola turn, whose engines
+    /// honour a continuation ([`can_continue`]).
+    continues_automatically: bool,
+    /// The requests the answer under way took before the current one.
+    answer: AnswerSoFar,
+    /// The partial answer the turn's next request continues — a
+    /// [`ResponseMode::Continue`] turn's target, or an answer this turn is
+    /// continuing by itself ([`TurnPrep::carry_answer`]) — which is the last
+    /// entry of `messages` while it is set. Taken by the round that answers it
+    /// ([`Continuation::extend`]): whatever that round writes is the continued
+    /// text, and a later round of the same turn is an ordinary one.
+    continuation: Option<Continuation>,
     /// The inference's attach plan (Reply → fresh item; Revise → a new
     /// generation superseding the target).
     inf_item_id: String,
@@ -10726,9 +15112,33 @@ struct TurnPrep {
     /// an explicit opt-in whose wire compatibility is the consumer's call, so
     /// they are never silently dropped.
     auto_tools: bool,
-    /// `(prompt_rate, completion_rate, scale_factor)` for eidola turns; `None`
-    /// for every non-spend backend. Kept so a later round can re-estimate.
-    remote_pricing: Option<(u128, u128, u128)>,
+    /// On whose authority this turn decided its endpoint could carry a
+    /// `tools` field. Read by [`Inner::should_degrade_tools`]: only a policy
+    /// that was never declared may be probed.
+    tool_policy: ToolPolicy,
+    /// The model's engine prefix cache as the catalog declared it, or `None`
+    /// for every model without one — every non-eidola backend included. Only
+    /// a `Some` here ever puts a `cache_key` on the wire ([`keyed_body`]). Carries the trust domain the turn talks
+    /// to, so a key never crosses from one endpoint or trust bundle to another.
+    cache_scope: Option<prefix_cache::CacheScope>,
+    /// The clock the key is judged by, at the moment it is claimed.
+    cache_clock: CacheClock,
+    /// Which of the lineage's keys the current round's request was sent with,
+    /// set by [`keyed_body`] at its claim: what the round's resume point is
+    /// written against ([`TurnPrep::note_answered`]). `None` until a claim,
+    /// and for a request that carried a one-use key.
+    claimed_key: Arc<Mutex<Option<prefix_cache::KeyIdentity>>>,
+    /// The cached prefix the current round's request declares
+    /// ([`TurnPrep::declarable_prefix`]), and is priced by; `None` for a
+    /// request that declares none, which is every request that carries no
+    /// lineage key or goes to a model with no cached rate.
+    declared: Option<eidola_common::engine_protocol::CachedPrefix>,
+    /// The model's context window as the catalog states it (`0` when it is not
+    /// known): a declaration whose prompt limit exceeds it is not sent.
+    context_length: u64,
+    /// The model's catalog pricing for eidola turns; `None` for every
+    /// non-spend backend. Kept so a later round can re-estimate.
+    remote_pricing: Option<ChargePricing>,
     /// The per-turn spend ceiling, checked **per round** against that round's
     /// own estimate over the grown messages array.
     budget: Option<i64>,
@@ -10740,37 +15150,350 @@ struct TurnPrep {
     /// for the common case.
     total_credits: u128,
     /// The in-flight credential spend — `None` for local turns, which have
-    /// no billing. Its absence disables the ACT header, the refund
+    /// no billing. Its absence disables the spend in the body, the refund
     /// machinery, and the `Wallet` emissions throughout the transports.
-    spend: Option<SpendPrep>,
-    /// Whether [`Self::spend`]'s hold has been **settled** — a refund applied
-    /// and its successor credential written.
     ///
-    /// A hold is settled by the round that took it. This exists because
-    /// `spend` is the only in-memory handle to the materials that mint that
-    /// successor (`SpendPrep`'s proof, pre-refund and public key), so
-    /// replacing it while unsettled abandons them: the credential then sits
-    /// `spending` until the next startup recovery sweep, its face value locked
-    /// out of the wallet. [`Inner::begin_next_round`] refuses to replace an
-    /// unsettled hold, which is what makes that unrepresentable rather than
-    /// merely avoided at each call site.
-    spend_settled: bool,
-    /// The `Authorization` header value; present iff `spend` is.
-    auth_value: Option<String>,
+    /// A hold is settled by the round that took it, input by input
+    /// ([`SpendPrep::all_settled`]). `spend` is the only in-memory handle to
+    /// the materials that mint each input's successor (proof, pre-refund and
+    /// public key), so replacing it while any input is unsettled abandons
+    /// them: that credential then sits `spending` until the next startup
+    /// recovery sweep, its face value locked out of the wallet.
+    /// [`Inner::begin_next_round`] refuses to replace an unsettled hold, which
+    /// is what makes that unrepresentable rather than merely avoided at each
+    /// call site.
+    spend: Option<SpendPrep>,
+    /// An external backend's own `Authorization` value (an OpenAI-compatible
+    /// backend's key); `None` for every Eidola turn, whose spend travels in
+    /// the body ([`TurnPrep::with_body`]).
+    external_auth: Option<String>,
     /// The invalidation bus, so the one place a settled hold is durably
     /// committed ([`Self::process_refund_obj`]) can emit at the write.
     bus: BroadcastSource,
 }
 
-/// The credential-spend half of a prepared (remote) turn: the spendable
-/// credential, the proof materials, and the pending-refund row id.
-struct SpendPrep {
+/// Where a request's hold may come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Funding {
+    /// The wallet, and when it cannot pay, account credit converted for it
+    /// ([`Inner::ensure_spend_inputs`]).
+    MayConvert,
+    /// The wallet alone: what it holds, or what a settlement in flight returns
+    /// to it. Never a conversion, and never a request to the account surface.
+    HeldOnly,
+}
+
+/// The pre-credential ids this process is spending **right now**.
+///
+/// A credential is `spending` in the database from the instant its
+/// pending-refund row is written until its successor is minted, and that
+/// covers two very different situations: a request in flight, and a hold
+/// stranded by a process that died mid-turn. Only the second is recoverable,
+/// and the database cannot tell them apart — the difference is whether some
+/// process still has the request going, which is knowledge only that process
+/// has. This is that knowledge, written down.
+type LiveSpends = Arc<Mutex<std::collections::HashSet<String>>>;
+
+/// One entry in [`LiveSpends`], held for exactly as long as the spend it
+/// names.
+///
+/// Removed on drop rather than at any particular success or failure, because
+/// every way a turn can end has to remove it: a hold whose turn was abandoned
+/// **is** stranded and must become recoverable again, and a hold whose turn is
+/// still running must not. Dropping is the one event both share.
+struct LiveSpend {
+    set: LiveSpends,
+    pre_cred_id: String,
+}
+
+impl Drop for LiveSpend {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .expect("live spends lock poisoned")
+            .remove(&self.pre_cred_id);
+    }
+}
+
+/// The credential-spend half of a prepared (remote) request: its inputs, in
+/// the order the request presents them (one credential, or a drain and a
+/// fill), each with its proof materials and pending-refund row.
+pub(crate) struct SpendPrep {
+    params: Params,
+    inputs: Vec<SpendInput>,
+}
+
+/// One input of a request: the credential it spends, the materials that
+/// mint its successor, and its share of the hold.
+struct SpendInput {
     cred: db::SpendableCredential,
     public_key: PublicKey,
-    params: Params,
-    spend_proof: SpendProof<128>,
+    spend_proof: SpendProof<ACT_L>,
     pre_refund: PreRefund,
+    /// The spend as the request body presents it: its Token and the
+    /// [`refund_recovery_key`] of its stored `PreRefund` bytes. Sent with the
+    /// spend and with any recovery of it.
+    presented: PresentedSpend,
     pre_cred_id: String,
+    /// This input's share of the hold: the whole hold for a lone input, the
+    /// credential's whole balance for a drain, the rest for a fill.
+    share: u128,
+    /// The successor's balance once this input is settled.
+    settled: Option<i64>,
+    /// Marks this input as one a request is in flight for, for as long as
+    /// these materials exist. `SpendPrep` is the only in-memory handle to a
+    /// hold, so its lifetime *is* the window recovery must stay out of.
+    _live: LiveSpend,
+}
+
+impl SpendPrep {
+    /// The `credentials` member's value: one element per input, in input
+    /// order.
+    pub(crate) fn credentials(&self) -> serde_json::Value {
+        let presented: Vec<&PresentedSpend> =
+            self.inputs.iter().map(|input| &input.presented).collect();
+        PresentedSpend::credentials_of(&presented)
+    }
+
+    /// The credential a request row names: the first input's. A request
+    /// with two inputs reaches the second through their shared spend group.
+    fn first_nonce(&self) -> &str {
+        &self.inputs[0].cred.nonce
+    }
+
+    /// Whether every input's successor is written.
+    fn all_settled(&self) -> bool {
+        self.inputs.iter().all(|input| input.settled.is_some())
+    }
+
+    /// Settle every input not yet settled: from `inline`, the `refunds`
+    /// array a response carried, when there is one (its element `i` answers
+    /// input `i`), and otherwise through recovery, each input by its own
+    /// nullifier and key. **The refund the server handed us first, and
+    /// recovery only for its absence**: the server's own stored copy is
+    /// best-effort, so asking recovery while an in-band token exists could
+    /// spend a credential and get nothing back. An in-band token that fails
+    /// to apply is not retried through recovery here — the server would hand
+    /// back the same token — and its input stays unsettled for a later
+    /// attempt and a later recovery ([`Inner::recover_stranded_spends`]).
+    ///
+    /// **Each successor written is announced at its write** (`Change::Wallet`
+    /// on `bus`), before the next input's recovery is awaited: a recovery
+    /// that stalls, or a caller that drops this future, never leaves a
+    /// settled input unannounced.
+    ///
+    /// Returns the number of successors written, and the first error any
+    /// input met. Once every input is settled at once, the partial returns
+    /// are checked against the in-order allocation the server must follow
+    /// ([`check_partial_returns`]); a mismatch is the server's fault, and is
+    /// surfaced as a warning, never corrected locally.
+    async fn settle(
+        &mut self,
+        client: &reqwest::Client,
+        base_url: &str,
+        db_conn: &turso::Connection,
+        bus: &BroadcastSource,
+        inline: Option<&serde_json::Value>,
+        now: i64,
+    ) -> (usize, Option<AppError>) {
+        let inline = inline.and_then(serde_json::Value::as_array);
+        let count = self.inputs.len();
+        let was_unsettled = self.inputs.iter().all(|input| input.settled.is_none());
+        let mut written = 0;
+        let mut first_error = None;
+        for (i, input) in self.inputs.iter_mut().enumerate() {
+            if input.settled.is_some() {
+                continue;
+            }
+            let refund_obj = match inline {
+                Some(refunds) if refunds.len() == count => Ok(refunds[i].clone()),
+                Some(_) => Err(AppError::Credential {
+                    message: "the response's refunds do not answer each input".into(),
+                }),
+                None => recover_refund(client, base_url, &input.presented, None).await,
+            };
+            let applied = match refund_obj {
+                Ok(refund_obj) => {
+                    process_refund(
+                        &refund_obj,
+                        &self.params,
+                        &input.spend_proof,
+                        &input.pre_refund,
+                        &input.public_key,
+                        db_conn,
+                        &input.pre_cred_id,
+                        input.cred.generation + 1,
+                        now,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            };
+            match applied {
+                Ok(credits) => {
+                    input.settled = Some(credits);
+                    written += 1;
+                    bus.emit(Change::Wallet);
+                }
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        if was_unsettled && self.all_settled() {
+            let settled: Vec<(i64, u128, i64)> = self
+                .inputs
+                .iter()
+                .map(|input| (input.cred.credits, input.share, input.settled.unwrap_or(0)))
+                .collect();
+            if !check_partial_returns(&settled) {
+                eprintln!(
+                    "warning: a response's refunds do not follow the in-order allocation of \
+                     its charge; the server is at fault"
+                );
+            }
+        }
+        (written, first_error)
+    }
+}
+
+/// Whether the partial returns a request's refunds carry follow the in-order
+/// allocation of its charge (`eidola_common::spend_credentials::
+/// partial_returns`), given each input's `(balance, share, successor
+/// balance)` in input order: each input's partial return is its successor's
+/// balance less its untouched remainder, the charge is the hold less their
+/// sum, and the allocation of that charge must give them back exactly.
+fn check_partial_returns(inputs: &[(i64, u128, i64)]) -> bool {
+    let mut shares = Vec::with_capacity(inputs.len());
+    let mut returns = Vec::with_capacity(inputs.len());
+    for (balance, share, successor) in inputs {
+        let (Ok(balance), Ok(successor)) = (u128::try_from(*balance), u128::try_from(*successor))
+        else {
+            return false;
+        };
+        let Some(t) = balance
+            .checked_sub(*share)
+            .and_then(|remainder| successor.checked_sub(remainder))
+        else {
+            return false;
+        };
+        shares.push(*share);
+        returns.push(t);
+    }
+    let Some(hold) = eidola_common::spend_credentials::hold(&shares) else {
+        return false;
+    };
+    let Some(charge) = hold.checked_sub(returns.iter().sum()) else {
+        return false;
+    };
+    eidola_common::spend_credentials::partial_returns(&shares, charge).as_deref()
+        == Some(returns.as_slice())
+}
+
+/// Whether settling the credentials now in flight could let a request whose
+/// worst case is `worst` be paid from the wallet: some in-flight credential,
+/// at its face value (the most its successor can hold), covers `worst` alone,
+/// or does so together with one other credential, in flight or `held` (which
+/// the caller includes the convertible account balance in, as a credential
+/// an allocation could make). Only then is waiting for in-flight refunds
+/// worth anything.
+fn settlement_could_cover(in_flight: &[i64], held: &[i64], worst: i64) -> bool {
+    in_flight.iter().enumerate().any(|(i, &face)| {
+        face >= worst
+            || in_flight
+                .iter()
+                .enumerate()
+                .any(|(j, &other)| j != i && face.saturating_add(other) >= worst)
+            || held
+                .iter()
+                .any(|&other| face.saturating_add(other) >= worst)
+    })
+}
+
+/// The inputs a request whose worst case is `worst` spends from the wallet
+/// as it is now, by [`choose_inputs`]: each credential with its share, or
+/// `Err(need)`, what a new credential must cover.
+async fn chosen_inputs(
+    db_conn: &turso::Connection,
+    worst: i64,
+) -> Result<Result<Vec<(db::SpendableCredential, i64)>, i64>, AppError> {
+    let mut wallet = db::spendable_credentials(db_conn).await?;
+    let balances: Vec<i64> = wallet.iter().map(|c| c.credits).collect();
+    Ok(match choose_inputs(&balances, worst) {
+        InputChoice::One(i) => Ok(vec![(wallet.swap_remove(i), worst)]),
+        InputChoice::Two { drain, fill } => {
+            let a = balances[drain];
+            // Take the later index first, so the earlier one stays put.
+            let fill_cred = wallet.swap_remove(fill);
+            let drain_cred = wallet.swap_remove(drain);
+            Ok(vec![(drain_cred, a), (fill_cred, worst - a)])
+        }
+        InputChoice::Allocate { need } => Err(need),
+    })
+}
+
+/// Which credentials pay for a request, chosen from the wallet in its spend
+/// order ([`db::spendable_credentials`]: soonest-lapsing key first, then
+/// smallest, then nullifier), by a rule with no thresholds
+/// (`docs/anonymous-credits.md` → Spending several tokens in one request):
+///
+/// 1. If the first credential covers the hold `W`, it pays alone, its share
+///    `W`.
+/// 2. Otherwise the first credential in the order, with balance `a < W`, for
+///    which some later credential covers `W − a` is drained: presented first
+///    with its whole balance as its share, then the first such later
+///    credential, with share `W − a`. That is normally the first credential;
+///    a later one is drained only when the first has no fill but another pair
+///    covers `W`, so a wallet able to pay is never sent to allocation.
+/// 3. If no pair covers `W` (or the wallet is empty), a new credential is
+///    allocated, and the rule runs again: it fills beside a drain (or pays
+///    alone). It must hold at least `W` less the largest balance; it is
+///    issued only at the denomination or the whole remaining balance, never
+///    at that size ([`auto_allocation_amount`]).
+///
+/// Every share is `W`, a drained balance, or the rest of `W` after a drain,
+/// so the shares sum to exactly `W` and reveal nothing but the drained
+/// balance. Exact drains, no rounding, and no deferral.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InputChoice {
+    /// The credential at this index pays alone.
+    One(usize),
+    /// The credential at `drain` is drained and the one at `fill` (later in
+    /// the order) pays the rest.
+    Two { drain: usize, fill: usize },
+    /// No pair in the wallet covers the hold: a new credential must cover
+    /// `need`, the whole hold, or the hold less the largest credential's
+    /// balance.
+    Allocate { need: i64 },
+}
+
+/// [`InputChoice`] for `balances` in the wallet's spend order and a hold of
+/// `worst`.
+pub(crate) fn choose_inputs(balances: &[i64], worst: i64) -> InputChoice {
+    let Some(&first) = balances.first() else {
+        return InputChoice::Allocate { need: worst };
+    };
+    if first >= worst {
+        return InputChoice::One(0);
+    }
+    // The first credential with a later one covering the rest of the hold.
+    // Every credential after the first is below the hold too, or the first
+    // would have a fill in it.
+    for (drain, &balance) in balances.iter().enumerate() {
+        let rest = worst - balance;
+        if let Some(i) = balances[drain + 1..].iter().position(|&b| b >= rest) {
+            return InputChoice::Two {
+                drain,
+                fill: drain + 1 + i,
+            };
+        }
+    }
+    // Every balance is below the hold here; the largest is the drain a new
+    // credential needs the least beside.
+    let largest = balances.iter().copied().max().unwrap_or(first);
+    InputChoice::Allocate {
+        need: worst - largest,
+    }
 }
 
 /// Persist-time verdict for a mechanical report. Ordinary turns skip the
@@ -10809,19 +15532,293 @@ impl TurnPrep {
     /// least one tool. That omission is load-bearing: a registry-less install
     /// sends exactly the bytes it sent before tool support existed, so
     /// upstream prefix caches — and every pinned-bytes test — are undisturbed.
+    ///
+    /// A turn whose model declares a prefix cache carries
+    /// [`CACHE_KEY_PLACEHOLDER`] here; the key itself is chosen as the body is
+    /// written ([`keyed_body`]), so this value — which is what the Record keeps
+    /// — never holds one. Every other turn's body is exactly what it was before
+    /// keys existed.
     fn request_body(&self, stream: bool) -> serde_json::Value {
         // The Eidola server forces `include_usage` upstream regardless
         // (accurate refunds depend on it), so the remote request stays
         // minimal — but a local llama-server only reports usage when the
         // client asks.
-        eidola_common::chat_completion_request_body(
+        let mut body = eidola_common::chat_completion_request_body(
             &self.wire_model,
             &self.messages,
             self.max_completion_tokens,
             &self.tool_schemas,
             stream,
             stream && self.spend.is_none(),
+            self.cache_scope.as_ref().map(|_| CACHE_KEY_PLACEHOLDER),
+            self.continuation.as_ref().map(|c| c.field),
+        );
+        if let Some(prefix) = self.declared {
+            prefix.insert_into(&mut body);
+        }
+        body
+    }
+
+    /// The cached prefix this round's request may declare, or `None`.
+    ///
+    /// **A declaration is the client's own statement about its own earlier
+    /// request**, and it is made only where that statement is known true:
+    /// the request carries its lineage's key, the model sells a cached rate,
+    /// the key the request will be sent with is the one that carried the
+    /// lineage's most recent answered request (its resume point is on that
+    /// key's row, and the rotation rule would keep the key now), and this
+    /// request's prompt begins with exactly what that request left
+    /// ([`prefix_cache::declaration`]). Its budget for what the request adds
+    /// stops at the model's window, and it must lower the hold; otherwise the
+    /// request declares nothing and its body is the one it would be without
+    /// this feature.
+    ///
+    /// The key is judged again at the claim, after the connection is open; a
+    /// key that rotated in between carries a declaration its engine cannot
+    /// meet, which it refuses, and the request is sent again undeclared.
+    async fn declarable_prefix(
+        &self,
+        pricing: ChargePricing,
+    ) -> Option<eidola_common::engine_protocol::CachedPrefix> {
+        use eidola_common::pricing::Prompt;
+        let scope = self.cache_scope.as_ref()?;
+        if !pricing.sells_cached_prompt() {
+            return None;
+        }
+        let (age, _, point) = match db::prefix_cache_resume(
+            &self.db_conn,
+            &self.space_id,
+            &self.model_participant_id,
         )
+        .await
+        {
+            Ok(found) => found?,
+            Err(e) => {
+                eprintln!("warning: a lineage's cache resume point could not be read: {e}");
+                return None;
+            }
+        };
+        let point = point?;
+        let model = prefix_cache::key_model(&self.model, self.resolved_sha256.as_deref());
+        if prefix_cache::decide(
+            Some(&age),
+            &model,
+            &scope.trust_domain,
+            &scope.policy,
+            self.cache_clock.now_ms(),
+        ) != prefix_cache::Claim::Reuse
+        {
+            return None;
+        }
+        // Bounded by the model's window, so the gateway's own check of the
+        // declared limit against the window never refuses it.
+        let prefix = prefix_cache::declaration(
+            &point,
+            &self.tool_schemas,
+            &self.messages,
+            self.context_length,
+        )?;
+        let declared = pricing.hold(
+            Prompt::Declared {
+                cached_tokens: u64::from(prefix.cached_tokens),
+                new_tokens: u64::from(prefix.new_tokens),
+            },
+            self.max_completion_tokens,
+        );
+        let counted = pricing.hold(
+            counted_prompt(&self.messages, &self.tool_schemas),
+            self.max_completion_tokens,
+        );
+        (declared != 0 && declared < counted).then_some(prefix)
+    }
+
+    /// Record what an answered request (`request_body`, as sent) left in the
+    /// engine under the key that carried it, **when it is an anchor**: a
+    /// request that asked for a new assistant turn becomes the lineage's
+    /// resume point ([`prefix_cache::ResumePoint`]), cleared instead when the
+    /// engine reported no prompt tokens. A request that continued an answer
+    /// (`continue_final_message`) is not an anchor and leaves the resume point
+    /// as it is, so every continuation of an answer, and the requests that
+    /// follow it, declare the request that began the answer. A no-op for a
+    /// request that carried no lineage key. Best-effort: a failed write costs
+    /// the next request its declaration, never the turn.
+    async fn note_answered(&self, request_body: &serde_json::Value, prompt_tokens: Option<i64>) {
+        if self.cache_scope.is_none() || request_body.get("continue_final_message").is_some() {
+            return;
+        }
+        let Some(identity) = *self.claimed_key.lock().expect("claimed key lock poisoned") else {
+            return;
+        };
+        let empty = Vec::new();
+        let messages = request_body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .unwrap_or(&empty);
+        let tools = request_body
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .unwrap_or(&empty);
+        let point = prompt_tokens.map(|prompt_tokens| prefix_cache::ResumePoint {
+            prompt_digest: prefix_cache::prompt_digest(tools, messages),
+            message_count: messages.len() as i64,
+            prompt_tokens,
+        });
+        if let Err(e) = db::record_prefix_resume(
+            &self.db_conn,
+            &self.space_id,
+            &self.model_participant_id,
+            identity,
+            point.as_ref(),
+        )
+        .await
+        {
+            eprintln!("warning: a lineage's cache resume point could not be written: {e}");
+        }
+    }
+
+    /// The engine's refusal of this round's declared cached prefix, read from
+    /// a non-2xx answer's status and its error document's `error.type`
+    /// (`engine_protocol::declared_prefix_refusal`). `None` for a request that
+    /// declared nothing, and for every other answer.
+    fn declared_prefix_refusal(
+        &self,
+        status: reqwest::StatusCode,
+        body: &serde_json::Value,
+        text: &str,
+    ) -> Option<AppError> {
+        self.declared?;
+        let kind = body
+            .get("error")
+            .and_then(|e| e.get("type"))
+            .and_then(|t| t.as_str())?;
+        eidola_common::engine_protocol::declared_prefix_refusal(status.as_u16(), kind)?;
+        Some(AppError::Server {
+            status: status.as_u16(),
+            message: parse_server_error_message(text),
+        })
+    }
+
+    /// The text a round writes: its reasoning and answer, or — for the round
+    /// that answers a continuation — the continued answer, the target's text
+    /// followed by the round's. Taking the continuation is what makes it this
+    /// round's alone: its partial message leaves `messages` with it, so a tool
+    /// round that follows replays only the call, as any tool round does, and
+    /// the round after that is an ordinary request.
+    /// Whether this round's request continues an answer already begun (rather
+    /// than reasoning, or nothing), so its content is the rest of that answer.
+    fn continues_an_answer(&self) -> bool {
+        self.continuation
+            .as_ref()
+            .is_some_and(|c| c.field == ContinueField::Content)
+    }
+
+    fn round_text(&mut self, reasoning: &str, content: &str) -> (String, String) {
+        match self.continuation.take() {
+            None => (reasoning.to_string(), content.to_string()),
+            Some(continuation) => {
+                self.messages.pop();
+                continuation.extend(reasoning, content)
+            }
+        }
+    }
+
+    /// The output a request that stopped at its ceiling counts against the
+    /// model's declared limit: the ceiling it asked for, or what it reported
+    /// generating where that is more, so a server that under-reports cannot
+    /// stretch an answer past the limit.
+    fn request_generated(&self, output_tokens: Option<i64>) -> u64 {
+        let reported = output_tokens
+            .and_then(|t| u64::try_from(t).ok())
+            .unwrap_or(0);
+        u64::from(self.max_completion_tokens).max(reported)
+    }
+
+    /// Whether an answer that just stopped at its ceiling, exactly
+    /// continuable, is continued at once: this turn continues its answers
+    /// automatically, and the answer, counting this request, is still under
+    /// the model's declared output limit — so an answer produces no more than
+    /// one request asking for the whole limit would.
+    fn continues_answer(&self, output_tokens: Option<i64>) -> bool {
+        self.continues_automatically
+            && self
+                .answer
+                .generated
+                .saturating_add(self.request_generated(output_tokens))
+                < u64::from(self.output_limit)
+    }
+
+    /// Carry the answer so far into the request that continues it: this
+    /// request's exchange is recorded (attached to the answer once it is
+    /// written), its tokens, hold and output join the answer's, and the
+    /// whole answer so far becomes the final partial message of the next
+    /// request — the request that began the answer, which `messages` holds
+    /// again once [`Self::round_text`] has taken any earlier partial message,
+    /// continued in the field it stopped in.
+    async fn carry_answer(
+        &mut self,
+        exchange: Exchange<'_>,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
+        reasoning: String,
+        content: String,
+    ) -> Result<(), AppError> {
+        let id = self
+            .insert_unattached_request(
+                exchange.request_body_json,
+                exchange.request_at,
+                exchange.response_at,
+                exchange.http_status,
+                exchange.response_body,
+                None,
+            )
+            .await?;
+        let generated = self.request_generated(output_tokens);
+        self.answer.request_ids.push(id);
+        self.answer.input_tokens = sum_tokens(self.answer.input_tokens, input_tokens);
+        self.answer.output_tokens = sum_tokens(self.answer.output_tokens, output_tokens);
+        self.answer.credits += self.charge_credits;
+        self.answer.generated = self.answer.generated.saturating_add(generated);
+        let field = if content.is_empty() {
+            ContinueField::ReasoningContent
+        } else {
+            ContinueField::Content
+        };
+        self.messages
+            .push(prefix_cache::continuation_message(&reasoning, &content));
+        self.continuation = Some(Continuation {
+            field,
+            reasoning,
+            content,
+        });
+        Ok(())
+    }
+
+    /// Whether an answer is being carried into a continuation that has not
+    /// been answered yet: what a failure of that request must not lose.
+    fn carries_answer(&self) -> bool {
+        self.continuation.is_some() && !self.answer.request_ids.is_empty()
+    }
+
+    /// Attach `body` to `request`: as JSON for every turn without a prefix
+    /// cache, as a [`keyed_body`] otherwise, and with this round's spend in
+    /// its `credentials` member when it has one.
+    ///
+    /// The spend goes onto a copy, on its way to the wire: `body` itself is
+    /// what the Record keeps, and it never holds a credential.
+    fn with_body(
+        &self,
+        request: reqwest::RequestBuilder,
+        body: &serde_json::Value,
+    ) -> reqwest::RequestBuilder {
+        let body = body_with_spend(body, self.spend.as_ref());
+        if self.cache_scope.is_none() {
+            return request.json(&*body);
+        }
+        let (stream, len) = keyed_body(self, &body);
+        request
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::CONTENT_LENGTH, len)
+            .body(stream)
     }
 
     /// Flush attestations captured since the last flush (a fresh handshake
@@ -10842,53 +15839,136 @@ impl TurnPrep {
         Ok(())
     }
 
-    /// Apply a refund object (inline from a response body, or recovered) to
-    /// the pending spend — writes the successor credential. A no-op for
-    /// local turns (nothing was spent).
+    /// Apply a response's `refunds` array to the pending spend — writes each
+    /// input's successor credential (element `i` answers input `i`). A no-op
+    /// for local turns (nothing was spent). An error when the array does not
+    /// answer each input, or any input's refund fails to apply; the inputs
+    /// that did settle stay settled.
     ///
-    /// **This is where a settled hold emits `Change::Wallet`.** Writing the
-    /// successor is the durable commit — the credential leaves `spending` at
-    /// that instant — and every refund the turn applies, inline or recovered,
-    /// arrives through here. Emitting at the write rather than at each caller
+    /// **A settled input emits `Change::Wallet` at its own write**, inside
+    /// [`SpendPrep::settle`]. Writing a successor is the durable commit — its
+    /// credential leaves `spending` at that instant — and every refund the
+    /// turn applies, inline or recovered, arrives through there. Emitting at the write rather than at each caller
     /// is what keeps the crate's emit-after-every-durable-commit rule true by
     /// construction: a caller that forgets (or an exit that returns before its
     /// own emit could run) cannot leave subscribers showing a credential as
     /// spending when it is not.
-    async fn process_refund_obj(&mut self, refund_obj: &serde_json::Value) -> Result<(), AppError> {
-        let Some(spend) = &self.spend else {
-            return Ok(());
-        };
-        process_refund(
-            refund_obj,
-            &spend.params,
-            &spend.spend_proof,
-            &spend.pre_refund,
-            &spend.public_key,
-            &self.db_conn,
-            &spend.pre_cred_id,
-            spend.cred.generation + 1,
-            self.now,
-        )
-        .await
-        .inspect(|()| {
-            self.spend_settled = true;
-            self.bus.emit(Change::Wallet);
-        })
+    async fn process_refund_obj(&mut self, refunds: &serde_json::Value) -> Result<(), AppError> {
+        self.settle_spend(Some(refunds)).await
     }
 
-    /// Best-effort refund recovery via `/v1/credentials/refund`. Returns
-    /// whether a successor credential was written — the `Wallet` emission for
-    /// it is [`Self::process_refund_obj`]'s, so a caller reads this only to
-    /// decide its own control flow, never to decide whether to emit. Always
-    /// `false` for local turns — there is no spend to recover.
+    /// Best-effort refund recovery via `/v1/credentials/refund`, input by
+    /// input. Returns whether every input is now settled — the `Wallet`
+    /// emission for a written successor is [`SpendPrep::settle`]'s, so a
+    /// caller reads this only to decide its own control flow, never to decide
+    /// whether to emit. Always `false` for local turns — there is no spend to
+    /// recover.
     async fn try_refund_recovery(&mut self) -> bool {
-        let (Some(_), Some(auth_value)) = (&self.spend, &self.auth_value) else {
+        if self.spend.is_none() {
             return false;
+        }
+        self.settle_spend(None).await.is_ok()
+    }
+
+    /// [`SpendPrep::settle`] for this turn's spend, which emits
+    /// `Change::Wallet` at each successor it writes. `Ok` once every input is
+    /// settled.
+    async fn settle_spend(&mut self, inline: Option<&serde_json::Value>) -> Result<(), AppError> {
+        let Some(spend) = self.spend.as_mut() else {
+            return Ok(());
         };
-        let auth_value = auth_value.clone();
-        match recover_refund(&self.client, &self.base_url, &auth_value).await {
-            Ok(refund_obj) => self.process_refund_obj(&refund_obj).await.is_ok(),
-            Err(_) => false,
+        let (_, error) = spend
+            .settle(
+                &self.client,
+                &self.base_url,
+                &self.db_conn,
+                &self.bus,
+                inline,
+                self.now,
+            )
+            .await;
+        match error {
+            Some(e) => Err(e),
+            None if spend.all_settled() => Ok(()),
+            None => Err(AppError::Credential {
+                message: "a spend's input is not settled".into(),
+            }),
+        }
+    }
+
+    /// Build `request`, record a plain route's destination, then send it —
+    /// the one door both transports send a round through, so the destination
+    /// row is written exactly between a build that succeeded and a send that
+    /// was attempted ([`Self::attach_plain_connection`]).
+    async fn send(
+        &mut self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let request = request.build()?;
+        self.attach_plain_connection().await;
+        self.cache_clock.at_send();
+        self.client.execute(request).await
+    }
+
+    /// Settle this round's hold: **the refund the server handed us first, and
+    /// recovery only for its absence** — the proxy's order, for the proxy's
+    /// reason.
+    ///
+    /// The server spends the credential before it dispatches, and its own
+    /// persistence of the refund token for `/v1/credentials/refund` is
+    /// best-effort: on any arm where that persistence failed, the copy carried
+    /// in band is the only one there will ever be, and recovery answers a
+    /// permanent `404` for a token it never stored. Asking recovery first
+    /// would spend a credential and get nothing back. An in-band token that
+    /// fails to apply is not retried through recovery here — the server would
+    /// hand back the same token — and stays unsettled for
+    /// [`Inner::begin_next_round`]'s last-chance attempt and a later recovery
+    /// ([`Inner::recover_stranded_spends`]).
+    ///
+    /// Returns whether every input is settled; the `Wallet` emission is
+    /// [`SpendPrep::settle`]'s. A no-op for a turn with no spend.
+    async fn settle(&mut self, inline: Option<&serde_json::Value>) -> bool {
+        if self.spend.is_none() {
+            return false;
+        }
+        match self.settle_spend(inline).await {
+            Ok(()) => true,
+            Err(e) => {
+                if inline.is_some() {
+                    eprintln!("warning: a turn's in-band refund failed to apply: {e}");
+                }
+                false
+            }
+        }
+    }
+
+    /// Give a plain route its `connection` row — **once a send is about to be
+    /// attempted, and not before**, and once per turn (an engine's address and
+    /// an external backend's URL do not move under a held lease or a resolved
+    /// row).
+    ///
+    /// **The Record's question is where the prompt went, and it has to stay
+    /// answerable after every mutation.** An attested route answers it through
+    /// the `connection` row its handshake writes; a plain route wrote none, so
+    /// the request row's only path to a URL was its `backend_id` — a key to a
+    /// row the reader can edit, or remove and re-add under the same name with
+    /// another URL, and an engine's address is a port that changes on every
+    /// start. The row written here is the URL this turn sends to, transport
+    /// `clearnet`, and **no** attestation, which is the truthful statement that
+    /// nothing was verified ([`insert_plain_connection`]). Written after the
+    /// request is built and before it is sent, because a `connection` row is a
+    /// statement that a transport was used and a build that refuses sends
+    /// nothing. Best-effort, like the proxy's: a failed insert costs the row,
+    /// never the turn.
+    async fn attach_plain_connection(&mut self) {
+        if !self.plain_route || self.connection_id.is_some() {
+            return;
+        }
+        match insert_plain_connection(&self.db_conn, &self.provider_id, &self.base_url, now_ms())
+            .await
+        {
+            Ok(id) => self.connection_id = Some(id),
+            Err(e) => eprintln!("warning: a turn's destination was not recorded: {e}"),
         }
     }
 
@@ -10896,7 +15976,7 @@ impl TurnPrep {
     /// Recorded on request rows; `None` keeps local turns honest in the
     /// Record.
     fn credential_nonce(&self) -> Option<String> {
-        self.spend.as_ref().map(|s| s.cred.nonce.clone())
+        self.spend.as_ref().map(|s| s.first_nonce().to_string())
     }
 
     /// Record a raw request/response with **no action to attach it to**.
@@ -10905,6 +15985,12 @@ impl TurnPrep {
     /// structurally-malformed `tool_calls` exit, and the streaming non-2xx arm
     /// (which has the same shape). The Record still shows the exchange, which
     /// is the whole point of keeping raw bodies.
+    ///
+    /// `error` is this app's own verdict on the exchange where it refused or
+    /// lost one the upstream's status does not describe — a body that was not
+    /// the shape asked for, a read that failed or met a ceiling — so the row
+    /// never presents as an answered request what the turn did not accept.
+    #[allow(clippy::too_many_arguments)]
     async fn insert_unattached_request(
         &self,
         request_body_json: &serde_json::Value,
@@ -10912,30 +15998,33 @@ impl TurnPrep {
         response_at: i64,
         http_status: u16,
         response_body: Vec<u8>,
-    ) -> Result<(), AppError> {
+        error: Option<String>,
+    ) -> Result<String, AppError> {
+        let id = Uuid::now_v7().to_string();
         db::insert_request(
             &self.db_conn,
             &db::Request {
-                id: Uuid::now_v7().to_string(),
+                id: id.clone(),
                 connection_id: self.connection_id.clone(),
                 action_id: None,
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
                 request_headers: None,
-                request_body: Some(request_body_json.to_string().into_bytes()),
+                request_body: Some(recorded::recorded_request(request_body_json)),
                 response_status: Some(http_status as i64),
                 response_headers: None,
                 response_body: Some(response_body),
                 request_at,
                 response_at: Some(response_at),
                 duration_ms: Some(response_at - request_at),
-                error: None,
+                error,
                 credential_nonce: self.credential_nonce(),
                 created_at: now_ms(),
                 backend_id: Some(self.backend_id.clone()),
             },
         )
-        .await
+        .await?;
+        Ok(id)
     }
 
     /// Persist one **tool round**: the model's tool-requesting output as a
@@ -10957,6 +16046,54 @@ impl TurnPrep {
     /// One transaction, like every other multi-statement action writer (the
     /// `persist_turn` rationale): the intermediate states are then not
     /// something any reader — or a crash — can keep.
+    /// Record the weights hash the turn resolved to on `action_id`, inside the
+    /// action's own transaction (`db::set_action_model_sha256`), and note
+    /// when it **moves** the participant's last recorded hash in this space
+    /// under this model: the one write that changes what the participant's
+    /// model notices say (`model_catalog::notices`' `Updated` compares the
+    /// latest recorded hash with what the tag names now). The first hash
+    /// ever recorded moves nothing a notice reads, and neither does a
+    /// continuation's, which that read skips.
+    async fn record_resolved_hash(
+        &mut self,
+        action_id: &str,
+        answered: bool,
+    ) -> Result<(), AppError> {
+        let Some(sha256) = self.resolved_sha256.clone() else {
+            return Ok(());
+        };
+        let previous = db::last_model_sha256(
+            &self.db_conn,
+            &self.space_id,
+            &self.model_participant_id,
+            &self.model,
+        )
+        .await?;
+        db::set_action_model_sha256(&self.db_conn, action_id, Some(&sha256)).await?;
+        // A failed generation records which weights erred, and moves no
+        // notice: it is not an answer (`db::last_model_sha256`). Nor does a
+        // continuation, pinned to the weights of the answer it continues.
+        if answered && !self.continues && previous.is_some_and(|p| p != sha256) {
+            self.weights_moved = true;
+        }
+        Ok(())
+    }
+
+    /// The `action.intent` of the model-call actions this turn writes.
+    fn action_intent(&self) -> Option<String> {
+        self.continues.then(|| db::INTENT_CONTINUE.to_string())
+    }
+
+    /// After a commit: when that write moved the participant's recorded
+    /// weights, announce `Change::Participants`, the variant of the surface
+    /// that shows model notices (`ParticipantInfo::model_notices`), so a
+    /// stale "model updated" notice is re-read rather than left standing.
+    fn announce_moved_weights(&mut self) {
+        if std::mem::take(&mut self.weights_moved) {
+            self.bus.emit(Change::Participants);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn persist_tool_call_action(
         &mut self,
@@ -10992,6 +16129,7 @@ impl TurnPrep {
                     .execute("COMMIT", ())
                     .await
                     .map_err(AppError::db)?;
+                self.announce_moved_weights();
                 Ok(id)
             }
             Err(e) => {
@@ -11016,6 +16154,9 @@ impl TurnPrep {
         http_status: u16,
         response_body: Vec<u8>,
     ) -> Result<String, AppError> {
+        // A round whose answer was continued before it called a tool is
+        // written as one action, carrying every request it took.
+        let answer = std::mem::take(&mut self.answer);
         let action_id = Uuid::now_v7().to_string();
         db::insert_action(
             &self.db_conn,
@@ -11028,17 +16169,23 @@ impl TurnPrep {
                 supersedes_action_id: None,
                 action_type: "tool_call".to_string(),
                 status: "complete".to_string(),
-                intent: None,
+                intent: self.action_intent(),
                 model: Some(self.model.clone()),
-                input_tokens,
-                output_tokens,
-                // This round's own hold — each round is a separate priced
+                input_tokens: sum_tokens(answer.input_tokens, input_tokens),
+                output_tokens: sum_tokens(answer.output_tokens, output_tokens),
+                // This round's own holds — each round is a separate priced
                 // request, so each round's action carries its own charge.
-                credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
+                credits_consumed: self
+                    .spend
+                    .as_ref()
+                    .map(|_| (answer.credits + self.charge_credits) as i64),
+                truncated: false,
+                resumable: false,
                 created_at: now_ms(),
             },
         )
         .await?;
+        self.record_resolved_hash(&action_id, true).await?;
         if let Some(ref ante) = self.trace_reply_to {
             db::insert_action_antecedent(&self.db_conn, &action_id, ante, 0, "reply").await?;
         }
@@ -11082,6 +16229,7 @@ impl TurnPrep {
             ordinal += 1;
         }
 
+        db::attach_requests(&self.db_conn, &answer.request_ids, &action_id).await?;
         db::insert_request(
             &self.db_conn,
             &db::Request {
@@ -11091,7 +16239,7 @@ impl TurnPrep {
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
                 request_headers: None,
-                request_body: Some(request_body_json.to_string().into_bytes()),
+                request_body: Some(recorded::recorded_request(request_body_json)),
                 response_status: Some(http_status as i64),
                 response_headers: None,
                 response_body: Some(response_body),
@@ -11168,6 +16316,8 @@ impl TurnPrep {
                 output_tokens: None,
                 // Tools run locally — no inference was purchased.
                 credits_consumed: None,
+                truncated: false,
+                resumable: false,
                 created_at: now_ms(),
             },
         )
@@ -11271,6 +16421,8 @@ impl TurnPrep {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
+                resumable: false,
                 created_at: now_ms(),
             },
         )
@@ -11342,29 +16494,25 @@ impl TurnPrep {
     async fn persist_turn(
         &mut self,
         action_status: &str,
+        truncated: bool,
+        resumable: bool,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
         reasoning: &str,
         content: &str,
-        request_body_json: &serde_json::Value,
-        request_at: i64,
-        response_at: i64,
-        http_status: u16,
-        response_body: Vec<u8>,
+        exchange: Option<Exchange<'_>>,
     ) -> Result<Option<String>, AppError> {
         db::begin_write(&self.db_conn).await?;
         let persisted = self
             .persist_turn_body(
                 action_status,
+                truncated,
+                resumable,
                 input_tokens,
                 output_tokens,
                 reasoning,
                 content,
-                request_body_json,
-                request_at,
-                response_at,
-                http_status,
-                response_body,
+                exchange,
             )
             .await;
         match persisted {
@@ -11373,6 +16521,7 @@ impl TurnPrep {
                     .execute("COMMIT", ())
                     .await
                     .map_err(AppError::db)?;
+                self.announce_moved_weights();
                 Ok(id)
             }
             Err(e) => {
@@ -11420,15 +16569,13 @@ impl TurnPrep {
     async fn persist_turn_body(
         &mut self,
         action_status: &str,
+        truncated: bool,
+        resumable: bool,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
         reasoning: &str,
         content: &str,
-        request_body_json: &serde_json::Value,
-        request_at: i64,
-        response_at: i64,
-        http_status: u16,
-        response_body: Vec<u8>,
+        exchange: Option<Exchange<'_>>,
     ) -> Result<Option<String>, AppError> {
         match self.revalidate_mechanical_report().await? {
             MechanicalReportGate::Proceed => {}
@@ -11437,17 +16584,29 @@ impl TurnPrep {
                 // about work nobody wants continued. Stale: the model wrote
                 // about wording a reader no longer sees, so the driver
                 // retries rather than settling a misleading footnote.
-                self.insert_unattached_request(
-                    request_body_json,
-                    request_at,
-                    response_at,
-                    http_status,
-                    response_body,
-                )
-                .await?;
+                if let Some(exchange) = exchange {
+                    self.insert_unattached_request(
+                        exchange.request_body_json,
+                        exchange.request_at,
+                        exchange.response_at,
+                        exchange.http_status,
+                        exchange.response_body,
+                        None,
+                    )
+                    .await?;
+                }
                 return Ok(None);
             }
         }
+        // An answer continued automatically is one generation, carrying
+        // every request it took: their holds and their rows (the caller sums
+        // their tokens, which it also reports).
+        let answer = std::mem::take(&mut self.answer);
+        let this_credits = if exchange.is_some() {
+            self.charge_credits
+        } else {
+            0
+        };
         let inference_action_id = Uuid::now_v7().to_string();
         db::insert_action(
             &self.db_conn,
@@ -11459,16 +16618,23 @@ impl TurnPrep {
                 supersedes_action_id: self.inf_supersedes.clone(),
                 action_type: "inference".to_string(),
                 status: action_status.to_string(),
-                intent: None,
+                intent: self.action_intent(),
                 model: Some(self.model.clone()),
                 input_tokens,
                 output_tokens,
                 // Local turns record no charge (`None`), not a fake zero.
-                credits_consumed: self.spend.as_ref().map(|_| self.charge_credits as i64),
+                credits_consumed: self
+                    .spend
+                    .as_ref()
+                    .map(|_| (answer.credits + this_credits) as i64),
+                truncated,
+                resumable: truncated && resumable,
                 created_at: now_ms(),
             },
         )
         .await?;
+        self.record_resolved_hash(&inference_action_id, action_status != "error")
+            .await?;
         if let Some(ref ante) = self.inf_reply_to {
             db::insert_action_antecedent(&self.db_conn, &inference_action_id, ante, 0, "reply")
                 .await?;
@@ -11559,51 +16725,55 @@ impl TurnPrep {
             .await?;
         }
 
-        db::insert_request(
-            &self.db_conn,
-            &db::Request {
-                id: Uuid::now_v7().to_string(),
-                connection_id: self.connection_id.clone(),
-                action_id: Some(inference_action_id.clone()),
-                method: "POST".to_string(),
-                path: "/v1/chat/completions".to_string(),
-                request_headers: None,
-                request_body: Some(request_body_json.to_string().into_bytes()),
-                response_status: Some(http_status as i64),
-                response_headers: None,
-                response_body: Some(response_body),
-                request_at,
-                response_at: Some(response_at),
-                duration_ms: Some(response_at - request_at),
-                error: None,
-                credential_nonce: self.credential_nonce(),
-                created_at: now_ms(),
-                backend_id: Some(self.backend_id.clone()),
-            },
-        )
-        .await?;
+        db::attach_requests(&self.db_conn, &answer.request_ids, &inference_action_id).await?;
+        if let Some(exchange) = exchange {
+            db::insert_request(
+                &self.db_conn,
+                &db::Request {
+                    id: Uuid::now_v7().to_string(),
+                    connection_id: self.connection_id.clone(),
+                    action_id: Some(inference_action_id.clone()),
+                    method: "POST".to_string(),
+                    path: "/v1/chat/completions".to_string(),
+                    request_headers: None,
+                    request_body: Some(recorded::recorded_request(exchange.request_body_json)),
+                    response_status: Some(exchange.http_status as i64),
+                    response_headers: None,
+                    response_body: Some(exchange.response_body),
+                    request_at: exchange.request_at,
+                    response_at: Some(exchange.response_at),
+                    duration_ms: Some(exchange.response_at - exchange.request_at),
+                    error: None,
+                    credential_nonce: self.credential_nonce(),
+                    created_at: now_ms(),
+                    backend_id: Some(self.backend_id.clone()),
+                },
+            )
+            .await?;
+        }
 
         Ok(Some(inference_action_id))
     }
 }
 
-/// Apply a refund object to a pending spend: decode + verify the refund
-/// against the spend proof and write the successor credential. Called from
-/// `TurnPrep::process_refund_obj` (live turns) and from the startup wallet
-/// recovery (which reconstructs the spend materials from persisted rows —
-/// which is why this stays a free function taking them piecewise).
+/// Apply a refund object to one pending input: decode + verify the refund
+/// against the input's spend proof and write the successor credential,
+/// returning its balance. Called from `SpendPrep::settle` (live requests)
+/// and from the startup wallet recovery (which reconstructs the spend
+/// materials from persisted rows — which is why this stays a free function
+/// taking them piecewise).
 #[allow(clippy::too_many_arguments)]
 async fn process_refund(
     refund_obj: &serde_json::Value,
     params: &Params,
-    spend_proof: &SpendProof<128>,
+    spend_proof: &SpendProof<ACT_L>,
     pre_refund: &PreRefund,
     public_key: &PublicKey,
     db_conn: &turso::Connection,
     pre_cred_id: &str,
     generation: i64,
     now: i64,
-) -> Result<(), AppError> {
+) -> Result<i64, AppError> {
     let refund_b64 = refund_obj
         .get("refund")
         .and_then(|v| v.as_str())
@@ -11616,6 +16786,19 @@ async fn process_refund(
         .ok_or_else(|| AppError::Credential {
             message: "missing issuer_key_id in refund".into(),
         })?;
+    // A refund is a credential under the spent credential's own key: it is
+    // verified against that key below, and it is stored under that key's id,
+    // never one the response names. A refund naming another key is refused
+    // rather than stored under a label that would misstate when it lapses.
+    let spent_key_id =
+        issuer_key_id_of(&public_key.to_cbor().map_err(|e| AppError::Credential {
+            message: format!("failed to encode issuer public key: {e}"),
+        })?);
+    if refund_key_id != spent_key_id {
+        return Err(AppError::Credential {
+            message: "the refund names a different issuer key from the spent credential's".into(),
+        });
+    }
 
     let refund_cbor = URL_SAFE_NO_PAD
         .decode(refund_b64)
@@ -11627,7 +16810,7 @@ async fn process_refund(
     })?;
 
     let new_token = pre_refund
-        .to_credit_token::<128>(params, spend_proof, &refund, public_key)
+        .to_credit_token::<ACT_L>(params, spend_proof, &refund, public_key)
         .map_err(|e| AppError::Credential {
             message: format!("failed to construct refund credit token: {e:?}"),
         })?;
@@ -11637,7 +16820,7 @@ async fn process_refund(
     })?;
     let new_nonce = hex_encode(&new_token.nullifier().to_bytes());
     let new_credits =
-        scalar_to_credit::<128>(&new_token.credits()).map_err(|e| AppError::Credential {
+        scalar_to_credit::<ACT_L>(&new_token.credits()).map_err(|e| AppError::Credential {
             message: format!("invalid credit amount in refund token: {e}"),
         })?;
 
@@ -11645,7 +16828,7 @@ async fn process_refund(
         db_conn,
         &new_nonce,
         pre_cred_id,
-        refund_key_id,
+        &spent_key_id,
         &new_token_cbor,
         new_credits as i64,
         generation,
@@ -11653,27 +16836,44 @@ async fn process_refund(
     )
     .await?;
 
-    Ok(())
+    Ok(new_credits as i64)
 }
 
 /// Attempt to recover a refund token from the server via
-/// `POST /v1/credentials/refund`. Returns the refund JSON object on success.
+/// `POST /v1/credentials/refund`. Returns the refund JSON object
+/// (`{refund, issuer_key_id}`) when it is one to settle on.
+///
+/// The spend is presented exactly as it was with its request: the same Token
+/// and refund recovery key in the body's `credentials` member. The server
+/// stores the refund sealed under that key and opens it only for the same key.
+///
+/// **A provisional answer is not a settlement.** While the spend's request
+/// may still be served, the server holds a refund of nothing (`t = 0`) for
+/// it, and says so (`"provisional": true`). Its successor shares a nullifier
+/// with the final refund's, so spending it would destroy the larger one when
+/// it comes. It is refused here (an error, so the spend stays `spending` for
+/// a later ask) until the server answers `"provisional": false`, which it
+/// does once the provisional refund is the spend's last word (no request is
+/// serving the spend any more: a crash or a restart left it), or until the
+/// spent key's `spend_until` has passed (`spend_until`, when known), when the
+/// successor must be taken while it is worth anything.
 async fn recover_refund(
     client: &reqwest::Client,
     base_url: &str,
-    auth_value: &str,
+    spend: &PresentedSpend,
+    spend_until: Option<i64>,
 ) -> Result<serde_json::Value, AppError> {
     let resp = client
         .post(format!("{base_url}/v1/credentials/refund"))
-        .header("Authorization", auth_value)
+        .json(&serde_json::json!({
+            eidola_common::spend_credentials::CREDENTIALS_MEMBER: spend.credentials(),
+        }))
         .send()
         .await
         .map_err(AppError::from_request)?;
 
-    let status = resp.status();
-    let body_text = resp.text().await.map_err(|e| AppError::Network {
-        message: format!("failed to read recovery response: {e}"),
-    })?;
+    let (status, body_text) =
+        crate::peer_read::read_api_answer(resp, "the recovery response").await?;
     let body: serde_json::Value =
         serde_json::from_str(&body_text).map_err(|e| AppError::Network {
             message: format!("failed to parse recovery response: {e}"),
@@ -11689,11 +16889,45 @@ async fn recover_refund(
         });
     }
 
-    body.get("refund")
-        .cloned()
+    let provisional = body
+        .get("provisional")
+        .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| AppError::Credential {
-            message: "recovery response missing refund field".into(),
-        })
+            message: "recovery response missing its provisional marker".into(),
+        })?;
+    if provisional && !accepts_provisional_refund(spend_until, now_ms()) {
+        return Err(AppError::Credential {
+            message: "the spend's request has not ended yet; its refund is provisional".into(),
+        });
+    }
+    match inline_refund(&body)
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+    {
+        Some([refund]) => Ok(refund.clone()),
+        _ => Err(AppError::Credential {
+            message: "recovery response missing its refund".into(),
+        }),
+    }
+}
+
+/// Whether a refund the server still calls provisional may be settled on at
+/// `now`: only once the spent key's `spend_until` has passed, when waiting
+/// longer would leave the successor worth nothing. Whether the request may
+/// still settle is the server's to say: it alone knows whether it is still
+/// serving it. All in ms.
+fn accepts_provisional_refund(spend_until: Option<i64>, now: i64) -> bool {
+    spend_until.is_some_and(|until| now >= until)
+}
+
+/// The refunds a response carries: its `refunds` array, one element per
+/// input in input order, when it is a non-empty array. Anything else (no
+/// array, an empty one) is no refund, and every input is recovered instead;
+/// an array that does not answer each input is refused where it is applied
+/// ([`SpendPrep::settle`]).
+pub(crate) fn inline_refund(body: &serde_json::Value) -> Option<&serde_json::Value> {
+    body.get(eidola_common::spend_credentials::REFUNDS_MEMBER)
+        .filter(|refunds| refunds.as_array().is_some_and(|a| !a.is_empty()))
 }
 
 // ============================================================================
@@ -11724,6 +16958,14 @@ async fn recover_refund(
 /// and the spend this constant bounds is unaffected: the endpoint rejected the
 /// request before doing any work, so its hold refunds in full. Pinned by
 /// `a_degraded_turn_costs_one_extra_request_and_no_more`.
+///
+/// **Nor is a request that continues an answer.** A round is one answer, and
+/// the requests that continue an answer which stopped at its ceiling belong
+/// to its round. They are bounded by the model's declared output limit
+/// instead — each is sent only while the answer is under it, and asks for no
+/// more than what remains of it — so a round produces no more output than one
+/// request asking for the whole limit, and each continuation is priced and
+/// checked against `budget` like any request.
 pub const MAX_TURN_ROUNDS: usize = 8;
 
 /// What one round of a turn's bounded loop produced.
@@ -11735,6 +16977,18 @@ enum RoundOutcome {
     /// actions are persisted, the results are appended to the messages array,
     /// and the next round's hold is already in place.
     ToolRound,
+    /// The engine refused the round's declared cached prefix: the refused
+    /// exchange is in the Record and its hold settled, nothing was written
+    /// at the semantic layer, and the loop sends the round again undeclared
+    /// ([`Inner::resend_undeclared`]). Carries the refusal, for a loop that
+    /// cannot resend.
+    PrefixRefused(AppError),
+    /// The answer stopped at its ceiling, the engine said it can be
+    /// continued exactly, and it is still under the model's declared limit:
+    /// the request is in the Record (attached once the answer is written),
+    /// the answer so far is the final partial message of the next request,
+    /// and the loop funds that request and sends it as part of the same round.
+    Continued,
 }
 
 /// One tool call as the model requested it.
@@ -11958,6 +17212,17 @@ fn accumulate_tool_call_deltas(
 fn finish_streaming_tool_calls(
     acc: std::collections::BTreeMap<u64, StreamingToolCall>,
 ) -> Result<Vec<ParsedToolCall>, AppError> {
+    streamed_tool_call_objects(acc)
+        .iter()
+        .map(parse_tool_call)
+        .collect()
+}
+
+/// The streamed accumulator as the tool-call objects it assembled, in index
+/// order: what a blocking `message.tool_calls` holds.
+fn streamed_tool_call_objects(
+    acc: std::collections::BTreeMap<u64, StreamingToolCall>,
+) -> Vec<serde_json::Value> {
     acc.into_values()
         .map(|c| {
             let call_type = if c.call_type.is_empty() {
@@ -11976,8 +17241,7 @@ fn finish_streaming_tool_calls(
             object.insert("id".into(), serde_json::Value::String(c.id));
             object.insert("type".into(), call_type);
             object.insert("function".into(), serde_json::Value::Object(function));
-
-            parse_tool_call(&serde_json::Value::Object(object))
+            serde_json::Value::Object(object)
         })
         .collect()
 }
@@ -12027,27 +17291,261 @@ async fn execute_tool_calls(
     out
 }
 
-/// The worst-case charge in credits for one request over `messages` and the
-/// `tool_schemas` that request advertises.
+/// One model's catalog pricing, as a hold computation reads it.
 ///
-/// `pricing` is `(prompt_rate, completion_rate, scale_factor)` from the model
-/// catalog. The prompt side is the shared contract's **single walk**,
-/// `eidola_common::prompt_charge` — the same function the server calls over
-/// the same request, which is what makes hold ≥ charge structural rather
-/// than a property two crates must keep agreeing on. The completion side is
-/// the full `max_completion_tokens` ceiling.
+/// **Built in one place, from the catalog row itself** ([`Self::from_catalog`]),
+/// so no path can carry part of the price and drop the rest: a flat-priced
+/// model is held at its flat price, and a token-priced one on its rates,
+/// including the cached-prompt rate where the catalog publishes one.
+///
+/// The arithmetic is the shared contract's (`eidola_common::pricing`), which
+/// the gateway runs over the same request, so the hold is exactly the worst
+/// case it recomputes. Its rates are on one scale (`pricing::RATE_SCALE`); a
+/// catalog rate published on another is converted where the conversion is
+/// exact, and a model whose rates do not convert exactly cannot be priced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChargePricing {
+    /// The per-token rates, or `None` when the catalog's do not convert
+    /// exactly onto the shared scale.
+    rates: Option<eidola_common::pricing::TokenRates>,
+    /// `(value, scale_factor)` of a flat per-request price, for a model the
+    /// catalog prices per request rather than per token.
+    per_request: Option<(u128, u128)>,
+}
+
+/// A catalog rate on the shared contract's scale: `value / scale_factor`
+/// credits per token as `rate / RATE_SCALE`, where that is exact.
+fn rate_on_shared_scale(price: &ScaledPriceInfo) -> Option<u64> {
+    let scaled = u128::from(price.value) * u128::from(eidola_common::pricing::RATE_SCALE);
+    let scale = u128::from(price.scale_factor);
+    if scale == 0 || !scaled.is_multiple_of(scale) {
+        return None;
+    }
+    u64::try_from(scaled / scale).ok()
+}
+
+impl ChargePricing {
+    fn from_catalog(pricing: &ModelPricingInfo) -> Self {
+        let rates = (|| {
+            Some(eidola_common::pricing::TokenRates {
+                prompt: rate_on_shared_scale(&pricing.per_prompt_token)?,
+                cached_prompt: match &pricing.per_cached_prompt_token {
+                    Some(price) => Some(rate_on_shared_scale(price)?),
+                    None => None,
+                },
+                completion: rate_on_shared_scale(&pricing.per_completion_token)?,
+            })
+        })();
+        Self {
+            rates,
+            per_request: pricing
+                .per_request
+                .as_ref()
+                .map(|p| (p.value as u128, p.scale_factor as u128)),
+        }
+    }
+
+    /// Token pricing alone, on the shared scale (tests).
+    #[cfg(test)]
+    pub(crate) fn per_token(prompt: u64, cached_prompt: Option<u64>, completion: u64) -> Self {
+        Self {
+            rates: Some(eidola_common::pricing::TokenRates {
+                prompt,
+                cached_prompt,
+                completion,
+            }),
+            per_request: None,
+        }
+    }
+
+    /// The per-token rates of a model priced per token, `None` for one priced
+    /// per request or whose rates cannot be priced.
+    fn token_rates(&self) -> Option<eidola_common::pricing::TokenRates> {
+        self.per_request.is_none().then_some(self.rates).flatten()
+    }
+
+    /// Whether a request to this model may declare a cached prefix: it is
+    /// priced per token and sells a cached-prompt rate.
+    fn sells_cached_prompt(&self) -> bool {
+        self.per_request.is_none() && self.rates.is_some_and(|r| r.cached_prompt.is_some())
+    }
+
+    /// The hold of one request whose prompt is priced as `prompt` and whose
+    /// completion ceiling is `max_completion_tokens` — **the client half of
+    /// the gateway's worst case, through the same functions**.
+    ///
+    /// A model priced per request costs the request fee and its flat price
+    /// whatever the request holds, rounded up exactly as the gateway rounds
+    /// it; that branch comes first and nothing else is consulted, as there.
+    /// Otherwise the fee, the prompt at its limit and the completion at its
+    /// ceiling (`pricing::token_hold`). `0` for a model that cannot be priced
+    /// (a flat price with no scale, rates that do not convert, a declared
+    /// prompt with no cached rate), which every caller refuses rather than
+    /// sends.
+    fn hold(&self, prompt: eidola_common::pricing::Prompt, max_completion_tokens: u32) -> u128 {
+        use eidola_common::pricing;
+        if let Some((value, scale_factor)) = self.per_request {
+            return if scale_factor == 0 {
+                0
+            } else {
+                pricing::request_hold(value.div_ceil(scale_factor))
+            };
+        }
+        self.rates
+            .and_then(|rates| pricing::token_hold(&rates, prompt, u64::from(max_completion_tokens)))
+            .unwrap_or(0)
+    }
+}
+
+/// The prompt of a request over `messages` and the `tool_schemas` it
+/// advertises, priced by the byte contract: the shared contract's **single
+/// walk**, `eidola_common::prompt_charge`, the function the gateway calls over
+/// the same request.
+fn counted_prompt(
+    messages: &[serde_json::Value],
+    tool_schemas: &[serde_json::Value],
+) -> eidola_common::pricing::Prompt {
+    eidola_common::pricing::Prompt::Counted {
+        chargeable_tokens: eidola_common::prompt_charge(messages, Some(tool_schemas))
+            .chargeable_prompt_tokens(),
+    }
+}
+
+/// The hold in credits of one request over `messages` and `tool_schemas`
+/// that declares no cached prefix ([`ChargePricing::hold`] of its
+/// [`counted_prompt`]). `0` when the model cannot be priced.
 fn estimate_charge_credits(
     messages: &[serde_json::Value],
     tool_schemas: &[serde_json::Value],
     max_completion_tokens: u32,
-    pricing: (u128, u128, u128),
+    pricing: ChargePricing,
 ) -> u128 {
-    let (prompt_rate, completion_rate, sf) = pricing;
-    let chargeable_prompt =
-        eidola_common::prompt_charge(messages, Some(tool_schemas)).chargeable_prompt_tokens();
-    let prompt_credits = (chargeable_prompt as u128 * prompt_rate).div_ceil(sf);
-    let completion_credits = (max_completion_tokens as u128 * completion_rate).div_ceil(sf);
-    prompt_credits + completion_credits
+    pricing.hold(
+        counted_prompt(messages, tool_schemas),
+        max_completion_tokens,
+    )
+}
+
+#[cfg(test)]
+mod charge_pricing_tests {
+    use super::*;
+    use eidola_common::pricing::{Prompt, REQUEST_FEE_CREDITS};
+
+    /// The server's own scale (`PRICING_SCALE_FACTOR`), so the values below
+    /// are the ones its `worst_case_cost` tests use.
+    const SF: u64 = 1_000_000;
+    const FEE: u128 = REQUEST_FEE_CREDITS as u128;
+
+    fn catalog(per_request: Option<u64>, token_rate: u64) -> ModelPricingInfo {
+        let mut pricing = serde_json::json!({
+            "per_prompt_token": { "value": token_rate, "scale_factor": SF },
+            "per_completion_token": { "value": token_rate, "scale_factor": SF },
+        });
+        if let Some(value) = per_request {
+            pricing["per_request"] = serde_json::json!({ "value": value, "scale_factor": SF });
+        }
+        serde_json::from_value(pricing).expect("a catalog pricing row")
+    }
+
+    fn messages(prompt: &str) -> Vec<serde_json::Value> {
+        vec![serde_json::json!({ "role": "user", "content": prompt })]
+    }
+
+    /// REGRESSION: **a flat-priced model is held at its flat price**, and
+    /// the request fee. The gateway returns the fee and the flat price,
+    /// rounded up, whatever the request holds — so must this.
+    #[test]
+    fn a_flat_priced_model_is_held_at_its_flat_price() {
+        // The server's fixture: 5 credits flat, with no token rates at all.
+        let flat = ChargePricing::from_catalog(&catalog(Some(5 * SF), 0));
+        assert_eq!(
+            estimate_charge_credits(&messages("hi"), &[], 100, flat),
+            FEE + 5
+        );
+        // Whatever the request holds, and whatever its token rates say.
+        let flat_with_rates = ChargePricing::from_catalog(&catalog(Some(5 * SF), 7 * SF));
+        let long = "x".repeat(10_000);
+        assert_eq!(
+            estimate_charge_credits(&messages(&long), &[], 4096, flat_with_rates),
+            FEE + 5
+        );
+        // Rounded up, as the server's `div_ceil` rounds it.
+        let fractional = ChargePricing::from_catalog(&catalog(Some(5 * SF + 1), 0));
+        assert_eq!(
+            estimate_charge_credits(&messages("hi"), &[], 100, fractional),
+            FEE + 6
+        );
+        // A flat-priced model never takes a declaration.
+        assert!(!flat.sells_cached_prompt());
+    }
+
+    /// A token-priced row holds the fee, the shared walk's prompt and the
+    /// whole ceiling.
+    #[test]
+    fn a_token_priced_model_is_held_on_its_rates() {
+        let from_catalog = ChargePricing::from_catalog(&catalog(None, SF));
+        assert_eq!(from_catalog, ChargePricing::per_token(SF, None, SF));
+        let prompt = eidola_common::prompt_charge(&messages("hi"), Some(&[]))
+            .chargeable_prompt_tokens() as u128;
+        assert_eq!(
+            estimate_charge_credits(&messages("hi"), &[], 100, from_catalog),
+            FEE + prompt + 100
+        );
+        assert!(!from_catalog.sells_cached_prompt());
+    }
+
+    /// A catalog's cached rate is read, converted onto the shared scale, and
+    /// prices a declared prompt: its cached part at the cached rate, the rest
+    /// at the prompt rate.
+    #[test]
+    fn a_declared_prompt_is_held_at_the_cached_rate() {
+        let row: ModelPricingInfo = serde_json::from_value(serde_json::json!({
+            "per_prompt_token": { "value": 1, "scale_factor": 1 },
+            "per_cached_prompt_token": { "value": 1, "scale_factor": 4 },
+            "per_completion_token": { "value": 3, "scale_factor": 1 },
+        }))
+        .expect("a catalog pricing row");
+        let pricing = ChargePricing::from_catalog(&row);
+        assert_eq!(pricing, ChargePricing::per_token(SF, Some(SF / 4), 3 * SF));
+        assert!(pricing.sells_cached_prompt());
+        let declared = Prompt::Declared {
+            cached_tokens: 1_024,
+            new_tokens: 100,
+        };
+        // 1,024 / 4 = 256; 100 × 1; 10 × 3.
+        assert_eq!(pricing.hold(declared, 10), FEE + 256 + 100 + 30);
+        // Without a cached rate a declaration cannot be priced: no hold.
+        let no_cached = ChargePricing::per_token(SF, None, 3 * SF);
+        assert_eq!(no_cached.hold(declared, 10), 0);
+    }
+
+    /// A flat price with no scale, or a rate that does not land on the shared
+    /// scale exactly, is no price: zero, which every caller refuses, rather
+    /// than a division by zero or a rounded rate the gateway does not hold.
+    #[test]
+    fn an_unreadable_price_is_a_zero_charge() {
+        let mut row = catalog(Some(5), 0);
+        row.per_request.as_mut().expect("flat").scale_factor = 0;
+        let pricing = ChargePricing::from_catalog(&row);
+        assert_eq!(
+            estimate_charge_credits(&messages("hi"), &[], 100, pricing),
+            0
+        );
+        let inexact: ModelPricingInfo = serde_json::from_value(serde_json::json!({
+            "per_prompt_token": { "value": 1, "scale_factor": 3 * SF },
+            "per_completion_token": { "value": 1, "scale_factor": 1 },
+        }))
+        .expect("a catalog pricing row");
+        assert_eq!(
+            estimate_charge_credits(
+                &messages("hi"),
+                &[],
+                100,
+                ChargePricing::from_catalog(&inexact)
+            ),
+            0
+        );
+    }
 }
 
 /// The per-round spend ceiling check. `budget` caps *each* request's estimated
@@ -12055,7 +17553,7 @@ fn estimate_charge_credits(
 /// per iteration" the parameter was introduced for.
 fn check_turn_budget(charge_credits: u128, budget: Option<i64>) -> Result<(), AppError> {
     if let Some(b) = budget
-        && charge_credits as i64 > b
+        && i64::try_from(charge_credits).map_or(true, |charge| charge > b)
     {
         return Err(AppError::Credential {
             message: format!("estimated charge {charge_credits} exceeds the turn budget {b}"),
@@ -12804,6 +18302,52 @@ pub fn post_stamp(created_at_ms: i64) -> String {
     )
 }
 
+/// What the user should be told about `selection`, the model choice of
+/// `participant_id` in `space_id` (`model_catalog::notices`), from `catalog`:
+/// a followed tag that now names other weights than the participant's last
+/// answer there came from (`action.model_sha256`), a pin whose tag has moved
+/// on, weights that are deprecated or retired. Empty for a choice on any
+/// other backend, and for no choice. Reads only the local database.
+async fn model_notices_for(
+    conn: &turso::Connection,
+    space_id: &str,
+    participant_id: &str,
+    selection: Option<&str>,
+    catalog: &[model_catalog::CatalogRow],
+) -> Result<Vec<model_catalog::ModelNotice>, AppError> {
+    let Some(selection) = selection.filter(|m| !m.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let mref = backends::parse_model_ref(selection);
+    if mref.backend_id != backends::EIDOLA_BACKEND_ID {
+        return Ok(Vec::new());
+    }
+    let canonical = backends::qualified_model_id(&mref.model, &mref.backend_id);
+    let last = db::last_model_sha256(conn, space_id, participant_id, &canonical).await?;
+    let acknowledged =
+        db::acknowledged_model_update(conn, space_id, participant_id, &canonical).await?;
+    let today = &post_stamp(now_ms())[..10];
+    Ok(model_catalog::notices(
+        catalog,
+        &mref.model,
+        last.as_deref(),
+        acknowledged.as_deref(),
+        today,
+    ))
+}
+
+/// The identity of the Eidola model `selection` names in `catalog`.
+fn model_identity_in(
+    catalog: &[model_catalog::CatalogRow],
+    selection: &str,
+) -> Option<model_catalog::ModelIdentity> {
+    let mref = backends::parse_model_ref(selection);
+    if mref.backend_id != backends::EIDOLA_BACKEND_ID {
+        return None;
+    }
+    model_catalog::identity(catalog, &mref.model)
+}
+
 /// Days since the Unix epoch → `(year, month, day)` in the proleptic Gregorian
 /// calendar. Howard Hinnant's `civil_from_days`, the exact inverse of the
 /// `days_from_civil` in `updater::trust`.
@@ -12847,6 +18391,493 @@ fn with_header(item_id: &str, label: &str, created_at_ms: i64, text: &str) -> St
         header
     } else {
         format!("{header}\n\n{text}")
+    }
+}
+
+/// One live regeneration's claim on the **item** it revises, released on drop
+/// — which is what makes it correct rather than merely present: an early `?`,
+/// a cancelled consumer and a panic all release it, and nothing has to remember
+/// to.
+///
+/// Keyed by item rather than by generation because that is what a regeneration
+/// replaces: two callers naming different generations of one post are still two
+/// regenerations of the same thing, and the second would spend a second
+/// credential to lose the durable single-successor race.
+///
+/// **The claim is announced on both sides.** A refused caller learns the item
+/// is claimed from [`AppError::RegenerationInFlight`]; it learns the claim has
+/// ended by awaiting [`AppCore::regeneration_settled`], which is the same fact
+/// read the other way round rather than a second source of truth. That is why
+/// the registry holds a `watch::Sender` per claimed item and not a bare set:
+/// dropping the sender *is* the release, so every waiter is woken by the same
+/// `Drop` that frees the item, and a turn that ends by `?`, by cancellation or
+/// by panic announces itself exactly as one that ends by succeeding.
+struct RegenerationGuard {
+    items: RegenerationRegistry,
+    item_id: String,
+}
+
+/// The claimed items, process-wide: item id → a sender whose *liveness* is the
+/// claim. See [`RegenerationGuard`].
+type RegenerationRegistry =
+    Arc<Mutex<std::collections::HashMap<String, tokio::sync::watch::Sender<()>>>>;
+
+impl RegenerationGuard {
+    fn claim(items: &RegenerationRegistry, item_id: &str) -> Result<Self, AppError> {
+        let mut registry = items.lock().expect("regeneration registry lock poisoned");
+        if registry.contains_key(item_id) {
+            return Err(AppError::RegenerationInFlight {
+                item_id: item_id.to_string(),
+            });
+        }
+        // The receiver is deliberately dropped: nobody is waiting *yet*, and a
+        // `watch` channel keeps working when its last receiver goes (senders
+        // hand out new ones on demand). What matters is that this sender lives
+        // exactly as long as the claim.
+        let (tx, _rx) = tokio::sync::watch::channel(());
+        registry.insert(item_id.to_string(), tx);
+        drop(registry);
+        Ok(Self {
+            items: items.clone(),
+            item_id: item_id.to_string(),
+        })
+    }
+}
+
+impl Drop for RegenerationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut items) = self.items.lock() {
+            // Removing the sender drops it, which resolves every waiter's
+            // `changed()` with the closed-channel error — the release and its
+            // announcement are one act, so there is no ordering to get wrong.
+            items.remove(&self.item_id);
+        }
+    }
+}
+
+/// The upstream's terminal `finish_reason` for the first choice, if it named
+/// one. `value` is a whole chunk (SSE) or a whole completion body (blocking) —
+/// the two spellings differ only in where the choice's payload sits, never in
+/// where the reason does.
+fn choice_finish_reason(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|v| v.as_str())
+}
+
+/// The engine's `continuable` verdict on the first choice, if it gave one: on a
+/// `length` ending, whether what it gave out can be continued exactly. Read off a
+/// whole chunk or a whole completion body, like [`choice_finish_reason`].
+fn choice_continuable(value: &serde_json::Value) -> Option<bool> {
+    value
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("continuable"))
+        .and_then(|v| v.as_bool())
+}
+
+/// The upstream stopped at the completion ceiling (`finish_reason: "length"`).
+/// Both transports read the same key, so this is the one place the spelling is
+/// written down.
+fn stopped_at_ceiling(finish_reason: Option<&str>) -> bool {
+    finish_reason == Some("length")
+}
+
+/// The completion ceiling a request asks for when nothing else decides it: the
+/// app's own turns, and a proxied request that named none.
+pub(crate) const FALLBACK_MAX_COMPLETION_TOKENS: u32 = 4096;
+
+/// The model's declared output limit (`max_completion_tokens` of every turn
+/// off Eidola's backend, and the bound on one answer of a turn on it): the
+/// largest completion the backend declares the model may be asked for, or
+/// [`FALLBACK_MAX_COMPLETION_TOKENS`] where it declares none, never past the
+/// model's context window when that is known (`context_length` 0 means it is
+/// not).
+///
+/// **The declared figure, not a guess at the room left.** It is a per-model
+/// constant the catalog publishes, so the value on the wire says nothing about
+/// this conversation; and the room after the prompt is the serving node's to
+/// apply — it clamps the request to what is left of its window, knowing the
+/// prompt's real token count, where this side has only the pricing contract's
+/// estimate, which is deliberately an over-count and would cut answers short
+/// exactly when a conversation is long. An Eidola turn asks for a rung of the
+/// ceiling ladder below it ([`ladder_ceiling`]) and continues an answer that
+/// reaches a rung by itself, up to this limit; an answer that reaches the
+/// limit is continued by the reader ([`AppCore::continue_stream`]) rather
+/// than lost.
+pub(crate) fn completion_ceiling(declared_max_output: Option<u64>, context_length: u64) -> u32 {
+    let declared = declared_max_output.unwrap_or(u64::from(FALLBACK_MAX_COMPLETION_TOKENS));
+    let ceiling = if context_length == 0 {
+        declared
+    } else {
+        declared.min(context_length)
+    };
+    u32::try_from(ceiling).unwrap_or(u32::MAX).max(1)
+}
+
+/// The lowest rung of the ceiling ladder ([`ladder_ceiling`]).
+pub const FIRST_CEILING_RUNG: u64 = 8_192;
+
+/// The rungs of the ceiling ladder under a model's declared output limit
+/// `limit`, lowest first: [`FIRST_CEILING_RUNG`], doubling while below the
+/// limit, and the limit itself as the top rung. A limit at or below the first
+/// rung is the only rung.
+fn ceiling_rungs(limit: u64) -> Vec<u64> {
+    let mut rungs = Vec::new();
+    let mut rung = FIRST_CEILING_RUNG;
+    while rung < limit {
+        rungs.push(rung);
+        rung = rung.saturating_mul(2);
+    }
+    rungs.push(limit.max(1));
+    rungs
+}
+
+/// The completion ceiling a request of a turn that continues its answers
+/// automatically asks for: a rung of a short public ladder, chosen by a pure
+/// function of the request (`prompt`, the pricing it states, and `generated`,
+/// the output its answer has already produced) and the model's published
+/// numbers (`limit`, its declared output limit within its window, and
+/// `pricing`, its published prices).
+///
+/// - **Wanted**: the smallest rung whose price at the completion rate is at
+///   least the price of reading the request's priced prompt
+///   (`Prompt::token_limit`) at the cached rate (the prompt rate where the
+///   model sells none), and which is at least `generated`; the top rung where
+///   none is.
+/// - **Fit**: while the request's hold at that rung exceeds one standard token
+///   ([`DEFAULT_ALLOCATION_CREDITS`]) and a lower rung exists, one rung lower.
+/// - Never more than `limit − generated` (and never zero).
+///
+/// So a continuation never re-reads more than the output it buys, and the
+/// ceiling on the wire says nothing the request does not: it reads no wallet,
+/// history or setting. A model priced per request, or one whose rates cannot
+/// be priced, asks for what remains of its whole limit: its hold does not
+/// depend on the ceiling.
+pub(crate) fn ladder_ceiling(
+    limit: u32,
+    prompt: eidola_common::pricing::Prompt,
+    pricing: &ChargePricing,
+    generated: u64,
+) -> u32 {
+    let limit = u64::from(limit);
+    let remaining = limit.saturating_sub(generated).max(1);
+    let ceiling = |rung: u64| u32::try_from(rung.min(remaining)).unwrap_or(u32::MAX);
+    let Some(rates) = pricing.token_rates() else {
+        return ceiling(remaining);
+    };
+    let rungs = ceiling_rungs(limit);
+    let read =
+        u128::from(prompt.token_limit()) * u128::from(rates.cached_prompt.unwrap_or(rates.prompt));
+    let mut at = rungs
+        .iter()
+        .position(|&rung| {
+            u128::from(rung) * u128::from(rates.completion) >= read && rung >= generated
+        })
+        .unwrap_or(rungs.len() - 1);
+    while at > 0 && pricing.hold(prompt, ceiling(rungs[at])) > DEFAULT_ALLOCATION_CREDITS as u128 {
+        at -= 1;
+    }
+    ceiling(rungs[at])
+}
+
+/// Whether an answer recorded under `model` can be continued: it was served
+/// by Eidola's backend, whose engines honour `continue_final_message` and
+/// whose catalog is the only one this app knows to. Elsewhere — a local
+/// llama.cpp engine, an arbitrary OpenAI-compatible server — a request ending
+/// in a partial assistant message may be answered with a new turn instead,
+/// and that answer would be written as the rest of this one.
+///
+/// Pure, so a surface can decide to offer the verb with exactly the rule the
+/// door applies ([`PostNode::continuable`]).
+pub fn can_continue(model: Option<&str>) -> bool {
+    model.is_some_and(|m| backends::parse_model_ref(m).backend_id == backends::EIDOLA_BACKEND_ID)
+}
+
+/// The canonical spelling of a model selection (`qualified_model_id` of its
+/// parse), so a participant's configured `model_ref` and the model a generation
+/// recorded compare as the same selection however each was written.
+fn canonical_model(selection: &str) -> String {
+    let r = backends::parse_model_ref(selection);
+    backends::qualified_model_id(&r.model, &r.backend_id)
+}
+
+/// What continuing a generation sends — or `None` when it cannot be continued.
+///
+/// **One predicate for the door and for the offer**: `prepare_turn` refuses a
+/// continuation exactly when this is `None`, and `PostNode::continuable` is
+/// whether it is `Some`, so a surface offers the verb exactly where it would
+/// work and the two cannot drift.
+#[derive(Debug)]
+struct ContinuationBasis {
+    /// The author, who writes the continuation.
+    participant_id: String,
+    /// The canonical model that wrote the generation.
+    model: String,
+    /// The generation's own reasoning and answer.
+    thinking: String,
+    text: String,
+    /// The `messages` and `tools` of the request that produced the generation,
+    /// as sent — its partial message removed when that request was itself a
+    /// continuation.
+    messages: Vec<serde_json::Value>,
+    tools: Vec<serde_json::Value>,
+    /// The actions that request's context assembly was fed, in order.
+    context_action_ids: Vec<String>,
+}
+
+/// The [`ContinuationBasis`] of `action_id` in `space_id`.
+///
+/// A generation can be continued when it is an agent's `inference` that
+/// stopped at its ceiling, its model is one whose server honours a
+/// continuation ([`can_continue`]), **its author is still an agent of this
+/// space answering with that model** (a member, by effective configuration —
+/// the selection `prepare_turn` would resolve for it), and **the request that
+/// produced it is in the Record whole**.
+///
+/// That last condition is what a continuation is built from. Its request is
+/// the generation's own request, byte for byte — the messages and tools that
+/// round sent, its tool rounds and trailing block among them — followed by the
+/// generation as a partial message. Rebuilt from the conversation as it stands
+/// now instead, an edit to a post the answer was written to, or to the
+/// author's charter, would have the model continue an answer to one prompt
+/// while reading another, and lose the prefix the engine cached for it. A body
+/// the Record kept only part of (past its retention cap) does not parse, and
+/// that generation is not continuable.
+async fn continuation_basis(
+    conn: &turso::Connection,
+    space_id: &str,
+    action_id: &str,
+) -> Result<Option<ContinuationBasis>, AppError> {
+    let Some(source) = db::continuation_source(conn, action_id).await? else {
+        return Ok(None);
+    };
+    let Some(model) = source.model.as_deref().map(canonical_model) else {
+        return Ok(None);
+    };
+    if source.action_type != "inference"
+        || !source.truncated
+        || !source.resumable
+        || !can_continue(Some(&model))
+    {
+        return Ok(None);
+    }
+    let author_answers_with_it = db::space_participants(conn, space_id)
+        .await?
+        .iter()
+        .find(|m| m.participant_id == source.participant_id)
+        .is_some_and(|m| {
+            m.kind == "agent"
+                && m.model_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .map(canonical_model)
+                    .as_deref()
+                    == Some(model.as_str())
+        });
+    if !author_answers_with_it {
+        return Ok(None);
+    }
+    let Some(body) = db::generation_request_body(conn, action_id).await? else {
+        return Ok(None);
+    };
+    let Ok(sent) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return Ok(None);
+    };
+    let Some(mut messages) = sent.get("messages").and_then(|m| m.as_array()).cloned() else {
+        return Ok(None);
+    };
+    if sent.get("continue_final_message").is_some() {
+        messages.pop();
+    }
+    let tools = sent
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let context_action_ids = db::context_assembly_actions(conn, action_id).await?;
+    Ok(Some(ContinuationBasis {
+        participant_id: source.participant_id,
+        model,
+        thinking: source.thinking,
+        text: source.text,
+        messages,
+        tools,
+        context_action_ids,
+    }))
+}
+
+#[cfg(test)]
+mod ceiling_and_continuation_tests {
+    use super::*;
+
+    #[test]
+    fn the_ceiling_is_the_declared_output_limit_within_the_window() {
+        // Declared: the declaration, bounded by a known window.
+        assert_eq!(completion_ceiling(Some(32_768), 262_144), 32_768);
+        assert_eq!(completion_ceiling(Some(32_768), 8_192), 8_192);
+        assert_eq!(completion_ceiling(Some(32_768), 0), 32_768);
+        // Undeclared: the fallback, bounded the same way.
+        assert_eq!(completion_ceiling(None, 0), FALLBACK_MAX_COMPLETION_TOKENS);
+        assert_eq!(
+            completion_ceiling(None, 1_000_000),
+            FALLBACK_MAX_COMPLETION_TOKENS
+        );
+        assert_eq!(completion_ceiling(None, 2_048), 2_048);
+        // Never zero, never past a `u32`.
+        assert_eq!(completion_ceiling(Some(0), 0), 1);
+        assert_eq!(completion_ceiling(Some(u64::MAX), 0), u32::MAX);
+    }
+
+    const SF: u64 = eidola_common::pricing::RATE_SCALE;
+
+    fn counted(tokens: u64) -> eidola_common::pricing::Prompt {
+        eidola_common::pricing::Prompt::Counted {
+            chargeable_tokens: tokens,
+        }
+    }
+
+    #[test]
+    fn the_rungs_double_from_the_first_to_the_declared_limit() {
+        assert_eq!(
+            ceiling_rungs(131_072),
+            [8_192, 16_384, 32_768, 65_536, 131_072]
+        );
+        assert_eq!(
+            ceiling_rungs(100_000),
+            [8_192, 16_384, 32_768, 65_536, 100_000]
+        );
+        assert_eq!(ceiling_rungs(8_192), [8_192]);
+        // A limit below the first rung is the only rung.
+        assert_eq!(ceiling_rungs(4_096), [4_096]);
+        assert_eq!(ceiling_rungs(0), [1]);
+    }
+
+    /// The rung follows the price of re-reading the prompt, at the cached
+    /// rate where the model sells one and the prompt rate where it does not.
+    #[test]
+    fn the_rung_grows_with_what_the_prompt_costs_to_read() {
+        let cached = ChargePricing::per_token(SF, Some(SF / 4), SF);
+        let uncached = ChargePricing::per_token(SF, None, SF);
+        assert_eq!(ladder_ceiling(131_072, counted(1_000), &cached, 0), 8_192);
+        // 32,768 at a quarter reads as 8,192: the first rung still buys it.
+        assert_eq!(ladder_ceiling(131_072, counted(32_768), &cached, 0), 8_192);
+        assert_eq!(ladder_ceiling(131_072, counted(32_769), &cached, 0), 16_384);
+        assert_eq!(ladder_ceiling(131_072, counted(70_000), &cached, 0), 32_768);
+        assert_eq!(
+            ladder_ceiling(131_072, counted(8_193), &uncached, 0),
+            16_384
+        );
+        // A declared prompt is read as its whole limit, cached part and budget.
+        let declared = eidola_common::pricing::Prompt::Declared {
+            cached_tokens: 30_000,
+            new_tokens: 4_000,
+        };
+        assert_eq!(ladder_ceiling(131_072, declared, &cached, 0), 16_384);
+        // Past every rung, the top one.
+        assert_eq!(
+            ladder_ceiling(131_072, counted(200_000), &uncached, 0),
+            131_072
+        );
+        // Under a limit below the first rung there is one choice.
+        assert_eq!(ladder_ceiling(4_096, counted(100_000), &uncached, 0), 4_096);
+    }
+
+    /// The rung is at least what the answer has generated, and never more
+    /// than what remains of the model's limit.
+    #[test]
+    fn the_rung_follows_what_the_answer_has_generated_and_stops_at_the_limit() {
+        let pricing = ChargePricing::per_token(SF, Some(SF / 4), SF);
+        assert_eq!(ladder_ceiling(65_536, counted(100), &pricing, 8_192), 8_192);
+        assert_eq!(
+            ladder_ceiling(65_536, counted(100), &pricing, 8_193),
+            16_384
+        );
+        assert_eq!(
+            ladder_ceiling(65_536, counted(100), &pricing, 16_384),
+            16_384
+        );
+        assert_eq!(
+            ladder_ceiling(65_536, counted(100), &pricing, 32_768),
+            32_768
+        );
+        // What remains bounds the rung.
+        assert_eq!(
+            ladder_ceiling(40_000, counted(100), &pricing, 32_768),
+            7_232
+        );
+        assert_eq!(
+            ladder_ceiling(40_000, counted(100), &pricing, 24_576),
+            15_424
+        );
+        // Never zero, even past the limit.
+        assert_eq!(ladder_ceiling(40_000, counted(100), &pricing, 40_000), 1);
+    }
+
+    /// A rung whose hold passes one standard token steps down while a lower
+    /// rung exists; the first rung is kept whatever it holds.
+    #[test]
+    fn a_rung_that_would_hold_more_than_a_standard_token_steps_down() {
+        // 100 credits a token, both sides: a prompt of 9,000 reads at
+        // 900,000, which wants the second rung, held at 2,539,400.
+        let dear = ChargePricing::per_token(100 * SF, None, 100 * SF);
+        assert_eq!(ladder_ceiling(131_072, counted(9_000), &dear, 0), 8_192);
+        assert!(
+            dear.hold(counted(9_000), 8_192) > DEFAULT_ALLOCATION_CREDITS as u128,
+            "the lowest rung is kept even above a standard token"
+        );
+        // Ten credits a token: the second rung is wanted (a prompt reading at
+        // more than 81,920), and held at 1000 + 82,000 + 163,840, under a
+        // standard token, so it stays.
+        let mid = ChargePricing::per_token(10 * SF, None, 10 * SF);
+        assert_eq!(ladder_ceiling(131_072, counted(8_200), &mid, 0), 16_384);
+        // A prompt reading past the top rung at that price wants the top,
+        // whose hold passes a standard token; it steps down to the highest
+        // rung that fits.
+        let wanted_top = counted(200_000);
+        assert!(mid.hold(wanted_top, 8_192) > DEFAULT_ALLOCATION_CREDITS as u128);
+        assert_eq!(ladder_ceiling(131_072, wanted_top, &mid, 0), 8_192);
+        let fits = counted(50_000);
+        // 50,000 reads at 500,000: wants 65,536 (655,360), held at
+        // 1000 + 500,000 + 655,360 = 1,156,360; one lower, 32,768, holds
+        // 828,680.
+        assert_eq!(ladder_ceiling(131_072, fits, &mid, 0), 32_768);
+    }
+
+    /// A model priced per request holds the same whatever its ceiling, so it
+    /// asks for what remains of its limit; so does one that cannot be priced.
+    #[test]
+    fn a_flat_or_unpriceable_model_asks_for_what_remains() {
+        let flat = ChargePricing {
+            rates: Some(eidola_common::pricing::TokenRates {
+                prompt: SF,
+                cached_prompt: None,
+                completion: SF,
+            }),
+            per_request: Some((5, 1)),
+        };
+        assert_eq!(ladder_ceiling(131_072, counted(10), &flat, 0), 131_072);
+        assert_eq!(ladder_ceiling(131_072, counted(10), &flat, 1_072), 130_000);
+        let unpriced = ChargePricing {
+            rates: None,
+            per_request: None,
+        };
+        assert_eq!(ladder_ceiling(32_768, counted(10), &unpriced, 0), 32_768);
+    }
+
+    #[test]
+    fn only_eidola_answers_can_be_continued() {
+        assert!(can_continue(Some("mimo-v2.6-flash")));
+        assert!(can_continue(Some("mimo-v2.6-flash@eidola")));
+        for other in ["gemma@local", "qwen@my-llama", "gpt@openai-compat"] {
+            assert!(!can_continue(Some(other)), "{other}");
+        }
+        assert!(!can_continue(None), "a post with no model was not inferred");
     }
 }
 
@@ -12919,6 +18950,16 @@ enum HeaderFilterState {
 }
 
 impl LeadingHeaderFilter {
+    /// A filter that passes everything: for the rest of an answer that has
+    /// already begun (a continuation's), whose first line is not this
+    /// stream's to judge.
+    fn passing() -> Self {
+        LeadingHeaderFilter {
+            state: HeaderFilterState::Passing,
+            held: String::new(),
+        }
+    }
+
     /// Feed one delta; returns what the caller should see (often the delta
     /// itself, and never more than what was fed).
     fn feed(&mut self, delta: &str) -> String {
@@ -13042,7 +19083,22 @@ fn render_messages(
             continue; // skip tool_call, tool_result, etc. for now
         }
         let role = match responder_participant_id {
-            // Upstream: only the responder's own posts are its words.
+            // Upstream: only the responder's own posts are its words — with
+            // **one exception, and it is the brief**. A brief is not a
+            // contribution to the conversation, it is the conversation's
+            // premise: the contract the room was opened to act on, addressed to
+            // everyone in it. Rendered as the author's own words it reached the
+            // one participant who wrote it — the owner, which is exactly who
+            // the brief floor schedules for a delegation that seats nobody — as
+            // its own prior output, at the end of a room with no roster block
+            // and no thread map behind it (both live in the system message, and
+            // neither exists for a single unbranched member). A model handed
+            // its own text as the last thing said has been asked to continue
+            // it, not to carry it out, and the delegation would then produce
+            // more brief. As `user` it is what it always was to every other
+            // participant: the request. Nothing is misattributed — the message
+            // header still names its author.
+            Some(_) if row.action_type == db::BRIEF_ACTION_TYPE => "user",
             Some(responder) => {
                 if row.participant_id == responder {
                     "assistant"
@@ -13361,6 +19417,10 @@ fn build_post_tree(data: db::SpaceTreeData) -> Vec<PostNode> {
             is_current: true,
             model: row.model.clone(),
             credits_consumed: row.credits_consumed,
+            truncated: row.truncated,
+            continuable: row.truncated
+                && row.action_type == "inference"
+                && can_continue(row.model.as_deref()),
             relation: reply_parent.get(&action_id).map(|_| "reply".to_string()),
             depth,
             is_branch,
@@ -14209,6 +20269,426 @@ fn truncate_on_word_boundary(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// The issuer key the server is issuing under now, as read from
+/// `GET /v1/keys` and checked: its id is the hash of its public key.
+struct CurrentIssuerKey {
+    listed: IssuerKeyResponse,
+    public_key_cbor: Vec<u8>,
+    public_key: PublicKey,
+    params: Params,
+    deadlines: db::IssuerKeyDeadlines,
+}
+
+/// Read the current issuing key from `GET /v1/keys`, and hold the server to
+/// the keys it has listed before.
+///
+/// Every issuer key shares the same domain separator — rotation mints new
+/// keys, never new separators — so the separator alone does not identify a
+/// single key. `/v1/keys` lists every still-accepted key (the previous
+/// epoch's, the current one's) and the next epoch's. The whole listing is
+/// checked first: every key on the calendar, one per epoch, a distinct key per
+/// epoch (`checked_listing`). A key whose windows nobody could have computed in
+/// advance is one a server could have timed around this client. Issuance signs
+/// with the *current* key: the current epoch's.
+///
+/// One key per epoch, and one epoch per key, is then checked against what
+/// this client has already seen. **Every** listed key is recorded,
+/// first-seen-wins (the next epoch's key a whole epoch before it issues), and
+/// every one must agree with the record. Any disagreement refuses the key
+/// ([`AppError::IssuerKeyRefused`]) before any issuance request is built, for
+/// every door that issues — explicit, just in time and in the background
+/// alike: the client cannot tell an emergency rotation from a server singling
+/// it out, and the honest design has no rotation within an epoch.
+async fn current_issuer_key(
+    client: &reqwest::Client,
+    base_url: &str,
+    expected_ds: &str,
+    timeout: std::time::Duration,
+    calendar: &IssuerCalendar,
+    db_conn: &turso::Connection,
+) -> Result<CurrentIssuerKey, AppError> {
+    let resp = client
+        .get(format!("{base_url}/v1/keys"))
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(AppError::from_request)?;
+    let (status, body) = read_response(resp).await?;
+    check_status(status, &body)?;
+    let keys: ListKeysResponse = serde_json::from_str(&body).map_err(|e| AppError::Network {
+        message: format!("failed to parse keys response: {e}"),
+    })?;
+    let now = now_ms();
+    let listing = checked_listing(calendar, &keys.data, expected_ds)?;
+    let now_epoch = u64::try_from(now.div_euclid(1000))
+        .ok()
+        .and_then(|secs| calendar.epoch_at(secs));
+    let Some(&(epoch, key)) = listing.iter().find(|(e, _)| Some(*e) == now_epoch) else {
+        let server_ds: Vec<&str> = keys
+            .data
+            .iter()
+            .map(|k| k.domain_separator.as_str())
+            .collect();
+        return Err(AppError::Credential {
+            message: format!(
+                "no issuer key currently valid for issuance matches expected \
+                 domain separator \"{expected_ds}\"\n\
+                 server advertised: {server_ds:?}"
+            ),
+        });
+    };
+
+    let public_key_cbor =
+        URL_SAFE_NO_PAD
+            .decode(&key.public_key)
+            .map_err(|e| AppError::Credential {
+                message: format!("invalid base64 public key: {e}"),
+            })?;
+    let public_key = PublicKey::from_cbor(&public_key_cbor).map_err(|e| AppError::Credential {
+        message: format!("invalid public key CBOR: {e}"),
+    })?;
+    // A key's id is SHA-256 of its public key, and the id is what every
+    // spend names. Stored under any other id, a credential is unusable
+    // (its spends name a key the server cannot find) or mislabelled.
+    // (`checked_listing` already refused a listing with any such key;
+    // this is the check the credential is stored under.)
+    if key.id != issuer_key_id_of(&public_key_cbor) {
+        return Err(AppError::Credential {
+            message: "the server's issuer key id is not the hash of its public key".into(),
+        });
+    }
+
+    let oldest_kept = epoch.saturating_sub(ISSUER_KEY_RECORD_EPOCHS);
+    let mut refusal = None;
+    for &(listed_epoch, listed) in &listing {
+        let pinned = db::pin_issuer_key_epoch(
+            db_conn,
+            base_url,
+            listed_epoch,
+            &listed.id,
+            oldest_kept,
+            now,
+        )
+        .await?;
+        let disagreement = if pinned.key_id != listed.id {
+            Some(IssuerKeyRefusal::SecondKeyForEpoch {
+                epoch: listed_epoch,
+            })
+        } else if pinned.also_recorded_for.is_some() {
+            Some(IssuerKeyRefusal::OneKeyForSeveralEpochs {
+                epoch: listed_epoch,
+            })
+        } else {
+            None
+        };
+        refusal = refusal.or(disagreement);
+    }
+    if let Some(refusal) = refusal {
+        return Err(AppError::IssuerKeyRefused { refusal });
+    }
+
+    let params = params_from_domain_separator(expected_ds)?;
+    // A credential's spendable life is bounded by when the server stops
+    // *accepting* the key, not when it stops issuing under it: a credential
+    // issued in the last moments of `issue_until` is spendable for a whole
+    // further epoch.
+    let deadlines = issuer_key_deadlines(iso_to_ms(&key.accept_until)?);
+    Ok(CurrentIssuerKey {
+        listed: key.clone(),
+        public_key_cbor,
+        public_key,
+        params,
+        deadlines,
+    })
+}
+
+/// One issuance as it is sent and settled: what the pre-credential row holds,
+/// decoded.
+struct PendingIssuanceRef<'a> {
+    id: &'a str,
+    issuer_key_id: &'a str,
+    pre_issuance: Box<PreIssuance>,
+    issuance_request: Box<anonymous_credit_tokens::IssuanceRequest>,
+    request_cbor: &'a [u8],
+    credits: i64,
+    idempotency_key: &'a [u8; 32],
+    public_key: &'a PublicKey,
+    params: &'a Params,
+}
+
+/// What an issuance request's answer means for its pre-credential.
+enum IssuanceAnswer {
+    /// The server answered with a signed response (fresh, or the one it
+    /// stored for this idempotency key).
+    Issued(IssueCredentialsResponse),
+    /// The server refused it in a way that proves nothing was or will be
+    /// debited under its idempotency key (see [`IssuanceAttempt`]).
+    Refused(AppError),
+    /// No answer, or a server error: it may or may not have been debited, and
+    /// a retry under the same key will say which.
+    Unknown(AppError),
+}
+
+/// Whether an issuance request is the first ever sent under its idempotency
+/// key, which decides what a refusal proves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IssuanceAttempt {
+    /// The first send, and so the only request under its key: a refusal the
+    /// gateway's issuance path itself gives means nothing was debited, and
+    /// abandoning it strands nothing ([`first_refusal_is_final`]).
+    First,
+    /// A retry after an answer that never arrived. The first attempt may have
+    /// been debited and its response stored, or may still be in flight at the
+    /// gateway and debit later, so only a refusal decided by the request bytes
+    /// alone, or one the gateway decides under the account lock in a way no
+    /// later attempt can change, proves the issuance is dead
+    /// ([`retry_refusal_is_final`]).
+    Retry,
+}
+
+/// Whether a retry's `status` proves that nothing was, or will be, debited
+/// under its idempotency key. A retry's refusal answers only the retry: the
+/// original attempt may have passed every check before it and still be on
+/// its way to the debit, so a refusal that turns on state that can change
+/// (the balance, the terms in force) proves nothing about it. Every 4xx the
+/// gateway's issuance path returns, classified explicitly:
+///
+/// * `400`: the request is malformed (credits, idempotency key, base64, CBOR,
+///   amount, or a commitment the key cannot sign). Decided by the bytes alone,
+///   which are the first attempt's bytes, so that attempt was refused the
+///   same way. Final.
+/// * `422`: the body did not deserialize. The same argument. Final.
+/// * `409`: the idempotency key answers a different request (a stored row,
+///   so nothing else can debit under the key), or the named key has stopped
+///   issuing. The gateway decides the second under the account lock on the
+///   database clock, and refuses any later debit under a key it has seen
+///   stop issuing on that same clock, so an original still in flight can
+///   never land after it. Final.
+/// * `402`: the balance at the retry's own debit. An original that stalled
+///   before its debit may still land, if the balance has grown by then. Kept.
+/// * `428`: the terms gate, which the original may have passed before the
+///   terms changed. Kept.
+/// * `401` / `403`: authentication, decided **before** the stored lookup. A
+///   relinked account with a mistyped secret is refused here although its
+///   paid issuance is stored and answers once the secret is right. Kept.
+/// * `429`, `404`, `408`, `413` and any other: not the issuance handler's own
+///   verdict on this key. Kept.
+///
+/// A kept issuance still ends: once its key stops issuing, the next retry is
+/// answered with the stored response or the final `409`, and the stored
+/// response outlives the key's spend window, after which the issuance is no
+/// longer asked for (`db::list_pending_issuances`).
+fn retry_refusal_is_final(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 400 | 409 | 422)
+}
+
+/// Whether a first attempt's `status` is one of the refusals the gateway's
+/// issuance path gives, each before any debit: `400` and `422` (the request),
+/// `401` (authentication), `402` (the balance), `409` (the idempotency key or
+/// the named issuer key) and `428` (the terms). Any other status did not come
+/// from that path's own verdict on this request, so it proves nothing about
+/// whether the request reached the debit, and the issuance stays pending.
+fn first_refusal_is_final(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 400 | 401 | 402 | 409 | 422 | 428)
+}
+
+/// Send one issuance request.
+async fn send_issuance(
+    client: &reqwest::Client,
+    base_url: &str,
+    account_id: &str,
+    secret: &str,
+    pending: &PendingIssuanceRef<'_>,
+    timeout: std::time::Duration,
+    attempt: IssuanceAttempt,
+) -> IssuanceAnswer {
+    let sent = client
+        .post(format!("{base_url}/v1/account/credentials"))
+        .timeout(timeout)
+        .basic_auth(account_id, Some(secret))
+        .json(&serde_json::json!({
+            "issuance_request": URL_SAFE_NO_PAD.encode(pending.request_cbor),
+            "credits": pending.credits,
+            "idempotency_key": hex_encode(pending.idempotency_key),
+            "issuer_key_id": pending.issuer_key_id,
+        }))
+        .send()
+        .await;
+    let resp = match sent {
+        Ok(resp) => resp,
+        Err(e) => return IssuanceAnswer::Unknown(AppError::from_request(e)),
+    };
+    let (status, body) = match read_response(resp).await {
+        Ok(read) => read,
+        Err(e) => return IssuanceAnswer::Unknown(e),
+    };
+    if let Err(e) = check_status(status, &body) {
+        let refused = match attempt {
+            IssuanceAttempt::First => first_refusal_is_final(status),
+            IssuanceAttempt::Retry => retry_refusal_is_final(status),
+        };
+        return if refused {
+            IssuanceAnswer::Refused(e)
+        } else {
+            IssuanceAnswer::Unknown(e)
+        };
+    }
+    match serde_json::from_str::<IssueCredentialsResponse>(&body) {
+        Ok(issued) => IssuanceAnswer::Issued(issued),
+        // A 200 whose body did not parse was debited; asking again under the
+        // same key gets the same stored response, which may parse this time.
+        Err(e) => IssuanceAnswer::Unknown(AppError::Network {
+            message: format!("failed to parse issuance response: {e}"),
+        }),
+    }
+}
+
+/// Build the credential from an issuance response, check what the issuer
+/// chose, and store it.
+async fn complete_issuance(
+    db_conn: &turso::Connection,
+    pending: &PendingIssuanceRef<'_>,
+    issued: &IssueCredentialsResponse,
+    now: i64,
+) -> Result<AllocateResult, AppError> {
+    // The response is verified against the pending issuance's key below; it
+    // must also say it is that key, since the id it names is the one the
+    // credential is stored and later spent under.
+    if issued.issuer_key_id != pending.issuer_key_id {
+        return Err(AppError::Credential {
+            message: "the server issued under a different key from the one it listed as \
+                      current"
+                .into(),
+        });
+    }
+    let response_cbor = URL_SAFE_NO_PAD
+        .decode(&issued.issuance_response)
+        .map_err(|e| AppError::Credential {
+            message: format!("invalid issuance response base64: {e}"),
+        })?;
+    let issuance_response =
+        IssuanceResponse::from_cbor(&response_cbor).map_err(|e| AppError::Credential {
+            message: format!("invalid issuance response CBOR: {e}"),
+        })?;
+    let credit_token = pending
+        .pre_issuance
+        .to_credit_token::<ACT_L>(
+            pending.params,
+            pending.public_key,
+            &pending.issuance_request,
+            &issuance_response,
+        )
+        .map_err(|e| AppError::Credential {
+            message: format!("failed to construct credit token: {e}"),
+        })?;
+    let token_credits =
+        scalar_to_credit::<ACT_L>(&credit_token.credits()).map_err(|e| AppError::Credential {
+            message: format!("invalid credit amount in token: {e}"),
+        })?;
+    check_issued_credential(
+        &credit_token,
+        pending.params,
+        pending.issuer_key_id,
+        pending.credits,
+        token_credits,
+    )?;
+    let token_cbor = credit_token.to_cbor().map_err(|e| AppError::Credential {
+        message: format!("failed to encode credit token: {e}"),
+    })?;
+    let nonce_hex = hex_encode(&credit_token.nullifier().to_bytes());
+    db::insert_credential(
+        db_conn,
+        &nonce_hex,
+        pending.id,
+        pending.issuer_key_id,
+        &token_cbor,
+        token_credits as i64,
+        0,
+        now,
+    )
+    .await?;
+    Ok(AllocateResult {
+        nonce: nonce_hex,
+        credits: issued.credits,
+        issuer_key_id: issued.issuer_key_id.clone(),
+    })
+}
+
+fn duration_ms(d: std::time::Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// The wait before the provisioner's next look at the wallet: uniform over
+/// `[min, max]`, drawn fresh each time from the OS RNG.
+fn provision_delay(min: std::time::Duration, max: std::time::Duration) -> std::time::Duration {
+    let (lo, hi) = (
+        duration_ms(min).max(0) as u64,
+        duration_ms(max).max(0) as u64,
+    );
+    if hi <= lo {
+        return min;
+    }
+    let span = hi - lo + 1;
+    std::time::Duration::from_millis(lo + rand_core::RngCore::next_u64(&mut OsRng) % span)
+}
+
+/// The request context every credential under the key `key_id` must carry:
+/// `SHA-256(issuer_name ‖ origin_info ‖ issuer_key_id)` reduced to a scalar,
+/// with the credential context empty, exactly as the server derives it.
+fn expected_request_context(key_id: &str) -> Result<anonymous_credit_tokens::Scalar, AppError> {
+    let key_hash = hex_decode(key_id)?;
+    let mut ctx = Vec::with_capacity(ISSUER_NAME.len() + ORIGIN_INFO.len() + key_hash.len());
+    ctx.extend_from_slice(ISSUER_NAME.as_bytes());
+    ctx.extend_from_slice(ORIGIN_INFO.as_bytes());
+    ctx.extend_from_slice(&key_hash);
+    let digest: [u8; 32] = Sha256::digest(&ctx).into();
+    Ok(anonymous_credit_tokens::Scalar::from_bytes_mod_order(
+        digest,
+    ))
+}
+
+/// Refuse a freshly issued credential whose issuer-chosen values could mark
+/// it. The issuance response fixes two values the issuance proof does not
+/// constrain to what the client asked for: the request context, which every
+/// later spend under this credential and its successors reveals in the
+/// clear, and the amount. A context other than the one every client under
+/// the key shares would make each of those spends recognisable as this
+/// issuance's, so it is checked before anything is stored; so is the amount.
+/// The context is read from a spend proof of nothing, built here and never
+/// sent, because the crate exposes a credential's context only that way.
+fn check_issued_credential(
+    token: &CreditToken,
+    params: &Params,
+    key_id: &str,
+    requested: i64,
+    issued: u128,
+) -> Result<(), AppError> {
+    if u128::try_from(requested).ok() != Some(issued) {
+        return Err(AppError::Credential {
+            message: "the server issued a different amount from the one requested".into(),
+        });
+    }
+    let (probe, _) = token
+        .prove_spend::<ACT_L>(params, anonymous_credit_tokens::Scalar::ZERO, OsRng)
+        .map_err(|e| AppError::Credential {
+            message: format!("failed to check the issued credential: {e:?}"),
+        })?;
+    if probe.context() != expected_request_context(key_id)? {
+        return Err(AppError::Credential {
+            message: "the server issued a credential under a request context other clients \
+                      under this key do not share"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+/// The ACT issuer key id of a CBOR-encoded public key: hex SHA-256 of its
+/// bytes, as the server computes it and every spend names it.
+fn issuer_key_id_of(public_key_cbor: &[u8]) -> String {
+    hex_encode(&Sha256::digest(public_key_cbor))
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -14247,6 +20727,142 @@ fn serialize_token_challenge() -> Vec<u8> {
 
 fn compute_challenge_digest() -> [u8; 32] {
     Sha256::digest(serialize_token_challenge()).into()
+}
+
+/// One spend's ACT Token: `token_type`, `challenge_digest`, `issuer_key_id`,
+/// the encoded spend proof (draft-schlesinger-privacypass-act).
+fn spend_token(issuer_key_hash: &[u8], spend_proof_cbor: &[u8]) -> Vec<u8> {
+    let mut token = Vec::with_capacity(2 + 32 + issuer_key_hash.len() + spend_proof_cbor.len());
+    token.extend_from_slice(&ACT_TOKEN_TYPE.to_be_bytes());
+    token.extend_from_slice(&compute_challenge_digest());
+    token.extend_from_slice(issuer_key_hash);
+    token.extend_from_slice(spend_proof_cbor);
+    token
+}
+
+/// One spend as a request presents it: its Token and its refund recovery key,
+/// written into the request body's `credentials` member
+/// (`eidola_common::spend_credentials`, the one spelling the gateway
+/// accepts). The spend and every recovery of it build it here.
+///
+/// **A secret on its way to the wire, and nowhere else.** The member is put
+/// onto a copy of a body as it is sent ([`body_with_spend`]); the body a
+/// request row records never holds it. `Debug` prints neither value, and the
+/// refund key is zeroed on drop.
+pub(crate) struct PresentedSpend {
+    token: Vec<u8>,
+    refund_key: zeroize::Zeroizing<[u8; 32]>,
+}
+
+impl PresentedSpend {
+    fn new(issuer_key_hash: &[u8], spend_proof_cbor: &[u8], pre_refund_cbor: &[u8]) -> Self {
+        Self {
+            token: spend_token(issuer_key_hash, spend_proof_cbor),
+            refund_key: refund_recovery_key(pre_refund_cbor),
+        }
+    }
+
+    /// The `credentials` member's value: an array of this one spend.
+    pub(crate) fn credentials(&self) -> serde_json::Value {
+        Self::credentials_of(&[self])
+    }
+
+    /// The `credentials` member's value for a request's inputs, in input
+    /// order.
+    fn credentials_of(inputs: &[&PresentedSpend]) -> serde_json::Value {
+        let inputs: Vec<(&[u8], &[u8; 32])> = inputs
+            .iter()
+            .map(|input| (input.token.as_slice(), &*input.refund_key))
+            .collect();
+        eidola_common::spend_credentials::credentials_member(&inputs)
+    }
+}
+
+impl std::fmt::Debug for PresentedSpend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PresentedSpend(<redacted>)")
+    }
+}
+
+/// `body` as sent: with `spend`'s inputs in its `credentials` member when
+/// there is one, and `body` itself otherwise. A copy, so the caller's `body`
+/// (what the Record keeps) never holds a credential.
+pub(crate) fn body_with_spend<'a>(
+    body: &'a serde_json::Value,
+    spend: Option<&SpendPrep>,
+) -> std::borrow::Cow<'a, serde_json::Value> {
+    with_credentials(body, spend.map(SpendPrep::credentials))
+}
+
+/// `body` with `credentials` as its `credentials` member, on a copy; `body`
+/// itself when there are none.
+fn with_credentials(
+    body: &serde_json::Value,
+    credentials: Option<serde_json::Value>,
+) -> std::borrow::Cow<'_, serde_json::Value> {
+    match credentials {
+        None => std::borrow::Cow::Borrowed(body),
+        Some(credentials) => {
+            let mut sent = body.clone();
+            if let Some(object) = sent.as_object_mut() {
+                object.insert(
+                    eidola_common::spend_credentials::CREDENTIALS_MEMBER.to_string(),
+                    credentials,
+                );
+            }
+            std::borrow::Cow::Owned(sent)
+        }
+    }
+}
+
+/// Domain separator for [`refund_recovery_key`].
+const REFUND_RECOVERY_KEY_DOMAIN: &[u8] = b"eidola-refund-recovery-key-v1\0";
+
+/// The refund recovery key for one spend
+/// (`eidola_common::refund_key`): SHA-256 over a domain separator and the
+/// spend's encoded `PreRefund`, the client-only state already kept for it.
+///
+/// The gateway seals the copy of the refund it stores under this key, and
+/// opens it on recovery only when the same key is presented, so it must be
+/// something only this client knows, and something every path that recovers
+/// a spend can rebuild. The `PreRefund` is both: its blinding factor `r` for
+/// the successor credential never leaves this client in the clear (spending
+/// the successor proves knowledge of it in zero knowledge), and the encoded
+/// bytes are stored beside the spend (`pre_credential_refund.pre_refund_data`)
+/// before the request is sent. Deriving the key from those bytes means no new
+/// secret to store and no state for a recovery to lose; hashing the exact
+/// stored bytes means the spend and every later recovery derive it from the
+/// same input. The domain separator keeps this use of the secret apart from
+/// its use inside the credential scheme.
+fn refund_recovery_key(pre_refund_cbor: &[u8]) -> zeroize::Zeroizing<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(REFUND_RECOVERY_KEY_DOMAIN);
+    hasher.update(pre_refund_cbor);
+    zeroize::Zeroizing::new(hasher.finalize().into())
+}
+
+/// Put an external backend's own key on a request, as an `Authorization`
+/// value marked sensitive so an HTTP client's own `Debug` never shows it.
+/// (An Eidola spend never travels in a header: it is in the body,
+/// [`body_with_spend`].)
+///
+/// A value that cannot be a header value is passed through as the string,
+/// so the builder refuses it exactly as it did before (the refusal carries no
+/// value).
+pub(crate) fn with_authorization(
+    request: reqwest::RequestBuilder,
+    authorization: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match authorization {
+        None => request,
+        Some(auth) => match reqwest::header::HeaderValue::from_str(auth) {
+            Ok(mut value) => {
+                value.set_sensitive(true);
+                request.header(reqwest::header::AUTHORIZATION, value)
+            }
+            Err(_) => request.header(reqwest::header::AUTHORIZATION, auth),
+        },
+    }
 }
 
 /// Current time as milliseconds since Unix epoch.
@@ -14333,12 +20949,12 @@ fn params_from_domain_separator(ds: &str) -> Result<Params, AppError> {
     Ok(Params::new(parts[1], parts[2], parts[3], parts[4]))
 }
 
+/// Read one server answer — **bounded as it arrives** (`peer_read`'s class
+/// rule). This is the shared reader for every call this app makes to the Eidola
+/// server, so the ceiling lands on all of them at once; attested or not, the
+/// bytes are still chosen by the other end.
 async fn read_response(resp: reqwest::Response) -> Result<(reqwest::StatusCode, String), AppError> {
-    let status = resp.status();
-    let body = resp.text().await.map_err(|e| AppError::Network {
-        message: format!("failed to read response body: {e}"),
-    })?;
-    Ok((status, body))
+    crate::peer_read::read_api_answer(resp, "the server's answer").await
 }
 
 fn check_status(status: reqwest::StatusCode, body: &str) -> Result<(), AppError> {
@@ -14444,6 +21060,36 @@ async fn flush_attestations(
     Ok(connection_id)
 }
 
+/// Record the destination of a route **no enclave vouches for** — an engine or
+/// an external backend: a `connection` row naming the URL a request is about to
+/// be sent to, transport `clearnet`, and **no** `attestation_hash`.
+///
+/// The schema already admits the honest shape, so nothing is claimed that did
+/// not happen: a row with no attestation is the statement that nothing was
+/// verified. Shared by the chat turn ([`TurnPrep::attach_plain_connection`])
+/// and the proxy, so both plain routes record their destination in the same
+/// place an attested route records its own.
+async fn insert_plain_connection(
+    db_conn: &turso::Connection,
+    provider_id: &str,
+    base_url: &str,
+    now: i64,
+) -> Result<String, AppError> {
+    let id = Uuid::now_v7().to_string();
+    db::insert_connection(
+        db_conn,
+        &id,
+        provider_id,
+        base_url,
+        "clearnet",
+        None,
+        now,
+        now,
+    )
+    .await?;
+    Ok(id)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -14451,6 +21097,518 @@ async fn flush_attestations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A spend's refund recovery key is a function of its stored
+    /// `PreRefund` bytes, and of nothing the server sees.** The spend and every
+    /// later recovery (in the turn, or afterwards from the stored row)
+    /// must rebuild the same key, and two spends must not share one.
+    #[test]
+    fn the_refund_recovery_key_is_rebuilt_from_the_stored_pre_refund() {
+        let params = Params::new("eidola", "inference", "production", "2026-03-05");
+        let issuer = anonymous_credit_tokens::PrivateKey::random(OsRng);
+        let pre = anonymous_credit_tokens::PreIssuance::random(OsRng);
+        let request = pre.request(&params, OsRng);
+        let response = issuer
+            .issue::<ACT_L>(
+                &params,
+                &request,
+                credit_to_scalar::<ACT_L>(1000).unwrap(),
+                anonymous_credit_tokens::Scalar::ZERO,
+                OsRng,
+            )
+            .unwrap();
+        let token = pre
+            .to_credit_token::<ACT_L>(&params, issuer.public(), &request, &response)
+            .unwrap();
+        let spend = |token: &CreditToken| {
+            let (proof, pre_refund) = token
+                .prove_spend::<ACT_L>(&params, credit_to_scalar::<ACT_L>(300).unwrap(), OsRng)
+                .unwrap();
+            (proof, pre_refund.to_cbor().unwrap())
+        };
+        let (proof, stored) = spend(&token);
+        let key = refund_recovery_key(&stored);
+
+        // Rebuilt from the stored bytes, and from a decode/re-encode of them.
+        assert_eq!(*refund_recovery_key(&stored.clone()), *key);
+        let reencoded = PreRefund::from_cbor(&stored).unwrap().to_cbor().unwrap();
+        assert_eq!(*refund_recovery_key(&reencoded), *key);
+
+        // Another spend's key is another key.
+        let (_, other) = spend(&token);
+        assert_ne!(*refund_recovery_key(&other), *key);
+
+        // Domain-separated: not a bare hash of the secret state, and not
+        // derivable from what the server is sent.
+        assert_ne!(<[u8; 32]>::from(Sha256::digest(&stored)), *key);
+        let proof_cbor = proof.to_cbor().unwrap();
+        assert_ne!(*refund_recovery_key(&proof_cbor), *key);
+        let text = eidola_common::refund_key::encode_refund_key(&key);
+        assert_eq!(
+            eidola_common::refund_key::decode_refund_key(&text),
+            Some(*key)
+        );
+    }
+
+    /// **A spend travels in the body it is sent with, and nowhere else.** The
+    /// copy that goes to the wire carries the `credentials` member, one
+    /// element per input in input order, exactly as the gateway reads it; the
+    /// body the caller keeps (what the Record stores) does not, and no header
+    /// carries any of it. Printed, the spend is nothing.
+    #[test]
+    fn a_spend_travels_only_in_the_sent_body() {
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let spend = PresentedSpend::new(&[7u8; 32], b"spend-proof", b"pre-refund");
+        let fill = PresentedSpend::new(&[8u8; 32], b"fill-proof", b"fill-pre-refund");
+        let key_text = String::from_utf8(
+            eidola_common::refund_key::encode_refund_key(&spend.refund_key).to_vec(),
+        )
+        .unwrap();
+        let recorded = serde_json::json!({ "model": "m", "messages": [] });
+
+        let sent = with_credentials(
+            &recorded,
+            Some(PresentedSpend::credentials_of(&[&spend, &fill])),
+        );
+        assert!(
+            recorded.get("credentials").is_none(),
+            "the kept body has none"
+        );
+        let credentials = sent["credentials"].as_array().unwrap();
+        assert_eq!(credentials.len(), 2);
+        assert_eq!(
+            credentials[0]["token"],
+            eidola_common::spend_credentials::encode_token(&spend.token)
+        );
+        assert_eq!(credentials[0]["refund_key"], key_text.as_str());
+        assert_eq!(
+            credentials[1]["token"],
+            eidola_common::spend_credentials::encode_token(&fill.token)
+        );
+        assert_eq!(&spend.token[..2], &ACT_TOKEN_TYPE.to_be_bytes());
+        // No spend, no member, and no copy.
+        assert!(matches!(
+            body_with_spend(&recorded, None),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(!format!("{spend:?}").contains(&key_text));
+
+        // An external backend's bearer key is a sensitive header.
+        let client = reqwest::Client::builder().build().unwrap();
+        let bearer = with_authorization(client.get("http://127.0.0.1:9/"), Some("Bearer sk-x"))
+            .build()
+            .unwrap();
+        assert!(bearer.headers()[reqwest::header::AUTHORIZATION].is_sensitive());
+        assert!(!format!("{bearer:?}").contains("sk-x"));
+    }
+
+    /// **A refund the server still calls provisional is settled on only when
+    /// waiting longer would leave it worth nothing**: at the spent key's
+    /// `spend_until`, and never on this client's own reckoning of when the
+    /// request might have ended.
+    #[test]
+    fn a_provisional_refund_is_accepted_only_at_the_spend_deadline() {
+        let until = 1_000_000;
+        assert!(!accepts_provisional_refund(None, i64::MAX));
+        assert!(!accepts_provisional_refund(Some(until), until - 1));
+        assert!(accepts_provisional_refund(Some(until), until));
+    }
+
+    /// **One refund per input.** A response's `refunds` is read only when it
+    /// is a non-empty array (whether it answers each input is checked where
+    /// it is applied); anything else is no refund, and every input is
+    /// recovered.
+    #[test]
+    fn a_response_refund_is_its_refunds_array() {
+        let one = serde_json::json!({ "refunds": [{ "refund": "r", "issuer_key_id": "k" }] });
+        assert_eq!(inline_refund(&one).unwrap()[0]["refund"], "r");
+        let two = serde_json::json!({ "refunds": [{ "refund": "a" }, { "refund": "b" }] });
+        assert_eq!(inline_refund(&two).unwrap()[1]["refund"], "b");
+        for none in [
+            serde_json::json!({}),
+            serde_json::json!({ "refunds": [] }),
+            serde_json::json!({ "refunds": { "refund": "r" } }),
+            serde_json::json!({ "refund": { "refund": "r", "issuer_key_id": "k" } }),
+        ] {
+            assert!(inline_refund(&none).is_none(), "{none}");
+        }
+    }
+
+    /// **The input rule** (`docs/anonymous-credits.md` → Spending several tokens in one request), over a
+    /// wallet already in its spend order: the first credential alone when it
+    /// covers the hold; otherwise drained, with the first *later* credential
+    /// that covers the rest; otherwise a new credential for what is missing
+    /// beside the largest.
+    #[test]
+    fn inputs_are_the_first_credential_or_a_drain_and_the_first_fill() {
+        use InputChoice::*;
+        let w = 6_200;
+        // Empty wallet: a new credential covers the whole hold.
+        assert_eq!(choose_inputs(&[], w), Allocate { need: w });
+        // The first covers it: alone, even when a later one fits better.
+        assert_eq!(choose_inputs(&[6_200, 9_000], w), One(0));
+        assert_eq!(choose_inputs(&[10_000, 6_200], w), One(0));
+        // The first does not: drained, and the first later credential that
+        // covers the rest fills, not the smallest or the largest.
+        assert_eq!(
+            choose_inputs(&[3_000, 1_000, 3_200, 9_000], w),
+            Two { drain: 0, fill: 2 }
+        );
+        assert_eq!(
+            choose_inputs(&[3_000, 5_000, 3_200], w),
+            Two { drain: 0, fill: 1 }
+        );
+        // Exactly the rest is enough.
+        assert_eq!(choose_inputs(&[1, 6_199], w), Two { drain: 0, fill: 1 });
+        // No pair covers the hold: a new credential, for the rest of the
+        // largest credential's drain only.
+        assert_eq!(choose_inputs(&[3_000, 3_199], w), Allocate { need: 3_001 });
+        assert_eq!(choose_inputs(&[3_000], w), Allocate { need: 3_200 });
+        // The first has no fill, but a later pair covers the hold: that pair
+        // pays, rather than allocation ($0.10, $0.60 and $0.60 against $1).
+        assert_eq!(
+            choose_inputs(&[100_000, 600_000, 600_000], 1_000_000),
+            Two { drain: 1, fill: 2 }
+        );
+    }
+
+    /// **Allocation happens only when no pair covers the hold**, and every
+    /// pair chosen pays it exactly: over every wallet of up to four
+    /// credentials drawn from a few balances, in every order.
+    #[test]
+    fn allocation_happens_only_when_no_pair_covers_the_hold() {
+        use InputChoice::*;
+        let values = [0i64, 1, 3, 4, 6, 7, 10];
+        let worst = 10;
+        let mut wallets: Vec<Vec<i64>> = vec![Vec::new()];
+        for _ in 0..4 {
+            let longer: Vec<Vec<i64>> = wallets
+                .iter()
+                .filter(|w| w.len() == wallets.last().map_or(0, Vec::len))
+                .flat_map(|w| {
+                    values.iter().map(move |&v| {
+                        let mut w = w.clone();
+                        w.push(v);
+                        w
+                    })
+                })
+                .collect();
+            wallets.extend(longer);
+        }
+        for wallet in &wallets {
+            let pair_covers = (0..wallet.len())
+                .any(|i| (i + 1..wallet.len()).any(|j| wallet[i] + wallet[j] >= worst));
+            let first_covers = wallet.first().is_some_and(|&b| b >= worst);
+            match choose_inputs(wallet, worst) {
+                One(i) => assert!(i == 0 && first_covers, "{wallet:?}"),
+                Two { drain, fill } => {
+                    assert!(!first_covers && drain < fill, "{wallet:?}");
+                    assert!(wallet[drain] < worst, "{wallet:?}");
+                    assert!(wallet[drain] + wallet[fill] >= worst, "{wallet:?}");
+                    // The first credential with a fill is the one drained.
+                    assert!(
+                        (0..drain)
+                            .all(|i| (i + 1..wallet.len()).all(|j| wallet[i] + wallet[j] < worst)),
+                        "{wallet:?}"
+                    );
+                }
+                Allocate { need } => {
+                    assert!(!first_covers && !pair_covers, "{wallet:?}");
+                    assert_eq!(need, worst - wallet.iter().copied().max().unwrap_or(0));
+                }
+            }
+        }
+    }
+
+    /// **Waiting for in-flight refunds is worth it when their successors could
+    /// pay**, alone or as one of two inputs: two in-flight credentials of
+    /// 3,000 and 4,000 could fund a 6,200 hold between them, and one of 3,000
+    /// beside a held 4,000 could too. Nothing in flight, or nothing that
+    /// reaches the hold even paired, is a true shortfall.
+    #[test]
+    fn waiting_counts_two_input_coverage_from_settling_credentials() {
+        assert!(settlement_could_cover(&[6_200], &[], 6_200));
+        assert!(settlement_could_cover(&[3_000, 4_000], &[], 6_200));
+        assert!(settlement_could_cover(&[3_000], &[4_000], 6_200));
+        assert!(!settlement_could_cover(&[], &[3_000, 4_000], 6_200));
+        assert!(!settlement_could_cover(&[3_000], &[], 6_200));
+        assert!(!settlement_could_cover(&[3_000, 3_000], &[100], 6_200));
+        // 4,000 of convertible balance, passed as one more held credential,
+        // fills beside a drained 3,000.
+        assert!(settlement_could_cover(&[3_000], &[0, 4_000], 6_200));
+    }
+
+    /// **The partial returns a response carries are checked against the
+    /// in-order allocation** (`docs/anonymous-credits.md` → Spending several tokens in one request): a drain
+    /// consumed first and the change on the fill passes; change landing on
+    /// the drain while the fill was charged does not, nor does a successor
+    /// worth more than its predecessor.
+    #[test]
+    fn partial_returns_are_checked_against_the_in_order_allocation() {
+        // (balance, share, successor) per input.
+        assert!(check_partial_returns(&[(10_000, 6_200, 4_000)]));
+        assert!(check_partial_returns(&[(10_000, 6_200, 10_000)]));
+        // Drain 3,000 and fill 3,200 of a 9,000 credential, charged 4,000.
+        assert!(check_partial_returns(&[
+            (3_000, 3_000, 0),
+            (9_000, 3_200, 8_000)
+        ]));
+        // Charged 500: the drain keeps 2,500 and the fill is untouched.
+        assert!(check_partial_returns(&[
+            (3_000, 3_000, 2_500),
+            (9_000, 3_200, 9_000)
+        ]));
+        // The same 500 taken from the fill instead: not the rule.
+        assert!(!check_partial_returns(&[
+            (3_000, 3_000, 3_000),
+            (9_000, 3_200, 8_500)
+        ]));
+        // A successor worth more than its predecessor.
+        assert!(!check_partial_returns(&[
+            (3_000, 3_000, 3_001),
+            (9_000, 3_200, 9_000)
+        ]));
+    }
+
+    /// **An event ends at any two line terminators the format allows.**
+    ///
+    /// The event-stream format takes `\r\n`, `\n` and a bare `\r`, so a blank
+    /// line is any two of them in a row — six pairs, not the two that are
+    /// common. Recognising only `\n\n` and `\r\n\r\n` meant a backend emitting
+    /// bare-`\r` SSE never split at all: every event piled into one frame until
+    /// the per-event ceiling refused the stream or EOF forwarded the whole tail
+    /// in one piece, so nothing streamed and no per-event work ran.
+    #[test]
+    fn an_event_ends_at_every_line_ending_the_format_allows() {
+        for (sep, len) in [
+            ("\n\n", 2),
+            ("\r\r", 2),
+            ("\r\n\r\n", 4),
+            ("\r\n\n", 3),
+            ("\n\r\n", 3),
+            ("\r\n\r", 3),
+        ] {
+            let buf = format!("data: one{sep}data: two\n\n");
+            assert_eq!(
+                find_event_boundary(buf.as_bytes()),
+                Some((9, len)),
+                "separator {sep:?} ends the first event"
+            );
+        }
+
+        // Nothing that is not a blank line ends one.
+        assert_eq!(find_event_boundary(b"data: one\ndata: two\n"), None);
+        assert_eq!(find_event_boundary(b""), None);
+    }
+
+    /// **A `\r` at a chunk edge is split eagerly, and the residual is what
+    /// makes that the right choice** — the classic split-across-chunk-edges
+    /// trap, resolved by comparing what each answer costs.
+    ///
+    /// Waiting for the byte that decides it strands the last event of any
+    /// `\r`-terminated stream (exactly `[DONE]`, at EOF, where no byte is
+    /// coming): the turn reports a stream that ended without finishing. Reading
+    /// it eagerly can split `\r\r` out of a `\r\r\n`, leaving a stray `\n`
+    /// heading the next event — which both readers already tolerate.
+    #[test]
+    fn a_carriage_return_at_a_chunk_edge_still_ends_its_event() {
+        // The end of the buffer is the end of the evidence.
+        assert_eq!(find_event_boundary(b"data: one\r\r"), Some((9, 2)));
+        assert_eq!(find_event_boundary(b"data: one\r"), None, "one is not two");
+
+        // With the next byte in hand the length follows what really arrived.
+        assert_eq!(find_event_boundary(b"data: one\r\rd"), Some((9, 2)));
+        assert_eq!(find_event_boundary(b"data: one\r\r\nd"), Some((9, 3)));
+        assert_eq!(find_event_boundary(b"data: one\r\n\r\nd"), Some((9, 4)));
+
+        // The residual, named: the `\r\r\n` split across a chunk edge leaves a
+        // `\n` heading the next event. It carries no `data:` prefix, so the
+        // turn path's line walk skips it, and the proxy forwards every byte it
+        // consumed either way — so the split is invisible downstream.
+        let (pos, len) = find_event_boundary(b"data: one\r\r").expect("a boundary");
+        assert_eq!(&b"data: one\r\r"[pos..pos + len], b"\r\r");
+        assert!(
+            !"\ndata: two"
+                .lines()
+                .next()
+                .expect("a line")
+                .starts_with("data:"),
+            "the stray newline heads a line no reader acts on"
+        );
+    }
+
+    /// **An event's fields are split the same way its edges are.**
+    ///
+    /// `str::lines()` knows two of the format's three line endings, so a
+    /// bare-`\r` event arrived as one line: `id: 1\rdata: {…}` has no `data:`
+    /// prefix and its payload was invisible to every reader. Terminators come
+    /// back with their lines so a caller rebuilding an event frames it the way
+    /// the sender did.
+    #[test]
+    fn an_events_fields_are_split_at_every_line_ending_too() {
+        assert_eq!(
+            split_event_lines("id: 1\rdata: {}"),
+            vec![("id: 1", "\r"), ("data: {}", "")],
+            "a bare carriage return separates two fields"
+        );
+        assert_eq!(
+            split_event_lines("id: 1\r\ndata: {}\n"),
+            vec![("id: 1", "\r\n"), ("data: {}", "\n")],
+            "and the mixed endings each come back as themselves"
+        );
+        assert_eq!(split_event_lines(""), vec![]);
+        assert_eq!(split_event_lines("\n"), vec![("", "\n")], "a blank line");
+
+        // Rebuilt from the pieces, an event is the bytes it arrived as.
+        let event = "id: 1\rdata: {}\r\nretry: 10";
+        let rebuilt: String = split_event_lines(event)
+            .iter()
+            .map(|(line, terminator)| format!("{line}{terminator}"))
+            .collect();
+        assert_eq!(rebuilt, event);
+    }
+
+    /// **An event carries one data value**: its `data:` fields joined with
+    /// `\n`, exactly one leading space stripped from each, a bare `data` line
+    /// counting as an empty field.
+    #[test]
+    fn an_events_data_fields_are_joined_into_one_value() {
+        assert_eq!(
+            sse_event_data("id: 1\ndata: {\"a\":\ndata:  1}\n"),
+            Some("{\"a\":\n 1}".to_string()),
+            "joined with a newline, and only one space taken from each"
+        );
+        assert_eq!(sse_event_data("data\rdata: x"), Some("\nx".to_string()));
+        assert_eq!(sse_event_data(": a comment\nid: 7"), None, "no data field");
+    }
+
+    /// A model list from a server that publishes no capabilities at all — the
+    /// shape every generic backend sends, and the shape our own server sent
+    /// until it learned to declare. Every axis must come back **undeclared**,
+    /// and undeclared must not be `false`: reading it as `false` would take
+    /// tools away from every model on every such backend at once.
+    #[test]
+    fn a_silent_model_list_declares_nothing_rather_than_no() {
+        let entry: ModelListEntry = serde_json::from_value(serde_json::json!({
+            "id": "some-model",
+            "context_length": 8192,
+            "pricing": {
+                "per_prompt_token": { "value": 1, "scale_factor": 1 },
+                "per_completion_token": { "value": 1, "scale_factor": 1 }
+            }
+        }))
+        .expect("a list with no capability fields still parses");
+
+        assert_eq!(entry.max_output_tokens, None);
+        assert_eq!(entry.declared_budget_class(), None);
+        assert_eq!(entry.declared_capabilities(), ModelCapabilities::default());
+        assert_eq!(entry.declared_capabilities().tool_calling, None);
+    }
+
+    /// A declaration is read leaf by leaf, and the leaf is an object.
+    #[test]
+    fn a_declared_model_list_is_read_leaf_by_leaf() {
+        let entry: ModelListEntry = serde_json::from_value(serde_json::json!({
+            "id": "some-model",
+            "context_length": 8192,
+            "max_output_tokens": 16384,
+            "output_budget_class": "reasoning",
+            "capabilities": {
+                "tool_calling": { "supported": true },
+                "reasoning": { "supported": false },
+                "input_modalities": ["text", "image"],
+                "output_modalities": ["text"]
+            },
+            "pricing": {
+                "per_prompt_token": { "value": 1, "scale_factor": 1 },
+                "per_completion_token": { "value": 1, "scale_factor": 1 }
+            }
+        }))
+        .expect("a declaring list parses");
+
+        assert_eq!(entry.max_output_tokens, Some(16_384));
+        assert_eq!(
+            entry.declared_budget_class(),
+            Some(OutputBudgetClass::Reasoning)
+        );
+        let caps = entry.declared_capabilities();
+        assert_eq!(caps.tool_calling, Some(true));
+        assert_eq!(caps.reasoning, Some(false));
+        assert_eq!(
+            caps.input_modalities,
+            Some(vec![Modality::Text, Modality::Image])
+        );
+        assert_eq!(caps.output_modalities, Some(vec![Modality::Text]));
+    }
+
+    /// **A newer server must not be able to break every conversation on this
+    /// machine.** The list is fetched on every eidola-backed turn and one
+    /// unreadable row fails the whole response, so a value this build has
+    /// never seen — a modality name, a budget class, a leaf with keys but no
+    /// `supported` — degrades to "undeclared" rather than to a parse error.
+    #[test]
+    fn a_newer_declaration_degrades_to_undeclared_rather_than_failing() {
+        let entry: ModelListEntry = serde_json::from_value(serde_json::json!({
+            "id": "some-model",
+            "context_length": 8192,
+            "output_budget_class": "extended-thinking",
+            "capabilities": {
+                "tool_calling": { "efforts": ["low", "high"] },
+                "input_modalities": ["text", "video"],
+                "web_search": { "supported": true }
+            },
+            "pricing": {
+                "per_prompt_token": { "value": 1, "scale_factor": 1 },
+                "per_completion_token": { "value": 1, "scale_factor": 1 }
+            }
+        }))
+        .expect("an unfamiliar declaration must still parse");
+
+        let caps = entry.declared_capabilities();
+        assert_eq!(
+            caps.tool_calling, None,
+            "a leaf with no `supported` is undeclared, not a `false`"
+        );
+        assert_eq!(caps.reasoning, None, "an absent leaf is undeclared");
+        assert_eq!(
+            caps.input_modalities,
+            Some(vec![Modality::Text, Modality::Unknown]),
+            "an unknown modality is kept as unknown rather than dropped"
+        );
+        assert_eq!(
+            entry.declared_budget_class(),
+            None,
+            "an unrecognized ladder reads as undeclared, like an absent one"
+        );
+    }
+
+    /// The precedence rule, stated as a table.
+    #[test]
+    fn a_declaration_decides_only_where_one_can_exist() {
+        assert_eq!(
+            ToolPolicy::from_declaration(Some(true)),
+            ToolPolicy::Declared(true)
+        );
+        assert_eq!(
+            ToolPolicy::from_declaration(Some(false)),
+            ToolPolicy::Declared(false)
+        );
+        assert_eq!(
+            ToolPolicy::from_declaration(None),
+            ToolPolicy::Learned,
+            "silence falls back to discovery — the safe floor, never a `false`"
+        );
+
+        assert!(
+            !ToolPolicy::Declared(true).probes_on_failure(),
+            "a declared-capable model's failure is a failure"
+        );
+        assert!(!ToolPolicy::Declared(false).probes_on_failure());
+        assert!(
+            ToolPolicy::Learned.probes_on_failure(),
+            "discovery is the only path that may pay for a probe"
+        );
+    }
 
     #[test]
     fn hex_round_trip() {
@@ -14477,6 +21635,149 @@ mod tests {
         // 2026-01-01T00:00:00Z → 1767225600000
         let ms = iso_to_ms("2026-01-01T00:00:00Z").unwrap();
         assert_eq!(ms, 1767225600000);
+    }
+
+    // --- Issuer key listings against the public calendar ---
+
+    const LISTED_DS: &str = "ACT-v1:eidola:inference:production:2026-03-05";
+
+    /// A listed key for `epoch` on the production calendar, whose public key
+    /// is `fill` repeated (the listing check hashes it, never decodes it).
+    fn listed(epoch: u64, fill: u8) -> IssuerKeyResponse {
+        let pk = vec![fill; 32];
+        let w = ISSUER_CALENDAR.windows(epoch).unwrap();
+        IssuerKeyResponse {
+            id: issuer_key_id_of(&pk),
+            public_key: URL_SAFE_NO_PAD.encode(&pk),
+            domain_separator: LISTED_DS.into(),
+            issue_from: rfc3339_utc(w.issue_from),
+            issue_until: rfc3339_utc(w.issue_until),
+            accept_until: rfc3339_utc(w.accept_until),
+        }
+    }
+
+    fn refusal_of(keys: &[IssuerKeyResponse]) -> Option<IssuerKeyRefusal> {
+        match checked_listing(&ISSUER_CALENDAR, keys, LISTED_DS) {
+            Err(AppError::IssuerKeyRefused { refusal }) => Some(refusal),
+            Err(e) => panic!("refused, but not by the calendar checks: {e}"),
+            Ok(_) => None,
+        }
+    }
+
+    #[test]
+    fn an_honest_listing_is_accepted_in_epoch_order() {
+        let mut other_ds = listed(2967, 9);
+        other_ds.domain_separator = "ACT-v1:someone:else:x:y".into();
+        let keys = [listed(2967, 3), listed(2965, 1), other_ds, listed(2966, 2)];
+        let checked = checked_listing(&ISSUER_CALENDAR, &keys, LISTED_DS).unwrap();
+        let epochs: Vec<u64> = checked.iter().map(|(e, _)| *e).collect();
+        assert_eq!(
+            epochs,
+            [2965, 2966, 2967],
+            "another separator's key is ignored"
+        );
+        // A key listed twice, identically, is one key.
+        assert_eq!(refusal_of(&[listed(2966, 2), listed(2966, 2)]), None);
+    }
+
+    /// The windows must be the calendar's own spelling, byte for byte: a
+    /// parse that rounds would let an off-calendar instant through.
+    #[test]
+    fn a_window_that_only_rounds_onto_the_calendar_is_refused() {
+        type Respell = fn(&mut IssuerKeyResponse);
+        let spellings: [(&str, Respell); 7] = [
+            ("a fraction of a second", |k| {
+                k.issue_from = k.issue_from.replace('Z', ".500Z")
+            }),
+            ("a fraction on the acceptance deadline", |k| {
+                k.accept_until = k.accept_until.replace('Z', ".999Z")
+            }),
+            ("no Z", |k| {
+                k.issue_until = k.issue_until.trim_end_matches('Z').into()
+            }),
+            ("an offset", |k| {
+                k.issue_from = k.issue_from.replace('Z', "+00:00")
+            }),
+            ("lower case", |k| k.issue_from = k.issue_from.to_lowercase()),
+            ("surrounding space", |k| {
+                k.issue_from = format!(" {}", k.issue_from)
+            }),
+            ("a signed year", |k| {
+                k.issue_from = format!("+{}", k.issue_from)
+            }),
+        ];
+        for (what, spell) in spellings {
+            let mut key = listed(2966, 2);
+            spell(&mut key);
+            assert_eq!(
+                refusal_of(&[key]),
+                Some(IssuerKeyRefusal::NotOnCalendar),
+                "{what} was accepted"
+            );
+        }
+        // A normalized instant: 24:00 on the 4th is the 5th to a lenient parser.
+        let mut key = listed(2966, 2);
+        let w = ISSUER_CALENDAR.windows(2966).unwrap();
+        assert_eq!(rfc3339_utc(w.issue_from), "2026-11-05T00:00:00Z");
+        key.issue_from = "2026-11-04T24:00:00Z".into();
+        assert_eq!(refusal_of(&[key]), Some(IssuerKeyRefusal::NotOnCalendar));
+    }
+
+    /// One key for two epochs is refused, whichever epochs and whatever the
+    /// order: listed as next epoch's too, it would leave next epoch
+    /// unrecorded for a different key to fill when it arrives.
+    #[test]
+    fn one_key_listed_for_two_epochs_is_refused() {
+        let mut next = listed(2966, 2);
+        let w = ISSUER_CALENDAR.windows(2967).unwrap();
+        next.issue_from = rfc3339_utc(w.issue_from);
+        next.issue_until = rfc3339_utc(w.issue_until);
+        next.accept_until = rfc3339_utc(w.accept_until);
+        for keys in [
+            vec![listed(2966, 2), next.clone()],
+            vec![next.clone(), listed(2966, 2)],
+            vec![listed(2965, 1), next, listed(2966, 2)],
+        ] {
+            assert_eq!(
+                refusal_of(&keys),
+                Some(IssuerKeyRefusal::OneKeyForSeveralEpochs { epoch: 2967 })
+            );
+        }
+    }
+
+    /// Two keys for one epoch are refused wherever they sit in the listing —
+    /// the next epoch's included, which no check at issuance would otherwise
+    /// look at, and in either order, so the server's ordering decides nothing.
+    #[test]
+    fn two_keys_for_any_one_epoch_are_refused() {
+        for keys in [
+            vec![listed(2966, 2), listed(2967, 3), listed(2967, 4)],
+            vec![listed(2967, 4), listed(2966, 2), listed(2967, 3)],
+            vec![listed(2966, 5), listed(2966, 2)],
+        ] {
+            assert!(matches!(
+                refusal_of(&keys),
+                Some(IssuerKeyRefusal::SecondKeyForEpoch { .. })
+            ));
+        }
+    }
+
+    /// Every entry is held to the checks, not only the current key: an entry
+    /// that escaped them would escape being recorded.
+    #[test]
+    fn every_listed_key_is_held_to_the_checks() {
+        let mut off = listed(2967, 3);
+        off.issue_from = off.issue_from.replace("T00", "T01");
+        assert_eq!(
+            refusal_of(&[listed(2966, 2), off]),
+            Some(IssuerKeyRefusal::NotOnCalendar)
+        );
+        let mut mislabelled = listed(2967, 3);
+        mislabelled.id = listed(2967, 4).id;
+        assert!(matches!(
+            checked_listing(&ISSUER_CALENDAR, &[listed(2966, 2), mislabelled], LISTED_DS),
+            Err(AppError::Credential { .. })
+        ));
     }
 
     #[test]
@@ -14534,6 +21835,110 @@ mod tests {
         });
         assert_eq!(tmpl, config::DEFAULT_TEMPLATE_ID);
         assert_eq!(model, config::DEFAULT_MODEL);
+    }
+
+    /// **A profile opened under another trust domain keeps no key of the old
+    /// one.** A build with another compiled-in server URL or measurement
+    /// changes the domain with no write to the eidola row, so the open itself
+    /// forgets — overwritten, and gone from the database's files — every key
+    /// minted under another domain, and keeps the current domain's.
+    #[test]
+    fn opening_a_profile_forgets_the_keys_of_another_trust_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().to_path_buf();
+        let data_dir = dir.path().join("data");
+        let on_disk = |key: &[u8]| {
+            std::fs::read_dir(&data_dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.is_file())
+                .any(|p| {
+                    std::fs::read(p)
+                        .unwrap()
+                        .windows(key.len())
+                        .any(|w| w == key)
+                })
+        };
+
+        let core = AppCore::new(config_dir.clone(), data_dir.clone()).unwrap();
+        let spaces: Vec<String> = (0..2)
+            .map(|_| {
+                core.runtime
+                    .block_on(core.post_reply("How do tides work?".into(), None, None))
+                    .unwrap()
+                    .space_id
+            })
+            .collect();
+        let inner = core.inner.clone();
+        let (other, current) = core.runtime.block_on(async move {
+            let conn = inner.db_conn().await.unwrap();
+            let row = db::get_backend(&conn, backends::EIDOLA_BACKEND_ID)
+                .await
+                .unwrap();
+            let here = EidolaResolved::from_row(row.as_ref())
+                .unwrap()
+                .cache_trust_domain();
+            let mut keys = Vec::new();
+            // A lineage keyed by a build that resolved another domain, never
+            // used since; and one keyed under this build's.
+            for (space, domain) in spaces
+                .iter()
+                .zip(["another-build's-domain".to_string(), here])
+            {
+                let agent = db::list_space_owned_participants(&conn, space)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|p| p.kind == "agent")
+                    .unwrap();
+                let scope = prefix_cache::CacheScope {
+                    policy: prefix_cache::PromptCachePolicy {
+                        idle_ttl_ms: 900_000,
+                        max_age_ms: 7_200_000,
+                    },
+                    trust_domain: domain,
+                };
+                let model = canonical_model(agent.model_ref.as_deref().unwrap());
+                let claimed = db::claim_prefix_cache_key(
+                    &conn,
+                    space,
+                    &agent.id,
+                    &model,
+                    None,
+                    &scope,
+                    now_ms(),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(claimed, db::ClaimOutcome::Claimed(..)));
+                let mut rows = conn
+                    .query(
+                        "SELECT key_bytes FROM prefix_cache_key WHERE space_id = ?1",
+                        [turso::Value::Text(space.clone())],
+                    )
+                    .await
+                    .unwrap();
+                let row = rows.next().await.unwrap().unwrap();
+                keys.push(row.get::<Vec<u8>>(0).unwrap());
+            }
+            (keys.remove(0), keys.remove(0))
+        });
+        drop(core);
+        assert!(on_disk(&other), "the old key is stored (the premise)");
+
+        let core = AppCore::new(config_dir, data_dir.clone()).unwrap();
+        core.runtime.block_on(core.open_database()).unwrap();
+        assert!(
+            !on_disk(&other),
+            "a key of another trust domain is nowhere in the database's files"
+        );
+        assert!(on_disk(&current), "this domain's key is kept");
+        let inner = core.inner.clone();
+        let left = core.runtime.block_on(async move {
+            let conn = inner.db_conn().await.unwrap();
+            db::prefix_cache_lineages(&conn).await.unwrap()
+        });
+        assert_eq!(left.len(), 1);
     }
 
     #[test]
@@ -14648,34 +22053,224 @@ mod tests {
     // --- Auto-provisioning decision logic ---------------------------------
 
     #[test]
-    fn auto_allocation_uses_default_chunk_when_balance_is_plentiful() {
-        // Plenty of balance, small charge → allocate the default chunk,
-        // leaving the rest of the balance in the account.
-        let amount = auto_allocation_amount(10 * DEFAULT_ALLOCATION_CREDITS, 6_200).unwrap();
-        assert_eq!(amount, DEFAULT_ALLOCATION_CREDITS);
+    fn auto_allocation_issues_the_denomination_when_balance_is_plentiful() {
+        // Plenty of balance, small need → the denomination, leaving the rest
+        // of the balance in the account.
+        let amount = auto_allocation_amount(10 * DEFAULT_ALLOCATION_CREDITS, 6_200);
+        assert_eq!(amount, Some(DEFAULT_ALLOCATION_CREDITS));
     }
 
     #[test]
-    fn auto_allocation_is_capped_by_available_balance() {
-        // Balance covers the charge but is below the default chunk →
-        // allocate everything that's available.
-        let amount = auto_allocation_amount(50_000, 6_200).unwrap();
-        assert_eq!(amount, 50_000);
+    fn auto_allocation_issues_the_whole_balance_when_less_than_the_denomination() {
+        assert_eq!(auto_allocation_amount(50_000, 6_200), Some(50_000));
+        assert_eq!(auto_allocation_amount(6_200, 6_200), Some(6_200));
+    }
+
+    /// REGRESSION: **a need past the denomination is never issued to its own
+    /// size.** The amount issued is visible on the account surface and a
+    /// fill's share at its spend, so an issuance equal to the share links the
+    /// two. Nothing is issued instead, however large the balance.
+    #[test]
+    fn auto_allocation_never_grows_to_cover_a_large_need() {
+        let need = DEFAULT_ALLOCATION_CREDITS + 500_000;
+        assert_eq!(
+            auto_allocation_amount(10 * DEFAULT_ALLOCATION_CREDITS, need),
+            None
+        );
+        assert_eq!(auto_allocation_amount(i64::MAX, need), None);
     }
 
     #[test]
-    fn auto_allocation_grows_to_cover_a_large_charge() {
-        // A single charge larger than the default chunk must still fit in
-        // one credential (spends draw from exactly one credential).
-        let required = DEFAULT_ALLOCATION_CREDITS + 500_000;
-        let amount = auto_allocation_amount(10 * DEFAULT_ALLOCATION_CREDITS, required).unwrap();
-        assert_eq!(amount, required);
+    fn auto_allocation_issues_nothing_a_balance_cannot_cover() {
+        assert_eq!(auto_allocation_amount(1_000, 6_200), None);
+        assert_eq!(auto_allocation_amount(0, 1), None);
+        assert_eq!(auto_allocation_amount(-5, 1), None);
+    }
+
+    /// **The amount issued is never a function of the need.** Over edge
+    /// values and a seeded sweep: whenever anything is issued, it is the
+    /// denomination or the whole balance when less, and it is issued exactly
+    /// when that amount covers the need.
+    #[test]
+    fn the_issued_amount_never_depends_on_the_need() {
+        let d = DEFAULT_ALLOCATION_CREDITS;
+        let check = |available: i64, need: i64| {
+            let issuable = available.min(d);
+            match auto_allocation_amount(available, need) {
+                Some(amount) => {
+                    assert_eq!(amount, issuable, "available {available}, need {need}");
+                    assert!(
+                        amount >= need && amount > 0,
+                        "available {available}, need {need}"
+                    );
+                }
+                None => assert!(
+                    issuable < need || issuable <= 0,
+                    "available {available}, need {need}: an issuance would have paid"
+                ),
+            }
+        };
+        let edges = [
+            i64::MIN,
+            -1,
+            0,
+            1,
+            2,
+            d / 4,
+            d - 1,
+            d,
+            d + 1,
+            2 * d,
+            i64::from(u32::MAX),
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+        for &available in &edges {
+            for &need in &edges {
+                check(available, need);
+            }
+        }
+        // A fixed-seed splitmix64, so a failure names a reproducible case.
+        let mut state: u64 = 0x5eed_0fd3_0a11;
+        let mut next = move || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        for _ in 0..20_000 {
+            let available = (next() % (4 * d as u64)) as i64;
+            let need = 1 + (next() % (3 * d as u64)) as i64;
+            check(available, need);
+            // The same balance answers every need it covers with one amount.
+            if let (Some(a), Some(b)) = (
+                auto_allocation_amount(available, need),
+                auto_allocation_amount(available, 1),
+            ) {
+                assert_eq!(a, b, "available {available}");
+            }
+        }
+    }
+
+    /// The largest payable hold: any two credentials, held or in flight, or
+    /// the largest beside one fresh denomination.
+    #[test]
+    fn the_largest_payable_hold_is_two_credentials_or_one_beside_a_denomination() {
+        let d = DEFAULT_ALLOCATION_CREDITS;
+        assert_eq!(
+            largest_payable_hold(&[], &[]),
+            d,
+            "an empty wallet: one denomination"
+        );
+        assert_eq!(largest_payable_hold(&[1_000], &[]), 1_000 + d);
+        assert_eq!(
+            largest_payable_hold(&[1_000, 600_000, 3_000], &[]),
+            600_000 + d,
+            "the largest residual, not the first, is drained"
+        );
+        assert_eq!(largest_payable_hold(&[], &[700_000]), 700_000 + d);
+        assert_eq!(
+            largest_payable_hold(&[2 * d], &[3 * d]),
+            5 * d,
+            "two credentials larger than the denomination pay together"
+        );
+        assert_eq!(largest_payable_hold(&[i64::MAX], &[i64::MAX]), i64::MAX);
+    }
+
+    /// A required-document row as `current_terms` would hand it back. Only
+    /// `document` and `version` decide coverage; the hash rides along
+    /// because a real snapshot carries one.
+    fn doc(document: &str, version: i64) -> TermsDocument {
+        TermsDocument {
+            document: document.into(),
+            version,
+            url: format!("https://example.invalid/{document}/"),
+            sha256: "0".repeat(64),
+        }
     }
 
     #[test]
-    fn auto_allocation_exact_balance_allocates_it_all() {
-        let amount = auto_allocation_amount(6_200, 6_200).unwrap();
-        assert_eq!(amount, 6_200);
+    fn a_document_added_after_the_snapshot_is_outstanding() {
+        // The defect this comparison exists for: every submission in the
+        // snapshot succeeds, so a per-document "it all went through" reads as
+        // complete while the account has never seen the new document.
+        let recorded = [doc("terms_of_service", 1)];
+        let required = [doc("terms_of_service", 1), doc("privacy_policy", 1)];
+        assert_eq!(
+            documents_not_covered(&required, &recorded),
+            vec!["privacy_policy".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_empty_recorded_set_leaves_everything_outstanding() {
+        // Two live cases land here: a gate switched on after an empty
+        // snapshot was fetched, and a submission that failed, where nothing
+        // is known to have been recorded.
+        let required = [doc("terms_of_service", 2), doc("privacy_policy", 1)];
+        assert_eq!(
+            documents_not_covered(&required, &[]),
+            vec!["terms_of_service".to_string(), "privacy_policy".to_string()]
+        );
+        // And with nothing required, an empty recorded set is complete.
+        assert!(documents_not_covered(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn acceptance_covers_the_requirement_it_meets_or_exceeds() {
+        // The server's rule, mirrored: accepting version N satisfies any
+        // requirement at or below N. A snapshot recorded just before a bump
+        // therefore still covers what it was taken against, and only a
+        // *higher* requirement is outstanding.
+        let recorded = [doc("terms_of_service", 3)];
+        assert!(documents_not_covered(&[doc("terms_of_service", 3)], &recorded).is_empty());
+        assert!(documents_not_covered(&[doc("terms_of_service", 2)], &recorded).is_empty());
+        assert_eq!(
+            documents_not_covered(&[doc("terms_of_service", 4)], &recorded),
+            vec!["terms_of_service".to_string()]
+        );
+    }
+
+    #[test]
+    fn extra_recorded_documents_do_not_make_anything_outstanding() {
+        // A document the server has stopped requiring is not a problem.
+        let recorded = [doc("terms_of_service", 1), doc("retired_notice", 9)];
+        assert!(documents_not_covered(&[doc("terms_of_service", 1)], &recorded).is_empty());
+    }
+
+    #[test]
+    fn only_a_retry_refusal_no_attempt_in_flight_can_overturn_is_final() {
+        let status = |code: u16| reqwest::StatusCode::from_u16(code).unwrap();
+        for code in [400, 409, 422] {
+            assert!(
+                retry_refusal_is_final(status(code)),
+                "{code} should be final"
+            );
+        }
+        for code in [401, 402, 403, 404, 408, 413, 428, 429, 500, 502, 503] {
+            assert!(
+                !retry_refusal_is_final(status(code)),
+                "{code} must stay pending"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_issuance_paths_own_refusals_end_a_first_attempt() {
+        let status = |code: u16| reqwest::StatusCode::from_u16(code).unwrap();
+        for code in [400, 401, 402, 409, 422, 428] {
+            assert!(
+                first_refusal_is_final(status(code)),
+                "{code} should be final"
+            );
+        }
+        for code in [403, 404, 405, 408, 413, 429, 431, 500, 502, 503] {
+            assert!(
+                !first_refusal_is_final(status(code)),
+                "{code} must stay pending"
+            );
+        }
     }
 
     #[test]
@@ -14688,32 +22283,6 @@ mod tests {
             }
             other => panic!("expected TermsAcceptanceRequired, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn auto_allocation_fails_typed_when_balance_cannot_cover_charge() {
-        let err = auto_allocation_amount(1_000, 6_200).unwrap_err();
-        match err {
-            AppError::InsufficientBalance {
-                available,
-                required,
-            } => {
-                assert_eq!(available, 1_000);
-                assert_eq!(required, 6_200);
-            }
-            other => panic!("expected InsufficientBalance, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn auto_allocation_fails_typed_on_zero_balance() {
-        assert!(matches!(
-            auto_allocation_amount(0, 1),
-            Err(AppError::InsufficientBalance {
-                available: 0,
-                required: 1
-            })
-        ));
     }
 
     // -----------------------------------------------------------------
@@ -14740,6 +22309,7 @@ mod tests {
             is_current: true,
             model: None,
             credits_consumed: None,
+            continuable: false,
             relation: parent.map(|_| "reply".to_string()),
             depth: 0,
             is_branch: false,
@@ -14752,6 +22322,7 @@ mod tests {
                 data: None,
             }],
             references: Vec::new(),
+            truncated: false,
             created_at: TEST_AT,
         }
     }
@@ -15202,6 +22773,7 @@ mod tests {
             model: None,
             credits_consumed: None,
             generation: 0,
+            truncated: false,
             created_at,
         }
     }

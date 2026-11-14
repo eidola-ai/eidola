@@ -9,7 +9,9 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, CodeBlockKind, Event, MetadataBlockKind, Options, Parser, Tag, TagEnd,
+};
 
 use crate::syntax::{ListKind, NodeKind, SyntaxNode, TableAlignment};
 
@@ -45,10 +47,60 @@ pub fn parse(markdown: &str) -> Vec<SyntaxNode> {
     opts.insert(Options::ENABLE_TABLES);
 
     let mut walker = Walker::new(markdown);
-    for (event, range) in Parser::new_ext(markdown, opts).into_offset_iter() {
-        walker.handle(event, range);
+    let frontmatter = frontmatter(markdown, opts);
+    let body_start = frontmatter.as_ref().map_or(0, |node| node.range.end);
+    walker.output.extend(frontmatter);
+    for (event, range) in Parser::new_ext(&markdown[body_start..], opts).into_offset_iter() {
+        walker.handle(event, range.start + body_start..range.end + body_start);
     }
     walker.finish()
+}
+
+/// The YAML (`---`) or TOML (`+++`) frontmatter opening `markdown`, projected
+/// to a closed [`NodeKind::CodeBlock`] so it inherits verbatim editing and
+/// exemption from soft-break promotion.
+///
+/// Pulldown stays the authority on what parses as a metadata block — closed,
+/// non-empty, no blank first line — but it recognizes one at any block
+/// boundary, where `---` is a thematic break to everyone else. So only this
+/// probe enables the options: a block at byte 0 is taken from it, and the rest
+/// of the document is parsed without them.
+fn frontmatter(markdown: &str, opts: Options) -> Option<SyntaxNode> {
+    if !markdown.starts_with("---") && !markdown.starts_with("+++") {
+        return None;
+    }
+    let opts = opts
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS;
+    let (event, range) = Parser::new_ext(markdown, opts).into_offset_iter().next()?;
+    let Event::Start(Tag::MetadataBlock(kind)) = event else {
+        return None;
+    };
+    let lang = match kind {
+        MetadataBlockKind::YamlStyle => "yaml",
+        MetadataBlockKind::PlusesStyle => "toml",
+    };
+
+    let content_start = markdown.find('\n')? + 1;
+    let closer_start = markdown[..range.end].rfind('\n')? + 1;
+    let content_range = content_start..closer_start;
+    // Ranged like a fenced block: through the closing line's own newline.
+    let end = markdown[range.end..]
+        .find('\n')
+        .map_or(markdown.len(), |i| range.end + i + 1);
+
+    let mut node = SyntaxNode::new(
+        NodeKind::CodeBlock {
+            lang: Some(lang.to_string()),
+            content_range: content_range.clone(),
+            delimiter_ranges: vec![0..content_start - 1, closer_start..range.end],
+            info_string_range: None,
+        },
+        0..end,
+    );
+    node.children
+        .push(SyntaxNode::new(NodeKind::Text, content_range));
+    Some(node)
 }
 
 struct Frame {
@@ -810,6 +862,89 @@ impl<'a> Walker<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frontmatter_of(source: &str) -> Option<SyntaxNode> {
+        parse(source)
+            .into_iter()
+            .next()
+            .filter(|n| matches!(n.kind, NodeKind::CodeBlock { .. }))
+    }
+
+    #[test]
+    fn frontmatter_is_shaped_like_a_closed_fence() {
+        let source = "---\ntitle: x\ntags: [a]\n---\n\n# Body\n";
+        let nodes = parse(source);
+        assert_eq!(nodes[0].range, 0..27);
+        let NodeKind::CodeBlock {
+            lang,
+            content_range,
+            delimiter_ranges,
+            info_string_range,
+        } = &nodes[0].kind
+        else {
+            panic!("{:?}", nodes[0].kind);
+        };
+        assert_eq!(lang.as_deref(), Some("yaml"));
+        assert_eq!(&source[content_range.clone()], "title: x\ntags: [a]\n");
+        assert_eq!(delimiter_ranges, &[0..3, 23..26]);
+        assert_eq!(*info_string_range, None);
+        assert!(
+            matches!(nodes[1].kind, NodeKind::Heading { level: 1, .. }),
+            "the body's offsets are the document's"
+        );
+        assert_eq!(nodes[1].range.start, 28);
+    }
+
+    #[test]
+    fn frontmatter_takes_every_conventional_closing() {
+        for (source, lang) in [
+            ("---\na: 1\n---", "yaml"),
+            ("---  \na: 1\n---  \nBody\n", "yaml"),
+            ("---\na: 1\n...\nBody\n", "yaml"),
+            ("---\na: 1\n\nb: 2\n---\n", "yaml"),
+            ("+++\na = 1\n+++\n", "toml"),
+        ] {
+            let node = frontmatter_of(source).unwrap_or_else(|| panic!("{source:?}"));
+            let NodeKind::CodeBlock {
+                lang: found,
+                delimiter_ranges,
+                ..
+            } = node.kind
+            else {
+                unreachable!();
+            };
+            assert_eq!(found.as_deref(), Some(lang), "{source:?}");
+            assert_eq!(delimiter_ranges.len(), 2, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn dashes_that_are_not_frontmatter_stay_thematic_breaks() {
+        for source in [
+            "---\n",
+            "---\n---\nBody\n",
+            "---\n\na: 1\n---\n",
+            "---\ntitle: unclosed\n\nBody\n",
+            " ---\na: 1\n---\n",
+            "----\na: 1\n----\n",
+        ] {
+            assert!(frontmatter_of(source).is_none(), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn a_metadata_shaped_block_after_the_first_byte_is_ordinary_markdown() {
+        let nodes = parse("Intro\n\n---\na: 1\n---\n\nAfter\n");
+        assert!(matches!(nodes[1].kind, NodeKind::ThematicBreak));
+        assert!(matches!(nodes[2].kind, NodeKind::Heading { level: 2, .. }));
+
+        let nodes = parse("---\na: 1\n---\n\n---\nb: 2\n---\n");
+        assert!(matches!(nodes[0].kind, NodeKind::CodeBlock { .. }));
+        assert!(
+            matches!(nodes[1].kind, NodeKind::ThematicBreak),
+            "only the opening block is frontmatter: {nodes:?}"
+        );
+    }
 
     fn first(nodes: &[SyntaxNode]) -> &SyntaxNode {
         nodes.first().expect("at least one block")

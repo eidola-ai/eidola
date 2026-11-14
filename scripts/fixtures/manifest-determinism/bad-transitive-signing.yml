@@ -1,0 +1,49 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# The indirect version of bad-signing-feeds-manifest.yml: the manifest job
+# names only `apple`, and `apple` names the signing job. Nothing declares
+# the signing environment on a partial-producing job, and no direct edge
+# from the manifest job to a signer exists — the check must still reject
+# it, because an intermediate job is under no obligation to drop what a
+# key-holding ancestor handed it.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  oci:
+    name: Build OCI images
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Record OCI partial
+        run: ./scripts/artifact-manifest.sh print-oci
+
+  apple-sign:
+    name: Sign and notarize
+    needs: oci
+    runs-on: self-hosted
+    environment: apple-signing
+    steps:
+      - name: Sign
+        run: codesign --sign "Developer ID Application" Eidola.app
+
+  apple:
+    name: Apple builds
+    needs: apple-sign
+    runs-on: self-hosted
+    steps:
+      - name: Build macOS artifacts
+        run: ./scripts/artifact-manifest.sh build-macos
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs:
+      - oci
+      - apple
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full

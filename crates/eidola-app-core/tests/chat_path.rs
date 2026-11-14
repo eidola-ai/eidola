@@ -5,7 +5,7 @@
 //!   `tests/bus.rs` was asserted-by-inspection only. Each typed-failure test
 //!   here asserts BOTH the returned error AND the emitted `Change`s, turning a
 //!   table row into an executed test.
-//! * **Wave-1 auto-provisioning** — `ensure_spendable_credential` had only a
+//! * **Auto-provisioning** — `ensure_spend_inputs` had only a
 //!   pure-decision unit test; `auto_provisioning_*` here drives the empty-wallet
 //!   + funded-account path all the way through a successful chat.
 //!
@@ -24,13 +24,14 @@
 mod chat_harness;
 
 use chat_harness::{
-    ChatBehavior, DEFAULT_AGENT_LABEL, HUMAN_LABEL, MODEL, MockConfig, MockServer, RefundMode,
-    Stamps, THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE, TRAILING_BLOCK_NOTE, flat_messages, map_entry,
-    roster, system_message, system_message_with, thread_map, trailing, with_account,
+    ChatBehavior, DEFAULT_AGENT_LABEL, FLAT_MODEL, FLAT_PRICE, HUMAN_LABEL, KeyWindow, MODEL,
+    MockConfig, MockServer, RefundMode, Stamps, THREAD_MAP_NOTE, THREAD_MAP_TOOLS_NOTE,
+    TRAILING_BLOCK_NOTE, flat_messages, map_entry, roster, system_message, system_message_with,
+    thread_map, trailing, with_account,
 };
 use eidola_app_core::changes::{Change, ChangeEvent};
-use eidola_app_core::error::AppError;
-use eidola_app_core::{AppCore, ChatStreamEvent};
+use eidola_app_core::error::{AppError, IssuerKeyRefusal};
+use eidola_app_core::{AppCore, ChatStreamEvent, DEFAULT_ALLOCATION_CREDITS, ProvisionOutcome};
 
 /// The generic system prompt the seeded default template agent carries (mirrors
 /// `db::DEFAULT_AGENT_SYSTEM_PROMPT`). Participant-aware turns prepend it as the
@@ -109,6 +110,21 @@ fn setup(config: MockConfig) -> (MockServer, AppCore, tempfile::TempDir) {
     chat_harness::core_for(config)
 }
 
+/// Wait until the mock has received more than `past` completion requests: a
+/// turn whose request has reached the upstream has taken its claim and its
+/// hold, which come before the request. The mock's `chat_delay_ms` then holds
+/// the turn there.
+async fn until_upstream_reached(mock: &MockServer, past: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while mock.chat_hits() <= past {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the turn never reached the upstream"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// The shared constructor is the only outer request shape app-core may send.
 /// Read every input from the harness-captured body, so a field added at either
 /// dispatch call site makes this exact-body comparison fail.
@@ -153,16 +169,51 @@ fn assert_shared_request_body(body: &serde_json::Value, expected_stream: bool) {
             tools,
             expected_stream,
             include_usage,
+            None,
+            None,
         ),
         "dispatch must send exactly the shared chat request body"
     );
-    eidola_server::types::test_chat_completion_request_is_accepted(body.clone())
+    assert!(
+        body.get("cache_key").is_none(),
+        "the client sends no prefix-cache key"
+    );
+    eidola_server_gateway::types::test_chat_completion_request_is_accepted(body.clone())
         .expect("captured body must satisfy the server's strict request type");
 }
 
 // ===========================================================================
 // Happy path — blocking chat
 // ===========================================================================
+
+/// **A turn's recorded duration covers the answer's generation.** The gateway
+/// answers with a stream that opens before the model has produced anything,
+/// so the response is timed when the whole answer has been read, not when
+/// the stream opened.
+#[test]
+fn a_blocking_turns_duration_covers_its_generation() {
+    run(|| {
+        let answer_ms = 400;
+        let (_mock, core, _dir) = setup(MockConfig {
+            answer_ms,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("chat should succeed");
+        let requests = core
+            .runtime()
+            .block_on(core.list_requests(10, 0))
+            .expect("requests");
+        assert_eq!(requests.len(), 1);
+        let duration = requests[0].duration_ms.expect("a duration");
+        assert!(
+            duration >= answer_ms as i64,
+            "recorded {duration} ms for an answer that took {answer_ms} ms to arrive"
+        );
+    })
+}
 
 #[test]
 fn blocking_chat_persists_and_emits() {
@@ -325,6 +376,35 @@ fn a_first_message_into_a_pre_created_space_instantiates_nothing() {
     });
 }
 
+/// REGRESSION: **a turn on a flat-priced model is held at its flat price.**
+///
+/// The turn path copied the catalog's token rates into its pricing tuple and
+/// dropped `per_request`, so a model the server prices per request — zero
+/// token rates — was refused as a zero charge before it was asked anything.
+/// The hold is the server's `worst_case_cost` for that model: the request fee
+/// and the flat price, whatever the request holds. Read off the spend proof
+/// the turn presented.
+#[test]
+fn a_turn_on_a_flat_priced_model_is_held_at_its_flat_price() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            list_flat_model: true,
+            ..Default::default()
+        });
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("How do tides work?".into(), FLAT_MODEL.into(), None))
+            .expect("a flat price is not a zero charge");
+        let charges = mock.chat_charges();
+        assert_eq!(
+            charges.first().copied().flatten(),
+            Some(chat_harness::REQUEST_FEE + FLAT_PRICE as u128),
+            "the turn's hold is the request fee and the flat price: {charges:?}"
+        );
+    });
+}
+
 #[test]
 fn blocking_chat_into_existing_space_does_not_emit_space_index_again() {
     run(|| {
@@ -397,9 +477,936 @@ fn blocking_chat_recovers_refund_when_no_inline_refund() {
     });
 }
 
+/// **A spend travels in the request body, and the Record never keeps it.**
+/// The wire body carries exactly one `credentials` element (a padded
+/// base64url Token and its refund recovery key) and no header carries a
+/// credential; the request row the Record keeps has neither.
+#[test]
+fn a_spend_travels_in_the_body_and_the_record_never_keeps_it() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat should succeed");
+
+        assert_eq!(mock.chat_auths(), vec![false], "no credential in a header");
+        let token = mock.chat_spends()[0].clone().expect("the body's one spend");
+        assert_eq!(token.len() % 4, 0, "padded base64url");
+        assert_eq!(mock.keyed_spends(), 1, "with its refund key beside it");
+        assert_eq!(
+            mock.hold_mismatches(),
+            0,
+            "the hold is exactly the worst case"
+        );
+
+        let requests = core
+            .runtime()
+            .block_on(core.list_requests(10, 0))
+            .expect("requests");
+        let row = requests
+            .iter()
+            .find(|r| r.path == "/v1/chat/completions")
+            .expect("the chat request's row");
+        let detail = request_detail(&core, &row.id);
+        let recorded = String::from_utf8(detail.request_body.expect("a recorded body")).unwrap();
+        assert!(!recorded.contains("credentials"), "{recorded}");
+        assert!(
+            !detail
+                .request_headers
+                .unwrap_or_default()
+                .contains("PrivateToken"),
+            "no spend in the recorded headers"
+        );
+        assert!(!recorded.contains(&token[..32]), "{recorded}");
+    });
+}
+
+/// **A provisional refund is not a settlement.** While a spend's request may
+/// still be served, the gateway's recovery answers with a refund of nothing
+/// marked `provisional`; its successor shares a nullifier with the final
+/// refund's, so settling on it could destroy the larger one. The turn and the
+/// startup sweep both leave the hold `spending` (no successor, no `Wallet` for
+/// it) while the gateway calls the refund provisional. Once the gateway says
+/// it is the spend's last word (no request is serving it any more: a crash
+/// or a restart left it), the sweep settles on it, and the successor holds the credential's
+/// untouched remainder.
+#[test]
+fn a_provisional_refund_is_settled_on_only_when_the_gateway_calls_it_final() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            refund: RefundMode::ProvisionalFirst(2),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("the answer arrives; only its settlement waits");
+        assert_eq!(
+            mock.refund_hits(),
+            1,
+            "no inline refund, so recovery was asked"
+        );
+        let spending = |core: &AppCore| {
+            core.runtime()
+                .block_on(core.wallet_lifecycle())
+                .expect("lifecycle")
+                .into_iter()
+                .filter(|c| c.state == "spending")
+                .collect::<Vec<_>>()
+        };
+        let held = spending(&core);
+        assert_eq!(
+            held.len(),
+            1,
+            "the provisional answer did not settle the hold"
+        );
+        let hold = held[0].spend_amount.expect("a spend amount");
+        let before = held[0].credits;
+
+        // The sweep, too, waits while the gateway calls it provisional.
+        let mut rx = core.subscribe_changes();
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_spending_credentials())
+            .expect("sweep");
+        assert!(recovered.is_empty(), "{recovered:?}");
+        assert_eq!(spending(&core).len(), 1);
+        assert!(!drain(&mut rx).contains(&Change::Wallet));
+
+        // The gateway now calls it final: the provisional successor is the
+        // settlement.
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_spending_credentials())
+            .expect("sweep");
+        assert_eq!(recovered.len(), 1);
+        assert!(spending(&core).is_empty());
+        assert!(drain(&mut rx).contains(&Change::Wallet));
+        let creds = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert!(
+            creds.iter().any(|c| c.credits == before - hold),
+            "the successor holds the untouched remainder c - s: {creds:?}"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Two-input requests: a drain and a fill
+// ---------------------------------------------------------------------------
+
+/// The active credentials' balances, smallest first.
+fn active_balances(core: &AppCore) -> Vec<i64> {
+    let mut balances: Vec<i64> = active_credentials(core)
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect();
+    balances.sort();
+    balances
+}
+
+/// The credentials still `spending`, as `(balance, share)`.
+fn spending_credentials(core: &AppCore) -> Vec<(i64, i64)> {
+    core.runtime()
+        .block_on(core.wallet_lifecycle())
+        .expect("lifecycle")
+        .into_iter()
+        .filter(|c| c.state == "spending")
+        .map(|c| (c.credits, c.spend_amount.expect("a share")))
+        .collect()
+}
+
+/// **A credential that cannot cover the hold is drained, and the rest
+/// filled** (`docs/anonymous-credits.md` → Spending several tokens in one request). The wallet's first
+/// credential in spend order (smallest, under the one key) holds 1,000
+/// credits, below the hold `W`: it is presented first with its whole balance
+/// as its share, and the 1,000,000-credit credential second with `W − 1,000`.
+/// The shares sum to exactly `W`. Settled at a charge of 1,500, the charge is
+/// consumed from the drain first: the drain's successor is empty, and the
+/// fill's returns all but 500. With the drain exhausted, the next request is
+/// paid by the fill's successor alone.
+#[test]
+fn a_credential_short_of_the_hold_is_drained_and_the_rest_filled() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            settled_charge: Some(1_500),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        for amount in [1_000_000, 1_000] {
+            core.runtime()
+                .block_on(core.account_allocate(amount))
+                .expect("an allocation");
+        }
+
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("a drain-and-fill turn");
+        let worst = mock.chat_charges()[0].expect("a hold") as i64;
+        assert!(worst > 1_000, "the drain cannot cover the hold alone");
+        assert_eq!(
+            mock.chat_shares()[0],
+            vec![1_000, (worst - 1_000) as u128],
+            "the drain first, its whole balance; the fill the rest"
+        );
+        let keys = &mock.chat_input_keys()[0];
+        assert_eq!(keys[0], keys[1], "one key: no key mixed without need");
+        assert_eq!(mock.hold_mismatches(), 0, "the shares sum to exactly W");
+        assert!(
+            spending_credentials(&core).is_empty(),
+            "both inputs settled"
+        );
+        assert_eq!(
+            active_balances(&core),
+            vec![0, 1_000_000 - 500],
+            "the charge consumed the drain first; the fill paid the rest"
+        );
+        // The Record's spend trail shows the request under both inputs.
+        let trail = core
+            .runtime()
+            .block_on(core.spend_trail(10, 0))
+            .expect("spend trail");
+        assert_eq!(trail.len(), 2, "{trail:?}");
+        assert_eq!(trail[0].request_id, trail[1].request_id);
+        assert_ne!(trail[0].credential_nonce, trail[1].credential_nonce);
+
+        core.runtime()
+            .block_on(core.chat("again".into(), MODEL.into(), None))
+            .expect("the next turn");
+        assert_eq!(
+            mock.chat_shares()[1],
+            vec![worst as u128],
+            "an exhausted drain is never presented; the fill pays alone"
+        );
+    });
+}
+
+/// **A drain whose change comes back is drained again**, as a run: charged
+/// less than its balance, the drained credential returns as a smaller
+/// successor, first in spend order and still short of the hold, so the next
+/// request drains it once more, with the fill's successor filling. The change
+/// lands on the drain and the fill comes back whole, until a charge exhausts
+/// the drain and the fill pays the rest.
+#[test]
+fn a_drain_with_change_is_drained_again_on_the_next_request() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            settled_charge: Some(400),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        for amount in [1_000_000, 1_000] {
+            core.runtime()
+                .block_on(core.account_allocate(amount))
+                .expect("an allocation");
+        }
+        // Each turn charged 400: the drain pays first, the fill only once the
+        // drain is exhausted (the third turn's 200 leaves 200 to the fill).
+        for (turn, drained, after) in [
+            (0usize, 1_000i64, [600i64, 1_000_000]),
+            (1, 600, [200, 1_000_000]),
+            (2, 200, [0, 1_000_000 - 200]),
+        ] {
+            core.runtime()
+                .block_on(core.chat(format!("turn {turn}"), MODEL.into(), None))
+                .expect("a turn");
+            let worst = mock.chat_charges()[turn].expect("a hold") as i64;
+            assert_eq!(
+                mock.chat_shares()[turn],
+                vec![drained as u128, (worst - drained) as u128],
+                "turn {turn}"
+            );
+            assert_eq!(active_balances(&core), after.to_vec(), "turn {turn}");
+        }
+    });
+}
+
+/// **Nothing that covers the rest: a new credential is the fill.** With only
+/// a 1,000-credit credential, the request still drains it, and the
+/// just-in-time allocation converts a standard credential to fill the rest,
+/// rather than converting one to pay the whole hold and stranding the
+/// residual.
+#[test]
+fn a_new_credential_fills_what_the_wallet_cannot() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("a small allocation");
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("the turn");
+        let worst = mock.chat_charges()[0].expect("a hold");
+        assert_eq!(mock.chat_shares()[0], vec![1_000, worst - 1_000]);
+        assert_eq!(mock.issuance_debits(), 2, "one just-in-time conversion");
+        assert!(spending_credentials(&core).is_empty());
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Issuance is never sized to the request (`docs/anonymous-credits.md` →
+// Issuance sizing)
+// ---------------------------------------------------------------------------
+
+/// A prompt whose hold on [`MockConfig::mimo_priced`]'s row is about
+/// 1,225,000 credits: past one denomination, so no single credential this
+/// client issues pays it. Each byte is about half a credit there (two thirds
+/// of a chargeable token at 0.75 credits a token), and the completion side
+/// holds the ladder's lowest rung, 24,576: a turn's ceiling is lowered as far
+/// as the ladder goes before its hold passes one denomination.
+fn a_prompt_past_one_denomination() -> String {
+    "x".repeat(2_400_000)
+}
+
+/// Every credential's `(state, credits)`, in a stable order: what a refused
+/// request must leave exactly as it found it.
+fn wallet_states(core: &AppCore) -> Vec<(String, i64)> {
+    let mut states: Vec<(String, i64)> = core
+        .runtime()
+        .block_on(core.wallet_lifecycle())
+        .expect("lifecycle")
+        .into_iter()
+        .map(|c| (c.state, c.credits))
+        .collect();
+    states.sort();
+    states
+}
+
+/// REGRESSION: **a hold past one denomination is issued one denomination,
+/// never its own size, and is paid by a drain and a fill.** On the shipped
+/// MiMo row a long prompt holds about 1.2 denominations. The wallet holds
+/// 100,000 and 600,000: no pair of them pays, and a credential sized to fill
+/// beside the first (the hold less 100,000) would be issued for exactly the
+/// share its spend then shows, linking the account to the request by amount.
+/// Instead one denomination is issued and fills beside the largest residual,
+/// which is drained; the 100,000 is left for a later request.
+#[test]
+fn a_large_hold_is_issued_one_denomination_and_paid_by_a_drain_and_a_fill() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            mimo_priced: true,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        for amount in [100_000, 600_000] {
+            core.runtime()
+                .block_on(core.account_allocate(amount))
+                .expect("an allocation");
+        }
+
+        core.runtime()
+            .block_on(core.chat(a_prompt_past_one_denomination(), MODEL.into(), None))
+            .expect("a residual and one denomination pay it");
+        let worst = mock.chat_charges()[0].expect("a hold") as i64;
+        assert!(
+            worst > DEFAULT_ALLOCATION_CREDITS && worst <= 600_000 + DEFAULT_ALLOCATION_CREDITS,
+            "the hold is past one denomination and within the residual beside one: {worst}"
+        );
+        assert_eq!(
+            mock.chat_bodies()[0]["max_completion_tokens"].as_u64(),
+            Some(8_192),
+            "a prompt that alone passes one denomination asks for the lowest rung"
+        );
+        assert!(worst - 100_000 > DEFAULT_ALLOCATION_CREDITS);
+        assert_eq!(
+            mock.issued_amounts(),
+            vec![100_000, 600_000, DEFAULT_ALLOCATION_CREDITS],
+            "the just-in-time issuance is the denomination, not the request's share"
+        );
+        assert_eq!(
+            mock.chat_shares()[0],
+            vec![600_000, (worst - 600_000) as u128],
+            "the largest residual is drained and the new denomination fills"
+        );
+        assert!(
+            !mock
+                .issued_amounts()
+                .iter()
+                .any(|&issued| issued == worst - 600_000 || issued == worst),
+            "no issuance equals a share or the hold"
+        );
+        assert_eq!(mock.hold_mismatches(), 0);
+        assert!(spending_credentials(&core).is_empty());
+        assert!(
+            active_balances(&core).contains(&100_000),
+            "the smaller residual waits for a later request"
+        );
+    });
+}
+
+/// **Ordinary turns issue only the denomination**: an empty wallet's first
+/// turn converts exactly one, and the turns after it are paid from it with
+/// nothing more issued.
+#[test]
+fn ordinary_turns_issue_only_the_denomination() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        for turn in 0..3 {
+            core.runtime()
+                .block_on(core.chat(format!("turn {turn}"), MODEL.into(), None))
+                .expect("a turn");
+        }
+        assert_eq!(mock.chat_charges().len(), 3);
+        assert_eq!(mock.issued_amounts(), vec![DEFAULT_ALLOCATION_CREDITS]);
+    });
+}
+
+/// **A balance below the denomination is issued whole**, the one amount
+/// other than the denomination a just-in-time issuance converts.
+#[test]
+fn a_balance_below_the_denomination_is_issued_whole() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            balance: 50_000,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("the whole balance covers the turn");
+        assert_eq!(mock.issued_amounts(), vec![50_000]);
+    });
+}
+
+/// REGRESSION: **a hold past what a residual and one denomination can pay is
+/// refused before anything is issued or any credential touched.** The wallet
+/// holds 100,000 and the hold is about 1.2 denominations: paying it would need
+/// an issuance sized to the request. The turn fails with the typed refusal;
+/// no issuance is asked for, no chat request is sent, the wallet is exactly
+/// as it was, and only the post (which a turn persists first) is announced.
+#[test]
+fn a_hold_past_a_residual_and_one_denomination_is_refused_before_anything_is_issued() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            mimo_priced: true,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(100_000))
+            .expect("an allocation");
+        let issuance_requests = mock.issuance_requests();
+        let before = wallet_states(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat(a_prompt_past_one_denomination(), MODEL.into(), None))
+            .expect_err("no residual and one denomination pay it");
+        match err {
+            AppError::HoldExceedsDenomination { hold, denomination } => {
+                assert_eq!(denomination, DEFAULT_ALLOCATION_CREDITS);
+                assert!(hold > 100_000 + denomination, "{hold}");
+            }
+            other => panic!("expected HoldExceedsDenomination, got {other:?}"),
+        }
+        assert_eq!(
+            mock.issuance_requests(),
+            issuance_requests,
+            "nothing was asked of the account surface"
+        );
+        assert_eq!(mock.issued_amounts(), vec![100_000]);
+        assert_eq!(mock.chat_hits(), 0, "nothing was sent");
+        assert_eq!(wallet_states(&core), before, "no credential was touched");
+
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::SpaceIndex), "got {changes:?}");
+        assert!(
+            !changes.contains(&Change::Wallet) && !changes.contains(&Change::Record),
+            "no Wallet or Record on a refusal before the spend; got {changes:?}"
+        );
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(only_space(&core)))
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "the post survived the refusal");
+    });
+}
+
+/// **With an empty wallet the refusal comes at one denomination**: a hold
+/// past it is never converted to its own size, however large the balance.
+#[test]
+fn an_empty_wallets_hold_past_one_denomination_is_refused() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            mimo_priced: true,
+            balance: 100 * DEFAULT_ALLOCATION_CREDITS,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let err = core
+            .runtime()
+            .block_on(core.chat(a_prompt_past_one_denomination(), MODEL.into(), None))
+            .expect_err("one denomination cannot pay it");
+        assert!(
+            matches!(err, AppError::HoldExceedsDenomination { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(mock.issuance_requests(), 0);
+        assert!(mock.issued_amounts().is_empty());
+        assert_eq!(mock.chat_hits(), 0);
+    });
+}
+
+/// **A hold is fitted under one denomination before it is refused.** On the
+/// shipped MiMo row this prompt held at the model's whole output limit passes
+/// one denomination, which an empty wallet could not pay. The ceiling ladder
+/// lowers the ceiling a rung at a time while the hold would pass the
+/// denomination, so the turn asks for less output, holds less than one
+/// denomination, and is paid by the one issued for it: the ladder's fit and
+/// the payability rule turn on the same constant.
+#[test]
+fn a_long_prompt_is_fitted_under_one_denomination_instead_of_refused() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            mimo_priced: true,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("x".repeat(1_700_000), MODEL.into(), None))
+            .expect("one denomination pays the fitted hold");
+
+        let hold = mock.chat_charges()[0].expect("a hold") as i64;
+        let ceiling = mock.chat_bodies()[0]["max_completion_tokens"]
+            .as_u64()
+            .expect("a ceiling");
+        assert_eq!(ceiling, 32_768, "one rung under the declared limit");
+        assert!(hold <= DEFAULT_ALLOCATION_CREDITS, "{hold}");
+        let at_the_limit = hold
+            + ((chat_harness::MIMO_MAX_OUTPUT_TOKENS - ceiling)
+                * chat_harness::MIMO_COMPLETION_RATE
+                / 1_000_000) as i64;
+        assert!(
+            at_the_limit > DEFAULT_ALLOCATION_CREDITS,
+            "held at the whole limit it would have been refused: {at_the_limit}"
+        );
+        assert_eq!(mock.issued_amounts(), vec![DEFAULT_ALLOCATION_CREDITS]);
+        assert_eq!(mock.chat_shares()[0], vec![hold as u128], "one input");
+        assert_eq!(mock.hold_mismatches(), 0);
+    });
+}
+
+/// **Every exit of a two-input round settles every input**: a completed
+/// answer and a stream ending in its metadata event (one refund per input, in
+/// band), a refusal after recording (refunds of all but the request fee in its
+/// error body), and a connection dropped before any answer (each input
+/// recovered by its own nullifier). A completed answer is charged nothing
+/// here and each input comes back whole; a refused or lost one is charged the
+/// fee, which the first input (the drain, holding exactly the fee) bears
+/// whole, in input order. No credential is left `spending`.
+#[test]
+fn every_exit_of_a_two_input_round_settles_every_input() {
+    for (chat, streaming) in [
+        (ChatBehavior::OkBlocking, false),
+        (ChatBehavior::StreamingWithMetadataRefund, true),
+        (ChatBehavior::Non2xxWithRefund(502), false),
+        (ChatBehavior::DropBeforeResponse, false),
+    ] {
+        run(move || {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat,
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            for amount in [1_000_000, 1_000] {
+                core.runtime()
+                    .block_on(core.account_allocate(amount))
+                    .expect("an allocation");
+            }
+            if streaming {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let _ = core.runtime().block_on(async {
+                    let collector = async { while rx.recv().await.is_some() {} };
+                    let chat = core.chat_stream("hello".into(), MODEL.into(), None, tx);
+                    tokio::join!(chat, collector).0
+                });
+            } else {
+                let _ = core
+                    .runtime()
+                    .block_on(core.chat("hello".into(), MODEL.into(), None));
+            }
+            assert_eq!(
+                mock.chat_inputs()[0].len(),
+                2,
+                "{chat:?}: a drain and a fill"
+            );
+            assert!(spending_credentials(&core).is_empty(), "{chat:?}");
+            let drained = if streaming || matches!(chat, ChatBehavior::OkBlocking) {
+                1_000
+            } else {
+                0
+            };
+            assert_eq!(active_balances(&core), vec![drained, 1_000_000], "{chat:?}");
+        });
+    }
+}
+
+/// **A wallet able to pay is never sent to allocation.** The first
+/// credential (1,000) has no fill, since no later credential covers the rest
+/// of the hold, but the two 3,000-credit credentials together do: the first
+/// of them is drained and the second fills, with nothing converted (the
+/// account has no balance to convert), and the 1,000 is left for a later
+/// request.
+#[test]
+fn a_later_pair_pays_when_the_first_credential_has_no_fill() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            balance: 0,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        for amount in [1_000, 3_000, 3_000] {
+            core.runtime()
+                .block_on(core.account_allocate(amount))
+                .expect("an allocation");
+        }
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("the wallet pays without converting anything");
+        let worst = mock.chat_charges()[0].expect("a hold");
+        assert!(
+            worst > 4_000 && worst <= 6_000,
+            "the pair, and only the pair, covers {worst}"
+        );
+        assert_eq!(mock.chat_shares()[0], vec![3_000, worst - 3_000]);
+        assert_eq!(mock.issuance_debits(), 3, "no conversion");
+        assert!(spending_credentials(&core).is_empty());
+        assert_eq!(active_balances(&core), vec![1_000, 3_000, 3_000]);
+    });
+}
+
+/// **Mixed keys, to drain an older key's residual.** A 1,000-credit residual
+/// under the epoch just ended is drained into a request whose fill is under
+/// the new epoch's key: the older key sorts first (its value lapses first),
+/// ahead of a smaller credential under the newer key, and no credential under
+/// it covers the rest. Each input's refund is signed
+/// under that input's own key (the mock signs with the key the input names,
+/// and the client verifies each against its own credential's key), so the
+/// drain's change stays under the old key and the fill's under the new.
+#[test]
+fn an_older_keys_residual_is_drained_into_a_newer_keys_fill() {
+    run(|| {
+        let config = MockConfig {
+            settled_charge: Some(1_500),
+            ..MockConfig::default()
+        };
+        let key_swap = config.key_swap.clone();
+        let deadline = config.key_deadline.clone();
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+        let (boundary, _) = deadline.issuing_ends_in(&core, 6, WEEK_SECS as u64, false);
+        let old = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the residual, under the epoch's key");
+
+        key_swap.swap();
+        sleep_past_unix_secs(boundary);
+        let new = core
+            .runtime()
+            .block_on(core.account_allocate(1_000_000))
+            .expect("the next epoch's key issues");
+        assert_ne!(old.issuer_key_id, new.issuer_key_id);
+        // Smaller than the residual, but under the key that lapses later: by
+        // balance alone it would be drained first.
+        core.runtime()
+            .block_on(core.account_allocate(500))
+            .expect("a small credential under the new key");
+
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("a turn draining the old key's residual");
+        assert_eq!(
+            mock.chat_input_keys()[0],
+            vec![old.issuer_key_id.clone(), new.issuer_key_id.clone()],
+            "the older key's residual first, the newer key's fill second"
+        );
+        assert_eq!(mock.chat_shares()[0][0], 1_000);
+        assert!(spending_credentials(&core).is_empty(), "each input settled");
+        assert_eq!(active_balances(&core), vec![0, 500, 1_000_000 - 500]);
+    });
+}
+
+/// **Each input is recovered on its own, and stays pending until its own
+/// refund is final.** The answer carries no refunds, so each input is
+/// recovered by its own nullifier: the gateway calls the first input's
+/// refund provisional and the second's final. The second settles; the first
+/// stays `spending` (the request is not settled as a whole), and the sweep
+/// settles it once the gateway calls it final.
+#[test]
+fn one_inputs_recovery_waits_while_the_others_is_final() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            refund: RefundMode::ProvisionalFirst(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        for amount in [1_000_000, 1_000] {
+            core.runtime()
+                .block_on(core.account_allocate(amount))
+                .expect("an allocation");
+        }
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("the answer arrives; only its settlement waits");
+        assert_eq!(mock.refund_hits(), 2, "each input recovered on its own");
+        assert_eq!(
+            spending_credentials(&core),
+            vec![(1_000, 1_000)],
+            "the drain waits on its provisional refund; the fill is settled"
+        );
+
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_spending_credentials())
+            .expect("sweep");
+        assert_eq!(recovered.len(), 1);
+        assert!(spending_credentials(&core).is_empty());
+    });
+}
+
+/// **Each input's settlement is announced at its own write.** The answer
+/// carries no refunds; the first input's recovery succeeds and the second's
+/// never answers. The first input's successor is durable, and `Wallet` says
+/// so while the turn is still waiting on the second, rather than only once
+/// the whole settlement returns, which here it never does.
+#[test]
+fn a_settled_input_is_announced_while_the_other_still_waits() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            refund: RefundMode::StallAfter(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        for amount in [1_000_000, 1_000] {
+            core.runtime()
+                .block_on(core.account_allocate(amount))
+                .expect("an allocation");
+        }
+        let mut rx = core.subscribe_changes();
+        // The turn is dropped once the second recovery is waiting and the
+        // first input's settlement has been announced: the state under test.
+        let mut changes = Vec::new();
+        core.runtime().block_on(async {
+            let turn = core.chat("hello".into(), MODEL.into(), None);
+            let one_settled_one_waiting = async {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    changes.extend(drain(&mut rx));
+                    let wallet = changes.iter().filter(|c| **c == Change::Wallet).count();
+                    if mock.refund_hits() == 2 && wallet >= 2 {
+                        return;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "one input never settled while the other waited"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            };
+            tokio::select! {
+                outcome = turn => panic!("the second recovery never answers: {outcome:?}"),
+                () = one_settled_one_waiting => {}
+            }
+        });
+        assert_eq!(mock.refund_hits(), 2);
+        assert_eq!(spending_credentials(&core).len(), 1, "one input settled");
+        changes.extend(drain(&mut rx));
+        let wallet = changes.iter().filter(|c| **c == Change::Wallet).count();
+        assert_eq!(
+            wallet, 2,
+            "one at the spend's start, one at the settled input's write"
+        );
+    });
+}
+
+/// **Two turns at once never take one credential.** Both inputs of a request
+/// are marked `spending` together, under the wallet's spend gate: the first
+/// turn takes the drain and the fill, and the second, finding neither, is
+/// paid by a new credential. No nullifier is presented twice.
+#[test]
+fn concurrent_turns_never_share_an_input() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat_delay_ms: 2_000,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        for amount in [1_000_000, 1_000] {
+            core.runtime()
+                .block_on(core.account_allocate(amount))
+                .expect("an allocation");
+        }
+        // The second turn chooses its inputs while the first is held at the
+        // upstream with both of its own still spending.
+        let (first, second) = core.runtime().block_on(async {
+            tokio::join!(core.chat("one".into(), MODEL.into(), None), async {
+                until_upstream_reached(&mock, 0).await;
+                core.chat("two".into(), MODEL.into(), None).await
+            })
+        });
+        first.expect("the first turn");
+        second.expect("the second turn");
+        let nullifiers: Vec<String> = mock.chat_nullifiers().into_iter().flatten().collect();
+        let distinct: std::collections::HashSet<&String> = nullifiers.iter().collect();
+        assert_eq!(distinct.len(), nullifiers.len(), "no input presented twice");
+        let mut counts: Vec<usize> = mock.chat_inputs().iter().map(Vec::len).collect();
+        counts.sort();
+        assert_eq!(
+            counts,
+            vec![1, 2],
+            "one turn drained and filled; the other paid alone"
+        );
+        assert_eq!(
+            mock.issuance_debits(),
+            3,
+            "the second turn's credential was new"
+        );
+        assert!(spending_credentials(&core).is_empty());
+    });
+}
+
+/// **Recovery opens the stored refund only with the key the spend carried.**
+/// The server seals the refund it stores under the spend's refund recovery
+/// key and refuses a spend without one; the mock holds both rules, answering
+/// a recovery that presents any other key with the real endpoint's 404. So a
+/// successor here means the spend sent a key and the recovery rebuilt the
+/// same one.
+#[test]
+fn recovery_presents_the_refund_key_its_spend_carried() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat should succeed");
+
+        assert_eq!(mock.chat_hits(), 1);
+        assert_eq!(mock.keyed_spends(), 1, "the spend carried its refund key");
+        assert!(
+            mock.refund_hits() >= 1,
+            "no inline refund, so recovery was asked"
+        );
+        let creds = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert!(
+            !creds.is_empty(),
+            "recovery presented the spend's own key, so the stored refund opened"
+        );
+    });
+}
+
 // ===========================================================================
 // Happy path — streaming chat
 // ===========================================================================
+
+/// **A stream framed with bare carriage returns is still a stream.**
+///
+/// The event-stream format takes `\r\n`, `\n` and a bare `\r` as line endings,
+/// and any two in a row end an event — so a reader recognising only `\n\n` and
+/// `\r\n\r\n` never split such a stream at all: every event piled into one
+/// frame, deltas arrived (if at all) as one lump at EOF, and on the proxy's own
+/// path the per-event ceiling refused the stream outright. The turn path shares
+/// `find_event_boundary` with the proxy, so it is asserted here too: the
+/// ordinary outcome over unusual framing is what proves the framing was read.
+#[test]
+fn a_stream_framed_with_bare_carriage_returns_still_delivers_its_deltas() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreamingBareCarriageReturns,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (res, content, reasoning, deltas) = core.runtime().block_on(async {
+            let collector = async {
+                let mut content = String::new();
+                let mut reasoning = String::new();
+                let mut deltas = 0usize;
+                while let Some(ev) = events_rx.recv().await {
+                    deltas += 1;
+                    match ev {
+                        ChatStreamEvent::ContentDelta(t) => content.push_str(&t),
+                        ChatStreamEvent::ReasoningDelta(t) => reasoning.push_str(&t),
+                    }
+                }
+                (content, reasoning, deltas)
+            };
+            let chat = core.chat_stream("stream me".into(), MODEL.into(), None, tx);
+            let (res, (content, reasoning, deltas)) = tokio::join!(chat, collector);
+            (res, content, reasoning, deltas)
+        });
+
+        let res = res.expect("a bare-CR stream completes like any other");
+        assert_eq!(content, "Hello from the stream.");
+        assert_eq!(reasoning, "thinking…");
+        assert_eq!(res.input_tokens, Some(11));
+        assert_eq!(res.output_tokens, Some(5));
+        assert_eq!(
+            deltas, 2,
+            "the events arrived one at a time rather than as one undivided frame"
+        );
+        assert!(mock.refund_hits() >= 1);
+    });
+}
+
+/// REGRESSION: **an event's data is its `data:` fields joined, then parsed
+/// once.**
+///
+/// The format lets a sender split one payload across as many `data:` fields as
+/// it likes; the receiver joins them with `\n`. Parsing field by field read
+/// every piece of a split payload as a fragment that is not JSON and skipped it
+/// — nothing failed, the deltas and the usage simply never arrived.
+#[test]
+fn a_payload_split_across_data_fields_is_read_as_one() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingSplitDataFields,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (res, content) = core.runtime().block_on(async {
+            let collector = async {
+                let mut content = String::new();
+                while let Some(ev) = events_rx.recv().await {
+                    if let ChatStreamEvent::ContentDelta(t) = ev {
+                        content.push_str(&t);
+                    }
+                }
+                content
+            };
+            let chat = core.chat_stream("stream me".into(), MODEL.into(), None, tx);
+            tokio::join!(chat, collector)
+        });
+
+        let res = res.expect("a split-data stream completes like any other");
+        assert_eq!(
+            content, "Hello from the stream.",
+            "the split delta was read"
+        );
+        assert_eq!(res.input_tokens, Some(11), "and so was the split usage");
+        assert_eq!(res.output_tokens, Some(5));
+    });
+}
 
 #[test]
 fn streaming_chat_delivers_deltas_and_persists() {
@@ -446,7 +1453,8 @@ fn streaming_chat_delivers_deltas_and_persists() {
         assert!(changes.contains(&Change::Wallet));
         assert!(changes.contains(&Change::Record));
 
-        // Streaming always goes through the recovery endpoint for its refund.
+        // This stream carries no refund event, so recovery answers for its
+        // absence.
         assert!(mock.refund_hits() >= 1);
 
         let messages = core
@@ -470,7 +1478,8 @@ fn blocking_and_streaming_dispatch_use_the_shared_request_body() {
                 .expect("blocking chat succeeds");
 
             let body = mock.chat_bodies().pop().expect("blocking request");
-            assert_shared_request_body(&body, false);
+            // The Eidola gateway serves only streams: the blocking twin asks for one.
+            assert_shared_request_body(&body, true);
         }
 
         {
@@ -511,7 +1520,8 @@ fn blocking_and_streaming_dispatch_use_the_shared_request_body() {
                 .chat_bodies()
                 .pop()
                 .expect("blocking tool follow-up request");
-            assert_shared_request_body(&body, false);
+            // The Eidola gateway serves only streams: the blocking twin asks for one.
+            assert_shared_request_body(&body, true);
         }
 
         {
@@ -721,6 +1731,531 @@ fn auto_provisioning_empty_wallet_funded_account_succeeds() {
         assert!(
             !after.is_empty(),
             "a successor credential should remain after the spend"
+        );
+    });
+}
+
+/// A credential is stored under the key that signed it and that the client
+/// verified it against, never under an id the issuance response names. An
+/// issuance naming another key is refused, and nothing enters the wallet.
+#[test]
+fn an_issuance_naming_another_key_is_refused() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            issued_key_id: Some("ab".repeat(32)),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let mut rx = core.subscribe_changes();
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(100_000))
+            .expect_err("an issuance naming another key must be refused");
+        assert!(
+            matches!(err, AppError::Credential { .. }),
+            "unexpected error: {err:?}"
+        );
+        let changes = drain(&mut rx);
+        assert!(
+            !changes.contains(&Change::Wallet) && !changes.contains(&Change::Account),
+            "a refused issuance announced a wallet or account change: {changes:?}"
+        );
+        let wallet = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert!(wallet.is_empty(), "nothing may be stored: {wallet:?}");
+    });
+}
+
+/// A refund is a credential under the spent credential's own key. One naming
+/// another key is not stored, so the spent credential stays `spending` rather
+/// than gaining a successor labelled with a key it does not belong to.
+#[test]
+fn a_refund_naming_another_key_is_not_stored() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            refund_key_id: Some("ab".repeat(32)),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // The blocking turn reports the refund it could not apply as its own
+        // failure; what matters here is what reached the wallet.
+        if let Err(err) = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+        {
+            assert!(
+                matches!(err, AppError::Credential { .. }),
+                "unexpected error: {err:?}"
+            );
+        }
+        let wallet = core
+            .runtime()
+            .block_on(core.wallet_credentials())
+            .expect("wallet");
+        assert!(
+            wallet.is_empty(),
+            "a successor was stored from a refund naming another key: {wallet:?}"
+        );
+        let spending = core
+            .runtime()
+            .block_on(core.wallet_spending_credentials())
+            .expect("spending");
+        assert_eq!(spending.len(), 1, "the spent credential stays in flight");
+    });
+}
+
+/// The request context is revealed by every spend of a credential and of all
+/// its successors, so a credential issued under a context other clients do
+/// not share is recognisable at each of them. The client refuses one, and
+/// one carrying a different amount from the one it asked for, before
+/// anything enters the wallet.
+#[test]
+fn an_issuance_that_could_mark_its_credential_is_refused() {
+    for (what, config) in [
+        (
+            "a context of its own",
+            MockConfig {
+                issuance_context: Some(chat_harness::distinct_context()),
+                ..MockConfig::default()
+            },
+        ),
+        (
+            "an amount other than the one asked for",
+            MockConfig {
+                issuance_extra_credits: 1,
+                ..MockConfig::default()
+            },
+        ),
+    ] {
+        run(move || {
+            let (_mock, core, _dir) = setup(config);
+            with_account(&core);
+            let err = core
+                .runtime()
+                .block_on(core.account_allocate(100_000))
+                .expect_err(what);
+            assert!(
+                matches!(err, AppError::Credential { .. }),
+                "{what}: unexpected error: {err:?}"
+            );
+            let wallet = core
+                .runtime()
+                .block_on(core.wallet_credentials())
+                .expect("wallet");
+            assert!(wallet.is_empty(), "{what}: stored {wallet:?}");
+        });
+    }
+}
+
+// ===========================================================================
+// Credential lifetime: bounded by the key's acceptance deadline
+// ===========================================================================
+
+const WEEK_SECS: i64 = 7 * 86_400;
+
+fn now_unix_secs() -> i64 {
+    eidola_app_core::now_ms().div_euclid(1_000)
+}
+
+/// Sleep until the wall clock is safely past `secs` (unix seconds). The
+/// lifecycle view reads the database's own clock, so a deadline is crossed by
+/// waiting for it rather than by moving a test clock.
+fn sleep_past_unix_secs(secs: i64) {
+    let target_ms = secs * 1_000 + 300;
+    let wait = target_ms - eidola_app_core::now_ms();
+    if wait > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(wait as u64));
+    }
+}
+
+fn margin_secs() -> i64 {
+    eidola_app_core::CREDENTIAL_SPEND_MARGIN.as_secs() as i64
+}
+
+fn credential_states(core: &AppCore) -> Vec<(String, i64)> {
+    core.runtime()
+        .block_on(core.wallet_lifecycle())
+        .expect("lifecycle")
+        .into_iter()
+        .map(|c| (c.state, c.generation))
+        .collect()
+}
+
+/// Allocations the wallet has seen: every allocation mints a generation-0
+/// credential, and every spend's successor is a later generation.
+fn allocations(core: &AppCore) -> usize {
+    credential_states(core)
+        .iter()
+        .filter(|(_, generation)| *generation == 0)
+        .count()
+}
+
+/// A credential issued moments before its key stops *issuing* is still
+/// spendable after that moment: the server accepts it for a further epoch,
+/// and the client must not strand the balance it debited at issuance.
+#[test]
+fn a_credential_issued_just_before_its_key_stops_issuing_stays_spendable() {
+    run(|| {
+        let config = MockConfig::default();
+        let deadline = config.key_deadline.clone();
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+        let (issue_until, _) = deadline.issuing_ends_in(&core, 2, WEEK_SECS as u64, true);
+
+        core.runtime()
+            .block_on(core.chat("first".into(), MODEL.into(), None))
+            .expect("the first turn provisions and spends");
+        assert_eq!(allocations(&core), 1);
+
+        sleep_past_unix_secs(issue_until);
+        assert!(
+            credential_states(&core)
+                .iter()
+                .any(|(state, _)| state == "active"),
+            "past issue_until but inside accept_until the change stays spendable: {:?}",
+            credential_states(&core)
+        );
+
+        core.runtime()
+            .block_on(core.chat("second".into(), MODEL.into(), None))
+            .expect("the second turn spends the change");
+        assert_eq!(mock.chat_hits(), 2);
+        assert_eq!(
+            allocations(&core),
+            1,
+            "the second turn must spend the existing credential, not allocate again"
+        );
+    });
+}
+
+/// The spendable life does end — `CREDENTIAL_SPEND_MARGIN` before the key's
+/// acceptance deadline. Past it the credential reads `expired`, and the
+/// provisioning queue no longer picks it: the next turn goes to allocate a
+/// fresh credential instead (and here finds no key still issuing, so fails
+/// before any completion request).
+#[test]
+fn a_credential_lapses_its_spend_margin_before_the_keys_acceptance_deadline() {
+    run(|| {
+        let config = MockConfig::default();
+        let deadline = config.key_deadline.clone();
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+        // Issuing ends two seconds from now and acceptance one epoch later, at
+        // the spend deadline plus the margin: an epoch of margin + 1 seconds.
+        let (issue_until, _) = deadline.issuing_ends_in(&core, 2, (margin_secs() + 1) as u64, true);
+        let spend_until = issue_until + 1;
+
+        core.runtime()
+            .block_on(core.chat("first".into(), MODEL.into(), None))
+            .expect("the first turn provisions and spends");
+        assert!(
+            credential_states(&core)
+                .iter()
+                .any(|(state, _)| state == "active"),
+            "before the spend deadline the change is spendable"
+        );
+
+        sleep_past_unix_secs(spend_until);
+        // The unspent change lapses; the settled spend keeps saying what it was
+        // until the key's acceptance deadline itself.
+        let mut states = credential_states(&core);
+        states.sort_by_key(|(_, generation)| *generation);
+        assert_eq!(
+            states,
+            vec![("spent".to_string(), 0), ("expired".to_string(), 1)],
+            "past accept_until less the margin, no credential under the key is spendable"
+        );
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("second".into(), MODEL.into(), None))
+            .expect_err("no spendable credential and no key still issuing");
+        assert!(matches!(err, AppError::Credential { .. }), "got {err:?}");
+        assert_eq!(
+            mock.chat_hits(),
+            1,
+            "the lapsed credential must never be spent"
+        );
+    });
+}
+
+/// The account is debited at issuance, so a credential that would be born
+/// already past its spend deadline is refused before the issuance request: a
+/// server advertising an acceptance window shorter than the margin gets no
+/// allocation, and the turn fails having written and announced nothing of
+/// the wallet.
+#[test]
+fn issuance_is_refused_when_the_key_could_not_be_spent_under() {
+    run(|| {
+        let now = now_unix_secs();
+        // Issuing until now + 30, accepted until a minute short of the margin
+        // from now: an epoch shorter than the margin.
+        let (window, calendar) =
+            KeyWindow::epoch_ending_at(now + 30, (margin_secs() - 60 - 30) as u64);
+        let (mock, core, _dir) = setup(MockConfig {
+            key_window: Some(window),
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect_err("issuance under a key about to lapse is refused");
+        assert!(matches!(err, AppError::Credential { .. }), "got {err:?}");
+        assert_eq!(mock.chat_hits(), 0);
+        assert!(credential_states(&core).is_empty(), "nothing was issued");
+
+        let changes = drain(&mut rx);
+        assert!(
+            !changes.contains(&Change::Wallet) && !changes.contains(&Change::Account),
+            "a refused issuance announces no wallet or account write; got {changes:?}"
+        );
+        assert!(changes.contains(&Change::SpaceIndex), "the post survives");
+    });
+}
+
+// ===========================================================================
+// Issuer keys against the public calendar, one per epoch
+// ===========================================================================
+
+/// A key whose windows are not one epoch's on the public calendar is refused
+/// before anything is requested: a window nobody could have computed in
+/// advance is one a server could have timed around this client.
+#[test]
+fn a_key_off_the_calendar_is_refused_before_issuance() {
+    run(|| {
+        let now = now_unix_secs();
+        // An issuing window covering now that starts at an arbitrary instant,
+        // the shape keys had before they were put on a calendar.
+        let (mock, core, _dir) = setup(MockConfig {
+            key_window: Some(KeyWindow::from_unix_secs(
+                now - 3_600,
+                now - 3_600 + WEEK_SECS,
+                now - 3_600 + 2 * WEEK_SECS,
+            )),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect_err("a key off the calendar is refused");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::NotOnCalendar
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(mock.chat_hits(), 0);
+        assert!(credential_states(&core).is_empty(), "nothing was issued");
+        let changes = drain(&mut rx);
+        assert!(
+            !changes.contains(&Change::Wallet) && !changes.contains(&Change::Account),
+            "a refused key announces no wallet or account write; got {changes:?}"
+        );
+    });
+}
+
+/// The same key the client checks is the one the calendar's production
+/// constants describe: with no test calendar, the mock's windows are the
+/// production epoch's, and they are accepted.
+#[test]
+fn the_production_calendars_current_epoch_is_accepted() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the current epoch's key on the production calendar issues");
+    });
+}
+
+/// An honest server has one key per epoch. Once this client has seen the
+/// epoch's key, a different one for the same epoch is refused — before any
+/// issuance request, though the second key is real and would have signed —
+/// and the refusal lasts until the next epoch, whose key is accepted.
+#[test]
+fn a_second_key_for_a_seen_epoch_is_refused_until_the_next_epoch() {
+    run(|| {
+        let config = MockConfig::default();
+        let key_swap = config.key_swap.clone();
+        let deadline = config.key_deadline.clone();
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+        // An epoch boundary a few seconds from now, on week-long epochs (a
+        // key's acceptance has to outlast the spend margin).
+        let (boundary, calendar) = deadline.issuing_ends_in(&core, 6, WEEK_SECS as u64, false);
+
+        let first = core
+            .runtime()
+            .block_on(core.account_allocate(1_000_000))
+            .expect("the epoch's first key issues");
+        let before = credential_states(&core).len();
+        assert_eq!(before, 1);
+
+        key_swap.swap();
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect_err("a second key for the epoch is refused");
+        let epoch = calendar
+            .epoch_at(u64::try_from(boundary - 1).unwrap())
+            .expect("on the calendar");
+        assert!(
+            matches!(
+                &err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::SecondKeyForEpoch { epoch: e }
+                } if *e == epoch
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            credential_states(&core).len(),
+            before,
+            "nothing was issued under the second key"
+        );
+        // The credential already held is untouched and still spends.
+        core.runtime()
+            .block_on(core.chat("still works".into(), MODEL.into(), None))
+            .expect("a held credential keeps working");
+        assert_eq!(mock.chat_hits(), 1);
+
+        // Asking again is refused the same way: nothing about the refusal
+        // wears off within the epoch.
+        let refused_again = core.runtime().block_on(core.account_allocate(1_000));
+        assert!(
+            matches!(refused_again, Err(AppError::IssuerKeyRefused { .. })),
+            "got {refused_again:?}"
+        );
+
+        sleep_past_unix_secs(boundary);
+        let next = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the next epoch's key issues");
+        assert_eq!(next.issuer_key_id, key_swap.second_key_id());
+        assert_ne!(next.issuer_key_id, first.issuer_key_id);
+    });
+}
+
+/// An honest server has a distinct key for every epoch. One that keeps its
+/// key across a boundary lists it for the epoch just ended and for the new
+/// one, and the client refuses it: a key the record could hold for one epoch
+/// only would leave the other to be filled by whatever the server shows next.
+#[test]
+fn a_key_kept_across_an_epoch_boundary_is_refused() {
+    run(|| {
+        let config = MockConfig::default();
+        let deadline = config.key_deadline.clone();
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        let (boundary, _) = deadline.issuing_ends_in(&core, 6, WEEK_SECS as u64, false);
+        core.runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the epoch's key issues");
+
+        sleep_past_unix_secs(boundary);
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect_err("the same key for the next epoch is refused");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::OneKeyForSeveralEpochs { .. }
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(credential_states(&core).len(), 1, "nothing more was issued");
+    });
+}
+
+/// The record remembers which epoch each key was seen for, so a key reused
+/// for a later epoch is refused even when the listing leaves out the entry
+/// it would have collided with.
+#[test]
+fn a_key_seen_for_one_epoch_is_refused_for_the_next() {
+    run(|| {
+        let config = MockConfig::default();
+        let omit = config.omit_previous_key.clone();
+        let deadline = config.key_deadline.clone();
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        let (boundary, _) = deadline.issuing_ends_in(&core, 6, WEEK_SECS as u64, false);
+        core.runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the epoch's key issues");
+
+        omit.store(true, std::sync::atomic::Ordering::SeqCst);
+        sleep_past_unix_secs(boundary);
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect_err("a key already seen for the previous epoch is refused");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::OneKeyForSeveralEpochs { .. }
+                }
+            ),
+            "got {err:?}"
+        );
+    });
+}
+
+/// The record is kept on disk: a client that restarts still refuses a
+/// second key for an epoch it saw before the restart.
+#[test]
+fn the_key_seen_for_an_epoch_survives_a_restart() {
+    run(|| {
+        // The upstream runs on a runtime of its own so it outlives the core.
+        let config = MockConfig::default();
+        let key_swap = config.key_swap.clone();
+        let mock_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("mock runtime");
+        let mock = mock_rt.block_on(chat_harness::start(config.clone()));
+        let (_unused, core, dir) = setup(config);
+        core.runtime()
+            .block_on(core.set_base_url(mock.base_url.clone()))
+            .expect("point at the lasting upstream");
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect("the epoch's first key issues");
+        drop(core);
+
+        key_swap.swap();
+        let core = chat_harness::reopen_core(&dir, &mock.base_url);
+        let err = core
+            .runtime()
+            .block_on(core.account_allocate(1_000))
+            .expect_err("a second key for the epoch is refused after a restart");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::SecondKeyForEpoch { .. }
+                }
+            ),
+            "got {err:?}"
         );
     });
 }
@@ -2383,8 +3918,8 @@ fn branched_eidola_space(core: &AppCore) -> String {
 ///   is actually going to send, which is *smaller* because the withdrawn tool
 ///   schemas are no longer being charged for;
 /// * nothing is stranded (no credential left `spending`) and nothing is lost —
-///   with the mock refunding each charge in full, the wallet's spendable total
-///   is exactly what it was before the turn;
+///   with the mock charging each recovered hold its request fee alone, the
+///   wallet's spendable total is what it was before the turn less two fees;
 /// * one answer is persisted, not two.
 #[test]
 fn a_rejected_tools_field_on_a_spending_backend_settles_both_holds() {
@@ -2410,7 +3945,8 @@ fn a_rejected_tools_field_on_a_spending_backend_settles_both_holds() {
             .runtime()
             .block_on(core.chat("Tell me more.".into(), MODEL.into(), Some(space.clone())))
             .expect("the turn must survive a server that rejects the tools field");
-        assert_eq!(result.content, "Hello from the mock.");
+        // The Eidola backend answers a blocking turn from a stream.
+        assert_eq!(result.content, chat_harness::STREAM_CONTENT);
 
         // The rejected attempt is an emission point of its own (bus.rs's
         // degrade row): its request row lands, and the retry's fresh hold is a
@@ -2445,7 +3981,7 @@ fn a_rejected_tools_field_on_a_spending_backend_settles_both_holds() {
 
         // Each attempt presented its own ACT token: a hold is bound to one
         // request, so reusing the rejected one would have been the bug.
-        let auths = mock.chat_auth_values();
+        let auths = mock.chat_spends();
         assert!(
             auths[2].is_some() && auths[3].is_some(),
             "both attempts spend: {auths:?}"
@@ -2515,9 +4051,11 @@ fn a_rejected_tools_field_on_a_spending_backend_settles_both_holds() {
             lifecycle.iter().all(|c| c.state != "spending"),
             "no hold outlives the turn; got {lifecycle:?}"
         );
-        // Nothing lost: the mock refunds each charge in full, so a settled pair
-        // of holds leaves the spendable total exactly where it was. A leaked
-        // hold or a double-charge would show up here as a shortfall.
+        // Nothing lost: neither request's answer carries its refund in band,
+        // and the mock charges a recovered spend the request fee and returns
+        // the rest, so a settled pair of holds leaves the spendable total short
+        // by exactly two fees. A leaked hold or a double-charge would show up
+        // here as a larger shortfall.
         let credits_after: i64 = core
             .runtime()
             .block_on(core.wallet_credentials())
@@ -2526,8 +4064,9 @@ fn a_rejected_tools_field_on_a_spending_backend_settles_both_holds() {
             .map(|c| c.credits)
             .sum();
         assert_eq!(
-            credits_after, credits_before,
-            "both holds came back — the failed attempt cost the wallet nothing"
+            credits_after,
+            credits_before - 2 * chat_harness::REQUEST_FEE as i64,
+            "both holds came back, each less its request fee"
         );
 
         // One answer, not two: the rejected attempt wrote no inference, so the
@@ -2602,6 +4141,174 @@ fn a_retry_will_not_take_a_hold_while_the_last_one_is_unsettled() {
             "the failed turn took one hold, not two"
         );
     });
+}
+
+/// **A declared "no" withholds the field: no probe, no failed round, no hold.**
+///
+/// The mock rejects any `tools`-bearing request, so a client that offered the
+/// field anyway would pay for a round that can only fail. Declaring the answer
+/// is what turns that from a lesson learned the expensive way into a
+/// non-event: one request, no `tools` on it, and one credential moved rather
+/// than two.
+#[test]
+fn a_declared_incapable_model_is_never_offered_tools() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectTools,
+            declared_tool_calling: Some(false),
+            ..MockConfig::default()
+        });
+        // A test necessarily reaches the mock through a base-URL override, and
+        // an override is a hint rather than a declaration — see
+        // `ToolPolicy`. This stands in for the compiled-in pin.
+        core.trust_declared_capabilities_for_test(true);
+        with_account(&core);
+        let space = branched_eidola_space(&core);
+
+        let settled_before = settled_credentials(&core);
+        let requests_before = mock.chat_bodies().len();
+
+        let result = core
+            .runtime()
+            .block_on(core.chat("Tell me more.".into(), MODEL.into(), Some(space.clone())))
+            .expect("a withheld tools field must leave an ordinary turn");
+        // The Eidola backend answers a blocking turn from a stream.
+        assert_eq!(result.content, chat_harness::STREAM_CONTENT);
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.len() - requests_before,
+            1,
+            "one request — the probe never happened"
+        );
+        assert!(
+            bodies[requests_before].get("tools").is_none(),
+            "a declared `false` withholds the field: {}",
+            bodies[requests_before]
+        );
+        // The map still rides the messages array: withholding the *tools*
+        // never costs the space its structural view.
+        assert!(
+            flat_messages(&bodies[requests_before])
+                .last()
+                .expect("a message")
+                .1
+                .contains("</thread-map>"),
+            "the branched space keeps its map"
+        );
+        assert_eq!(
+            settled_credentials(&core) - settled_before,
+            1,
+            "one hold for one round — nothing was spent discovering what was declared"
+        );
+    });
+}
+
+/// **A declared "yes" disarms the probe, so a failure stays a failure.**
+///
+/// Today any round-1 `Server` error is read as "this endpoint rejects the
+/// `tools` field". Where the endpoint has *declared* it accepts one, that
+/// reading is simply wrong, and wrong in an expensive direction: a transient
+/// upstream 500 would be retried toolless, and if the retry succeeded the
+/// model would silently lose its tools for the rest of the process — after
+/// charging for both attempts. Declaration answers the question the probe
+/// existed to ask, so the error surfaces instead.
+#[test]
+fn a_declared_capable_model_does_not_degrade_on_a_server_error() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectTools,
+            declared_tool_calling: Some(true),
+            ..MockConfig::default()
+        });
+        core.trust_declared_capabilities_for_test(true);
+        with_account(&core);
+        let space = branched_eidola_space(&core);
+
+        let requests_before = mock.chat_bodies().len();
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("Tell me more.".into(), MODEL.into(), Some(space.clone())))
+            .expect_err("a 500 from a model we know does tools is a genuine failure");
+        assert!(
+            matches!(err, AppError::Server { .. }),
+            "the turn reports the upstream failure rather than a capability verdict: {err:?}"
+        );
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.len() - requests_before,
+            1,
+            "no toolless retry: the declaration already answered the question"
+        );
+        assert!(
+            bodies[requests_before].get("tools").is_some(),
+            "the declared-capable model was offered its tools: {}",
+            bodies[requests_before]
+        );
+    });
+}
+
+/// **Provenance, not backend kind: an override-reached eidola backend keeps
+/// discovering.**
+///
+/// The same mock declares `tool_calling: false` here, and the client offers
+/// the field anyway. The connection was reached through a base-URL override,
+/// so it is not the catalog this binary pinned — it might be a development
+/// stack mid-iteration, or another operator's server whose catalog is theirs.
+/// A declaration there is a hint, and the learned degrade stays armed exactly
+/// as it is for a local engine.
+#[test]
+fn a_declaration_from_an_override_reached_backend_is_only_a_hint() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::RejectTools,
+            declared_tool_calling: Some(false),
+            ..MockConfig::default()
+        });
+        // Deliberately *not* trusting the declaration: this is the default
+        // state, and the one every override-reached connection is in.
+        with_account(&core);
+        let space = branched_eidola_space(&core);
+
+        let requests_before = mock.chat_bodies().len();
+
+        let result = core
+            .runtime()
+            .block_on(core.chat("Tell me more.".into(), MODEL.into(), Some(space.clone())))
+            .expect("the degrade still recovers the turn");
+        // The Eidola backend answers a blocking turn from a stream.
+        assert_eq!(result.content, chat_harness::STREAM_CONTENT);
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.len() - requests_before,
+            2,
+            "the hinted `false` was ignored: tools offered, rejected, retried"
+        );
+        assert!(
+            bodies[requests_before].get("tools").is_some(),
+            "a hint does not withhold: {}",
+            bodies[requests_before]
+        );
+        assert!(
+            bodies[requests_before + 1].get("tools").is_none(),
+            "and the retry withdraws them: {}",
+            bodies[requests_before + 1]
+        );
+    });
+}
+
+/// Credentials that have settled into a completed spend — one per round that
+/// reached the wire and was charged for.
+fn settled_credentials(core: &AppCore) -> usize {
+    core.runtime()
+        .block_on(core.wallet_lifecycle())
+        .expect("lifecycle")
+        .iter()
+        .filter(|c| c.state == "spent")
+        .count()
 }
 
 /// The degrade is remembered for the process, so the wasted request happens at
@@ -3331,7 +5038,7 @@ fn streaming_non_2xx_emits_record_and_space() {
 #[test]
 fn mid_sse_abort_emits_user_turn_and_keeps_the_post() {
     run(|| {
-        let (_mock, core, _dir) = setup(MockConfig {
+        let (mock, core, _dir) = setup(MockConfig {
             chat: ChatBehavior::StreamingMidAbort,
             ..MockConfig::default()
         });
@@ -3348,18 +5055,31 @@ fn mid_sse_abort_emits_user_turn_and_keeps_the_post() {
         assert!(matches!(err, AppError::Network { .. }), "got {:?}", err);
 
         let changes = drain(&mut rx);
-        // User turn committed before the stream began reading → Space + SpaceIndex
-        // + Wallet, but no Record (request row not written on mid-stream failure).
+        // User turn committed before the stream began reading → Space +
+        // SpaceIndex + Wallet; and the exchange that died is a Record row with
+        // the read failure as its error — a failure of an exchange that
+        // happened, which is the one a reader opens the Record for.
         assert!(
             changes.contains(&Change::Space(space_id.clone())),
             "got {changes:?}"
         );
         assert!(changes.contains(&Change::SpaceIndex), "got {changes:?}");
         assert!(changes.contains(&Change::Wallet), "got {changes:?}");
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+        let rows = completion_rows(&core);
+        assert_eq!(rows.len(), 1);
         assert!(
-            !changes.contains(&Change::Record),
-            "no Record on mid-SSE abort; got {changes:?}"
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("stream read failed")),
+            "{:?}",
+            rows[0].error
         );
+        // The hold settles on this exit too — the stream died before any
+        // refund event, so recovery answers for its absence.
+        assert!(mock.refund_hits() >= 1, "the hold went to recovery");
+        assert_settled(&core);
 
         let messages = core
             .runtime()
@@ -3367,6 +5087,244 @@ fn mid_sse_abort_emits_user_turn_and_keeps_the_post() {
             .expect("messages");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
+    });
+}
+
+/// **A stream the gateway cut short is not an answer, and it settles from
+/// the refund it carried.** The gateway ends a cut-short stream with its
+/// metadata event (the refund it settled on) and no `[DONE]`: the turn fails
+/// as a stream that never finished, writes no answer (a regeneration keeps
+/// what it would have replaced), and the hold settles from the in-band refund
+/// without asking recovery.
+#[test]
+fn a_stream_cut_short_is_not_an_answer_and_settles_in_band() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingCutShortWithRefund,
+            refund: RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let (tx, _events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let err = core
+            .runtime()
+            .block_on(core.chat_stream("stream me".into(), MODEL.into(), None, tx))
+            .expect_err("an interrupted stream is not an answer");
+        assert!(matches!(err, AppError::Network { .. }), "got {err:?}");
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(only_space(&core)))
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "only the user's turn: {messages:?}");
+        assert_eq!(mock.refund_hits(), 0, "settled from the refund in band");
+        assert_settled(&core);
+    });
+}
+
+/// **A stream the gateway cut short settles on what was generated.** When a
+/// stream ends early (its client went away, it reached its deadline, or its
+/// engine failed), the gateway releases the engine and stores a final refund
+/// charging the prompt and the output generated up to the cut: never the
+/// whole hold for what was not produced, never nothing. The client recovers
+/// it like any refund, and its successor holds the credential's balance less
+/// exactly that charge.
+#[test]
+fn a_stream_cut_short_settles_on_what_was_generated() {
+    run(|| {
+        const CHARGED: u128 = 17;
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingMidAbort,
+            refund: RefundMode::ChargedEarly(CHARGED),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let lifecycle = |core: &AppCore| {
+            core.runtime()
+                .block_on(core.wallet_lifecycle())
+                .expect("lifecycle")
+        };
+        let mut rx = core.subscribe_changes();
+
+        let (tx, _events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.chat_stream("stream me".into(), MODEL.into(), None, tx))
+            .expect_err("the stream was cut short");
+
+        assert!(mock.refund_hits() >= 1, "the hold went to recovery");
+        assert!(drain(&mut rx).contains(&Change::Wallet));
+        let spent = lifecycle(&core)
+            .into_iter()
+            .find(|c| c.state == "spent")
+            .expect("the spent credential");
+        let hold = spent.spend_amount.expect("its hold");
+        let successor = lifecycle(&core)
+            .into_iter()
+            .find(|c| c.state == "active")
+            .expect("its successor");
+        assert_eq!(
+            successor.credits,
+            spent.credits - i64::try_from(CHARGED).unwrap(),
+            "charged {CHARGED} of a {hold}-credit hold"
+        );
+        assert_settled(&core);
+    });
+}
+
+// ===========================================================================
+// The blocking twins against the Eidola backend read a stream
+//
+// The gateway serves chat only as a stream, so a blocking turn, a blocking
+// continuation, a chore and the proxy's non-streamed route each ask it for one
+// and assemble the answer (`whole_answer`). The mock refuses a spending request
+// that does not ask for a stream, as the gateway does, and counts it.
+// ===========================================================================
+
+/// **A blocking turn the gateway cut short is not an answer, and it settles on
+/// the refund the stream carried.** The stream ends with the metadata event
+/// (charged what was generated) and no `[DONE]`: the turn fails as its
+/// streaming twin does, writes no answer, settles from the in-band refund —
+/// the only copy, under `NotStored` — and the Record keeps the partial answer
+/// with the ending as its error.
+#[test]
+fn a_blocking_turn_cut_short_settles_in_band_and_keeps_what_arrived() {
+    run(|| {
+        const CHARGED: u128 = 31;
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingCutShortWithRefund,
+            refund: RefundMode::NotStored,
+            settled_charge: Some(CHARGED),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+        let err = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect_err("an interrupted answer is not an answer");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("ended without finishing")),
+            "{err:?}"
+        );
+        assert_eq!(
+            mock.blocking_asks(),
+            0,
+            "the blocking turn asked for a stream"
+        );
+        assert_eq!(mock.chat_bodies()[0]["stream"], true);
+
+        assert_eq!(mock.refund_hits(), 0, "settled from the refund in band");
+        assert_settled(&core);
+        let lifecycle = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("lifecycle");
+        let spent = lifecycle
+            .iter()
+            .find(|c| c.state == "spent")
+            .expect("the spent credential");
+        let successor = lifecycle
+            .iter()
+            .find(|c| c.state == "active")
+            .expect("its successor");
+        assert_eq!(
+            successor.credits,
+            spent.credits - i64::try_from(CHARGED).unwrap(),
+            "charged what was generated, once"
+        );
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Wallet), "got {changes:?}");
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(only_space(&core)))
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "only the user's turn: {messages:?}");
+        let rows = completion_rows(&core);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ended without finishing")),
+            "{:?}",
+            rows[0].error
+        );
+        let recorded = request_detail(&core, &rows[0].id)
+            .response_body
+            .expect("a recorded body");
+        assert!(
+            String::from_utf8_lossy(&recorded).contains(STREAM_CONTENT),
+            "the Record keeps what arrived"
+        );
+    });
+}
+
+/// **A blocking turn's answer from the Eidola backend is read from a stream**,
+/// every round of it: the tool round and the round after it each ask for a
+/// stream, the blocking reader sees the call, and each round's hold settles
+/// from its in-band refund.
+#[test]
+fn a_blocking_tool_turn_reads_each_round_from_a_stream() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ToolRoundsBlocking(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+        let res = core
+            .runtime()
+            .block_on(core.chat("use the tool".into(), MODEL.into(), None))
+            .expect("a two-round turn");
+        assert_eq!(res.content, chat_harness::TOOL_FINAL_CONTENT);
+        assert_eq!(mock.blocking_asks(), 0);
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies.iter().all(|b| b["stream"] == true), "{bodies:?}");
+        assert_eq!(
+            bodies[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .nth(1)
+                .unwrap()["tool_calls"][0]["id"],
+            chat_harness::tool_call_id(1),
+            "the call the stream carried is replayed"
+        );
+        assert_eq!(mock.refund_hits(), 0, "each round settled in band");
+        assert_settled(&core);
+    });
+}
+
+/// **A blocking continuation reads a stream too**, and the continued answer
+/// is written whole.
+#[test]
+fn a_blocking_continuation_reads_a_stream() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Answer,
+                again: false,
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        let res = core
+            .runtime()
+            .block_on(core.continue_answer(cut.response_action_id.clone().unwrap()))
+            .expect("the continuation");
+        assert_eq!(res.content, format!("{STREAM_CONTENT}{CONTINUED_TAIL}"));
+        assert_eq!(mock.blocking_asks(), 0);
+        assert!(
+            mock.chat_bodies().iter().all(|b| b["stream"] == true),
+            "both blocking doors asked for a stream"
+        );
+        assert_settled(&core);
     });
 }
 
@@ -3575,6 +5533,157 @@ fn blocking_setup_failure_leaves_the_saved_post() {
             .block_on(core.get_space_messages(space_id))
             .expect("messages");
         assert_eq!(messages.len(), 1, "user turn persisted; no assistant reply");
+    });
+}
+
+// ===========================================================================
+// A stale selection: the catalog stopped listing a model something still
+// names. Removing a row does not un-pick the participant that chose it, so the
+// selection simply goes stale, and the one behaviour worse than failing is
+// answering with a different model behind the reader's back. Every turn path
+// therefore refuses by name, before any request is sent.
+// ===========================================================================
+
+/// The turn a participant takes on a model the catalog has retired.
+#[test]
+fn a_turn_whose_model_left_the_catalog_is_refused_by_name() {
+    run(|| {
+        let omissions = chat_harness::catalog_omissions();
+        let (mock, core, _dir) = setup(MockConfig {
+            catalog_omits: omissions.clone(),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        // The model was there when the space was made — a first turn proves it.
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the model is in the catalog");
+        let sent_before = mock.chat_hits();
+        assert_eq!(sent_before, 1);
+
+        // Now the row goes away. Nothing un-picks the participant.
+        omissions.lock().expect("omissions").push(MODEL.into());
+
+        let res = core.runtime().block_on(core.chat(
+            "and the neap tides?".into(),
+            MODEL.into(),
+            Some(first.space_id.clone()),
+        ));
+        match &res {
+            Err(AppError::ModelUnavailable { model }) => {
+                assert_eq!(model, MODEL, "the refusal names what was asked for");
+            }
+            other => panic!("expected a typed refusal naming the model; got {other:?}"),
+        }
+        assert_eq!(
+            mock.chat_hits(),
+            sent_before,
+            "no completion request at all — nothing could have been substituted"
+        );
+
+        // The post survived (it commits before `prepare_turn`), and no answer
+        // was written under it.
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(first.space_id))
+            .expect("messages");
+        assert_eq!(
+            messages.iter().filter(|m| m.role == "user").count(),
+            2,
+            "both asks are saved; got {messages:#?}"
+        );
+        assert_eq!(
+            messages.iter().filter(|m| m.role == "assistant").count(),
+            1,
+            "only the first ask was answered; got {messages:#?}"
+        );
+    });
+}
+
+/// The streaming transport shares `prepare_turn`, so it must refuse the same
+/// way and just as early — before a single delta reaches the reader.
+#[test]
+fn a_streaming_turn_whose_model_left_the_catalog_is_refused_by_name() {
+    run(|| {
+        let omissions = chat_harness::catalog_omissions();
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            catalog_omits: omissions.clone(),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        omissions.lock().expect("omissions").push(MODEL.into());
+
+        let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (res, deltas) = core.runtime().block_on(async {
+            let run = core.chat_stream("Hello".into(), MODEL.into(), None, tx);
+            tokio::join!(run, collect_deltas(events_rx))
+        });
+        match &res {
+            Err(AppError::ModelUnavailable { model }) => {
+                assert_eq!(model, MODEL, "the refusal names what was asked for");
+            }
+            other => panic!("expected a typed refusal naming the model; got {other:?}"),
+        }
+        assert_eq!(
+            deltas,
+            (String::new(), String::new()),
+            "nothing was streamed"
+        );
+        assert_eq!(mock.chat_hits(), 0, "no completion request was sent");
+    });
+}
+
+/// A regeneration replays the model the post recorded, so a retired row
+/// reaches it exactly as it reaches a fresh turn — and the answer it would
+/// have replaced is untouched.
+#[test]
+fn a_regeneration_replaying_a_retired_catalog_row_is_refused_by_name() {
+    run(|| {
+        let omissions = chat_harness::catalog_omissions();
+        let (mock, core, _dir) = setup(MockConfig {
+            catalog_omits: omissions.clone(),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let answer = tree[1].action_id.clone();
+        let original = block_text(&tree[1]);
+        let sent_before = mock.chat_hits();
+
+        omissions.lock().expect("omissions").push(MODEL.into());
+
+        let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let res = core.runtime().block_on(async {
+            let regen = core.regenerate_stream(answer.clone(), MODEL.into(), tx);
+            let (res, _) = tokio::join!(regen, collect_deltas(events_rx));
+            res
+        });
+        match &res {
+            Err(AppError::ModelUnavailable { model }) => {
+                assert_eq!(model, MODEL, "the refusal names what was asked for");
+            }
+            other => panic!("expected a typed refusal naming the model; got {other:?}"),
+        }
+        assert_eq!(mock.chat_hits(), sent_before, "no request was sent");
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        assert_eq!(tree.len(), 2, "no successor post; got {tree:#?}");
+        assert_eq!(block_text(&tree[1]), original, "the answer is intact");
+        assert_eq!(tree[1].generation_count, 1, "and it gained no generation");
     });
 }
 
@@ -3857,16 +5966,25 @@ fn each_tool_round_acquires_its_own_hold() {
             .block_on(core.chat("use the tool".into(), MODEL.into(), None))
             .expect("tool turn succeeds");
 
-        // Two `PrivateToken` headers, and they differ — each round proved a
-        // fresh spend.
+        // Two spends in the body's `credentials`, none in a header, and they
+        // differ — each round proved a fresh spend.
         let auths: Vec<String> = mock
-            .chat_auth_values()
+            .chat_spends()
             .into_iter()
-            .map(|a| a.expect("every eidola round sends an ACT header"))
+            .map(|a| a.expect("every eidola round carries a spend"))
             .collect();
         assert_eq!(auths.len(), 2);
-        assert!(auths.iter().all(|a| a.starts_with("PrivateToken token=")));
+        assert_eq!(
+            mock.chat_auths(),
+            vec![false, false],
+            "no credential in a header"
+        );
         assert_ne!(auths[0], auths[1], "each round proves its own spend");
+        assert_eq!(
+            mock.hold_mismatches(),
+            0,
+            "each round holds exactly its worst case"
+        );
 
         let requests = core
             .runtime()
@@ -3957,7 +6075,9 @@ fn a_tool_rounds_hold_covers_the_tool_bytes_it_sends() {
         let expected: u64 = bodies
             .iter()
             .map(|b| {
-                contract_prompt_tokens(b) + b["max_completion_tokens"].as_u64().expect("ceiling")
+                chat_harness::REQUEST_FEE as u64
+                    + contract_prompt_tokens(b)
+                    + b["max_completion_tokens"].as_u64().expect("ceiling")
             })
             .sum();
         assert_eq!(
@@ -4155,7 +6275,9 @@ fn a_later_turns_hold_covers_the_traces_it_replays() {
 
         assert_eq!(
             second.credits_charged as u64,
-            contract_prompt_tokens(last) + last["max_completion_tokens"].as_u64().expect("ceiling"),
+            chat_harness::REQUEST_FEE as u64
+                + contract_prompt_tokens(last)
+                + last["max_completion_tokens"].as_u64().expect("ceiling"),
             "the hold equals the contract over the bytes actually sent"
         );
 
@@ -5358,5 +7480,7097 @@ fn post_headers_carry_a_stable_absolute_stamp() {
                 }
             }
         }
+    });
+}
+
+// ===========================================================================
+// The completion ceiling — a turn that stopped because it ran out of budget
+// ===========================================================================
+
+/// A post's readable text — its `text` blocks joined, which is what a reader
+/// would have lost had a truncated regeneration superseded it.
+fn block_text(node: &eidola_app_core::PostNode) -> String {
+    node.blocks
+        .iter()
+        .filter(|b| b.block_type == "text")
+        .filter_map(|b| b.text.clone())
+        .collect()
+}
+
+/// Drain a turn's stream events while it runs, returning `(content, reasoning)`.
+/// The collector must run *concurrently* with the turn: the sender is dropped
+/// only when the turn returns.
+async fn collect_deltas(
+    mut events_rx: tokio::sync::mpsc::UnboundedReceiver<ChatStreamEvent>,
+) -> (String, String) {
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    while let Some(ev) = events_rx.recv().await {
+        match ev {
+            ChatStreamEvent::ContentDelta(t) => content.push_str(&t),
+            ChatStreamEvent::ReasoningDelta(t) => reasoning.push_str(&t),
+        }
+    }
+    (content, reasoning)
+}
+
+/// A post's reasoning — its `thinking` blocks joined.
+fn block_thinking(node: &eidola_app_core::PostNode) -> String {
+    node.blocks
+        .iter()
+        .filter(|b| b.block_type == "thinking")
+        .filter_map(|b| b.text.clone())
+        .collect()
+}
+
+/// A reasoning model spends the whole completion budget thinking and never
+/// starts the answer. The reasoning is real work, and the turn that stopped
+/// there is written like any turn that stopped at its ceiling: an `inference`
+/// carrying the reasoning and no answer, marked truncated, and continuable —
+/// so a continuation can resume the thought rather than start it over. The
+/// exchange is the generation's own request row.
+#[test]
+fn a_ceiling_exit_before_any_answer_is_written_and_marked_blocking() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ReasoningOnlyLength,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+
+        let res = core
+            .runtime()
+            .block_on(core.chat("think about it".into(), MODEL.into(), None))
+            .expect("a turn cut off before its answer is still a turn");
+        assert!(res.truncated, "the ceiling bound it, and it must say so");
+        assert_eq!(res.content, "", "there is no answer text yet");
+        assert_eq!(mock.chat_hits(), 1);
+        let answer = res
+            .response_action_id
+            .clone()
+            .expect("the reasoning is written as a generation");
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(res.space_id.clone()))
+            .expect("tree");
+        assert_eq!(tree.len(), 2, "the question and the cut-off answer");
+        let post = &tree[1];
+        assert_eq!(post.action_id, answer);
+        assert_eq!(post.action_type, "inference");
+        assert!(
+            post.truncated && post.continuable,
+            "marked, and continuable"
+        );
+        assert_eq!(block_thinking(post), TRUNCATED_REASONING);
+        assert_eq!(block_text(post), "", "no answer block");
+
+        // The exchange is the generation's own, not an unattached row.
+        let requests = core
+            .runtime()
+            .block_on(core.list_requests(10, 0))
+            .expect("requests");
+        let chat_rows: Vec<_> = requests
+            .iter()
+            .filter(|r| r.path == "/v1/chat/completions")
+            .collect();
+        assert_eq!(chat_rows.len(), 1, "the exchange is recorded");
+        let detail = core
+            .runtime()
+            .block_on(core.request_detail(chat_rows[0].id.clone()))
+            .expect("request detail")
+            .expect("the row is there");
+        assert_eq!(detail.action_id.as_deref(), Some(answer.as_str()));
+        let body = String::from_utf8(detail.response_body.expect("a recorded response body"))
+            .expect("utf-8");
+        assert!(
+            body.contains("\"finish_reason\":\"length\""),
+            "the reason the turn ended is in the trail: {body}"
+        );
+
+        // The ordinary success emissions.
+        let changes = drain(&mut rx);
+        for expected in [Change::Space(res.space_id), Change::Wallet, Change::Record] {
+            assert!(changes.contains(&expected), "{expected:?} in {changes:?}");
+        }
+    });
+}
+
+/// The streaming twin: same upstream, same verdict. The reasoning streams as it
+/// arrives, and the generation it streamed into is written and marked.
+#[test]
+fn a_ceiling_exit_before_any_answer_is_written_and_marked_streaming() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ReasoningOnlyLength,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (res, content, reasoning) = core.runtime().block_on(async {
+            let chat = core.chat_stream("think about it".into(), MODEL.into(), None, tx);
+            let (res, (content, reasoning)) = tokio::join!(chat, collect_deltas(events_rx));
+            (res, content, reasoning)
+        });
+
+        let res = res.expect("a stream cut off before its answer is still a turn");
+        assert!(
+            res.truncated,
+            "blocking and streaming classify a ceiling exit alike"
+        );
+        assert!(content.is_empty(), "there was no answer to stream");
+        assert_eq!(reasoning, TRUNCATED_REASONING);
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(res.space_id))
+            .expect("tree");
+        let post = &tree[1];
+        assert_eq!(Some(&post.action_id), res.response_action_id.as_ref());
+        assert!(post.truncated && post.continuable);
+        assert_eq!(block_thinking(post), TRUNCATED_REASONING);
+
+        // The hold is settled exactly as a turn that produced text settles it:
+        // the tokens were spent whether or not they became an answer.
+        assert!(mock.refund_hits() >= 1);
+    });
+}
+
+/// Regenerating an answer, and the new generation stops before its answer
+/// begins. It is a generation like any other — written, marked, current — and
+/// **the answer it superseded is one step back**: regeneration is
+/// append-only, so the readable answer is still the item's earlier generation
+/// (what the switcher shows), and the new one can be continued to its own.
+#[test]
+fn a_regeneration_cut_off_before_its_answer_keeps_the_old_answer_one_generation_back() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkThenReasoningOnlyLength,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let answer = tree[1].action_id.clone();
+        assert_eq!(tree[1].action_type, "inference");
+        let original = block_text(&tree[1]);
+        assert!(!original.is_empty(), "the answer has readable text");
+
+        let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let res = core.runtime().block_on(async {
+            let regen = core.regenerate_stream(answer.clone(), MODEL.into(), tx);
+            let (res, _) = tokio::join!(regen, collect_deltas(events_rx));
+            res
+        });
+        let res = res.expect("a regeneration cut off before its answer is a generation");
+        assert!(res.truncated);
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        assert_eq!(
+            tree.len(),
+            2,
+            "a new generation, not a new post; got {tree:#?}"
+        );
+        let tip = &tree[1];
+        assert_ne!(
+            tip.action_id, answer,
+            "the regeneration is the current generation"
+        );
+        assert_eq!(tip.generation_count, 2);
+        assert!(tip.truncated && tip.continuable);
+        assert_eq!(block_text(tip), "");
+
+        // The superseded answer is intact, one generation back.
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(first.space_id))
+            .expect("raw actions");
+        let old = actions
+            .iter()
+            .find(|a| a.id == answer)
+            .expect("the superseded generation is kept");
+        let old_text: String = old
+            .blocks
+            .iter()
+            .filter(|b| b.block_type == "text")
+            .filter_map(|b| b.text_content.clone())
+            .collect();
+        assert_eq!(old_text, original, "the answer is intact");
+    });
+}
+
+/// A ceiling exit that **did** produce text is a different thing: the partial
+/// answer is real and worth keeping, so the turn is ordinary — but it is not
+/// finished, and the result says so rather than leaving a surface to guess.
+/// Asserted through both transports against one upstream.
+#[test]
+fn a_partial_answer_at_the_ceiling_is_kept_and_reported_as_truncated() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::PartialAnswerLength,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let blocking = core
+            .runtime()
+            .block_on(core.chat("go on".into(), MODEL.into(), None))
+            .expect("a partial answer is still a turn");
+        assert_eq!(blocking.content, "Hello from the stream.");
+        assert!(
+            blocking.truncated,
+            "the ceiling bound it, and it must say so"
+        );
+        assert!(blocking.response_action_id.is_some(), "the text is kept");
+
+        let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let streaming = core.runtime().block_on(async {
+            let chat = core.chat_stream(
+                "go on".into(),
+                MODEL.into(),
+                Some(blocking.space_id.clone()),
+                tx,
+            );
+            let (res, _) = tokio::join!(chat, collect_deltas(events_rx));
+            res
+        });
+        let streaming = streaming.expect("a partial answer is still a turn");
+        assert_eq!(streaming.content, "Hello from the stream.");
+        assert!(
+            streaming.truncated,
+            "the transports must agree about the ceiling"
+        );
+
+        // Both answers are in the transcript.
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(blocking.space_id.clone()))
+            .expect("messages");
+        assert_eq!(messages.len(), 4, "two questions, two partial answers");
+
+        // And the verdict is on the answers' own rows, not only on the result
+        // the caller happened to be holding — one classification, two readers.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(blocking.space_id))
+            .expect("tree");
+        for post in &tree {
+            let expected = post.action_type == "inference";
+            assert_eq!(
+                post.truncated, expected,
+                "{} ({}) recorded the wrong ceiling verdict",
+                post.action_id, post.action_type
+            );
+        }
+    });
+}
+
+/// The mark is **durable**, which only a second process can prove: a reopened
+/// profile has none of the first one's memory, so a mark that survives the
+/// restart survives because the answer's own row carries it.
+#[test]
+fn a_cut_off_answer_still_says_so_after_a_restart() {
+    run(|| {
+        let (mock, core, dir) = setup(MockConfig {
+            chat: ChatBehavior::PartialAnswerLength,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let res = core
+            .runtime()
+            .block_on(core.chat("go on".into(), MODEL.into(), None))
+            .expect("a partial answer is still a turn");
+        assert!(res.truncated, "the live turn reported the ceiling");
+        let space_id = res.space_id.clone();
+        let answer = res.response_action_id.clone().expect("the text is kept");
+        let base_url = mock.base_url.clone();
+
+        // The mock runs on the core's runtime, so it goes with it; nothing
+        // below needs an upstream, only the database left on disk.
+        drop(core);
+        let core = chat_harness::reopen_core(&dir, &base_url);
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space_id))
+            .expect("tree");
+        let post = tree
+            .iter()
+            .find(|p| p.action_id == answer)
+            .expect("the answer survived the restart");
+        assert!(
+            post.truncated,
+            "the reopened profile shows the answer with nothing saying it stopped short"
+        );
+        assert!(
+            tree.iter().all(|p| p.truncated == (p.action_id == answer)),
+            "only the cut-off answer carries the mark; got {tree:#?}"
+        );
+    });
+}
+
+/// An ordinary turn is not truncated, so nothing downstream has to distinguish
+/// "the flag is false" from "nobody set it".
+#[test]
+fn an_ordinary_turn_is_not_reported_as_truncated() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        let res = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat");
+        assert!(!res.truncated);
+        assert!(!res.continuable);
+
+        // Nor is the durable flag set on anything the turn wrote — "nobody set
+        // it" and "it is false" have to be the same state on disk too.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(res.space_id))
+            .expect("tree");
+        assert!(tree.iter().all(|p| !p.truncated), "got {tree:#?}");
+    });
+}
+
+// ===========================================================================
+// Continuing an answer that stopped at the ceiling
+// ===========================================================================
+
+use chat_harness::{
+    CEILING_TOKENS, CONTINUED_ANSWER, CONTINUED_REASONING, CONTINUED_TAIL, Cut, STREAM_CONTENT,
+    TRUNCATED_REASONING,
+};
+
+/// The item's current generation in `space_id`'s tree, at `index`.
+fn post_at(core: &AppCore, space_id: &str, index: usize) -> eidola_app_core::PostNode {
+    core.runtime()
+        .block_on(core.get_space_tree(space_id.to_string()))
+        .expect("tree")
+        .swap_remove(index)
+}
+
+/// Continue `action_id` on the streaming door, collecting what streamed.
+fn continue_streaming(
+    core: &AppCore,
+    action_id: &str,
+) -> (
+    Result<eidola_app_core::ChatResult, AppError>,
+    String,
+    String,
+) {
+    let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+    core.runtime().block_on(async {
+        let cont = core.continue_stream(action_id.to_string(), tx);
+        let (res, (content, reasoning)) = tokio::join!(cont, collect_deltas(events_rx));
+        (res, content, reasoning)
+    })
+}
+
+/// The request a continuation sends is the request its answer's turn sent,
+/// with that answer as a final partial assistant message the model is asked to
+/// continue — every earlier message byte for byte, the same tools and ceiling,
+/// and the two members vLLM and SGLang read. Held to the shared construction
+/// and to the server's strict request type.
+fn assert_continues(original: &serde_json::Value, continued: &serde_json::Value, field: &str) {
+    let sent = original["messages"].as_array().expect("messages");
+    let messages = continued["messages"].as_array().expect("messages");
+    assert_eq!(
+        &messages[..messages.len() - 1],
+        sent.as_slice(),
+        "the prompt the answer was written to, unchanged"
+    );
+    let partial = messages.last().expect("a final message");
+    assert_eq!(partial["role"], "assistant");
+    assert_eq!(continued["add_generation_prompt"], false);
+    let expected_field = match field {
+        "content" => serde_json::json!(true),
+        other => serde_json::json!(other),
+    };
+    assert_eq!(continued["continue_final_message"], expected_field);
+    assert_eq!(continued["tools"], original["tools"]);
+    assert_eq!(
+        continued["max_completion_tokens"],
+        original["max_completion_tokens"]
+    );
+    let tools = continued["tools"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let stream = continued["stream"] == true;
+    let continuation = match field {
+        "content" => eidola_common::engine_protocol::ContinueField::Content,
+        _ => eidola_common::engine_protocol::ContinueField::ReasoningContent,
+    };
+    assert_eq!(
+        continued,
+        &eidola_common::chat_completion_request_body(
+            MODEL,
+            messages,
+            u32::try_from(continued["max_completion_tokens"].as_u64().unwrap()).unwrap(),
+            tools,
+            stream,
+            continued
+                .get("stream_options")
+                .and_then(|o| o.get("include_usage"))
+                == Some(&serde_json::json!(true)),
+            None,
+            Some(continuation),
+        ),
+        "the shared construction, and nothing else"
+    );
+    eidola_server_gateway::types::test_chat_completion_request_is_accepted(continued.clone())
+        .expect("the server's strict request type accepts a continuation");
+}
+
+/// **The reasoning-only answer, continued**, on the streaming door: the
+/// request ends inside the reasoning (`"reasoning_content"`, the answer so far
+/// empty), the stream opens with the reasoning being continued and then
+/// carries the rest, and what is written is one new generation of the same post
+/// — the reasoning whole, the answer it reached, no longer truncated.
+#[test]
+fn a_reasoning_only_answer_continues_from_inside_its_reasoning() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Reasoning,
+                again: false,
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        assert!(cut.truncated);
+        let cut_id = cut.response_action_id.clone().unwrap();
+
+        let mut rx = core.subscribe_changes();
+        let (res, content, reasoning) = continue_streaming(&core, &cut_id);
+        let res = res.expect("the continuation");
+        assert!(!res.truncated, "the continuation finished");
+        assert_eq!(res.content, CONTINUED_ANSWER);
+        let whole_reasoning = format!("{TRUNCATED_REASONING}{CONTINUED_REASONING}");
+        assert_eq!(
+            reasoning, whole_reasoning,
+            "the stream opens with what it continues"
+        );
+        assert_eq!(content, CONTINUED_ANSWER);
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        assert_continues(&bodies[0], &bodies[1], "reasoning_content");
+        let partial = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(partial["reasoning_content"], TRUNCATED_REASONING);
+        assert_eq!(partial["content"], "");
+
+        let post = post_at(&core, &cut.space_id, 1);
+        assert_ne!(post.action_id, cut_id, "a new generation");
+        assert_eq!(Some(&post.action_id), res.response_action_id.as_ref());
+        assert_eq!(post.generation_count, 2, "of the same post");
+        assert_eq!(block_thinking(&post), whole_reasoning);
+        assert_eq!(block_text(&post), CONTINUED_ANSWER);
+        assert!(!post.truncated && !post.continuable);
+
+        // A paid turn's emissions, like any other.
+        let changes = drain(&mut rx);
+        for expected in [Change::Space(cut.space_id), Change::Wallet, Change::Record] {
+            assert!(changes.contains(&expected), "{expected:?} in {changes:?}");
+        }
+    });
+}
+
+/// **The cut-off answer, continued**, on the blocking door: the request
+/// continues the content (`true`, with the reasoning before it), and the new
+/// generation is the old answer followed by the rest — the rest unstripped,
+/// since its first line is mid-answer.
+#[test]
+fn a_cut_off_answer_continues_where_it_stopped() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Answer,
+                again: false,
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        let cut_id = cut.response_action_id.clone().unwrap();
+        assert_eq!(cut.content, STREAM_CONTENT);
+        assert!(cut.continuable, "the result carries the door's verdict");
+
+        let res = core
+            .runtime()
+            .block_on(core.continue_answer(cut_id.clone()))
+            .expect("the continuation");
+        let whole = format!("{STREAM_CONTENT}{CONTINUED_TAIL}");
+        assert_eq!(res.content, whole, "the continued answer, whole");
+        assert!(!res.truncated);
+
+        let bodies = mock.chat_bodies();
+        assert_continues(&bodies[0], &bodies[1], "content");
+        let partial = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(partial["content"], STREAM_CONTENT);
+        assert_eq!(partial["reasoning_content"], TRUNCATED_REASONING);
+
+        let post = post_at(&core, &cut.space_id, 1);
+        assert_eq!(block_text(&post), whole);
+        assert_eq!(block_thinking(&post), TRUNCATED_REASONING);
+        assert_eq!(post.generation_count, 2);
+    });
+}
+
+/// A continuation can stop at the ceiling too — still before its answer — and
+/// is then continued again, from the whole reasoning so far: each continuation
+/// a generation, each request the one before it extended.
+#[test]
+fn a_continuation_that_stops_again_is_continued_again() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Reasoning,
+                again: true,
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        let cut_id = cut.response_action_id.clone().unwrap();
+
+        let (again, _, _) = continue_streaming(&core, &cut_id);
+        let again = again.expect("the first continuation");
+        assert!(again.truncated, "it stopped at the ceiling again");
+        assert!(again.continuable, "and its result says it can go on");
+        let once = format!("{TRUNCATED_REASONING}{CONTINUED_REASONING}");
+        let post = post_at(&core, &cut.space_id, 1);
+        assert_eq!(block_thinking(&post), once);
+        assert_eq!(block_text(&post), "");
+        assert!(post.truncated && post.continuable, "and can be continued");
+
+        let (done, content, reasoning) = continue_streaming(&core, &post.action_id);
+        let done = done.expect("the second continuation");
+        assert!(!done.truncated);
+        let twice = format!("{once}{CONTINUED_REASONING}");
+        assert_eq!(reasoning, twice);
+        assert_eq!(content, CONTINUED_ANSWER);
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        assert_continues(&bodies[0], &bodies[1], "reasoning_content");
+        assert_continues(&bodies[0], &bodies[2], "reasoning_content");
+        let partial = bodies[2]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(partial["reasoning_content"], once);
+
+        let post = post_at(&core, &cut.space_id, 1);
+        assert_eq!(post.generation_count, 3);
+        assert_eq!(block_thinking(&post), twice);
+        assert_eq!(block_text(&post), CONTINUED_ANSWER);
+    });
+}
+
+/// A continuation that calls a tool: the round that answered the continuation
+/// is a tool round whose narration is the continued reasoning, and the request
+/// after it is an **ordinary** one — the partial message replaced by the call,
+/// as any tool round replays it, and no continuation members — whose answer is
+/// the post's new generation.
+#[test]
+fn a_continuation_that_calls_a_tool_continues_as_a_tool_round() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueIntoToolRound,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        with_echo_tool(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("Echo something.".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        assert!(cut.truncated);
+        let cut_id = cut.response_action_id.clone().unwrap();
+
+        let (res, content, _) = continue_streaming(&core, &cut_id);
+        let res = res.expect("the continuation");
+        assert_eq!(res.content, TOOL_FINAL_CONTENT);
+        assert!(content.ends_with(TOOL_FINAL_CONTENT));
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.len(),
+            3,
+            "the cut, the continuation, the round after it"
+        );
+        assert_continues(&bodies[0], &bodies[1], "reasoning_content");
+        let after = &bodies[2];
+        assert!(after.get("continue_final_message").is_none());
+        assert!(after.get("add_generation_prompt").is_none());
+        let sent = bodies[0]["messages"].as_array().unwrap();
+        let messages = after["messages"].as_array().unwrap();
+        assert_eq!(&messages[..sent.len()], sent.as_slice());
+        assert_eq!(messages.len(), sent.len() + 2, "the call and its result");
+        assert_eq!(messages[sent.len()]["role"], "assistant");
+        assert!(messages[sent.len()].get("tool_calls").is_some());
+        assert!(
+            messages[sent.len()].get("reasoning_content").is_none(),
+            "the partial message is gone"
+        );
+        assert_eq!(messages[sent.len() + 1]["role"], "tool");
+
+        // The round's trace carries the continued narration.
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(cut.space_id.clone()))
+            .expect("raw actions");
+        let round = actions
+            .iter()
+            .find(|a| a.action_type == "tool_call")
+            .expect("the continued round's trace");
+        let narration: String = round
+            .blocks
+            .iter()
+            .filter(|b| b.block_type == "thinking")
+            .filter_map(|b| b.text_content.clone())
+            .collect();
+        assert_eq!(narration, TRUNCATED_REASONING);
+
+        let post = post_at(&core, &cut.space_id, 1);
+        assert_eq!(block_text(&post), TOOL_FINAL_CONTENT);
+        assert_eq!(post.generation_count, 2);
+    });
+}
+
+/// **A continuation sends the request its answer was written to**, not the
+/// conversation as it stands now. The question is edited after the answer was
+/// cut off; continuing the answer still sends the original question, byte for
+/// byte — the model finishes the answer it was writing, to the prompt it was
+/// writing it to, and the engine's cached prefix for that request still
+/// applies. The edited question belongs to a fresh answer (a regeneration).
+#[test]
+fn a_continuation_sends_the_request_its_answer_was_written_to() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Answer,
+                again: false,
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        let question = post_at(&core, &cut.space_id, 0).action_id;
+        core.runtime()
+            .block_on(core.edit_post(question, "Why is the sky blue?".into()))
+            .expect("edit the question after the cut");
+        let answer = post_at(&core, &cut.space_id, 1);
+        assert!(
+            answer.continuable,
+            "an edited question does not take the verb away"
+        );
+
+        core.runtime()
+            .block_on(core.continue_answer(answer.action_id))
+            .expect("the continuation");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        assert_continues(&bodies[0], &bodies[1], "content");
+        let sent = bodies[1].to_string();
+        assert!(sent.contains("How do tides work?"), "the original question");
+        assert!(!sent.contains("Why is the sky blue?"), "never the edit");
+    });
+}
+
+/// **Continue is offered exactly while the door would take it**: the author
+/// still answers in this space, with the model that wrote the answer. Change
+/// the author's model, or take the author out of the space, and the post stops
+/// being continuable — and the door refuses it before anything is sent.
+#[test]
+fn continue_is_offered_only_while_its_author_can_continue() {
+    for change in ["model", "membership"] {
+        run(move || {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: ChatBehavior::ContinueAfterLength {
+                    cut: Cut::Reasoning,
+                    again: false,
+                },
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            let cut = core
+                .runtime()
+                .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+                .expect("the cut-off turn");
+            let answer = post_at(&core, &cut.space_id, 1);
+            assert!(
+                answer.continuable,
+                "{change}: continuable before the change"
+            );
+            let author = core
+                .runtime()
+                .block_on(core.test_space_actions(cut.space_id.clone()))
+                .expect("raw actions")
+                .into_iter()
+                .find(|a| a.id == answer.action_id)
+                .expect("the answer")
+                .participant_id;
+            match change {
+                "model" => core
+                    .runtime()
+                    .block_on(core.update_space_participant(
+                        author,
+                        eidola_app_core::ParticipantUpdate {
+                            label: None,
+                            model_ref: Some(Some("another-model".into())),
+                            system_prompt: None,
+                            notify_policy: None,
+                        },
+                        eidola_app_core::ExpectedScope::Any,
+                    ))
+                    .expect("change the author's model"),
+                _ => {
+                    core.runtime()
+                        .block_on(core.remove_space_participant(cut.space_id.clone(), author))
+                        .expect("take the author out of the space");
+                }
+            }
+            let answer = post_at(&core, &cut.space_id, 1);
+            assert!(!answer.continuable, "{change}: no longer offered");
+            let hits = mock.chat_hits();
+            let (refused, _, _) = continue_streaming(&core, &answer.action_id);
+            assert!(
+                matches!(refused, Err(AppError::WrongPostKind { .. })),
+                "{change}: the door refuses it as what it is; got {refused:?}"
+            );
+            assert_eq!(mock.chat_hits(), hits, "{change}: nothing was sent");
+        });
+    }
+}
+
+/// An answer whose request the Record could not keep whole (past its retention
+/// cap) has no request to continue from, so it is not continuable — offered
+/// nowhere, refused at the door — rather than continued from a rebuilt prompt.
+#[test]
+fn an_answer_whose_request_the_record_cut_is_not_continuable() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Answer,
+                again: false,
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let long = "tide ".repeat((1 << 20) / 5 + 1024);
+        let cut = core
+            .runtime()
+            .block_on(core.chat(long, MODEL.into(), None))
+            .expect("the cut-off turn");
+        assert!(cut.truncated);
+        assert!(
+            !cut.continuable,
+            "the result says so too, so a caller suggests no continuation"
+        );
+        let answer = post_at(&core, &cut.space_id, 1);
+        assert!(answer.truncated && !answer.continuable);
+        let hits = mock.chat_hits();
+        let refused = core
+            .runtime()
+            .block_on(core.continue_answer(answer.action_id));
+        assert!(
+            matches!(refused, Err(AppError::WrongPostKind { .. })),
+            "got {refused:?}"
+        );
+        assert_eq!(mock.chat_hits(), hits);
+    });
+}
+
+/// **Continue is offered only where the stored text is exactly what the model
+/// generated.** An engine that cut the answer off inside something its parser
+/// drops (an unfinished tool call) says so (`continuable: false`): the answer is
+/// still written and marked, but not continuable — offered nowhere, refused at
+/// the door — on both transports, since continuing it would resume before the
+/// dropped text rather than where generation stopped.
+#[test]
+fn an_answer_cut_inside_what_the_engine_dropped_is_not_continuable() {
+    for streamed in [false, true] {
+        run(move || {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: ChatBehavior::ContinueAfterLength {
+                    cut: Cut::Dropped,
+                    again: false,
+                },
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            let cut = if streamed {
+                let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+                core.runtime().block_on(async {
+                    let chat =
+                        core.chat_stream("How do tides work?".into(), MODEL.into(), None, tx);
+                    let (res, _) = tokio::join!(chat, collect_deltas(events_rx));
+                    res
+                })
+            } else {
+                core.runtime()
+                    .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            }
+            .expect("the cut-off turn");
+            assert!(cut.truncated, "streamed {streamed}");
+            assert!(!cut.continuable, "streamed {streamed}");
+            let answer = post_at(&core, &cut.space_id, 1);
+            assert!(
+                answer.truncated && !answer.continuable,
+                "streamed {streamed}"
+            );
+            let hits = mock.chat_hits();
+            let refused = core
+                .runtime()
+                .block_on(core.continue_answer(answer.action_id));
+            assert!(
+                matches!(refused, Err(AppError::WrongPostKind { .. })),
+                "streamed {streamed}: got {refused:?}"
+            );
+            assert_eq!(mock.chat_hits(), hits, "nothing was sent");
+        });
+    }
+}
+
+/// A header-shaped first line this app strips from an answer makes the stored
+/// text differ from what was generated, so that answer is not continuable
+/// either, whatever the engine said of its own output.
+#[test]
+fn an_answer_whose_header_line_was_stripped_is_not_continuable() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::HeaderThenLength,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        assert!(cut.truncated && !cut.continuable);
+        assert!(!post_at(&core, &cut.space_id, 1).continuable);
+    });
+}
+
+/// The door refuses what it cannot continue **before anything is spent**: an
+/// answer that finished, and a post that is not an agent's answer at all. No
+/// request goes out, nothing is written, no credential moves.
+#[test]
+fn only_an_answer_that_stopped_at_its_ceiling_can_be_continued() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        let res = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(res.space_id.clone()))
+            .expect("tree");
+        assert!(tree.iter().all(|p| !p.continuable));
+        let hits = mock.chat_hits();
+        let mut rx = core.subscribe_changes();
+
+        for target in [tree[1].action_id.clone(), tree[0].action_id.clone()] {
+            let (refused, _, _) = continue_streaming(&core, &target);
+            assert!(
+                matches!(refused, Err(AppError::WrongPostKind { .. })),
+                "got {refused:?}"
+            );
+            let refused = core.runtime().block_on(core.continue_answer(target));
+            assert!(
+                matches!(refused, Err(AppError::WrongPostKind { .. })),
+                "got {refused:?}"
+            );
+        }
+        assert_eq!(mock.chat_hits(), hits, "no request went out");
+        let after = core
+            .runtime()
+            .block_on(core.get_space_tree(res.space_id))
+            .expect("tree");
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[1].generation_count, 1, "nothing was written");
+        let changes = drain(&mut rx);
+        assert!(!changes.contains(&Change::Wallet), "got {changes:?}");
+    });
+}
+
+/// A continuation is paid like any turn: its own hold, sized by the shared
+/// pricing contract over what it sends — the partial message's reasoning
+/// included — at the same completion ceiling, and settled.
+#[test]
+fn a_continuation_is_held_over_what_it_sends() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Answer,
+                again: false,
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        core.runtime()
+            .block_on(core.continue_answer(cut.response_action_id.unwrap()))
+            .expect("the continuation");
+
+        let bodies = mock.chat_bodies();
+        let charges = mock.chat_charges();
+        assert_eq!(charges.len(), 2, "each request held its own credential");
+        // The harness's rates are 1 credit a prompt token and 1 a completion
+        // token, so a hold is the contract's prompt tokens plus the ceiling.
+        for (body, charge) in bodies.iter().zip(&charges) {
+            let messages = body["messages"].as_array().unwrap();
+            let prompt = eidola_common::prompt_charge(messages, None).chargeable_prompt_tokens();
+            let ceiling = body["max_completion_tokens"].as_u64().unwrap();
+            assert_eq!(
+                *charge,
+                Some(chat_harness::REQUEST_FEE + u128::from(prompt + ceiling)),
+                "{body}"
+            );
+        }
+        let partial = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let without_reasoning = {
+            let mut m = partial.clone();
+            m.as_object_mut().unwrap().remove("reasoning_content");
+            m
+        };
+        assert!(
+            eidola_common::prompt_charge(std::slice::from_ref(&partial), None)
+                .total_content_bytes()
+                > eidola_common::prompt_charge(&[without_reasoning], None).total_content_bytes(),
+            "the reasoning it sends is charged"
+        );
+    });
+}
+
+/// The completion ceiling is the model's own declared output limit when its
+/// catalog row declares one, rather than a fixed 4096, and the hold covers it.
+/// Undeclared, it stays at the fallback, which the truncating behaviours
+/// report as the budget spent ([`CEILING_TOKENS`]).
+#[test]
+fn the_ceiling_is_the_models_declared_output_limit() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            declared_max_output: Some(6_000),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat");
+        let body = mock.chat_bodies().pop().unwrap();
+        assert_eq!(body["max_completion_tokens"], 6_000);
+
+        // The catalog's context window bounds it.
+        let (mock, core, _dir) = setup(MockConfig {
+            declared_max_output: Some(100_000),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat");
+        assert_eq!(
+            mock.chat_bodies().pop().unwrap()["max_completion_tokens"],
+            8192
+        );
+
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("chat");
+        assert_eq!(
+            mock.chat_bodies().pop().unwrap()["max_completion_tokens"],
+            CEILING_TOKENS
+        );
+    });
+}
+
+// ===========================================================================
+// The ceiling ladder and automatic continuation
+//
+// An Eidola turn asks for a rung of a public ladder (8,192 doubling up to the
+// model's declared limit), chosen from the request and the model's published
+// prices; an answer that stops at its ceiling, exactly continuable, is
+// continued at once with the request that began it plus the answer so far,
+// until it ends or reaches the declared limit, and written as one generation.
+// The mock refuses any hold but its own worst case, so every test here also
+// checks each request's hold is the one its rung prices.
+// ===========================================================================
+
+/// A catalog whose model declares `limit` output tokens inside a window wide
+/// enough for every rung.
+fn ladder_config(chat: ChatBehavior, limit: u64) -> MockConfig {
+    MockConfig {
+        chat,
+        declared_max_output: Some(limit),
+        context_length: Some(262_144),
+        ..MockConfig::default()
+    }
+}
+
+fn ladder_setup(chat: ChatBehavior, limit: u64) -> (MockServer, AppCore, tempfile::TempDir) {
+    let (mock, core, dir) = setup(ladder_config(chat, limit));
+    with_account(&core);
+    (mock, core, dir)
+}
+
+/// A turn on either transport, with what a streaming caller accumulated
+/// (empty for a blocking one).
+fn ladder_turn(
+    core: &AppCore,
+    prompt: &str,
+    streaming: bool,
+) -> (
+    Result<eidola_app_core::ChatResult, AppError>,
+    String,
+    String,
+) {
+    if !streaming {
+        let result = core
+            .runtime()
+            .block_on(core.chat(prompt.to_string(), MODEL.into(), None));
+        return (result, String::new(), String::new());
+    }
+    let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+    core.runtime().block_on(async {
+        let ask = core.chat_stream_reply(prompt.to_string(), MODEL.into(), None, None, tx);
+        let (res, (content, reasoning)) = tokio::join!(ask, collect_deltas(events_rx));
+        (res, content, reasoning)
+    })
+}
+
+fn ceilings(bodies: &[serde_json::Value]) -> Vec<u64> {
+    bodies
+        .iter()
+        .map(|b| b["max_completion_tokens"].as_u64().expect("a ceiling"))
+        .collect()
+}
+
+/// The first `n` parts of a [`ChatBehavior::LongAnswer`], joined.
+fn long_answer(n: u64) -> String {
+    (1..=n).map(chat_harness::long_part).collect()
+}
+
+/// `continued` is `first` — the request that began the answer — with the
+/// answer so far as its final partial message, continued in its content.
+fn assert_continues_the_answer(
+    first: &serde_json::Value,
+    continued: &serde_json::Value,
+    so_far: &str,
+) {
+    let sent = first["messages"].as_array().expect("messages");
+    let messages = continued["messages"].as_array().expect("messages");
+    assert_eq!(&messages[..messages.len() - 1], sent.as_slice());
+    let partial = messages.last().expect("a partial message");
+    assert_eq!(partial["role"], "assistant");
+    assert_eq!(partial["content"], so_far);
+    assert_eq!(partial["reasoning_content"], chat_harness::LONG_REASONING);
+    assert_eq!(continued["continue_final_message"], true);
+    assert_eq!(continued["add_generation_prompt"], false);
+    assert_eq!(continued["tools"], first["tools"]);
+}
+
+/// The inference generations of a space, oldest first.
+fn inferences(core: &AppCore, space_id: &str) -> Vec<eidola_app_core::PostNode> {
+    core.runtime()
+        .block_on(core.get_space_tree(space_id.to_string()))
+        .expect("tree")
+        .into_iter()
+        .filter(|n| n.action_type == "inference")
+        .collect()
+}
+
+/// **An answer longer than its ceiling is continued to its end and written
+/// once**, on both transports: four requests, the rungs doubling with what the
+/// answer has generated, each continuation the request that began the answer
+/// plus the answer so far, one generation holding the whole answer with every
+/// request attached to it, and a streaming caller holding exactly that text.
+#[test]
+fn an_answer_longer_than_its_ceiling_is_continued_to_its_end_and_written_once() {
+    for streaming in [false, true] {
+        run(move || {
+            let (mock, core, _dir) = ladder_setup(
+                ChatBehavior::LongAnswer {
+                    requests: 4,
+                    fail_at: None,
+                },
+                131_072,
+            );
+            let (result, content, reasoning) = ladder_turn(&core, "Tell me everything.", streaming);
+            let result = result.expect("the turn");
+            let whole = long_answer(4);
+            assert_eq!(result.content, whole);
+            assert!(!result.truncated, "the answer ended");
+            if streaming {
+                assert_eq!(content, whole, "the caller's stream is seamless");
+                assert_eq!(reasoning, chat_harness::LONG_REASONING);
+            }
+
+            let bodies = mock.chat_bodies();
+            assert_eq!(
+                ceilings(&bodies),
+                [8_192, 8_192, 16_384, 32_768],
+                "the rungs double with what was generated"
+            );
+            assert!(bodies[0].get("continue_final_message").is_none());
+            for (k, body) in bodies.iter().enumerate().skip(1) {
+                assert_continues_the_answer(&bodies[0], body, &long_answer(k as u64));
+            }
+            assert_eq!(mock.hold_mismatches(), 0, "each hold is its rung's");
+            assert_eq!(
+                result.output_tokens,
+                Some(8_192 + 8_192 + 16_384 + 5),
+                "the answer's output is every request's"
+            );
+
+            let written = inferences(&core, &result.space_id);
+            assert_eq!(written.len(), 1, "one generation");
+            assert_eq!(block_text(&written[0]), whole);
+            assert_eq!(block_thinking(&written[0]), chat_harness::LONG_REASONING);
+            assert!(!written[0].truncated);
+            let rows = completion_rows(&core);
+            assert_eq!(rows.len(), 4);
+            for row in &rows {
+                assert_eq!(
+                    request_detail(&core, &row.id).action_id,
+                    result.response_action_id,
+                    "every request of the answer is attached to it"
+                );
+            }
+            let actions = core
+                .runtime()
+                .block_on(core.test_space_actions(result.space_id.clone()))
+                .expect("actions");
+            let inference = actions
+                .iter()
+                .find(|a| a.action_type == "inference")
+                .expect("the inference");
+            let charges: u128 = mock.chat_charges().iter().map(|c| c.expect("a hold")).sum();
+            assert_eq!(
+                inference.credits_consumed,
+                Some(charges as i64),
+                "the generation carries every request's hold"
+            );
+            assert!(spending_credentials(&core).is_empty());
+        });
+    }
+}
+
+/// **A deep context starts on a higher rung**: the first rung whose price at
+/// the completion rate covers reading the prompt again — at the prompt rate
+/// for a model that sells no cached rate, at the cached rate for one that does.
+#[test]
+fn a_deep_context_starts_on_a_higher_rung() {
+    let prompt = "the tide rises and falls twice a day. ".repeat(1_000);
+    let rung_for = |read: u64| {
+        [8_192u64, 16_384, 32_768, 65_536, 131_072]
+            .into_iter()
+            .find(|&r| r >= read)
+            .unwrap_or(131_072)
+    };
+    let p = prompt.clone();
+    run(move || {
+        let (mock, core, _dir) = ladder_setup(ChatBehavior::OkEitherTransport, 131_072);
+        core.runtime()
+            .block_on(core.chat(p, MODEL.into(), None))
+            .expect("the turn");
+        let body = mock.chat_bodies().pop().unwrap();
+        let read = contract_prompt_tokens(&body);
+        assert!(read > 16_384, "a deep context: {read}");
+        assert_eq!(body["max_completion_tokens"].as_u64(), Some(rung_for(read)));
+        assert!(body["max_completion_tokens"].as_u64().unwrap() > 16_384);
+        assert_eq!(mock.hold_mismatches(), 0);
+    });
+    run(move || {
+        let (mock, core, _dir) = setup(MockConfig {
+            cached_prompt_price: Some(CACHED_RATE),
+            ..ladder_config(ChatBehavior::OkEitherTransport, 131_072)
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat(prompt, MODEL.into(), None))
+            .expect("the turn");
+        let body = mock.chat_bodies().pop().unwrap();
+        let read = contract_prompt_tokens(&body);
+        // A quarter of a credit a token: the same prompt reads for a quarter.
+        assert_eq!(
+            body["max_completion_tokens"].as_u64(),
+            Some(rung_for(read.div_ceil(4)))
+        );
+        assert_eq!(mock.hold_mismatches(), 0);
+    });
+}
+
+/// **An answer never runs past the model's declared limit**: the last
+/// continuation asks for what remains, the requests' ceilings sum to the
+/// limit, and an answer that reaches it is written truncated and left for the
+/// reader to continue, as an answer that reached its ceiling always was.
+#[test]
+fn an_answer_never_runs_past_the_declared_limit() {
+    run(|| {
+        let (mock, core, _dir) = ladder_setup(
+            ChatBehavior::LongAnswer {
+                requests: 100,
+                fail_at: None,
+            },
+            40_000,
+        );
+        let (result, _, _) = ladder_turn(&core, "Never stop.", false);
+        let result = result.expect("the turn");
+        let bodies = mock.chat_bodies();
+        assert_eq!(ceilings(&bodies), [8_192, 8_192, 16_384, 7_232]);
+        assert_eq!(ceilings(&bodies).iter().sum::<u64>(), 40_000);
+        assert!(result.truncated, "it stopped at the limit");
+        assert!(result.continuable, "and the reader may continue it");
+        assert_eq!(result.content, long_answer(4));
+        assert_eq!(inferences(&core, &result.space_id).len(), 1);
+        assert_eq!(mock.hold_mismatches(), 0);
+    });
+}
+
+/// **A continuation that fails loses nothing**, on both transports: the answer
+/// so far is written as it stood, at its ceiling and continuable by the
+/// reader; every hold settles; the failed request's row is attached to
+/// nothing. Continuing it then picks up where it stopped.
+#[test]
+fn a_continuation_that_fails_leaves_the_answer_written_and_continuable() {
+    for streaming in [false, true] {
+        run(move || {
+            let (mock, core, _dir) = ladder_setup(
+                ChatBehavior::LongAnswer {
+                    requests: 3,
+                    fail_at: Some(2),
+                },
+                131_072,
+            );
+            let (result, content, _) = ladder_turn(&core, "Tell me everything.", streaming);
+            let result = result.expect("the turn ends as a ceiling ending does");
+            assert_eq!(result.content, long_answer(1));
+            if streaming {
+                assert_eq!(content, long_answer(1));
+            }
+            assert!(result.truncated && result.continuable);
+            assert_eq!(mock.chat_bodies().len(), 2);
+            let written = inferences(&core, &result.space_id);
+            assert_eq!(written.len(), 1);
+            assert!(written[0].truncated && written[0].continuable);
+            let rows = completion_rows(&core);
+            let attached: Vec<Option<String>> = rows
+                .iter()
+                .map(|r| request_detail(&core, &r.id).action_id)
+                .collect();
+            assert_eq!(
+                attached.iter().filter(|a| a.is_some()).count(),
+                1,
+                "the answered request is the generation's, the failed one nobody's: {attached:?}"
+            );
+            assert!(spending_credentials(&core).is_empty(), "nothing held");
+            assert_eq!(mock.hold_mismatches(), 0);
+
+            let (res, _, _) = continue_streaming(&core, &result.response_action_id.unwrap());
+            let continued = res.expect("the reader continues it");
+            assert_eq!(continued.content, long_answer(3));
+            assert!(!continued.truncated);
+        });
+    }
+}
+
+/// **A continuation that cannot be paid loses nothing**: a per-turn budget
+/// the first request fits and its continuation (a longer prompt at the same
+/// rung) does not ends the turn with the answer written as it stood.
+#[test]
+fn a_continuation_the_budget_cannot_pay_leaves_the_answer_written() {
+    run(|| {
+        let config = || {
+            ladder_config(
+                ChatBehavior::LongAnswer {
+                    requests: 2,
+                    fail_at: None,
+                },
+                131_072,
+            )
+        };
+        // Learn the first request's hold.
+        let (mock, core, _dir) = setup(config());
+        with_account(&core);
+        core.runtime()
+            .block_on(core.test_chat_with_budget("budget me".into(), MODEL.into(), None, i64::MAX))
+            .expect("probe");
+        let first_hold = mock.chat_charges()[0].expect("a hold") as i64;
+        assert!(mock.chat_charges()[1].expect("a hold") as i64 > first_hold);
+
+        let (mock, core, _dir) = setup(config());
+        with_account(&core);
+        let result = core
+            .runtime()
+            .block_on(core.test_chat_with_budget(
+                "budget me".into(),
+                MODEL.into(),
+                None,
+                first_hold,
+            ))
+            .expect("the turn ends as a ceiling ending does");
+        assert_eq!(
+            mock.chat_bodies().len(),
+            1,
+            "the continuation was never sent"
+        );
+        assert_eq!(result.content, long_answer(1));
+        assert!(result.truncated && result.continuable);
+        assert_eq!(inferences(&core, &result.space_id).len(), 1);
+        assert!(spending_credentials(&core).is_empty());
+    });
+}
+
+/// **A continuation may end in tool calls**: the continued text is the tool
+/// round's narration, and the request after the tool round is an ordinary
+/// one, a new answer on the first rung, declaring the anchor that began the
+/// round.
+#[test]
+fn an_automatic_continuation_may_end_in_a_tool_round() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            cached_prompt_price: Some(CACHED_RATE),
+            engine_prompt_tokens: Some(0),
+            ..ladder_config(ChatBehavior::ContinueIntoToolRound, 131_072)
+        });
+        with_account(&core);
+        core.register_tool(std::sync::Arc::new(EchoTool))
+            .expect("echo is not reserved");
+        let result = turn(&core, &long_prompt("use the tool"), None, None);
+        assert_eq!(result.content, chat_harness::TOOL_FINAL_CONTENT);
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(bodies[1]["continue_final_message"], "reasoning_content");
+        assert!(bodies[2].get("continue_final_message").is_none());
+        assert_eq!(ceilings(&bodies), [8_192, 8_192, 8_192]);
+        let anchor = declared_prefix(&bodies[1]).expect("the continuation declares");
+        let after = declared_prefix(&bodies[2]).expect("the tool round's follow-up declares");
+        assert_eq!(anchor.0, after.0, "the anchor that began the round");
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(result.space_id.clone()))
+            .expect("actions");
+        let call = actions
+            .iter()
+            .find(|a| a.action_type == "tool_call")
+            .expect("the tool round");
+        assert!(
+            call.blocks.iter().any(|b| b.block_type == "thinking"
+                && b.text_content.as_deref() == Some(chat_harness::TRUNCATED_REASONING)),
+            "the answer it continued narrates the round: {:?}",
+            call.blocks
+        );
+        assert_declarations_exact(&mock);
+    });
+}
+
+/// An automatic continuation declares the anchor that began its answer, every
+/// continuation the same one, and so does the next turn.
+#[test]
+fn an_automatic_continuation_declares_its_anchor() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            cached_prompt_price: Some(CACHED_RATE),
+            engine_prompt_tokens: Some(0),
+            ..ladder_config(
+                ChatBehavior::LongAnswer {
+                    requests: 3,
+                    fail_at: None,
+                },
+                131_072,
+            )
+        });
+        with_account(&core);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        assert_eq!(first.content, long_answer(3));
+        turn(&core, "And then?", Some(first.space_id), None);
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 4);
+        assert_eq!(declared_prefix(&bodies[0]), None);
+        let anchor = declared_prefix(&bodies[1]).expect("a declaration").0;
+        for body in &bodies[2..] {
+            assert_eq!(declared_prefix(body).expect("a declaration").0, anchor);
+        }
+        assert_declarations_exact(&mock);
+        assert_eq!(mock.declared_refusals(), 0);
+    });
+}
+
+/// A refused declaration on a continuation is sent once more undeclared, as
+/// any request's is, and the answer goes on.
+#[test]
+fn a_refused_continuation_is_sent_once_more_undeclared() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            cached_prompt_price: Some(CACHED_RATE),
+            engine_prompt_tokens: Some(0),
+            ..ladder_config(
+                ChatBehavior::LongAnswer {
+                    requests: 2,
+                    fail_at: None,
+                },
+                131_072,
+            )
+        });
+        with_account(&core);
+        // The first request has nothing to declare; the next declared one is
+        // the continuation.
+        mock.refuse_next_declared("cached_prefix_missing");
+        let result = turn(&core, &long_prompt("one"), None, None);
+        assert_eq!(result.content, long_answer(2));
+        assert!(!result.truncated);
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        assert!(declared_prefix(&bodies[1]).is_some());
+        assert_eq!(declared_prefix(&bodies[2]), None, "resent undeclared");
+        assert_eq!(bodies[1]["messages"], bodies[2]["messages"]);
+        assert_eq!(mock.declared_refusals(), 1);
+        assert_eq!(inferences(&core, &result.space_id).len(), 1);
+        assert!(spending_credentials(&core).is_empty());
+        assert_eq!(mock.hold_mismatches(), 0);
+    });
+}
+
+/// **A delegated room's turns are continued the same way**: the door the
+/// sub-space driver drives turns through (`respond_stream_as`) continues an
+/// answer that stops at its ceiling, under the same bound.
+#[test]
+fn a_driven_turns_answer_is_continued_too() {
+    run(|| {
+        let (mock, core, _dir) = ladder_setup(
+            ChatBehavior::LongAnswer {
+                requests: 2,
+                fail_at: None,
+            },
+            131_072,
+        );
+        let space = core
+            .runtime()
+            .block_on(core.post_reply("A question.".into(), None, None))
+            .expect("post");
+        let ada = core
+            .runtime()
+            .block_on(core.add_space_participant(
+                space.space_id.clone(),
+                eidola_app_core::NewParticipant {
+                    label: "Ada".into(),
+                    model_ref: Some(MODEL.into()),
+                    system_prompt: None,
+                    notify_policy: "explicit".into(),
+                },
+            ))
+            .expect("add agent");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let result = core
+            .runtime()
+            .block_on(core.respond_stream_as(space.space_id.clone(), ada.id, space.action_id, tx))
+            .expect("Ada answers");
+        assert_eq!(result.content, long_answer(2));
+        assert_eq!(ceilings(&mock.chat_bodies()), [8_192, 8_192]);
+    });
+}
+
+/// **Every other backend keeps its ceiling**: an answer from an external
+/// backend that stops at its ceiling is written truncated after one request
+/// asking for the whole limit, and is not continued.
+#[test]
+fn a_turn_on_another_backend_is_neither_laddered_nor_continued() {
+    run(|| {
+        let (mock, core, _dir) = setup(ladder_config(
+            ChatBehavior::LongAnswer {
+                requests: 3,
+                fail_at: None,
+            },
+            131_072,
+        ));
+        external_backend(&core, &mock.base_url);
+        let result = core
+            .runtime()
+            .block_on(core.chat("hi".into(), "qwen3-8b@ext".into(), None))
+            .expect("the turn completes");
+        assert!(result.truncated);
+        assert!(
+            !result.continuable,
+            "only an Eidola answer can be continued"
+        );
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 1, "not continued");
+        assert_eq!(
+            bodies[0]["max_completion_tokens"].as_u64(),
+            Some(chat_harness::CEILING_TOKENS as u64),
+            "the fallback ceiling, as before"
+        );
+    });
+}
+
+// ===========================================================================
+// Streaming regeneration
+// ===========================================================================
+
+/// The streaming regeneration door is the blocking one's twin, not a second
+/// implementation: `stream: true` on the wire, `Revise` context (the generation
+/// being replaced is withheld), and exactly one successor generation.
+#[test]
+fn streaming_regeneration_revises_in_place_and_streams_its_deltas() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let u1_item = tree[0].item_id.clone();
+        let answer = tree[1].action_id.clone();
+
+        let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (res, content, reasoning) = core.runtime().block_on(async {
+            let regen = core.regenerate_stream(answer.clone(), MODEL.into(), tx);
+            let (res, (content, reasoning)) = tokio::join!(regen, collect_deltas(events_rx));
+            (res, content, reasoning)
+        });
+        let res = res.expect("streaming regenerate");
+
+        // The deltas arrived — the whole point of the door.
+        assert_eq!(content, "Hello from the stream.");
+        assert_eq!(reasoning, "thinking…");
+        assert_eq!(res.content, "Hello from the stream.");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2, "one chat + one regenerate");
+        assert_eq!(
+            bodies[1].get("stream").and_then(|s| s.as_bool()),
+            Some(true),
+            "the streaming door must ask for a stream"
+        );
+
+        // `Revise` context: the upstream question only. The generation being
+        // replaced is withheld, so the model does not read its own last try.
+        let stamps = Stamps::of(&core, &first.space_id);
+        assert_eq!(
+            flat_messages(&bodies[1]),
+            vec![
+                (
+                    "system".to_string(),
+                    system_message(Some(SEEDED_SYSTEM_PROMPT), DEFAULT_AGENT_LABEL)
+                ),
+                (
+                    "user".to_string(),
+                    stamps.headed(&u1_item, HUMAN_LABEL, "How do tides work?")
+                )
+            ],
+        );
+
+        // Exactly one successor generation of the same item — a new version of
+        // the answer, never a reply branch.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        assert_eq!(tree.len(), 2, "still one question and one answer");
+        assert_eq!(tree[1].item_id, tree[1].item_id, "same item");
+        assert_eq!(tree[1].generation_count, 2, "the answer has two versions");
+        assert_eq!(
+            tree[1].action_id,
+            res.response_action_id.expect("a successor generation"),
+        );
+    });
+}
+
+/// Two regenerations of one post cannot both spend. The claim is process-wide
+/// and lives with the running turn, not with whoever asked for it — so a second
+/// ask is refused **before** the credential, which is the only place refusing
+/// costs nothing (the durable single-successor index rejects the loser only
+/// after both have paid).
+#[test]
+fn a_second_regeneration_of_one_post_is_refused_before_it_spends() {
+    run(|| {
+        // The mock holds each answer, so the first regeneration is provably
+        // still running when the second asks — the state the guard is about.
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            chat_delay_ms: 2_000,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let answer = tree[1].action_id.clone();
+        let before = mock.chat_hits();
+
+        // The first regeneration's consumer drops its receiver immediately —
+        // the window closed — while the turn itself runs on. The second ask
+        // must still meet the claim.
+        let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (first_res, second_res) = core.runtime().block_on(async {
+            let a = core.regenerate_stream(answer.clone(), MODEL.into(), tx1);
+            let b = async {
+                // Let the first claim its item before the second asks. The
+                // held response keeps it claimed until well after this.
+                until_upstream_reached(&mock, before).await;
+                core.regenerate_stream(answer.clone(), MODEL.into(), tx2)
+                    .await
+            };
+            let (a, b, _, _) = tokio::join!(a, b, collect_deltas(rx1), collect_deltas(rx2));
+            (a, b)
+        });
+
+        first_res.expect("the first regeneration runs");
+        let err = second_res.expect_err("the second must be refused");
+        assert!(
+            matches!(err, AppError::RegenerationInFlight { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            mock.chat_hits() - before,
+            1,
+            "the refused ask sent no model request"
+        );
+
+        // One successor, one spend — not two of either.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        assert_eq!(tree[1].generation_count, 2);
+    });
+}
+
+/// The claim is released when the turn ends, whichever way it ended — so a
+/// refused-then-retried regeneration is an ordinary regeneration.
+#[test]
+fn a_finished_regeneration_releases_its_claim() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let answer = tree[1].action_id.clone();
+
+        for _ in 0..2 {
+            let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+            core.runtime()
+                .block_on(async {
+                    let regen = core.regenerate_stream(answer.clone(), MODEL.into(), tx);
+                    let (res, _) = tokio::join!(regen, collect_deltas(events_rx));
+                    res
+                })
+                .expect("a released claim lets the next regeneration through");
+        }
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        assert_eq!(tree[1].generation_count, 3, "two regenerations landed");
+    });
+}
+
+/// The claim is only worth what it covers, and **the tip is inside it**.
+///
+/// A regeneration that resolved the post's current generation *before* claiming
+/// can be overtaken between the two: the winner commits its successor and
+/// releases the item, and the loser then claims a free item and carries a tip
+/// that has already been superseded — acquiring and spending a credential on a
+/// turn whose successor `idx_one_successor_per_action` is certain to refuse.
+/// Reading the tip under the claim makes that unrepresentable: the caller that
+/// waited revises whatever is there when its turn comes.
+///
+/// Staged rather than raced — `test_open_regeneration_claim_window` stops the
+/// first regeneration in exactly the window the ordering is about.
+#[test]
+fn a_regeneration_that_waited_for_the_claim_revises_the_generation_it_finds() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let answer = tree[1].action_id.clone();
+        let before = mock.chat_hits();
+
+        let mut window = core.test_open_regeneration_claim_window();
+        let (waited, overtaker_tip) = std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+                core.runtime().block_on(async {
+                    let regen = core.regenerate_stream(answer.clone(), MODEL.into(), tx);
+                    let (res, _) = tokio::join!(regen, collect_deltas(events_rx));
+                    res
+                })
+            });
+            let resume = core
+                .runtime()
+                .block_on(window.recv())
+                .expect("the first regeneration reaches the claim window");
+            // Closing the window lets every later regeneration run straight
+            // through it — only the first one is being staged.
+            drop(window);
+
+            // The overtaker claims the free item, commits a new generation and
+            // releases it, all while the first is still holding here.
+            let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+            let overtaker = core
+                .runtime()
+                .block_on(async {
+                    let regen = core.regenerate_stream(answer.clone(), MODEL.into(), tx);
+                    let (res, _) = tokio::join!(regen, collect_deltas(events_rx));
+                    res
+                })
+                .expect("the overtaking regeneration lands");
+            let overtaker_tip = overtaker
+                .response_action_id
+                .expect("the overtaker wrote a successor");
+
+            resume.send(()).expect("the waiting regeneration resumes");
+            (waiting.join().expect("the waiting thread"), overtaker_tip)
+        });
+
+        let waited = waited.expect("the regeneration that waited revises what it finds");
+        let tip = waited
+            .response_action_id
+            .expect("it wrote a successor of its own");
+        assert_ne!(tip, overtaker_tip, "two generations, not one");
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        assert_eq!(tree.len(), 2, "still one question and one answer");
+        assert_eq!(
+            tree[1].generation_count, 3,
+            "both regenerations landed as generations of the one item"
+        );
+        assert_eq!(tree[1].action_id, tip, "the last to finish is the tip");
+        assert_eq!(
+            mock.chat_hits() - before,
+            2,
+            "two regenerations, two model requests — neither paid for nothing"
+        );
+    });
+}
+
+/// **What a reply written against a post being regenerated actually costs.**
+///
+/// The two doors are independent here by design: the claim keyed by item makes
+/// one *regeneration* of a post exclusive, and says nothing about a **reply**
+/// to it. So a reply started while the answer is being revised is accepted,
+/// spends, and commits — and because reply threading follows item identity, the
+/// tree then resolves its edge to the item's new tip and shows it beneath an
+/// answer it was never written against.
+///
+/// Pinned as the **current, deliberate** app-core behaviour, and as the reason
+/// the exclusivity lives where the verbs do: re-threading is what keeps a reply
+/// from dangling when any writer supersedes its antecedent — a second window, a
+/// delegated room's driver, a CLI post — and refusing every reply to a claimed
+/// item would take that asynchrony away from all of them to solve one surface's
+/// affordance problem. The surface that offers both verbs is the one that knows
+/// the reader pressed them a second apart.
+#[test]
+fn a_reply_written_during_a_regeneration_rethreads_onto_the_answer_it_never_saw() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            chat_delay_ms: 1_500,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let answer = tree[1].action_id.clone();
+        let before = mock.chat_hits();
+
+        // Both in flight at once: the answer is being revised while a reply is
+        // written against the generation that is on its way out.
+        let (regen, reply) = core.runtime().block_on(async {
+            let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+            let regenerating = async {
+                let r = core.regenerate_stream(answer.clone(), MODEL.into(), tx1);
+                let (r, _) = tokio::join!(r, collect_deltas(rx1));
+                r
+            };
+            let replying = async {
+                // Let the regeneration claim and get its request out first.
+                until_upstream_reached(&mock, before).await;
+                let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+                let r =
+                    core.respond_stream(first.space_id.clone(), MODEL.into(), answer.clone(), tx2);
+                let (r, _) = tokio::join!(r, collect_deltas(rx2));
+                r
+            };
+            tokio::join!(regenerating, replying)
+        });
+
+        let regen = regen.expect("the regeneration lands");
+        let reply = reply.expect("and the reply is accepted — nothing refuses it");
+        let new_tip = regen.response_action_id.expect("a successor generation");
+        let reply_id = reply.response_action_id.expect("the reply was written");
+        assert!(reply.credits_charged > 0, "and it was billed");
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        let reply_row = tree
+            .iter()
+            .find(|n| n.action_id == reply_id)
+            .expect("the reply is in the tree");
+        assert_eq!(
+            reply_row.parent_action_id.as_deref(),
+            Some(new_tip.as_str()),
+            "the reply hangs beneath the regenerated answer — item identity \
+             resolved its edge onto a generation it was never written against"
+        );
+        assert_ne!(new_tip, answer, "the answer really was superseded");
+    });
+}
+
+/// **A regeneration that fails announces its end too.**
+///
+/// Supersession is only half an ending: a regeneration that succeeds leaves a
+/// new generation for a surface to notice, but one that fails leaves nothing a
+/// transcript read can see — no action row, at most a Record entry attached to
+/// nothing. A surface refused by the claim would
+/// therefore go on saying "already being regenerated" for the life of the
+/// window. The claim's release is the fact that ends it, and it is published
+/// rather than inferred.
+#[test]
+fn a_failed_regeneration_still_settles_its_claim() {
+    run(|| {
+        // The regeneration's stream ends without ever saying it finished — a
+        // failure that writes no successor, which is exactly the ending
+        // supersession cannot provide.
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkThenStreamEndsWithoutDone,
+            chat_delay_ms: 2_000,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let answer = tree[1].action_id.clone();
+        let item = tree[1].item_id.clone();
+
+        // Nothing is running, so the wait is already over — a caller that asks
+        // after the release is not left waiting for an event that is past.
+        let idle = core.runtime().block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                core.regeneration_settled(item.clone()),
+            )
+            .await
+        });
+        assert!(idle.is_ok(), "an unclaimed item settles immediately");
+        let before = mock.chat_hits();
+
+        let (regen, (second, early)) = core.runtime().block_on(async {
+            let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+            let running = async {
+                let r = core.regenerate_stream(answer.clone(), MODEL.into(), tx);
+                let (r, _) = tokio::join!(r, collect_deltas(events_rx));
+                r
+            };
+            let probe = async {
+                // Let the claim be taken; the held response keeps it claimed
+                // well past everything below.
+                until_upstream_reached(&mock, before).await;
+                let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+                let second = {
+                    let s = core.regenerate_stream(answer.clone(), MODEL.into(), tx2);
+                    let (s, _) = tokio::join!(s, collect_deltas(rx2));
+                    s
+                };
+                // A refused second ask proves the claim is held *right now*, so
+                // a wait resolving here would be answering about nothing.
+                let early = tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    core.regeneration_settled(item.clone()),
+                )
+                .await;
+                // Now park a waiter **while the claim is still held** and let
+                // it run to the release. This is the arm that matters: the
+                // immediate arm answers a caller that asks too late, and only
+                // this one proves the release *wakes* what is waiting on it.
+                let parked = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    core.regeneration_settled(item.clone()),
+                )
+                .await;
+                (second, (early, parked))
+            };
+            tokio::join!(running, probe)
+        });
+        let (early, parked) = early;
+
+        assert!(
+            matches!(regen, Err(AppError::Network { .. })),
+            "the regeneration failed without writing anything; got {regen:?}"
+        );
+        assert!(
+            matches!(second, Err(AppError::RegenerationInFlight { .. })),
+            "the claim was held while it ran; got {second:?}"
+        );
+        assert!(
+            early.is_err(),
+            "and the wait held with it — a claim in flight has not settled"
+        );
+        assert!(
+            parked.is_ok(),
+            "a waiter parked while the claim was held is woken by its release"
+        );
+
+        // The transcript is exactly what it was: nothing superseded the answer,
+        // so nothing a refresh could read had changed.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        assert_eq!(tree.len(), 2, "no successor post; got {tree:#?}");
+        assert_eq!(tree[1].action_id, answer, "the tip did not move");
+        assert_eq!(tree[1].generation_count, 1, "still one generation");
+
+        // And yet the wait is over — the release announced itself.
+        let settled = core.runtime().block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                core.regeneration_settled(item.clone()),
+            )
+            .await
+        });
+        assert!(
+            settled.is_ok(),
+            "a failed regeneration releases its claim and says so, though it \
+             leaves no successor to notice"
+        );
+    });
+}
+
+// ===========================================================================
+// A stream that ends without ever saying it is over
+// ===========================================================================
+
+/// **Partial data from a connection that stopped is not an answer.** Every byte
+/// is well-formed — this is not the mid-frame abort, which fails in the
+/// decoder — and the only thing missing is the upstream's claim to have
+/// finished. Read as a completion, the text persisted as whole.
+#[test]
+fn a_stream_that_never_says_it_finished_writes_no_answer() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingEndsWithoutDone,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+
+        let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let (res, content) = core.runtime().block_on(async {
+            let chat = core.chat_stream("stream me".into(), MODEL.into(), None, tx);
+            let (res, (content, _)) = tokio::join!(chat, collect_deltas(events_rx));
+            (res, content)
+        });
+
+        let err = res.expect_err("a stream that never finished is not an answer");
+        assert!(
+            matches!(err, AppError::Network { .. }),
+            "it is a transport failure — not a truncation, which needs a \
+             ceiling nobody reached; got {err:?}"
+        );
+        // The reader did watch text arrive. That is what makes the old
+        // behaviour tempting and wrong: the deltas were real, the answer was
+        // not finished, and nothing durable could have said so.
+        assert!(!content.is_empty(), "the deltas reached the consumer");
+
+        let space_id = only_space(&core);
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id.clone()))
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "only the user's turn; got {messages:?}");
+        assert_eq!(messages[0].role, "user");
+
+        // The exchange is still forensically kept, attached to no action — the
+        // same shape every other "ran, wrote nothing" exit takes.
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+        assert!(
+            changes.contains(&Change::Space(space_id)),
+            "got {changes:?}"
+        );
+    });
+}
+
+/// **And a regeneration keeps the answer it would have replaced.** This is why
+/// the rule is the conservative one: `Revise` supersedes, so persisting
+/// transport-cut text here destroys a real answer and leaves a severed one in
+/// its place. The claim releases and announces itself as it does on any other
+/// failure, so a window marking the collision stops marking it.
+#[test]
+fn a_regeneration_whose_stream_never_finished_keeps_the_answer_it_would_replace() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkThenStreamEndsWithoutDone,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("first chat");
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id.clone()))
+            .expect("tree");
+        let answer = tree[1].action_id.clone();
+        let item = tree[1].item_id.clone();
+        let original = block_text(&tree[1]);
+        assert!(!original.is_empty(), "there is a real answer to protect");
+
+        let (tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let res = core.runtime().block_on(async {
+            let regen = core.regenerate_stream(answer.clone(), MODEL.into(), tx);
+            let (res, _) = tokio::join!(regen, collect_deltas(events_rx));
+            res
+        });
+        assert!(matches!(res, Err(AppError::Network { .. })), "got {res:?}");
+
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(first.space_id))
+            .expect("tree");
+        assert_eq!(tree.len(), 2, "no successor post; got {tree:#?}");
+        assert_eq!(tree[1].action_id, answer, "the tip did not move");
+        assert_eq!(block_text(&tree[1]), original, "the answer is intact");
+        assert_eq!(tree[1].generation_count, 1, "still one generation");
+
+        // The claim ends the way it ends on every other failure.
+        let settled = core.runtime().block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                core.regeneration_settled(item),
+            )
+            .await
+        });
+        assert!(settled.is_ok(), "the claim released and announced it");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Recovery vs. a turn that is still flying
+// ---------------------------------------------------------------------------
+
+/// A credential is `spending` from the instant its pending-refund row is
+/// written until its successor is minted, and the database cannot say which of
+/// the two situations that covers: a request in flight, or a hold stranded by
+/// a process that died mid-turn. Only the second is recoverable.
+///
+/// The recovery endpoint takes an unrecorded nullifier as proof the request
+/// never arrived — it records it and refunds — so asking it about a live hold
+/// does not merely fail to help, it **breaks the turn**: the real request then
+/// reaches the server with a nullifier already recorded and is refused as a
+/// replay, and an answer the account paid for is lost because somebody asked
+/// for the money back on its behalf. This is why the process taking the turn
+/// keeps its own record of which holds are its own, and recovery reads it.
+#[test]
+fn a_hold_a_live_turn_is_flying_with_is_not_recovered() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlocking,
+            // A window to act inside — an instant answer makes an in-flight
+            // turn unobservable, and this is entirely about that instant.
+            chat_delay_ms: 1_500,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        let (turn, in_flight, recovered) = core.runtime().block_on(async {
+            let taking = core.chat("How do tides work?".into(), MODEL.into(), None);
+            let recovering = async {
+                // Let the turn take its hold and get its request out.
+                until_upstream_reached(&mock, 0).await;
+                let in_flight = core
+                    .wallet_spending_credentials()
+                    .await
+                    .expect("the wallet reads");
+                let recovered = core
+                    .recover_spending_credentials()
+                    .await
+                    .expect("recovery runs");
+                (in_flight, recovered)
+            };
+            let (turn, (in_flight, recovered)) = tokio::join!(taking, recovering);
+            (turn, in_flight, recovered)
+        });
+
+        assert_eq!(
+            in_flight.len(),
+            1,
+            "the fixture has to actually catch the hold mid-flight to prove anything"
+        );
+        assert!(
+            recovered.is_empty(),
+            "a hold whose request is still going is not stranded: {recovered:?}"
+        );
+        assert_eq!(
+            mock.refund_hits(),
+            0,
+            "and the server was never even asked about it — the ask is what \
+             records the nullifier and dooms the turn"
+        );
+        let turn = turn.expect("so the turn still lands");
+        assert!(turn.credits_charged > 0, "and is billed, once");
+    });
+}
+
+/// The other half, and the reason the record is dropped rather than cleared at
+/// any particular success: a hold whose turn ended without settling it **is**
+/// stranded, and must be recoverable again the moment that turn is over.
+#[test]
+fn a_hold_whose_turn_ended_without_settling_it_is_recovered() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            // The round's own settlement attempt fails; the next call to the
+            // recovery endpoint succeeds.
+            refund: RefundMode::FailFirst(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+
+        core.runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the turn answers even though its hold did not settle");
+
+        let (in_flight, recovered) = core.runtime().block_on(async {
+            let in_flight = core
+                .wallet_spending_credentials()
+                .await
+                .expect("the wallet reads");
+            let recovered = core
+                .recover_spending_credentials()
+                .await
+                .expect("recovery runs");
+            (in_flight, recovered)
+        });
+
+        assert_eq!(in_flight.len(), 1, "the turn left its hold behind");
+        assert_eq!(
+            recovered.len(),
+            1,
+            "and nothing holds it out of recovery once its turn is over"
+        );
+    });
+}
+
+// ===========================================================================
+// The refund class on the turn path: every arm on which the server can hand
+// a refund back, settled from the token it handed over — recovery only for its
+// absence. `RefundMode::NotStored` is the server whose own persistence of the
+// token failed: the in-band copy is still sent and recovery answers `404`, so a
+// passing test here cannot be recovery in disguise.
+// ===========================================================================
+
+/// Drive one streaming ask to its end, draining the deltas.
+fn stream_once(core: &AppCore, prompt: &str) -> Result<eidola_app_core::ChatResult, AppError> {
+    let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+    core.runtime().block_on(async {
+        let drain = async { while events_rx.recv().await.is_some() {} };
+        let chat = core.chat_stream(prompt.into(), MODEL.into(), None, tx);
+        let (res, ()) = tokio::join!(chat, drain);
+        res
+    })
+}
+
+/// The wallet holds nothing mid-spend and at least one credential reached
+/// `spent` — the hold this turn took was settled.
+fn assert_settled(core: &AppCore) {
+    let wallet = core
+        .runtime()
+        .block_on(core.wallet_lifecycle())
+        .expect("wallet");
+    assert!(
+        wallet.iter().any(|c| c.state == "spent"),
+        "the hold settled: {wallet:?}"
+    );
+    assert!(
+        !wallet.iter().any(|c| c.state == "spending"),
+        "nothing is stranded mid-spend: {wallet:?}"
+    );
+}
+
+/// The completion rows the Record holds, newest first.
+fn completion_rows(core: &AppCore) -> Vec<eidola_app_core::RequestInfo> {
+    core.runtime()
+        .block_on(core.list_requests(50, 0))
+        .expect("record")
+        .into_iter()
+        .filter(|r| r.path == "/v1/chat/completions")
+        .collect()
+}
+
+fn request_detail(core: &AppCore, id: &str) -> eidola_app_core::RequestDetail {
+    core.runtime()
+        .block_on(core.request_detail(id.to_string()))
+        .expect("detail")
+        .expect("a recorded row")
+}
+
+/// REGRESSION: **a streamed turn settles from the refund its metadata event
+/// carried.**
+///
+/// The server closes a stream with an `eidola.chat.completion.metadata` event
+/// carrying the refund, and sends it even when its own best-effort persistence
+/// of that token failed — the arm where recovery can never answer. The turn
+/// used to discard the event and ask recovery anyway, under a comment saying
+/// SSE carries no inline refund, which stranded the credential in `spending`
+/// for good. Both framings: one data field per event, and the payload split
+/// across several (`sse_event_data`).
+#[test]
+fn a_streamed_turn_settles_from_the_refund_its_metadata_event_carried() {
+    for behavior in [
+        ChatBehavior::StreamingWithMetadataRefund,
+        ChatBehavior::StreamingSplitDataFields,
+    ] {
+        run(move || {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: behavior,
+                refund: RefundMode::NotStored,
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            let mut rx = core.subscribe_changes();
+
+            let res = stream_once(&core, "stream me").expect("the turn completes");
+            assert_eq!(res.content, "Hello from the stream.", "{behavior:?}");
+            assert_settled(&core);
+            assert_eq!(
+                mock.refund_hits(),
+                0,
+                "{behavior:?}: the token in the stream settled the hold; recovery is for its \
+                 absence"
+            );
+            let changes = drain(&mut rx);
+            assert!(changes.contains(&Change::Wallet), "got {changes:?}");
+            assert!(changes.contains(&Change::Record), "got {changes:?}");
+        });
+    }
+}
+
+/// What a streamed turn hands back and what it emitted on the way: the result,
+/// and every live content delta in order.
+fn stream_collecting(
+    core: &AppCore,
+    prompt: &str,
+) -> (Result<eidola_app_core::ChatResult, AppError>, Vec<String>) {
+    let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+    core.runtime().block_on(async {
+        let collect = async {
+            let mut deltas = Vec::new();
+            while let Some(event) = events_rx.recv().await {
+                if let ChatStreamEvent::ContentDelta(text) = event {
+                    deltas.push(text);
+                }
+            }
+            deltas
+        };
+        let chat = core.chat_stream(prompt.into(), MODEL.into(), None, tx);
+        tokio::join!(chat, collect)
+    })
+}
+
+/// **A padded stream reads exactly as an unpadded one.** The Eidola server
+/// frames every stream as fixed-size writes on a fixed tick (comment events,
+/// trailing whitespace on a JSON line, an event carried across frames); the
+/// harness frames this one with the server's own framer. The turn yields the
+/// same text, the same usage and the same charge, settles from the same
+/// in-band refund, emits the same changes, and the Record keeps every event
+/// that carried data and none of the padding, saying how much it left out.
+#[test]
+fn a_padded_stream_reads_exactly_as_an_unpadded_one() {
+    let outcome = |behavior: ChatBehavior| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        run(move || {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: behavior,
+                refund: RefundMode::NotStored,
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            let mut changes_rx = core.subscribe_changes();
+            let (res, deltas) = stream_collecting(&core, "stream me");
+            let res = res.expect("the turn completes");
+            assert_settled(&core);
+            assert_eq!(mock.refund_hits(), 0, "{behavior:?}: settled in-band");
+            let mut changes = drain(&mut changes_rx);
+            changes.sort_by_key(|c| format!("{c:?}"));
+            changes.dedup();
+            let rows = completion_rows(&core);
+            let recorded = request_detail(&core, &rows[0].id)
+                .response_body
+                .expect("a recorded body");
+            tx.send((
+                res.content,
+                deltas.concat(),
+                res.input_tokens,
+                res.output_tokens,
+                res.credits_charged,
+                changes
+                    .iter()
+                    .map(|c| format!("{c:?}").split('(').next().unwrap().to_string())
+                    .collect::<Vec<_>>(),
+                recorded,
+            ))
+            .unwrap();
+        });
+        rx.recv().unwrap()
+    };
+    let plain = outcome(ChatBehavior::StreamingWithMetadataRefund);
+    let padded = outcome(ChatBehavior::StreamingPadded);
+    assert_eq!(padded.0, "Hello from the stream.");
+    assert_eq!(padded.0, plain.0, "the answer");
+    assert_eq!(padded.1, plain.1, "the live deltas");
+    assert_eq!((padded.2, padded.3), (plain.2, plain.3), "the usage");
+    assert_eq!(padded.4, plain.4, "the charge");
+    assert_eq!(padded.5, plain.5, "the changes emitted");
+
+    let text = String::from_utf8(padded.6).expect("UTF-8");
+    assert!(!text.contains("\n:"), "no padding comment is kept: {text}");
+    for piece in [
+        "Hello ",
+        "from the ",
+        "stream.",
+        "[DONE]",
+        "eidola.chat.completion.metadata",
+    ] {
+        assert!(text.contains(piece), "{piece} is kept: {text}");
+    }
+    assert!(
+        text.contains("bytes of stream padding"),
+        "and the omission is stated: {text}"
+    );
+}
+
+/// **The read ceiling bounds the answer, not its padding.** A slow answer's
+/// frames keep coming at the frame rate, so a stream can carry far more
+/// padding than the eight-megabyte ceiling while its answer is a few words.
+/// Counted, that padding would end the turn at the ceiling with nothing read;
+/// kept, it would fill the Record and push the answer out of it.
+#[test]
+fn a_long_padded_stream_is_not_cut_at_the_ceiling_or_lost_from_the_record() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingPaddedPastReadCeiling,
+            refund: RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let res = stream_once(&core, "stream me").expect("the turn completes");
+        assert_eq!(res.content, "Hello from the stream.");
+        assert_settled(&core);
+
+        let rows = completion_rows(&core);
+        assert_eq!(rows[0].error, None);
+        let recorded = request_detail(&core, &rows[0].id)
+            .response_body
+            .expect("a recorded body");
+        assert!(recorded.len() < 64 * 1024, "{} bytes kept", recorded.len());
+        let text = String::from_utf8(recorded).expect("UTF-8");
+        assert!(
+            text.contains("stream.") && text.contains("[DONE]"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("this Record entry keeps the first"),
+            "nothing that carried data was cut: {text}"
+        );
+        let padding: usize = text
+            .split("[eidola: ")
+            .nth(1)
+            .and_then(|t| t.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .expect("the padding note states a count");
+        assert!(padding > 10 * 1024 * 1024 - 64 * 1024, "{padding}");
+    });
+}
+
+/// **The ceiling is asked of events, not of transport chunks.** The answer here
+/// is just under the ceiling, and its last frames arrive coalesced into one
+/// chunk that is mostly padding: counted before its padding was told from its
+/// data, that chunk carried the sum past the ceiling and the turn failed with
+/// almost all of its answer read.
+#[test]
+fn an_answer_just_under_the_ceiling_is_not_pushed_over_it_by_padding() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingPaddedNearReadCeiling,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let res = stream_once(&core, "stream me").expect("the turn completes");
+        assert!(
+            res.content.len() > 8 * 1024 * 1024 - 64 * 1024,
+            "{} bytes",
+            res.content.len()
+        );
+        assert!(res.content.bytes().all(|b| b == b'y'));
+        let rows = completion_rows(&core);
+        assert_eq!(rows[0].error, None);
+    });
+}
+
+/// REGRESSION: **a stream that never opened still settles from the refund its
+/// error body carried.**
+///
+/// A streaming request that fails after the server recorded the nullifier —
+/// request validation, `send_stream`, a spend-proof re-encode — answers with a
+/// refund-bearing JSON error body rather than a stream. The non-2xx arm read
+/// the body for its message only and asked recovery for the token.
+#[test]
+fn a_pre_stream_failure_settles_from_the_refund_its_error_body_carried() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::Non2xxWithRefund(503),
+            refund: RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = stream_once(&core, "stream me").expect_err("a stream that never opened");
+        assert!(
+            matches!(err, AppError::Server { status: 503, .. }),
+            "the upstream's own status: {err:?}"
+        );
+        assert_settled(&core);
+        assert_eq!(mock.refund_hits(), 0, "recovery is for an absent token");
+
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+        let rows = completion_rows(&core);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].response_status, Some(503));
+        assert_eq!(
+            rows[0].error, None,
+            "a non-2xx needs no error column — its status says what happened"
+        );
+    });
+}
+
+/// REGRESSION: **a `2xx` is not a stream until it is the shape that was asked
+/// for — and the whole completion it carried still settles the hold.**
+///
+/// A backend that ignored `stream: true` answers a whole JSON completion,
+/// refund and all. Parsed as SSE it yields no events and ends without `[DONE]`,
+/// so the turn failed as a dropped connection and the body — the only copy of
+/// the token, where the server's persistence failed — was never read.
+/// `OkBlocking` with `ignores_stream` answers JSON whatever transport asked,
+/// which is precisely the fixture.
+#[test]
+fn a_streamed_ask_answered_with_a_whole_completion_is_refused_and_settles_from_it() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlocking,
+            ignores_stream: true,
+            refund: RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+
+        let err = stream_once(&core, "stream me").expect_err("not a stream");
+        match &err {
+            AppError::Network { message } => assert!(
+                message.contains("server-sent events"),
+                "named for the shape it was not: {message}"
+            ),
+            other => panic!("expected a Network shape refusal, got {other:?}"),
+        }
+        assert_settled(&core);
+        assert_eq!(
+            mock.refund_hits(),
+            0,
+            "the body's own token settled the hold"
+        );
+
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+        let space_id = only_space(&core);
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id))
+            .expect("messages");
+        assert_eq!(
+            messages.len(),
+            1,
+            "no answer is written from a refused shape"
+        );
+
+        let rows = completion_rows(&core);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].response_status, Some(200));
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("server-sent events")),
+            "the row carries this app's refusal, not only the upstream's 200: {:?}",
+            rows[0].error
+        );
+    });
+}
+
+/// **The blocking arms were already clean, and stay pinned.** The blocking
+/// round reads `refund` off the parsed body ahead of the status check, so a
+/// `2xx` answer and a refund-bearing error body both settle from their own
+/// token — asserted here against the server whose persistence failed, where
+/// recovery would have nothing to give.
+#[test]
+fn the_blocking_arms_settle_from_the_refund_their_bodies_carried() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlocking,
+            refund: RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("a blocking answer");
+        assert_settled(&core);
+        assert_eq!(mock.refund_hits(), 0);
+    });
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::Non2xxWithRefund(500),
+            refund: RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let err = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect_err("an error body");
+        assert!(
+            matches!(err, AppError::Server { status: 500, .. }),
+            "{err:?}"
+        );
+        assert_settled(&core);
+        assert_eq!(mock.refund_hits(), 0);
+    });
+}
+
+/// REGRESSION: **a body that could not be read is a read failure, not an
+/// empty answer** — on both pre-stream arms. An upstream that reset after its
+/// head used to read as an empty error document (the non-2xx arm defaulted the
+/// failed read), so the turn reported the upstream's status for what was a
+/// transport failure and the Record kept nothing of it.
+#[test]
+fn a_pre_stream_body_cut_short_is_reported_as_the_read_failure() {
+    for (status, content_type) in [(503, "application/json"), (200, "application/json")] {
+        run(move || {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: ChatBehavior::HeadThenCut {
+                    status,
+                    content_type,
+                },
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            let err = stream_once(&core, "stream me").expect_err("the body never arrived");
+            assert!(
+                matches!(err, AppError::Network { .. }),
+                "{status}: a transport failure, not the head's claim: {err:?}"
+            );
+            assert!(mock.refund_hits() >= 1, "the hold went to recovery");
+            assert_settled(&core);
+            let rows = completion_rows(&core);
+            assert_eq!(rows.len(), 1, "the exchange is in the Record");
+            assert!(rows[0].error.is_some(), "with the failure as its error");
+            assert_cut_prefix_recorded(&core, &rows[0].id);
+        });
+    }
+}
+
+/// **What arrived before the reset is part of the exchange**, so the Record
+/// keeps it: `HeadThenCut` sends a head, the first bytes of a JSON body and
+/// then nothing. A row holding an empty body would describe an exchange in
+/// which no bytes came back.
+fn assert_cut_prefix_recorded(core: &AppCore, id: &str) {
+    let recorded = request_detail(core, id).response_body.unwrap_or_default();
+    assert!(
+        recorded.starts_with(br#"{"error":"#),
+        "the prefix that arrived is recorded: {:?}",
+        String::from_utf8_lossy(&recorded)
+    );
+}
+
+/// The blocking twin: a body cut short fails the turn as the read failure it
+/// is, settles the hold, and keeps what arrived.
+#[test]
+fn a_blocking_body_cut_short_is_recorded_with_what_arrived() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::HeadThenCut {
+                status: 200,
+                content_type: "application/json",
+            },
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let err = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect_err("the body never arrived");
+        assert!(matches!(err, AppError::Network { .. }), "{err:?}");
+        assert!(mock.refund_hits() >= 1, "the hold went to recovery");
+        assert_settled(&core);
+        let rows = completion_rows(&core);
+        assert_eq!(rows.len(), 1, "the exchange is in the Record");
+        assert!(rows[0].error.is_some(), "with the failure as its error");
+        assert_cut_prefix_recorded(&core, &rows[0].id);
+    });
+}
+
+// ===========================================================================
+// What the turn reads and what it keeps: every peer read bounded as it
+// arrives, and every recorded body bounded and honest about it.
+// ===========================================================================
+
+/// REGRESSION: **one event may not grow without end.** A backend that never
+/// terminates an event grew the frame buffer until the process died; the turn
+/// now refuses it at the frame ceiling, settles the hold, and records why.
+#[test]
+fn an_event_that_never_ends_fails_the_turn_rather_than_accumulating() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingUnterminatedFlood,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let err = stream_once(&core, "stream me").expect_err("refused at the ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("ceiling")),
+            "{err:?}"
+        );
+        assert!(mock.refund_hits() >= 1);
+        assert_settled(&core);
+        let rows = completion_rows(&core);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ceiling")),
+            "{:?}",
+            rows[0].error
+        );
+    });
+}
+
+/// REGRESSION: **the frame ceiling holds for an event that arrives whole.**
+/// The ceiling was measured only on what was left in the buffer after complete
+/// events were drained, so an oversized event whose terminating blank line
+/// came in the same read was taken whole — any size up to the whole-stream
+/// ceiling, parsed, forwarded and persisted. It is now asked of each complete
+/// event before it is drained.
+#[test]
+fn an_oversized_complete_event_fails_the_turn() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingOneOversizedEvent,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let err = stream_once(&core, "stream me").expect_err("refused at the frame ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("single event")),
+            "{err:?}"
+        );
+        assert_settled(&core);
+        let space_id = only_space(&core);
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id))
+            .expect("messages");
+        assert_eq!(
+            messages.len(),
+            1,
+            "no answer is written from a refused event"
+        );
+    });
+}
+
+/// REGRESSION: **a streamed answer is held to the read ceiling, and refused
+/// only once its stream has been read to the end.** Every event here is small
+/// and well framed, so no frame bound trips; the turn assembles the deltas
+/// into an answer in memory, so what it takes in stops at the ceiling and
+/// nothing past it reaches the caller. The stream is read on to its metadata
+/// event, whose refund settles the hold (the only copy, under
+/// `RefundMode::NotStored`), and the turn is refused as the blocking twin
+/// refuses an assembled answer past the ceiling: no answer written, the
+/// Record keeping what its cap allows of the whole stream.
+#[test]
+fn a_stream_past_the_read_ceiling_fails_the_turn() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingPastReadCeiling,
+            refund: RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+        let (res, deltas) = stream_collecting(&core, "stream me");
+        let err = res.expect_err("refused at the ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message }
+                if message.contains("ceiling") && message.contains("fragment")),
+            "{err:?}"
+        );
+        let forwarded: usize = deltas.iter().map(String::len).sum();
+        assert!(
+            forwarded <= 8 << 20,
+            "nothing past the ceiling reaches the caller: {forwarded} bytes"
+        );
+        assert_settled(&core);
+        assert_eq!(
+            mock.refund_hits(),
+            0,
+            "the refund at the stream's end settled the hold"
+        );
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Wallet), "got {changes:?}");
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+
+        let space_id = only_space(&core);
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id))
+            .expect("messages");
+        assert_eq!(
+            messages.len(),
+            1,
+            "no answer is written from a refused read"
+        );
+
+        let rows = completion_rows(&core);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("fragment")),
+            "{:?}",
+            rows[0].error
+        );
+        let recorded = request_detail(&core, &rows[0].id)
+            .response_body
+            .expect("a recorded body");
+        let text = String::from_utf8_lossy(&recorded);
+        assert!(
+            text.contains("The rest was received and not retained"),
+            "the whole stream was read: {}",
+            &text[text.len().saturating_sub(300)..]
+        );
+    });
+}
+
+/// REGRESSION: **the read ceiling counts a streamed answer, not the stream it
+/// arrives in.** Every delta comes in an event many times its size, so a long
+/// answer's stream passes the ceiling while the answer is small; counted
+/// against the envelope, the read stopped mid-stream, the turn failed, and
+/// the refund at the stream's end never arrived.
+#[test]
+fn a_stream_whose_envelope_passes_the_read_ceiling_is_an_answer() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::StreamingEnvelopePastReadCeiling,
+            refund: RefundMode::NotStored,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let (res, deltas) = stream_collecting(&core, "stream me");
+        let res = res.expect("the turn completes");
+        assert_eq!(res.content, "y".repeat(160));
+        assert_eq!(deltas.concat(), res.content);
+        assert_settled(&core);
+        assert_eq!(
+            mock.refund_hits(),
+            0,
+            "the refund at the stream's end settled the hold"
+        );
+        let rows = completion_rows(&core);
+        assert_eq!(rows[0].error, None);
+    });
+}
+
+/// REGRESSION: **a blocking answer is bounded as it arrives, and a body the
+/// ceiling stopped is refused whatever it parses as.** `resp.text()` buffered
+/// the whole answer before anything could cap it; the padded complete object
+/// is the case where a truncated read still parses, so the refusal has to be
+/// decided by the ceiling rather than inferred from the parse. A backend
+/// that answers blocking requests is where that body arrives: an engine.
+#[test]
+fn a_blocking_answer_past_the_read_ceiling_is_refused_rather_than_parsed() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingPaddedPastCeiling,
+            ..MockConfig::default()
+        });
+        core.test_register_loaded_local_model("local", "engine", mock.port());
+        let mut rx = core.subscribe_changes();
+        let err = core
+            .runtime()
+            .block_on(core.chat("hello".into(), "engine@local".into(), None))
+            .expect_err("refused at the ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("ceiling")),
+            "{err:?}"
+        );
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+
+        let space_id = only_space(&core);
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id))
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "the parsed prefix is not an answer");
+        let rows = completion_rows(&core);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ceiling")),
+            "{:?}",
+            rows[0].error
+        );
+        let recorded = request_detail(&core, &rows[0].id)
+            .response_body
+            .expect("a recorded body");
+        let text = String::from_utf8_lossy(&recorded);
+        assert!(
+            text.contains("the read stopped at the"),
+            "the row says where reading stopped: {}",
+            &text[text.len().saturating_sub(300)..]
+        );
+    });
+}
+
+/// **The read ceiling bounds an answer assembled from a stream** as it bounds
+/// a blocking body: the Eidola backend's blocking turn reads a stream, and one
+/// whose deltas pass the ceiling is refused once it has been read to its end,
+/// the hold settled (by recovery, with no refund in band), and the Record
+/// keeps what its cap allows of what was read.
+#[test]
+fn an_assembled_answer_past_the_read_ceiling_is_refused() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingPaddedPastCeiling,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+        let err = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect_err("refused at the ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("ceiling")),
+            "{err:?}"
+        );
+        assert_eq!(mock.blocking_asks(), 0, "the turn asked for a stream");
+        assert!(
+            mock.refund_hits() >= 1,
+            "no refund in band, so recovery answers"
+        );
+        assert_settled(&core);
+        let changes = drain(&mut rx);
+        assert!(changes.contains(&Change::Record), "got {changes:?}");
+
+        let space_id = only_space(&core);
+        let messages = core
+            .runtime()
+            .block_on(core.get_space_messages(space_id))
+            .expect("messages");
+        assert_eq!(messages.len(), 1, "a refused read is not an answer");
+        let rows = completion_rows(&core);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ceiling")),
+            "{:?}",
+            rows[0].error
+        );
+        let recorded = request_detail(&core, &rows[0].id)
+            .response_body
+            .expect("a recorded body");
+        let text = String::from_utf8_lossy(&recorded);
+        // The stream was read to its end, where its refunds would be, so the
+        // Record states its whole size beside what it kept.
+        assert!(
+            text.contains("The rest was received and not retained"),
+            "the whole stream was read: {}",
+            &text[text.len().saturating_sub(300)..]
+        );
+    });
+}
+
+/// REGRESSION: **the ceiling refuses whatever the status.** A non-2xx is
+/// excused from parsing — an error document need not be JSON — and that
+/// excuse swallowed the ceiling: a fragment of an oversized error body became
+/// an error generation and a `Server` error carrying a message read off the
+/// fragment. Both transports.
+#[test]
+fn a_non_2xx_body_past_the_read_ceiling_is_refused_too() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::Non2xxPaddedPastCeiling(500),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let err = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect_err("refused at the ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("ceiling")),
+            "the ceiling, not the status: {err:?}"
+        );
+        assert_settled(&core);
+        let space_id = only_space(&core);
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space_id.clone()))
+            .expect("tree");
+        assert!(
+            !tree.iter().any(|n| n.action_type == "inference"),
+            "no error generation is written from a fragment"
+        );
+        let rows = completion_rows(&core);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ceiling")),
+            "{:?}",
+            rows[0].error
+        );
+
+        let err = stream_once(&core, "stream me").expect_err("refused at the ceiling");
+        assert!(
+            matches!(&err, AppError::Network { message } if message.contains("ceiling")),
+            "the streaming pre-stream read too: {err:?}"
+        );
+        let rows = completion_rows(&core);
+        assert!(
+            rows[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ceiling")),
+            "{:?}",
+            rows[0].error
+        );
+    });
+}
+
+/// REGRESSION: **what the Record keeps of an answer is bounded, and a partial
+/// says so** — while the answer itself is untouched.
+#[test]
+fn a_long_answer_is_kept_whole_and_recorded_as_the_truncation_it_is() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreamingOversized,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let res = stream_once(&core, "stream me").expect("the turn completes");
+        assert_eq!(res.content.len(), 1_200_000, "the answer is whole");
+
+        let rows = completion_rows(&core);
+        let recorded = request_detail(&core, &rows[0].id)
+            .response_body
+            .expect("a recorded body");
+        assert!(
+            recorded.len() < 1_200_000,
+            "what is retained is bounded: {} bytes",
+            recorded.len()
+        );
+        let text = String::from_utf8_lossy(&recorded);
+        assert!(
+            text.contains("this Record entry keeps the first"),
+            "and a partial says it is one: {}",
+            &text[text.len().saturating_sub(300)..]
+        );
+    });
+}
+
+/// REGRESSION: **the request column is bounded too, and it is the durable
+/// half.** Every turn wrote its whole request body down — a long conversation's
+/// prompt, every round, into the profile database and its WAL with nothing
+/// pruning it. The prompt still travels upstream whole; what is bounded is
+/// what is kept, and a row that keeps less says so in a request's words.
+#[test]
+fn an_enormous_prompt_is_recorded_as_the_truncation_it_is() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        // The prompt holds more than one denomination, so the wallet starts
+        // with one: drained beside a fresh one, the two pay it.
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect("an allocation");
+        let prompt = "x".repeat(2 * 1024 * 1024);
+        core.runtime()
+            .block_on(core.chat(prompt, MODEL.into(), None))
+            .expect("the turn completes");
+
+        let seen = mock.chat_bodies()[0].to_string();
+        assert!(seen.len() > 2 * 1024 * 1024, "the prompt travels whole");
+
+        let rows = completion_rows(&core);
+        let recorded = request_detail(&core, &rows[0].id)
+            .request_body
+            .expect("a request body");
+        assert!(
+            recorded.len() < seen.len(),
+            "the row keeps less than travelled: {} of {}",
+            recorded.len(),
+            seen.len()
+        );
+        let text = String::from_utf8_lossy(&recorded);
+        let tail = &text[text.len().saturating_sub(300)..];
+        assert!(tail.contains("-byte request"), "a request's note: {tail}");
+        assert!(
+            !tail.contains("response") && !tail.contains("delivered"),
+            "never the response's words: {tail}"
+        );
+    });
+}
+
+// ===========================================================================
+// Where a plain route's prompt went: a `connection` row, not a pointer to a
+// backend row that can change.
+// ===========================================================================
+
+/// REGRESSION: **the Record says where an external backend's prompt went, after
+/// anything is done to the backend.** The turn's external route wrote no
+/// `connection` row, so the request's only path to a URL was its `backend_id`
+/// — a key to a row the reader can replace under the same name.
+#[test]
+fn an_external_turns_destination_survives_the_backend_being_replaced() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        external_backend(&core, &mock.base_url);
+        core.runtime()
+            .block_on(core.chat("hi".into(), "qwen3-8b@ext".into(), None))
+            .expect("the turn completes");
+
+        core.runtime().block_on(async {
+            core.remove_backend("ext".to_string())
+                .await
+                .expect("remove");
+        });
+        external_backend(&core, "https://somewhere-else.example");
+
+        let rows = completion_rows(&core);
+        assert_eq!(rows.len(), 1);
+        let detail = request_detail(&core, &rows[0].id);
+        assert_eq!(
+            detail.base_url.as_deref(),
+            Some(mock.base_url.as_str()),
+            "the Record still says where the prompt went"
+        );
+        assert_eq!(detail.transport.as_deref(), Some("clearnet"));
+        assert_eq!(
+            detail.attestation_hash, None,
+            "and claims no verification that never happened"
+        );
+    });
+}
+
+/// The engine twin: an engine's address is a port this process picked, and the
+/// next start picks another, so only a row written as the turn sends can say
+/// where its prompt went. Streaming, so both transports are held between this
+/// and the external test.
+#[test]
+fn an_engine_turns_destination_is_recorded() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        core.test_register_loaded_local_model("local", "engine", mock.port());
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(async {
+                let drain = async { while events_rx.recv().await.is_some() {} };
+                let chat = core.chat_stream("hi".into(), "engine@local".into(), None, tx);
+                let (res, ()) = tokio::join!(chat, drain);
+                res
+            })
+            .expect("the turn completes");
+
+        let rows = completion_rows(&core);
+        let detail = request_detail(&core, &rows[0].id);
+        assert_eq!(
+            detail.base_url.as_deref(),
+            Some(format!("http://127.0.0.1:{}", mock.port()).as_str()),
+            "the engine's address at the time is in the Record"
+        );
+        assert_eq!(detail.transport.as_deref(), Some("clearnet"));
+        assert_eq!(detail.attestation_hash, None);
+    });
+}
+
+/// **An attested route writes no plain row.** Its destination comes from the
+/// handshake's own `connection` row, and a clearnet row with no attestation
+/// beside it would claim an unverified transport for a route that verifies
+/// every connection. The harness's injected client observes no handshake, so
+/// the Eidola turn here records no connection at all — which is exactly what
+/// distinguishes "not a plain route" from "a plain route".
+#[test]
+fn an_attested_turn_writes_no_plain_connection() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect("the turn completes");
+        let rows = completion_rows(&core);
+        let detail = request_detail(&core, &rows[0].id);
+        assert_eq!(detail.transport, None, "{:?}", detail.base_url);
+    });
+}
+
+// ===========================================================================
+// Redirects: a turn's prompt goes to the origin the reader configured, or
+// nowhere.
+// ===========================================================================
+
+/// REGRESSION: **a turn does not follow a redirect.**
+///
+/// reqwest's default policy follows up to ten and replays a cloneable body on
+/// `307`/`308`, so an external backend (or anything between) could answer
+/// `/v1/chat/completions` with a `Location` pointing anywhere and be handed the
+/// whole conversation at an origin the reader never configured — while the
+/// Record went on naming the backend that was. The redirect is the answer
+/// instead: the turn fails with the upstream's own status and nothing leaves
+/// for the other origin. Both transports.
+///
+/// An **ordinary** core: the harness's injected client would answer for the
+/// one the turn builds, and the policy is what is being held.
+#[test]
+fn a_turn_does_not_follow_a_redirect() {
+    run(|| {
+        let (backend_url, reached) = chat_harness::redirecting_upstream();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("core");
+        external_backend(&core, &backend_url);
+
+        let err = core
+            .runtime()
+            .block_on(core.chat("a private prompt".into(), "m@ext".into(), None))
+            .expect_err("a redirect is not an answer");
+        assert!(
+            matches!(err, AppError::Server { status: 307, .. }),
+            "the upstream's own status, not a chased one: {err:?}"
+        );
+        let space = only_space(&core);
+
+        let (tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let err = core
+            .runtime()
+            .block_on(async {
+                let drain = async { while events_rx.recv().await.is_some() {} };
+                let chat = core.chat_stream(
+                    "another private prompt".into(),
+                    "m@ext".into(),
+                    Some(space.clone()),
+                    tx,
+                );
+                let (res, ()) = tokio::join!(chat, drain);
+                res
+            })
+            .expect_err("a redirect is not a stream");
+        assert!(
+            matches!(err, AppError::Server { status: 307, .. }),
+            "{err:?}"
+        );
+        assert!(
+            !reached.load(std::sync::atomic::Ordering::SeqCst),
+            "and no prompt left for an origin the reader did not configure"
+        );
+    });
+}
+
+// ===========================================================================
+// Prefix-cache keys
+//
+// A model whose catalog row declares `prompt_cache` is served by an engine that
+// reuses a prompt prefix between requests sharing a `cache_key`. The client
+// sends one key per lineage — one participant answering in one space — and
+// rotates it before the engine's retention would have let the cache go. Every
+// other model gets no key and the exact bytes it got before keys existed.
+//
+// No catalog row sells such a model today, so these tests are the only place
+// the path runs: the harness publishes `supported_prompt_cache()` for MODEL.
+// ===========================================================================
+
+use chat_harness::{CACHE_IDLE_TTL_SECS, CACHE_MAX_AGE_SECS, supported_prompt_cache};
+
+/// What the Record keeps in place of a request's key.
+const WITHHELD_CACHE_KEY: &str = "[withheld: this request's prefix-cache key]";
+
+/// A core over a catalog that declares MODEL's engine caches prompt prefixes.
+fn cache_setup(chat: ChatBehavior) -> (MockServer, AppCore, tempfile::TempDir) {
+    let (mock, core, dir) = setup(MockConfig {
+        chat,
+        declared_prompt_cache: Some(supported_prompt_cache()),
+        ..MockConfig::default()
+    });
+    with_account(&core);
+    (mock, core, dir)
+}
+
+/// The key a captured body carried, checked to be one the gateway accepts.
+fn sent_key(body: &serde_json::Value) -> String {
+    let key = body
+        .get("cache_key")
+        .and_then(|k| k.as_str())
+        .unwrap_or_else(|| panic!("the request carries a prefix-cache key: {body}"))
+        .to_string();
+    assert!(
+        eidola_common::engine_protocol::is_cache_key_text(&key),
+        "a key in the shared canonical shape: {key}"
+    );
+    key
+}
+
+/// Every key the mock saw, in order (`None` for a request without one).
+fn keys(mock: &MockServer) -> Vec<Option<String>> {
+    mock.chat_cache_keys()
+}
+
+/// A body is the shared construction with the given key, and the gateway's
+/// strict request type accepts it.
+fn assert_shared_keyed_body(body: &serde_json::Value, stream: bool, key: &str) {
+    let tools = body
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let include_usage = body
+        .get("stream_options")
+        .and_then(|o| o.get("include_usage"))
+        .and_then(|v| v.as_bool())
+        == Some(true);
+    assert_eq!(
+        body,
+        &eidola_common::chat_completion_request_body(
+            body["model"].as_str().unwrap(),
+            body["messages"].as_array().unwrap(),
+            u32::try_from(body["max_completion_tokens"].as_u64().unwrap()).unwrap(),
+            tools,
+            stream,
+            include_usage,
+            Some(key),
+            None,
+        ),
+        "the shared body, plus the key and nothing else"
+    );
+    eidola_server_gateway::types::test_chat_completion_request_is_accepted(body.clone())
+        .expect("the server's strict request type accepts the keyed body");
+}
+
+#[test]
+fn a_model_whose_engine_caches_prefixes_is_sent_a_key_on_both_transports() {
+    run(|| {
+        let (mock, core, _dir) = cache_setup(ChatBehavior::OkBlocking);
+        let first = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("blocking turn");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        // Both transports ask the Eidola gateway for a stream; only the
+        // requests matter here.
+        let _ = core.runtime().block_on(core.chat_stream(
+            "And why two per day?".into(),
+            MODEL.into(),
+            Some(first.space_id.clone()),
+            tx,
+        ));
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        let key = sent_key(&bodies[0]);
+        assert_shared_keyed_body(&bodies[0], true, &key);
+        assert_shared_keyed_body(&bodies[1], true, &key);
+    });
+}
+
+/// Requests to a model that declares no prefix cache — no leaf, a leaf saying
+/// no, or a leaf this client cannot bound — are **byte for byte** the shared
+/// body without a key: exactly what the client sent before keys existed.
+#[test]
+fn a_model_without_a_declared_prefix_cache_is_sent_the_body_it_always_was() {
+    let leaves = [
+        None,
+        Some(serde_json::json!({ "supported": false })),
+        Some(serde_json::json!({ "supported": true, "idle_ttl_secs": 900 })),
+        Some(serde_json::json!({ "supported": true, "idle_ttl_secs": 0, "max_age_secs": 7200 })),
+    ];
+    for leaf in leaves {
+        run(move || {
+            let (mock, core, _dir) = setup(MockConfig {
+                chat: ChatBehavior::OkStreaming,
+                declared_prompt_cache: leaf.clone(),
+                ..MockConfig::default()
+            });
+            with_account(&core);
+            let first = turn(&core, "How do tides work?", None, None);
+            turn(&core, "And why?", Some(first.space_id.clone()), None);
+            core.runtime()
+                .block_on(core.chat(
+                    "Blocking, too.".into(),
+                    MODEL.into(),
+                    Some(first.space_id.clone()),
+                ))
+                .expect("the blocking twin asks for a stream and reads it whole");
+
+            let raw = mock.chat_raw_bodies();
+            assert_eq!(raw.len(), 3, "{leaf:?}");
+            for (sent, stream) in raw.iter().zip([true, true, true]) {
+                let parsed: serde_json::Value = serde_json::from_slice(sent).unwrap();
+                assert!(parsed.get("cache_key").is_none(), "{leaf:?}: {parsed}");
+                let include_usage = parsed
+                    .get("stream_options")
+                    .and_then(|o| o.get("include_usage"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true);
+                let expected = eidola_common::chat_completion_request_body(
+                    parsed["model"].as_str().unwrap(),
+                    parsed["messages"].as_array().unwrap(),
+                    u32::try_from(parsed["max_completion_tokens"].as_u64().unwrap()).unwrap(),
+                    &[],
+                    stream,
+                    include_usage,
+                    None,
+                    None,
+                );
+                assert_eq!(
+                    sent,
+                    &serde_json::to_vec(&expected).unwrap(),
+                    "{leaf:?}: the bytes on the wire are the keyless shared body"
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn turns_and_tool_rounds_in_one_lineage_share_one_key() {
+    run(|| {
+        let (mock, core, _dir) = cache_setup(ChatBehavior::ToolRoundsBlocking(2));
+        core.register_tool(std::sync::Arc::new(EchoTool))
+            .expect("echo is not reserved");
+        let first = core
+            .runtime()
+            .block_on(core.chat("use the tool".into(), MODEL.into(), None))
+            .expect("a three-round turn");
+        core.runtime()
+            .block_on(core.chat(
+                "and again".into(),
+                MODEL.into(),
+                Some(first.space_id.clone()),
+            ))
+            .expect("a second turn");
+
+        let sent = keys(&mock);
+        assert_eq!(sent.len(), 4, "three rounds, then a one-round turn");
+        let key = sent[0].clone().expect("a key");
+        assert!(
+            sent.iter().all(|k| k.as_deref() == Some(key.as_str())),
+            "every round of every turn in the lineage carries one key: {sent:?}"
+        );
+    });
+}
+
+/// A branch is a reply to a post that is not the tail, and a regeneration is a
+/// new generation of an answer. Both read the trunk this lineage already sent,
+/// so both inherit its key.
+#[test]
+fn a_branch_and_a_regeneration_inherit_the_lineage_key() {
+    run(|| {
+        let (mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        let second = turn(&core, "And why two per day?", Some(space.clone()), None);
+        // Branch off the first answer, beside the second exchange.
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        let first_answer = tree[1].action_id.clone();
+        turn(
+            &core,
+            "What about neap tides?",
+            Some(space.clone()),
+            Some(first_answer),
+        );
+        // Regenerate the second answer.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.regenerate_stream(
+                second.response_action_id.clone().expect("an answer"),
+                MODEL.into(),
+                tx,
+            ))
+            .expect("regenerate");
+
+        let sent = keys(&mock);
+        assert_eq!(sent.len(), 4);
+        let key = sent[0].clone().expect("a key");
+        assert!(
+            sent.iter().all(|k| k.as_deref() == Some(key.as_str())),
+            "the branch and the regeneration carry the lineage's key: {sent:?}"
+        );
+    });
+}
+
+/// A continuation is the lineage's next request in the most literal sense — its
+/// prompt is the previous request's prompt plus that request's own output — so
+/// it carries the lineage's key, which is what lets the engine serve all of it
+/// from the prefix its generation left. Otherwise its body is the shared
+/// construction a continuation is everywhere.
+#[test]
+fn a_continuation_carries_the_lineage_key() {
+    run(|| {
+        let (mock, core, _dir) = cache_setup(ChatBehavior::ContinueAfterLength {
+            cut: Cut::Reasoning,
+            again: false,
+        });
+        let cut = turn(&core, "How do tides work?", None, None);
+        assert!(cut.truncated);
+        let (res, _, _) = continue_streaming(&core, &cut.response_action_id.unwrap());
+        res.expect("the continuation");
+
+        let sent = keys(&mock);
+        assert_eq!(sent.len(), 2);
+        let key = sent[0].clone().expect("a key");
+        assert_eq!(sent[1].as_deref(), Some(key.as_str()), "the lineage's key");
+        let bodies: Vec<serde_json::Value> = mock
+            .chat_bodies()
+            .into_iter()
+            .map(|mut b| {
+                b.as_object_mut().unwrap().remove("cache_key");
+                b
+            })
+            .collect();
+        assert_continues(&bodies[0], &bodies[1], "reasoning_content");
+    });
+}
+
+/// Never one key across conversations, and never one across the participants
+/// of one conversation.
+#[test]
+fn other_spaces_and_other_participants_get_keys_of_their_own() {
+    run(|| {
+        let (mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        turn(&core, "A different conversation.", None, None);
+
+        let ada = core
+            .runtime()
+            .block_on(core.add_space_participant(
+                space.clone(),
+                eidola_app_core::NewParticipant {
+                    label: "Ada".into(),
+                    model_ref: Some(MODEL.into()),
+                    system_prompt: None,
+                    notify_policy: "explicit".into(),
+                },
+            ))
+            .expect("add agent");
+        let asked = core
+            .runtime()
+            .block_on(core.post_reply("Ada, your view?".into(), Some(space.clone()), None))
+            .expect("post");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.respond_stream_as(space.clone(), ada.id, asked.action_id, tx))
+            .expect("Ada answers");
+        // And the first participant again, in the first space.
+        turn(&core, "Back to you.", Some(space.clone()), None);
+
+        let sent: Vec<String> = keys(&mock)
+            .into_iter()
+            .map(|k| k.expect("every request is keyed"))
+            .collect();
+        assert_eq!(sent.len(), 4);
+        assert_ne!(sent[0], sent[1], "another space, another key");
+        assert_ne!(sent[0], sent[2], "another participant, another key");
+        assert_ne!(sent[1], sent[2]);
+        assert_eq!(sent[0], sent[3], "and the first lineage keeps its own");
+    });
+}
+
+/// A shared agent takes part in many conversations, and is a separate lineage
+/// in each: its key in one space never travels to another.
+#[test]
+fn a_shared_agent_has_a_key_per_space() {
+    run(|| {
+        let (mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        let home = first.space_id.clone();
+        let agent = core
+            .runtime()
+            .block_on(core.list_space_participants(home.clone()))
+            .expect("participants")
+            .into_iter()
+            .find(|p| p.kind == "agent")
+            .expect("the answering agent")
+            .id;
+        core.runtime()
+            .block_on(core.promote_participant(agent.clone(), None, None))
+            .expect("share the agent");
+
+        let elsewhere = core
+            .runtime()
+            .block_on(core.post_reply("Another conversation.".into(), None, None))
+            .expect("a new space");
+        core.runtime()
+            .block_on(core.add_global_participant(elsewhere.space_id.clone(), agent.clone(), None))
+            .expect("the shared agent joins");
+        let ask = |space: &str, action: String| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+            core.runtime()
+                .block_on(core.respond_stream_as(space.to_string(), agent.clone(), action, tx))
+                .expect("the shared agent answers")
+        };
+        ask(&elsewhere.space_id, elsewhere.action_id.clone());
+        let back = core
+            .runtime()
+            .block_on(core.post_reply("Back home.".into(), Some(home.clone()), None))
+            .expect("post");
+        ask(&home, back.action_id);
+
+        let sent: Vec<String> = keys(&mock).into_iter().map(Option::unwrap).collect();
+        assert_eq!(sent.len(), 3);
+        assert_ne!(
+            sent[0], sent[1],
+            "the same agent, another space: another key"
+        );
+        assert_eq!(sent[0], sent[2], "and its home lineage keeps its own");
+    });
+}
+
+#[test]
+fn an_idle_lineage_gets_a_fresh_key() {
+    run(|| {
+        let (mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+
+        // Just inside the idle TTL: kept.
+        core.test_advance_cache_clock(CACHE_IDLE_TTL_SECS * 1000 - 1000);
+        turn(&core, "Still there?", Some(space.clone()), None);
+        // The use above restarted the idle clock; a full TTL of silence now.
+        core.test_advance_cache_clock(CACHE_IDLE_TTL_SECS * 1000);
+        turn(&core, "After a long pause.", Some(space.clone()), None);
+        turn(&core, "Right after.", Some(space.clone()), None);
+
+        let sent: Vec<String> = keys(&mock).into_iter().map(Option::unwrap).collect();
+        assert_eq!(sent[0], sent[1], "used inside the idle TTL: kept");
+        assert_ne!(sent[1], sent[2], "idle for the whole TTL: rotated");
+        assert_eq!(sent[2], sent[3], "and the fresh key is the lineage's now");
+    });
+}
+
+#[test]
+fn a_key_is_retired_at_its_maximum_age_however_busy() {
+    run(|| {
+        let (mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+
+        // Never idle for long, but the key grows old: a turn every
+        // (idle TTL − 1 s) until the maximum age has passed.
+        let step = CACHE_IDLE_TTL_SECS * 1000 - 1000;
+        let steps = (CACHE_MAX_AGE_SECS * 1000) / step + 1;
+        for i in 0..steps {
+            core.test_advance_cache_clock(step);
+            turn(&core, &format!("Turn {i}."), Some(space.clone()), None);
+        }
+
+        let sent: Vec<String> = keys(&mock).into_iter().map(Option::unwrap).collect();
+        let changes = sent.windows(2).filter(|w| w[0] != w[1]).count();
+        assert_eq!(
+            changes, 1,
+            "rotated exactly once, at the maximum age: {sent:?}"
+        );
+        let rotated_at = sent.iter().position(|k| *k != sent[0]).unwrap();
+        // Request `n` was sent `n * step` after the key's birth.
+        assert!(
+            (rotated_at as i64) * step >= CACHE_MAX_AGE_SECS * 1000,
+            "not before the maximum age"
+        );
+        assert!(
+            (rotated_at as i64 - 1) * step < CACHE_MAX_AGE_SECS * 1000,
+            "and at the first request past it"
+        );
+    });
+}
+
+/// The client cannot measure a key's age on a clock that went backwards, so it
+/// does not try.
+#[test]
+fn a_clock_set_back_retires_the_key() {
+    run(|| {
+        let (mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        core.test_advance_cache_clock(-60_000);
+        turn(
+            &core,
+            "A minute earlier?",
+            Some(first.space_id.clone()),
+            None,
+        );
+
+        let sent: Vec<String> = keys(&mock).into_iter().map(Option::unwrap).collect();
+        assert_ne!(sent[0], sent[1]);
+    });
+}
+
+/// The key is durable: a restart does not cost the lineage its cache.
+#[test]
+fn a_lineage_keeps_its_key_across_a_restart() {
+    run(|| {
+        // The upstream runs on a runtime of its own so it outlives the core.
+        let config = MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            ..MockConfig::default()
+        };
+        let mock_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("mock runtime");
+        let mock = mock_rt.block_on(chat_harness::start(config.clone()));
+        let (_unused, core, dir) = setup(config);
+        core.runtime()
+            .block_on(core.set_base_url(mock.base_url.clone()))
+            .expect("point at the lasting upstream");
+        with_account(&core);
+        let first = turn(&core, "How do tides work?", None, None);
+        drop(core);
+        let core = chat_harness::reopen_core(&dir, &mock.base_url);
+        turn(
+            &core,
+            "After a restart.",
+            Some(first.space_id.clone()),
+            None,
+        );
+
+        let sent: Vec<String> = keys(&mock).into_iter().map(Option::unwrap).collect();
+        assert_eq!(sent[0], sent[1]);
+    });
+}
+
+/// The Record shows what left the machine — except the key, which it says was
+/// sent and never shows.
+#[test]
+fn the_record_withholds_the_key() {
+    run(|| {
+        let (mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        turn(&core, "And why?", Some(first.space_id.clone()), None);
+        let sent: Vec<String> = keys(&mock).into_iter().map(Option::unwrap).collect();
+
+        let rows = core
+            .runtime()
+            .block_on(core.list_requests(100, 0))
+            .expect("requests");
+        let completions: Vec<_> = rows
+            .iter()
+            .filter(|r| r.path.ends_with("/chat/completions"))
+            .collect();
+        assert_eq!(completions.len(), 2);
+        for row in completions {
+            let detail = core
+                .runtime()
+                .block_on(core.request_detail(row.id.clone()))
+                .expect("detail")
+                .expect("row");
+            let body = String::from_utf8(detail.request_body.expect("a body")).unwrap();
+            for key in &sent {
+                assert!(
+                    !body.contains(key.as_str()),
+                    "the key is not recorded: {body}"
+                );
+            }
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["cache_key"], WITHHELD_CACHE_KEY);
+        }
+    });
+}
+
+/// Claiming a key writes a row no surface reads, so it announces nothing: a
+/// keyed turn emits exactly what an unkeyed one does.
+#[test]
+fn a_keyed_turn_emits_exactly_what_an_unkeyed_one_does() {
+    fn emissions(prompt_cache: Option<serde_json::Value>) -> Vec<String> {
+        let (_mock, core, _dir) = setup(MockConfig {
+            declared_prompt_cache: prompt_cache,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("chat");
+        drain(&mut rx)
+            .into_iter()
+            .map(|c| match c {
+                Change::Space(_) => "Space".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+    run(|| {
+        assert_eq!(emissions(Some(supported_prompt_cache())), emissions(None));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Prefix stability: what the key is worth
+//
+// A key buys reuse only of a true prefix. Consecutive requests in a lineage
+// share every message up to the post the earlier one answered; the one
+// message after it, the trailing metadata block (roster, thread map), is
+// rebuilt per turn by design and is the only thing the next request does not
+// repeat. These pin that, byte for byte, over the serialized `messages`.
+// ---------------------------------------------------------------------------
+
+/// `messages` serialized as the request body serializes it, without the
+/// closing bracket — so "a prefix of the next request's array" is a plain
+/// byte-prefix test.
+fn open_messages(messages: &[serde_json::Value]) -> String {
+    let mut s = serde_json::to_string(messages).unwrap();
+    assert_eq!(s.pop(), Some(']'));
+    s
+}
+
+fn messages_of(body: &serde_json::Value) -> Vec<serde_json::Value> {
+    body["messages"].as_array().unwrap().clone()
+}
+
+#[test]
+fn consecutive_turns_in_a_linear_lineage_are_byte_prefix_extensions() {
+    run(|| {
+        let (mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        turn(&core, "And why two per day?", Some(space.clone()), None);
+        turn(&core, "And neap tides?", Some(space.clone()), None);
+
+        let bodies = mock.chat_bodies();
+        for pair in bodies.windows(2) {
+            let earlier = messages_of(&pair[0]);
+            let later = serde_json::to_string(&messages_of(&pair[1])).unwrap();
+            assert!(
+                later.starts_with(&open_messages(&earlier)),
+                "the whole earlier request is the head of the later one:\n{}\n{later}",
+                open_messages(&earlier)
+            );
+        }
+    });
+}
+
+/// A multi-party space carries a trailing roster, and a branched one a thread
+/// map: one volatile message after the post being answered. Everything before
+/// it is the next request's head.
+#[test]
+fn a_trailing_block_is_the_only_part_of_a_request_the_next_one_drops() {
+    run(|| {
+        let (mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        core.runtime()
+            .block_on(core.add_space_participant(
+                space.clone(),
+                eidola_app_core::NewParticipant {
+                    label: "Ada".into(),
+                    model_ref: Some(MODEL.into()),
+                    system_prompt: None,
+                    notify_policy: "explicit".into(),
+                },
+            ))
+            .expect("add agent");
+        // Two turns with a roster, then a branch, then two turns on the branch
+        // with a roster and a map.
+        let second = turn(&core, "And why two per day?", Some(space.clone()), None);
+        turn(&core, "And neap tides?", Some(space.clone()), None);
+        let branch = turn(
+            &core,
+            "Back up: spring tides?",
+            Some(space.clone()),
+            second.response_action_id.clone(),
+        );
+        turn(
+            &core,
+            "Go on.",
+            Some(space.clone()),
+            branch.response_action_id.clone(),
+        );
+        turn(&core, "And then?", Some(space.clone()), None);
+
+        let bodies = mock.chat_bodies();
+        // Pairs on one spine whose head did not flip in between: the roster
+        // pair (requests 1 → 2) and the branch pair (requests 4 → 5).
+        for (a, b) in [(1usize, 2usize), (4, 5)] {
+            let earlier = messages_of(&bodies[a]);
+            let later = messages_of(&bodies[b]);
+            let last = earlier.last().unwrap()["content"].as_str().unwrap();
+            assert!(
+                last.contains("Respond to #"),
+                "request {a} ends with the trailing block: {last}"
+            );
+            let kept = &earlier[..earlier.len() - 1];
+            let later_text = serde_json::to_string(&later).unwrap();
+            assert!(
+                later_text.starts_with(&open_messages(kept)),
+                "request {a} up to its trailing block is the head of request {b}"
+            );
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// A key's end: forgotten when its lineage can no longer send, overwritten on
+// disk whenever it is replaced or forgotten, and never carried from one trust
+// domain to another.
+// ---------------------------------------------------------------------------
+
+/// The lineages holding a key, as `(space, participant)`.
+fn lineages(core: &AppCore) -> Vec<(String, String)> {
+    core.runtime()
+        .block_on(core.test_prefix_cache_lineages())
+        .expect("lineages")
+        .into_iter()
+        .map(|(s, p, ..)| (s, p))
+        .collect()
+}
+
+/// A lineage's `(generation, created_at, last_used_at)`.
+fn lineage_times(core: &AppCore, space: &str) -> (i64, i64, i64) {
+    let rows = core
+        .runtime()
+        .block_on(core.test_prefix_cache_lineages())
+        .expect("lineages");
+    let row = rows
+        .iter()
+        .find(|(s, ..)| s == space)
+        .unwrap_or_else(|| panic!("a key for {space}: {rows:?}"));
+    (row.2, row.3, row.4)
+}
+
+/// Whether any file of the profile's database still holds `key`'s bytes —
+/// the database itself and its write-ahead log alike.
+fn key_on_disk(dir: &tempfile::TempDir, key: &str) -> bool {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(key)
+        .expect("a key decodes");
+    std::fs::read_dir(dir.path().join("data"))
+        .expect("data dir")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| path.is_file())
+        .any(|path| {
+            let contents = std::fs::read(&path).unwrap_or_default();
+            contents.windows(bytes.len()).any(|w| w == bytes.as_slice())
+        })
+}
+
+fn agent_of(core: &AppCore, space: &str) -> String {
+    core.runtime()
+        .block_on(core.list_space_participants(space.to_string()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("an agent")
+        .id
+}
+
+#[test]
+fn archiving_a_conversation_forgets_its_keys_and_leaves_no_copy_on_disk() {
+    run(|| {
+        let (mock, core, dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        let other = turn(&core, "Another conversation.", None, None);
+        let key = sent_key(&mock.chat_bodies()[0]);
+        assert!(
+            key_on_disk(&dir, &key),
+            "a live key is stored (the scan's baseline)"
+        );
+        assert_eq!(lineages(&core).len(), 2);
+
+        core.runtime()
+            .block_on(core.archive_space(first.space_id.clone()))
+            .expect("archive");
+
+        let left = lineages(&core);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(
+            left[0].0, other.space_id,
+            "only the open conversation keeps its key"
+        );
+        assert!(
+            !key_on_disk(&dir, &key),
+            "and the forgotten key is nowhere on disk"
+        );
+    });
+}
+
+#[test]
+fn a_participant_that_leaves_forgets_its_key_and_the_others_keep_theirs() {
+    run(|| {
+        let (_mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        let ada = core
+            .runtime()
+            .block_on(core.add_space_participant(
+                space.clone(),
+                eidola_app_core::NewParticipant {
+                    label: "Ada".into(),
+                    model_ref: Some(MODEL.into()),
+                    system_prompt: None,
+                    notify_policy: "explicit".into(),
+                },
+            ))
+            .expect("add agent");
+        let asked = core
+            .runtime()
+            .block_on(core.post_reply("Ada?".into(), Some(space.clone()), None))
+            .expect("post");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.respond_stream_as(space.clone(), ada.id.clone(), asked.action_id, tx))
+            .expect("Ada answers");
+        assert_eq!(lineages(&core).len(), 2);
+
+        core.runtime()
+            .block_on(core.remove_space_participant(space.clone(), ada.id.clone()))
+            .expect("Ada leaves");
+        let left = lineages(&core);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_ne!(left[0].1, ada.id);
+    });
+}
+
+#[test]
+fn a_shared_agent_that_leaves_one_space_or_retires_forgets_those_keys() {
+    run(|| {
+        let (_mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        let home = first.space_id.clone();
+        let agent = agent_of(&core, &home);
+        core.runtime()
+            .block_on(core.promote_participant(agent.clone(), None, None))
+            .expect("share the agent");
+        let answer_in = |prompt: &str| {
+            let post = core
+                .runtime()
+                .block_on(core.post_reply(prompt.into(), None, None))
+                .expect("a new space");
+            core.runtime()
+                .block_on(core.add_global_participant(post.space_id.clone(), agent.clone(), None))
+                .expect("join");
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+            core.runtime()
+                .block_on(core.respond_stream_as(
+                    post.space_id.clone(),
+                    agent.clone(),
+                    post.action_id,
+                    tx,
+                ))
+                .expect("answer");
+            post.space_id
+        };
+        let elsewhere = answer_in("Elsewhere.");
+        let third = answer_in("A third place.");
+        let ours = |core: &AppCore| {
+            lineages(core)
+                .into_iter()
+                .filter(|(_, p)| *p == agent)
+                .map(|(s, _)| s)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ours(&core).len(), 3);
+
+        core.runtime()
+            .block_on(core.remove_space_participant(elsewhere.clone(), agent.clone()))
+            .expect("leave one space");
+        let kept = ours(&core);
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(!kept.contains(&elsewhere));
+        assert!(kept.contains(&third));
+
+        core.runtime()
+            .block_on(core.retire_participant(agent.clone()))
+            .expect("retire");
+        assert!(
+            ours(&core).is_empty(),
+            "a retired agent sends nothing, anywhere"
+        );
+    });
+}
+
+#[test]
+fn a_rotated_key_leaves_no_copy_on_disk() {
+    run(|| {
+        let (mock, core, dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        core.test_advance_cache_clock(CACHE_IDLE_TTL_SECS * 1000);
+        turn(&core, "After a pause.", Some(first.space_id.clone()), None);
+        let sent: Vec<String> = keys(&mock).into_iter().map(Option::unwrap).collect();
+        assert_ne!(sent[0], sent[1]);
+        assert!(key_on_disk(&dir, &sent[1]), "the live key is stored");
+        assert!(
+            !key_on_disk(&dir, &sent[0]),
+            "the one it replaced is nowhere on disk"
+        );
+    });
+}
+
+/// Pointing the client at another endpoint and back — the `client-local` /
+/// `client-reset` round trip — never carries a key across: each trust domain
+/// gets keys of its own, and the pinned endpoint never sees the local one.
+#[test]
+fn a_key_never_crosses_from_one_trust_domain_to_another() {
+    run(|| {
+        let (pinned, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let local = core.runtime().block_on(chat_harness::start(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            ..MockConfig::default()
+        }));
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+
+        core.runtime()
+            .block_on(core.set_base_url(local.base_url.clone()))
+            .expect("point at the local stack");
+        assert!(
+            lineages(&core).is_empty(),
+            "the old domain's keys are forgotten at once"
+        );
+        turn(&core, "Against the local stack.", Some(space.clone()), None);
+
+        core.runtime()
+            .block_on(core.set_base_url(pinned.base_url.clone()))
+            .expect("point back");
+        assert!(lineages(&core).is_empty());
+        turn(&core, "Back again.", Some(space.clone()), None);
+
+        let at_pinned: Vec<String> = keys(&pinned).into_iter().map(Option::unwrap).collect();
+        let at_local: Vec<String> = keys(&local).into_iter().map(Option::unwrap).collect();
+        assert_eq!((at_pinned.len(), at_local.len()), (2, 1));
+        assert!(
+            !at_pinned.contains(&at_local[0]),
+            "the local key never reaches the pinned endpoint"
+        );
+        assert_ne!(
+            at_pinned[0], at_pinned[1],
+            "and the pinned lineage starts over on return"
+        );
+
+        // Re-asserting the same configuration is not a change.
+        core.runtime()
+            .block_on(core.set_base_url(pinned.base_url.clone()))
+            .expect("same URL");
+        assert_eq!(
+            lineages(&core).len(),
+            1,
+            "a write that changed nothing keeps the key"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// When a request counts as a key's use: only once it may have left.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_delivered_request_records_its_attempt_as_the_keys_last_use() {
+    run(|| {
+        let (_mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        let (generation, born, used) = lineage_times(&core, &first.space_id);
+        assert_eq!(born, used, "a fresh key is born used at its attempt");
+        core.test_advance_cache_clock(100_000);
+        turn(&core, "Later.", Some(first.space_id.clone()), None);
+        let (g, b, u) = lineage_times(&core, &first.space_id);
+        assert_eq!((g, b), (generation, born), "the same key");
+        assert!(
+            u >= used + 100_000,
+            "its use moved to the second attempt: {used} → {u}"
+        );
+    });
+}
+
+/// A request refused at connect never left: it must not renew the lineage's
+/// idle clock, or a later reuse could link requests further apart than the
+/// idle TTL the catalog promised.
+#[test]
+fn a_request_that_never_left_does_not_count_as_a_use() {
+    run(|| {
+        let close = chat_harness::CloseSwitch::default();
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            close_switch: close.clone(),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let first = turn(&core, "How do tides work?", None, None);
+        let before = lineage_times(&core, &first.space_id);
+        core.test_advance_cache_clock(100_000);
+        // The next catalog fetch is answered, then the listener goes away.
+        close.arm();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let err = core
+            .runtime()
+            .block_on(core.chat_stream_reply(
+                "Refused.".into(),
+                MODEL.into(),
+                Some(first.space_id.clone()),
+                None,
+                tx,
+            ))
+            .expect_err("the completion's connection is refused");
+        assert!(matches!(err, AppError::Network { .. }), "{err:?}");
+        assert_eq!(
+            lineage_times(&core, &first.space_id),
+            before,
+            "nothing left, so nothing was used"
+        );
+    });
+}
+
+/// A connection that drops after the request was written may have delivered
+/// it: counted as used, at the attempt time.
+#[test]
+fn a_request_whose_delivery_is_unknown_counts_as_a_use_at_its_attempt() {
+    run(|| {
+        let (_mock, core, _dir) = cache_setup(ChatBehavior::DropBeforeResponse);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let space = core
+            .runtime()
+            .block_on(core.post_reply("How do tides work?".into(), None, None))
+            .expect("post")
+            .space_id;
+        let ask = |prompt: &str| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+            core.runtime()
+                .block_on(core.chat_stream_reply(
+                    prompt.into(),
+                    MODEL.into(),
+                    Some(space.clone()),
+                    None,
+                    tx,
+                ))
+                .expect_err("the connection drops")
+        };
+        drop(tx);
+        ask("First.");
+        let (generation, _, used) = lineage_times(&core, &space);
+        core.test_advance_cache_clock(100_000);
+        ask("Second.");
+        let (g, _, u) = lineage_times(&core, &space);
+        assert_eq!(g, generation);
+        assert!(
+            u >= used + 100_000,
+            "an unknown delivery is a use: {used} → {u}"
+        );
+    });
+}
+
+/// **A key is judged when it becomes observable, not when its request was
+/// built.** Connection setup — TCP, TLS, the peer's attestation — or a process
+/// suspended in between can take a request past the idle TTL after it was
+/// prepared; the key must still be retired, because the engine's cache is.
+#[test]
+fn a_key_is_judged_when_its_request_is_written_not_when_it_was_built() {
+    run(|| {
+        let (mock, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, "How do tides work?", None, None);
+        // Prepared comfortably inside the idle TTL…
+        core.test_advance_cache_clock(CACHE_IDLE_TTL_SECS * 1000 - 10_000);
+        // …but its connection takes twenty seconds to be ready to write.
+        core.test_delay_cache_clock_at_each_send(20_000);
+        turn(
+            &core,
+            "After a slow connection.",
+            Some(first.space_id.clone()),
+            None,
+        );
+        core.test_delay_cache_clock_at_each_send(0);
+        turn(&core, "Right after.", Some(first.space_id.clone()), None);
+
+        let sent: Vec<String> = keys(&mock).into_iter().map(Option::unwrap).collect();
+        assert_ne!(sent[0], sent[1], "idle past the TTL when written: rotated");
+        assert_eq!(sent[1], sent[2], "and the fresh key carries on");
+    });
+}
+
+/// **A model change forgets the key at the write**, so a change made through a
+/// model that sends no key cannot leave the first model's key standing:
+/// A (keyed) → B (unkeyed) → A again starts a new key.
+#[test]
+fn a_model_change_through_an_unkeyed_model_still_retires_the_key() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            list_flat_model: true,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let first = turn(&core, "How do tides work?", None, None);
+        let space = first.space_id.clone();
+        let agent = agent_of(&core, &space);
+        let set_model = |model: &str| {
+            core.runtime()
+                .block_on(core.update_space_participant(
+                    agent.clone(),
+                    eidola_app_core::ParticipantUpdate {
+                        label: None,
+                        model_ref: Some(Some(model.to_string())),
+                        system_prompt: None,
+                        notify_policy: None,
+                    },
+                    eidola_app_core::ExpectedScope::Any,
+                ))
+                .expect("set the model")
+        };
+        set_model(FLAT_MODEL);
+        assert!(
+            lineages(&core).is_empty(),
+            "the model change forgot the key at the write"
+        );
+        set_model(MODEL);
+        let asked = core
+            .runtime()
+            .block_on(core.post_reply("Back on the first model.".into(), Some(space.clone()), None))
+            .expect("post");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.respond_stream_as(space.clone(), agent.clone(), asked.action_id, tx))
+            .expect("answer");
+
+        let sent: Vec<String> = keys(&mock).into_iter().map(Option::unwrap).collect();
+        assert_eq!(sent.len(), 2);
+        assert_ne!(sent[0], sent[1], "A → B → A is a new key");
+    });
+}
+
+/// The same at the membership level: a shared agent's model override in one
+/// space forgets that lineage's key, and only that one.
+#[test]
+fn a_model_override_forgets_only_its_spaces_key() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            list_flat_model: true,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let first = turn(&core, "How do tides work?", None, None);
+        let home = first.space_id.clone();
+        let agent = agent_of(&core, &home);
+        core.runtime()
+            .block_on(core.promote_participant(agent.clone(), None, None))
+            .expect("share the agent");
+        let post = core
+            .runtime()
+            .block_on(core.post_reply("Elsewhere.".into(), None, None))
+            .expect("a new space");
+        core.runtime()
+            .block_on(core.add_global_participant(post.space_id.clone(), agent.clone(), None))
+            .expect("join");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.respond_stream_as(
+                post.space_id.clone(),
+                agent.clone(),
+                post.action_id,
+                tx,
+            ))
+            .expect("answer");
+        assert_eq!(lineages(&core).len(), 2);
+
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                post.space_id.clone(),
+                agent.clone(),
+                eidola_app_core::ParticipantOverride {
+                    label: None,
+                    model_ref: Some(Some(FLAT_MODEL.to_string())),
+                    system_prompt: None,
+                    notify_policy: None,
+                },
+            ))
+            .expect("override the model here");
+        let left = lineages(&core);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].0, home, "the other space's key is untouched");
+    });
+}
+
+/// **The eidola configuration and the keys it invalidates change together or
+/// not at all.** A failure forgetting the keys rolls the configuration write
+/// back with it: the error is reported, nothing is announced, the client still
+/// talks to the endpoint it did, and the lineage keeps its key.
+#[test]
+fn a_configuration_write_and_its_key_cleanup_are_one_transaction() {
+    run(|| {
+        let (pinned, core, _dir) = cache_setup(ChatBehavior::OkStreaming);
+        let elsewhere = core.runtime().block_on(chat_harness::start(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            ..MockConfig::default()
+        }));
+        let first = turn(&core, "How do tides work?", None, None);
+
+        core.test_fail_cache_key_cleanup(true);
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.set_base_url(elsewhere.base_url.clone()))
+            .expect_err("the cleanup failed, so the write did too");
+        assert!(
+            !drain(&mut rx).contains(&Change::Backends),
+            "a write that did not commit announces nothing"
+        );
+        core.test_fail_cache_key_cleanup(false);
+
+        assert_eq!(lineages(&core).len(), 1, "the key is still there");
+        turn(&core, "Still here?", Some(first.space_id.clone()), None);
+        assert_eq!(elsewhere.chat_hits(), 0, "the endpoint did not change");
+        let sent: Vec<String> = keys(&pinned).into_iter().map(Option::unwrap).collect();
+        assert_eq!(sent[0], sent[1], "and the lineage kept its key");
+
+        core.runtime()
+            .block_on(core.set_base_url(elsewhere.base_url.clone()))
+            .expect("without the fault, the write lands");
+        assert!(lineages(&core).is_empty());
+    });
+}
+
+// ===========================================================================
+// Issuance ahead of need, and issuance that survives a lost response
+// ===========================================================================
+
+/// A wallet that has spent lately and holds less than the provisioner's
+/// threshold: an explicit small allocation, then one turn spent from it.
+fn spend_from_a_small_credential(core: &AppCore, credits: i64) {
+    with_account(core);
+    core.runtime()
+        .block_on(core.account_allocate(credits))
+        .expect("a small explicit allocation");
+    core.runtime()
+        .block_on(core.chat("hello".into(), MODEL.into(), None))
+        .expect("the turn spends the small credential");
+}
+
+fn active_credentials(core: &AppCore) -> Vec<(i64, i64)> {
+    core.runtime()
+        .block_on(core.wallet_credentials())
+        .expect("active credentials")
+        .into_iter()
+        .map(|c| (c.credits, c.generation))
+        .collect()
+}
+
+/// A mock whose current issuer key is halfway through its issuing window, so
+/// a provisioner pass is never inside [`PROVISION_LATE_WINDOW`] whatever the
+/// wall clock reads. The production calendar's epochs turn over at a fixed
+/// weekday, and a pass in the hours before that defers.
+fn mid_epoch() -> MockConfig {
+    let (_, calendar) =
+        KeyWindow::epoch_ending_at(now_unix_secs() + WEEK_SECS / 2, WEEK_SECS as u64);
+    MockConfig {
+        issuer_calendar: Some(calendar),
+        ..MockConfig::default()
+    }
+}
+
+fn provision(core: &AppCore) -> ProvisionOutcome {
+    core.runtime()
+        .block_on(core.test_provision_once())
+        .expect("a provisioner pass")
+}
+
+/// Below the threshold, with recent spending and a funded account, one pass
+/// issues credentials of the standard size: one here, since the account's
+/// just-in-time issuance already makes it one of two under the key; the next
+/// pass finds the buffer covered and issues nothing.
+#[test]
+fn the_provisioner_tops_up_a_wallet_running_low() {
+    run(|| {
+        let (mock, core, _dir) = setup(mid_epoch());
+        spend_from_a_small_credential(&core, 100_000);
+        assert_eq!(mock.issuance_debits(), 1);
+
+        let outcome = provision(&core);
+        assert!(
+            matches!(outcome, ProvisionOutcome::Issued { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(mock.issuance_debits(), 2);
+        assert!(
+            active_credentials(&core).contains(&(DEFAULT_ALLOCATION_CREDITS, 0)),
+            "the background credential is the standard size: {:?}",
+            active_credentials(&core)
+        );
+
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+        assert_eq!(mock.issuance_debits(), 2, "a covered wallet issues nothing");
+    });
+}
+
+/// **Two credentials under each key the provisioner issues under**, so a
+/// request draining one and filling from another under that key is placed
+/// among every account that provisioned, not the heavy users. The account
+/// was issued one credential under the epoch just ended; under the new
+/// epoch's key it has none, so the provisioner issues two, both the standard
+/// size. Where the account already holds an issuance under the key (a
+/// just-in-time one), it issues one more ([`the_provisioner_tops_up_a_wallet_running_low`]).
+#[test]
+fn the_provisioner_issues_two_credentials_under_a_key_it_has_not_issued_under() {
+    run(|| {
+        let config = MockConfig::default();
+        let key_swap = config.key_swap.clone();
+        let deadline = config.key_deadline.clone();
+        let (mock, core, _dir) = setup(config);
+        let (boundary, _) = deadline.issuing_ends_in(&core, 6, WEEK_SECS as u64, false);
+        spend_from_a_small_credential(&core, 100_000);
+        assert_eq!(mock.issuance_debits(), 1);
+
+        key_swap.swap();
+        sleep_past_unix_secs(boundary);
+        let outcome = provision(&core);
+        let ProvisionOutcome::Issued { nonces } = outcome else {
+            panic!("got {outcome:?}");
+        };
+        assert_eq!(nonces.len(), 2, "two under the new key");
+        assert_eq!(mock.issuance_debits(), 3);
+        assert_eq!(
+            mock.issuance_debited_credits(),
+            100_000 + 2 * DEFAULT_ALLOCATION_CREDITS,
+            "both the one public denomination"
+        );
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+    });
+}
+
+/// **A pair interrupted by a lost response is finished on a later pass.**
+/// The first of the two issuances under a fresh key loses its response, so
+/// the pass ends there. The next pass recovers it, which covers the buffer,
+/// and still issues the second: the account ends up with two issuances under
+/// the key, as every provisioning account does. Then the buffer is covered.
+#[test]
+fn a_pair_interrupted_by_a_lost_response_is_finished_later() {
+    run(|| {
+        let config = MockConfig::default();
+        let key_swap = config.key_swap.clone();
+        let deadline = config.key_deadline.clone();
+        let (mock, core, _dir) = setup(config);
+        let (boundary, _) = deadline.issuing_ends_in(&core, 6, WEEK_SECS as u64, false);
+        spend_from_a_small_credential(&core, 100_000);
+
+        key_swap.swap();
+        sleep_past_unix_secs(boundary);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.test_provision_once())
+            .expect_err("the first issuance's response was lost");
+        assert_eq!(mock.issuance_debits(), 2);
+
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        let outcome = provision(&core);
+        let ProvisionOutcome::Issued { nonces } = outcome else {
+            panic!("got {outcome:?}");
+        };
+        assert_eq!(
+            nonces.len(),
+            1,
+            "the pair's second, after the first was recovered"
+        );
+        assert_eq!(mock.issuance_debits(), 3);
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+        assert_eq!(mock.issuance_debits(), 3);
+    });
+}
+
+/// The credential the provisioner issues is not the one the next request
+/// spends: what was already held still covers it, so the new credential's
+/// first spend waits for the reader's own use to exhaust the old one rather
+/// than following its issuance.
+#[test]
+fn a_background_credential_is_not_spent_by_the_next_request() {
+    run(|| {
+        let (mock, core, _dir) = setup(mid_epoch());
+        spend_from_a_small_credential(&core, 100_000);
+        assert!(matches!(provision(&core), ProvisionOutcome::Issued { .. }));
+
+        core.runtime()
+            .block_on(core.chat("again".into(), MODEL.into(), None))
+            .expect("the next turn");
+        assert_eq!(mock.chat_hits(), 2);
+        assert_eq!(mock.issuance_debits(), 2, "the next turn converted nothing");
+        assert!(
+            active_credentials(&core).contains(&(DEFAULT_ALLOCATION_CREDITS, 0)),
+            "the background credential is still unspent after the next turn: {:?}",
+            active_credentials(&core)
+        );
+    });
+}
+
+/// No buffer is kept for a wallet that has not spent: a credential issued for
+/// it would most likely lapse unspent. Nothing is sent to the server at all.
+#[test]
+fn the_provisioner_keeps_no_buffer_for_a_wallet_that_has_not_spent() {
+    run(|| {
+        let (mock, core, _dir) = setup(mid_epoch());
+        with_account(&core);
+        assert_eq!(provision(&core), ProvisionOutcome::Idle);
+        assert_eq!(mock.issuance_requests(), 0);
+        assert!(credential_states(&core).is_empty());
+    });
+}
+
+/// Without an account the provisioner does nothing.
+#[test]
+fn the_provisioner_does_nothing_without_an_account() {
+    run(|| {
+        let (mock, core, _dir) = setup(mid_epoch());
+        assert_eq!(provision(&core), ProvisionOutcome::NoAccount);
+        assert_eq!(mock.issuance_requests(), 0);
+    });
+}
+
+/// Below one standard allocation of balance nothing is issued in the
+/// background; the remainder is left for the just-in-time path, which still
+/// converts it when a request needs it.
+#[test]
+fn the_provisioner_never_issues_from_a_balance_below_a_standard_allocation() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            balance: DEFAULT_ALLOCATION_CREDITS - 1,
+            ..mid_epoch()
+        });
+        spend_from_a_small_credential(&core, 100_000);
+        assert_eq!(provision(&core), ProvisionOutcome::LowBalance);
+        assert_eq!(mock.issuance_debits(), 1);
+    });
+}
+
+/// A key whose credentials lapse within the provisioner's horizon is never
+/// issued under in the background: the credential would not count toward the
+/// buffer, and would lapse before it could carry the days ahead.
+#[test]
+fn the_provisioner_never_issues_under_a_key_about_to_lapse() {
+    run(|| {
+        // Six-hour epochs: the current key stops issuing in an hour and is
+        // accepted for six more, well inside the 24-hour horizon.
+        let (window, calendar) = KeyWindow::epoch_ending_at(now_unix_secs() + 3_600, 6 * 3_600);
+        let (mock, core, _dir) = setup(MockConfig {
+            key_window: Some(window),
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        });
+        spend_from_a_small_credential(&core, 100_000);
+        assert_eq!(provision(&core), ProvisionOutcome::NoUsableKey);
+        assert_eq!(mock.issuance_debits(), 1);
+    });
+}
+
+/// Late in a key's issuing window, with enough still held, the provisioner
+/// waits for the next key; with too little held it issues anyway.
+#[test]
+fn the_provisioner_prefers_a_keys_early_life() {
+    // The current key stops issuing in an hour, inside the late window, and
+    // its credentials are accepted for a further week.
+    let config = || {
+        let (window, calendar) =
+            KeyWindow::epoch_ending_at(now_unix_secs() + 3_600, WEEK_SECS as u64);
+        MockConfig {
+            key_window: Some(window),
+            issuer_calendar: Some(calendar),
+            ..MockConfig::default()
+        }
+    };
+    run(move || {
+        let (mock, core, _dir) = setup(config());
+        spend_from_a_small_credential(&core, 200_000);
+        assert_eq!(provision(&core), ProvisionOutcome::Deferred);
+        assert_eq!(mock.issuance_debits(), 1);
+    });
+    run(move || {
+        let (mock, core, _dir) = setup(config());
+        spend_from_a_small_credential(&core, 50_000);
+        assert!(matches!(provision(&core), ProvisionOutcome::Issued { .. }));
+        assert_eq!(mock.issuance_debits(), 2);
+    });
+}
+
+/// The running provisioner looks only after an interval drawn from its
+/// window — never at start, never in reaction to a request — and then issues.
+#[test]
+fn the_provisioner_issues_only_after_its_interval() {
+    run(|| {
+        let (mock, core, _dir) = setup(mid_epoch());
+        spend_from_a_small_credential(&core, 100_000);
+        let min = std::time::Duration::from_millis(600);
+        core.test_set_provision_interval(min, std::time::Duration::from_millis(900));
+        let started = std::time::Instant::now();
+        core.start_credential_provisioner();
+
+        // A request made right after start provokes nothing.
+        core.runtime()
+            .block_on(core.chat("right away".into(), MODEL.into(), None))
+            .expect("a turn");
+        assert_eq!(mock.issuance_debits(), 1, "nothing was issued at start");
+
+        let deadline = started + std::time::Duration::from_secs(10);
+        while mock.issuance_debits() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(mock.issuance_debits(), 2, "the provisioner issued once");
+        assert!(
+            elapsed >= min,
+            "the first look came {elapsed:?} after start, inside its {min:?} floor"
+        );
+    });
+}
+
+/// The just-in-time path still provisions a turn the wallet cannot cover,
+/// whatever the provisioner is doing.
+#[test]
+fn the_just_in_time_path_remains_the_fallback() {
+    run(|| {
+        let (mock, core, _dir) = setup(mid_epoch());
+        with_account(&core);
+        core.start_credential_provisioner();
+        core.runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect("an empty wallet still gets its turn");
+        assert_eq!(mock.issuance_debits(), 1);
+        assert_eq!(mock.chat_hits(), 1);
+    });
+}
+
+/// A response lost after the server debited (the connection closed before
+/// anything came back) is not lost value: the pending issuance survives a
+/// restart, and asking again under the same idempotency key gets the stored
+/// response — one debit, one credential.
+#[test]
+fn a_lost_issuance_response_is_recovered_without_a_second_debit() {
+    run(|| {
+        // The upstream runs on a runtime of its own so it outlives the core.
+        let mock_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("mock runtime");
+        let mock = mock_rt.block_on(chat_harness::start(MockConfig::default()));
+        let (_unused, core, dir) = setup(MockConfig::default());
+        core.runtime()
+            .block_on(core.set_base_url(mock.base_url.clone()))
+            .expect("point at the lasting upstream");
+        with_account(&core);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("the response never arrived");
+        assert_eq!(mock.issuance_debits(), 1);
+        assert!(credential_states(&core).is_empty());
+
+        // Too young to be asked for again: an original attempt could still be
+        // in flight on the server.
+        assert!(
+            core.runtime()
+                .block_on(core.recover_pending_issuances())
+                .expect("recovery")
+                .recovered
+                .is_empty()
+        );
+        assert_eq!(mock.issuance_requests(), 1, "nothing was resent");
+
+        // The process dies; the next one recovers it.
+        let base_url = mock.base_url.clone();
+        drop(core);
+        let core = chat_harness::reopen_core(&dir, &base_url);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_pending_issuances())
+            .expect("recovery")
+            .recovered;
+        assert_eq!(recovered.len(), 1, "the lost issuance came back");
+        assert_eq!(mock.issuance_requests(), 2);
+        assert_eq!(mock.issuance_debits(), 1, "the retry was not debited again");
+        assert_eq!(
+            active_credentials(&core),
+            vec![(DEFAULT_ALLOCATION_CREDITS, 0)]
+        );
+
+        // Recovered once, it is never asked for again.
+        assert!(
+            core.runtime()
+                .block_on(core.recover_pending_issuances())
+                .expect("recovery")
+                .recovered
+                .is_empty()
+        );
+        assert_eq!(mock.issuance_requests(), 2);
+    });
+}
+
+/// The provisioner's own pass recovers a lost issuance before deciding, so a
+/// background issuance whose response was lost is answered, not repeated.
+#[test]
+fn the_provisioner_recovers_a_lost_issuance_instead_of_issuing_again() {
+    run(|| {
+        let (mock, core, _dir) = setup(mid_epoch());
+        spend_from_a_small_credential(&core, 100_000);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.test_provision_once())
+            .expect_err("the background issuance's response was lost");
+        assert_eq!(mock.issuance_debits(), 2);
+
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+        assert_eq!(mock.issuance_debits(), 2, "recovered, not issued again");
+        assert!(active_credentials(&core).contains(&(DEFAULT_ALLOCATION_CREDITS, 0)));
+    });
+}
+
+/// An issuance the server refused debited nothing, so it is abandoned rather
+/// than asked for again.
+#[test]
+fn a_refused_issuance_is_not_asked_for_again() {
+    run(|| {
+        let (mock, core, _dir) = setup(mid_epoch());
+        let knobs = mock.issuance_knobs();
+        with_account(&core);
+        knobs.refuse_with(Some(402));
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("refused");
+        knobs.refuse_with(None);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        assert!(
+            core.runtime()
+                .block_on(core.recover_pending_issuances())
+                .expect("recovery")
+                .recovered
+                .is_empty()
+        );
+        assert_eq!(mock.issuance_requests(), 1, "a refusal is final");
+    });
+}
+
+/// A retry is only ever sent for the account the issuance was made for.
+#[test]
+fn a_pending_issuance_is_never_retried_for_another_account() {
+    run(|| {
+        let (mock, core, _dir) = setup(mid_epoch());
+        with_account(&core);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("lost");
+        core.reset_account().expect("sign out");
+        core.set_account_credentials(
+            "00000000-0000-0000-0000-000000000002".into(),
+            "other-secret".into(),
+        )
+        .expect("switch account");
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        assert!(
+            core.runtime()
+                .block_on(core.recover_pending_issuances())
+                .expect("recovery")
+                .recovered
+                .is_empty()
+        );
+        assert_eq!(mock.issuance_requests(), 1);
+    });
+}
+
+/// **What is held stays within the threshold plus two allocations**, even when
+/// a background issuance's response is lost and every retry of it fails. The
+/// lost issuance may already have been paid for, so it counts toward the
+/// buffer and nothing is issued beside it; without that, each pass whose
+/// recovery failed would convert another allocation. The mock refunds every
+/// charge in full, so everything it ever debited is still held.
+#[test]
+fn what_is_held_stays_within_the_threshold_plus_two_allocations() {
+    run(|| {
+        let (mock, core, _dir) = setup(mid_epoch());
+        spend_from_a_small_credential(&core, 100_000);
+        let bound = eidola_app_core::PROVISION_THRESHOLD_CREDITS
+            + eidola_app_core::PROVISION_CREDENTIALS_PER_KEY * DEFAULT_ALLOCATION_CREDITS;
+
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.test_provision_once())
+            .expect_err("the background issuance's response was lost");
+        assert_eq!(mock.issuance_debits(), 2);
+
+        // Inside the retry hold-off, and then with every retry failing.
+        let _ = provision(&core);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        mock.issuance_knobs().fail_retries(true);
+        for _ in 0..6 {
+            let _ = core.runtime().block_on(core.test_provision_once());
+            assert!(
+                mock.issuance_debited_credits() <= bound,
+                "{} credits converted, past the bound of {bound}",
+                mock.issuance_debited_credits()
+            );
+        }
+        assert_eq!(mock.issuance_debits(), 2, "nothing was issued beside it");
+
+        // Once a retry is answered, the stored response is what lands.
+        mock.issuance_knobs().fail_retries(false);
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+        assert_eq!(mock.issuance_debits(), 2);
+        assert!(active_credentials(&core).contains(&(DEFAULT_ALLOCATION_CREDITS, 0)));
+    });
+}
+
+/// An unresolved issuance too small to cover the buffer still holds off a
+/// fresh one: it may have been paid for, and issuing beside it is how what is
+/// held escapes its bound.
+#[test]
+fn an_unresolved_issuance_holds_off_a_fresh_one() {
+    run(|| {
+        let (mock, core, _dir) = setup(mid_epoch());
+        spend_from_a_small_credential(&core, 50_000);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(50_000))
+            .expect_err("lost");
+        assert_eq!(mock.issuance_debits(), 2);
+
+        assert_eq!(provision(&core), ProvisionOutcome::Unresolved);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        mock.issuance_knobs().fail_retries(true);
+        assert_eq!(provision(&core), ProvisionOutcome::Unresolved);
+        assert_eq!(mock.issuance_debits(), 2);
+    });
+}
+
+/// With the Eidola backend switched off, the provisioner sends nothing:
+/// neither a fresh issuance nor the retry of a pending one.
+#[test]
+fn the_provisioner_leaves_a_disabled_backend_alone() {
+    run(|| {
+        let (mock, core, _dir) = setup(mid_epoch());
+        spend_from_a_small_credential(&core, 100_000);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(50_000))
+            .expect_err("lost");
+        let requests = mock.issuance_requests();
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        core.runtime()
+            .block_on(core.set_backend_enabled("eidola".into(), false))
+            .expect("disable eidola");
+
+        assert_eq!(provision(&core), ProvisionOutcome::BackendDisabled);
+        assert_eq!(mock.issuance_requests(), requests, "nothing was sent");
+    });
+}
+
+/// A server that accepts an issuance and never answers holds nothing for
+/// long: the request is cut off at its deadline, the gate is free again, and
+/// the issuance is left pending to be asked for once the server answers.
+#[test]
+fn a_stalled_issuance_gives_up_at_its_deadline() {
+    run(|| {
+        let (mock, core, _dir) = setup(mid_epoch());
+        spend_from_a_small_credential(&core, 100_000);
+        core.test_set_issuance_timeouts(
+            std::time::Duration::from_millis(400),
+            std::time::Duration::from_secs(5),
+        );
+        mock.issuance_knobs().stall(true);
+        let started = std::time::Instant::now();
+        core.runtime()
+            .block_on(core.test_provision_once())
+            .expect_err("the stalled request is cut off");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the pass took {:?}",
+            started.elapsed()
+        );
+
+        mock.issuance_knobs().stall(false);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        assert_eq!(provision(&core), ProvisionOutcome::Covered);
+        assert_eq!(
+            mock.issuance_debits(),
+            2,
+            "the pending issuance landed once"
+        );
+    });
+}
+
+/// Waiting for the issuance gate is bounded: a turn that needs a just-in-time
+/// conversion while another issuance holds the gate — and it waits with
+/// `spend_gate` held, so every later paid turn would wait behind it — gives up
+/// with a typed timeout instead of waiting for that issuance's server.
+#[test]
+fn a_turn_waiting_on_a_stalled_issuance_times_out() {
+    run(|| {
+        let (mock, core, _dir) = setup(mid_epoch());
+        with_account(&core);
+        core.test_set_issuance_timeouts(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(400),
+        );
+        mock.issuance_knobs().stall(true);
+        std::thread::scope(|scope| {
+            let holder = scope.spawn(|| {
+                let _ = core
+                    .runtime()
+                    .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS));
+            });
+            while mock.issuance_requests() == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let started = std::time::Instant::now();
+            let err = core
+                .runtime()
+                .block_on(core.chat("hi".into(), MODEL.into(), None))
+                .expect_err("the gate is held by a stalled issuance");
+            assert!(
+                matches!(err, AppError::ProvisioningTimeout { .. }),
+                "got {err:?}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "the turn waited {:?}",
+                started.elapsed()
+            );
+            assert_eq!(mock.chat_hits(), 0);
+            mock.issuance_knobs().stall(false);
+            holder.join().unwrap();
+        });
+    });
+}
+
+/// A retry the gateway refuses at authentication (a relinked account whose
+/// secret was mistyped) proves nothing about the issuance it retries: the
+/// gateway checks the secret before it looks for the stored response. So the
+/// issuance stays pending, and once the secret is right it lands, debited
+/// once.
+#[test]
+fn a_retry_refused_at_authentication_is_kept_until_the_secret_is_right() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("lost");
+        assert_eq!(mock.issuance_debits(), 1);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+
+        // The same account relinked with a secret the gateway refuses.
+        mock.issuance_knobs().unauthorized(true);
+        assert!(
+            core.runtime()
+                .block_on(core.recover_pending_issuances())
+                .expect("recovery")
+                .recovered
+                .is_empty()
+        );
+        assert_eq!(
+            mock.issuance_requests(),
+            2,
+            "the retry was sent and refused"
+        );
+
+        // The secret corrected: the stored response is what lands.
+        mock.issuance_knobs().unauthorized(false);
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_pending_issuances())
+            .expect("recovery")
+            .recovered;
+        assert_eq!(recovered.len(), 1, "the paid issuance was not abandoned");
+        assert_eq!(mock.issuance_debits(), 1);
+        assert_eq!(
+            active_credentials(&core),
+            vec![(DEFAULT_ALLOCATION_CREDITS, 0)]
+        );
+    });
+}
+
+/// A retry refused on state that can change — the balance, the terms in force,
+/// or a key the gateway's database still has issuing — proves nothing about
+/// an original attempt that stalled before its debit and may still land. So
+/// the issuance stays pending through each such refusal, and once the
+/// original lands, the stored response is what the next retry recovers,
+/// debited once.
+#[test]
+fn a_retry_refused_while_its_original_may_still_land_is_kept() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        mock.issuance_knobs().hold_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("no answer");
+        assert_eq!(mock.issuance_debits(), 0, "the original has not landed");
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+
+        for status in [402, 428, 503] {
+            mock.issuance_knobs().refuse_with(Some(status));
+            let requests = mock.issuance_requests();
+            assert!(
+                core.runtime()
+                    .block_on(core.recover_pending_issuances())
+                    .expect("recovery")
+                    .recovered
+                    .is_empty()
+            );
+            assert_eq!(
+                mock.issuance_requests(),
+                requests + 1,
+                "the retry was sent and refused with {status}"
+            );
+        }
+        mock.issuance_knobs().refuse_with(None);
+
+        // The stalled original reaches its debit.
+        mock.land_held_issuances();
+        assert_eq!(mock.issuance_debits(), 1);
+
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_pending_issuances())
+            .expect("recovery")
+            .recovered;
+        assert_eq!(recovered.len(), 1, "the paid issuance was not abandoned");
+        assert_eq!(mock.issuance_debits(), 1);
+        assert_eq!(
+            active_credentials(&core),
+            vec![(DEFAULT_ALLOCATION_CREDITS, 0)]
+        );
+    });
+}
+
+/// Recovering a stranded hold is an unlinked request and nothing else: it
+/// sends nothing to the account surface, although an issuance of the
+/// account's is pending and old enough to be asked for again, and it does not
+/// wait on the issuance gate a stalled issuance holds.
+#[test]
+fn recovering_a_stranded_hold_sends_nothing_to_the_account_surface() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            refund: RefundMode::FailFirst(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the turn answers though its hold did not settle");
+        assert_eq!(
+            core.runtime()
+                .block_on(core.wallet_spending_credentials())
+                .expect("wallet")
+                .len(),
+            1
+        );
+
+        core.test_set_issuance_timeouts(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(400),
+        );
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        mock.issuance_knobs().stall(true);
+        let mut rx = core.subscribe_changes();
+        std::thread::scope(|scope| {
+            let requests = mock.issuance_requests();
+            let holder = scope.spawn(|| {
+                let _ = core
+                    .runtime()
+                    .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS));
+            });
+            while mock.issuance_requests() == requests {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let recovered = core
+                .runtime()
+                .block_on(core.recover_spending_credentials())
+                .expect("the issuance gate is not this recovery's to wait on");
+            assert_eq!(recovered.len(), 1, "the hold was settled");
+            mock.issuance_knobs().stall(false);
+            holder.join().unwrap();
+        });
+        assert!(drain(&mut rx).contains(&Change::Wallet));
+
+        // The stalled issuance is now pending and old enough to retry.
+        let requests = mock.issuance_requests();
+        assert!(
+            core.runtime()
+                .block_on(core.recover_spending_credentials())
+                .expect("recovery")
+                .is_empty()
+        );
+        assert_eq!(
+            mock.issuance_requests(),
+            requests,
+            "spend recovery asked the account surface for an issuance"
+        );
+    });
+}
+
+/// A hold left `spending` by a turn that is over is asked for again before
+/// anything is converted for the next request: the wallet's own value pays,
+/// and no issuance is made beside the spend.
+#[test]
+fn a_stranded_hold_is_asked_for_again_before_anything_is_converted() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            refund: RefundMode::FailFirst(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the turn answers though its hold did not settle");
+        assert_eq!(mock.issuance_debits(), 1);
+        assert_eq!(
+            core.runtime()
+                .block_on(core.wallet_spending_credentials())
+                .expect("wallet")
+                .len(),
+            1,
+            "the wallet's only credential is stranded"
+        );
+
+        core.runtime()
+            .block_on(core.chat("And the moon?".into(), MODEL.into(), None))
+            .expect("the next turn is paid from the recovered hold");
+        assert_eq!(
+            mock.issuance_debits(),
+            1,
+            "a second credential was converted beside a recoverable hold"
+        );
+    });
+}
+
+/// A request that waits on a stranded hold asks for it again while there is
+/// still time for the answer: a refund that became final during the wait
+/// pays the waiting turn, rather than settling just after it gave up.
+#[test]
+fn a_waiting_request_asks_again_in_time_for_the_answer() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            refund: RefundMode::ProvisionalFirst(2),
+            // Nothing more can be converted for the second request.
+            balance: 0,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect("the wallet's one credential");
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("the answer arrives; only its settlement waits");
+        assert_eq!(mock.refund_hits(), 1, "answered provisionally");
+
+        core.test_set_issuance_timeouts(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(2),
+        );
+        // Asked at once (still provisional), then again inside the wait
+        core.runtime()
+            .block_on(core.chat("and again".into(), MODEL.into(), None))
+            .expect("the hold settled in time to pay the waiting turn");
+        // (final by then); the fourth ask is the second turn's own settlement.
+        assert_eq!(mock.refund_hits(), 4);
+        assert_eq!(mock.issuance_debits(), 1);
+    });
+}
+
+/// The long-lived process asks again for a stranded hold on its own, at a
+/// time no request decides, and sends nothing for a backend turned off.
+#[test]
+fn the_long_lived_process_asks_again_for_a_stranded_hold() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            refund: RefundMode::FailFirst(1),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        core.runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the turn answers though its hold did not settle");
+        let spending = |core: &AppCore| {
+            core.runtime()
+                .block_on(core.wallet_spending_credentials())
+                .expect("wallet")
+                .len()
+        };
+        assert_eq!(spending(&core), 1);
+        let asked = mock.refund_hits();
+
+        core.runtime()
+            .block_on(core.set_backend_enabled("eidola".into(), false))
+            .expect("disable");
+        core.test_set_provision_interval(
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_millis(300),
+        );
+        core.start_credential_provisioner();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        assert_eq!(mock.refund_hits(), asked, "a disabled backend was asked");
+        assert_eq!(spending(&core), 1);
+
+        core.runtime()
+            .block_on(core.set_backend_enabled("eidola".into(), true))
+            .expect("enable");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while spending(&core) > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(spending(&core), 0, "nothing asked again for the hold");
+    });
+}
+
+/// A turn retried after its conversion's answer was lost converts nothing
+/// new and sends nothing to the account surface: the pending issuance may
+/// already have been paid for, so the turn is refused, however old the
+/// pending issuance is, until the issuance's own doors have asked for it
+/// again. One debit, however many attempts.
+#[test]
+fn a_turn_retried_after_a_lost_conversion_never_converts_again() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect_err("the conversion's answer never arrived");
+        assert_eq!(mock.issuance_debits(), 1);
+
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        for _ in 0..3 {
+            let err = core
+                .runtime()
+                .block_on(core.chat("hi".into(), MODEL.into(), None))
+                .expect_err("nothing is converted beside an unresolved issuance");
+            assert!(
+                matches!(err, AppError::ProvisioningTimeout { .. }),
+                "got {err:?}"
+            );
+        }
+        assert_eq!(
+            mock.issuance_requests(),
+            1,
+            "a retried turn converted again, or re-sent the pending issuance"
+        );
+
+        let recovery = core
+            .runtime()
+            .block_on(core.recover_pending_issuances())
+            .expect("recovery");
+        assert_eq!(recovery.recovered.len(), 1);
+        core.runtime()
+            .block_on(core.chat("hi".into(), MODEL.into(), None))
+            .expect("the recovered credential pays the turn");
+        assert_eq!(mock.issuance_requests(), 2);
+        assert_eq!(mock.issuance_debits(), 1, "the account was debited once");
+    });
+}
+
+/// A request that has just asked for a stranded hold sends nothing
+/// account-authenticated after it: with the hold still provisional and an
+/// issuance pending and old enough to retry, the request is refused without
+/// the retry, which stays with the provisioner and the explicit doors.
+#[test]
+fn a_request_never_retries_an_issuance_beside_a_spend_recovery() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat: ChatBehavior::OkBlockingNoInlineRefund,
+            refund: RefundMode::ProvisionalFirst(u64::MAX),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let allocate = |core: &AppCore| {
+            core.runtime()
+                .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+        };
+        allocate(&core).expect("the wallet's one credential");
+        core.runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("the answer arrives; only its settlement waits");
+        mock.issuance_knobs().lose_next(1);
+        allocate(&core).expect_err("lost");
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        core.test_set_issuance_timeouts(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(600),
+        );
+
+        let (asked, requests) = (mock.refund_hits(), mock.issuance_requests());
+        let err = core
+            .runtime()
+            .block_on(core.chat("and again".into(), MODEL.into(), None))
+            .expect_err("the hold is provisional and nothing may be converted");
+        assert!(
+            matches!(err, AppError::ProvisioningTimeout { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            mock.refund_hits() > asked,
+            "the stranded hold was asked for"
+        );
+        assert_eq!(
+            mock.issuance_requests(),
+            requests,
+            "an issuance retry followed the recovery of a spend"
+        );
+    });
+}
+
+/// A pending issuance blocks conversion, not payment: a request made while
+/// another turn is flying with the wallet's only credential still waits for
+/// that turn's refund and is paid by it.
+#[test]
+fn a_pending_issuance_does_not_stop_a_request_waiting_for_a_refund() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            chat_delay_ms: 600,
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let allocate = |core: &AppCore| {
+            core.runtime()
+                .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+        };
+        allocate(&core).expect("the wallet's one credential");
+        mock.issuance_knobs().lose_next(1);
+        allocate(&core).expect_err("lost");
+        let requests = mock.issuance_requests();
+
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                core.runtime()
+                    .block_on(core.chat("first".into(), MODEL.into(), None))
+            });
+            while mock.chat_hits() == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            core.runtime()
+                .block_on(core.chat("second".into(), MODEL.into(), None))
+                .expect("paid by the first turn's refund");
+            first.join().unwrap().expect("the first turn");
+        });
+        assert_eq!(mock.chat_hits(), 2);
+        assert_eq!(mock.issuance_requests(), requests, "nothing was converted");
+    });
+}
+
+/// The explicit door follows the same rule: repeated after a lost answer, it
+/// recovers the conversion already made and converts nothing new in that
+/// call.
+#[test]
+fn an_explicit_conversion_repeated_after_a_lost_answer_recovers_it_instead() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        mock.issuance_knobs().lose_next(1);
+        let allocate = |core: &AppCore| {
+            core.runtime()
+                .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+        };
+        allocate(&core).expect_err("lost");
+        let err = allocate(&core).expect_err("unresolved");
+        assert!(
+            matches!(err, AppError::ProvisioningTimeout { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(mock.issuance_requests(), 1);
+
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        let err = allocate(&core).expect_err("recovered, nothing new converted");
+        assert!(matches!(err, AppError::Credential { .. }), "got {err:?}");
+        assert_eq!(mock.issuance_debits(), 1);
+        assert_eq!(
+            active_credentials(&core),
+            vec![(DEFAULT_ALLOCATION_CREDITS, 0)]
+        );
+
+        allocate(&core).expect("with nothing pending, the door converts");
+        assert_eq!(mock.issuance_debits(), 2);
+    });
+}
+
+/// A first attempt answered with a status the gateway's issuance path never
+/// gives proves nothing about a debit, so the issuance stays pending and is
+/// asked for again.
+#[test]
+fn a_first_attempt_refused_by_something_else_stays_pending() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig::default());
+        with_account(&core);
+        mock.issuance_knobs().refuse_with(Some(404));
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("refused");
+        mock.issuance_knobs().refuse_with(None);
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        let recovery = core
+            .runtime()
+            .block_on(core.recover_pending_issuances())
+            .expect("recovery");
+        assert_eq!(recovery.recovered.len(), 1, "the issuance was abandoned");
+    });
+}
+
+/// The provisioner issues only under a key the client's calendar and epoch
+/// record accept: a server that lists a second key for an epoch the client
+/// already holds a key for is refused before anything is debited, in the
+/// background as at every other door.
+#[test]
+fn the_provisioner_never_issues_under_a_refused_key() {
+    run(|| {
+        let config = MockConfig::default();
+        let swap = config.key_swap.clone();
+        let (mock, core, _dir) = setup(config);
+        spend_from_a_small_credential(&core, 100_000);
+        swap.swap();
+        let err = core
+            .runtime()
+            .block_on(core.test_provision_once())
+            .expect_err("a second key for the epoch is refused");
+        assert!(
+            matches!(
+                err,
+                AppError::IssuerKeyRefused {
+                    refusal: IssuerKeyRefusal::SecondKeyForEpoch { .. }
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(mock.issuance_debits(), 1, "nothing was issued under it");
+    });
+}
+
+/// A pending issuance is asked for again under the key it was made under,
+/// even once the epoch has moved and the server lists another key as current:
+/// the stored response answers it, whatever is current now. (Recovery stops
+/// at the key's spend deadline, inside the server's retention of the stored
+/// response.)
+#[test]
+fn a_pending_issuance_is_retried_under_its_own_key_after_the_epoch_moves() {
+    run(|| {
+        let config = MockConfig::default();
+        let swap = config.key_swap.clone();
+        let deadline = config.key_deadline.clone();
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+        // Twenty-minute epochs, the current one ending in three seconds.
+        let (boundary, _) = deadline.issuing_ends_in(&core, 3, 20 * 60, false);
+        mock.issuance_knobs().lose_next(1);
+        core.runtime()
+            .block_on(core.account_allocate(DEFAULT_ALLOCATION_CREDITS))
+            .expect_err("lost");
+
+        sleep_past_unix_secs(boundary);
+        // The next epoch, honestly under a key of its own.
+        swap.swap();
+        core.test_set_issuance_settle_age(std::time::Duration::ZERO);
+        let recovered = core
+            .runtime()
+            .block_on(core.recover_pending_issuances())
+            .expect("recovery")
+            .recovered;
+        assert_eq!(
+            recovered.len(),
+            1,
+            "a retry naming the new key would not match what was stored"
+        );
+        assert_eq!(mock.issuance_debits(), 1);
+    });
+}
+
+// ===========================================================================
+// Hash-keyed models: an Eidola model reference (`tag`, `tag@sha256:<hex>`,
+// `sha256:<hex>`) is matched against the catalog as the gateway resolves it,
+// and every request of a turn names the weights the turn resolved to.
+// ===========================================================================
+
+const HASH_1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const HASH_2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+/// A followed tag is pinned to the hash the catalog gives it when the turn
+/// starts, on **every** request of the turn — the tool round and the answer
+/// after it — so a release moving the tag mid-turn cannot split one turn
+/// across two sets of weights. Each action records the hash it came from;
+/// the selection itself stays the tag.
+#[test]
+fn every_round_of_a_turn_names_the_hash_its_tag_resolved_to() {
+    run(|| {
+        let script = chat_harness::tool_script();
+        let config = MockConfig {
+            chat: ChatBehavior::ToolScript,
+            tool_script: script.clone(),
+            ..MockConfig::default()
+        };
+        *config.published_sha256.lock().unwrap() = Some(HASH_1.to_string());
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+        with_echo_tool(&core);
+
+        *script.lock().unwrap() = vec![(TOOL_NAME.to_string(), r#"{"text":"x"}"#.to_string())];
+        let result = core
+            .runtime()
+            .block_on(core.chat("use the tool".into(), MODEL.into(), None))
+            .expect("turn");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2, "a tool round and the answer");
+        for body in &bodies {
+            assert_eq!(body["model"], format!("{MODEL}@sha256:{HASH_1}"));
+        }
+        assert_eq!(result.model, MODEL, "the selection stays the tag");
+        let actions = core
+            .runtime()
+            .block_on(core.test_space_actions(result.space_id))
+            .expect("actions");
+        let paid: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a.action_type.as_str(), "tool_call" | "inference"))
+            .collect();
+        assert_eq!(paid.len(), 2);
+        for action in paid {
+            assert_eq!(action.model.as_deref(), Some(MODEL));
+            assert_eq!(
+                action.model_sha256.as_deref(),
+                Some(HASH_1),
+                "{}",
+                action.action_type
+            );
+        }
+    });
+}
+
+/// When a release moves the tag, the next turn follows it, and the record
+/// says which weights each answer came from — what the client's "model
+/// updated" notice compares. A gateway that publishes no hashes leaves the
+/// reference as the tag and records none.
+#[test]
+fn a_followed_tag_moves_with_the_catalog_and_the_record_says_which_weights_answered() {
+    run(|| {
+        let config = MockConfig::default();
+        let published = config.published_sha256.clone();
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("before any hash".into(), MODEL.into(), None))
+            .expect("turn 1");
+        let space = first.space_id.clone();
+        *published.lock().unwrap() = Some(HASH_1.to_string());
+        core.runtime()
+            .block_on(core.chat(
+                "on the first weights".into(),
+                MODEL.into(),
+                Some(space.clone()),
+            ))
+            .expect("turn 2");
+        *published.lock().unwrap() = Some(HASH_2.to_string());
+        core.runtime()
+            .block_on(core.chat(
+                "after the tag moved".into(),
+                MODEL.into(),
+                Some(space.clone()),
+            ))
+            .expect("turn 3");
+
+        let models: Vec<String> = mock
+            .chat_bodies()
+            .iter()
+            .map(|b| b["model"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            models,
+            [
+                MODEL.to_string(),
+                format!("{MODEL}@sha256:{HASH_1}"),
+                format!("{MODEL}@sha256:{HASH_2}"),
+            ]
+        );
+        let answered: Vec<Option<String>> = core
+            .runtime()
+            .block_on(core.test_space_actions(space))
+            .expect("actions")
+            .into_iter()
+            .filter(|a| a.action_type == "inference")
+            .map(|a| a.model_sha256)
+            .collect();
+        assert_eq!(
+            answered,
+            [None, Some(HASH_1.to_string()), Some(HASH_2.to_string())]
+        );
+    });
+}
+
+/// A pin is stored qualified (`tag@sha256:<hex>@eidola`), matched in the
+/// catalog by its hash alone, and sent bare; once the catalog no longer
+/// carries those weights it is refused by name before anything is spent,
+/// rather than answered by whatever the tag names now.
+#[test]
+fn a_pin_is_matched_by_its_hash_and_refused_by_name_when_its_weights_are_gone() {
+    run(|| {
+        let config = MockConfig::default();
+        let published = config.published_sha256.clone();
+        *published.lock().unwrap() = Some(HASH_1.to_string());
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+        let pin = format!("{MODEL}@sha256:{HASH_1}");
+        let selection = format!("{pin}@eidola");
+
+        let result = core
+            .runtime()
+            .block_on(core.chat("pinned".into(), selection.clone(), None))
+            .expect("pinned turn");
+        assert_eq!(mock.chat_bodies()[0]["model"], pin);
+        assert_eq!(
+            result.model, selection,
+            "a pin's canonical spelling is qualified"
+        );
+
+        // The bare spelling of the same pin reaches the same weights.
+        core.runtime()
+            .block_on(core.chat(
+                "bare pin".into(),
+                pin.clone(),
+                Some(result.space_id.clone()),
+            ))
+            .expect("bare pinned turn");
+        assert_eq!(mock.chat_bodies()[1]["model"], pin);
+
+        *published.lock().unwrap() = Some(HASH_2.to_string());
+        match core.runtime().block_on(core.chat(
+            "after".into(),
+            selection.clone(),
+            Some(result.space_id),
+        )) {
+            Err(AppError::ModelUnavailable { model }) => assert_eq!(model, selection),
+            other => panic!("expected ModelUnavailable, got {other:?}"),
+        }
+        assert_eq!(
+            mock.chat_bodies().len(),
+            2,
+            "nothing was sent for the refused pin"
+        );
+    });
+}
+
+/// **An answer from new weights announces the roster.** A participant's
+/// "model updated" notice compares the hash its last answer came from with
+/// what the tag names now, and the surfaces that show notices refresh on
+/// `Change::Participants` — so the turn whose answer first comes from the new
+/// weights is the write that changes the notice, and it says so. The first
+/// hash ever recorded and an answer from the same weights again change no
+/// notice, and announce nothing.
+#[test]
+fn an_answer_from_new_weights_announces_the_participants_change() {
+    run(|| {
+        let config = MockConfig::default();
+        let published = config.published_sha256.clone();
+        *published.lock().unwrap() = Some(HASH_1.to_string());
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        let participants_in = |rx: &mut tokio::sync::broadcast::Receiver<ChangeEvent>| {
+            drain(rx)
+                .into_iter()
+                .filter(|c| matches!(c, Change::Participants))
+                .count()
+        };
+
+        let mut rx = core.subscribe_changes();
+        let first = core
+            .runtime()
+            .block_on(core.chat("first".into(), MODEL.into(), None))
+            .expect("turn 1");
+        let space = first.space_id.clone();
+        assert_eq!(participants_in(&mut rx), 0, "a first hash moves no notice");
+
+        core.runtime()
+            .block_on(core.chat("same weights".into(), MODEL.into(), Some(space.clone())))
+            .expect("turn 2");
+        assert_eq!(
+            participants_in(&mut rx),
+            0,
+            "the same weights again move nothing"
+        );
+
+        *published.lock().unwrap() = Some(HASH_2.to_string());
+        core.runtime()
+            .block_on(core.chat("new weights".into(), MODEL.into(), Some(space.clone())))
+            .expect("turn 3");
+        assert_eq!(
+            participants_in(&mut rx),
+            1,
+            "the answer from new weights announces the roster once"
+        );
+
+        core.runtime()
+            .block_on(core.chat("settled".into(), MODEL.into(), Some(space)))
+            .expect("turn 4");
+        assert_eq!(participants_in(&mut rx), 0);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Notices, identity and the notice actions, end to end over a fixture catalog
+// (a fixture can move a tag and retire weights, which the shipped one does not).
+// ---------------------------------------------------------------------------
+
+use eidola_app_core::model_catalog::{CatalogRow, Lifecycle, ModelNotice, WeightsFile};
+
+const FIXTURE_FILES: &[WeightsFile] = &[WeightsFile {
+    path: "model.safetensors",
+    size: 9,
+    sha256: "5555555555555555555555555555555555555555555555555555555555555555",
+}];
+
+/// The catalog a client built after a release moved [`MODEL`] from
+/// [`HASH_1`] (now deprecated) to [`HASH_2`].
+const MOVED_CATALOG: &[CatalogRow] = &[
+    CatalogRow {
+        sha256: HASH_2,
+        tags: &[MODEL],
+        name: "Fixture",
+        repo: "example/fixture",
+        revision: "6666666666666666666666666666666666666666",
+        files: FIXTURE_FILES,
+        lifecycle: Lifecycle::Current,
+    },
+    CatalogRow {
+        sha256: HASH_1,
+        tags: &[],
+        name: "Fixture (previous)",
+        repo: "example/fixture",
+        revision: "7777777777777777777777777777777777777777",
+        files: FIXTURE_FILES,
+        lifecycle: Lifecycle::Deprecated {
+            retire_after: "2099-01-01",
+        },
+    },
+];
+
+/// The participant answering as [`MODEL`] in `space`.
+fn answering(core: &AppCore, space: &str) -> eidola_app_core::ParticipantInfo {
+    core.runtime()
+        .block_on(core.list_space_participants(space.to_string()))
+        .expect("participants")
+        .into_iter()
+        .find(|p| p.model_ref.as_deref() == Some(MODEL))
+        .expect("the answering agent")
+}
+
+/// A followed tag that moved shows "model updated" after an answer from the
+/// earlier weights; dismissing it writes the acknowledgement, announces the
+/// roster, and keeps it dismissed; dismissing again is refused as stale.
+#[test]
+fn a_moved_tags_update_notice_is_shown_and_can_be_dismissed() {
+    run(|| {
+        let config = MockConfig::default();
+        *config.published_sha256.lock().unwrap() = Some(HASH_1.to_string());
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        core.test_set_model_catalog(MOVED_CATALOG);
+
+        let first = core
+            .runtime()
+            .block_on(core.chat("on the old weights".into(), MODEL.into(), None))
+            .expect("turn");
+        let space = first.space_id.clone();
+        let agent = answering(&core, &space);
+        assert_eq!(
+            agent.model_notices,
+            vec![ModelNotice::Updated {
+                tag: MODEL.into(),
+                previous_sha256: HASH_1.into(),
+                current_sha256: HASH_2.into(),
+            }]
+        );
+
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.dismiss_model_update(space.clone(), agent.id.clone()))
+            .expect("dismiss");
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Change::Participants))
+        );
+        assert_eq!(answering(&core, &space).model_notices, vec![]);
+        match core
+            .runtime()
+            .block_on(core.dismiss_model_update(space, agent.id))
+        {
+            Err(AppError::ModelNoticeStale { .. }) => {}
+            other => panic!("expected ModelNoticeStale, got {other:?}"),
+        }
+        assert_eq!(drain(&mut rx), vec![], "a stale dismissal says nothing");
+    });
+}
+
+/// A pin whose tag has moved is offered the newer weights (and told its own
+/// retire); the one-click switch re-pins it to them in this conversation,
+/// after which nothing is left to say and a second switch is refused.
+#[test]
+fn a_pin_whose_tag_moved_can_switch_to_the_newer_weights() {
+    run(|| {
+        let config = MockConfig::default();
+        *config.published_sha256.lock().unwrap() = Some(HASH_1.to_string());
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        core.test_set_model_catalog(MOVED_CATALOG);
+        let first = core
+            .runtime()
+            .block_on(core.chat("hello".into(), MODEL.into(), None))
+            .expect("turn");
+        let space = first.space_id.clone();
+        let agent = answering(&core, &space);
+        let old_pin = format!("{MODEL}@sha256:{HASH_1}@eidola");
+        if agent.source == "referenced" {
+            core.runtime()
+                .block_on(core.set_space_participant_override(
+                    space.clone(),
+                    agent.id.clone(),
+                    eidola_app_core::ParticipantOverride {
+                        model_ref: Some(Some(old_pin.clone())),
+                        ..Default::default()
+                    },
+                ))
+                .expect("pin");
+        } else {
+            core.runtime()
+                .block_on(core.update_space_participant(
+                    agent.id.clone(),
+                    eidola_app_core::ParticipantUpdate {
+                        label: None,
+                        model_ref: Some(Some(old_pin.clone())),
+                        system_prompt: None,
+                        notify_policy: None,
+                    },
+                    eidola_app_core::ExpectedScope::Any,
+                ))
+                .expect("pin");
+        }
+        let pinned = core
+            .runtime()
+            .block_on(core.list_space_participants(space.clone()))
+            .expect("participants")
+            .into_iter()
+            .find(|p| p.id == agent.id)
+            .unwrap();
+        assert_eq!(
+            pinned.model_notices,
+            vec![
+                ModelNotice::NewerAvailable {
+                    tag: MODEL.into(),
+                    newer_sha256: HASH_2.into(),
+                },
+                ModelNotice::Retiring {
+                    retire_after: "2099-01-01".into(),
+                    past: false,
+                },
+            ]
+        );
+
+        let mut rx = core.subscribe_changes();
+        let selection = core
+            .runtime()
+            .block_on(core.switch_to_newer_weights(space.clone(), agent.id.clone()))
+            .expect("switch");
+        assert_eq!(selection, format!("{MODEL}@sha256:{HASH_2}@eidola"));
+        assert_eq!(drain(&mut rx), vec![Change::Participants]);
+        let switched = core
+            .runtime()
+            .block_on(core.list_space_participants(space.clone()))
+            .expect("participants")
+            .into_iter()
+            .find(|p| p.id == agent.id)
+            .unwrap();
+        assert_eq!(switched.model_ref.as_deref(), Some(selection.as_str()));
+        assert_eq!(switched.model_notices, vec![]);
+        assert!(matches!(
+            core.runtime()
+                .block_on(core.switch_to_newer_weights(space, agent.id)),
+            Err(AppError::ModelNoticeStale { .. })
+        ));
+        assert_eq!(drain(&mut rx), vec![], "a stale switch says nothing");
+    });
+}
+
+/// A model's identity, and the pins a picker offers, come from the catalog:
+/// the hash, its source and manifest, the page to check them against.
+#[test]
+fn a_models_identity_and_pins_come_from_the_catalog() {
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig::default());
+        assert!(
+            core.model_identity(MODEL).is_none(),
+            "the shipped catalog does not list the harness's model"
+        );
+        core.test_set_model_catalog(MOVED_CATALOG);
+        let identity = core.model_identity(MODEL).expect("identity");
+        assert_eq!(identity.sha256, HASH_2);
+        assert_eq!(identity.repo, "example/fixture");
+        assert_eq!(identity.files.len(), 1);
+        assert_eq!(
+            identity.doc_url,
+            eidola_app_core::model_catalog::MODEL_IDENTITY_DOC
+        );
+        let pinned = core
+            .model_identity(&format!("{MODEL}@sha256:{HASH_1}@eidola"))
+            .expect("pinned identity");
+        assert_eq!(pinned.lifecycle, "deprecated");
+        assert!(core.model_identity("gemma-4-e2b@local").is_none());
+        assert_eq!(
+            core.model_pins(),
+            vec![(MODEL.to_string(), format!("{MODEL}@sha256:{HASH_2}@eidola"))]
+        );
+    });
+}
+
+/// With no seam, the core reads the catalog compiled into it: every served
+/// shipped row has its identity by each tag, by its pin and by its hash, a
+/// pin offered per tag, and a current row raises no notice for a selection
+/// whose last answer came from those weights.
+#[test]
+fn the_shipped_catalogs_models_have_identities_and_pins() {
+    use eidola_app_core::model_catalog::{CATALOG, notices};
+    run(|| {
+        let (_mock, core, _dir) = setup(MockConfig::default());
+        let served: Vec<&CatalogRow> = CATALOG
+            .iter()
+            .filter(|r| !matches!(r.lifecycle, Lifecycle::Retired { .. }))
+            .collect();
+        assert!(!served.is_empty(), "the shipped catalog serves a model");
+        let pins = core.model_pins();
+        for row in served {
+            for tag in row.tags {
+                let pin = format!("{tag}@sha256:{}@eidola", row.sha256);
+                for selection in [
+                    tag.to_string(),
+                    format!("{tag}@eidola"),
+                    pin.clone(),
+                    format!("sha256:{}", row.sha256),
+                ] {
+                    let identity = core.model_identity(&selection).expect(&selection);
+                    assert_eq!(identity.sha256, row.sha256, "{selection}");
+                    assert_eq!(identity.repo, row.repo);
+                    assert_eq!(identity.revision, row.revision);
+                    assert_eq!(identity.files.len(), row.files.len());
+                    for (shown, file) in identity.files.iter().zip(row.files) {
+                        assert_eq!(
+                            (shown.path.as_str(), shown.size, shown.sha256.as_str()),
+                            (file.path, file.size, file.sha256)
+                        );
+                    }
+                }
+                assert!(
+                    pins.contains(&(tag.to_string(), pin)),
+                    "{tag} is offered pinned"
+                );
+                if row.lifecycle == Lifecycle::Current {
+                    assert_eq!(
+                        notices(CATALOG, tag, Some(row.sha256), None, "2026-11-11"),
+                        vec![],
+                        "{tag}"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// **A continuation is asked of the weights that wrote what it continues.**
+/// With the tag where it was, the continuation names those weights and
+/// records them; once a release has moved the tag and those weights are no
+/// longer served, it is refused by name before anything is spent, rather
+/// than finished by other weights under the same tag.
+#[test]
+fn a_continuation_is_pinned_to_the_weights_that_wrote_the_partial_answer() {
+    run(|| {
+        let config = MockConfig {
+            chat: ChatBehavior::ContinueAfterLength {
+                cut: Cut::Answer,
+                again: false,
+            },
+            ..MockConfig::default()
+        };
+        let published = config.published_sha256.clone();
+        *published.lock().unwrap() = Some(HASH_1.to_string());
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+
+        // The tag where it was: continued on the same weights.
+        let cut = core
+            .runtime()
+            .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+            .expect("the cut-off turn");
+        let res = core
+            .runtime()
+            .block_on(core.continue_answer(cut.response_action_id.clone().unwrap()))
+            .expect("the continuation");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies[1]["model"], format!("{MODEL}@sha256:{HASH_1}"));
+        let recorded: Vec<Option<String>> = core
+            .runtime()
+            .block_on(core.test_space_actions(cut.space_id.clone()))
+            .expect("actions")
+            .into_iter()
+            .filter(|a| a.action_type == "inference")
+            .map(|a| a.model_sha256)
+            .collect();
+        assert!(
+            recorded.iter().all(|h| h.as_deref() == Some(HASH_1)),
+            "{recorded:?}"
+        );
+        assert!(!res.truncated);
+
+        // Cut again, then the tag moves and the old weights are gone.
+        let cut = core
+            .runtime()
+            .block_on(core.chat(
+                "And the moon?".into(),
+                MODEL.into(),
+                Some(cut.space_id.clone()),
+            ))
+            .expect("the second cut-off turn");
+        *published.lock().unwrap() = Some(HASH_2.to_string());
+        let sent = mock.chat_bodies().len();
+        match core
+            .runtime()
+            .block_on(core.continue_answer(cut.response_action_id.clone().unwrap()))
+        {
+            Err(AppError::ModelUnavailable { model }) => assert_eq!(model, MODEL),
+            other => panic!("expected ModelUnavailable, got {other:?}"),
+        }
+        assert_eq!(mock.chat_bodies().len(), sent, "nothing was sent");
+    });
+}
+
+/// A cut-off answer from [`HASH_1`], then the release that moves [`MODEL`]'s
+/// tag to [`HASH_2`] with the earlier weights still served, then a second
+/// (cut-off) answer in the same space from the new weights: `(mock, core,
+/// dir, the first turn)`.
+fn an_answer_on_each_side_of_a_tag_move(
+    config: MockConfig,
+) -> (
+    MockServer,
+    AppCore,
+    tempfile::TempDir,
+    eidola_app_core::ChatResult,
+) {
+    let config = MockConfig {
+        chat: ChatBehavior::ContinueAfterLength {
+            cut: Cut::Answer,
+            again: false,
+        },
+        ..config
+    };
+    let published = config.published_sha256.clone();
+    let untagged = config.untagged_sha256.clone();
+    *published.lock().unwrap() = Some(HASH_1.to_string());
+    let (mock, core, dir) = setup(config);
+    with_account(&core);
+    core.test_set_model_catalog(MOVED_CATALOG);
+    let first = core
+        .runtime()
+        .block_on(core.chat("How do tides work?".into(), MODEL.into(), None))
+        .expect("the answer from the earlier weights");
+    *published.lock().unwrap() = Some(HASH_2.to_string());
+    *untagged.lock().unwrap() = Some(HASH_1.to_string());
+    core.runtime()
+        .block_on(core.chat(
+            "And the moon?".into(),
+            MODEL.into(),
+            Some(first.space_id.clone()),
+        ))
+        .expect("the answer from the new weights");
+    (mock, core, dir, first)
+}
+
+/// **Continuing an answer from earlier weights does not raise "model
+/// updated" again.** The participant's later answer already came from the
+/// weights the tag names now; the continuation records the earlier weights
+/// on its own generation, and is not what the notice reads.
+#[test]
+fn continuing_an_earlier_weights_answer_raises_no_update_notice() {
+    run(|| {
+        let (mock, core, _dir, first) = an_answer_on_each_side_of_a_tag_move(MockConfig::default());
+        let space = first.space_id.clone();
+        assert_eq!(
+            answering(&core, &space).model_notices,
+            vec![],
+            "the answer from the new weights settled the notice (the premise)"
+        );
+
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.continue_answer(first.response_action_id.clone().unwrap()))
+            .expect("the continuation");
+        let bodies = mock.chat_bodies();
+        assert_eq!(
+            bodies.last().unwrap()["model"],
+            format!("{MODEL}@sha256:{HASH_1}"),
+            "asked of the weights that wrote the partial answer"
+        );
+        let continued = core
+            .runtime()
+            .block_on(core.test_space_actions(space.clone()))
+            .expect("actions")
+            .into_iter()
+            .rfind(|a| a.action_type == "inference")
+            .expect("the continued generation");
+        assert_eq!(continued.model_sha256.as_deref(), Some(HASH_1));
+        assert_eq!(answering(&core, &space).model_notices, vec![]);
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Change::Participants)),
+            "and it moved nothing the roster shows"
+        );
+    });
+}
+
+/// **A key is bound to the weights, not to the name that selected them.** A
+/// followed tag that moves rotates its lineage's key, and a continuation
+/// pinned to the earlier weights never carries the key a request to the
+/// current ones did: no key is seen with two weights hashes.
+#[test]
+fn no_key_reaches_two_weights_when_a_followed_tag_moves() {
+    run(|| {
+        let (mock, core, _dir, first) = an_answer_on_each_side_of_a_tag_move(MockConfig {
+            declared_prompt_cache: Some(supported_prompt_cache()),
+            ..MockConfig::default()
+        });
+        core.runtime()
+            .block_on(core.continue_answer(first.response_action_id.clone().unwrap()))
+            .expect("the continuation");
+
+        let sent: Vec<(String, String)> = mock
+            .chat_bodies()
+            .iter()
+            .map(|b| (b["model"].as_str().unwrap().to_string(), sent_key(b)))
+            .collect();
+        let old = format!("{MODEL}@sha256:{HASH_1}");
+        let new = format!("{MODEL}@sha256:{HASH_2}");
+        assert_eq!(
+            sent.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>(),
+            [old.as_str(), new.as_str(), old.as_str()]
+        );
+        assert_ne!(sent[0].1, sent[1].1, "the tag's move rotated the key");
+        assert_ne!(
+            sent[1].1, sent[2].1,
+            "the continuation does not carry the current weights' key"
+        );
+    });
+}
+
+/// **A failed generation is not an answer from new weights.** After the tag
+/// moves, a turn that errors upstream records which weights erred, but the
+/// participant's last answer is still the one from the earlier weights: the
+/// roster is not announced, and the next successful answer is the one that
+/// moves it.
+#[test]
+fn a_failed_generation_does_not_move_the_last_answers_weights() {
+    run(|| {
+        let config = MockConfig::default();
+        let published = config.published_sha256.clone();
+        let fail = config.fail_next_chat.clone();
+        *published.lock().unwrap() = Some(HASH_1.to_string());
+        let (_mock, core, _dir) = setup(config);
+        with_account(&core);
+        let first = core
+            .runtime()
+            .block_on(core.chat("first".into(), MODEL.into(), None))
+            .expect("turn 1");
+        let space = first.space_id.clone();
+
+        *published.lock().unwrap() = Some(HASH_2.to_string());
+        *fail.lock().unwrap() = Some(503);
+        let mut rx = core.subscribe_changes();
+        core.runtime()
+            .block_on(core.chat("fails".into(), MODEL.into(), Some(space.clone())))
+            .expect_err("the upstream refused");
+        let errored = core
+            .runtime()
+            .block_on(core.test_space_actions(space.clone()))
+            .expect("actions")
+            .into_iter()
+            .rfind(|a| a.action_type == "inference")
+            .expect("the error generation");
+        assert_eq!(errored.status, "error");
+        assert_eq!(errored.model_sha256.as_deref(), Some(HASH_2));
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, Change::Participants)),
+            "a failed generation moves no notice"
+        );
+
+        core.runtime()
+            .block_on(core.chat("succeeds".into(), MODEL.into(), Some(space)))
+            .expect("turn 3");
+        assert_eq!(
+            drain(&mut rx)
+                .iter()
+                .filter(|c| matches!(c, Change::Participants))
+                .count(),
+            1,
+            "the first successful answer from the new weights announces the roster"
+        );
+    });
+}
+
+// ===========================================================================
+// Declared cached prefixes
+//
+// A request carrying its lineage's key, to a model that sells a cached rate,
+// declares how much of its prompt the engine already holds when the client
+// knows it: its prompt begins with exactly what the lineage's most recent
+// answered request left. It is priced by that declaration. The harness's
+// caching engine (`MockConfig::engine_prompt_tokens`) serves a declaration
+// only if its own arithmetic derives exactly the same numbers from a request
+// it served under the same key, and refuses it `409` otherwise; the mock
+// computes every hold, declared or not, independently of the shared rule.
+// ===========================================================================
+
+/// The cached-prompt rate the harness sells: a quarter of a credit a token.
+const CACHED_RATE: (u64, u64) = (1, 4);
+
+/// A user prompt long enough that its conversation's prompt passes a few
+/// quanta of the declared prefix, so a declaration has something to claim.
+fn long_prompt(tag: &str) -> String {
+    format!(
+        "{tag}: {}",
+        "the tide rises and falls twice a day. ".repeat(120)
+    )
+}
+
+/// A core over a catalog that declares MODEL's prefix cache and sells its
+/// cached rate, answered by the harness's caching engine.
+fn declaring_setup(chat: ChatBehavior) -> (MockServer, AppCore, tempfile::TempDir) {
+    let (mock, core, dir) = setup(declaring_config(chat));
+    with_account(&core);
+    (mock, core, dir)
+}
+
+fn declaring_config(chat: ChatBehavior) -> MockConfig {
+    MockConfig {
+        chat,
+        declared_prompt_cache: Some(supported_prompt_cache()),
+        cached_prompt_price: Some(CACHED_RATE),
+        engine_prompt_tokens: Some(0),
+        ..MockConfig::default()
+    }
+}
+
+/// The `cached_prefix` member a captured body carried, as `(cached, new)`.
+fn declared_prefix(body: &serde_json::Value) -> Option<(u64, u64)> {
+    let member = body.get("cached_prefix")?;
+    Some((
+        member["cached_tokens"].as_u64().expect("cached_tokens"),
+        member["new_tokens"].as_u64().expect("new_tokens"),
+    ))
+}
+
+/// The hold the byte contract gives `body` at the harness's rates (one credit
+/// a prompt and a completion token): the fee, the chargeable prompt, the
+/// ceiling.
+fn undeclared_hold(body: &serde_json::Value) -> u128 {
+    chat_harness::REQUEST_FEE
+        + u128::from(contract_prompt_tokens(body))
+        + u128::from(body["max_completion_tokens"].as_u64().expect("ceiling"))
+}
+
+/// Every declaration the client sent was one the engine derives exactly, and
+/// every hold was the mock's own worst case.
+fn assert_declarations_exact(mock: &MockServer) {
+    assert_eq!(mock.declaration_mismatches(), 0, "every declaration exact");
+    assert_eq!(mock.hold_mismatches(), 0, "every hold the worst case");
+}
+
+/// **A second turn declares what the first left**, on both transports: the
+/// first request of a lineage declares nothing, the next ones declare the
+/// previous request's prompt — rounded down to the quantum — and are held by
+/// the declaration, well under what the same body holds undeclared.
+#[test]
+fn a_later_turn_declares_what_the_last_one_left() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        let space = first.space_id.clone();
+        core.runtime()
+            .block_on(core.chat("And why twice?".into(), MODEL.into(), Some(space.clone())))
+            .expect("a blocking turn");
+        turn(&core, "And at the poles?", Some(space), None);
+
+        let bodies = mock.chat_bodies();
+        let charges = mock.chat_charges();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(declared_prefix(&bodies[0]), None, "nothing to declare yet");
+        for (body, charge) in bodies.iter().zip(&charges).skip(1) {
+            let (cached, _) = declared_prefix(body).expect("a declaration");
+            assert!(cached > 0 && cached % 256 == 0, "{cached}");
+            let held = charge.expect("a hold");
+            assert!(held < undeclared_hold(body), "{held} vs undeclared");
+        }
+        assert_declarations_exact(&mock);
+        assert_eq!(mock.declared_refusals(), 0);
+        assert!(spending_credentials(&core).is_empty());
+    });
+}
+
+/// Each tool round of a turn extends the round before it, so it declares
+/// that round's prompt.
+#[test]
+fn a_tool_round_declares_the_round_before_it() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::ToolRoundsBlocking(2));
+        core.register_tool(std::sync::Arc::new(EchoTool))
+            .expect("echo is not reserved");
+        core.runtime()
+            .block_on(core.chat(long_prompt("use the tool"), MODEL.into(), None))
+            .expect("a three-round turn");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(declared_prefix(&bodies[0]), None);
+        assert!(declared_prefix(&bodies[1]).is_some(), "round 2 declares");
+        assert!(declared_prefix(&bodies[2]).is_some(), "round 3 declares");
+        assert_declarations_exact(&mock);
+    });
+}
+
+/// A regeneration sends the request its answer was written to, so it
+/// declares that request's whole prompt and adds nothing past it.
+#[test]
+fn a_regeneration_declares_the_request_it_repeats() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.regenerate_stream(
+                first.response_action_id.clone().expect("an answer"),
+                MODEL.into(),
+                tx,
+            ))
+            .expect("regenerate");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies[0]["messages"], bodies[1]["messages"]);
+        let (cached, new) = declared_prefix(&bodies[1]).expect("a declaration");
+        // Nothing added: the budget is the earlier prompt past the boundary,
+        // and the byte contract's per-request allowance.
+        assert!(new <= 256 + 32, "{cached} + {new}");
+        assert_declarations_exact(&mock);
+    });
+}
+
+/// A continuation of an answer that stopped at its ceiling declares **the
+/// request that began the answer** (its anchor), and nothing of the answer:
+/// the answer goes back as text, which need not encode to the tokens the
+/// model sampled, so the engine is not relied on to hold it. The partial
+/// message is priced as added. The harness's engine refuses a declaration
+/// reaching past an anchor, so an exact one here is the anchor's.
+#[test]
+fn a_continuation_declares_its_anchor() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::ContinueAfterLength {
+            cut: chat_harness::Cut::Answer,
+            again: false,
+        });
+        let cut = turn(&core, &long_prompt("one"), None, None);
+        assert!(cut.continuable);
+        let (res, _, _) = continue_streaming(&core, &cut.response_action_id.unwrap());
+        res.expect("the continuation");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        let (cached, new) = declared_prefix(&bodies[1]).expect("a declaration");
+        let anchor_prompt = cut.input_tokens.expect("the anchor's prompt") as u64;
+        assert!(
+            cached < anchor_prompt,
+            "the anchor's prompt and nothing past it: {cached} of {anchor_prompt}"
+        );
+        // What follows the anchor — the partial message — is the budget's.
+        let partial = bodies[1]["messages"].as_array().unwrap().last().unwrap();
+        assert!(
+            new >= eidola_common::prompt_charge(std::slice::from_ref(partial), None)
+                .chargeable_prompt_tokens(),
+            "the answer so far is priced as added: {new}"
+        );
+        assert_declarations_exact(&mock);
+        assert_eq!(mock.declared_refusals(), 0);
+    });
+}
+
+/// A second continuation of the same answer declares the same anchor: a
+/// continuation's own prompt is never one.
+#[test]
+fn a_second_continuation_of_an_answer_declares_the_same_anchor() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::ContinueAfterLength {
+            cut: chat_harness::Cut::Answer,
+            again: true,
+        });
+        let cut = turn(&core, &long_prompt("one"), None, None);
+        let (again, _, _) = continue_streaming(&core, &cut.response_action_id.unwrap());
+        let again = again.expect("the first continuation");
+        assert!(again.truncated && again.continuable, "it stopped again");
+        let (res, _, _) = continue_streaming(&core, &again.response_action_id.unwrap());
+        res.expect("the second continuation");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        let first = declared_prefix(&bodies[1]).expect("a declaration");
+        let second = declared_prefix(&bodies[2]).expect("a declaration");
+        assert_eq!(first.0, second.0, "one anchor for both");
+        assert!(second.1 > first.1, "the longer answer is the larger budget");
+        assert_declarations_exact(&mock);
+        assert_eq!(mock.declared_refusals(), 0);
+    });
+}
+
+/// The turn after a continued answer declares the anchor that answer began
+/// from: it repeats that request's messages, and the continuation left the
+/// lineage's resume point where it was.
+#[test]
+fn a_new_turn_after_a_continued_answer_declares_its_anchor() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::ContinueAfterLength {
+            cut: chat_harness::Cut::Answer,
+            again: false,
+        });
+        let cut = turn(&core, &long_prompt("one"), None, None);
+        let (res, _, _) = continue_streaming(&core, &cut.response_action_id.clone().unwrap());
+        res.expect("the continuation");
+        turn(&core, "And then?", Some(cut.space_id), None);
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        let continued = declared_prefix(&bodies[1]).expect("a declaration");
+        let next = declared_prefix(&bodies[2]).expect("a declaration");
+        assert_eq!(continued.0, next.0, "the same anchor");
+        assert_declarations_exact(&mock);
+        assert_eq!(mock.declared_refusals(), 0);
+    });
+}
+
+/// A tool round after a continued round declares the anchor too: the
+/// request that follows the tool round extends the request that began the
+/// answer, with the call and its result.
+#[test]
+fn a_tool_round_after_a_continued_round_declares_the_anchor() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::ContinueIntoToolRound);
+        core.register_tool(std::sync::Arc::new(EchoTool))
+            .expect("echo is not reserved");
+        let cut = turn(&core, &long_prompt("one"), None, None);
+        let (res, _, _) = continue_streaming(&core, &cut.response_action_id.unwrap());
+        res.expect("the continuation and its tool round");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies[1].get("continue_final_message").is_some());
+        assert!(bodies[2].get("continue_final_message").is_none());
+        let continued = declared_prefix(&bodies[1]).expect("a declaration");
+        let after = declared_prefix(&bodies[2]).expect("a declaration");
+        assert_eq!(continued.0, after.0, "the same anchor");
+        assert_declarations_exact(&mock);
+        assert_eq!(mock.declared_refusals(), 0);
+    });
+}
+
+/// **Anything short of an exact prefix declares nothing**: an earlier post
+/// edited (the context changes ahead of what was cached), or the turn's tools
+/// changed (they render before every message).
+#[test]
+fn a_changed_prefix_declares_nothing() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        let space = first.space_id.clone();
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        core.runtime()
+            .block_on(core.edit_post(tree[0].action_id.clone(), long_prompt("edited")))
+            .expect("edit");
+        turn(&core, "And why?", Some(space), None);
+        let bodies = mock.chat_bodies();
+        assert_ne!(bodies[0]["messages"][1], bodies[1]["messages"][1]);
+        assert_eq!(declared_prefix(&bodies[1]), None, "an edited earlier post");
+        assert_declarations_exact(&mock);
+    });
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        core.register_tool(std::sync::Arc::new(EchoTool))
+            .expect("echo is not reserved");
+        core.runtime()
+            .block_on(core.chat("Use a tool?".into(), MODEL.into(), Some(first.space_id)))
+            .expect("a turn");
+        let bodies = mock.chat_bodies();
+        assert!(bodies[0].get("tools").is_none() && bodies[1].get("tools").is_some());
+        assert_eq!(declared_prefix(&bodies[1]), None, "the tools changed");
+        assert_declarations_exact(&mock);
+    });
+}
+
+/// **A trailing block ends what a later turn can claim.** A space with more
+/// than two members, or with branches, closes each request with a message
+/// about the room as it stands (the roster, the map), which the next turn
+/// does not repeat: its prompt shares everything before that message, and the
+/// client cannot know how many tokens that is, so it declares nothing. Within
+/// a turn the trailing message stays put, so a regeneration still declares.
+#[test]
+fn a_trailing_block_leaves_a_later_turn_nothing_to_declare() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        let space = first.space_id.clone();
+        let tree = core
+            .runtime()
+            .block_on(core.get_space_tree(space.clone()))
+            .expect("tree");
+        // A branch beside the first answer: from here on every request ends
+        // with the trailing block.
+        turn(
+            &core,
+            "What about neap tides?",
+            Some(space.clone()),
+            Some(tree[0].action_id.clone()),
+        );
+        let last = turn(&core, "And why?", Some(space), None);
+        let bodies = mock.chat_bodies();
+        let trailing = |b: &serde_json::Value| {
+            b["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("Participants in this conversation")
+        };
+        assert!(trailing(&bodies[1]) && trailing(&bodies[2]));
+        assert_eq!(declared_prefix(&bodies[2]), None, "the next turn");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.regenerate_stream(
+                last.response_action_id.expect("an answer"),
+                MODEL.into(),
+                tx,
+            ))
+            .expect("regenerate");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies[2]["messages"], bodies[3]["messages"]);
+        assert!(declared_prefix(&bodies[3]).is_some(), "the regeneration");
+        assert_declarations_exact(&mock);
+    });
+}
+
+/// A key that rotated has nothing to declare: its engine never saw the
+/// earlier request under it.
+#[test]
+fn a_rotated_key_declares_nothing() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        core.test_advance_cache_clock(CACHE_IDLE_TTL_SECS * 1000);
+        turn(&core, "And why?", Some(first.space_id), None);
+        let sent = keys(&mock);
+        assert_ne!(sent[0], sent[1], "the idle key rotated");
+        assert_eq!(declared_prefix(&mock.chat_bodies()[1]), None);
+        assert_eq!(mock.declared_refusals(), 0);
+    });
+}
+
+/// **A replaced key starts with nothing to declare**, even when no request
+/// answered under it yet: the key the first turn left a resume point on
+/// rotates under a request that then fails, and the next request — under the
+/// new key, which the rotation rule keeps — declares nothing, rather than
+/// claiming what the old key's engine held.
+#[test]
+fn a_replaced_key_keeps_nothing_of_its_predecessor() {
+    run(|| {
+        let config = declaring_config(ChatBehavior::OkStreaming);
+        let fail = config.fail_next_chat.clone();
+        let (mock, core, _dir) = setup(config);
+        with_account(&core);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        let space = first.space_id.clone();
+        core.test_advance_cache_clock(CACHE_IDLE_TTL_SECS * 1000);
+        *fail.lock().unwrap() = Some(503);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        core.runtime()
+            .block_on(core.chat_stream_reply(
+                "And why?".into(),
+                MODEL.into(),
+                Some(space.clone()),
+                None,
+                tx,
+            ))
+            .expect_err("the upstream refused");
+        turn(&core, "And at the poles?", Some(space), None);
+
+        let sent = keys(&mock);
+        assert_ne!(sent[0], sent[1], "the idle key rotated");
+        assert_eq!(sent[1], sent[2], "and its successor was kept");
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(declared_prefix(&bodies[2]), None);
+        assert_eq!(mock.declared_refusals(), 0);
+    });
+}
+
+/// **What a turn adds is budgeted at no more than the window leaves.** The
+/// byte contract counts two thirds of a token a byte, so a large message
+/// added to a conversation that fits the model's window can count past the
+/// window. The turn still declares its anchor: the budget for the rest is the
+/// window less the cached part, the hold is priced by it, and the engine,
+/// which derives the same two numbers by its own arithmetic, serves it.
+/// Priced undeclared, the whole conversation would be held at the prompt
+/// rate, as if nothing of it were cached.
+#[test]
+fn a_large_addition_is_declared_up_to_the_window() {
+    run(|| {
+        // The harness's model declares a window of 8,192 tokens.
+        let window = 8_192;
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        turn(&core, &"y".repeat(12_000), Some(first.space_id), None);
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        let (cached, new) = declared_prefix(&bodies[1]).expect("the turn declares");
+        assert!(cached > 0);
+        assert_eq!(cached + new, window, "the budget stops at the window");
+        assert!(
+            contract_prompt_tokens(&bodies[1]) > window,
+            "the byte contract counts the prompt past the window"
+        );
+        let ceiling = bodies[1]["max_completion_tokens"]
+            .as_u64()
+            .expect("a ceiling");
+        let held = mock.chat_charges()[1].expect("a hold");
+        assert_eq!(
+            held,
+            chat_harness::REQUEST_FEE + u128::from(cached.div_ceil(4) + new + ceiling),
+            "held by the declaration: the cached part at a quarter, the rest of the window whole"
+        );
+        assert!(held < undeclared_hold(&bodies[1]));
+        assert_eq!(mock.declared_refusals(), 0, "and served");
+        assert_declarations_exact(&mock);
+    });
+}
+
+/// **A model that sells no cached rate is sent exactly what it was sent
+/// before declarations existed**: a keyed body, byte for byte the shared
+/// construction, with no `cached_prefix` member.
+#[test]
+fn a_model_without_a_cached_rate_is_sent_the_body_it_always_was() {
+    run(|| {
+        let (mock, core, _dir) = setup(MockConfig {
+            cached_prompt_price: None,
+            ..declaring_config(ChatBehavior::OkStreaming)
+        });
+        with_account(&core);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        turn(&core, "And why?", Some(first.space_id.clone()), None);
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2);
+        let key = sent_key(&bodies[0]);
+        for body in &bodies {
+            assert_shared_keyed_body(body, true, &key);
+        }
+        assert_eq!(mock.hold_mismatches(), 0);
+    });
+}
+
+/// **A refused declaration is sent once more without it**, for each refusal
+/// and on both transports: the refused request is charged the request fee and
+/// nothing else, both holds settle, the turn writes one answer, and the
+/// lineage declares again from what the resend left.
+#[test]
+fn a_refused_declaration_is_sent_once_more_undeclared() {
+    for kind in ["cached_prefix_missing", "prompt_budget_exceeded"] {
+        for streaming in [true, false] {
+            run(move || {
+                let (mock, core, _dir) = declaring_setup(ChatBehavior::StreamingWithMetadataRefund);
+                let first = turn(&core, &long_prompt("one"), None, None);
+                let space = first.space_id.clone();
+                let before: i64 = core
+                    .runtime()
+                    .block_on(core.wallet_credentials())
+                    .expect("wallet")
+                    .iter()
+                    .map(|c| c.credits)
+                    .sum();
+                let issuances = mock.issuance_requests();
+                mock.refuse_next_declared(kind);
+                let mut rx = core.subscribe_changes();
+                let result = if streaming {
+                    Ok(turn(&core, "And why?", Some(space.clone()), None))
+                } else {
+                    core.runtime().block_on(core.chat(
+                        "And why?".into(),
+                        MODEL.into(),
+                        Some(space.clone()),
+                    ))
+                };
+                let result = result.expect("the resend answers");
+                assert!(result.response_action_id.is_some());
+
+                let bodies = mock.chat_bodies();
+                assert_eq!(
+                    bodies.len(),
+                    3,
+                    "{kind}: the refused request and its resend"
+                );
+                assert!(declared_prefix(&bodies[1]).is_some(), "{kind}");
+                assert_eq!(
+                    declared_prefix(&bodies[2]),
+                    None,
+                    "{kind}: resent undeclared"
+                );
+                assert_eq!(bodies[1]["messages"], bodies[2]["messages"]);
+                assert_eq!(mock.declared_refusals(), 1);
+                assert_eq!(mock.issuance_requests(), issuances, "nothing converted");
+
+                // Both holds settled: the refused one was charged the fee, the
+                // answered one nothing (the harness's completed charge, settled
+                // in band).
+                assert!(spending_credentials(&core).is_empty(), "{kind}");
+                let after: i64 = core
+                    .runtime()
+                    .block_on(core.wallet_credentials())
+                    .expect("wallet")
+                    .iter()
+                    .map(|c| c.credits)
+                    .sum();
+                assert_eq!(after, before - chat_harness::REQUEST_FEE as i64, "{kind}");
+                // One answer, and the refused exchange in the Record beside it.
+                let tree = core
+                    .runtime()
+                    .block_on(core.get_space_tree(space.clone()))
+                    .expect("tree");
+                assert_eq!(tree.len(), 4, "{kind}: two exchanges, one answer each");
+                let changes = drain(&mut rx);
+                for expected in [Change::Space(space.clone()), Change::Wallet, Change::Record] {
+                    assert!(changes.contains(&expected), "{expected:?} in {changes:?}");
+                }
+
+                // The resend's answer is the lineage's new resume point.
+                turn(&core, "And at the poles?", Some(space), None);
+                assert!(declared_prefix(&mock.chat_bodies()[3]).is_some(), "{kind}");
+                assert_declarations_exact(&mock);
+            });
+        }
+    }
+}
+
+/// An engine that lost what the lineage left (here: every entry evicted) is
+/// refused as missing, and the resend is undeclared.
+#[test]
+fn an_evicted_prefix_is_refused_and_resent_undeclared() {
+    run(|| {
+        let (mock, core, _dir) = declaring_setup(ChatBehavior::OkStreaming);
+        let first = turn(&core, &long_prompt("one"), None, None);
+        mock.evict_engine_cache();
+        turn(&core, "And why?", Some(first.space_id), None);
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 3);
+        assert!(declared_prefix(&bodies[1]).is_some());
+        assert_eq!(declared_prefix(&bodies[2]), None);
+        assert_eq!(mock.declared_refusals(), 1);
+        assert_declarations_exact(&mock);
+    });
+}
+
+/// **The resend never converts account credit.** A wallet that covers the
+/// declared hold but not the undeclared one, beside an account with plenty
+/// of credit: the refused request is charged its fee, the resend cannot be
+/// paid from what is held, and the turn fails with the typed, retryable
+/// `UncachedRetryUnfunded` — with no issuance asked for and no request sent.
+#[test]
+fn the_undeclared_resend_never_converts() {
+    for streaming in [true, false] {
+        run(move || {
+            // The first turn's hold, measured on a core of its own: the same
+            // prompt in a fresh space sends bodies of the same length.
+            let first_hold = {
+                let (mock, core, _dir) = declaring_setup(ChatBehavior::StreamingWithMetadataRefund);
+                turn(&core, &long_prompt("one"), None, None);
+                mock.chat_charges()[0].expect("a hold")
+            };
+            let (mock, core, _dir) = declaring_setup(ChatBehavior::StreamingWithMetadataRefund);
+            core.runtime()
+                .block_on(core.account_allocate(first_hold as i64))
+                .expect("exactly the first turn's hold");
+            let first = turn(&core, &long_prompt("one"), None, None);
+            assert_eq!(mock.chat_charges()[0], Some(first_hold));
+            let issuances = mock.issuance_requests();
+            mock.refuse_next_declared("cached_prefix_missing");
+            let space = first.space_id.clone();
+            let err = if streaming {
+                let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+                core.runtime().block_on(core.chat_stream_reply(
+                    "And why?".into(),
+                    MODEL.into(),
+                    Some(space.clone()),
+                    None,
+                    tx,
+                ))
+            } else {
+                core.runtime().block_on(core.chat(
+                    "And why?".into(),
+                    MODEL.into(),
+                    Some(space.clone()),
+                ))
+            }
+            .expect_err("the resend cannot be paid without converting");
+            assert!(
+                matches!(err, AppError::UncachedRetryUnfunded),
+                "typed: {err:?}"
+            );
+            let bodies = mock.chat_bodies();
+            assert_eq!(bodies.len(), 2, "no undeclared request was sent");
+            assert!(
+                undeclared_hold(&bodies[1]) > first_hold - chat_harness::REQUEST_FEE,
+                "the resend's hold is past what the wallet holds"
+            );
+            assert_eq!(
+                mock.issuance_requests(),
+                issuances,
+                "nothing was asked of the account"
+            );
+            assert!(spending_credentials(&core).is_empty());
+            assert_eq!(
+                active_balances(&core),
+                vec![first_hold as i64 - chat_harness::REQUEST_FEE as i64],
+                "the refused request cost its fee and nothing else"
+            );
+            // A fresh attempt is an ordinary request, and converts as any does.
+            turn(&core, "And why, again?", Some(space), None);
+            assert!(mock.issuance_requests() > issuances);
+        });
+    }
+}
+
+/// **A resend no attempt could pay is refused as the request's problem.** A
+/// request is cheap to hold while an engine holds its prefix and dear without
+/// it: here the declared request is paid from the wallet's one credential,
+/// the engine refuses the declaration, and the same request undeclared holds
+/// more than that credential and one fresh denomination pay together. The
+/// resend is refused with `HoldExceedsDenomination`, not the retryable
+/// `UncachedRetryUnfunded`, because an attempt free to convert would be
+/// refused too; nothing is asked of the account, no undeclared request is
+/// sent, and the wallet has paid the refused declaration's fee and nothing
+/// else.
+#[test]
+fn a_resend_past_what_one_denomination_pays_is_refused_as_the_requests_problem() {
+    run(|| {
+        // A window that holds the whole conversation: a declaration past the
+        // model's window is never made.
+        let (mock, core, _dir) = setup(MockConfig {
+            context_length: Some(4_194_304),
+            ..declaring_config(ChatBehavior::StreamingWithMetadataRefund)
+        });
+        with_account(&core);
+        // One credential that pays the first turn alone.
+        let held = 2_100_000;
+        core.runtime()
+            .block_on(core.account_allocate(held))
+            .expect("an allocation");
+        let first = turn(&core, &"x".repeat(3_000_000), None, None);
+        let space = first.space_id.clone();
+        assert_eq!(active_balances(&core), vec![held]);
+        let issuances = mock.issuance_requests();
+        mock.refuse_next_declared("cached_prefix_missing");
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
+        let err = core
+            .runtime()
+            .block_on(core.chat_stream_reply(
+                "y".repeat(2_100_000),
+                MODEL.into(),
+                Some(space),
+                None,
+                tx,
+            ))
+            .expect_err("nothing could pay the request undeclared");
+
+        let bodies = mock.chat_bodies();
+        assert_eq!(bodies.len(), 2, "no undeclared request was sent");
+        assert!(declared_prefix(&bodies[1]).is_some());
+        assert_eq!(mock.declared_refusals(), 1);
+        let declared = mock.chat_charges()[1].expect("a hold") as i64;
+        assert!(declared <= held, "declared, the wallet paid it: {declared}");
+        let undeclared = undeclared_hold(&bodies[1]) as i64;
+        let left = held - chat_harness::REQUEST_FEE as i64;
+        assert!(
+            undeclared > left + DEFAULT_ALLOCATION_CREDITS,
+            "undeclared, it is past the credential and one denomination: {undeclared}"
+        );
+        match err {
+            AppError::HoldExceedsDenomination { hold, denomination } => {
+                assert_eq!(hold, undeclared);
+                assert_eq!(denomination, DEFAULT_ALLOCATION_CREDITS);
+            }
+            other => panic!("expected HoldExceedsDenomination, got {other:?}"),
+        }
+        assert_eq!(
+            mock.issuance_requests(),
+            issuances,
+            "nothing was asked of the account"
+        );
+        assert!(spending_credentials(&core).is_empty());
+        assert_eq!(
+            active_balances(&core),
+            vec![left],
+            "the refused declaration cost its fee and nothing else"
+        );
+        assert_eq!(mock.hold_mismatches(), 0);
     });
 }

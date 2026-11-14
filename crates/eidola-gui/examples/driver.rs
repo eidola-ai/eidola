@@ -81,9 +81,9 @@ mod driver {
     use eidola_app_core::error::AppError;
     use eidola_app_core::updates::{UpdateCheckResult, UpdateCheckSnapshot, VerifiedRelease};
     use eidola_app_core::{
-        AttestationInfo, BalancePoolInfo, BalancesResult, ConfigState, ModelInfo, ParticipantInfo,
-        ParticipantReference, PriceInfo, SpaceInfo, SpaceMessage, SpaceTemplateInfo,
-        SubscriptionInfo, SubscriptionState, TemplateParticipantInfo,
+        AttestationInfo, BalancePoolInfo, BalancesResult, ConfigState, ModelCapabilities,
+        ModelInfo, ParticipantInfo, ParticipantReference, PriceInfo, SpaceInfo, SpaceMessage,
+        SpaceTemplateInfo, SubscriptionInfo, SubscriptionState, TemplateParticipantInfo,
     };
     use eidola_gui::about::AboutView;
     use eidola_gui::library::LibraryView;
@@ -102,7 +102,7 @@ mod driver {
         TouchPhase, VisualTestAppContext, point, px, size,
     };
     use gpui_component::{Root, ThemeMode};
-    use gpui_component_assets::Assets;
+    use gpui_kit_assets::Assets;
     use serde::Deserialize;
     use serde_json::{Value, json};
 
@@ -271,6 +271,123 @@ mod driver {
                 },
             },
             Scene {
+                name: "space_regenerating",
+                description: "Space view: a regeneration in flight, pending in place on the answer it is replacing (no verbs offered while it runs)",
+                default_size: size(px(900.), px(720.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| {
+                        s.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx);
+                        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+                        if let Some(seq) = s.revising_seq("a2") {
+                            s.push_reasoning_delta_for_test(
+                                seq,
+                                "Re-reading 343b before I answer. The shepherd is a rebuttal, \
+                                 not the definition — so the order has to be \
+                                 definition, craft-analogy, then the shepherd.",
+                                cx,
+                            );
+                        }
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_regenerating_elsewhere",
+                description: "Space view: a regeneration refused because one is already running against that answer somewhere this window cannot see — a quiet mark on the post, not a failure notice",
+                default_size: size(px(900.), px(720.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| {
+                        s.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx);
+                        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+                        if let Some(seq) = s.revising_seq("a2") {
+                            s.collide_revision_for_test(seq, cx);
+                        }
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_answer_cut_off",
+                description: "Space view: an answer that stopped at its length allowance — scroll the first reply to its end to see the mark beneath the text it is about",
+                default_size: size(px(900.), px(720.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    view.update(cx, |v, cx| {
+                        v.space().update(cx, |s, cx| {
+                            s.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx)
+                        });
+                        v.note_truncated_turn_for_test("a2", cx);
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_not_joined",
+                description: "Space view: a delegated conversation the reader has only been watching — the refusal that names posting as the way in (join-on-post)",
+                default_size: size(px(900.), px(720.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    view.update(cx, |v, cx| {
+                        v.space().update(cx, |s, cx| {
+                            s.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx);
+                            // What a reader who has only been watching meets
+                            // when they reach for a verb that acts on somebody
+                            // else's work. Posting is not in that set — it is
+                            // what joins them — so the copy names it.
+                            s.apply_turn_failure_for_test(
+                                "agent-b",
+                                "a2",
+                                eidola_app_core::error::AppError::NotJoined {
+                                    space_id: "demo".into(),
+                                },
+                                cx,
+                            );
+                        });
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
                 name: "space_docked_composer",
                 description: "Space view: a populated conversation settled at the document floor with its active composer fully docked",
                 default_size: size(px(900.), px(720.)),
@@ -297,6 +414,52 @@ mod driver {
                             cx,
                         );
                         view.set_page_scroll_for_test(-100_000.0);
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_find",
+                description: "Space view: a conversation with a phrase to find, for driving the ⌘F bar (secondary-f, then type)",
+                default_size: size(px(860.), px(720.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        )
+                    });
+                    let space = view.read(cx).space().clone();
+                    space.update(cx, |s, cx| {
+                        s.set_messages_for_test(findable_conversation(), cx)
+                    });
+                    root(view, window, cx)
+                },
+            },
+            Scene {
+                name: "space_find_overlay",
+                description: "Space view: the Find-all overlay expanded over a branched conversation — the topological map beside every result",
+                default_size: size(px(980.), px(760.)),
+                build: |window, cx| {
+                    let stores = ready_stores(cx);
+                    let view = cx.new(|cx| {
+                        let mut view = SpaceView::new(
+                            stores,
+                            Some("demo".into()),
+                            WindowInput::new(cx),
+                            window,
+                            cx,
+                        );
+                        view.space().update(cx, |space, cx| {
+                            space.set_post_tree_for_test(fixtures::kitchen_sink_posts(), cx)
+                        });
+                        view.seed_find_for_test("justice", window, cx);
+                        view.toggle_find_overlay(window, cx);
+                        view
                     });
                     root(view, window, cx)
                 },
@@ -602,6 +765,7 @@ mod driver {
                                 refs.iter()
                                     .map(|r| eidola_app_core::IncomingReference {
                                         action_id: r.action_id.clone(),
+                                        item_id: format!("item-of-{}", r.action_id),
                                         space_id: "demo".into(),
                                         ordinal: 1,
                                         content_block_id: Some(r.block_id.clone()),
@@ -609,6 +773,9 @@ mod driver {
                                         range_end: Some(r.range.1),
                                         annotation: None,
                                         created_at: 0,
+                                        author_label: "Ada".into(),
+                                        author_kind: "agent".into(),
+                                        space_title: None,
                                     })
                                     .collect(),
                             );
@@ -1246,6 +1413,7 @@ mod driver {
                 last_activity_at: 0,
                 message_count: 4,
                 archived_at: None,
+                parent: None,
             }];
             s.space_settings = Some((
                 "demo".into(),
@@ -1312,6 +1480,7 @@ mod driver {
             // The **wire** label (task 64); every surface shows "You".
             label: "User".into(),
             model_ref: None,
+            model_notices: Vec::new(),
             system_prompt: None,
             notify_policy: "explicit".into(),
             role: "member".into(),
@@ -1332,7 +1501,8 @@ mod driver {
             source: "owned".into(),
             kind: "agent".into(),
             label: "Assistant".into(),
-            model_ref: Some("gemma4-31b".into()),
+            model_ref: Some(eidola_app_core::config::DEFAULT_MODEL.into()),
+            model_notices: Vec::new(),
             system_prompt: Some("Be concise and cite sources.".into()),
             notify_policy: "human".into(),
             role: "member".into(),
@@ -1345,6 +1515,7 @@ mod driver {
             kind: "agent".into(),
             label: "Critic".into(),
             model_ref: Some("qwen3-8b@my-vllm".into()),
+            model_notices: Vec::new(),
             system_prompt: Some("Challenge assumptions and find weak points.".into()),
             notify_policy: "all".into(),
             role: "member".into(),
@@ -1364,8 +1535,8 @@ mod driver {
                 router_model: None,
                 participants: vec![TemplateParticipantInfo {
                     id: "t-default-1".into(),
-                    label: "Assistant".into(),
-                    model_ref: Some("gemma4-31b".into()),
+                    label: "Gemma 4 E4B".into(),
+                    model_ref: Some(eidola_app_core::config::DEFAULT_MODEL.into()),
                     system_prompt: None,
                     notify_policy: "human".into(),
                 }],
@@ -1556,10 +1727,10 @@ mod driver {
             trusted_measurements: Vec::new(),
             trusted_measurements_are_override: false,
             pinned_measurement: eidola_app_core::MeasurementInfo {
-                snp: "1122334455667788112233445566778811223344556677881122334455667788".into(),
-                tdx_rtmr1: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+                measurement: "112233445566778811223344556677881122334455667788112233445566778811223344556677881122334455667788".into(),
+                host_data: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
                     .into(),
-                tdx_rtmr2: "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa"
+                guest_policy: "0x30133"
                     .into(),
             },
             has_hardware_root_ca: false,
@@ -1573,21 +1744,36 @@ mod driver {
         vec![
             ModelInfo {
                 id: "gemma4-31b".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 0.53,
                 completion_credits_per_token: 1.5,
                 request_credits: None,
             },
             ModelInfo {
                 id: "kimi-k2-6".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 262_144,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 3.0,
                 completion_credits_per_token: 9.0,
                 request_credits: None,
             },
             ModelInfo {
                 id: "qwen3-coder-watt".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 1.05,
                 completion_credits_per_token: 5.25,
                 request_credits: None,
@@ -1597,56 +1783,96 @@ mod driver {
             // fixture for the picker's own scroll indicator.
             ModelInfo {
                 id: "llama4-scout".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 0.8,
                 completion_credits_per_token: 2.4,
                 request_credits: None,
             },
             ModelInfo {
                 id: "deepseek-v3".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 1.2,
                 completion_credits_per_token: 3.0,
                 request_credits: None,
             },
             ModelInfo {
                 id: "mistral-large-3".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 1.5,
                 completion_credits_per_token: 4.5,
                 request_credits: None,
             },
             ModelInfo {
                 id: "gpt-oss-120b".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 1.1,
                 completion_credits_per_token: 3.3,
                 request_credits: None,
             },
             ModelInfo {
                 id: "phi5-moe".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 0.4,
                 completion_credits_per_token: 1.2,
                 request_credits: None,
             },
             ModelInfo {
                 id: "command-r-plus-2".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 1.3,
                 completion_credits_per_token: 3.9,
                 request_credits: None,
             },
             ModelInfo {
                 id: "yi-large-2".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 0.9,
                 completion_credits_per_token: 2.7,
                 request_credits: None,
             },
             ModelInfo {
                 id: "glm-5-air".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 0.6,
                 completion_credits_per_token: 1.8,
                 request_credits: None,
@@ -1662,6 +1888,14 @@ mod driver {
                 product_description: Some("A month of casual questions".into()),
                 amount_display: "5.00 USD".into(),
                 recurrence: "/month".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 500,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 1,
+                },
                 credits: 5_000_000,
             },
             PriceInfo {
@@ -1670,6 +1904,14 @@ mod driver {
                 product_description: Some("Daily thinking, long documents".into()),
                 amount_display: "20.00 USD".into(),
                 recurrence: "/month".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 2000,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 1,
+                },
                 credits: 20_000_000,
             },
             // A one-time price, so the plans surfaces show both kinds — it is
@@ -1680,6 +1922,11 @@ mod driver {
                 product_description: Some("Credit that keeps for a year".into()),
                 amount_display: "10.00 USD".into(),
                 recurrence: "".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 1000,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::OneTime,
                 credits: 10_000_000,
             },
         ]
@@ -1864,6 +2111,61 @@ mod driver {
                           the blue is scattered away entirely, and what survives to reach you \
                           is the warm red-orange of a low sun."
                     .into(),
+            },
+        ]
+    }
+
+    /// A conversation carrying one word several times over, in prose, a
+    /// heading, a list and a table — the shapes the searchable projection has
+    /// to see through (delimiters hidden, a link's URL not searchable, a table
+    /// cell searchable).
+    fn findable_conversation() -> Vec<SpaceMessage> {
+        // Written as lines joined at render time: a Rust string literal's line
+        // continuations keep whatever indentation rustfmt lands on, which turns
+        // a markdown table into indented prose.
+        let answer = [
+            "To optimize for value you must balance memory bandwidth and compute against",
+            "the overhead of inter-GPU communication.",
+            "",
+            "Here is the **performance** survey for different deployment configurations.",
+            "The [reference numbers](https://performance.example/runs) come from a single",
+            "week of sampling.",
+            "",
+            "## Deployment comparison",
+            "",
+            "| Configuration | Quantization | Parallelism | Performance |",
+            "| --- | --- | --- | --- |",
+            "| 1 card | INT4 | none | Moderate |",
+            "| 2 cards | FP8 | TP2 | High |",
+            "| 4 cards | BF16 | TP4 | Very high |",
+            "",
+            "- **Latency:** falls sharply up to two cards, then flattens.",
+            "- **Throughput:** climbs with every card, at falling efficiency.",
+            "",
+            "Past four cards the extra performance is not worth the money.",
+        ]
+        .join("\n");
+        vec![
+            SpaceMessage {
+                role: "user".into(),
+                content: "Do a quick survey and compare performance at different deployment sizes."
+                    .into(),
+            },
+            SpaceMessage {
+                role: "assistant".into(),
+                content: answer,
+            },
+            SpaceMessage {
+                role: "user".into(),
+                content: "Which one would you pick for steady daily use?".into(),
+            },
+            SpaceMessage {
+                role: "assistant".into(),
+                content: [
+                    "Two cards. It is the point where performance and cost cross, and the",
+                    "third card buys less than the second did.",
+                ]
+                .join(" "),
             },
         ]
     }
@@ -2138,10 +2440,34 @@ mod driver {
                 last_activity_at: ts,
                 message_count: 4,
                 archived_at: None,
+                parent: None,
+            }
+        }
+        /// A conversation one of the reader's agents opened from another one —
+        /// what the parent badge is for.
+        fn delegated(
+            id: &str,
+            title: &str,
+            days_ago: i64,
+            parent: (&str, Option<&str>),
+        ) -> SpaceInfo {
+            SpaceInfo {
+                parent: Some(eidola_app_core::SpaceParent {
+                    space_id: parent.0.into(),
+                    title: parent.1.map(String::from),
+                }),
+                ..space(id, Some(title), None, days_ago)
             }
         }
         vec![
             space("s1", Some("Tides and the moon"), None, 0),
+            delegated(
+                "s1a",
+                "Check Friday's tide tables",
+                0,
+                ("s1", Some("Tides and the moon")),
+            ),
+            delegated("s1b", "Second opinion on the moon phase", 0, ("s1", None)),
             space(
                 "s2",
                 Some("Borrow checker, closures, and lifetimes"),

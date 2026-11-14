@@ -35,11 +35,15 @@
 //! `<model>@<backend-id>`, parsed at the **last** `@` (backend ids are
 //! validated to `[a-z0-9-]`, so the split is unambiguous even for
 //! Ollama-style `name:tag` or HF-style `org/model` ids). The single sugar:
-//! `eidola`, being the default backend, may be written bare — `gemma4-31b`
-//! means `gemma4-31b@eidola`, and [`qualified_model_id`] keeps the bare
+//! `eidola`, being the default backend, may be written bare — `<tag>`
+//! means `<tag>@eidola`, and [`qualified_model_id`] keeps the bare
 //! form canonical so the common case reads clean everywhere (config,
 //! action rows, the CLI). Every other backend — the local singleton
-//! included — always spells its models qualified (`<slug>@local`).
+//! included — always spells its models qualified (`<slug>@local`). An Eidola
+//! model reference may carry a digest (`tag@sha256:<hex>`, a pin; see
+//! `model_catalog`), which holds an `@` of its own: [`parse_model_ref`] never
+//! reads a digest as a backend id, and [`qualified_model_id`] always spells a
+//! pin qualified, `tag@sha256:<hex>@eidola`.
 //!
 //! ## Forensics
 //!
@@ -52,7 +56,7 @@ use serde::{Deserialize, Serialize};
 use crate::changes::Change;
 use crate::db;
 use crate::error::AppError;
-use crate::{Inner, ModelInfo, now_ms};
+use crate::{Inner, ModelCapabilities, ModelInfo, now_ms};
 
 /// The reserved singleton backend ids.
 pub const EIDOLA_BACKEND_ID: &str = "eidola";
@@ -101,7 +105,9 @@ impl BackendKind {
 
 /// One configured backend, as surfaced to the CLI/GUI. The api key itself
 /// is never carried — only whether one is set (replacing it is write-only).
-#[derive(Clone, Debug)]
+/// **Serialized by the local control protocol** ([`crate::ipc`]): a field
+/// rename here is a wire change.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BackendInfo {
     pub id: String,
     pub kind: BackendKind,
@@ -153,11 +159,20 @@ pub struct ModelRef {
 /// `@`; a bare selection routes to `eidola` (the default backend's sugar).
 /// Pure and infallible — whether the backend *exists* is the router's
 /// question, not the parser's.
+///
+/// **A digest is never a backend.** An Eidola pin, `tag@sha256:<hex>`, holds
+/// an `@` of its own; what follows the last `@` there starts with the digest
+/// prefix, which no backend id can (backend ids are `[a-z0-9-]`), so a
+/// selection whose tail is a digest is an Eidola model whole. Qualified,
+/// `tag@sha256:<hex>@eidola`, the last `@` is the backend's as usual.
 pub fn parse_model_ref(selection: &str) -> ModelRef {
     if let Some(at) = selection.rfind('@') {
         let (model, backend) = selection.split_at(at);
         let backend = &backend[1..];
-        if !model.is_empty() && !backend.is_empty() {
+        if !model.is_empty()
+            && !backend.is_empty()
+            && !backend.starts_with(eidola_common::model_reference::DIGEST_PREFIX)
+        {
             return ModelRef {
                 backend_id: backend.to_string(),
                 model: model.to_string(),
@@ -172,9 +187,12 @@ pub fn parse_model_ref(selection: &str) -> ModelRef {
 
 /// The canonical selection string for a (model, backend) pair — the inverse
 /// of [`parse_model_ref`]. Eidola models stay bare (the default backend's
-/// sugar); every other backend's models are spelled qualified.
+/// sugar) unless they carry an `@` of their own: a pin, `tag@sha256:<hex>`,
+/// is always spelled qualified, `tag@sha256:<hex>@eidola`, so no reader of the
+/// selection has to know the digest rule to split it. Every other backend's
+/// models are spelled qualified.
 pub fn qualified_model_id(model: &str, backend_id: &str) -> String {
-    if backend_id == EIDOLA_BACKEND_ID {
+    if backend_id == EIDOLA_BACKEND_ID && !model.contains('@') {
         model.to_string()
     } else {
         format!("{model}@{backend_id}")
@@ -254,7 +272,7 @@ pub struct BackendUpdate {
     /// `llamacpp` only: flip request-triggered auto-start.
     pub auto_start: Option<bool>,
     /// `eidola` only: set/clear the enclave-measurement override list (a JSON
-    /// array of the `EnclaveMeasurement` shape). `Some(None)` reverts to pin.
+    /// array of the `tinfoil_verifier::SevSnpPin` shape). `Some(None)` reverts to pin.
     pub trusted_measurements: Option<Option<String>>,
     /// `eidola` only: set/clear the PEM ARK certificate override.
     pub hardware_root_ca: Option<Option<String>>,
@@ -267,6 +285,46 @@ pub struct BackendUpdate {
 // ============================================================================
 
 impl Inner {
+    /// Hold this backend's configuration gate for the whole of one
+    /// configuration operation — **its database write and the cleanup that
+    /// belongs to it**.
+    ///
+    /// Those two steps are one operation, and nothing but a critical section
+    /// makes that true. Each of these methods commits and then acts on
+    /// in-memory state (retiring engines and their reports), so without the
+    /// gate an older operation's cleanup can arrive after a newer write has
+    /// already settled the row: disable commits, enable commits over it, a
+    /// load registers the engine the *final* configuration authorises, and the
+    /// disable's cleanup then stops it — a load that reported success, an
+    /// enabled backend, and no engine.
+    ///
+    /// **An in-memory generation cannot replace this.** The cleanup that
+    /// should run is the one belonging to the write the database kept, and a
+    /// counter bumped either side of the commit orders itself, not the
+    /// commits: two operations can bump in one order and commit in the other.
+    /// Ordering a generation against the commit means writing it *in* the
+    /// transaction — a persisted column, which is a schema change — or
+    /// serializing, which is this.
+    ///
+    /// Holding a lock across a load's work was refused for good reason (an
+    /// engine load walks the filesystem, picks a port and spawns a child, and
+    /// a configuration edit must not wait on any of that). The reasoning does
+    /// not carry here: a configuration operation is one short database
+    /// statement plus a synchronous sweep of two in-memory maps, it touches no
+    /// filesystem and no subprocess, and the gate is per backend. Loads do not
+    /// take it at all — a load that read a stale row is a different axis,
+    /// closed by [`crate::local_models::BackendEpoch`].
+    async fn lock_backend_config(&self, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = {
+            let mut gates = self
+                .backend_config_gates
+                .lock()
+                .expect("backend config gates");
+            gates.entry(id.to_string()).or_default().clone()
+        };
+        gate.lock_owned().await
+    }
+
     pub(crate) async fn list_backends(&self) -> Result<Vec<BackendInfo>, AppError> {
         let conn = self.db_conn().await?;
         let rows = db::list_backends(&conn).await?;
@@ -302,6 +360,10 @@ impl Inner {
     /// soft-removed row with the same id. Emits [`Change::Backends`].
     pub(crate) async fn add_backend(&self, new: NewBackend) -> Result<BackendInfo, AppError> {
         validate_backend_id(&new.id)?;
+        // Taken after validation, so a rejected id allocates no gate. A revive
+        // is a configuration write like any other: it must not commit inside
+        // another operation's write-and-cleanup.
+        let _config = self.lock_backend_config(&new.id).await;
         match new.kind {
             BackendKind::Eidola | BackendKind::Local => {
                 return Err(AppError::Config {
@@ -392,11 +454,17 @@ impl Inner {
         id: &str,
         enabled: bool,
     ) -> Result<(), AppError> {
+        let _config = self.lock_backend_config(id).await;
         let conn = self.db_conn().await?;
         if !db::set_backend_enabled(&conn, id, enabled, now_ms()).await? {
             return Err(AppError::NotConfigured {
                 message: format!("no backend named `{id}` is configured"),
             });
+        }
+        if !enabled {
+            // A disabled backend cannot serve a turn, so nothing may keep
+            // running under its id.
+            self.retire_engines_for(id).await;
         }
         self.bus.emit(Change::Backends);
         Ok(())
@@ -413,6 +481,9 @@ impl Inner {
         id: &str,
         update: BackendUpdate,
     ) -> Result<(), AppError> {
+        // Held from the read: the validation below is against this row, and a
+        // write landing between the two would be validated against neither.
+        let _config = self.lock_backend_config(id).await;
         let conn = self.db_conn().await?;
         let row = db::get_backend(&conn, id)
             .await?
@@ -482,41 +553,99 @@ impl Inner {
             }
         }
 
+        // Repointing a backend at another models directory (or another
+        // `llama-server`) changes what `<slug>@<id>` *means*, so the engines
+        // already running under that id belong to a configuration that is
+        // about to stop existing — see [`Self::retire_backend_engines`].
+        let repointed = update
+            .models_dir
+            .as_ref()
+            .is_some_and(|d| d.as_deref() != row.models_dir.as_deref())
+            || update.engine_path.as_ref().is_some_and(|p| {
+                p.as_deref().map(|p| p.trim()).filter(|p| !p.is_empty())
+                    != row.engine_path.as_deref()
+            });
+
         let overrides_json = update
             .model_overrides
             .map(|o| overrides_to_json(o.as_deref()));
-        let updated = db::update_backend_config(
-            &conn,
-            id,
-            update.display_name.as_deref(),
-            update
-                .base_url
-                .as_ref()
-                .map(|o| o.as_deref().map(|u| u.trim().trim_end_matches('/'))),
-            update.api_key.as_ref().map(|o| o.as_deref()),
-            update.models_dir.as_ref().map(|o| o.as_deref()),
-            overrides_json.as_ref().map(|o| o.as_deref()),
-            update
-                .engine_path
-                .as_ref()
-                .map(|o| o.as_deref().map(|p| p.trim()).filter(|p| !p.is_empty())),
-            update.auto_start,
-            update
-                .trusted_measurements
-                .as_ref()
-                .map(|o| o.as_deref().filter(|m| !m.is_empty())),
-            update.hardware_root_ca.as_ref().map(|o| o.as_deref()),
-            update
-                .hardware_intermediate_ca
-                .as_ref()
-                .map(|o| o.as_deref()),
-            now_ms(),
-        )
-        .await?;
+        // **One transaction: the configuration and the keys it invalidates.**
+        // A prefix-cache key never outlives the trust domain it was minted
+        // under — every key is bound to the digest of the eidola endpoint and
+        // trust bundle, and a mismatch rotates it at the next claim — and this
+        // is the belt to that brace: a write that changes the domain forgets
+        // every key from another one in the same transaction, read back from
+        // the row as written. So the configuration never commits without its
+        // cleanup, and a failure in either leaves both as they were and is
+        // reported with nothing to announce. A write that changed nothing
+        // keeps every key.
+        db::begin_write(&conn).await?;
+        let written = async {
+            let updated = db::update_backend_config(
+                &conn,
+                id,
+                update.display_name.as_deref(),
+                update
+                    .base_url
+                    .as_ref()
+                    .map(|o| o.as_deref().map(|u| u.trim().trim_end_matches('/'))),
+                update.api_key.as_ref().map(|o| o.as_deref()),
+                update.models_dir.as_ref().map(|o| o.as_deref()),
+                overrides_json.as_ref().map(|o| o.as_deref()),
+                update
+                    .engine_path
+                    .as_ref()
+                    .map(|o| o.as_deref().map(|p| p.trim()).filter(|p| !p.is_empty())),
+                update.auto_start,
+                update
+                    .trusted_measurements
+                    .as_ref()
+                    .map(|o| o.as_deref().filter(|m| !m.is_empty())),
+                update.hardware_root_ca.as_ref().map(|o| o.as_deref()),
+                update
+                    .hardware_intermediate_ca
+                    .as_ref()
+                    .map(|o| o.as_deref()),
+                now_ms(),
+            )
+            .await?;
+            if !updated || kind != BackendKind::Eidola {
+                return Ok((updated, 0));
+            }
+            #[cfg(feature = "test-support")]
+            if self
+                .fail_cache_key_cleanup
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(AppError::Database {
+                    message: "injected failure forgetting prefix-cache keys".into(),
+                });
+            }
+            let current = db::get_backend(&conn, id).await?;
+            let domain = crate::EidolaResolved::from_row(current.as_ref())?.cache_trust_domain();
+            Ok((true, db::forget_cache_keys_outside(&conn, &domain).await?))
+        }
+        .await;
+        let (updated, forgotten) = match written {
+            Ok(done) => {
+                conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+                done
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
         if !updated {
             return Err(AppError::NotConfigured {
                 message: format!("no backend named `{id}` is configured"),
             });
+        }
+        if forgotten > 0 {
+            db::truncate_log_after_forgetting_keys(&conn).await;
+        }
+        if repointed {
+            self.retire_engines_for(id).await;
         }
         self.bus.emit(Change::Backends);
         Ok(())
@@ -524,6 +653,7 @@ impl Inner {
 
     /// Soft-remove an external backend (forensic rows keep their target).
     pub(crate) async fn remove_backend(&self, id: &str) -> Result<(), AppError> {
+        let _config = self.lock_backend_config(id).await;
         if id == EIDOLA_BACKEND_ID || id == LOCAL_BACKEND_ID {
             return Err(AppError::Config {
                 message: format!("backend `{id}` is built in — disable it instead"),
@@ -535,8 +665,41 @@ impl Inner {
                 message: format!("no backend named `{id}` is configured"),
             });
         }
+        self.retire_engines_for(id).await;
         self.bus.emit(Change::Backends);
+        // The removal took any proxy exposure with it (`db::remove_backend`),
+        // so the stored proxy settings moved and every reader of them is stale.
+        self.bus.emit(Change::Proxy);
         Ok(())
+    }
+
+    /// Stop every engine registered under `backend_id` and forget its engines'
+    /// standing reports — the row that gave both their meaning has gone or
+    /// changed, and neither may outlive its configuration
+    /// (`Inner::retire_backend_engines`).
+    ///
+    /// Emits [`Change::LocalModels`] when *either* of those happened, since
+    /// either changes what the snapshot renders — a backend whose engine had
+    /// already failed has no engine to stop and a report to forget, and that
+    /// is precisely the case a count of engines could not see. A retirement
+    /// that finds nothing stays silent: an invalidation nobody needs would
+    /// redraw every subscriber on every disable.
+    async fn retire_engines_for(&self, backend_id: &str) {
+        // Test seam only: widen the window between the configuration write
+        // above and this cleanup. Compiled out of production builds.
+        #[cfg(feature = "test-support")]
+        {
+            let pause = *self
+                .backend_config_pause
+                .lock()
+                .expect("backend config pause");
+            if let Some(pause) = pause {
+                tokio::time::sleep(pause).await;
+            }
+        }
+        if self.retire_backend_engines(backend_id).changed() {
+            self.bus.emit(Change::LocalModels);
+        }
     }
 
     /// The models a backend offers, as selectable entries whose `id` is the
@@ -556,12 +719,38 @@ impl Inner {
             .ok_or_else(|| AppError::NotConfigured {
                 message: format!("no backend named `{id}` is configured"),
             })?;
+        self.backend_models_for_row(&row).await
+    }
+
+    /// The models **exactly this row** offers — reading no backend row of its
+    /// own.
+    ///
+    /// [`Self::backend_models`] resolves by id, which is right for a picker
+    /// asking about the backend as it is now. A caller that *authorized* a row
+    /// must scan that row and no other: the proxy's `/v1/models` reads the
+    /// exposed row and then scans, and a remove-and-re-add between the two put
+    /// a different URL and a different key behind the same id — so the catalog
+    /// request went to a destination the reader never exposed, carrying the
+    /// replacement's credential, and its answer went back to the caller. Every
+    /// destination here comes from `row`: the Eidola configuration, an external
+    /// backend's URL and key, a `llamacpp` backend's models directory. (The
+    /// managed `local` store is the one exception, and an honest one: it is a
+    /// built-in that cannot be removed or re-added, and its directory is not a
+    /// row field at all.)
+    pub(crate) async fn backend_models_for_row(
+        &self,
+        row: &db::BackendRow,
+    ) -> Result<Vec<ModelInfo>, AppError> {
+        let id = row.id.as_str();
         let kind = BackendKind::parse(&row.kind).ok_or_else(|| AppError::Database {
             message: format!("unknown backend kind `{}`", row.kind),
         })?;
 
         match kind {
-            BackendKind::Eidola => self.available_models().await,
+            BackendKind::Eidola => {
+                self.eidola_models(&crate::EidolaResolved::from_row(Some(row))?)
+                    .await
+            }
             BackendKind::OpenAi => {
                 if let Some(pinned) = parse_overrides(row.model_overrides.as_deref())? {
                     return Ok(pinned
@@ -578,10 +767,16 @@ impl Inner {
                     req = req.bearer_auth(key);
                 }
                 let resp = req.send().await.map_err(AppError::from_request)?;
-                let status = resp.status();
-                let text = resp.text().await.map_err(|e| AppError::Network {
-                    message: format!("failed to read model list: {e}"),
-                })?;
+                // **Bounded as it arrives** (`peer_read`'s class rule). The
+                // proxy exposes this listing to a downstream tool, and an
+                // external backend chooses every byte of it: a per-request
+                // deadline bounds how long it may take and not how much it may
+                // send, so an enormous catalog would spend this process's
+                // memory once per authenticated caller. The reader also strips
+                // the URL out of any transport error, as every reqwest error in
+                // this crate does.
+                let (status, text) =
+                    crate::peer_read::read_api_answer(resp, "the model list").await?;
                 if !status.is_success() {
                     return Err(AppError::Server {
                         status: status.as_u16(),
@@ -604,16 +799,17 @@ impl Inner {
                     .collect())
             }
             BackendKind::Local | BackendKind::LlamaCpp => {
-                let state = self.local_models_state().await?;
                 let models = if kind == BackendKind::Local {
-                    state.models
+                    self.local_models_state().await?.models
                 } else {
-                    state
-                        .external
-                        .into_iter()
-                        .find(|b| b.backend_id == row.id)
-                        .map(|b| b.models)
-                        .unwrap_or_default()
+                    // This row's directory, not whatever the id names now.
+                    match row.models_dir.as_deref() {
+                        Some(dir) => {
+                            self.scan_engine_dir(&row.id, std::path::Path::new(dir))
+                                .await
+                        }
+                        None => Vec::new(),
+                    }
                 };
                 // Every on-disk model is selectable — a request against an
                 // unloaded one loads its engine on demand. `on_disk` is the
@@ -633,7 +829,17 @@ impl Inner {
                             context_tokens, ..
                         } => Some(ModelInfo {
                             id: m.id,
+                            sha256: None,
+                            tags: Vec::new(),
                             context_length: context_tokens as u64,
+                            // A local model is a file someone supplied. What
+                            // it can do is a property of the chat template
+                            // baked into that file, which this build has never
+                            // seen — so there is no declaration to make, and
+                            // saying nothing is the only honest answer.
+                            max_output_tokens: None,
+                            output_budget_class: None,
+                            capabilities: ModelCapabilities::default(),
                             prompt_credits_per_token: 0.0,
                             completion_credits_per_token: 0.0,
                             request_credits: None,
@@ -641,7 +847,12 @@ impl Inner {
                         crate::local_models::LocalModelStatus::Available
                         | crate::local_models::LocalModelStatus::Loading => Some(ModelInfo {
                             id: m.id,
+                            sha256: None,
+                            tags: Vec::new(),
                             context_length: 0,
+                            max_output_tokens: None,
+                            output_budget_class: None,
+                            capabilities: ModelCapabilities::default(),
                             prompt_credits_per_token: 0.0,
                             completion_credits_per_token: 0.0,
                             request_credits: None,
@@ -654,12 +865,18 @@ impl Inner {
     }
 }
 
-/// A model whose backend publishes no pricing or context metadata — the
-/// honest shape for generic OpenAI-compatible listings.
+/// A model whose backend publishes no pricing, context or capability
+/// metadata — the honest shape for generic OpenAI-compatible listings, where
+/// `data[].id` is the only field anything agrees on.
 fn plain_model_info(id: String) -> ModelInfo {
     ModelInfo {
         id,
+        sha256: None,
+        tags: Vec::new(),
         context_length: 0,
+        max_output_tokens: None,
+        output_budget_class: None,
+        capabilities: ModelCapabilities::default(),
         prompt_credits_per_token: 0.0,
         completion_credits_per_token: 0.0,
         request_credits: None,
@@ -722,6 +939,46 @@ mod tests {
                 model: "org/model".into()
             }
         );
+    }
+
+    /// Every spelling of an Eidola digest reference parses to the eidola
+    /// backend and the whole reference, and a pin's canonical spelling is
+    /// qualified: a digest is never read as a backend id.
+    #[test]
+    fn a_digest_reference_is_never_split_as_a_backend() {
+        let hash = "a".repeat(64);
+        let pinned = format!("mimo-v2.6-flash@sha256:{hash}");
+        let unlabelled = format!("sha256:{hash}");
+        for (selection, model) in [
+            (format!("{pinned}@eidola"), pinned.clone()),
+            (pinned.clone(), pinned.clone()),
+            (unlabelled.clone(), unlabelled.clone()),
+            (format!("{unlabelled}@eidola"), unlabelled.clone()),
+        ] {
+            assert_eq!(
+                parse_model_ref(&selection),
+                ModelRef {
+                    backend_id: "eidola".into(),
+                    model
+                },
+                "{selection}"
+            );
+        }
+        assert_eq!(
+            qualified_model_id(&pinned, "eidola"),
+            format!("{pinned}@eidola")
+        );
+        assert_eq!(qualified_model_id(&unlabelled, "eidola"), unlabelled);
+        assert_eq!(
+            qualified_model_id("mimo-v2.6-flash", "eidola"),
+            "mimo-v2.6-flash"
+        );
+        for model in [pinned, unlabelled, "mimo-v2.6-flash".to_string()] {
+            let q = qualified_model_id(&model, "eidola");
+            assert_eq!(parse_model_ref(&q).model, model, "{q}");
+        }
+        // No backend id can begin with the digest prefix.
+        assert!(validate_backend_id("sha256:x").is_err());
     }
 
     #[test]

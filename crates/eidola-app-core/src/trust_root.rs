@@ -12,15 +12,17 @@
 
 include!(concat!(env!("OUT_DIR"), "/trust_root.gen.rs"));
 
-use tinfoil_verifier::{EnclaveMeasurement, TdxMeasurement};
+use tinfoil_verifier::SevSnpPin;
 
-/// The pinned server enclave measurement this client release verifies.
-pub fn server_measurement() -> EnclaveMeasurement {
-    EnclaveMeasurement {
-        snp_measurement: SERVER_SNP_MEASUREMENT.to_string(),
-        tdx_measurement: TdxMeasurement {
-            rtmr1: SERVER_TDX_RTMR1.to_string(),
-            rtmr2: SERVER_TDX_RTMR2.to_string(),
-        },
+/// The pinned server enclave launch identity this client release verifies:
+/// the SEV-SNP launch digest of the release image the server's config names
+/// (`SERVER_CVM_VERSION`, image `SERVER_IGVM_SHA256`), the config's hash as
+/// HOST_DATA, and the image's guest policy. The server is pinned on SEV-SNP
+/// only; a TDX presentation of it is refused before it is authenticated.
+pub fn server_measurement() -> SevSnpPin {
+    SevSnpPin {
+        measurement: SERVER_SNP_MEASUREMENT.to_string(),
+        host_data: SERVER_SNP_HOST_DATA.to_string(),
+        guest_policy: SERVER_SNP_GUEST_POLICY.to_string(),
     }
 }

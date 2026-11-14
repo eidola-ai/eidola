@@ -20,7 +20,7 @@ pub const LOCK_FILE_NAME: &str = "eidola.db.lock";
 /// incompatible build and [`initialize`] refuses to open it (delete the dev
 /// database; see the error text). Bump this on every fresh-start reset so
 /// stale databases are detected rather than silently limping.
-const LATEST_VERSION: i64 = 9;
+const LATEST_VERSION: i64 = 22;
 
 /// Well-known id of the shared human "User" participant — the single
 /// participant row joined into every space (agent participants are per-space
@@ -49,10 +49,14 @@ const DEFAULT_TEMPLATE_AGENT_ID: &str = "00000000-0000-7000-8000-000000000011";
 const DEFAULT_AGENT_SYSTEM_PROMPT: &str =
     "You are a helpful assistant. Answer clearly and concisely.";
 
-/// A readable default label derived from a model reference (e.g.
-/// `gemma4-31b` → `Gemma4 31b`). Only a *default* — the user edits it — so
-/// title-casing hyphen tokens is enough; it never needs to be canonical.
+/// A readable default label derived from a model reference: a curated local
+/// model's display name (`Gemma 4 E4B`), else the model title-cased by
+/// hyphen tokens (`my-model@ext` → `My Model`). Only a *default* — the user
+/// edits it — so it never needs to be canonical.
 pub fn default_agent_label(model_ref: &str) -> String {
+    if let Some(entry) = crate::local_models::catalog_entry_for_model_ref(model_ref) {
+        return entry.display_name.to_string();
+    }
     // Drop any `@backend` suffix, then title-case hyphen/underscore tokens.
     let model = model_ref
         .rsplit_once('@')
@@ -507,24 +511,36 @@ async fn set_user_version(conn: &Connection, version: i64) -> Result<(), AppErro
 // Layer 0 — Wallet: Issuer key operations
 // ---------------------------------------------------------------------------
 
+/// The local lifecycle deadlines of one issuer key, both ms since epoch (see
+/// the `issuer_key` table in `schema.sql`): `spend_until` is the last instant a
+/// new spend may begin under the key, `accept_until` the server's own
+/// acceptance deadline, until which an in-flight spend stays recoverable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IssuerKeyDeadlines {
+    pub spend_until: i64,
+    pub accept_until: i64,
+}
+
 pub async fn upsert_issuer_key(
     conn: &Connection,
     id: &str,
     params_hash: &str,
     public_key_data: &[u8],
     params_data: &[u8],
-    expires_at: i64,
+    deadlines: IssuerKeyDeadlines,
     created_at: i64,
 ) -> Result<(), AppError> {
     conn.execute(
-        "INSERT OR IGNORE INTO issuer_key (id, params_hash, public_key_data, params_data, expires_at, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR IGNORE INTO issuer_key \
+             (id, params_hash, public_key_data, params_data, spend_until, accept_until, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         (
             Value::Text(id.to_string()),
             Value::Text(params_hash.to_string()),
             Value::Blob(public_key_data.to_vec()),
             Value::Blob(params_data.to_vec()),
-            Value::Integer(expires_at),
+            Value::Integer(deadlines.spend_until),
+            Value::Integer(deadlines.accept_until),
             Value::Integer(created_at),
         ),
     )
@@ -535,27 +551,149 @@ pub async fn upsert_issuer_key(
     Ok(())
 }
 
+/// What the per-epoch key record says about one listed key
+/// ([`pin_issuer_key_epoch`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinnedIssuerKey {
+    /// The key recorded for the epoch: the first one seen for it.
+    pub key_id: String,
+    /// Another epoch this same key is recorded for, if any. An honest server
+    /// has a distinct key for every epoch.
+    pub also_recorded_for: Option<u64>,
+}
+
+/// Record `issuer_key_id` as the key for `epoch` at `scope` unless one is
+/// already recorded, and say what the record holds either way: the key
+/// recorded for the epoch (the first key seen for an epoch is the one that
+/// stands; see the `issuer_key_epoch` table), and any other epoch the same
+/// key is recorded for. Epochs before `oldest_kept` are pruned in the same
+/// transaction.
+pub async fn pin_issuer_key_epoch(
+    conn: &Connection,
+    scope: &str,
+    epoch: u64,
+    issuer_key_id: &str,
+    oldest_kept: u64,
+    now: i64,
+) -> Result<PinnedIssuerKey, AppError> {
+    let epoch = i64::try_from(epoch).map_err(|_| AppError::Credential {
+        message: "issuer epoch out of range".into(),
+    })?;
+    let oldest = i64::try_from(oldest_kept).unwrap_or(i64::MAX);
+    begin_write(conn).await?;
+    match pin_issuer_key_epoch_body(conn, scope, epoch, issuer_key_id, oldest, now).await {
+        Ok(pinned) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(pinned)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn pin_issuer_key_epoch_body(
+    conn: &Connection,
+    scope: &str,
+    epoch: i64,
+    issuer_key_id: &str,
+    oldest: i64,
+    now: i64,
+) -> Result<PinnedIssuerKey, AppError> {
+    conn.execute(
+        "DELETE FROM issuer_key_epoch WHERE scope = ?1 AND epoch < ?2",
+        (Value::Text(scope.to_string()), Value::Integer(oldest)),
+    )
+    .await
+    .map_err(AppError::db)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO issuer_key_epoch (scope, epoch, issuer_key_id, first_seen) \
+         VALUES (?1, ?2, ?3, ?4)",
+        (
+            Value::Text(scope.to_string()),
+            Value::Integer(epoch),
+            Value::Text(issuer_key_id.to_string()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+    let mut rows = conn
+        .query(
+            "SELECT issuer_key_id FROM issuer_key_epoch WHERE scope = ?1 AND epoch = ?2",
+            (Value::Text(scope.to_string()), Value::Integer(epoch)),
+        )
+        .await
+        .map_err(AppError::db)?;
+    let key_id = match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<String>(0).map_err(AppError::db)?,
+        None => {
+            return Err(AppError::Database {
+                message: "issuer key epoch record vanished".into(),
+            });
+        }
+    };
+    drop(rows);
+    let mut rows = conn
+        .query(
+            "SELECT epoch FROM issuer_key_epoch \
+             WHERE scope = ?1 AND issuer_key_id = ?2 AND epoch != ?3 ORDER BY epoch LIMIT 1",
+            (
+                Value::Text(scope.to_string()),
+                Value::Text(issuer_key_id.to_string()),
+                Value::Integer(epoch),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    let also_recorded_for = match rows.next().await.map_err(AppError::db)? {
+        Some(row) => u64::try_from(row.get::<i64>(0).map_err(AppError::db)?).ok(),
+        None => None,
+    };
+    Ok(PinnedIssuerKey {
+        key_id,
+        also_recorded_for,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Layer 0 — Wallet: Pre-credential operations
 // ---------------------------------------------------------------------------
 
+/// What an issuance's pre-credential row records, written before the request
+/// is first sent (see the `pre_credential` table).
+pub struct PreIssuanceRecord<'a> {
+    pub id: &'a str,
+    pub issuer_key_id: &'a str,
+    /// The CBOR `PreIssuance` (the client's secret issuance state).
+    pub data: &'a [u8],
+    pub credits: i64,
+    pub idempotency_key: &'a [u8; 32],
+    /// The CBOR `IssuanceRequest` exactly as it is sent.
+    pub issuance_request: &'a [u8],
+    pub account_id: &'a str,
+    pub created_at: i64,
+}
+
 pub async fn insert_pre_credential_issuance(
     conn: &Connection,
-    id: &str,
-    issuer_key_id: &str,
-    data: &[u8],
-    credits: i64,
-    created_at: i64,
+    record: &PreIssuanceRecord<'_>,
 ) -> Result<(), AppError> {
     conn.execute(
-        "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, spend_amount, created_at) \
-         VALUES (?1, 'issuance', NULL, ?2, ?3, ?4, NULL, ?5)",
+        "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, \
+         spend_amount, idempotency_key, issuance_request, account_id, created_at) \
+         VALUES (?1, 'issuance', NULL, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8)",
         (
-            Value::Text(id.to_string()),
-            Value::Text(issuer_key_id.to_string()),
-            Value::Blob(data.to_vec()),
-            Value::Integer(credits),
-            Value::Integer(created_at),
+            Value::Text(record.id.to_string()),
+            Value::Text(record.issuer_key_id.to_string()),
+            Value::Blob(record.data.to_vec()),
+            Value::Integer(record.credits),
+            Value::Blob(record.idempotency_key.to_vec()),
+            Value::Blob(record.issuance_request.to_vec()),
+            Value::Text(record.account_id.to_string()),
+            Value::Integer(record.created_at),
         ),
     )
     .await
@@ -565,6 +703,233 @@ pub async fn insert_pre_credential_issuance(
     Ok(())
 }
 
+/// An issuance whose response never landed: its pre-credential row has no
+/// credential, was not abandoned, and its key still lets a new spend begin.
+pub struct PendingIssuance {
+    pub id: String,
+    pub issuer_key_id: String,
+    pub data: Vec<u8>,
+    pub credits: i64,
+    pub idempotency_key: Vec<u8>,
+    pub issuance_request: Vec<u8>,
+    pub account_id: String,
+    pub created_at: i64,
+    pub public_key_data: Vec<u8>,
+}
+
+/// Every [`PendingIssuance`] at `now`, oldest first.
+pub async fn list_pending_issuances(
+    conn: &Connection,
+    now: i64,
+) -> Result<Vec<PendingIssuance>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT pc.id, pc.issuer_key_id, pc.data, pc.credits, pc.idempotency_key, \
+             pc.issuance_request, pc.account_id, pc.created_at, ik.public_key_data \
+             FROM pre_credential pc \
+             JOIN issuer_key ik ON ik.id = pc.issuer_key_id \
+             WHERE pc.type = 'issuance' \
+               AND pc.abandoned_at IS NULL \
+               AND ik.spend_until > ?1 \
+               AND NOT EXISTS (SELECT 1 FROM credential c WHERE c.pre_credential_id = pc.id) \
+             ORDER BY pc.created_at",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query([now]).await.map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push(PendingIssuance {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            issuer_key_id: row.get::<String>(1).map_err(AppError::db)?,
+            data: row.get::<Vec<u8>>(2).map_err(AppError::db)?,
+            credits: row.get::<i64>(3).map_err(AppError::db)?,
+            idempotency_key: row.get::<Vec<u8>>(4).map_err(AppError::db)?,
+            issuance_request: row.get::<Vec<u8>>(5).map_err(AppError::db)?,
+            account_id: row.get::<String>(6).map_err(AppError::db)?,
+            created_at: row.get::<i64>(7).map_err(AppError::db)?,
+            public_key_data: row.get::<Vec<u8>>(8).map_err(AppError::db)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Mark an issuance the server answered as debiting nothing, so recovery
+/// stops asking for it. Idempotent.
+pub async fn abandon_pre_credential_issuance(
+    conn: &Connection,
+    id: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE pre_credential SET abandoned_at = ?2 \
+         WHERE id = ?1 AND type = 'issuance' AND abandoned_at IS NULL",
+        (Value::Text(id.to_string()), Value::Integer(now)),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to abandon pre_credential: {e}"),
+    })?;
+    Ok(())
+}
+
+/// The issuer key this client recorded for `epoch` under `scope` (the
+/// server's base URL), if it has seen one: what the server listed first for
+/// that epoch.
+pub async fn issuer_key_for_epoch(
+    conn: &Connection,
+    scope: &str,
+    epoch: u64,
+) -> Result<Option<String>, AppError> {
+    let Ok(epoch) = i64::try_from(epoch) else {
+        return Ok(None);
+    };
+    let mut stmt = conn
+        .prepare("SELECT issuer_key_id FROM issuer_key_epoch WHERE scope = ?1 AND epoch = ?2")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(scope.to_string()), Value::Integer(epoch)))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+        None => Ok(None),
+    }
+}
+
+/// How many issuances `account_id` has made under `issuer_key_id` and not
+/// abandoned: those that landed and those whose response is still pending.
+pub async fn issuances_under_key(
+    conn: &Connection,
+    account_id: &str,
+    issuer_key_id: &str,
+) -> Result<i64, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT COUNT(*) FROM pre_credential \
+             WHERE type = 'issuance' AND abandoned_at IS NULL \
+               AND account_id = ?1 AND issuer_key_id = ?2",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((
+            Value::Text(account_id.to_string()),
+            Value::Text(issuer_key_id.to_string()),
+        ))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<i64>(0).map_err(AppError::db),
+        None => Ok(0),
+    }
+}
+
+/// The credits the wallet can still spend at `now` from credentials whose key
+/// lets a spend begin until at least `horizon_until`: every active
+/// credential's balance, plus what an in-flight spend's successor is worth at
+/// least (its balance less the charge held). A credential about to lapse is
+/// left out, since it cannot carry the next few days' spending.
+pub async fn spendable_credits_until(
+    conn: &Connection,
+    now: i64,
+    horizon_until: i64,
+) -> Result<i64, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT COALESCE(SUM(CASE \
+                 WHEN pc.id IS NULL THEN c.credits \
+                 WHEN c_next.nonce IS NULL THEN MAX(c.credits - pc.spend_amount, 0) \
+                 ELSE 0 END), 0) \
+             FROM credential c \
+             JOIN issuer_key ik ON ik.id = c.issuer_key_id \
+             LEFT JOIN pre_credential pc \
+                 ON pc.credential_nonce = c.nonce AND pc.type = 'refund' \
+             LEFT JOIN credential c_next ON c_next.pre_credential_id = pc.id \
+             WHERE ik.spend_until > ?2 AND ik.accept_until > ?1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Integer(now), Value::Integer(horizon_until)))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<i64>(0).map_err(AppError::db),
+        None => Ok(0),
+    }
+}
+
+/// When this wallet last began a spend (the newest spend pre-credential), if
+/// it ever has.
+pub async fn last_spend_at(conn: &Connection) -> Result<Option<i64>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT MAX(created_at) FROM pre_credential WHERE type = 'refund'")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<Option<i64>>(0).map_err(AppError::db),
+        None => Ok(None),
+    }
+}
+
+/// One input of a request about to be sent: the spend's pending-refund row.
+pub struct SpendInputRecord<'a> {
+    /// The pre-credential id (UUIDv7) its successor will name.
+    pub id: &'a str,
+    pub credential_nonce: &'a str,
+    pub issuer_key_id: &'a str,
+    /// The encoded `PreRefund`.
+    pub data: &'a [u8],
+    /// The input's share.
+    pub spend_amount: i64,
+    pub spend_proof_data: &'a [u8],
+}
+
+/// Mark every input of one request `spending`, **together**: one write
+/// transaction inserting each input's pending-refund row under one
+/// `spend_group`, so a crash cannot leave one input marked and another not,
+/// and the request's inputs are taken at one instant. A credential already
+/// spending (`idx_one_spend_per_credential`) refuses the whole write.
+pub async fn insert_spend_inputs(
+    conn: &Connection,
+    spend_group: &str,
+    inputs: &[SpendInputRecord<'_>],
+    created_at: i64,
+) -> Result<(), AppError> {
+    begin_write(conn).await?;
+    for input in inputs {
+        let inserted = conn
+            .execute(
+                "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, \
+                     credits, spend_amount, spend_proof_data, spend_group, created_at) \
+                 VALUES (?1, 'refund', ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8)",
+                (
+                    Value::Text(input.id.to_string()),
+                    Value::Text(input.credential_nonce.to_string()),
+                    Value::Text(input.issuer_key_id.to_string()),
+                    Value::Blob(input.data.to_vec()),
+                    Value::Integer(input.spend_amount),
+                    Value::Blob(input.spend_proof_data.to_vec()),
+                    Value::Text(spend_group.to_string()),
+                    Value::Integer(created_at),
+                ),
+            )
+            .await;
+        if let Err(e) = inserted {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(AppError::Database {
+                message: format!("failed to insert refund pre_credential: {e}"),
+            });
+        }
+    }
+    conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+    Ok(())
+}
+
+/// One spend of one credential, its own request's only input.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_pre_credential_refund(
     conn: &Connection,
@@ -576,24 +941,20 @@ pub async fn insert_pre_credential_refund(
     spend_proof_data: &[u8],
     created_at: i64,
 ) -> Result<(), AppError> {
-    conn.execute(
-        "INSERT INTO pre_credential (id, type, credential_nonce, issuer_key_id, data, credits, spend_amount, spend_proof_data, created_at) \
-         VALUES (?1, 'refund', ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
-        (
-            Value::Text(id.to_string()),
-            Value::Text(credential_nonce.to_string()),
-            Value::Text(issuer_key_id.to_string()),
-            Value::Blob(data.to_vec()),
-            Value::Integer(spend_amount),
-            Value::Blob(spend_proof_data.to_vec()),
-            Value::Integer(created_at),
-        ),
+    insert_spend_inputs(
+        conn,
+        id,
+        &[SpendInputRecord {
+            id,
+            credential_nonce,
+            issuer_key_id,
+            data,
+            spend_amount,
+            spend_proof_data,
+        }],
+        created_at,
     )
     .await
-    .map_err(|e| AppError::Database {
-        message: format!("failed to insert refund pre_credential: {e}"),
-    })?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -640,34 +1001,39 @@ pub struct SpendableCredential {
     pub public_key_data: Vec<u8>,
 }
 
-pub async fn find_spendable_credential(
+/// Every credential a spend may begin from now, with anything in it, in the
+/// order inputs are chosen from (`docs/anonymous-credits.md` → Spending several tokens in one request): its
+/// key's `accept_until` ascending (the soonest-lapsing value first), then
+/// balance ascending, then nonce (the nullifier's bytes, as hex, so text
+/// order is byte order). Every element of the order is public or random, so
+/// the order discloses nothing a request does not already show.
+pub async fn spendable_credentials(
     conn: &Connection,
-    min_credits: i64,
-) -> Result<Option<SpendableCredential>, AppError> {
+) -> Result<Vec<SpendableCredential>, AppError> {
     let mut stmt = conn
         .prepare(
             "SELECT c.nonce, c.issuer_key_id, c.data, c.credits, c.generation, ik.public_key_data \
              FROM credential_lifecycle cl \
              JOIN credential c ON c.nonce = cl.nonce \
              JOIN issuer_key ik ON ik.id = c.issuer_key_id \
-             WHERE cl.state = 'active' AND c.credits >= ?1 \
-             ORDER BY c.credits ASC \
-             LIMIT 1",
+             WHERE cl.state = 'active' AND c.credits > 0 \
+             ORDER BY ik.accept_until ASC, c.credits ASC, c.nonce ASC",
         )
         .await
         .map_err(AppError::db)?;
-    let mut rows = stmt.query([min_credits]).await.map_err(AppError::db)?;
-    match rows.next().await.map_err(AppError::db)? {
-        None => Ok(None),
-        Some(row) => Ok(Some(SpendableCredential {
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        results.push(SpendableCredential {
             nonce: row.get::<String>(0).map_err(AppError::db)?,
             issuer_key_id: row.get::<String>(1).map_err(AppError::db)?,
             data: row.get::<Vec<u8>>(2).map_err(AppError::db)?,
             credits: row.get::<i64>(3).map_err(AppError::db)?,
             generation: row.get::<i64>(4).map_err(AppError::db)?,
             public_key_data: row.get::<Vec<u8>>(5).map_err(AppError::db)?,
-        })),
+        });
     }
+    Ok(results)
 }
 
 pub struct CredentialRow {
@@ -712,6 +1078,9 @@ pub struct SpendingCredentialRow {
     pub spend_proof_data: Vec<u8>,
     pub issuer_key_id: String,
     pub public_key_data: Vec<u8>,
+    /// The spent key's `spend_until` (ms): past it, nothing waits for a
+    /// final refund.
+    pub spend_until: i64,
 }
 
 pub async fn list_spending_credentials(
@@ -721,7 +1090,7 @@ pub async fn list_spending_credentials(
         .prepare(
             "SELECT c.nonce, c.credits, c.generation, c.created_at, \
                     pc.spend_amount, pc.id, pc.data, pc.spend_proof_data, \
-                    pc.issuer_key_id, ik.public_key_data \
+                    pc.issuer_key_id, ik.public_key_data, ik.spend_until \
              FROM credential_lifecycle cl \
              JOIN credential c ON c.nonce = cl.nonce \
              JOIN pre_credential pc ON pc.credential_nonce = c.nonce AND pc.type = 'refund' \
@@ -745,6 +1114,7 @@ pub async fn list_spending_credentials(
             spend_proof_data: row.get::<Vec<u8>>(7).map_err(AppError::db)?,
             issuer_key_id: row.get::<String>(8).map_err(AppError::db)?,
             public_key_data: row.get::<Vec<u8>>(9).map_err(AppError::db)?,
+            spend_until: row.get::<i64>(10).map_err(AppError::db)?,
         });
     }
     Ok(results)
@@ -1114,9 +1484,41 @@ pub async fn update_backend_config(
     Ok(n > 0)
 }
 
-/// Soft-remove a backend (forensic rows keep their FK target). Returns
-/// whether a live row was removed.
+/// Soft-remove a backend (forensic rows keep their FK target) **and drop the
+/// proxy exposure that named it**. Returns whether a live row was removed.
+///
+/// **The exposure dies with the incarnation it was granted to.** Removal is
+/// soft — `request.backend_id` keeps a resolvable target forever — and
+/// `insert_backend` *revives* a row of the same id, overwriting every
+/// configuration column. The `proxy_backend` row survived both, so re-adding
+/// `acme` with a different base URL and a different key came back **already
+/// exposed**, and any holder of a proxy key could send prompts to a destination
+/// the reader had never ticked. Nothing on the way says so either: the listing
+/// joins `removed_at IS NULL`, so while the backend is gone the exposure is
+/// invisible — a permission standing where nobody can see it, waiting to apply
+/// to something else.
+///
+/// So the permission is not tied to a name; it is ended with the thing it was
+/// about. One `BEGIN IMMEDIATE`, because a removal that dropped one of the two
+/// is exactly the half-state this exists to prevent, and only where a live row
+/// was really removed — a call naming an already-removed backend must not clear
+/// an exposure some concurrent re-add just granted.
 pub async fn remove_backend(conn: &Connection, id: &str, now: i64) -> Result<bool, AppError> {
+    begin_write(conn).await?;
+    match remove_backend_tx_body(conn, id, now).await {
+        Ok(removed) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(removed)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn remove_backend_tx_body(conn: &Connection, id: &str, now: i64) -> Result<bool, AppError> {
     let n = conn
         .execute(
             "UPDATE backend SET removed_at = ?2, updated_at = ?2 \
@@ -1125,7 +1527,16 @@ pub async fn remove_backend(conn: &Connection, id: &str, now: i64) -> Result<boo
         )
         .await
         .map_err(AppError::db)?;
-    Ok(n > 0)
+    if n == 0 {
+        return Ok(false);
+    }
+    conn.execute(
+        "DELETE FROM proxy_backend WHERE backend_id = ?1",
+        (Value::Text(id.to_string()),),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,6 +1633,25 @@ pub struct Request {
     pub backend_id: Option<String>,
 }
 
+/// Attach request rows written before their action existed to `action_id`:
+/// the earlier requests of an answer a turn continued automatically, written
+/// as each was answered and attached when the answer is.
+pub(crate) async fn attach_requests(
+    conn: &Connection,
+    request_ids: &[String],
+    action_id: &str,
+) -> Result<(), AppError> {
+    for id in request_ids {
+        conn.execute(
+            "UPDATE request SET action_id = ?2 WHERE id = ?1 AND action_id IS NULL",
+            (Value::Text(id.clone()), Value::Text(action_id.to_string())),
+        )
+        .await
+        .map_err(AppError::db)?;
+    }
+    Ok(())
+}
+
 pub async fn insert_request(conn: &Connection, entry: &Request) -> Result<(), AppError> {
     // 17 parameters — beyond turso's tuple IntoParams impls, so a Vec.
     let params: Vec<Value> = vec![
@@ -1284,6 +1714,569 @@ fn opt_str(v: Option<&str>) -> Value {
         Some(s) => Value::Text(s.to_string()),
         None => Value::Null,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Layer 1 — Transport: prefix-cache keys
+// ---------------------------------------------------------------------------
+
+/// What a claim hands the request being written.
+pub(crate) enum ClaimOutcome {
+    /// The lineage's key — reused, or freshly minted and stored — and which
+    /// of the lineage's keys it is.
+    Claimed(
+        crate::prefix_cache::CacheKey,
+        crate::prefix_cache::KeyIdentity,
+    ),
+    /// The lineage can no longer send ([`lineage_sendable_sql`]), or its
+    /// participant answers there with another model than the request's:
+    /// nothing was stored, and the request carries no key of the lineage's.
+    Unsendable,
+}
+
+#[cfg(test)]
+impl ClaimOutcome {
+    fn claimed(self) -> Option<crate::prefix_cache::CacheKey> {
+        match self {
+            ClaimOutcome::Claimed(key, _) => Some(key),
+            ClaimOutcome::Unsendable => None,
+        }
+    }
+}
+
+/// Hand one request its lineage's prefix-cache key: the stored key when the
+/// rotation rule keeps it ([`crate::prefix_cache::decide`]), a freshly minted
+/// one otherwise.
+///
+/// **A lineage is `(space_id, participant_id)`**: one participant answering in
+/// one space, on whatever branch and whether replying or regenerating. The key
+/// row carries the model and the `trust_domain` it was minted under, so a
+/// participant whose model changes, or a client pointed at another endpoint or
+/// trust bundle, starts a new key. **The model is the weights**
+/// ([`crate::prefix_cache::key_model`]): the hash the turn resolved to
+/// (`weights`) where the catalog publishes one, so a followed tag that moves
+/// rotates the key and no key reaches two engine deployments; the selection
+/// (`selection`, canonical) only where it publishes none.
+///
+/// **Called at the instant the key becomes observable** — when the transport
+/// first asks for the request body, after the connection, TLS and attestation
+/// are done (`keyed_body` in `lib.rs`) — so `now` is the moment the rotation
+/// rule must hold at, and the claim *is* the use: it stamps `last_used_at`. A
+/// request whose connection never opened never claims.
+///
+/// **A lineage closed in the meantime gets nothing.** The claim asks, inside
+/// its own transaction, whether the lineage can still send (the space open,
+/// the participant live and a live member — [`lineage_sendable_sql`], the
+/// predicate [`forget_unsendable_cache_keys`] deletes by). A turn prepared
+/// before an archival, a retirement or a departure landed would otherwise
+/// recreate the key that write just forgot; instead it is
+/// [`ClaimOutcome::Unsendable`] and nothing is stored.
+///
+/// **So does a lineage whose model changed in the meantime.** The claim asks,
+/// in the same transaction, whether the participant's effective model in the
+/// space is still `selection`. The write that changes it forgets the key
+/// (the `prefix_cache_key_forget_on_model*` triggers), and a turn still
+/// running on the old model — a tool loop's next round — would otherwise mint
+/// that model a fresh key after the change, for a return to it to find
+/// standing.
+///
+/// Decided at the write, in one `BEGIN IMMEDIATE`: two turns of one lineage
+/// racing each other (a regeneration beside a reply, a driven turn beside a
+/// human's) both read the row the other wrote, so they share a key or one of
+/// them mints the lineage's next key; no interleaving leaves them holding
+/// different keys each believes current. An error only when the store fails
+/// or a fresh key was due and the OS could not supply randomness. Emits
+/// nothing: no surface reads a key.
+pub(crate) async fn claim_prefix_cache_key(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    selection: &str,
+    weights: Option<&str>,
+    scope: &crate::prefix_cache::CacheScope,
+    now: i64,
+) -> Result<ClaimOutcome, AppError> {
+    begin_write(conn).await?;
+    let claimed = claim_prefix_cache_key_body(
+        conn,
+        space_id,
+        participant_id,
+        selection,
+        weights,
+        scope,
+        now,
+    )
+    .await;
+    match claimed {
+        Ok((claimed, replaced)) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            if replaced {
+                truncate_log_after_forgetting_keys(conn).await;
+            }
+            Ok(claimed)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn claim_prefix_cache_key_body(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    selection: &str,
+    weights: Option<&str>,
+    scope: &crate::prefix_cache::CacheScope,
+    now: i64,
+) -> Result<(ClaimOutcome, bool), AppError> {
+    use crate::prefix_cache::{CacheKey, Claim, StoredKeyAge, decide, key_model, mint};
+    use eidola_common::engine_protocol::CACHE_KEY_BYTES;
+    use zeroize::Zeroizing;
+
+    let lineage = (
+        Value::Text(space_id.to_string()),
+        Value::Text(participant_id.to_string()),
+    );
+    let mut sendable = conn
+        .query(
+            &format!("SELECT {}", lineage_sendable_sql("?1", "?2")),
+            lineage.clone(),
+        )
+        .await
+        .map_err(AppError::db)?;
+    let open = match sendable.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<i64>(0).map_err(AppError::db)? != 0,
+        None => false,
+    };
+    drop(sendable);
+    if !open {
+        return Ok((ClaimOutcome::Unsendable, false));
+    }
+    let mut effective = conn
+        .query(EFFECTIVE_MODEL_SQL, lineage.clone())
+        .await
+        .map_err(AppError::db)?;
+    let answers_with = match effective.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<Option<String>>(0).map_err(AppError::db)?,
+        None => None,
+    };
+    drop(effective);
+    if answers_with
+        .as_deref()
+        .map(crate::canonical_model)
+        .as_deref()
+        != Some(selection)
+    {
+        return Ok((ClaimOutcome::Unsendable, false));
+    }
+    let model = key_model(selection, weights);
+    let mut rows = conn
+        .query(
+            &format!(
+                "SELECT model, trust_domain, created_at, last_used_at, generation, key_bytes \
+                 FROM prefix_cache_key WHERE {LINEAGE_IS}"
+            ),
+            lineage.clone(),
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut stored: Option<(StoredKeyAge, i64, Zeroizing<Vec<u8>>)> = None;
+    use crate::prefix_cache::KeyIdentity;
+    if let Some(row) = rows.next().await.map_err(AppError::db)? {
+        let age = StoredKeyAge {
+            model: row.get::<String>(0).map_err(AppError::db)?,
+            trust_domain: row.get::<String>(1).map_err(AppError::db)?,
+            created_at: row.get::<i64>(2).map_err(AppError::db)?,
+            last_used_at: row.get::<i64>(3).map_err(AppError::db)?,
+        };
+        let generation = row.get::<i64>(4).map_err(AppError::db)?;
+        let bytes = Zeroizing::new(row.get::<Vec<u8>>(5).map_err(AppError::db)?);
+        stored = Some((age, generation, bytes));
+    }
+    drop(rows);
+
+    if let Some((age, generation, bytes)) = &stored
+        && decide(Some(age), &model, &scope.trust_domain, &scope.policy, now) == Claim::Reuse
+        && let Ok(bytes) = <&[u8; CACHE_KEY_BYTES]>::try_from(&bytes[..])
+    {
+        conn.execute(
+            &format!(
+                "UPDATE prefix_cache_key SET last_used_at = ?4 \
+                 WHERE {LINEAGE_IS} AND generation = ?3"
+            ),
+            (
+                lineage.0,
+                lineage.1,
+                Value::Integer(*generation),
+                Value::Integer(now),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+        let identity = KeyIdentity {
+            generation: *generation,
+            created_at: age.created_at,
+        };
+        return Ok((
+            ClaimOutcome::Claimed(CacheKey::from_bytes(bytes), identity),
+            false,
+        ));
+    }
+
+    let Some(fresh) = mint() else {
+        return Err(AppError::Database {
+            message: "the operating system supplied no randomness for a prefix-cache key".into(),
+        });
+    };
+    // **The retiring key is overwritten in place before it is replaced.** The
+    // upsert below rewrites the row's cell in place only when the new record
+    // is exactly as long as the old one; a different model can change the
+    // length, and turso then frees the old cell without clearing it, leaving
+    // the old key in the page's free space. Zeroing first is a same-length
+    // write, so it always lands on the old bytes, whatever follows.
+    let generation = match &stored {
+        Some((_, previous, _)) => {
+            scrub_cache_keys_where(conn, LINEAGE_IS, (lineage.0.clone(), lineage.1.clone()))
+                .await?;
+            previous.saturating_add(1)
+        }
+        None => 1,
+    };
+    // The parameter is a copy turso owns from here; the local one is scrubbed
+    // when `fresh` drops.
+    conn.execute(
+        "INSERT INTO prefix_cache_key \
+             (space_id, participant_id, model, trust_domain, generation, key_bytes, \
+              created_at, last_used_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) \
+         ON CONFLICT (space_id, participant_id) DO UPDATE SET \
+             model = excluded.model, trust_domain = excluded.trust_domain, \
+             generation = excluded.generation, key_bytes = excluded.key_bytes, \
+             created_at = excluded.created_at, last_used_at = excluded.last_used_at, \
+             resume_prompt_digest = NULL, resume_message_count = NULL, \
+             resume_prompt_tokens = NULL",
+        vec![
+            lineage.0,
+            lineage.1,
+            Value::Text(model),
+            Value::Text(scope.trust_domain.clone()),
+            Value::Integer(generation),
+            Value::Blob(fresh.to_vec()),
+            Value::Integer(now),
+        ],
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok((
+        ClaimOutcome::Claimed(
+            CacheKey::from_bytes(&fresh),
+            KeyIdentity {
+                generation,
+                created_at: now,
+            },
+        ),
+        stored.is_some(),
+    ))
+}
+
+/// A lineage's key as a request about to be prepared sees it, **without the
+/// key**: what the rotation rule judges it by, which key it is, and its
+/// resume point ([`crate::prefix_cache::ResumePoint`]) if it has one. `None`
+/// when the lineage holds no key.
+pub(crate) async fn prefix_cache_resume(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+) -> Result<
+    Option<(
+        crate::prefix_cache::StoredKeyAge,
+        crate::prefix_cache::KeyIdentity,
+        Option<crate::prefix_cache::ResumePoint>,
+    )>,
+    AppError,
+> {
+    use crate::prefix_cache::{KeyIdentity, ResumePoint, StoredKeyAge};
+    let mut rows = conn
+        .query(
+            &format!(
+                "SELECT model, trust_domain, created_at, last_used_at, generation, \
+                        resume_prompt_digest, resume_message_count, resume_prompt_tokens \
+                 FROM prefix_cache_key WHERE {LINEAGE_IS}"
+            ),
+            (
+                Value::Text(space_id.to_string()),
+                Value::Text(participant_id.to_string()),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    let Some(row) = rows.next().await.map_err(AppError::db)? else {
+        return Ok(None);
+    };
+    let age = StoredKeyAge {
+        model: row.get::<String>(0).map_err(AppError::db)?,
+        trust_domain: row.get::<String>(1).map_err(AppError::db)?,
+        created_at: row.get::<i64>(2).map_err(AppError::db)?,
+        last_used_at: row.get::<i64>(3).map_err(AppError::db)?,
+    };
+    let identity = KeyIdentity {
+        generation: row.get::<i64>(4).map_err(AppError::db)?,
+        created_at: age.created_at,
+    };
+    let digest = |bytes: Option<Vec<u8>>| bytes.and_then(|b| <[u8; 32]>::try_from(b).ok());
+    let prompt_digest = digest(row.get::<Option<Vec<u8>>>(5).map_err(AppError::db)?);
+    let message_count = row.get::<Option<i64>>(6).map_err(AppError::db)?;
+    let prompt_tokens = row.get::<Option<i64>>(7).map_err(AppError::db)?;
+    let point = match (prompt_digest, message_count, prompt_tokens) {
+        (Some(prompt_digest), Some(message_count), Some(prompt_tokens)) => Some(ResumePoint {
+            prompt_digest,
+            message_count,
+            prompt_tokens,
+        }),
+        _ => None,
+    };
+    Ok(Some((age, identity, point)))
+}
+
+/// Set (or, with `None`, clear) the resume point of the lineage's key — **only
+/// if that key is still `identity`**, the one the request it describes was
+/// sent with. A key replaced in the meantime keeps its own (empty) resume
+/// point. Emits nothing: no surface reads it.
+pub(crate) async fn record_prefix_resume(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    identity: crate::prefix_cache::KeyIdentity,
+    point: Option<&crate::prefix_cache::ResumePoint>,
+) -> Result<(), AppError> {
+    let blob = |b: Option<&[u8; 32]>| b.map_or(Value::Null, |b| Value::Blob(b.to_vec()));
+    let int = |i: Option<i64>| i.map_or(Value::Null, Value::Integer);
+    conn.execute(
+        &format!(
+            "UPDATE prefix_cache_key SET resume_prompt_digest = ?5, resume_message_count = ?6, \
+                 resume_prompt_tokens = ?7 \
+             WHERE {LINEAGE_IS} AND generation = ?3 AND created_at = ?4"
+        ),
+        vec![
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+            Value::Integer(identity.generation),
+            Value::Integer(identity.created_at),
+            blob(point.map(|p| &p.prompt_digest)),
+            int(point.map(|p| p.message_count)),
+            int(point.map(|p| p.prompt_tokens)),
+        ],
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+/// Clear the resume point of the lineage's key, whichever key it holds: an
+/// engine refused what the lineage believed it held. Emits nothing.
+pub(crate) async fn forget_prefix_resume(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+) -> Result<(), AppError> {
+    conn.execute(
+        &format!(
+            "UPDATE prefix_cache_key SET resume_prompt_digest = NULL, \
+                 resume_message_count = NULL, resume_prompt_tokens = NULL \
+             WHERE {LINEAGE_IS}"
+        ),
+        (
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+/// Every lineage holding a key, **without the key**: `(space, participant,
+/// generation, created_at, last_used_at)`. For tests of the key's lifecycle,
+/// which must observe the row and must not be handed the secret to do it.
+#[cfg(feature = "test-support")]
+pub(crate) async fn prefix_cache_lineages(
+    conn: &Connection,
+) -> Result<Vec<(String, String, i64, i64, i64)>, AppError> {
+    let mut rows = conn
+        .query(
+            "SELECT space_id, participant_id, generation, created_at, last_used_at \
+             FROM prefix_cache_key ORDER BY space_id, participant_id",
+            (),
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        out.push((
+            row.get::<String>(0).map_err(AppError::db)?,
+            row.get::<String>(1).map_err(AppError::db)?,
+            row.get::<i64>(2).map_err(AppError::db)?,
+            row.get::<i64>(3).map_err(AppError::db)?,
+            row.get::<i64>(4).map_err(AppError::db)?,
+        ));
+    }
+    Ok(out)
+}
+
+/// Forget every key minted under a trust domain other than `current`,
+/// overwritten before it goes — part of the write that changes the eidola
+/// endpoint or trust bundle, so no key outlives the domain it was minted for
+/// even until its lineage's next claim would have rotated it.
+///
+/// **Runs inside the caller's transaction** (`backends::update_backend` opens
+/// one around the configuration write and this), so the configuration and its
+/// keys change together or not at all. Returns how many were forgotten; the
+/// caller empties the log after committing when any were
+/// ([`truncate_log_after_forgetting_keys`]).
+pub(crate) async fn forget_cache_keys_outside(
+    conn: &Connection,
+    current: &str,
+) -> Result<u64, AppError> {
+    scrub_cache_keys_where(
+        conn,
+        "trust_domain <> ?1",
+        (Value::Text(current.to_string()),),
+    )
+    .await?;
+    conn.execute(
+        "DELETE FROM prefix_cache_key WHERE trust_domain <> ?1",
+        (Value::Text(current.to_string()),),
+    )
+    .await
+    .map_err(AppError::db)
+}
+
+/// One lineage's row, by `?1` (space) and `?2` (participant).
+const LINEAGE_IS: &str = "space_id = ?1 AND participant_id = ?2";
+
+/// The model selection participant `?2` answers with in space `?1`, as
+/// stored: its live membership's override, else its own — the resolution
+/// [`space_participants`] gives a turn.
+const EFFECTIVE_MODEL_SQL: &str = "SELECT COALESCE( \
+         (SELECT sp.override_model_ref FROM space_participant sp \
+           WHERE sp.space_id = ?1 AND sp.participant_id = ?2 AND sp.left_at IS NULL), \
+         (SELECT p.model_ref FROM participant p WHERE p.id = ?2))";
+
+/// **Whether a lineage can still send**, as one SQL boolean over the space
+/// `space` and the participant `participant` (column references or
+/// parameters): the space is open, and the participant is live and a live
+/// member of it — owned by the space, or referenced into it and not left.
+///
+/// The one definition both ends of a key's life read. The claim asks it of the
+/// lineage it is about to key, so a turn prepared before a lineage closed
+/// cannot recreate its key ([`claim_prefix_cache_key`]); the forget deletes by
+/// its negation over every stored row, so every door that closes a space
+/// (archival, retirement's notebook and rooms, a departing owner's
+/// delegations — each writes `archived_at`), retires a participant or ends a
+/// membership leaves no key behind ([`forget_unsendable_cache_keys`]).
+/// `prepare_turn` refuses an archived space and resolves only live members, so
+/// a lineage this answers `false` for has no turn left to send.
+fn lineage_sendable_sql(space: &str, participant: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM space s WHERE s.id = {space} AND s.archived_at IS NULL) \
+          AND EXISTS (SELECT 1 FROM participant p \
+                      WHERE p.id = {participant} AND p.removed_at IS NULL \
+                        AND (p.owner_space_id = {space} \
+                             OR EXISTS (SELECT 1 FROM space_participant sp \
+                                        WHERE sp.space_id = {space} \
+                                          AND sp.participant_id = {participant} \
+                                          AND sp.left_at IS NULL))))"
+    )
+}
+
+/// The stored rows whose lineage can no longer send.
+fn unsendable_lineage_sql() -> String {
+    format!(
+        "NOT {}",
+        lineage_sendable_sql(
+            "prefix_cache_key.space_id",
+            "prefix_cache_key.participant_id"
+        )
+    )
+}
+
+/// Overwrite the stored key bytes of every row matching `predicate` with
+/// zeros, in place.
+///
+/// Same-length, so turso rewrites each cell where it lies
+/// (`BTreeCursor::overwrite_cell`'s in-place arm) rather than freeing it, and
+/// whatever follows — a replacement of another length, a delete, which frees
+/// cells **without clearing them** — can only leave zeros behind in the page.
+async fn scrub_cache_keys_where(
+    conn: &Connection,
+    predicate: &str,
+    params: impl turso::IntoParams,
+) -> Result<(), AppError> {
+    let sql = format!(
+        "UPDATE prefix_cache_key SET key_bytes = zeroblob({}) WHERE {predicate}",
+        eidola_common::engine_protocol::CACHE_KEY_BYTES
+    );
+    conn.execute(&sql, params).await.map_err(AppError::db)?;
+    Ok(())
+}
+
+/// Fold the write-ahead log into the database file and empty it, after a key
+/// was replaced or deleted — best-effort, outside any transaction.
+///
+/// **The overwrite in [`scrub_cache_keys_where`] reaches the page, not its
+/// history.** turso keeps every committed version of a page as a frame in the
+/// `-wal` file, and has no `secure_delete`, so until the log is checkpointed
+/// and reset, frames from before the overwrite still hold the old key. A
+/// `TRUNCATE` checkpoint copies the current pages (zeros where the key was)
+/// into the database file and empties the log. It is attempted only on the
+/// rare writes that retire a key. If a reader holds the log it cannot complete
+/// now; the frames then go at the next checkpoint that empties the log, and the
+/// warning says so without naming any key.
+pub(crate) async fn truncate_log_after_forgetting_keys(conn: &Connection) {
+    let outcome = async {
+        let mut rows = conn
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await
+            .map_err(AppError::db)?;
+        let busy = match rows.next().await.map_err(AppError::db)? {
+            Some(row) => row.get::<i64>(0).map_err(AppError::db)? != 0,
+            None => false,
+        };
+        Ok::<bool, AppError>(busy)
+    }
+    .await;
+    match outcome {
+        Ok(false) => {}
+        Ok(true) => eprintln!(
+            "warning: the database log could not be emptied after a prefix-cache key was retired; \
+             it will be at the next checkpoint"
+        ),
+        Err(e) => eprintln!(
+            "warning: the database log could not be emptied after a prefix-cache key was retired: {e}"
+        ),
+    }
+}
+
+/// Delete the key of every lineage that can no longer send
+/// ([`lineage_sendable_sql`]), each overwritten before it goes.
+///
+/// Stated as the invariant rather than per door, and run inside the
+/// transaction of every write that can end a lineage — archival, retirement,
+/// a removal from a space — so a door added later that ends a lineage through
+/// one of those writes is covered without naming it here. Returns how many
+/// keys were forgotten.
+pub(crate) async fn forget_unsendable_cache_keys(conn: &Connection) -> Result<u64, AppError> {
+    let unsendable = unsendable_lineage_sql();
+    scrub_cache_keys_where(conn, &unsendable, ()).await?;
+    conn.execute(
+        &format!("DELETE FROM prefix_cache_key WHERE {unsendable}"),
+        (),
+    )
+    .await
+    .map_err(AppError::db)
 }
 
 // ---------------------------------------------------------------------------
@@ -1544,14 +2537,19 @@ pub async fn space_footprint_counts(
 /// leg. If that ever stopped being true the FK would abort this transaction
 /// and the space would be kept, which is the direction this whole feature errs
 /// in; deleting the rows to be safe would err the other way, taking a grant
-/// with a space nobody proved was empty. The inbound edges of a
-/// space-owned `participant` are `action` and `memory_block` (both checked;
-/// `space_participant` / `space_template_participant` are CHECK-pinned to
-/// globals and `space.notebook_participant_id` names only a global). FK
+/// with a space nobody proved was empty. **`prefix_cache_key`** (it names the
+/// space and a participant) is empty for anything reapable too — only a turn
+/// writes a key row, and a turn answers a post in its space — but unlike a
+/// grant a key is nothing anyone is owed, so its rows are scrubbed and
+/// deleted first rather than left to hold the space. The inbound edges of a
+/// space-owned `participant` are `action`, `memory_block` (both checked) and
+/// `prefix_cache_key` (empty, as above; `space_participant` /
+/// `space_template_participant` are CHECK-pinned to globals and
+/// `space.notebook_participant_id` names only a global). FK
 /// enforcement is on for every connection, so anything this reasoning missed
 /// aborts the transaction and the space is kept — which is the direction the
 /// whole feature errs in.
-pub async fn discard_space_if_pristine(
+pub(crate) async fn discard_space_if_pristine(
     conn: &Connection,
     space_id: &str,
 ) -> Result<bool, AppError> {
@@ -1582,7 +2580,12 @@ async fn discard_space_if_pristine_body(
         return Ok(false);
     }
 
+    // A pristine space has had no turn, so it has no key; the delete is the
+    // statement of that, and it is scrubbed first like every other.
+    scrub_cache_keys_where(conn, "space_id = ?1", (Value::Text(space_id.to_string()),)).await?;
     for stmt in [
+        "DELETE FROM prefix_cache_key WHERE space_id = ?1",
+        "DELETE FROM model_update_ack WHERE space_id = ?1",
         "DELETE FROM space_participant WHERE space_id = ?1",
         "DELETE FROM participant WHERE scope = 'space' AND owner_space_id = ?1",
         "DELETE FROM space WHERE id = ?1",
@@ -1622,6 +2625,12 @@ pub struct SubspaceRow {
     /// named one. It is where the report attaches, so the answer lands on the
     /// branch the work was asked for on. `None` for a spawn that named none.
     pub parent_action_id: Option<String>,
+    /// The item the turn that opened this room writes its answer under — which
+    /// *turn* asked for the room, where the anchor above says only which post
+    /// it was asked on. The report attaches beneath that turn's answer. `None`
+    /// for a spawn with no turn behind it. See the column's own note in
+    /// `schema.sql`.
+    pub parent_answer_item_id: Option<String>,
     pub title: Option<String>,
     pub created_at: i64,
     pub archived_at: Option<i64>,
@@ -1717,9 +2726,10 @@ fn subspace_row(row: &turso::Row) -> Result<SubspaceRow, AppError> {
         parent_space_id: row.get::<String>(1).map_err(AppError::db)?,
         owner_participant_id: row.get::<String>(2).map_err(AppError::db)?,
         parent_action_id: row.get::<Option<String>>(3).map_err(AppError::db)?,
-        title: row.get::<Option<String>>(4).map_err(AppError::db)?,
-        created_at: row.get::<i64>(5).map_err(AppError::db)?,
-        archived_at: row.get::<Option<i64>>(6).map_err(AppError::db)?,
+        parent_answer_item_id: row.get::<Option<String>>(4).map_err(AppError::db)?,
+        title: row.get::<Option<String>>(5).map_err(AppError::db)?,
+        created_at: row.get::<i64>(6).map_err(AppError::db)?,
+        archived_at: row.get::<Option<i64>>(7).map_err(AppError::db)?,
     })
 }
 
@@ -1729,8 +2739,8 @@ async fn subspace_rows(
     param: Option<&str>,
 ) -> Result<Vec<SubspaceRow>, AppError> {
     let sql = format!(
-        "SELECT s.id, s.parent_space_id, {SUBSPACE_OWNER_SQL}, s.parent_action_id, s.title, \
-                s.created_at, s.archived_at \
+        "SELECT s.id, s.parent_space_id, {SUBSPACE_OWNER_SQL}, s.parent_action_id, \
+                s.parent_answer_item_id, s.title, s.created_at, s.archived_at \
          FROM space s \
          WHERE s.parent_space_id IS NOT NULL AND {SUBSPACE_OWNER_SQL} IS NOT NULL \
            AND {where_clause} \
@@ -1838,6 +2848,91 @@ pub async fn turns_taken_in_space(conn: &Connection, space_id: &str) -> Result<i
     }
 }
 
+/// What a continuation extends: the generation's author and model, whether it
+/// stopped at its completion ceiling, and the reasoning and answer it wrote —
+/// each its `thinking` / `text` blocks joined in ordinal order (a turn writes
+/// at most one of each).
+#[derive(Debug, Clone)]
+pub struct ContinuationSource {
+    pub action_type: String,
+    pub participant_id: String,
+    pub model: Option<String>,
+    pub truncated: bool,
+    /// Its text is exactly what the model generated (`action.resumable`).
+    pub resumable: bool,
+    pub thinking: String,
+    pub text: String,
+}
+
+/// The [`ContinuationSource`] of `action_id`, or `None` for no such action.
+pub async fn continuation_source(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<ContinuationSource>, AppError> {
+    let mut rows = conn
+        .query(
+            "SELECT participant_id, model, truncated, action_type, resumable FROM action \
+             WHERE id = ?1",
+            [Value::Text(action_id.to_string())],
+        )
+        .await
+        .map_err(AppError::db)?;
+    let Some(row) = rows.next().await.map_err(AppError::db)? else {
+        return Ok(None);
+    };
+    let mut source = ContinuationSource {
+        action_type: row.get::<String>(3).map_err(AppError::db)?,
+        participant_id: row.get::<String>(0).map_err(AppError::db)?,
+        model: row.get::<Option<String>>(1).map_err(AppError::db)?,
+        truncated: row.get::<i64>(2).map_err(AppError::db)? != 0,
+        resumable: row.get::<i64>(4).map_err(AppError::db)? != 0,
+        thinking: String::new(),
+        text: String::new(),
+    };
+    drop(rows);
+    let mut blocks = conn
+        .query(
+            "SELECT block_type, text_content FROM content_block \
+             WHERE action_id = ?1 AND block_type IN ('thinking', 'text') \
+               AND text_content IS NOT NULL \
+             ORDER BY ordinal ASC",
+            [Value::Text(action_id.to_string())],
+        )
+        .await
+        .map_err(AppError::db)?;
+    while let Some(row) = blocks.next().await.map_err(AppError::db)? {
+        let text = row.get::<String>(1).map_err(AppError::db)?;
+        match row.get::<String>(0).map_err(AppError::db)?.as_str() {
+            "thinking" => source.thinking.push_str(&text),
+            _ => source.text.push_str(&text),
+        }
+    }
+    Ok(Some(source))
+}
+
+/// The request body the Record keeps for the chat completion that produced
+/// `action_id` — the generation's own request row, the last one when there is
+/// more than one. `None` when there is none.
+pub async fn generation_request_body(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<Vec<u8>>, AppError> {
+    let mut rows = conn
+        .query(
+            "SELECT request_body FROM request \
+             WHERE action_id = ?1 AND path = '/v1/chat/completions' \
+               AND request_body IS NOT NULL \
+             ORDER BY request_at DESC, id DESC LIMIT 1",
+            [Value::Text(action_id.to_string())],
+        )
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<Vec<u8>>(0).map_err(AppError::db)?)),
+    }
+}
+
 /// `(id, text)` of an action's first quotable ([`QUOTABLE_BLOCK_TYPE`]) content
 /// block — what a driver quotes when it attaches a post to a turn it is about
 /// to run. `None` for an action with no text block (a decline, a trace).
@@ -1936,7 +3031,22 @@ pub async fn has_reference_from(
 ///
 /// A direct reply rather than any descendant, because the relationship is
 /// exact: a spawn happens inside a turn, and that turn persists its answer as a
-/// reply to the very post it was answering. Newest — by **commit order**, the
+/// reply to the very post it was answering.
+///
+/// **"The same post" is the item, not the generation.** A reply edge records
+/// the generation that was current when it was written and is never remapped
+/// (causality is action ids), while everything that *renders* or *attaches*
+/// resolves an edge to its antecedent's item — so an anchor and an answer can
+/// name one post through two different generations and still be about it. That
+/// is not hypothetical here: a delegation resolves its anchor to the generation
+/// the parent currently shows, while the answer of the very turn that opened it
+/// keeps the raw antecedent the turn was prepared with, so an edit landing
+/// between preparation and the tool put the two in different namespaces.
+/// Matching on `aa.antecedent_action_id` missed the answer entirely, and the
+/// report then attached to the anchor as that answer's sibling. Joining through
+/// the item is the same identity rule the transcript already threads by, and it
+/// is what keeps this one rule rather than a second record of which answer
+/// belongs to which delegation. Newest — by **commit order**, the
 /// one ordering a writer's clock cannot contradict (see [`action_watermark`])
 /// — and **a generation the parent shows** (current, terminal status, post
 /// type — the transcript's predicate, as settlement reads it): an answer
@@ -1956,41 +3066,46 @@ pub async fn has_reference_from(
 /// answer and wait out the grace alarm, attaching the report to the anchor as
 /// a sibling of a word the parent already shows.
 ///
-/// **This resolves an answer, not *the* answer, and the gap is recorded rather
-/// than closed.** If the same owner answers the same post twice without one
-/// superseding the other — two concurrent explicit asks on one target, which is
-/// the only way to get there — the report attaches beneath the newer of the
-/// two, which may not be the turn the spawn happened inside. Nothing durable
-/// distinguishes them: a turn's rounds chain off *the post it answers*,
-/// deliberately never off its own inference (which a capped or budget-stopped
-/// turn never writes), so there is no edge from a spawning round to that turn's
-/// own answer. The one durable trace that relates them at all is
-/// `context_assembly`, and it is not one-to-one — a later turn replaying a
-/// trace records the same round in its own assembly, so the join answers a set.
-/// Recording the spawning round on the room would need a caller that could
-/// supply it, and there is none: nothing exposes the spawn door as a tool, and
-/// `tools::Tool::call` receives parsed arguments and no turn identity at all.
-/// So the residual is exactly this: **same owner, same anchor, two live answers
-/// — the report lands under the newer.** No report is lost, and the inversion
-/// the wait exists to prevent cannot happen either way, because both candidates
-/// are answers *of that owner to that anchor*: the report still sits beneath
-/// one of them rather than above it. Building for it before a caller exists
-/// would be machinery for a shape that has not been designed yet.
+/// **`after_row` is the line that says *which* answer.** An anchored spawn
+/// happens inside the owning agent's turn, so the answer the report belongs
+/// under is the one that turn is still to write — and any answer of that owner
+/// to that anchor which is already committed is a *different* answer: the
+/// generation a regeneration is in the middle of replacing, or a prior reply to
+/// the same post. Accepting one of those ends the wait at once and reports
+/// beneath an answer the delegation did not come from, while the answer it did
+/// come from is still on the wire; if the regeneration in flight then fails,
+/// its item's tip is a hidden `error` and the report is left hanging under a
+/// generation the parent no longer shows. So a caller that knows a turn is
+/// behind the delegation passes the commit-order line the room was opened at
+/// ([`subspace_opened_at_row`]) and only answers committed after it are
+/// candidates. `None` keeps the unrestricted rule, which is the honest one for
+/// a caller with no turn behind it: the newest answer is then the best guess
+/// available.
+///
+/// **It is a `rowid` and not a clock** for the reason [`action_watermark`]
+/// gives: every writer samples `now_ms()` above its own transaction, so a
+/// timestamp cannot order two writes that raced, while `rowid` is assigned at
+/// insert under serialized writers and `action` is append-only — nothing here
+/// ever deletes a row, so the sequence cannot be reused.
 pub async fn last_reply_by_participant(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
     antecedent_action_id: &str,
+    after_row: Option<i64>,
 ) -> Result<Option<String>, AppError> {
     let sql = format!(
         "SELECT a.id FROM action a \
          JOIN action_antecedent aa \
            ON aa.action_id = a.id AND aa.relation = 'reply' \
+         JOIN action ante ON ante.id = aa.antecedent_action_id \
+         JOIN action anchored ON anchored.id = ?3 \
          JOIN item_current ic ON ic.current_action_id = a.id \
          JOIN action origin ON origin.item_id = a.item_id \
            AND origin.supersedes_action_id IS NULL \
          WHERE a.space_id = ?1 AND origin.participant_id = ?2 \
-           AND aa.antecedent_action_id = ?3 \
+           AND ante.item_id = anchored.item_id \
+           AND a.rowid > ?4 \
            AND a.status IN ('complete', 'cancelled') \
            AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
          ORDER BY a.rowid DESC LIMIT 1"
@@ -2001,12 +3116,43 @@ pub async fn last_reply_by_participant(
             Value::Text(space_id.to_string()),
             Value::Text(participant_id.to_string()),
             Value::Text(antecedent_action_id.to_string()),
+            // No line means every row is after it. `rowid` starts at 1.
+            Value::Integer(after_row.unwrap_or(0)),
         ])
         .await
         .map_err(AppError::db)?;
     match rows.next().await.map_err(AppError::db)? {
         None => Ok(None),
         Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
+/// The commit-order line a delegated room was opened at: the `rowid` of its
+/// **brief**, which [`spawn_subspace_tx`] writes in the same transaction as the
+/// room itself and which is therefore the first action the room has.
+///
+/// **No new state records this** — the fact was already durable. Every action
+/// committed before the spawn has a lower `rowid` and every action committed
+/// after it a higher one (writers are serialized and `action` is append-only),
+/// so the brief *is* the pre-spawn watermark, and it reads the same after a
+/// restart as before one because it reads rows. `MIN` rather than a stored
+/// brief id for the same reason: the room's own first action is the brief by
+/// construction, so there is nothing to keep in step.
+pub async fn subspace_opened_at_row(
+    conn: &Connection,
+    space_id: &str,
+) -> Result<Option<i64>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT MIN(rowid) FROM action WHERE space_id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(space_id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => row.get::<Option<i64>>(0).map_err(AppError::db),
     }
 }
 
@@ -2159,6 +3305,13 @@ pub(crate) struct SubspacePlan<'a> {
     /// to `space.parent_action_id` and validated to be a post the parent
     /// **currently shows** (current generation, terminal status, post type).
     pub parent_action_id: Option<&'a str>,
+    /// The item the spawning turn will write its answer under — which turn is
+    /// asking, which the anchor alone cannot say. Written to
+    /// `space.parent_answer_item_id`, unvalidated on purpose: at this moment
+    /// the answer does not exist, so there is nothing to check it against, and
+    /// the report's own lookup is what decides whether a visible post of it has
+    /// landed. `None` for a caller with no turn behind it.
+    pub answer_item_id: Option<&'a str>,
     /// Global agents to seat beside the owner, deduped and in requested order.
     pub participant_ids: &'a [String],
     /// Capability names requested; each must already be held by the parent,
@@ -2194,7 +3347,8 @@ pub(crate) struct SubspacePlan<'a> {
 /// 6. every requested sub-agent is a live global agent (the
 ///    `add_global_participant` rule, asked here so the refusal is the spawn's).
 ///
-/// Then, in one commit: the space row (parent, the parent's `cascade_limit`
+/// Then, in one commit: the space row (parent, the anchor and the spawning
+/// turn's answer item, the parent's `cascade_limit`
 /// and `router_model`, **born stamped** — an agent minted this deliberately,
 /// exactly as a promotion mints a notebook), the owner's `role = 'owner'`
 /// membership, each sub-agent as a `member` with `override_notify_policy =
@@ -2296,7 +3450,8 @@ async fn spawn_subspace_tx_body(
     };
     if !has_model(&owner) {
         refuse!(SpawnRefusal::NoModelConfigured {
-            label: owner.label.clone(),
+            participant_id: plan.owner_participant_id.to_string(),
+            label: Some(owner.label.clone()),
         });
     }
 
@@ -2377,20 +3532,43 @@ async fn spawn_subspace_tx_body(
         });
     }
 
-    // (7) the sub-agents themselves — the same base-config rule as the owner:
-    // an agent with no model of its own is skipped by every planner, so
+    // (7) the sub-agents themselves — the same three rules as the owner, in
+    // the same order and for the same reasons. **Eligible**: a space-owned or
+    // retired participant cannot be referenced into another space at all.
+    // **Still in the parent**: the seats a delegation names are resolved
+    // against the roster its turn was prepared from, which is deliberate (the
+    // name a model reads is the name that resolves) and is a *snapshot* — so
+    // a departure landing between that snapshot and this write leaves a
+    // candidate that still resolves to somebody who has left. Asked here, at
+    // the write, because that is the only place it cannot be raced: seating a
+    // departed member would put an agent in a room opened from a conversation
+    // it is not in, and hand its backend a brief drawn from that conversation.
+    // The owner's own membership is asked one guard up for the same reason,
+    // and this is that rule applied to the other side of the roster.
+    // **Modelled**: the sub-space sees each participant's base configuration,
+    // and an agent with no model of its own is skipped by every planner, so
     // seating one would report a spawn that scheduled nothing.
     for id in plan.participant_ids {
         match get_participant(conn, id).await? {
             Some(p) if p.scope == "global" && p.kind == "agent" && p.removed_at.is_none() => {
+                if !is_space_member(conn, plan.parent_space_id, id).await? {
+                    refuse!(SpawnRefusal::ParticipantHasLeft {
+                        participant_id: id.to_string(),
+                        label: Some(p.label.clone()),
+                    });
+                }
                 if !has_model(&p) {
                     refuse!(SpawnRefusal::NoModelConfigured {
-                        label: p.label.clone(),
+                        participant_id: id.to_string(),
+                        label: Some(p.label.clone()),
                     });
                 }
             }
+            // No name to give: the row may not be readable at all, and a row
+            // that is may be a kind this never had a roster name for.
             _ => refuse!(SpawnRefusal::ParticipantNotEligible {
                 participant_id: id.to_string(),
+                label: None,
             }),
         }
     }
@@ -2425,9 +3603,9 @@ async fn spawn_subspace_tx_body(
     // the brief below means it could never have been reaped anyway.
     conn.execute(
         "INSERT INTO space \
-         (id, parent_space_id, parent_action_id, title, linkability, cascade_limit, \
-          router_model, created_at, touched_at) \
-         VALUES (?1, ?2, ?7, ?3, 'unlinked', ?4, ?5, ?6, ?6)",
+         (id, parent_space_id, parent_action_id, parent_answer_item_id, title, linkability, \
+          cascade_limit, router_model, created_at, touched_at) \
+         VALUES (?1, ?2, ?7, ?8, ?3, 'unlinked', ?4, ?5, ?6, ?6)",
         (
             Value::Text(plan.space_id.to_string()),
             Value::Text(plan.parent_space_id.to_string()),
@@ -2436,6 +3614,7 @@ async fn spawn_subspace_tx_body(
             opt_str(parent_router_model.as_deref()),
             Value::Integer(plan.now),
             opt_str(plan.parent_action_id),
+            opt_str(plan.answer_item_id),
         ),
     )
     .await
@@ -2515,13 +3694,15 @@ async fn spawn_subspace_tx_body(
             participant_id: plan.owner_participant_id.to_string(),
             item_id: plan.brief_item_id.to_string(),
             supersedes_action_id: None,
-            action_type: "brief".to_string(),
+            action_type: BRIEF_ACTION_TYPE.to_string(),
             status: "complete".to_string(),
             intent: None,
             model: None,
             input_tokens: None,
             output_tokens: None,
             credits_consumed: None,
+            truncated: false,
+            resumable: false,
             created_at: plan.now,
         },
     )
@@ -2798,6 +3979,10 @@ pub async fn update_participant_config(
             ));
         }
     }
+    if let Some(expected) = &write.model_premise {
+        params.push(opt_str(expected.as_deref()));
+        premise.push_str(&format!(" AND model_ref IS ?{}", params.len()));
+    }
     let sql = format!(
         "UPDATE participant SET {} WHERE id = ?1{premise}",
         sets.join(", ")
@@ -2928,6 +4113,10 @@ pub struct PersonaWrite {
     /// statement, the premise makes that stale write strike nothing (Codex
     /// review, PR #279).
     pub premise: ScopePremise,
+    /// **The model the caller believed the row holds**, when the write was
+    /// derived from it (the newer-weights switch). `Some` makes a row whose
+    /// model has since changed strike nothing; `None` asks nothing of it.
+    pub model_premise: Option<Option<String>>,
 }
 
 /// The scope a config write was composed against.
@@ -3023,7 +4212,7 @@ pub struct Promotion<'a> {
 /// The caller has already validated *what* may be promoted (kind, scope, the
 /// shared "User", removal) and what the persona may say; this is the mechanics —
 /// **plus the one check that cannot be done ahead of the transaction**, below.
-pub async fn promote_participant_tx(
+pub(crate) async fn promote_participant_tx(
     conn: &Connection,
     promotion: &Promotion<'_>,
 ) -> Result<(), AppError> {
@@ -3260,7 +4449,7 @@ pub enum GrantDecision {
 /// not an agent, the shared human, a template-scoped row) still belong to the
 /// caller: they are typed errors a reader can act on, and finding them out in
 /// here would be a rollback where a message belongs.
-pub async fn grant_space_membership_tx(
+pub(crate) async fn grant_space_membership_tx(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
@@ -3300,7 +4489,7 @@ pub async fn grant_space_membership_tx(
 /// reported a failure for a join that had committed (Codex review, PR #280).
 /// `None` means the join struck nothing — the liveness premise expired — with
 /// nothing written and nothing to announce.
-pub async fn join_space_participant_tx(
+pub(crate) async fn join_space_participant_tx(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
@@ -3599,15 +4788,24 @@ pub struct Retirement {
 /// The participant row itself always survives (soft-remove), so every
 /// `action.participant_id` in the trail stays resolvable; retirement is about
 /// the *library*, never the history.
-pub async fn retire_participant_tx(
+pub(crate) async fn retire_participant_tx(
     conn: &Connection,
     participant_id: &str,
     now: i64,
 ) -> Result<Retirement, AppError> {
     begin_write(conn).await?;
-    match retire_participant_tx_body(conn, participant_id, now).await {
-        Ok(retirement) => {
+    match async {
+        let done = retire_participant_tx_body(conn, participant_id, now).await?;
+        let forgotten = forget_unsendable_cache_keys(conn).await?;
+        Ok((done, forgotten))
+    }
+    .await
+    {
+        Ok((retirement, forgotten)) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            if forgotten > 0 {
+                truncate_log_after_forgetting_keys(conn).await;
+            }
             Ok(retirement)
         }
         Err(e) => {
@@ -3988,6 +5186,12 @@ pub async fn participant_spaces(
             archived_at: row.get::<Option<i64>>(3).map_err(AppError::db)?,
             last_activity_at: row.get::<i64>(4).map_err(AppError::db)?,
             message_count: row.get::<i64>(5).map_err(AppError::db)?,
+            // **Deliberately never a parent here.** This read is model-facing
+            // (`list_my_spaces`), and membership is its whole boundary: naming
+            // the conversation a delegated room was opened from would report a
+            // space the asking agent may well not be in, from a listing that
+            // exists to report only the ones it is.
+            parent: None,
         });
     }
     Ok(out)
@@ -4185,6 +5389,37 @@ pub async fn update_space_participant_override(
     override_notify_policy: Option<Option<&str>>,
     now: i64,
 ) -> Result<bool, AppError> {
+    update_space_participant_override_if(
+        conn,
+        space_id,
+        participant_id,
+        override_label,
+        override_model_ref,
+        override_system_prompt,
+        override_notify_policy,
+        None,
+        now,
+    )
+    .await
+}
+
+/// [`update_space_participant_override`], also conditioned on the model the
+/// caller believed the membership resolves to (`COALESCE(override, base)`):
+/// `Some` makes a membership whose effective model has since changed strike
+/// nothing, so a write derived from that model (the newer-weights switch)
+/// cannot overwrite a newer choice.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_space_participant_override_if(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    override_label: Option<Option<&str>>,
+    override_model_ref: Option<Option<&str>>,
+    override_system_prompt: Option<Option<&str>>,
+    override_notify_policy: Option<Option<&str>>,
+    model_premise: Option<Option<&str>>,
+    now: i64,
+) -> Result<bool, AppError> {
     let mut sets: Vec<String> = Vec::new();
     let mut params: Vec<Value> = vec![
         Value::Text(space_id.to_string()),
@@ -4242,12 +5477,23 @@ pub async fn update_space_participant_override(
         ),
         None => String::new(),
     };
+    let model_guard = match model_premise {
+        Some(expected) => {
+            params.push(opt_str(expected));
+            format!(
+                " AND COALESCE(override_model_ref, \
+                     (SELECT p.model_ref FROM participant p WHERE p.id = ?2)) IS ?{}",
+                params.len()
+            )
+        }
+        None => String::new(),
+    };
     let sql = format!(
         "UPDATE space_participant SET {} \
          WHERE space_id = ?1 AND participant_id = ?2 AND left_at IS NULL \
            AND EXISTS ( \
                SELECT 1 FROM participant p WHERE p.id = ?2 AND p.removed_at IS NULL \
-           ){owner_guard}",
+           ){owner_guard}{model_guard}",
         sets.join(", ")
     );
     // An override is per-space configuration, so it stamps the space — before
@@ -4342,16 +5588,25 @@ pub struct SpaceDeparture {
     pub archived_spaces: Vec<String>,
 }
 
-pub async fn remove_space_participant_tx(
+pub(crate) async fn remove_space_participant_tx(
     conn: &Connection,
     space_id: &str,
     participant_id: &str,
     now: i64,
 ) -> Result<SpaceDeparture, AppError> {
     begin_write(conn).await?;
-    match remove_space_participant_tx_body(conn, space_id, participant_id, now).await {
-        Ok(outcome) => {
+    match async {
+        let done = remove_space_participant_tx_body(conn, space_id, participant_id, now).await?;
+        let forgotten = forget_unsendable_cache_keys(conn).await?;
+        Ok((done, forgotten))
+    }
+    .await
+    {
+        Ok((outcome, forgotten)) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            if forgotten > 0 {
+                truncate_log_after_forgetting_keys(conn).await;
+            }
             Ok(outcome)
         }
         Err(e) => {
@@ -4961,7 +6216,7 @@ pub type TemplateParticipantInput = (String, Option<String>, Option<String>, Str
 /// `Change::Templates` only after this returns `Ok` (the changes.rs
 /// emit-after-commit rule). `participants = None` leaves the participant set
 /// untouched; `Some(&[])` clears it.
-pub async fn update_template_tx(
+pub(crate) async fn update_template_tx(
     conn: &Connection,
     id: &str,
     title: Option<&str>,
@@ -5055,7 +6310,7 @@ pub async fn soft_remove_space_template(
 /// inside it too**, decided at the write like every other guard in this module,
 /// so a template removed a moment ago cannot be instantiated by a check taken
 /// before the writer was reserved.
-pub async fn instantiate_template(
+pub(crate) async fn instantiate_template(
     conn: &Connection,
     template_id: &str,
     new_space_id: &str,
@@ -5259,6 +6514,13 @@ pub struct ActionEntry {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub credits_consumed: Option<i64>,
+    /// The upstream stopped this generation at the completion ceiling rather
+    /// than because the model was done. Only an `inference` may set it (the
+    /// schema CHECKs that); every other writer passes `false`.
+    pub truncated: bool,
+    /// A truncated generation whose text is exactly what the model generated, so
+    /// it can be continued (the schema CHECKs it implies `truncated`).
+    pub resumable: bool,
     pub created_at: i64,
 }
 
@@ -5295,12 +6557,31 @@ pub(crate) struct PostPlan<'a> {
     /// Quoted references at ordinals `1..=N` in supplied order — already
     /// validated by the caller, which is where a refusal belongs.
     pub references: &'a [crate::ReferenceSpec],
+    /// Join the author into this space as part of writing the post.
+    ///
+    /// Set for a **delegated room**, where the shared human has no membership
+    /// by construction: the first thing they say there joins them. The join
+    /// rides the post's own transaction because the roster the models are shown
+    /// has to be true of the transcript they read — a post by somebody the
+    /// roster omits is a lie about the room, and any gap between the two
+    /// writes is a window in which a turn can be planned over exactly that.
+    pub join_author: bool,
     pub created_at: i64,
 }
 
+/// What [`post_tx`] committed, beyond the post itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PostOutcome {
+    /// The space took a derived title from this post.
+    pub auto_titled: bool,
+    /// The author's membership was written (a fresh join or a revived one) —
+    /// what the caller announces on.
+    pub joined: bool,
+}
+
 /// Write one post — **the action, its text, its reply edge, its quoted
-/// references and any title it earns, in one `BEGIN IMMEDIATE` transaction.**
-/// Answers whether the space took a derived title.
+/// references, any title it earns and, where the plan asks for it, the author's
+/// own membership, in one `BEGIN IMMEDIATE` transaction.**
 ///
 /// **A post is not its action row.** Written as separate autocommitted
 /// statements, the row lands first and its text, its place in the thread and
@@ -5319,12 +6600,15 @@ pub(crate) struct PostPlan<'a> {
 /// adjacent, which is what makes them transaction-able at all — and the caller
 /// validates before it opens this, so a refusal still writes nothing and now
 /// cannot half-write either.
-pub(crate) async fn post_tx(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, AppError> {
+pub(crate) async fn post_tx(
+    conn: &Connection,
+    plan: &PostPlan<'_>,
+) -> Result<PostOutcome, AppError> {
     begin_write(conn).await?;
     match post_tx_body(conn, plan).await {
-        Ok(auto_titled) => {
+        Ok(outcome) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
-            Ok(auto_titled)
+            Ok(outcome)
         }
         Err(e) => {
             // Best-effort rollback; propagate the original error regardless.
@@ -5334,7 +6618,24 @@ pub(crate) async fn post_tx(conn: &Connection, plan: &PostPlan<'_>) -> Result<bo
     }
 }
 
-async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, AppError> {
+async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<PostOutcome, AppError> {
+    // The membership lands **before** the words, so no ordering inside the
+    // transaction can show a post whose author the roster does not carry.
+    // Insert-or-revive on the space's primary key: a live membership is left
+    // exactly as it stands, so this is a no-op for every ordinary space and
+    // for the second thing a reader says in a delegated one.
+    let joined = if plan.join_author {
+        ensure_space_participant(
+            conn,
+            plan.space_id,
+            plan.participant_id,
+            crate::MembershipRole::Member.as_str(),
+            plan.created_at,
+        )
+        .await?
+    } else {
+        false
+    };
     insert_action(
         conn,
         &ActionEntry {
@@ -5350,6 +6651,8 @@ async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, Ap
             input_tokens: None,
             output_tokens: None,
             credits_consumed: None,
+            truncated: false,
+            resumable: false,
             created_at: plan.created_at,
         },
     )
@@ -5383,7 +6686,10 @@ async fn post_tx_body(conn: &Connection, plan: &PostPlan<'_>) -> Result<bool, Ap
         )
         .await?;
     }
-    Ok(auto_titled)
+    Ok(PostOutcome {
+        auto_titled,
+        joined,
+    })
 }
 
 /// Everything an edit writes, validated by the caller before this is opened.
@@ -5451,6 +6757,8 @@ async fn edit_post_tx_body(conn: &Connection, plan: &EditPostPlan<'_>) -> Result
             input_tokens: None,
             output_tokens: None,
             credits_consumed: None,
+            truncated: false,
+            resumable: false,
             created_at: plan.created_at,
         },
     )
@@ -5483,13 +6791,163 @@ async fn edit_post_tx_body(conn: &Connection, plan: &EditPostPlan<'_>) -> Result
     Ok(())
 }
 
+/// Record the weights hash the Eidola gateway answered `action_id` with
+/// (`action.model_sha256`): the hash the turn's model reference resolved to.
+/// Written in the same transaction as the action itself; `None` writes
+/// nothing, so a backend without weights hashes leaves the column NULL.
+pub async fn set_action_model_sha256(
+    conn: &Connection,
+    action_id: &str,
+    sha256: Option<&str>,
+) -> Result<(), AppError> {
+    let Some(sha256) = sha256 else {
+        return Ok(());
+    };
+    conn.execute(
+        "UPDATE action SET model_sha256 = ?1 WHERE id = ?2",
+        (
+            Value::Text(sha256.to_string()),
+            Value::Text(action_id.to_string()),
+        ),
+    )
+    .await
+    .map_err(|e| AppError::Database {
+        message: format!("failed to record the action's weights hash: {e}"),
+    })?;
+    Ok(())
+}
+
+/// Record that the user dismissed the "model updated" notice of
+/// `participant_id` in `space_id` under selection `model` (canonical), for
+/// the weights `sha256` the tag names now (`model_update_ack`).
+pub async fn acknowledge_model_update(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    model: &str,
+    sha256: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO model_update_ack (space_id, participant_id, model, sha256, acknowledged_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT (space_id, participant_id, model) \
+         DO UPDATE SET sha256 = excluded.sha256, acknowledged_at = excluded.acknowledged_at",
+        (
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+            Value::Text(model.to_string()),
+            Value::Text(sha256.to_string()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+/// The weights hash the user last dismissed a "model updated" notice for,
+/// for `participant_id` in `space_id` under selection `model` (canonical).
+pub async fn acknowledged_model_update(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    model: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT sha256 FROM model_update_ack \
+             WHERE space_id = ?1 AND participant_id = ?2 AND model = ?3",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+            Value::Text(model.to_string()),
+        ))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<String>(0).map(Some).map_err(AppError::db),
+        None => Ok(None),
+    }
+}
+
+/// The weights hash `action_id` was answered with (`action.model_sha256`),
+/// if one was recorded.
+pub async fn action_model_sha256(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT model_sha256 FROM action WHERE id = ?1")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query([Value::Text(action_id.to_string())])
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<Option<String>>(0).map_err(AppError::db),
+        None => Ok(None),
+    }
+}
+
+/// `action.intent` of the model calls of a turn that continues a truncated
+/// answer. Such a turn is asked of the weights that wrote the answer, not of
+/// what its selection resolves to, so it says nothing about where a followed
+/// tag points ([`last_model_sha256`]).
+pub(crate) const INTENT_CONTINUE: &str = "continue";
+
+/// The weights hash the last answer of `participant_id` in `space_id` under
+/// model selection `model` (canonical) came from, if any did — a failed
+/// generation (`status = 'error'`) is no answer, whatever it recorded: what a
+/// followed tag last resolved to, which the "model updated" notice compares
+/// with what it resolves to now. A continuation ([`INTENT_CONTINUE`]) is
+/// skipped: it records the weights of the answer it continued, which may be
+/// ones the tag has since left, and counting it would raise the notice again
+/// for a move the participant's later answers already followed.
+pub async fn last_model_sha256(
+    conn: &Connection,
+    space_id: &str,
+    participant_id: &str,
+    model: &str,
+) -> Result<Option<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT model_sha256 FROM action \
+             WHERE space_id = ?1 AND participant_id = ?2 AND model = ?3 \
+               AND model_sha256 IS NOT NULL AND status <> 'error' \
+               AND intent IS NOT ?4 \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((
+            Value::Text(space_id.to_string()),
+            Value::Text(participant_id.to_string()),
+            Value::Text(model.to_string()),
+            Value::Text(INTENT_CONTINUE.to_string()),
+        ))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => row.get::<Option<String>>(0).map_err(AppError::db),
+        None => Ok(None),
+    }
+}
+
 pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO action (id, space_id, participant_id, participant_scope, item_id, \
          supersedes_action_id, supersedes_item_id, action_type, status, \
-         intent, model, input_tokens, output_tokens, credits_consumed, created_at) \
+         intent, model, input_tokens, output_tokens, credits_consumed, truncated, \
+         resumable, created_at) \
          VALUES (?1, ?2, ?3, (SELECT scope FROM participant WHERE id = ?3), \
-                 ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         (
             Value::Text(entry.id.clone()),
             Value::Text(entry.space_id.clone()),
@@ -5519,6 +6977,8 @@ pub async fn insert_action(conn: &Connection, entry: &ActionEntry) -> Result<(),
                 Some(c) => Value::Integer(c),
                 None => Value::Null,
             },
+            Value::Integer(i64::from(entry.truncated)),
+            Value::Integer(i64::from(entry.resumable)),
             Value::Integer(entry.created_at),
         ),
     )
@@ -5846,6 +7306,57 @@ async fn is_visible_post_in_space(
 /// The post `action_id`'s item currently shows, or `None` if that item has no
 /// visible tip — superseded wording, a hidden `error` generation, a missing
 /// row. The walk asks this of every frontier id before planning it, so an
+/// The post an **item** currently shows in `space_id`, or `None` when it shows
+/// none — the item-keyed twin of [`visible_tip_of_action`], through the same
+/// transcript predicate (current generation, terminal status, post type).
+///
+/// It exists for the one question an action id cannot answer: *has the turn
+/// that opened this delegated room written its answer yet?* A turn mints the
+/// item its answer will be written under before it makes a single request
+/// (`TurnPrep::inf_item_id`), and that item is the only thing that identifies
+/// one turn among several the same agent may be running against the same post
+/// — the answer's own action id does not exist until the turn ends, and a
+/// capped or budget-stopped turn never writes one at all.
+///
+/// **`after_row` is still required, and the two rules are not redundant.** An
+/// item names the turn but not the *generation*: a regeneration's
+/// `inf_item_id` is the item it is revising, whose visible post until the turn
+/// lands is the answer being replaced. So the item rules out an answer from
+/// **another** turn, and the watermark rules out an answer that predates the
+/// room; each covers exactly what the other cannot. See
+/// [`last_reply_by_participant`] for the watermark's own argument.
+pub async fn visible_post_of_item(
+    conn: &Connection,
+    space_id: &str,
+    item_id: &str,
+    after_row: Option<i64>,
+) -> Result<Option<String>, AppError> {
+    let sql = format!(
+        "SELECT tip.id FROM item_current ic \
+         JOIN action tip ON tip.id = ic.current_action_id \
+         WHERE ic.item_id = ?1 AND ic.space_id = ?2 \
+           AND tip.rowid > ?3 \
+           AND tip.status IN ('complete', 'cancelled') \
+           AND tip.action_type IN ({POST_ACTION_TYPES_SQL}) \
+         LIMIT 1"
+    );
+    let mut rows = conn
+        .query(
+            &sql,
+            (
+                Value::Text(item_id.to_string()),
+                Value::Text(space_id.to_string()),
+                Value::Integer(after_row.unwrap_or(0)),
+            ),
+        )
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        None => Ok(None),
+        Some(row) => Ok(Some(row.get::<String>(0).map_err(AppError::db)?)),
+    }
+}
+
 /// edit or regeneration that landed while a sibling branch was walking is
 /// one wording, not two.
 pub async fn visible_tip_of_action(
@@ -5879,6 +7390,14 @@ pub async fn visible_tip_of_action(
 pub struct IncomingReferenceRow {
     /// The referring post's action id (a current generation).
     pub action_id: String,
+    /// The referring post's **item** — its identity across generations.
+    ///
+    /// The action id is the generation, and an edit mints a new one: editing a
+    /// referring post without touching its quote replicates the edge onto a
+    /// fresh action, so the backlink is the same backlink while
+    /// [`Self::action_id`] is not the same string. Anything holding on to a
+    /// row across a reload wants this.
+    pub item_id: String,
     /// The referring post's space (references may cross spaces).
     pub space_id: String,
     pub ordinal: i64,
@@ -5887,6 +7406,26 @@ pub struct IncomingReferenceRow {
     pub range_end: Option<i64>,
     pub annotation: Option<String>,
     pub created_at: i64,
+    /// The **referring** post's author, as that post's own space names it
+    /// (`COALESCE(space_participant.override_label, participant.label)` joined
+    /// on `ar.space_id`). Carried for the same reason the outgoing direction
+    /// carries [`AntecedentEdgeRow::antecedent_author_label`]: a referrer in
+    /// another space cannot be named from anything the quoted space knows.
+    pub author_label: String,
+    /// The referring post's author's participant **kind**, from the same join.
+    /// The label is not renderable on its own — see
+    /// [`crate::IncomingReference::author_kind`].
+    pub author_kind: String,
+    /// The referring space's title, `NULL` for one never named.
+    ///
+    /// An author does not identify a post: the same participant can quote one
+    /// passage from two conversations, and a surface listing backlinks would
+    /// then offer two rows that read alike and open different windows. The
+    /// title is what tells them apart, and it travels with the row that already
+    /// names that space by id. A surface that shows it wants
+    /// [`crate::AppCore::references_to_visible_to`], which reports only spaces
+    /// the viewer may read.
+    pub space_title: Option<String>,
 }
 
 /// All current-generation posts referencing `antecedent_action_id` (relation
@@ -5899,9 +7438,15 @@ pub async fn references_to(
     let mut stmt = conn
         .prepare(&format!(
             "SELECT aa.action_id, ar.space_id, aa.ordinal, aa.content_block_id, \
-                    aa.range_start, aa.range_end, aa.annotation, ar.created_at \
+                    aa.range_start, aa.range_end, aa.annotation, ar.created_at, \
+                    COALESCE(rsp.override_label, rp.label), rp.kind, rs.title, \
+                    ar.item_id \
              FROM action_antecedent aa \
              JOIN action_resolved ar ON ar.action_id = aa.action_id \
+             JOIN participant rp ON rp.id = ar.participant_id \
+             JOIN space rs ON rs.id = ar.space_id \
+             LEFT JOIN space_participant rsp \
+               ON rsp.space_id = ar.space_id AND rsp.participant_id = ar.participant_id \
              WHERE aa.antecedent_action_id = ?1 \
                AND aa.relation = 'reference' \
                AND ar.action_type IN ({POST_ACTION_TYPES_SQL}) \
@@ -5926,6 +7471,10 @@ pub async fn references_to(
             range_end: row.get::<Option<i64>>(5).map_err(AppError::db)?,
             annotation: row.get::<Option<String>>(6).map_err(AppError::db)?,
             created_at: row.get::<i64>(7).map_err(AppError::db)?,
+            author_label: row.get::<String>(8).map_err(AppError::db)?,
+            author_kind: row.get::<String>(9).map_err(AppError::db)?,
+            space_title: row.get::<Option<String>>(10).map_err(AppError::db)?,
+            item_id: row.get::<String>(11).map_err(AppError::db)?,
         });
     }
     Ok(out)
@@ -6394,6 +7943,8 @@ pub struct RawActionRow {
     pub participant_scope: String,
     pub status: String,
     pub model: Option<String>,
+    /// The weights hash the action's Eidola model reference resolved to.
+    pub model_sha256: Option<String>,
     pub credits_consumed: Option<i64>,
     pub reply_to: Option<String>,
     pub blocks: Vec<RawBlockRow>,
@@ -6419,7 +7970,7 @@ pub async fn raw_space_actions(
             "SELECT a.id, a.action_type, a.status, a.model, a.credits_consumed, \
                     (SELECT aa.antecedent_action_id FROM action_antecedent aa \
                       WHERE aa.action_id = a.id AND aa.relation = 'reply'), \
-                    a.participant_id, a.participant_scope \
+                    a.participant_id, a.participant_scope, a.model_sha256 \
              FROM action a WHERE a.space_id = ?1 ORDER BY a.created_at ASC, a.id ASC",
         )
         .await
@@ -6439,6 +7990,7 @@ pub async fn raw_space_actions(
             reply_to: row.get::<Option<String>>(5).map_err(AppError::db)?,
             participant_id: row.get::<String>(6).map_err(AppError::db)?,
             participant_scope: row.get::<String>(7).map_err(AppError::db)?,
+            model_sha256: row.get::<Option<String>>(8).map_err(AppError::db)?,
             blocks: Vec::new(),
         });
     }
@@ -6890,6 +8442,24 @@ pub struct SpaceListRow {
     pub archived_at: Option<i64>,
     pub last_activity_at: i64,
     pub message_count: i64,
+    /// The conversation this one was delegated from, when it was — `None` for
+    /// an ordinary conversation.
+    pub parent: Option<ParentSpace>,
+}
+
+/// The conversation a delegated room was opened from: enough to name it and to
+/// open it, and nothing else.
+///
+/// **One value, not two nullable columns.** "Which conversation" and "what it
+/// is called" travel together or not at all — a title with no id names
+/// somewhere a reader cannot go, and an id with no title is a link with no
+/// words — so the pair is the unit and its absence is the ordinary case. The
+/// title stays optional inside it because a conversation genuinely need not
+/// have one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParentSpace {
+    pub space_id: String,
+    pub title: Option<String>,
 }
 
 pub async fn list_spaces(
@@ -6906,11 +8476,20 @@ pub async fn list_spaces(
     } else {
         "WHERE s.notebook_participant_id IS NULL AND s.archived_at IS NULL "
     };
+    // The parent join is a self-join on the navigational `parent_space_id`, and
+    // it answers in the **same read** as the listing rather than in a per-row
+    // lookup behind it: a listing is virtualized, so a second read per row
+    // would put a query inside a scroll. A delegated room's parent always
+    // exists (the FK says so) and is deliberately **not** filtered on archival
+    // or on being a notebook — a room can be opened from either, and naming
+    // where a row came from is not a door into it.
     let sql = format!(
         "SELECT s.id, s.title, s.created_at, s.archived_at, \
                 COALESCE(MAX(a.created_at), s.created_at) AS last_activity_at, \
-                COUNT(a.id) AS message_count \
+                COUNT(a.id) AS message_count, \
+                s.parent_space_id, p.title \
          FROM space s \
+         LEFT JOIN space p ON p.id = s.parent_space_id \
          LEFT JOIN action a ON a.space_id = s.id \
               AND a.action_type IN ({POST_ACTION_TYPES_SQL}) \
               AND a.status IN ('complete', 'cancelled') \
@@ -6918,7 +8497,7 @@ pub async fn list_spaces(
                   SELECT 1 FROM action sup WHERE sup.supersedes_action_id = a.id \
               ) \
          {filter}\
-         GROUP BY s.id, s.title, s.created_at, s.archived_at \
+         GROUP BY s.id, s.title, s.created_at, s.archived_at, s.parent_space_id, p.title \
          ORDER BY last_activity_at DESC"
     );
     let mut stmt = conn.prepare(&sql).await.map_err(AppError::db)?;
@@ -6932,6 +8511,13 @@ pub async fn list_spaces(
             archived_at: row.get::<Option<i64>>(3).map_err(AppError::db)?,
             last_activity_at: row.get::<i64>(4).map_err(AppError::db)?,
             message_count: row.get::<i64>(5).map_err(AppError::db)?,
+            parent: row
+                .get::<Option<String>>(6)
+                .map_err(AppError::db)?
+                .map(|space_id| ParentSpace {
+                    space_id,
+                    title: row.get::<Option<String>>(7).ok().flatten(),
+                }),
         });
     }
     Ok(results)
@@ -7267,13 +8853,21 @@ pub const POST_ACTION_TYPES_SQL: &str = "'user_input', 'inference', 'brief'";
 /// The same set, for the checks that happen in Rust rather than in SQL — the
 /// reference gate (what a quote may name) and the read-side filters that back
 /// it up. Kept beside [`POST_ACTION_TYPES_SQL`] so the two cannot drift.
-pub const POST_ACTION_TYPES: [&str; 3] = ["user_input", "inference", "brief"];
+pub const POST_ACTION_TYPES: [&str; 3] = ["user_input", "inference", BRIEF_ACTION_TYPE];
+
+/// The opening post of an agent-spawned sub-space — the only action type this
+/// module writes outside a turn, and written in exactly one place
+/// ([`spawn_subspace_tx`]). Named because planning asks about it by name (a
+/// brief is the one post that must schedule somebody; see
+/// `crate::Inner::mechanical_plan`), and a rule that spelled the type inline
+/// would be a rule that drifts from the writer.
+pub const BRIEF_ACTION_TYPE: &str = "brief";
 
 /// Action types an **agent** authors as a post. The role split that renders a
 /// transcript for a model is participant-derived (only the responder's own
 /// posts are `assistant`), but the display-side view has no responder to ask,
 /// so it reads this.
-pub const AGENT_POST_ACTION_TYPES: [&str; 2] = ["inference", "brief"];
+pub const AGENT_POST_ACTION_TYPES: [&str; 2] = ["inference", BRIEF_ACTION_TYPE];
 
 /// Whether an action type is a post an agent authored (see
 /// [`AGENT_POST_ACTION_TYPES`]).
@@ -7309,6 +8903,11 @@ pub struct PostActionRow {
     pub action_type: String,
     pub model: Option<String>,
     pub credits_consumed: Option<i64>,
+    /// The upstream stopped this generation at its completion ceiling — the
+    /// durable fact behind the render's "this answer reached its length limit"
+    /// mark, which is why it is read here and not only carried on the live
+    /// turn's result.
+    pub truncated: bool,
     /// Derived 0-based generation number of this (tip) action. The item's total
     /// generation count is `generation + 1`.
     pub generation: i64,
@@ -7386,7 +8985,8 @@ pub async fn get_space_tree_data(
     let action_sql = format!(
         "SELECT ar.action_id, ar.item_id, p.kind, \
                 COALESCE(sp.override_label, p.label), ar.action_type, \
-                ar.model, ar.credits_consumed, ar.generation, ar.created_at \
+                ar.model, ar.credits_consumed, ar.truncated, ar.generation, \
+                ar.created_at \
          FROM action_resolved ar \
          JOIN participant p ON p.id = ar.participant_id \
          LEFT JOIN space_participant sp \
@@ -7416,8 +9016,9 @@ pub async fn get_space_tree_data(
             action_type: row.get::<String>(4).map_err(AppError::db)?,
             model: row.get::<Option<String>>(5).map_err(AppError::db)?,
             credits_consumed: row.get::<Option<i64>>(6).map_err(AppError::db)?,
-            generation: row.get::<i64>(7).map_err(AppError::db)?,
-            created_at: row.get::<i64>(8).map_err(AppError::db)?,
+            truncated: row.get::<i64>(7).map_err(AppError::db)? != 0,
+            generation: row.get::<i64>(8).map_err(AppError::db)?,
+            created_at: row.get::<i64>(9).map_err(AppError::db)?,
         });
     }
 
@@ -7859,15 +9460,24 @@ pub async fn space_action_ids(conn: &Connection, space_id: &str) -> Result<Vec<S
 /// thing that decides this. Doing it in the archival's own transaction is what
 /// makes "a live room under a closed one" unrepresentable rather than a state
 /// somebody has to notice.
-pub async fn archive_space_tx(
+pub(crate) async fn archive_space_tx(
     conn: &Connection,
     space_id: &str,
     archived_at: i64,
 ) -> Result<Vec<String>, AppError> {
     begin_write(conn).await?;
-    match archive_space_tx_body(conn, space_id, archived_at).await {
-        Ok(archived) => {
+    match async {
+        let done = archive_space_tx_body(conn, space_id, archived_at).await?;
+        let forgotten = forget_unsendable_cache_keys(conn).await?;
+        Ok((done, forgotten))
+    }
+    .await
+    {
+        Ok((archived, forgotten)) => {
             conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            if forgotten > 0 {
+                truncate_log_after_forgetting_keys(conn).await;
+            }
             Ok(archived)
         }
         Err(e) => {
@@ -8307,12 +9917,468 @@ pub async fn list_credential_lifecycle(
 }
 
 // ---------------------------------------------------------------------------
+// The local inference proxy
+// ---------------------------------------------------------------------------
+
+/// The `proxy_settings` singleton, as stored. Read-only: writes go through
+/// [`update_proxy_settings`], which moves columns rather than rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxySettingsRow {
+    pub enabled: bool,
+    pub bind_address: String,
+    pub bind_port: i64,
+    pub local_exposure: String,
+}
+
+/// One `proxy_key` row. The key itself is not here and never was — see the
+/// table's comment in `schema.sql`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxyKeyRow {
+    pub id: String,
+    pub label: String,
+    pub prefix: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+}
+
+/// Read the proxy settings, or `None` when the singleton has never been
+/// written. A profile that has never opened the pane has no row, and that is
+/// not an error: the caller resolves the compiled-in defaults instead, exactly
+/// as `Config`'s `*_override` resolvers do.
+pub async fn get_proxy_settings(conn: &Connection) -> Result<Option<ProxySettingsRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT enabled, bind_address, bind_port, local_exposure \
+             FROM proxy_settings WHERE id = 1",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => Ok(Some(ProxySettingsRow {
+            enabled: row.get::<i64>(0).map_err(AppError::db)? != 0,
+            bind_address: row.get::<String>(1).map_err(AppError::db)?,
+            bind_port: row.get::<i64>(2).map_err(AppError::db)?,
+            local_exposure: row.get::<String>(3).map_err(AppError::db)?,
+        })),
+        None => Ok(None),
+    }
+}
+
+/// Move the columns a write actually names, and no others.
+///
+/// **Column-partial, in one statement, because two controls are two writes.**
+/// A read-modify-write of the whole row lets two settings changes made before
+/// the first settles both read the same snapshot, and whichever commits last
+/// silently restores the other's old value — the reader watches a switch they
+/// flipped flip back. `COALESCE` over a `NULL` parameter is what makes each
+/// write touch only its own column, so the interleaving is not merely unlikely
+/// but unrepresentable: two writes to two columns compose whatever order they
+/// land in, and two writes to *one* column are last-writer-wins, which is the
+/// honest meaning of pressing one control twice.
+///
+/// The literals in the insert arm are the compiled-in defaults a row that has
+/// never been written resolves to; they must stay in step with
+/// `proxy::DEFAULT_BIND_ADDRESS` / `DEFAULT_BIND_PORT` and
+/// `LocalExposure::default`.
+pub async fn update_proxy_settings(
+    conn: &Connection,
+    enabled: Option<bool>,
+    bind_address: Option<&str>,
+    bind_port: Option<i64>,
+    local_exposure: Option<&str>,
+    now: i64,
+) -> Result<(), AppError> {
+    let opt_int = |v: Option<i64>| v.map(Value::Integer).unwrap_or(Value::Null);
+    let opt_str = |v: Option<&str>| v.map(|s| Value::Text(s.to_string())).unwrap_or(Value::Null);
+    conn.execute(
+        "INSERT INTO proxy_settings \
+             (id, enabled, bind_address, bind_port, local_exposure, created_at, updated_at) \
+         VALUES (1, COALESCE(?1, 0), COALESCE(?2, '127.0.0.1'), COALESCE(?3, 11437), \
+                 COALESCE(?4, 'loaded'), ?5, ?5) \
+         ON CONFLICT(id) DO UPDATE SET \
+             enabled = COALESCE(?1, enabled), \
+             bind_address = COALESCE(?2, bind_address), \
+             bind_port = COALESCE(?3, bind_port), \
+             local_exposure = COALESCE(?4, local_exposure), \
+             updated_at = ?5",
+        (
+            opt_int(enabled.map(i64::from)),
+            opt_str(bind_address),
+            opt_int(bind_port),
+            opt_str(local_exposure),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+/// The backend ids the proxy exposes, in registry order (the same order
+/// `list_backends` presents, so the pane and the listing agree). Backends
+/// soft-removed or disabled since they were exposed are **not** returned:
+/// exposure is a permission, and a permission over something that is not
+/// there offers nothing.
+pub async fn list_proxy_backends(conn: &Connection) -> Result<Vec<String>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT b.id FROM proxy_backend p \
+             JOIN backend b ON b.id = p.backend_id \
+             WHERE b.removed_at IS NULL AND b.enabled = 1 \
+             ORDER BY CASE b.kind WHEN 'eidola' THEN 0 WHEN 'local' THEN 1 ELSE 2 END, \
+             b.created_at, b.id",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        ids.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    Ok(ids)
+}
+
+/// The live backend of that id **if the proxy is allowed to reach it**, in one
+/// statement.
+///
+/// **The permission and the row it is about are read together, or neither is
+/// what the other was granted for.** Exposure is granted to an *incarnation*:
+/// removal is soft, `insert_backend` revives a row of the same id overwriting
+/// every configuration column, and `remove_backend` therefore drops the
+/// exposure with the row (see there). So a caller that checks a settings
+/// snapshot for the id and *then* reads the backend is checking one incarnation
+/// and using another: a remove-and-re-add landing in between clears the
+/// permission the snapshot still shows, and the request goes to whatever base
+/// URL and key the new row carries — a destination nobody ticked. The
+/// snapshot's age is not the defect; asking two questions is, and the gap is
+/// wide because a request pauses between them for network and engine work.
+///
+/// One statement is one point in time, which is the same shape the write side
+/// takes for the same reason ([`set_proxy_backend`]'s single transaction):
+/// whichever of this read and a concurrent removal reaches the database first,
+/// the other sees a committed state and decides against *that*. What comes back
+/// is the row the request will actually be sent to, and its being here at all
+/// is the authorization.
+pub async fn exposed_backend(conn: &Connection, id: &str) -> Result<Option<BackendRow>, AppError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {BACKEND_COLUMNS} FROM backend WHERE id = ?1 \
+             AND removed_at IS NULL AND enabled = 1 \
+             AND id IN (SELECT backend_id FROM proxy_backend)"
+        ))
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(id.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => Ok(Some(backend_row_from(&row)?)),
+        None => Ok(None),
+    }
+}
+
+/// Every exposure row, live backend or not — what the settings pane's
+/// checkboxes read, so a backend the user disabled still shows its exposure
+/// choice rather than silently losing it.
+pub async fn list_proxy_backend_rows(conn: &Connection) -> Result<Vec<String>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT backend_id FROM proxy_backend ORDER BY backend_id")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        ids.push(row.get::<String>(0).map_err(AppError::db)?);
+    }
+    Ok(ids)
+}
+
+/// Expose or withdraw one backend. Idempotent in both directions.
+/// What an exposure write did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExposureWrite {
+    /// The permission now says what the caller asked it to.
+    Applied,
+    /// There is no live backend of that id to grant a permission over, so
+    /// nothing was written.
+    NoLiveBackend,
+}
+
+/// Grant or withdraw the proxy's permission over one backend.
+///
+/// **The write carries its own premise** (the decide-at-the-write rule). A
+/// caller that checks the backend is live and *then* writes leaves a gap that
+/// `remove_backend` fits inside: the check passes, the removal's transaction
+/// soft-deletes the row and drops the exposure with it, and the insert then
+/// lands anyway — the foreign key is satisfied, because removal is soft, so the
+/// permission stands invisibly on a removed backend and re-adding that id
+/// revives it already exposed. That is exactly the implicit exposure the
+/// removal cure exists to prevent, reached through the other door.
+///
+/// So the liveness read and the insert are one `BEGIN IMMEDIATE` transaction,
+/// which turso serializes against the removal's own: whichever reserves the
+/// writer first, the loser sees the winner's committed state and decides
+/// against *that*. Withdrawing needs no premise — ending a permission over
+/// something that is not there is what the caller asked for either way.
+pub async fn set_proxy_backend(
+    conn: &Connection,
+    backend_id: &str,
+    exposed: bool,
+    now: i64,
+) -> Result<ExposureWrite, AppError> {
+    if !exposed {
+        conn.execute(
+            "DELETE FROM proxy_backend WHERE backend_id = ?1",
+            (Value::Text(backend_id.to_string()),),
+        )
+        .await
+        .map_err(AppError::db)?;
+        return Ok(ExposureWrite::Applied);
+    }
+    begin_write(conn).await?;
+    match expose_proxy_backend_tx_body(conn, backend_id, now).await {
+        Ok(wrote) => {
+            conn.execute("COMMIT", ()).await.map_err(AppError::db)?;
+            Ok(wrote)
+        }
+        Err(e) => {
+            // Best-effort rollback; propagate the original error regardless.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(e)
+        }
+    }
+}
+
+async fn expose_proxy_backend_tx_body(
+    conn: &Connection,
+    backend_id: &str,
+    now: i64,
+) -> Result<ExposureWrite, AppError> {
+    let live = get_backend(conn, backend_id)
+        .await?
+        .is_some_and(|row| row.removed_at.is_none());
+    if !live {
+        return Ok(ExposureWrite::NoLiveBackend);
+    }
+    conn.execute(
+        "INSERT INTO proxy_backend (backend_id, created_at) VALUES (?1, ?2) \
+         ON CONFLICT(backend_id) DO NOTHING",
+        (Value::Text(backend_id.to_string()), Value::Integer(now)),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(ExposureWrite::Applied)
+}
+
+/// Every key ever generated, newest first — live ones and revoked ones alike,
+/// because a revoked row's label is what tells a reader which tool lost access.
+pub async fn list_proxy_keys(conn: &Connection) -> Result<Vec<ProxyKeyRow>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, label, prefix, created_at, last_used_at, revoked_at \
+             FROM proxy_key ORDER BY created_at DESC, id DESC",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    let mut keys = Vec::new();
+    while let Some(row) = rows.next().await.map_err(AppError::db)? {
+        keys.push(ProxyKeyRow {
+            id: row.get::<String>(0).map_err(AppError::db)?,
+            label: row.get::<String>(1).map_err(AppError::db)?,
+            prefix: row.get::<String>(2).map_err(AppError::db)?,
+            created_at: row.get::<i64>(3).map_err(AppError::db)?,
+            last_used_at: row.get::<Option<i64>>(4).map_err(AppError::db)?,
+            revoked_at: row.get::<Option<i64>>(5).map_err(AppError::db)?,
+        });
+    }
+    Ok(keys)
+}
+
+/// Record a newly generated key. `key_hash` is the one-way digest; the key is
+/// the caller's to display once and then forget.
+pub async fn insert_proxy_key(
+    conn: &Connection,
+    id: &str,
+    label: &str,
+    prefix: &str,
+    key_hash: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT INTO proxy_key (id, label, prefix, key_hash, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        (
+            Value::Text(id.to_string()),
+            Value::Text(label.to_string()),
+            Value::Text(prefix.to_string()),
+            Value::Text(key_hash.to_string()),
+            Value::Integer(now),
+        ),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+/// Revoke one key. Answers whether a live row was actually revoked, so the
+/// caller reports what happened rather than assuming (the decide-at-the-write
+/// rule).
+pub async fn revoke_proxy_key(conn: &Connection, id: &str, now: i64) -> Result<bool, AppError> {
+    let affected = conn
+        .execute(
+            "UPDATE proxy_key SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+            (Value::Text(id.to_string()), Value::Integer(now)),
+        )
+        .await
+        .map_err(AppError::db)?;
+    Ok(affected > 0)
+}
+
+/// The live key with this hash — its id, and when it was last used. The lookup
+/// is by digest, so nothing here ever holds a presented secret beyond the
+/// caller's own frame.
+///
+/// The `last_used_at` rides along because the caller has to know whether the
+/// stamp it is about to write *changes what any surface shows*: the pane draws
+/// "used" or "never used" and nothing finer, so a key already used needs no
+/// invalidation and one being used for the first time needs exactly one. Read
+/// here rather than in a second query, because the row is already in hand.
+pub async fn find_live_proxy_key(
+    conn: &Connection,
+    key_hash: &str,
+) -> Result<Option<(String, Option<i64>)>, AppError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, last_used_at FROM proxy_key WHERE key_hash = ?1 AND revoked_at IS NULL",
+        )
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt
+        .query((Value::Text(key_hash.to_string()),))
+        .await
+        .map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => Ok(Some((
+            row.get::<String>(0).map_err(AppError::db)?,
+            row.get::<Option<i64>>(1).map_err(AppError::db)?,
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// How many keys are live — what decides whether the proxy has anyone to let
+/// in at all.
+pub async fn live_proxy_key_count(conn: &Connection) -> Result<i64, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT COUNT(*) FROM proxy_key WHERE revoked_at IS NULL")
+        .await
+        .map_err(AppError::db)?;
+    let mut rows = stmt.query(()).await.map_err(AppError::db)?;
+    match rows.next().await.map_err(AppError::db)? {
+        Some(row) => Ok(row.get::<i64>(0).map_err(AppError::db)?),
+        None => Ok(0),
+    }
+}
+
+/// Stamp a key's last use. Best-effort telemetry for the pane — a failure here
+/// must never cost a request that was already authenticated.
+pub async fn touch_proxy_key(conn: &Connection, id: &str, now: i64) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE proxy_key SET last_used_at = ?2 WHERE id = ?1",
+        (Value::Text(id.to_string()), Value::Integer(now)),
+    )
+    .await
+    .map_err(AppError::db)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
+    /// REGRESSION: **the exposure write carries its own premise.**
+    ///
+    /// Asking whether the backend is live and *then* inserting leaves a gap a
+    /// concurrent `remove_backend` fits inside: the check passes, the removal
+    /// soft-deletes the row and drops the exposure it is deleting, and the
+    /// insert lands anyway — the foreign key is satisfied, because removal is
+    /// soft. The permission then stands on a removed backend where no listing
+    /// shows it, and re-adding that id revives it already exposed, which is the
+    /// implicit exposure the removal cure exists to prevent, reached through the
+    /// other door. The race cannot be scheduled from a test; what can be held is
+    /// the property that makes it harmless — a write that decides for itself.
+    #[test]
+    fn exposing_a_removed_backend_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+        runtime.block_on(async move {
+            let database = open(dir.path()).await.expect("open");
+            let conn = connect(&database).await.expect("connect");
+            let row = BackendRow {
+                id: "acme".into(),
+                kind: "openai".into(),
+                display_name: "Acme".into(),
+                enabled: true,
+                base_url: Some("https://first.example".into()),
+                api_key: None,
+                models_dir: None,
+                model_overrides: None,
+                engine_path: None,
+                auto_start: true,
+                trusted_measurements: None,
+                hardware_root_ca: None,
+                hardware_intermediate_ca: None,
+                created_at: 1,
+                updated_at: 1,
+                removed_at: None,
+            };
+            insert_backend(&conn, &row).await.expect("add");
+            assert_eq!(
+                set_proxy_backend(&conn, "acme", true, 2)
+                    .await
+                    .expect("expose"),
+                ExposureWrite::Applied,
+                "a live backend takes the permission"
+            );
+
+            // The state the race leaves behind: the backend is gone (softly),
+            // and a write that had already passed its check arrives.
+            assert!(remove_backend(&conn, "acme", 3).await.expect("remove"));
+            assert_eq!(
+                set_proxy_backend(&conn, "acme", true, 4)
+                    .await
+                    .expect("expose"),
+                ExposureWrite::NoLiveBackend,
+                "and a removed one refuses at the write"
+            );
+            assert!(
+                list_proxy_backend_rows(&conn)
+                    .await
+                    .expect("rows")
+                    .is_empty(),
+                "nothing stands where no listing would ever show it"
+            );
+
+            // Withdrawing needs no premise: it is what the caller asked for
+            // whether or not the backend is there.
+            assert_eq!(
+                set_proxy_backend(&conn, "acme", false, 5)
+                    .await
+                    .expect("withdraw"),
+                ExposureWrite::Applied
+            );
+        });
+    }
 
     /// A reference edge quoting a post's text — what the two edge-level
     /// predicates are asked about. *Whether the quoted post can be named by
@@ -8384,6 +10450,356 @@ mod tests {
     /// constraints only fire with `foreign_keys = ON`).
     async fn fk_conn(db: &Database) -> Connection {
         connect(db).await.unwrap()
+    }
+
+    fn cache_scope(domain: &str) -> crate::prefix_cache::CacheScope {
+        crate::prefix_cache::CacheScope {
+            policy: crate::prefix_cache::PromptCachePolicy {
+                idle_ttl_ms: 900_000,
+                max_age_ms: 7_200_000,
+            },
+            trust_domain: domain.to_string(),
+        }
+    }
+
+    /// Have `agent` answer with `model`, as a participant's own model change
+    /// writes it.
+    async fn set_agent_model(conn: &Connection, agent: &str, model: &str) {
+        conn.execute(
+            "UPDATE participant SET model_ref = ?2 WHERE id = ?1",
+            (
+                Value::Text(agent.to_string()),
+                Value::Text(model.to_string()),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn stored_key_bytes(conn: &Connection) -> Vec<Vec<u8>> {
+        let mut rows = conn
+            .query("SELECT key_bytes FROM prefix_cache_key", ())
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push(row.get::<Vec<u8>>(0).unwrap());
+        }
+        out
+    }
+
+    /// **A key replaced by one of another record length leaves no copy in
+    /// the database's files.** A different model can make the row longer or
+    /// shorter, so turso moves the cell and frees the old one without
+    /// clearing it — and a *shorter* record is the case that leaves the old
+    /// bytes outside the new cell; the key is overwritten in place first, and the log that
+    /// held the page's history is emptied once the replacement commits.
+    #[tokio::test]
+    async fn a_key_replaced_across_a_model_change_leaves_no_copy_in_the_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database = open(dir.path()).await.expect("open");
+        let conn = fk_conn(&database).await;
+        initialize(&conn).await.unwrap();
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "s",
+            None,
+            "unlinked",
+            1,
+        )
+        .await
+        .unwrap();
+        let agent = list_space_owned_participants(&conn, "s").await.unwrap()[0]
+            .id
+            .clone();
+        let scope = cache_scope("d");
+        // Long enough that the shorter record placed after it does not reach
+        // back over where the old key lay.
+        let selection = "a-model-with-a-long-name/".repeat(8);
+        set_agent_model(&conn, &agent, &selection).await;
+        claim_prefix_cache_key(&conn, "s", &agent, &selection, None, &scope, 10_000)
+            .await
+            .unwrap()
+            .claimed()
+            .expect("a key");
+        let old = stored_key_bytes(&conn).await.remove(0);
+        // The same selection, now resolved to weights: another model to the
+        // key, and a shorter record.
+        let weights = "a".repeat(64);
+        claim_prefix_cache_key(
+            &conn,
+            "s",
+            &agent,
+            &selection,
+            Some(&weights),
+            &scope,
+            10_001,
+        )
+        .await
+        .unwrap()
+        .claimed()
+        .expect("a new key for the new model");
+        let new = stored_key_bytes(&conn).await.remove(0);
+        assert_ne!(old, new);
+
+        let on_disk = |key: &[u8]| {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.is_file())
+                .any(|p| {
+                    std::fs::read(p)
+                        .unwrap()
+                        .windows(key.len())
+                        .any(|w| w == key)
+                })
+        };
+        assert!(
+            on_disk(&new),
+            "the live key is stored (the scan's baseline)"
+        );
+        assert!(
+            !on_disk(&old),
+            "the replaced key is in neither the database nor its log"
+        );
+    }
+
+    /// The reaper deletes a pristine space's key rows with it — there can be
+    /// none in practice (a key needs a turn, a turn a post), but if there were,
+    /// the space's foreign keys would otherwise keep it.
+    #[tokio::test]
+    async fn the_pristine_reaper_takes_a_spaces_keys_with_it() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "p",
+            None,
+            "unlinked",
+            1,
+        )
+        .await
+        .unwrap();
+        let agent = list_space_owned_participants(&conn, "p").await.unwrap()[0]
+            .id
+            .clone();
+        set_agent_model(&conn, &agent, "m").await;
+        claim_prefix_cache_key(&conn, "p", &agent, "m", None, &cache_scope("d"), 10)
+            .await
+            .unwrap()
+            .claimed()
+            .expect("a key");
+        assert!(discard_space_if_pristine(&conn, "p").await.unwrap());
+        assert!(stored_key_bytes(&conn).await.is_empty());
+    }
+
+    /// **A claim cannot recreate a key its lineage's closing just forgot.** A
+    /// turn prepared before the space was archived reaches its claim after the
+    /// archival committed — staged here as exactly that order — and gets
+    /// nothing stored; so does a participant that is not a live member.
+    #[tokio::test]
+    async fn a_claim_after_its_lineage_closed_stores_nothing() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "c",
+            None,
+            "unlinked",
+            1,
+        )
+        .await
+        .unwrap();
+        let agent = list_space_owned_participants(&conn, "c").await.unwrap()[0]
+            .id
+            .clone();
+        set_agent_model(&conn, &agent, "m").await;
+        let scope = cache_scope("d");
+        assert!(
+            claim_prefix_cache_key(&conn, "c", &agent, "m", None, &scope, 10)
+                .await
+                .unwrap()
+                .claimed()
+                .is_some(),
+            "an open lineage is keyed (the premise)"
+        );
+
+        // The archival lands between the turn's preparation and its claim.
+        archive_space_tx(&conn, "c", 20).await.unwrap();
+        assert!(
+            stored_key_bytes(&conn).await.is_empty(),
+            "the archival forgot the key"
+        );
+        assert!(matches!(
+            claim_prefix_cache_key(&conn, "c", &agent, "m", None, &scope, 30)
+                .await
+                .unwrap(),
+            ClaimOutcome::Unsendable
+        ));
+        assert!(
+            stored_key_bytes(&conn).await.is_empty(),
+            "and the late claim recreated none"
+        );
+
+        // A live participant that is not a member of the space.
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "o",
+            None,
+            "unlinked",
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            claim_prefix_cache_key(&conn, "o", &agent, "m", None, &scope, 40)
+                .await
+                .unwrap(),
+            ClaimOutcome::Unsendable
+        ));
+        assert!(stored_key_bytes(&conn).await.is_empty());
+    }
+
+    /// **A claim cannot recreate a key a model change just forgot.** A turn
+    /// still running on model A reaches its next round's claim after the
+    /// participant was switched to B: nothing is stored, so a return to A
+    /// finds no key of A's standing. The same for a per-space override.
+    #[tokio::test]
+    async fn a_claim_after_its_participants_model_changed_stores_nothing() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "s",
+            None,
+            "unlinked",
+            1,
+        )
+        .await
+        .unwrap();
+        let agent = list_space_owned_participants(&conn, "s").await.unwrap()[0]
+            .id
+            .clone();
+        set_agent_model(&conn, &agent, "a").await;
+        let scope = cache_scope("d");
+        let claim = |model: &'static str, now: i64| {
+            let (conn, agent, scope) = (conn.clone(), agent.clone(), scope.clone());
+            async move {
+                claim_prefix_cache_key(&conn, "s", &agent, model, None, &scope, now)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(claim("a", 10).await.claimed().is_some(), "the premise");
+
+        // The switch lands between two rounds of a turn on A.
+        set_agent_model(&conn, &agent, "b").await;
+        assert!(
+            stored_key_bytes(&conn).await.is_empty(),
+            "the model change forgot the key"
+        );
+        assert!(matches!(claim("a", 20).await, ClaimOutcome::Unsendable));
+        assert!(
+            stored_key_bytes(&conn).await.is_empty(),
+            "and the late claim recreated none"
+        );
+        // A spelling of the same selection is the same model.
+        assert!(claim("b", 30).await.claimed().is_some());
+        set_agent_model(&conn, &agent, "b@eidola").await;
+        assert!(claim("b", 40).await.claimed().is_some());
+
+        // A shared agent overridden in one space answers there with the
+        // override, and only there.
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "o",
+            None,
+            "unlinked",
+            1,
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE participant SET scope = 'global', owner_space_id = NULL WHERE id = ?1",
+            [Value::Text(agent.clone())],
+        )
+        .await
+        .unwrap();
+        for space in ["s", "o"] {
+            conn.execute(
+                "INSERT INTO space_participant \
+                     (space_id, participant_id, participant_scope, role, joined_at) \
+                 VALUES (?1, ?2, 'global', 'member', 1)",
+                (Value::Text(space.to_string()), Value::Text(agent.clone())),
+            )
+            .await
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE space_participant SET override_model_ref = 'c' \
+             WHERE space_id = 'o' AND participant_id = ?1",
+            [Value::Text(agent.clone())],
+        )
+        .await
+        .unwrap();
+        let claim_in = |space: &'static str, model: &'static str| {
+            let (conn, agent, scope) = (conn.clone(), agent.clone(), scope.clone());
+            async move {
+                claim_prefix_cache_key(&conn, space, &agent, model, None, &scope, 50)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(matches!(claim_in("o", "b").await, ClaimOutcome::Unsendable));
+        assert!(claim_in("o", "c").await.claimed().is_some());
+        assert!(claim_in("s", "b").await.claimed().is_some());
+        assert!(matches!(claim_in("s", "c").await, ClaimOutcome::Unsendable));
+    }
+
+    /// The configuration hook's primitive: keys of every other trust domain go,
+    /// the current one's stay.
+    #[tokio::test]
+    async fn only_the_current_trust_domains_keys_survive_a_change() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        for space in ["a", "b"] {
+            instantiate_template(
+                &conn,
+                crate::config::DEFAULT_TEMPLATE_ID,
+                space,
+                None,
+                "unlinked",
+                1,
+            )
+            .await
+            .unwrap();
+        }
+        let agent_a = list_space_owned_participants(&conn, "a").await.unwrap()[0]
+            .id
+            .clone();
+        let agent_b = list_space_owned_participants(&conn, "b").await.unwrap()[0]
+            .id
+            .clone();
+        set_agent_model(&conn, &agent_a, "m").await;
+        set_agent_model(&conn, &agent_b, "m").await;
+        claim_prefix_cache_key(&conn, "a", &agent_a, "m", None, &cache_scope("old"), 10)
+            .await
+            .unwrap();
+        claim_prefix_cache_key(&conn, "b", &agent_b, "m", None, &cache_scope("new"), 10)
+            .await
+            .unwrap();
+        begin_write(&conn).await.unwrap();
+        assert_eq!(forget_cache_keys_outside(&conn, "new").await.unwrap(), 1);
+        conn.execute("COMMIT", ()).await.unwrap();
+        let left = prefix_cache_lineages(&conn).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].0, "b");
     }
 
     async fn open_memory_migrated() -> Database {
@@ -8804,6 +11220,8 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
+                resumable: false,
                 created_at,
             },
         )
@@ -9000,7 +11418,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            last_reply_by_participant(&conn, "parent", &owner, &asked)
+            last_reply_by_participant(&conn, "parent", &owner, &asked, None)
                 .await
                 .unwrap()
                 .as_deref(),
@@ -9020,7 +11438,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            last_reply_by_participant(&conn, "parent", &owner, &asked)
+            last_reply_by_participant(&conn, "parent", &owner, &asked, None)
                 .await
                 .unwrap()
                 .as_deref(),
@@ -9077,6 +11495,8 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
+                resumable: false,
                 created_at,
             },
         )
@@ -9125,6 +11545,8 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
+                resumable: false,
                 created_at,
             },
         )
@@ -9188,6 +11610,7 @@ mod tests {
                     range_end: None,
                     annotation: None,
                 }],
+                join_author: false,
                 created_at: 3_000,
             },
         )
@@ -9228,11 +11651,13 @@ mod tests {
                     auto_title: Some("Named by its first post"),
                     reply_to: Some(&first),
                     references: &[],
+                    join_author: false,
                     created_at: 4_000,
                 },
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .auto_titled,
             "the space took the title"
         );
         assert!(
@@ -9427,6 +11852,8 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
+                resumable: false,
                 created_at: 4_000,
             },
         )
@@ -9619,6 +12046,8 @@ mod tests {
                     input_tokens: None,
                     output_tokens: None,
                     credits_consumed: credits,
+                    truncated: false,
+                    resumable: false,
                     created_at: at,
                 },
             )
@@ -9770,6 +12199,8 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             credits_consumed: None,
+            truncated: false,
+            resumable: false,
             created_at: 1_000,
         };
 
@@ -9798,14 +12229,29 @@ mod tests {
             "ph",
             b"pub",
             b"params",
-            99_999_999_999_999,
+            IssuerKeyDeadlines {
+                spend_until: 99_999_999_999_999,
+                accept_until: 99_999_999_999_999,
+            },
             1_000,
         )
         .await
         .unwrap();
-        insert_pre_credential_issuance(conn, "pc-1", "ik-1", b"pre", 10_000, 1_000)
-            .await
-            .unwrap();
+        insert_pre_credential_issuance(
+            conn,
+            &PreIssuanceRecord {
+                id: "pc-1",
+                issuer_key_id: "ik-1",
+                data: b"pre",
+                credits: 10_000,
+                idempotency_key: &[0u8; 32],
+                issuance_request: b"request",
+                account_id: "account",
+                created_at: 1_000,
+            },
+        )
+        .await
+        .unwrap();
         insert_credential(conn, "nonce-1", "pc-1", "ik-1", b"cred", 10_000, 0, 1_100)
             .await
             .unwrap();
@@ -9860,6 +12306,8 @@ mod tests {
                 input_tokens: Some(120),
                 output_tokens: Some(480),
                 credits_consumed: Some(700),
+                truncated: false,
+                resumable: false,
                 created_at: 2_200,
             },
         )
@@ -10040,18 +12488,365 @@ mod tests {
         assert_eq!(states, vec![("nonce-2", "active"), ("nonce-1", "spent")]);
 
         // An expired issuer key flips its credentials to expired.
-        upsert_issuer_key(&conn, "ik-exp", "ph", b"pub", b"params", 1, 1_000)
-            .await
-            .unwrap();
-        insert_pre_credential_issuance(&conn, "pc-exp", "ik-exp", b"pre", 5, 4_000)
-            .await
-            .unwrap();
+        upsert_issuer_key(
+            &conn,
+            "ik-exp",
+            "ph",
+            b"pub",
+            b"params",
+            IssuerKeyDeadlines {
+                spend_until: 1,
+                accept_until: 1,
+            },
+            1_000,
+        )
+        .await
+        .unwrap();
+        insert_pre_credential_issuance(
+            &conn,
+            &PreIssuanceRecord {
+                id: "pc-exp",
+                issuer_key_id: "ik-exp",
+                data: b"pre",
+                credits: 5,
+                idempotency_key: &[0u8; 32],
+                issuance_request: b"request",
+                account_id: "account",
+                created_at: 4_000,
+            },
+        )
+        .await
+        .unwrap();
         insert_credential(&conn, "nonce-exp", "pc-exp", "ik-exp", b"c", 5, 0, 4_000)
             .await
             .unwrap();
         let lc = list_credential_lifecycle(&conn).await.unwrap();
         let exp = lc.iter().find(|r| r.nonce == "nonce-exp").unwrap();
         assert_eq!(exp.state, "expired");
+    }
+
+    /// The first key recorded for an epoch stands: a second one for the same
+    /// epoch reads back the first, another epoch's key is recorded on its
+    /// own, a key recorded for one epoch is reported when it turns up for
+    /// another, another server's record is separate, and epochs past the
+    /// record's horizon are pruned.
+    #[tokio::test]
+    async fn the_first_key_seen_for_an_epoch_stands() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+        let a = "https://a.example";
+        let b = "https://b.example";
+        let pin = |scope: &'static str, epoch: u64, id: &'static str, oldest: u64| {
+            let conn = conn.clone();
+            async move {
+                pin_issuer_key_epoch(&conn, scope, epoch, id, oldest, 1)
+                    .await
+                    .unwrap()
+            }
+        };
+        let first = |id: &str| PinnedIssuerKey {
+            key_id: id.to_string(),
+            also_recorded_for: None,
+        };
+
+        assert_eq!(pin(a, 10, "k10", 9).await, first("k10"));
+        assert_eq!(
+            pin(a, 10, "other", 9).await,
+            first("k10"),
+            "a second key for a seen epoch does not replace the first"
+        );
+        assert_eq!(pin(a, 11, "k11", 9).await, first("k11"));
+        assert_eq!(
+            pin(b, 10, "b10", 9).await,
+            first("b10"),
+            "each server's epochs are its own"
+        );
+        // The same key offered for another epoch is recorded there too, and
+        // the record says where else it stands.
+        assert_eq!(
+            pin(a, 13, "k10", 9).await,
+            PinnedIssuerKey {
+                key_id: "k10".into(),
+                also_recorded_for: Some(10),
+            }
+        );
+        assert_eq!(
+            pin(b, 11, "k10", 9).await,
+            first("k10"),
+            "another server's record is not consulted"
+        );
+
+        // Moving on prunes epochs before the horizon for that server only.
+        assert_eq!(
+            pin(a, 12, "k12", 11).await,
+            PinnedIssuerKey {
+                key_id: "k12".into(),
+                also_recorded_for: None,
+            }
+        );
+        let mut rows = conn
+            .query(
+                "SELECT scope, epoch FROM issuer_key_epoch ORDER BY scope, epoch",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            seen.push((row.get::<String>(0).unwrap(), row.get::<i64>(1).unwrap()));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (a.to_string(), 11),
+                (a.to_string(), 12),
+                (a.to_string(), 13),
+                (b.to_string(), 10),
+                (b.to_string(), 11)
+            ]
+        );
+    }
+
+    /// **A request's inputs are taken together or not at all.** Two inputs
+    /// are marked `spending` in one transaction under one spend group; an
+    /// input whose credential is already spending refuses the whole write, so
+    /// the other input is not left marked. The wallet's spend order is the
+    /// key's `accept_until`, then balance, then nonce, and leaves out empty
+    /// credentials.
+    #[tokio::test]
+    async fn a_requests_inputs_are_taken_together_or_not_at_all() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+        let now = crate::now_ms();
+        let hour = 3_600_000;
+        for (id, accept_until) in [("ik-old", now + 2 * hour), ("ik-new", now + 4 * hour)] {
+            let deadlines = IssuerKeyDeadlines {
+                spend_until: accept_until - hour,
+                accept_until,
+            };
+            upsert_issuer_key(&conn, id, "ph", b"pub", b"params", deadlines, 1_000)
+                .await
+                .unwrap();
+        }
+        // Each credential's nonce is random, as a real nullifier is; which of
+        // the two equal old-key balances sorts first is decided by them.
+        let nonce = || uuid::Uuid::new_v4().simple().to_string();
+        let (new_small, old_large, old_small_1, old_small_2, old_empty) =
+            (nonce(), nonce(), nonce(), nonce(), nonce());
+        for (key, nonce, credits) in [
+            ("ik-new", &new_small, 10),
+            ("ik-old", &old_large, 900),
+            ("ik-old", &old_small_1, 20),
+            ("ik-old", &old_small_2, 20),
+            ("ik-old", &old_empty, 0),
+        ] {
+            let pc = format!("pc-{nonce}");
+            insert_pre_credential_issuance(
+                &conn,
+                &PreIssuanceRecord {
+                    id: &pc,
+                    issuer_key_id: key,
+                    data: b"pre",
+                    credits,
+                    idempotency_key: &[0u8; 32],
+                    issuance_request: b"request",
+                    account_id: "account",
+                    created_at: 1_000,
+                },
+            )
+            .await
+            .unwrap();
+            insert_credential(&conn, nonce, &pc, key, b"cred", credits, 0, 1_000)
+                .await
+                .unwrap();
+        }
+        let order: Vec<String> = spendable_credentials(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.nonce)
+            .collect();
+        let (first_small, second_small) = if old_small_1 < old_small_2 {
+            (&old_small_1, &old_small_2)
+        } else {
+            (&old_small_2, &old_small_1)
+        };
+        assert_eq!(
+            order,
+            [first_small, second_small, &old_large, &new_small].map(String::clone),
+            "soonest-lapsing key first, then smallest, then nonce; nothing empty"
+        );
+
+        fn input<'a>(id: &'a str, nonce: &'a str, key: &'a str) -> SpendInputRecord<'a> {
+            SpendInputRecord {
+                id,
+                credential_nonce: nonce,
+                issuer_key_id: key,
+                data: b"pre-refund",
+                spend_amount: 5,
+                spend_proof_data: b"proof",
+            }
+        }
+        // One input of a request is already spending: neither is taken.
+        insert_pre_credential_refund(&conn, "pc-busy", &old_large, "ik-old", b"r", 5, b"p", 2_000)
+            .await
+            .unwrap();
+        insert_spend_inputs(
+            &conn,
+            "group-refused",
+            &[
+                input("pc-in-1", first_small, "ik-old"),
+                input("pc-in-2", &old_large, "ik-old"),
+            ],
+            3_000,
+        )
+        .await
+        .expect_err("a credential already spending refuses the request");
+        let states = |lc: Vec<CredentialLifecycleRow>, nonce: &str| {
+            lc.into_iter().find(|r| r.nonce == nonce).unwrap().state
+        };
+        assert_eq!(
+            states(list_credential_lifecycle(&conn).await.unwrap(), first_small),
+            "active",
+            "the other input is not left marked"
+        );
+
+        // Two free inputs, under two keys, are taken together.
+        insert_spend_inputs(
+            &conn,
+            "group-taken",
+            &[
+                input("pc-in-3", first_small, "ik-old"),
+                input("pc-in-4", &new_small, "ik-new"),
+            ],
+            3_000,
+        )
+        .await
+        .unwrap();
+        for nonce in [first_small, &new_small] {
+            assert_eq!(
+                states(list_credential_lifecycle(&conn).await.unwrap(), nonce),
+                "spending"
+            );
+        }
+    }
+
+    /// A key's two deadlines split the lifecycle: past `spend_until` an unspent
+    /// credential is `expired` (no new spend may start, so the provisioning
+    /// queue cannot pick it), but one whose spend is already in flight stays
+    /// `spending` — recoverable — until `accept_until`, when everything under
+    /// the key is `expired`.
+    #[tokio::test]
+    async fn spend_and_accept_deadlines_split_the_lifecycle() {
+        let db = open_memory_fresh().await;
+        let conn = db.connect().unwrap();
+        let now = crate::now_ms();
+        let hour = 3_600_000;
+
+        async fn credential_under(conn: &Connection, key: &str, nonce: &str, credits: i64) {
+            let pc = format!("pc-{nonce}");
+            insert_pre_credential_issuance(
+                conn,
+                &PreIssuanceRecord {
+                    id: &pc,
+                    issuer_key_id: key,
+                    data: b"pre",
+                    credits,
+                    idempotency_key: &[0u8; 32],
+                    issuance_request: b"request",
+                    account_id: "account",
+                    created_at: 1_000,
+                },
+            )
+            .await
+            .unwrap();
+            insert_credential(conn, nonce, &pc, key, b"cred", credits, 0, 1_000)
+                .await
+                .unwrap();
+        }
+        async fn key(
+            conn: &Connection,
+            id: &str,
+            spend_until: i64,
+            accept_until: i64,
+        ) -> Result<(), AppError> {
+            let deadlines = IssuerKeyDeadlines {
+                spend_until,
+                accept_until,
+            };
+            upsert_issuer_key(conn, id, "ph", b"pub", b"params", deadlines, 1_000).await
+        }
+
+        // Spend deadline still ahead: spendable.
+        key(&conn, "ik-live", now + hour, now + 2 * hour)
+            .await
+            .unwrap();
+        credential_under(&conn, "ik-live", "live", 50).await;
+        // Spend deadline passed, acceptance deadline ahead.
+        key(&conn, "ik-margin", now - 1_000, now + hour)
+            .await
+            .unwrap();
+        credential_under(&conn, "ik-margin", "margin-idle", 10).await;
+        credential_under(&conn, "ik-margin", "margin-flying", 10).await;
+        insert_pre_credential_refund(
+            &conn,
+            "pc-margin-refund",
+            "margin-flying",
+            "ik-margin",
+            b"pre-refund",
+            4,
+            b"proof",
+            2_000,
+        )
+        .await
+        .unwrap();
+        // Acceptance deadline passed: everything lapses, in flight or not.
+        key(&conn, "ik-gone", now - 2_000, now - 1_000)
+            .await
+            .unwrap();
+        credential_under(&conn, "ik-gone", "gone-flying", 10).await;
+        insert_pre_credential_refund(
+            &conn,
+            "pc-gone-refund",
+            "gone-flying",
+            "ik-gone",
+            b"pre-refund",
+            4,
+            b"proof",
+            2_000,
+        )
+        .await
+        .unwrap();
+
+        let lc = list_credential_lifecycle(&conn).await.unwrap();
+        let state = |nonce: &str| {
+            lc.iter()
+                .find(|r| r.nonce == nonce)
+                .map(|r| r.state.clone())
+                .unwrap()
+        };
+        assert_eq!(state("live"), "active");
+        assert_eq!(state("margin-idle"), "expired");
+        assert_eq!(state("margin-flying"), "spending");
+        assert_eq!(state("gone-flying"), "expired");
+
+        // The provisioning queue reads the same view: the smaller credential
+        // past its spend deadline is never offered, the live one is.
+        let offered: Vec<String> = spendable_credentials(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.nonce)
+            .collect();
+        assert_eq!(offered, vec!["live".to_string()]);
+        // Recovery still sees the in-flight spend inside the acceptance window.
+        let flying: Vec<String> = list_spending_credentials(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.nonce)
+            .collect();
+        assert_eq!(flying, vec!["margin-flying".to_string()]);
     }
 
     #[tokio::test]
@@ -10294,6 +13089,107 @@ mod tests {
             "a space_participant referencing a space-owned participant must \
              violate the composite FK (only globals are referenceable)"
         );
+    }
+
+    /// **A write conditioned on a model strikes nothing once the model has
+    /// moved** — on an owned row (`PersonaWrite::model_premise`) and on a
+    /// membership's effective model (`update_space_participant_override_if`).
+    #[tokio::test]
+    async fn a_model_premise_refuses_a_write_once_the_model_moved() {
+        let db = open_memory_fresh().await;
+        let conn = fk_conn(&db).await;
+        instantiate_template(
+            &conn,
+            crate::config::DEFAULT_TEMPLATE_ID,
+            "space-p",
+            None,
+            "unlinked",
+            1_000,
+        )
+        .await
+        .unwrap();
+        let members = space_participants(&conn, "space-p").await.unwrap();
+        let agent = members.iter().find(|m| m.kind == "agent").unwrap().clone();
+        let human = members.iter().find(|m| m.kind == "human").unwrap().clone();
+        assert_eq!(agent.source, "owned");
+        assert_eq!(human.source, "referenced");
+        let model_of = |id: String| {
+            let conn = conn.clone();
+            async move {
+                space_participants(&conn, "space-p")
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|m| m.participant_id == id)
+                    .unwrap()
+                    .model_ref
+            }
+        };
+
+        // Owned row: a stale premise strikes nothing, the current one lands.
+        let write = |expected: Option<&str>| PersonaWrite {
+            model_ref: Some(Some("newer".into())),
+            model_premise: Some(expected.map(str::to_string)),
+            ..Default::default()
+        };
+        assert!(
+            !update_participant_config(&conn, &agent.participant_id, &write(Some("moved")), 2_000)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            model_of(agent.participant_id.clone()).await,
+            agent.model_ref
+        );
+        assert!(
+            update_participant_config(
+                &conn,
+                &agent.participant_id,
+                &write(agent.model_ref.as_deref()),
+                2_000
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            model_of(agent.participant_id.clone()).await.as_deref(),
+            Some("newer")
+        );
+
+        // Membership: the premise is the effective model, override or base.
+        let set = |expected: Option<&str>| {
+            let conn = conn.clone();
+            let expected = expected.map(str::to_string);
+            async move {
+                update_space_participant_override_if(
+                    &conn,
+                    "space-p",
+                    HUMAN_PARTICIPANT_ID,
+                    None,
+                    Some(Some("pinned")),
+                    None,
+                    None,
+                    Some(expected.as_deref()),
+                    2_000,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        assert!(!set(Some("moved")).await, "a stale base premise");
+        assert!(
+            set(human.model_ref.as_deref()).await,
+            "the base it inherits"
+        );
+        assert_eq!(
+            model_of(HUMAN_PARTICIPANT_ID.to_string()).await.as_deref(),
+            Some("pinned")
+        );
+        assert!(
+            !set(human.model_ref.as_deref()).await,
+            "the override now decides the effective model"
+        );
+        assert!(set(Some("pinned")).await);
     }
 
     #[tokio::test]
@@ -11238,5 +14134,235 @@ mod tests {
             kept.label, "Scribe",
             "nor were the overrides it was inserted with"
         );
+    }
+
+    /// **Deciding at the write means reserving the writer.**
+    ///
+    /// Several of app-core's transactions read before they write: they check a
+    /// scope, a membership, a `left_at`, and choose what to write from what they
+    /// found (task 36's promotion guard, task 37's promote-or-join grant, the
+    /// notebook-owner removal guard). That shape is only worth anything if the read
+    /// and the write are one act against one snapshot — and a *deferred* `BEGIN`
+    /// (what plain `BEGIN` means here as in SQLite) reserves nothing.
+    ///
+    /// Measured on turso at our pin, two live connections on one `Database`
+    /// (`AppCore::db_conn` mints a fresh connection per call, so this is an
+    /// in-process race, not merely a cross-process one):
+    ///
+    /// * `BEGIN` — A reads, B writes and commits without blocking A, and A's
+    ///   write comes back `BusySnapshot("database snapshot is stale, rollback
+    ///   and retry the transaction")`. `busy_timeout` cannot rescue it: a stale
+    ///   snapshot is not something you can wait out.
+    /// * `BEGIN IMMEDIATE` — A reserves the writer; B waits on its own `BEGIN
+    ///   IMMEDIATE` for exactly A's hold, then acquires and reads A's committed
+    ///   state, deciding against *that*.
+    ///
+    /// So every transaction goes through `db::begin_write`. These tests pin the
+    /// consequence at the layer the finding is about (Codex review, PR #280).
+    ///
+    /// **They live beside the writers rather than in `tests/`** because the
+    /// transactions they drive are crate-private — an exported one is the write
+    /// reachable without its guards (see
+    /// `the_raw_db_writers_are_not_exported`), and an integration test is an
+    /// external consumer like any other.
+    mod tx_contention {
+        use crate::db;
+
+        /// **A result that describes the commit point cannot be overtaken.** The grant
+        /// answers with the membership it wrote, read inside its own transaction — so a
+        /// removal or retirement landing immediately afterwards changes what the roster
+        /// says next, but not what the grant reported. Answering from a read *after*
+        /// the commit put a failure message beside committed work, including (for a
+        /// space-owned candidate) an irreversible promotion — the very state deciding
+        /// at the write exists to prevent (Codex review, PR #280).
+        #[test]
+        fn a_grants_answer_describes_its_commit_not_the_roster_afterwards() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+            runtime.block_on(async move {
+                let database = db::open(dir.path()).await.expect("open");
+                let conn = db::connect(&database).await.expect("connect");
+                db::insert_space(&conn, "home", Some("Home"), "unlinked", 1)
+                    .await
+                    .expect("home");
+                db::insert_space(&conn, "here", Some("Here"), "unlinked", 1)
+                    .await
+                    .expect("destination");
+                db::insert_participant(
+                    &conn,
+                    "agent",
+                    "space",
+                    Some("home"),
+                    None,
+                    "agent",
+                    "Mara",
+                    None,
+                    None,
+                    "explicit",
+                    "member",
+                    None,
+                    1,
+                )
+                .await
+                .expect("a space-owned agent");
+
+                let outcome =
+                    db::grant_space_membership_tx(&conn, "here", "agent", "observer", "notebook-id", 2)
+                        .await
+                        .expect("the grant");
+                assert!(matches!(
+                    outcome.decision,
+                    db::GrantDecision::Promoted { .. }
+                ));
+                assert_eq!(outcome.member.role, "observer");
+                assert_eq!(outcome.member.label, "Mara");
+
+                // Another window ends the membership the instant the grant commits —
+                // the window a post-commit read would have raced.
+                db::remove_space_participant_tx(&conn, "here", "agent", 3)
+                    .await
+                    .expect("the other window's removal");
+
+                // The roster a caller would have re-read now says nothing about it…
+                assert!(
+                    db::space_participants(&conn, "here")
+                        .await
+                        .expect("roster")
+                        .iter()
+                        .all(|m| m.participant_id != "agent"),
+                    "the hazard is real: a read taken now finds no member"
+                );
+                // …while the grant's own answer still describes what it committed, and
+                // the promotion it made is still there to be seen.
+                assert_eq!(outcome.member.role, "observer");
+                let promoted = db::get_participant(&conn, "agent")
+                    .await
+                    .expect("read")
+                    .expect("the row");
+                assert_eq!(
+                    promoted.scope, "global",
+                    "the irreversible half committed — which is why its call must not have reported failure"
+                );
+            });
+        }
+
+        /// The concurrent-window case the grant's transaction exists for: a promotion
+        /// holds the writer while a grant starts. The grant must **wait** and then take
+        /// the join branch against the promoted row — never fail with a stale-snapshot
+        /// error, and never write a second promotion.
+        #[test]
+        fn a_grant_that_meets_a_writer_waits_and_decides_against_what_it_finds() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .expect("runtime");
+
+            runtime.block_on(async move {
+                let database = db::open(dir.path()).await.expect("open");
+                let setup = db::connect(&database).await.expect("connect");
+
+                db::insert_space(&setup, "home", Some("Home"), "unlinked", 1)
+                    .await
+                    .expect("home space");
+                db::insert_space(&setup, "here", Some("Here"), "unlinked", 1)
+                    .await
+                    .expect("destination space");
+                db::insert_participant(
+                    &setup,
+                    "agent",
+                    "space",
+                    Some("home"),
+                    None,
+                    "agent",
+                    "Mara",
+                    None,
+                    None,
+                    "explicit",
+                    "member",
+                    None,
+                    1,
+                )
+                .await
+                .expect("a space-owned agent");
+
+                // A competing writer — another window's promotion — holds the writer
+                // for a beat, exactly as a real transaction does between its first
+                // statement and its commit.
+                let holder = db::connect(&database).await.expect("connect");
+                holder
+                    .execute("BEGIN IMMEDIATE", ())
+                    .await
+                    .expect("the competing writer reserves");
+                holder
+                    .execute(
+                        "UPDATE participant SET scope = 'global', owner_space_id = NULL WHERE id = 'agent'",
+                        (),
+                    )
+                    .await
+                    .expect("the promotion's own write");
+
+                let granting = db::connect(&database).await.expect("connect");
+                let grant = tokio::spawn(async move {
+                    let started = std::time::Instant::now();
+                    let decision = db::grant_space_membership_tx(
+                        &granting,
+                        "here",
+                        "agent",
+                        "observer",
+                        "notebook-id",
+                        2,
+                    )
+                    .await;
+                    (decision, started.elapsed())
+                });
+
+                // Let the grant reach its `BEGIN IMMEDIATE` and block there, then let
+                // the promotion land.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                holder
+                    .execute("COMMIT", ())
+                    .await
+                    .expect("the promotion commits");
+
+                let (decision, waited) = grant.await.expect("the grant task");
+                let decision = decision.expect(
+                    "the grant waited for the writer rather than failing on a stale snapshot — \
+                     a deferred BEGIN answers BusySnapshot here",
+                );
+                assert_eq!(
+                    decision.decision,
+                    db::GrantDecision::Joined,
+                    "it decided against the row it found: already global, so plain membership"
+                );
+                assert_eq!(
+                    decision.member.role, "observer",
+                    "and it answered with the membership as of its own commit"
+                );
+                assert!(
+                    waited >= std::time::Duration::from_millis(150),
+                    "it really did wait for the other writer (waited {waited:?})"
+                );
+
+                // One promotion, one membership — the join did not promote again, and
+                // the notebook the promoting branch would have minted does not exist.
+                let member = db::space_participants(&setup, "here")
+                    .await
+                    .expect("roster")
+                    .into_iter()
+                    .find(|m| m.participant_id == "agent")
+                    .expect("a member of the destination");
+                assert_eq!(member.role, "observer");
+                assert!(
+                    db::get_space(&setup, "notebook-id")
+                        .await
+                        .expect("read")
+                        .is_none(),
+                    "the join branch mints no notebook"
+                );
+            });
+        }
     }
 }

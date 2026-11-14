@@ -95,7 +95,7 @@ jobs:
     steps:
       - name: Mint promotion App token
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.PROMOTE_APP_ID }}
           private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
@@ -129,10 +129,15 @@ jobs:
           # TODO: uncomment once reviewers exist and a review is required
           # [ "$REVIEW" = "APPROVED" ] || { echo "::error::review decision is '$REVIEW', expected APPROVED"; exit 1; }
 
-          # All required checks (i.e. the CI chain) must be green. `gh pr checks`
-          # exits 0 only when every required check has passed.
-          gh pr checks "$PR" --repo "$REPO" --required \
-            || { echo "::error::required checks are not all green"; exit 1; }
+          # Every required check (i.e. the CI chain) must have passed. Its
+          # exit status alone is not enough: `gh pr checks` exits 0 when a
+          # check is skipped or cancelled, and this push bypasses the ruleset
+          # that would otherwise refuse those. So each required check's
+          # bucket must be `pass`, and there must be at least one.
+          checks="$(gh pr checks "$PR" --repo "$REPO" --required --json name,bucket || true)"
+          printf '%s\n' "$checks" | jq -r '.[] | "\(.bucket)\t\(.name)"'
+          printf '%s\n' "$checks" | jq -e 'type == "array" and length > 0 and all(.[]; .bucket == "pass")' >/dev/null \
+            || { echo "::error::required checks are not all green (each must pass; skipped, cancelled and pending do not)"; exit 1; }
 
           # Fast-forward main. force=false => the API refuses a non-fast-forward.
           gh api -X PATCH "repos/$REPO/git/refs/heads/main" \

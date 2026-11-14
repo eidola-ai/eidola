@@ -34,9 +34,11 @@ const NON_CANONICAL: &str = "### heading\nbody text directly under the heading\n
     **Note:**\n> a quoted line right after a paragraph\n\n\
     | left | right |\n| --- | --- |\n| cell one | cell two |";
 
-/// Host view rendering the editor `disabled` (the read-only post surface).
+/// Host view rendering the editor `disabled` (the read-only post surface),
+/// optionally narrowed to one **fragment** of the document.
 struct ReadonlyHarness {
     state: Entity<MarkdownEditorState>,
+    fragment: Option<std::ops::Range<usize>>,
 }
 
 impl gpui::Render for ReadonlyHarness {
@@ -45,13 +47,25 @@ impl gpui::Render for ReadonlyHarness {
         _: &mut gpui::Window,
         _: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
-        MarkdownEditor::new(&self.state).disabled(true)
+        let editor = MarkdownEditor::new(&self.state).disabled(true);
+        match self.fragment.clone() {
+            Some(range) => editor.fragment(range),
+            None => editor,
+        }
     }
 }
 
 fn open_readonly_editor(
     cx: &mut TestAppContext,
     markdown: &str,
+) -> (VisualTestContext, Entity<MarkdownEditorState>) {
+    open_readonly_fragment(cx, markdown, None)
+}
+
+fn open_readonly_fragment(
+    cx: &mut TestAppContext,
+    markdown: &str,
+    fragment: Option<std::ops::Range<usize>>,
 ) -> (VisualTestContext, Entity<MarkdownEditorState>) {
     let state = EditorState::with_markdown(markdown);
     let (handle, editor) = cx.update(|cx| {
@@ -72,6 +86,7 @@ fn open_readonly_editor(
                     inner = Some(editor.clone());
                     let harness = cx.new(|_| ReadonlyHarness {
                         state: editor.clone(),
+                        fragment: fragment.clone(),
                     });
                     cx.new(|cx| Root::new(harness, window, cx))
                 },
@@ -224,4 +239,261 @@ fn update_readonly_refuses_document_mutations_wholesale() {
     let next = update_readonly(state, EditorEvent::DeleteBackward);
     assert_eq!(next.markdown, raw);
     assert_eq!(next.selection, Selection::Range { anchor: 0, head: 4 });
+}
+
+/// A block that scrolls horizontally instead of wrapping can hide a source
+/// offset off to one side, however well its *row* has been revealed — the case
+/// a host's find bar meets when a match lands past the right edge of a wide
+/// fenced block. The reveal seam is the horizontal twin of
+/// `content_y_for_offset`, and it moves the band only when it has to.
+#[gpui::test]
+fn a_wide_code_block_reveals_an_offset_outside_its_clip(cx: &mut TestAppContext) {
+    // One code row far wider than the 700px window, with the word to find at
+    // the far end of it.
+    let filler = "abcdefghij ".repeat(30);
+    let markdown = format!("```\n{filler}kestrel\n```");
+    let far = markdown
+        .find("kestrel")
+        .expect("the token is in the source");
+    let near = markdown
+        .find("abcdefghij")
+        .expect("the opening is in the source");
+
+    let (mut vcx, editor) = open_readonly_editor(cx, &markdown);
+    assert_eq!(
+        editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0)),
+        0.0,
+        "the block starts unscrolled"
+    );
+
+    // An offset already inside the band moves nothing — the reader's own
+    // horizontal scroll is not something a reveal may tidy up.
+    let moved = editor.update(&mut vcx, |e, cx| {
+        e.reveal_range_horizontally(&(near..near + 3), cx)
+    });
+    assert!(!moved, "an offset in plain view is already revealed");
+    assert_eq!(
+        editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0)),
+        0.0,
+        "…and the band did not move for it"
+    );
+
+    // One beyond the clip brings the band to it.
+    let moved = editor.update(&mut vcx, |e, cx| {
+        e.reveal_range_horizontally(&(far..far + 7), cx)
+    });
+    assert!(moved, "the offset past the right edge needed revealing");
+    let scrolled = editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0));
+    assert!(
+        scrolled > 0.0,
+        "the block scrolled to reach it (offset {scrolled})"
+    );
+
+    // Its own postcondition: having revealed it, the seam has nothing left to
+    // do for that offset.
+    vcx.run_until_parked();
+    let again = editor.update(&mut vcx, |e, cx| {
+        e.reveal_range_horizontally(&(far..far + 7), cx)
+    });
+    assert!(!again, "the revealed offset is now inside the band");
+    assert_eq!(
+        editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0)),
+        scrolled,
+        "…and nothing moved again"
+    );
+}
+
+/// What has to end up inside the clip is the match's **last** glyph. A target
+/// computed from the start alone parks the first character at the clip edge and
+/// leaves the rest running off the far side — and then reports it revealed.
+#[gpui::test]
+fn a_wide_code_block_reveals_the_whole_match_not_its_first_glyph(cx: &mut TestAppContext) {
+    let filler = "abcdefghij ".repeat(30);
+    let markdown = format!("```\n{filler}kestrel and a longer tail\n```");
+    let far = markdown
+        .find("kestrel")
+        .expect("the token is in the source");
+
+    // Two editors over one document, revealed from the same start offset: one
+    // a short span, one running further right. Revealing only the start would
+    // scroll both identically.
+    let (mut short_cx, short) = open_readonly_editor(cx, &markdown);
+    let moved = short.update(&mut short_cx, |e, cx| {
+        e.reveal_range_horizontally(&(far..far + 7), cx)
+    });
+    assert!(moved, "the short span was outside the clip");
+    let short_scroll = short.read_with(&short_cx, |e, _| e.code_block_scroll_for_test(0));
+
+    let (mut long_cx, long) = open_readonly_editor(cx, &markdown);
+    let moved = long.update(&mut long_cx, |e, cx| {
+        e.reveal_range_horizontally(&(far..far + 25), cx)
+    });
+    assert!(moved, "the long span was outside the clip too");
+    let long_scroll = long.read_with(&long_cx, |e, _| e.code_block_scroll_for_test(0));
+
+    assert!(
+        long_scroll > short_scroll,
+        "a span reaching further right has to scroll further \
+         (short {short_scroll}, long {long_scroll})"
+    );
+}
+
+/// Row ranges are end-inclusive, so an offset where one row ends and the next
+/// begins is claimed by both. The vertical seam resolves that downstream — the
+/// row a reader would say the offset is on — and the horizontal one has to give
+/// the same answer, or the two seams reveal a match into different rows.
+#[gpui::test]
+fn a_match_at_a_row_boundary_is_revealed_on_the_row_it_starts(cx: &mut TestAppContext) {
+    // A very wide first row, then a short second row whose first token is the
+    // match. Resolved upstream the offset is the *end* of the wide row, far off
+    // to the right, and the block scrolls; resolved downstream it is the start
+    // of the short row, already in view, and nothing moves.
+    let wide = "abcdefghij ".repeat(40);
+    let markdown = format!("```\n{wide}\nkestrel\n```");
+    let at = markdown
+        .find("kestrel")
+        .expect("the token is in the source");
+
+    let (mut vcx, editor) = open_readonly_editor(cx, &markdown);
+    let moved = editor.update(&mut vcx, |e, cx| {
+        e.reveal_range_horizontally(&(at..at + 7), cx)
+    });
+    assert!(
+        !moved,
+        "the match begins its own row at the content edge — it is already in view"
+    );
+    assert_eq!(
+        editor.read_with(&vcx, |e, _| e.code_block_scroll_for_test(0)),
+        0.0,
+        "…so the block never scrolled to the previous row's far end"
+    );
+}
+
+/// A block that wraps has no horizontal viewport to speak of, so the seam
+/// answers for it without arithmetic — which is what keeps every ordinary
+/// paragraph out of the reveal path entirely.
+#[gpui::test]
+fn a_wrapping_paragraph_has_no_horizontal_reveal(cx: &mut TestAppContext) {
+    let markdown = "a plain paragraph ".repeat(40);
+    let far = markdown.len() - 10;
+    let (mut vcx, editor) = open_readonly_editor(cx, &markdown);
+
+    let moved = editor.update(&mut vcx, |e, cx| {
+        e.reveal_range_horizontally(&(far..far + 7), cx)
+    });
+    assert!(!moved, "a wrapping block never scrolls sideways");
+}
+
+/// A **fragment** lays out only the blocks intersecting its range, and each one
+/// keeps the chrome its container chain earns — which is the whole reason a
+/// host filters the document's own render rather than re-parsing the block on
+/// its own. The standalone path has no source ranges at all, so a fragment
+/// through it takes no highlight quads; here the offsets are still the
+/// document's, which is what a highlight and a per-offset geometry need.
+#[gpui::test]
+fn a_fragment_lays_out_only_its_blocks_and_keeps_their_containers(cx: &mut TestAppContext) {
+    let markdown = "an opening paragraph\n\n\
+        - a list item\n\n  > a quote inside the item\n\n\
+        a closing paragraph";
+    let quote = markdown
+        .find("a quote inside the item")
+        .expect("the passage is in the source");
+
+    // The whole document first: every block is laid out, and the nested one
+    // sits indented under the two containers above it.
+    let (vcx, editor) = open_readonly_editor(cx, markdown);
+    let whole = editor.read_with(&vcx, |e, _| e.debug_line_source_geometry());
+    assert!(
+        whole.len() >= 4,
+        "the document lays out every block ({} lines)",
+        whole.len()
+    );
+    let nested_x = whole
+        .iter()
+        .find(|(start, end, ..)| *start <= quote && *end >= quote)
+        .map(|(_, _, x, ..)| *x)
+        .unwrap_or_else(|| panic!("the nested paragraph is laid out: {whole:?}"));
+    let opening_x = whole
+        .first()
+        .map(|(_, _, x, ..)| *x)
+        .expect("the opening paragraph is laid out");
+    assert!(
+        nested_x > opening_x,
+        "precondition: the container chain indents it ({nested_x} vs {opening_x})"
+    );
+    drop(vcx);
+
+    // Now the same document narrowed to that one block. It is the only thing
+    // laid out — and it is laid out at the same indent, because the block still
+    // carries its own container chain.
+    let (vcx, editor) = open_readonly_fragment(cx, markdown, Some(quote..quote + 4));
+    let fragment = editor.read_with(&vcx, |e, _| e.debug_line_source_geometry());
+    assert_eq!(
+        fragment.len(),
+        1,
+        "only the block the range names is laid out ({fragment:?})"
+    );
+    let (start, end, x, ..) = fragment[0];
+    assert!(
+        start <= quote && end >= quote,
+        "…and it is the block that holds the passage ({start}..{end})"
+    );
+    assert_eq!(
+        x, nested_x,
+        "…still inside its blockquote inside its list item"
+    );
+    // The offsets are the *document's*, which is what makes a highlight over a
+    // source range land — the property the standalone render path loses.
+    assert!(
+        start > 0,
+        "the fragment's own line still addresses the whole document ({start})"
+    );
+}
+
+/// **The painted range is the whole document as far as this surface claims.**
+/// Filtering the layout alone left the *selection* addressing everything: Select
+/// All selected `0..markdown.len()`, so a Copy from a result card put every
+/// unpainted block of the post on the clipboard, and a shift-navigation or a
+/// drag past the fragment's edge reached text the reader cannot see.
+#[gpui::test]
+fn a_fragment_selects_only_what_it_paints(cx: &mut TestAppContext) {
+    let markdown = "an opening paragraph\n\n\
+        the middle one, which is the fragment\n\n\
+        a closing paragraph";
+    let middle = markdown
+        .find("the middle one")
+        .expect("the passage is in the source");
+    let fragment = middle..middle + "the middle one, which is the fragment".len();
+
+    let (mut vcx, editor) = open_readonly_fragment(cx, markdown, Some(fragment.clone()));
+
+    // Select All, the command the context menu and ⌘A both reach.
+    vcx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.perform(gpui_markdown_editor::EditorCommand::SelectAll, window, cx)
+        });
+    });
+    let selected = editor.read_with(&vcx, |e, _| e.selection().selection_range());
+    assert_eq!(
+        selected, fragment,
+        "Select All selects the fragment, not the document behind it"
+    );
+    assert_eq!(
+        &markdown[selected.clone()],
+        "the middle one, which is the fragment",
+        "…so a copy carries exactly what the card paints"
+    );
+
+    // And a caret sent to the document's end — the event a document-end
+    // navigation, a shift-extension or a drag past the last painted line all
+    // arrive as — stops at the fragment's own end rather than in text this
+    // surface never drew.
+    vcx.update(|_, cx| {
+        editor.update(cx, |e, cx| e.append_at_end("", cx));
+    });
+    assert_eq!(
+        editor.read_with(&vcx, |e, _| e.selection().head()),
+        fragment.end,
+        "the document's end is the fragment's end"
+    );
 }

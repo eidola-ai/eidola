@@ -39,6 +39,15 @@
         "git_commit": "release.git_commit"
       }
     },
+    "apple_signature_reconstructs": {
+      "template": "I have personally verified that applying the published detached signature bundle (sha256 {apple_signature_bundle_sha256}) to the reproducible unsigned build recorded in artifact-manifest.json (sha256 {artifact_manifest_sha256}) yields exactly the shipped signed artifact (sha256 {apple_shipped_artifact_sha256}).",
+      "sources": {
+        "apple_signature_bundle_sha256": "attestation.apple_signature_bundle_sha256",
+        "artifact_manifest_sha256": "attestation.artifact_manifest_sha256",
+        "apple_shipped_artifact_sha256": "attestation.apple_shipped_artifact_sha256"
+      },
+      "cross_checks": {}
+    },
     "diff_reviewed": {
       "template": "I have personally inspected the source-level diff between git commit {previous_release_git_commit} (the prior release) and git commit {git_commit} (this release).",
       "sources": {

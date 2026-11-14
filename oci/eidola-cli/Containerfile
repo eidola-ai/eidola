@@ -2,7 +2,7 @@
 
 # ── base ───────────────────────────────────────────────────────────────────────
 # Environment variables, pinned toolchain digest.
-FROM stagex/pallet-rust:sx2026.05.0@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS base
+FROM stagex/pallet-rust:sx2026.09.0@sha256:6033fb215dd7c87c885dd7b1c12de42464606dcc0323fc57339318d61f010a30 AS base
 
 ARG CARGO_PROFILE=release
 
@@ -63,6 +63,10 @@ COPY crates/ ./crates/
 # these (build scripts aren't compiled with stub sources), so they're only
 # required here at the real build.
 COPY releases/ ./releases/
+# The model catalog, which `eidola-app-core/build.rs` also compiles in (the
+# same files the gateway serves from). A glob, so a tree without the
+# directory still builds; the build script then sees no rows.
+COPY --parents models* ./
 
 # Ensure Cargo detects source changes over the fetch-stage stubs.
 # SOURCE_DATE_EPOCH=0 clamps COPY timestamps to epoch 0, matching the

@@ -725,11 +725,15 @@ fn a_remote_utility_model_summarizes_and_spends() {
         let calls = summary_calls(&mock);
         assert_eq!(calls.len(), 1, "the remote model is used like any other");
         assert_eq!(calls[0]["model"], chat_harness::ROUTER_REMOTE_MODEL);
+        // The Eidola gateway serves only streams: the chore asked for one and
+        // read the summary assembled from it.
+        assert_eq!(calls[0]["stream"], true);
+        assert_eq!(mock.blocking_asks(), 0);
         assert_eq!(summary_actions(&core, &fx.space).len(), 1);
 
-        let auths = mock.chat_auth_values();
+        let spends = mock.chat_spends();
         assert!(
-            auths.last().expect("an auth slot").is_some(),
+            spends.last().expect("a spend slot").is_some(),
             "a remote summary call carries a spend token"
         );
         let lifecycle = core
@@ -880,5 +884,51 @@ fn a_committed_summary_emits_space() {
         let mut rx = core.subscribe_changes();
         summarize(&core, &fx.space);
         assert!(drain(&mut rx).is_empty(), "a cache hit is silent");
+    });
+}
+
+/// REGRESSION: **a truncated answer is not a smaller answer.**
+///
+/// `read_bounded` reports `over_ceiling`, and a caller that reads the bytes and
+/// drops that flag gets the worst of both: most oversized JSON truncates into
+/// nothing and parses as `Null` — a silent degradation reported as success —
+/// while the dangerous minority is a *complete* object followed by padding,
+/// where the cut lands in the padding and the object parses perfectly. That is
+/// what this mock sends a blocking ask, so the chore accepted a partial answer
+/// as a whole one and wrote a summary from a body it never finished reading.
+/// The remote model here is answered with a stream whose data passes the
+/// ceiling, which the assembled read refuses the same way.
+#[test]
+fn a_summary_answer_past_the_ceiling_is_refused_rather_than_parsed() {
+    run(|| {
+        let (_mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            summary: SummaryBehavior::ReplyPaddedPastCeiling(SUMMARY.into()),
+            ..MockConfig::default()
+        });
+        with_account(&core);
+        let fx = branched_space(&core);
+        core.runtime()
+            .block_on(core.set_space_router_model(
+                fx.space.clone(),
+                Some(chat_harness::ROUTER_REMOTE_MODEL.into()),
+            ))
+            .expect("set remote utility model");
+
+        summarize(&core, &fx.space);
+
+        assert!(
+            summary_actions(&core, &fx.space).is_empty(),
+            "nothing is written from a body this app never finished reading"
+        );
+        // And the hold settles on that exit like every other one.
+        let lifecycle = core
+            .runtime()
+            .block_on(core.wallet_lifecycle())
+            .expect("wallet lifecycle");
+        assert!(
+            !lifecycle.iter().any(|c| c.state == "spending"),
+            "the hold is settled, not stranded: {lifecycle:?}"
+        );
     });
 }

@@ -43,7 +43,6 @@
 //! driver can address "the third row" precisely.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use gpui::{
@@ -67,18 +66,32 @@ pub struct ProbeEntry {
     pub bounds: Bounds<Pixels>,
 }
 
-/// Whether probes record into the registry. Off by default; the driver turns
-/// it on at startup (`set_probes_enabled(true)`), and `EIDOLA_PROBES=1` turns
-/// it on for ad-hoc runs. The a11y half of [`Probe::probe`] is unconditional.
-static ENABLED: AtomicBool = AtomicBool::new(false);
+// Whether probes record into the registry, **on this thread**. Off by
+// default; the driver turns it on at startup (`set_probes_enabled(true)`), and
+// `EIDOLA_PROBES=1` turns it on for ad-hoc runs. The a11y half of
+// `Probe::probe` is unconditional.
+//
+// Per-thread rather than process-wide because the registry is keyed by window
+// id alone, and **window ids are only unique within one `App`** — a parallel
+// test suite runs many, each numbering its windows from the same start. A
+// global flag therefore let any test that merely drew a window record into the
+// bucket a *probing* test was reading, under a colliding id: entries nobody
+// asked for, asserted against by somebody else. A libtest worker owns its
+// `App` and everything that draws in it, so the thread is exactly the scope
+// the flag means. Two threads probing at once would still share the registry's
+// id space, which is what the suites' own lock is for.
+thread_local! {
+    static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// window id (`WindowId::as_u64`) → probe name → entry.
 static REGISTRY: LazyLock<Mutex<HashMap<u64, HashMap<String, ProbeEntry>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Enable or disable probe recording process-wide.
+/// Enable or disable probe recording **for the calling thread** (see
+/// [`ENABLED`]).
 pub fn set_probes_enabled(enabled: bool) {
-    ENABLED.store(enabled, Ordering::Relaxed);
+    ENABLED.with(|e| e.set(enabled));
 }
 
 /// Whether probe recording is currently enabled (via [`set_probes_enabled`]
@@ -86,7 +99,7 @@ pub fn set_probes_enabled(enabled: bool) {
 pub fn probes_enabled() -> bool {
     static FROM_ENV: LazyLock<bool> =
         LazyLock::new(|| matches!(std::env::var("EIDOLA_PROBES").as_deref(), Ok("1")));
-    ENABLED.load(Ordering::Relaxed) || *FROM_ENV
+    ENABLED.with(|e| e.get()) || *FROM_ENV
 }
 
 /// Drop every recorded entry for a window. The driver calls this before
@@ -237,7 +250,12 @@ pub trait Probe: StatefulInteractiveElement + ParentElement + Sized {
         // ring and the activation.
         if derive_focus && crate::focus::is_focusable(role) {
             this = this.focusable();
-            if crate::focus::is_tab_stop(role) {
+            // **A covered control is not a tab stop** ([`crate::focus::Covered`]):
+            // painting a surface over the window takes nothing out of the tab
+            // order, so without this Tab walks off the visible surface into
+            // affordances the reader cannot see. The role, the label and
+            // focusability all stay — only the stop goes.
+            if crate::focus::is_tab_stop(role) && !crate::focus::tab_stops_suppressed() {
                 this = this.tab_index(0);
                 let shadows = crate::focus::ring_shadows(crate::focus::ring_colors());
                 this = this.focus_visible(move |s| s.shadow(shadows));

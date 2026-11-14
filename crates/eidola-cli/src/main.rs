@@ -1,16 +1,28 @@
+mod client;
 mod service;
+mod session;
 
 use std::io::{IsTerminal, Write};
 
 use clap::{Parser, Subcommand};
 use eidola_app_core::error::AppError;
-use eidola_app_core::{AppCore, ChatStreamEvent, config};
+use eidola_app_core::ipc::ProtocolError;
+use eidola_app_core::{ChatStreamEvent, TermsAcceptance, TermsDocument, config};
+
+use client::Failure;
+use session::{Session, Startup};
 
 #[derive(Parser)]
 #[command(name = "eidola", about = "Eidola CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// Open the local profile in this process instead of asking a running
+    /// Eidola over its control socket. For debugging: it forces the mode, it
+    /// does not bypass the lock, so it fails while another Eidola holds the
+    /// profile.
+    #[arg(long, global = true)]
+    embedded: bool,
 }
 
 #[derive(Subcommand)]
@@ -25,10 +37,12 @@ enum Command {
         /// Path to PEM-encoded SEV-SNP ASK (Intermediate CA) certificate
         #[arg(long)]
         hardware_intermediate_ca: Option<String>,
-        /// Add a trusted enclave release: `<snp>:<rtmr1>:<rtmr2>`
+        /// Add a trusted server launch identity:
+        /// `<measurement>:<host_data>:<guest_policy>` (the SEV-SNP launch
+        /// digest, the config hash it is launched with, the guest policy)
         #[arg(long)]
         trust_measurement: Option<String>,
-        /// Remove a trusted enclave release by SNP measurement
+        /// Remove a trusted server launch identity: `<measurement>:<host_data>`
         #[arg(long)]
         untrust_measurement: Option<String>,
         /// Drop every trusted-measurement override (revert to the pin)
@@ -61,7 +75,17 @@ enum Command {
     /// Send a chat message
     Chat {
         /// The prompt to send
-        prompt: String,
+        #[arg(required_unless_present = "continue_post")]
+        prompt: Option<String>,
+        /// Continue an answer that stopped at its length limit, by its post id
+        /// (the one the length-limit warning names), from where it stopped —
+        /// by the model that wrote it, as a new version of that answer
+        #[arg(
+            long = "continue",
+            value_name = "POST",
+            conflicts_with_all = ["prompt", "model", "space"]
+        )]
+        continue_post: Option<String>,
         /// Model to use (defaults to the default template's agent model —
         /// transitional until wave 2 makes turns participant-aware)
         #[arg(long, short)]
@@ -156,9 +180,10 @@ enum UpdateCommand {
 enum AccountCommand {
     /// Create a new account on the server
     Create {
-        /// Agree to the current terms of service and privacy policy.
-        /// Required when the server has an acceptance gate configured;
-        /// run without it to see the documents first.
+        /// Agree to the terms of service and privacy policy printed by this
+        /// invocation. Required when the server has an acceptance gate
+        /// configured; the documents are printed either way, and only the
+        /// versions printed here are submitted.
         #[arg(long)]
         accept_terms: bool,
     },
@@ -249,6 +274,16 @@ enum ModelCommand {
     Unpin {
         /// Model id (`<slug>@<backend>`) or bare slug (the local store)
         id: String,
+    },
+    /// Show an Eidola model's identity: the weights hash it resolves to,
+    /// where the weights come from and every file the hash covers, so you
+    /// can check them yourself — and anything you should know about it (a
+    /// newer model for a pin, an announced or passed retirement). Read from
+    /// the catalog compiled into this build.
+    Show {
+        /// `tag`, `tag@sha256:<hex>` or `sha256:<hex>` (with or without
+        /// `@eidola`)
+        reference: String,
     },
 }
 
@@ -350,26 +385,13 @@ enum SpacesCommand {
     },
 }
 
-/// Build this process's `AppCore`.
-///
-/// **The sub-space turn driver is deliberately not started here**, and the GUI
-/// deliberately does start it (`stores::open_app_core`). A delegated
-/// conversation is driven by a loop that plans, takes a turn, and plans again
-/// until the room stops — work measured in model round trips, with no window
-/// waiting on it. This process exits when its command does, so starting that
-/// loop would mean beginning walks it cannot finish and turns whose answers
-/// nobody would be told about.
-///
-/// The consequence is stated rather than hidden: a command here **can** open a
-/// delegated conversation through the API, and that room simply does not run
-/// until the app is next open, at which point its startup sweep picks it up
-/// exactly as it picks up any room a previous run left mid-delegation.
-fn build_core() -> Result<AppCore, AppError> {
+/// This machine's profile directories.
+fn profile_dirs() -> (std::path::PathBuf, std::path::PathBuf) {
     let config_dir = config::default_config_path()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .expect("could not determine config directory");
     let data_dir = config::default_data_dir().expect("could not determine data directory");
-    AppCore::new(config_dir, data_dir)
+    (config_dir, data_dir)
 }
 
 /// Read a hardware-CA PEM from disk and check that it parses — the two
@@ -403,9 +425,174 @@ fn read_ca_pem(path: Option<&str>, field_name: &str) -> Result<Option<String>, A
     Ok(Some(pem))
 }
 
-/// Print an error plus, for the typed variants a user can act on, a hint.
-fn report(e: &AppError) {
+/// Print a failure plus, for the ones a user can act on, a hint.
+/// What `eidola model show <reference>` prints for `reference` against
+/// `catalog`: the weights it resolves to, their tags, source, lifecycle and
+/// per-file manifest, how to check them, and the notices a choice of it
+/// deserves (`model_catalog::notices`; with no answer history here, a
+/// followed tag's "updated" notice does not arise). `None` when the catalog
+/// does not know it, or it is not an Eidola reference.
+fn model_show_lines(
+    catalog: &[eidola_app_core::model_catalog::CatalogRow],
+    reference: &str,
+    today: &str,
+) -> Option<Vec<String>> {
+    use eidola_app_core::model_catalog::{self as mc, ModelNotice};
+    let mref = eidola_app_core::parse_model_ref(reference);
+    if mref.backend_id != "eidola" {
+        return None;
+    }
+    let id = mc::identity(catalog, &mref.model)?;
+    let total: u64 = id.files.iter().map(|f| f.size).sum();
+    let mut out = vec![
+        format!("{}  {}", mref.model, id.name),
+        format!("  sha256:      {}", id.sha256),
+        format!(
+            "  tags:        {}",
+            if id.tags.is_empty() {
+                "(none)".to_string()
+            } else {
+                id.tags.join(", ")
+            }
+        ),
+        format!(
+            "  source:      https://huggingface.co/{}/tree/{}",
+            id.repo, id.revision
+        ),
+        format!(
+            "  status:      {}",
+            match (id.lifecycle.as_str(), &id.retire_after) {
+                ("deprecated", Some(date)) => format!("deprecated, retires after {date}"),
+                ("retired", _) => "retired".to_string(),
+                (other, _) => other.to_string(),
+            }
+        ),
+        format!("  files:       {} ({})", id.files.len(), fmt_size(total)),
+    ];
+    // Each file's exact size, which is what a download is checked against
+    // (a rounded one reads a 4 KB template as "0 MB").
+    for f in &id.files {
+        out.push(format!("    {}  {}  {} bytes", f.sha256, f.path, f.size));
+    }
+    out.push(format!("  check them:  {}", id.doc_url));
+    for notice in mc::notices(catalog, &mref.model, None, None, today) {
+        out.push(match notice {
+            ModelNotice::Updated { tag, .. } => format!("note: {tag} now names newer weights"),
+            ModelNotice::NewerAvailable { tag, newer_sha256 } => format!(
+                "note: {tag} now names newer weights, sha256:{newer_sha256}; this pin keeps \
+                 the ones above"
+            ),
+            ModelNotice::Retiring { retire_after, past } => {
+                if past {
+                    format!("note: these weights were due to retire on {retire_after}")
+                } else {
+                    format!("note: these weights retire after {retire_after}")
+                }
+            }
+            ModelNotice::Retired => {
+                "note: these weights are retired; requests naming them are refused".to_string()
+            }
+        });
+    }
+    Some(out)
+}
+
+fn report(e: &Failure) {
     eprintln!("error: {e}");
+    failure_hint(e);
+}
+
+/// Print why no session could be opened, plus its hint.
+///
+/// Separate from [`report`] because the selection rule can fail in ways a
+/// command cannot: nothing was attempted, and what the reader needs to know is
+/// which Eidola should be running, not which argument was wrong.
+fn report_startup(e: &Startup) {
+    eprintln!("error: {e}");
+    match e {
+        Startup::Core(e) => app_hint(e),
+        Startup::NotAccepting { .. } => {
+            eprintln!(
+                "hint: something holds the local profile without answering its \
+                 control socket — an Eidola older than this one, or one whose \
+                 listener stopped. Quit it and run this again"
+            );
+        }
+        Startup::OtherProfile { .. } => {
+            eprintln!(
+                "hint: a profile is both roots, and only the data one is shared \
+                 here — point this command's config root at the running Eidola's \
+                 (XDG_CONFIG_HOME on Linux), or quit that Eidola and run this again"
+            );
+        }
+        Startup::Dial(e) => failure_hint(e),
+    }
+}
+
+/// The actionable hint for anything a command can fail with.
+fn failure_hint(e: &Failure) {
+    match e {
+        Failure::App(e) => app_hint(e),
+        // A verb the running app has never heard of is what an app older than
+        // this `eidola` looks like from here — the protocol matched, the
+        // vocabulary did not.
+        Failure::Protocol(ProtocolError::UnknownVerb { verb }) => {
+            eprintln!(
+                "hint: the running Eidola has no `{verb}` — it is older than \
+                 this `eidola`; quit it and run this again"
+            );
+        }
+        Failure::Protocol(ProtocolError::UnsupportedProtocol {
+            supported,
+            requested,
+        }) => {
+            eprintln!(
+                "hint: the running Eidola speaks control protocol {supported} \
+                 and this `eidola` speaks {requested} — run the `eidola` that \
+                 came with it, or quit it and run this again"
+            );
+        }
+        // A variant name this build has never heard of. The app's own
+        // rendering is already on the error line; naming the variant is what
+        // makes the report actionable to whoever reads it next.
+        Failure::Unrecognized { kind, .. } => {
+            eprintln!(
+                "hint: the running Eidola reported `{kind}`, a failure this \
+                 `eidola` has no type for — it is newer than this one"
+            );
+        }
+        Failure::EmbeddedOnly { .. } => {
+            eprintln!(
+                "hint: quit Eidola (`eidola service stop` for the background \
+                 service) and run this again"
+            );
+        }
+        Failure::AccountReplaced { .. } => {
+            eprintln!(
+                "hint: that link funds the account this machine held when the \
+                 request went out, and it now holds another one — check \
+                 `eidola account show` and run this again"
+            );
+        }
+        // Every process that speaks this control protocol states these, so an
+        // answer missing one is a build from before it did.
+        Failure::Incomplete { .. } => {
+            eprintln!(
+                "hint: the running Eidola is a build from before this `eidola` \
+                 — quit it and run the app that came with this one"
+            );
+        }
+        // Deliberately unhinted: the pipelining refusals
+        // (`DuplicateRequestId`, `ReservedRequestId`) reconstruct typed and
+        // render their own sentence, but this client is strictly
+        // request/response and cannot provoke either, so advice here would be
+        // guidance for a state it has no way to reach.
+        _ => {}
+    }
+}
+
+/// The actionable hint for a typed app failure, in either mode.
+fn app_hint(e: &AppError) {
     // The typed onboarding errors get actionable hints. (Chat
     // auto-provisions credentials from the account balance, so these
     // only fire when the account itself is missing or unfunded.)
@@ -417,6 +604,13 @@ fn report(e: &AppError) {
             eprintln!(
                 "hint: run `eidola account prices`, then \
                  `eidola account checkout <price_id>` to add credit"
+            );
+        }
+        AppError::HoldExceedsDenomination { .. } => {
+            eprintln!(
+                "hint: adding credit will not help — this request could cost more than this \
+                 client pays without issuing a credential sized to it; shorten the \
+                 conversation or choose another model"
             );
         }
         AppError::TermsAcceptanceRequired { .. } => {
@@ -432,13 +626,31 @@ fn report(e: &AppError) {
                  command) and run this again"
             );
         }
+        AppError::LocalModelNotDownloaded { model } => {
+            eprintln!("{}", not_downloaded_hint(model));
+        }
         _ => {}
+    }
+}
+
+/// How to get an on-device model a turn named but this machine lacks: the
+/// download command for a curated one, else where to find the command.
+fn not_downloaded_hint(model: &str) -> String {
+    match eidola_app_core::catalog_entry_for_model_ref(model) {
+        Some(entry) => format!(
+            "hint: run `eidola model download {}` ({}), or pick another model with `--model`",
+            entry.id,
+            fmt_size(entry.size_bytes)
+        ),
+        None => "hint: download it with `eidola model download <url>`, or pick another \
+                 model with `--model`"
+            .to_string(),
     }
 }
 
 fn main() {
     // Parse first: `--help`, `--version`, and argument errors must work even
-    // when the local database is held by another Eidola (building the core
+    // when the local database is held by another Eidola (opening the profile
     // takes its exclusive lock and can fail with `DatabaseInUse`).
     let cli = Cli::parse();
 
@@ -452,27 +664,58 @@ fn main() {
             ServiceCommand::Stop => service::stop(),
         };
         if let Err(e) = result {
-            report(&e);
+            report(&Failure::App(e));
             std::process::exit(1);
         }
         return;
     }
 
-    // Build the core (and its tokio runtime) outside any async context so it
+    // `model show` reads only the catalog compiled into this binary, so it
+    // needs neither the profile nor the app, and works whoever holds them.
+    if let Some(Command::Model {
+        command: ModelCommand::Show { reference },
+    }) = &cli.command
+    {
+        let today = eidola_app_core::post_stamp(eidola_app_core::now_ms());
+        match model_show_lines(
+            eidola_app_core::model_catalog::CATALOG,
+            reference,
+            &today[..10],
+        ) {
+            Some(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
+                return;
+            }
+            None => {
+                report(&Failure::App(
+                    eidola_app_core::error::AppError::ModelUnavailable {
+                        model: reference.clone(),
+                    },
+                ));
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Decide who answers — the running Eidola, or this process. Either way the
+    // session (and its tokio runtime) is built outside any async context so it
     // can be dropped cleanly when main returns.
-    let core = match build_core() {
-        Ok(core) => core,
+    let (config_dir, data_dir) = profile_dirs();
+    let session = match Session::open(config_dir, data_dir, cli.embedded) {
+        Ok(session) => session,
         Err(e) => {
-            report(&e);
+            report_startup(&e);
             std::process::exit(1);
         }
     };
 
-    // Use the core's own runtime to drive the CLI commands.
-    let result = core.runtime().block_on(run(&core, cli));
+    let result = session.runtime().block_on(run(&session, cli));
 
-    // Drop core before exiting so its runtime shuts down outside async context.
-    drop(core);
+    // Drop the session before exiting so its runtime shuts down outside async
+    // context.
+    drop(session);
 
     if let Err(e) = result {
         report(&e);
@@ -480,9 +723,13 @@ fn main() {
     }
 }
 
-async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
+async fn run(session: &Session, cli: Cli) -> Result<(), Failure> {
     match cli.command {
         None => {
+            // The trust bundle is the one surface the control socket has no
+            // verb for, in either direction — reading it back is the other
+            // half of `configure`.
+            let core = session.local("reading the trust bundle")?;
             let state = core.config_state();
             let default_model = core.default_model().await?;
             let trust = core.eidola_trust().await?;
@@ -523,9 +770,9 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 }
             );
             for m in &trust.trusted_measurements {
-                println!("  - snp = {}", m.snp);
-                println!("    tdx.rtmr1 = {}", m.tdx_rtmr1);
-                println!("    tdx.rtmr2 = {}", m.tdx_rtmr2);
+                println!("  - sev_snp.measurement = {}", m.measurement);
+                println!("    sev_snp.host_data = {}", m.host_data);
+                println!("    sev_snp.guest_policy = {}", m.guest_policy);
             }
             println!(
                 "hardware_root_ca: {}",
@@ -556,6 +803,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             clear_hardware_root_ca,
             clear_hardware_intermediate_ca,
         }) => {
+            let core = session.local("`eidola configure`")?;
             if base_url.is_none()
                 && hardware_root_ca.is_none()
                 && hardware_intermediate_ca.is_none()
@@ -568,7 +816,8 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             {
                 return Err(AppError::Config {
                     message: "specify at least one option (see --help)".into(),
-                });
+                }
+                .into());
             }
             // ── Resolve and validate every input before applying any of
             // them. `configure` writes the trust bundle one column at a
@@ -626,18 +875,21 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             if let Some(m) = trust_entry {
                 let added = core
                     .trust_measurement(
-                        m.snp_measurement.clone(),
-                        m.tdx_measurement.rtmr1.clone(),
-                        m.tdx_measurement.rtmr2.clone(),
+                        m.measurement.clone(),
+                        m.host_data.clone(),
+                        m.guest_policy.clone(),
                     )
                     .await?;
                 if added {
                     println!(
-                        "added trusted measurement: snp={}, tdx.rtmr1={}, tdx.rtmr2={}",
-                        m.snp_measurement, m.tdx_measurement.rtmr1, m.tdx_measurement.rtmr2,
+                        "added trusted measurement: measurement={}, host_data={}, guest_policy={}",
+                        m.measurement, m.host_data, m.guest_policy,
                     );
                 } else {
-                    println!("measurement already trusted (snp={})", m.snp_measurement);
+                    println!(
+                        "measurement already trusted (measurement={}, host_data={})",
+                        m.measurement, m.host_data
+                    );
                 }
             }
             if clear_trusted_measurements {
@@ -647,16 +899,16 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             if let Some(key) = untrust_key {
                 let removed = core.untrust_measurement(key.clone()).await?;
                 if removed {
-                    println!("removed trusted measurement (snp={key})");
+                    println!("removed trusted measurement ({key})");
                 } else {
-                    println!("measurement not found (snp={key})");
+                    println!("measurement not found ({key})");
                 }
             }
             Ok(())
         }
         Some(Command::Account { command }) => match command {
             None => {
-                let info = core.account_show().await?;
+                let info = session.account_show().await?;
                 println!("id: {}", info.id);
                 if let Some(customer_id) = &info.stripe_customer_id {
                     println!("stripe_customer_id: {customer_id}");
@@ -665,39 +917,74 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             Some(AccountCommand::Create { accept_terms }) => {
+                let core = session.local("`eidola account create`")?;
                 // Consent is captured here, not in app-core: creating an
-                // account records acceptance of the current terms/privacy
-                // versions, so the documents must be surfaced first.
+                // account records acceptance of the terms/privacy versions,
+                // so the documents must be surfaced first. This exact
+                // snapshot is then what `account_create` submits.
                 let docs = core.current_terms().await?;
-                if !docs.is_empty() && !accept_terms {
+                let consent = CreateConsent::decide(!docs.is_empty(), accept_terms);
+                if consent.displays() {
+                    // **Printed on every path that submits.** `--accept-terms`
+                    // skips the second invocation, never the display: the flag
+                    // claims agreement to these documents, and it could not
+                    // claim it about text this run never showed. Fetching once
+                    // and printing what is submitted also closes the rerun
+                    // race — read version 1, rerun with the flag after version
+                    // 2 is published, and version 2 is what gets printed.
                     eprintln!("creating an account means agreeing to:");
-                    for d in &docs {
-                        eprintln!(
-                            "  {} v{} — {} (sha256 {})",
-                            d.document, d.version, d.url, d.sha256
-                        );
+                    for line in terms_lines(&docs) {
+                        eprintln!("{line}");
                     }
+                }
+                if !consent.creates() {
                     eprintln!("re-run with --accept-terms to agree and create the account");
                     std::process::exit(2);
                 }
-                let result = core.account_create().await?;
+                let result = match core.account_create(docs).await {
+                    Ok(result) => result,
+                    // The server kept only the secret's hash: this is the one
+                    // chance to see it. Print it where the person is looking,
+                    // with the command that links it once the profile is fixed.
+                    Err(AppError::AccountNotSaved { account, reason }) => {
+                        eprintln!(
+                            "the account was created, but this profile could not save it: {reason}"
+                        );
+                        eprintln!("this is the only copy of its secret; save both lines now:");
+                        eprintln!("id: {}", account.account_id);
+                        eprintln!("secret: {}", account.secret.expose());
+                        eprintln!(
+                            "once the profile is fixed, link it with: eidola account configure --id <id> --secret <secret>"
+                        );
+                        if let Some(file) = &account.recovery_file {
+                            eprintln!(
+                                "a copy is also in {} (owner-only); delete it once the account is linked",
+                                file.display()
+                            );
+                        }
+                        report_terms_standing(&account.terms);
+                        std::process::exit(1);
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 println!("account created");
                 println!("id: {}", result.id);
                 println!("created_at: {}", result.created_at);
+                report_terms_standing(&result.terms);
                 Ok(())
             }
             Some(AccountCommand::AcceptTerms { yes }) => {
+                let core = session.local("`eidola account accept-terms`")?;
                 let docs = core.current_terms().await?;
                 if docs.is_empty() {
                     println!("the server requires no terms acceptance");
                     return Ok(());
                 }
+                // Unconditional, above the `--yes` branch: that flag skips
+                // the *prompt*, never the display.
                 println!("the server requires acceptance of:");
-                for d in &docs {
-                    println!(
-                        "  {} v{} — {} (sha256 {})",
-                        d.document, d.version, d.url, d.sha256
-                    );
+                for line in terms_lines(&docs) {
+                    println!("{line}");
                 }
                 if !yes {
                     use std::io::Write;
@@ -711,22 +998,35 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                         std::process::exit(2);
                     }
                 }
-                let accepted = core.accept_current_terms().await?;
-                println!("accepted {} document(s)", accepted.len());
+                // The displayed snapshot is what gets submitted. If a
+                // version advanced while the prompt was open, the server
+                // refuses the pair rather than recording agreement to text
+                // that was never printed.
+                let count = docs.len();
+                let standing = core.accept_terms(docs).await?;
+                println!("accepted {count} document(s)");
+                // Accepting every printed document is not the same as having
+                // nothing left to accept — a document that became required
+                // while the prompt was open was in no snapshot and refused by
+                // no submission. Say so rather than let the next purchase be
+                // the first the reader hears of it.
+                report_terms_standing(&standing);
                 Ok(())
             }
             Some(AccountCommand::Reset) => {
-                core.reset_account()?;
+                session.local("`eidola account reset`")?.reset_account()?;
                 println!("account credentials removed");
                 Ok(())
             }
             Some(AccountCommand::Configure { id, secret }) => {
-                core.set_account_credentials(id, secret)?;
+                session
+                    .local("`eidola account configure`")?
+                    .set_account_credentials(id, secret)?;
                 println!("account configured");
                 Ok(())
             }
             Some(AccountCommand::Prices) => {
-                let prices = core.account_prices().await?;
+                let prices = session.account_prices().await?;
                 if prices.is_empty() {
                     println!("no prices available");
                     return Ok(());
@@ -746,7 +1046,34 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 price_id,
                 no_browser,
             }) => {
-                let url = core.account_checkout(price_id).await?;
+                // The link is minted against the credentials held when the
+                // request goes out, and that round trip is long enough for the
+                // account to be replaced under it — reset or reconfigured in
+                // the running app, which owns the profile in client mode.
+                // Printing it then would put a checkout that funds an account
+                // this machine no longer holds the secret for in front of the
+                // reader under the current account's name.
+                //
+                // **The answering side says which credentials it signed
+                // with**, and that is what the profile is checked against,
+                // because it is the only answer an account replaced and
+                // replaced back inside the round trip cannot fool. An answer
+                // that does not say is refused rather than fallen back on:
+                // there is nothing weaker to fall back *to* that this process
+                // could trust, since every look it can take of its own is the
+                // one that swap defeats.
+                let mint = session.account_checkout(price_id).await?;
+                let Some(minted_for) = mint.minted_for.as_deref() else {
+                    return Err(Failure::Incomplete {
+                        what: "which account it minted that link for",
+                    });
+                };
+                if session.account_fingerprint().as_deref() != Some(minted_for) {
+                    return Err(Failure::AccountReplaced {
+                        what: "that checkout link",
+                    });
+                }
+                let url = mint.url;
                 let should_open = !no_browser && std::io::stdout().is_terminal();
                 println!("{url}");
                 if should_open {
@@ -755,7 +1082,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             Some(AccountCommand::Balances) => {
-                let balances = core.account_balances().await?;
+                let balances = session.account_balances().await?;
                 println!("available: {} credits", balances.available);
                 for pool in &balances.pools {
                     let expires = pool
@@ -767,7 +1094,10 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             Some(AccountCommand::Allocate { credits }) => {
-                let result = core.account_allocate(credits).await?;
+                let result = session
+                    .local("`eidola account allocate`")?
+                    .account_allocate(credits)
+                    .await?;
                 println!("credential allocated: {}", result.nonce);
                 println!("credits: {}", result.credits);
                 println!("issuer_key_id: {}", result.issuer_key_id);
@@ -777,18 +1107,15 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
         Some(Command::Wallet { command }) => match command {
             WalletCommand::Credentials { command } => match command {
                 CredentialsCommand::List => {
-                    let spending = core.wallet_spending_credentials().await?;
+                    let wallet = wallet_listing(session).await?;
+                    let (spending, credentials) = wallet_sections(&wallet);
                     if !spending.is_empty() {
                         println!("in-flight credentials:");
                         for c in &spending {
-                            println!(
-                                "  {}: {} credits, {} charged",
-                                c.nonce, c.credits, c.spend_amount
-                            );
+                            println!("  {}", in_flight_line(c));
                         }
                         println!();
                     }
-                    let credentials = core.wallet_credentials().await?;
                     if credentials.is_empty() && spending.is_empty() {
                         println!("no credentials");
                         return Ok(());
@@ -805,20 +1132,13 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     Ok(())
                 }
                 CredentialsCommand::Recover => {
-                    let spending = core.wallet_spending_credentials().await?;
-                    if spending.is_empty() {
-                        println!("no in-flight credentials");
-                        return Ok(());
-                    }
-                    println!("attempting to recover {} credential(s)...", spending.len());
-                    let recovered = core.recover_spending_credentials().await?;
-                    if recovered.is_empty() {
-                        println!("no credentials could be recovered");
-                    } else {
-                        println!("recovered {} credential(s):", recovered.len());
-                        for nonce in &recovered {
-                            println!("  {nonce}");
-                        }
+                    // Both doors, always: a conversion whose answer was lost
+                    // leaves nothing in flight to announce it.
+                    let spends = session.recover_spending_credentials().await?;
+                    let still_spending = session.wallet_spending_credentials().await?.len();
+                    let issuances = session.recover_pending_issuances().await?;
+                    for line in recovery_report(&spends, still_spending, issuances.as_ref()) {
+                        println!("{line}");
                     }
                     Ok(())
                 }
@@ -828,35 +1148,60 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             prompt,
             model,
             space,
+            continue_post,
         }) => {
-            // No --model flag → the default template's agent model (async
-            // `AppCore::default_model`, falling back to the embedded default).
-            // Transitional until wave 2 makes turns participant-aware.
+            // No --model flag → the default template's agent model, resolved
+            // by **whichever process takes the turn**, at the moment it takes
+            // it. Embedded, that is this one: it owns the profile for the
+            // whole command, so resolving here *is* resolving at turn start.
+            // In client mode the app owns it, and the default template — or
+            // that template's agent model — can be changed between this
+            // lookup and the turn; a resolved default is indistinguishable on
+            // the wire from a model the reader named, so sending one would
+            // leave the app unable to apply its own current answer. It
+            // therefore travels unnamed.
+            //
+            // A continuation names no model: the answer it continues names its
+            // own participant and model, and is continued by exactly those.
             let model = match model {
-                Some(m) => m,
-                None => core.default_model().await?,
+                Some(m) => Some(m),
+                None if session.is_client() || continue_post.is_some() => None,
+                None => Some(session.default_model().await?),
             };
 
             // Engine-served models load on demand inside the request path
             // (app-core evicts LRU idle engines to make room); this block
-            // only narrates the potentially-long first-load wait. Engines
-            // are owned by *this* process, so they die with the run.
-            let mref = eidola_app_core::parse_model_ref(&model);
-            let engine_backed = mref.backend_id == eidola_app_core::LOCAL_BACKEND_ID
-                || core.list_backends().await?.iter().any(|b| {
-                    b.id == mref.backend_id
-                        && b.kind == eidola_app_core::BackendKind::LlamaCpp
-                        && b.auto_start
-                });
-            if engine_backed {
-                eprintln!("loading {model}… (a request loads the engine on demand)");
+            // only narrates the potentially-long first-load wait, and can do
+            // so only for a model this process can name before the turn
+            // starts. The turn's closing report names the one that answered.
+            if let Some(named) = model.as_deref() {
+                let mref = eidola_app_core::parse_model_ref(named);
+                let engine_backed = mref.backend_id == eidola_app_core::LOCAL_BACKEND_ID
+                    || session.list_backends().await?.iter().any(|b| {
+                        b.id == mref.backend_id
+                            && b.kind == eidola_app_core::BackendKind::LlamaCpp
+                            && b.auto_start
+                    });
+                if engine_backed {
+                    eprintln!("loading {named}… (a request loads the engine on demand)");
+                }
             }
 
             // Stream chunks straight to stdout. Reasoning goes to stderr
             // (dim, prefixed with "thinking: ") so a piped stdout still
             // captures only the final answer text.
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChatStreamEvent>();
-            let chat_fut = core.chat_stream(prompt, model.clone(), space, tx);
+            let chat_fut = async {
+                match continue_post {
+                    // The stream opens with the text being continued, so
+                    // stdout ends holding the whole answer, as for any turn.
+                    Some(post) => session.continue_stream(post, tx).await,
+                    None => {
+                        let prompt = prompt.expect("clap requires a prompt without --continue");
+                        session.chat_stream(prompt, model, space, tx).await
+                    }
+                }
+            };
 
             // Pump events while chat_fut runs. We `tokio::join!` the two
             // halves so events drain in real time rather than only after
@@ -901,19 +1246,25 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
 
             let (result, ()) = tokio::join!(chat_fut, printer);
             let result = result?;
-            eprintln!(
-                "---\nspace: {}  model: {}  tokens: {}/{}  credits: {}",
-                result.space_id,
-                result.model,
-                result.input_tokens.unwrap_or(0),
-                result.output_tokens.unwrap_or(0),
-                result.credits_charged,
-            );
+            // Only ever non-zero against an app newer than this binary, and
+            // said out loud because those events were part of the answer: an
+            // unreadable delta that vanished quietly would leave a turn
+            // looking whole when it is not.
+            let unread = session.unread_events().await;
+            if unread > 0 {
+                let theirs = session.app_version().await.unwrap_or_default();
+                let ours = env!("CARGO_PKG_VERSION");
+                eprintln!(
+                    "warning: {unread} streamed event(s) this build could not read — \
+                     the running Eidola ({theirs}) is newer than this `eidola` ({ours})"
+                );
+            }
+            eprintln!("{}", chat_summary(&result));
             Ok(())
         }
         Some(Command::Spaces { command }) => match command {
             SpacesCommand::List { archived } => {
-                let spaces = core.list_spaces(archived).await?;
+                let spaces = session.list_spaces(archived).await?;
                 if spaces.is_empty() {
                     println!("no active spaces");
                     return Ok(());
@@ -934,7 +1285,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             SpacesCommand::Archive { id } => {
-                let archived = core.archive_space(id.clone()).await?;
+                let archived = session.archive_space(id.clone()).await?;
                 if archived {
                     println!("archived space {id}");
                 } else {
@@ -943,14 +1294,17 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             SpacesCommand::Rename { id, title } => {
-                core.rename_space(id.clone(), title).await?;
+                session.rename_space(id.clone(), title).await?;
                 println!("renamed space {id}");
                 Ok(())
             }
         },
         Some(Command::Model { command }) => match command {
             ModelCommand::List => {
-                let state = core.local_models_state().await?;
+                // The scan and the registry, from one moment — see
+                // `Session::models`.
+                let snapshot = session.models().await?;
+                let state = &snapshot.state;
                 match &state.engine_path {
                     Some(p) => println!("engine: {p}"),
                     None => println!(
@@ -963,24 +1317,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     println!("no local models yet");
                 } else {
                     for m in &state.models {
-                        let status = match &m.status {
-                            eidola_app_core::LocalModelStatus::Downloading { received, total } => {
-                                match total {
-                                    Some(t) if *t > 0 => {
-                                        format!("downloading {}%", received * 100 / t)
-                                    }
-                                    _ => "downloading".to_string(),
-                                }
-                            }
-                            eidola_app_core::LocalModelStatus::Available => "available".into(),
-                            eidola_app_core::LocalModelStatus::Loading => "loading".into(),
-                            eidola_app_core::LocalModelStatus::Loaded { port, pinned, .. } => {
-                                format!(
-                                    "loaded (127.0.0.1:{port}{})",
-                                    if *pinned { ", pinned" } else { "" }
-                                )
-                            }
-                        };
+                        let status = status_cell(m, &snapshot.running);
                         println!(
                             "{:<40} {:>9}  {}",
                             m.id,
@@ -995,7 +1332,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 // The table above is a *scan*: an engine whose backing file
                 // went away mid-session has no row there while it still holds
                 // a port and its memory. The registry is the honest answer.
-                let unaccounted = unaccounted_engines(&core.running_engines(), &state);
+                let unaccounted = unaccounted_engines(&snapshot.running, state);
                 if !unaccounted.is_empty() {
                     println!("\nrunning engines not listed above:");
                     for engine in &unaccounted {
@@ -1006,7 +1343,7 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     }
                 }
                 println!("\ncatalog (download with `eidola model download <id>`):");
-                for entry in core.local_model_catalog() {
+                for entry in eidola_app_core::LOCAL_MODEL_CATALOG {
                     let installed = catalog_installed(&state.models, entry.file_name);
                     println!(
                         "{:<18} {:>9}  {}{}",
@@ -1020,24 +1357,31 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
             }
             ModelCommand::Download { source } => {
                 // A catalog id resolves to its URL; anything else is a URL.
-                let url = core
-                    .local_model_catalog()
+                let url = eidola_app_core::LOCAL_MODEL_CATALOG
                     .iter()
                     .find(|c| c.id == source)
                     .map(|c| c.url.to_string())
                     .unwrap_or(source);
-                let id = core.download_local_model(url).await?;
+                let id = session.download_local_model(url).await?;
                 println!("downloading {id}…");
-                // The transfer task dies with this process, so wait for it,
-                // rendering a progress line.
+                if session.is_client() {
+                    // Whoever runs the transfer owns it. In client mode that
+                    // is the app, so this loop is watching, not driving.
+                    println!(
+                        "the running Eidola owns this transfer — it continues if you stop watching"
+                    );
+                }
+                // In embedded mode the transfer task dies with this process,
+                // so wait for it, rendering a progress line.
                 let slug = eidola_app_core::parse_model_ref(&id).model;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    let state = core.local_models_state().await?;
+                    let state = session.models().await?.state;
                     let Some(m) = state.models.iter().find(|m| m.slug == slug) else {
                         return Err(AppError::LocalModel {
                             message: "model disappeared during download".into(),
-                        });
+                        }
+                        .into());
                     };
                     match &m.status {
                         eidola_app_core::LocalModelStatus::Downloading { received, total } => {
@@ -1058,7 +1402,8 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                                 Some(err) => {
                                     return Err(AppError::LocalModel {
                                         message: format!("download failed: {err}"),
-                                    });
+                                    }
+                                    .into());
                                 }
                                 None => println!("downloaded {id}"),
                             }
@@ -1069,14 +1414,14 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             ModelCommand::Delete { id } => {
-                core.delete_local_model(id.clone()).await?;
+                session.delete_local_model(id.clone()).await?;
                 println!("deleted {id}");
                 Ok(())
             }
             ModelCommand::Load { id } => {
                 println!("loading {id} (this can take a while for large models)…");
-                core.load_local_model(id.clone()).await?;
-                let state = core.local_models_state().await?;
+                session.load_local_model(id.clone()).await?;
+                let state = session.models().await?.state;
                 let mref = eidola_app_core::parse_model_ref(&id);
                 let in_backend: Vec<&eidola_app_core::LocalModelInfo> = if mref.backend_id
                     == eidola_app_core::EIDOLA_BACKEND_ID
@@ -1100,34 +1445,45 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     }
                     println!("chat with it: `eidola chat \"hi\" --model {}`", m.id);
                 }
-                // The engine is a child of *this* process, so exiting would
-                // kill it. Keep serving until Ctrl-C (the GUI, by contrast,
-                // holds engines for its whole app lifetime).
+                // The engine belongs to whichever process loaded it. In
+                // embedded mode that is this one, so exiting would kill it —
+                // keep serving until Ctrl-C. In client mode it is the app's,
+                // which holds engines for its whole lifetime, so there is
+                // nothing here to wait for and unloading on the way out would
+                // take away what was just asked for.
+                if session.is_client() {
+                    println!(
+                        "the running Eidola holds this engine — `eidola model unload {id}` stops it"
+                    );
+                    return Ok(());
+                }
                 println!("serving — press Ctrl-C to stop");
                 let _ = tokio::signal::ctrl_c().await;
-                core.unload_local_model(id.clone()).await.ok();
+                session.unload_local_model(id.clone()).await.ok();
                 println!("\nunloaded {id}");
                 Ok(())
             }
             ModelCommand::Unload { id } => {
-                core.unload_local_model(id.clone()).await?;
+                session.unload_local_model(id.clone()).await?;
                 println!("unloaded {id}");
                 Ok(())
             }
             ModelCommand::Pin { id } => {
-                core.set_local_model_pinned(id.clone(), true).await?;
+                session.set_local_model_pinned(id.clone(), true).await?;
                 println!("pinned {id} — protected from automatic unloading");
                 Ok(())
             }
             ModelCommand::Unpin { id } => {
-                core.set_local_model_pinned(id.clone(), false).await?;
+                session.set_local_model_pinned(id.clone(), false).await?;
                 println!("unpinned {id}");
                 Ok(())
             }
+            // Answered in `main`, before a session is opened.
+            ModelCommand::Show { .. } => unreachable!("`model show` is answered in main"),
         },
         Some(Command::Backend { command }) => match command {
             BackendCommand::List => {
-                let backends = core.list_backends().await?;
+                let backends = session.list_backends().await?;
                 for b in &backends {
                     let state = if b.enabled { "enabled" } else { "disabled" };
                     println!(
@@ -1163,6 +1519,11 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             BackendCommand::Add { kind } => {
+                // Adding a backend chooses a new destination for prompts and
+                // stores the credential for it, which is the same class of
+                // decision the trust bundle is — off the socket until there is
+                // a consent layer to gate it.
+                let core = session.local("`eidola backend add`")?;
                 let new = match kind {
                     BackendAddCommand::Openai {
                         id,
@@ -1208,12 +1569,12 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             BackendCommand::Enable { id } => {
-                core.set_backend_enabled(id.clone(), true).await?;
+                session.set_backend_enabled(id.clone(), true).await?;
                 println!("enabled backend `{id}`");
                 Ok(())
             }
             BackendCommand::Disable { id } => {
-                core.set_backend_enabled(id.clone(), false).await?;
+                session.set_backend_enabled(id.clone(), false).await?;
                 println!("disabled backend `{id}`");
                 if id == "eidola" {
                     println!(
@@ -1223,12 +1584,15 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                 Ok(())
             }
             BackendCommand::Remove { id } => {
-                core.remove_backend(id.clone()).await?;
+                session
+                    .local("`eidola backend remove`")?
+                    .remove_backend(id.clone())
+                    .await?;
                 println!("removed backend `{id}`");
                 Ok(())
             }
             BackendCommand::Models { id } => {
-                let models = core.backend_models(id.clone()).await?;
+                let models = session.backend_models(id.clone()).await?;
                 if models.is_empty() {
                     println!("no models offered (for engine-backed backends, load one first)");
                     return Ok(());
@@ -1239,6 +1603,14 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
                     } else {
                         println!("{}", m.id);
                     }
+                    // An Eidola model's identity: its weights hash and every
+                    // tag naming it (`eidola model show <tag>` for the rest).
+                    if let Some(sha256) = &m.sha256 {
+                        println!("    sha256:{sha256}");
+                        if !m.tags.is_empty() {
+                            println!("    tags: {}", m.tags.join(", "));
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -1246,8 +1618,16 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
         Some(Command::Update {
             command: UpdateCommand::Check,
         }) => {
-            let snapshot = core.update_check().await;
-            print_update_check(&snapshot);
+            // The check compares the *running* build — its version, and the
+            // claim expectations compiled into it — against the feed, and in
+            // client mode the process that ran it is the app. Say whose
+            // verdict this is before printing it.
+            let checked_by = session.app_version().await;
+            let snapshot = session.update_check().await?;
+            if let Some(note) = update_check_attribution(checked_by.as_deref()) {
+                eprintln!("{note}");
+            }
+            print_update_check(&snapshot, checked_by.as_deref());
             match snapshot.result {
                 // Distinct exit codes so scripts can route on the two
                 // states that need a human decision.
@@ -1312,6 +1692,122 @@ async fn run(core: &AppCore, cli: Cli) -> Result<(), AppError> {
     }
 }
 
+/// The wallet listing's data: **one** read of the credential lifecycle.
+///
+/// A named seam rather than a call at the use site, so what the listing is
+/// allowed to read is one decision in one place — see [`wallet_sections`] for
+/// why more than one read cannot be made coherent.
+async fn wallet_listing(
+    session: &Session,
+) -> Result<Vec<eidola_app_core::CredentialLifecycleInfo>, Failure> {
+    session.wallet_lifecycle().await
+}
+
+/// The two sections `eidola wallet credentials list` prints, split out of one
+/// lifecycle snapshot.
+///
+/// **Both sections come from one read, and that is the whole point.**
+/// Settlement removes a `spending` credential and creates its `active`
+/// successor atomically, so reading the two states separately can show a
+/// credential still in flight beside the successor it already became — a pair
+/// that never coexisted. The states are computed by one SQL view, so a single
+/// read of it cannot say that; two reads either side of a settling turn can.
+///
+/// Ordering is restored to oldest-first, which is what the per-state queries
+/// gave the reader before; the snapshot itself arrives newest-first because
+/// that is what a whole-wallet listing wants. `nonce` breaks ties, so the order
+/// is stable rather than merely sorted.
+fn wallet_sections(
+    lifecycle: &[eidola_app_core::CredentialLifecycleInfo],
+) -> (
+    Vec<&eidola_app_core::CredentialLifecycleInfo>,
+    Vec<&eidola_app_core::CredentialLifecycleInfo>,
+) {
+    let of = |state: &str| {
+        let mut rows: Vec<&eidola_app_core::CredentialLifecycleInfo> =
+            lifecycle.iter().filter(|c| c.state == state).collect();
+        rows.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.nonce.cmp(&b.nonce))
+        });
+        rows
+    };
+    (of("spending"), of("active"))
+}
+
+/// One in-flight credential's line.
+///
+/// `spend_amount` is `Option` on the lifecycle row while the old per-state
+/// query typed it as always present. A `spending` row carries one by the
+/// view's own definition, so the absent case is not reachable through a
+/// healthy profile — which is exactly why it is said out loud rather than
+/// rendered as `0 charged`, a number that would read as a fact.
+fn in_flight_line(c: &eidola_app_core::CredentialLifecycleInfo) -> String {
+    match c.spend_amount {
+        Some(amount) => format!("{}: {} credits, {} charged", c.nonce, c.credits, amount),
+        None => format!("{}: {} credits, charge not recorded", c.nonce, c.credits),
+    }
+}
+
+/// What `eidola wallet credentials recover` prints: the holds it settled and
+/// those still in flight, then the conversions whose lost answer arrived and
+/// those still unanswered. `issuances` is `None` when another process answers
+/// for the profile and asks for those itself.
+fn recovery_report(
+    spends: &[String],
+    still_spending: usize,
+    issuances: Option<&eidola_app_core::IssuanceRecovery>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if spends.is_empty() && still_spending == 0 {
+        lines.push("no in-flight credentials".to_string());
+    }
+    if !spends.is_empty() {
+        lines.push(format!(
+            "recovered {} in-flight credential(s):",
+            spends.len()
+        ));
+        lines.extend(spends.iter().map(|nonce| format!("  {nonce}")));
+    }
+    if still_spending > 0 {
+        lines.push(format!(
+            "{still_spending} credential(s) still in flight: the request may still be running, \
+             or the server could not be reached; try again later"
+        ));
+    }
+    match issuances {
+        None => lines.push(
+            "conversions awaiting an answer are asked for again by the running Eidola".to_string(),
+        ),
+        Some(issuances) => {
+            if !issuances.recovered.is_empty() {
+                lines.push(format!(
+                    "recovered {} converted credential(s) whose answer had been lost:",
+                    issuances.recovered.len()
+                ));
+                lines.extend(issuances.recovered.iter().map(|nonce| format!("  {nonce}")));
+            }
+            if issuances.waiting > 0 {
+                lines.push(format!(
+                    "{} conversion(s) too recent to ask for again; try again in ten minutes",
+                    issuances.waiting
+                ));
+            }
+            if issuances.unresolved > 0 {
+                lines.push(format!(
+                    "{} conversion(s) still unanswered; try again later",
+                    issuances.unresolved
+                ));
+            }
+            if issuances.recovered.is_empty() && issuances.waiting + issuances.unresolved == 0 {
+                lines.push("no conversions awaiting an answer".to_string());
+            }
+        }
+    }
+    lines
+}
+
 /// Human-readable relative expiry for balance pools (`expires_at` is epoch
 /// milliseconds). Mirrors the GUI's humanized expiry rather than printing a
 /// raw timestamp.
@@ -1371,6 +1867,80 @@ impl UnlistedEngine {
     }
 }
 
+/// The status cell `eidola model list` prints for one scanned row.
+///
+/// The reconciliation lives *inside* the renderer rather than beside it, so
+/// there is no way to render a cell that skipped it — which is the shape of
+/// the defect this cures: the authoritative answer was in the same response
+/// and the table printed the other one.
+fn status_cell(
+    row: &eidola_app_core::LocalModelInfo,
+    running: &[eidola_app_core::RunningEngine],
+) -> String {
+    use eidola_app_core::LocalModelStatus;
+    match reconciled_status(row, running) {
+        LocalModelStatus::Downloading { received, total } => match total {
+            Some(t) if t > 0 => format!("downloading {}%", received * 100 / t),
+            _ => "downloading".to_string(),
+        },
+        LocalModelStatus::Available => "available".into(),
+        LocalModelStatus::Loading => "loading".into(),
+        LocalModelStatus::Loaded { port, pinned, .. } => format!(
+            "loaded (127.0.0.1:{port}{})",
+            if pinned { ", pinned" } else { "" }
+        ),
+    }
+}
+
+/// The status to print for one scanned row, reconciled against the registry.
+///
+/// **The registry wins, and not as a matter of preference.** A row's
+/// `Loaded`/`Loading` comes from the very same engine map
+/// [`eidola_app_core::AppCore::running_engines`] reports: the scan takes that
+/// lock once per directory entry it walks, and the registry is read after the
+/// whole walk, so where the two disagree the registry is simply the later read
+/// of one map. A row claiming an engine the registry no longer carries is
+/// describing a subprocess that has since exited or been unloaded — and
+/// printing it as running would have the table contradict, in the same
+/// payload, the authority [`unaccounted_engines`] below already treats as
+/// final.
+///
+/// A row the registry *does* carry takes its details from that later read too,
+/// so a port or a pin that moved is not printed stale.
+///
+/// **It settles the question in both directions**, because the later read is
+/// the later read whichever way the two disagree. A row the scan found
+/// `Available` whose id the registry *does* carry is describing a moment
+/// before an engine started — another connection can load one between the
+/// scan's per-row peek and the whole-walk registry read, and in client mode
+/// the app answering has a long-lived registry and other callers to do it.
+/// Left alone, that row printed `available` while [`unaccounted_engines`]
+/// printed the very same id as running, two lines apart in one payload.
+///
+/// **Only a `Downloading` row is left alone.** An engine for its id is a real
+/// pair — re-downloading a slug whose engine is still up — and promoting it
+/// would hide the transfer the row exists to report. That engine earns its own
+/// line below instead, which is the other direction of the same reconciliation.
+fn reconciled_status(
+    row: &eidola_app_core::LocalModelInfo,
+    running: &[eidola_app_core::RunningEngine],
+) -> eidola_app_core::LocalModelStatus {
+    use eidola_app_core::LocalModelStatus;
+    if matches!(row.status, LocalModelStatus::Downloading { .. }) {
+        return row.status.clone();
+    }
+    match running.iter().find(|e| e.id == row.id) {
+        Some(e) if e.ready => LocalModelStatus::Loaded {
+            port: e.port,
+            context_tokens: e.context_tokens,
+            pinned: e.pinned,
+        },
+        Some(_) => LocalModelStatus::Loading,
+        // The engine is gone; the file on disk is what is left of it.
+        None => LocalModelStatus::Available,
+    }
+}
+
 /// Which running engines `eidola model list` must name for itself.
 ///
 /// **Membership comes from the registry; the scan only decorates.**
@@ -1383,9 +1953,13 @@ impl UnlistedEngine {
 /// The table alone therefore claims less is running than actually is.
 ///
 /// An engine is dropped here only when the printed table already said it is
-/// up: a managed-store row with the same id whose status is `Loaded` or
-/// `Loading`. Everything else earns a line — including an engine on a
-/// `llamacpp` backend, whose models this listing never prints at all.
+/// up — and *printed* is the operative word: the test is
+/// [`reconciled_status`], the very status the row will carry, not the raw
+/// scan status underneath it. Asking the scan instead would put a row that
+/// this payload promotes to `loaded` back in this section as well, saying the
+/// same thing twice in two voices. Everything else earns a line — including
+/// an engine on a `llamacpp` backend, whose models this listing never prints
+/// at all, and a `Downloading` row's engine, which no printed row speaks for.
 ///
 /// `orphaned` is the stronger claim and is made only on the stronger
 /// evidence: **no row the scan actually found** carries this id, external
@@ -1408,7 +1982,7 @@ fn unaccounted_engines(
             let listed = state.models.iter().find(|m| m.id == engine.id && m.on_disk);
             let spoken_for = listed.is_some_and(|m| {
                 matches!(
-                    m.status,
+                    reconciled_status(m, running),
                     eidola_app_core::LocalModelStatus::Loaded { .. }
                         | eidola_app_core::LocalModelStatus::Loading
                 )
@@ -1448,12 +2022,42 @@ fn catalog_installed(models: &[eidola_app_core::LocalModelInfo], file_name: &str
 
 /// Print one `update check` outcome — the same five states the GUI's
 /// Updates window renders, sharing the core types.
-fn print_update_check(snapshot: &eidola_app_core::updates::UpdateCheckSnapshot) {
+/// The line that says whose build an update verdict is about.
+///
+/// `checked_by` is the answering app's version in client mode and `None`
+/// embedded. The verdict is a comparison against the *running* build — its
+/// version and the claim expectations compiled into it — so in client mode it
+/// is the app's answer, not this `eidola`'s, and that is said every time.
+///
+/// **Matching versions are not a matching build.** A version names a release;
+/// two binaries built from different commits report the same one, and today
+/// every source build reports `0.1.0`. Their expected claims and their
+/// embedded trust roots can differ regardless, which is exactly what the
+/// verdict is computed from — so suppressing the note when the numbers agree
+/// would present the app's answer as one this build had reached, on the
+/// strength of a number that does not say so.
+fn update_check_attribution(checked_by: Option<&str>) -> Option<String> {
+    let theirs = checked_by?;
+    let ours = env!("CARGO_PKG_VERSION");
+    Some(format!(
+        "note: the running Eidola ({theirs}) ran this check, so the verdict below \
+         is about its build and its expected claims, not this `eidola`'s ({ours}) \
+         — a version names a release, not a build, so matching numbers are not \
+         proof of a matching answer"
+    ))
+}
+
+fn print_update_check(
+    snapshot: &eidola_app_core::updates::UpdateCheckSnapshot,
+    checked_by: Option<&str>,
+) {
     use eidola_app_core::updates::UpdateCheckResult;
 
+    // Whichever build ran the check is the one "up to date" is about.
+    let installed = checked_by.unwrap_or(env!("CARGO_PKG_VERSION"));
     match &snapshot.result {
         UpdateCheckResult::UpToDate { latest_version } => {
-            println!("Eidola {} is up to date.", env!("CARGO_PKG_VERSION"));
+            println!("Eidola {installed} is up to date.");
             match latest_version {
                 Some(v) => println!("latest release: v{v}"),
                 None => println!("no release is marked latest yet"),
@@ -1606,12 +2210,722 @@ fn print_indented(text: &str, indent: usize) {
     }
 }
 
+/// Say where the account stands with the terms gate, when that is anything
+/// other than settled.
+///
+/// This is the **only** place the user is told, and today the CLI is the only
+/// surface that tells them at all, so the wording carries the whole remedy:
+/// name what is outstanding, and name the command that clears it. Silence is
+/// reserved for [`TermsAcceptance::Complete`] — "could not check" gets a
+/// sentence of its own, because a reader who is told nothing reasonably
+/// concludes there is nothing to do.
+/// What a finished `eidola chat` says on **stderr**, once the answer itself has
+/// gone to stdout: the run's metadata, and — ahead of it — the one thing about
+/// the answer the answer cannot say for itself.
+///
+/// **A turn stopped at the model's length allowance is a successful turn with
+/// an unfinished answer in it**, and every other signal reads like an ordinary
+/// success: the exit code is 0, the usage is honest, the text ends on a line
+/// like any other. Only `ChatResult::truncated` separates a model that was
+/// finished from a ceiling that bound it, so without this a reader — or a
+/// script keeping stdout — takes a mid-sentence answer for a whole one. It
+/// leads because it is about the text just printed, not about the run, and it
+/// is a `warning:` rather than an error because nothing failed and the partial
+/// answer is real.
+///
+/// **A declined turn is the same shape with even less to go on**: the agent saw
+/// the context and chose to bow out, so there is no answer at all — stdout is
+/// empty under a full, ordinary footer, which is exactly what a model that
+/// emitted nothing looks like. `ChatResult::declined` is the only thing that
+/// tells the two apart, and it says so first, ahead of anything about text that
+/// was never written. It is a `note:` rather than a `warning:`: nothing went
+/// wrong and nothing is degraded — the decline is the turn working as intended,
+/// and the only defect was never saying so. The stated reason is commentary an
+/// agent may omit, so its absence is reported as an absence rather than left to
+/// read as a missing sentence.
+///
+/// Pure, so what a finished turn says is assertable without taking one. It
+/// writes nothing itself for the same reason the streaming printer splits the
+/// streams: **stdout is the answer and nothing else.**
+fn chat_summary(result: &eidola_app_core::ChatResult) -> String {
+    let mut out = String::new();
+    if let Some(declined) = &result.declined {
+        out.push_str("note: the agent declined this turn, so there is no answer above");
+        if declined.reason.is_empty() {
+            out.push_str(" — it gave no reason\n");
+        } else {
+            out.push_str(&format!(" — it said: {}\n", declined.reason));
+        }
+    }
+    if result.truncated {
+        // Where the answer can be continued the warning names the command that
+        // does it, with the post it acts on — the one id this run has that the
+        // reader could not otherwise find. `continuable` is the door's own
+        // verdict, so the command named is never one that would be refused.
+        match result
+            .response_action_id
+            .as_deref()
+            .filter(|_| result.continuable)
+        {
+            Some(post) => out.push_str(&format!(
+                "warning: this answer stopped at the model's length limit, not because the \
+                 model was done — continue it from where it stopped with `eidola chat \
+                 --continue {post}`\n"
+            )),
+            None => out.push_str(
+                "warning: this answer stopped at the model's length limit, not because the \
+                 model was done — ask for a shorter answer\n",
+            ),
+        }
+    }
+    out.push_str(&format!(
+        "---\nspace: {}  model: {}  tokens: {}/{}  credits: {}",
+        result.space_id,
+        result.model,
+        result.input_tokens.unwrap_or(0),
+        result.output_tokens.unwrap_or(0),
+        result.credits_charged,
+    ));
+    out
+}
+
+fn report_terms_standing(standing: &TermsAcceptance) {
+    match standing {
+        TermsAcceptance::Complete => {}
+        TermsAcceptance::Outstanding { documents } => {
+            eprintln!(
+                "warning: this account still needs to accept {} — run \
+                 `eidola account accept-terms` to review and accept it; \
+                 purchases are refused until then",
+                documents.join(" and ")
+            );
+        }
+        TermsAcceptance::Unknown { error } => {
+            eprintln!(
+                "warning: could not confirm this account's terms acceptance ({error}) — \
+                 run `eidola account accept-terms` if a purchase is refused"
+            );
+        }
+    }
+}
+
+/// One line per document: what it is, which version, where to read it, and
+/// the hash of the exact text. **Every path that submits a snapshot renders it
+/// through this first** — see [`CreateConsent`].
+fn terms_lines(documents: &[TermsDocument]) -> impl Iterator<Item = String> + '_ {
+    documents.iter().map(|d| {
+        format!(
+            "  {} v{} — {} (sha256 {})",
+            d.document, d.version, d.url, d.sha256
+        )
+    })
+}
+
+/// What `account create` does about consent, decided from the fetched
+/// snapshot and `--accept-terms`.
+///
+/// It exists as a decision rather than a chain of conditions so the rule it
+/// enforces is checkable: **no outcome creates an account against documents
+/// this invocation did not print.** The flag governs whether a *second*
+/// invocation is needed, never whether the documents are shown — a claim of
+/// agreement cannot be made about text the reader was given no chance to see,
+/// and it was that coupling (`!docs.is_empty() && !accept_terms` gating the
+/// print) that let `--accept-terms` submit an unprinted version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateConsent {
+    /// The server runs no acceptance gate: nothing to show, nothing recorded.
+    Nothing,
+    /// Show the documents and stop — agreement has not been given yet.
+    ShowThenStop,
+    /// Show the documents and create the account against them.
+    ShowThenCreate,
+}
+
+impl CreateConsent {
+    fn decide(has_documents: bool, accept_terms: bool) -> Self {
+        match (has_documents, accept_terms) {
+            (false, _) => Self::Nothing,
+            (true, false) => Self::ShowThenStop,
+            (true, true) => Self::ShowThenCreate,
+        }
+    }
+
+    /// Whether the documents are put in front of the reader.
+    fn displays(self) -> bool {
+        matches!(self, Self::ShowThenStop | Self::ShowThenCreate)
+    }
+
+    /// Whether the account is created — and so whether the snapshot is
+    /// submitted as accepted.
+    fn creates(self) -> bool {
+        matches!(self, Self::Nothing | Self::ShowThenCreate)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default model on a fresh profile is not downloaded; the hint
+    /// names the command that downloads it.
+    #[test]
+    fn a_curated_model_that_is_not_downloaded_hints_its_download_command() {
+        let hint = not_downloaded_hint(eidola_app_core::config::DEFAULT_MODEL);
+        assert!(
+            hint.contains("`eidola model download gemma-4-e4b`"),
+            "{hint}"
+        );
+        let other = not_downloaded_hint("mine@local");
+        assert!(other.contains("`eidola model download <url>`"), "{other}");
+    }
+
+    /// A conversion whose answer was lost leaves nothing in flight, so the
+    /// report must reach it with no in-flight credential to announce it, and
+    /// say plainly what is still unanswered.
+    #[test]
+    fn the_recovery_report_covers_lost_conversions_with_nothing_in_flight() {
+        let issuances = eidola_app_core::IssuanceRecovery {
+            recovered: vec!["abc".into()],
+            waiting: 1,
+            unresolved: 2,
+        };
+        let lines = recovery_report(&[], 0, Some(&issuances));
+        assert_eq!(lines[0], "no in-flight credentials");
+        assert!(lines.iter().any(|l| l.contains("recovered 1 converted")));
+        assert!(lines.contains(&"  abc".to_string()));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("1 conversion(s) too recent"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("2 conversion(s) still unanswered"))
+        );
+
+        let nothing = recovery_report(&[], 0, Some(&Default::default()));
+        assert_eq!(
+            nothing,
+            [
+                "no in-flight credentials",
+                "no conversions awaiting an answer"
+            ]
+        );
+
+        let held = recovery_report(&["n1".into()], 1, None);
+        assert!(held[0].starts_with("recovered 1 in-flight"));
+        assert!(
+            held.iter()
+                .any(|l| l.starts_with("1 credential(s) still in flight"))
+        );
+        assert!(held.last().unwrap().contains("the running Eidola"));
+    }
+
+    mod model_show {
+        use eidola_app_core::model_catalog::{CatalogRow, Lifecycle, WeightsFile};
+
+        const NEW: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+        const OLD: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        const FILES: &[WeightsFile] = &[WeightsFile {
+            path: "model.safetensors",
+            size: 2048,
+            sha256: "5555555555555555555555555555555555555555555555555555555555555555",
+        }];
+        const ROWS: &[CatalogRow] = &[
+            CatalogRow {
+                sha256: NEW,
+                tags: &["flash"],
+                name: "Flash",
+                repo: "example/flash",
+                revision: "6666666666666666666666666666666666666666",
+                files: FILES,
+                lifecycle: Lifecycle::Current,
+            },
+            CatalogRow {
+                sha256: OLD,
+                tags: &[],
+                name: "Flash (previous)",
+                repo: "example/flash",
+                revision: "7777777777777777777777777777777777777777",
+                files: FILES,
+                lifecycle: Lifecycle::Deprecated {
+                    retire_after: "2027-06-01",
+                },
+            },
+        ];
+
+        #[test]
+        fn a_followed_tag_shows_its_hash_source_and_manifest() {
+            let lines = super::super::model_show_lines(ROWS, "flash", "2026-11-09").unwrap();
+            let text = lines.join("\n");
+            assert!(text.contains(&format!("sha256:      {NEW}")), "{text}");
+            assert!(text.contains("tags:        flash"), "{text}");
+            assert!(
+                text.contains(
+                    "source:      https://huggingface.co/example/flash/tree/\
+                     6666666666666666666666666666666666666666"
+                ),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "{}  model.safetensors  2048 bytes",
+                    "5".repeat(64)
+                )),
+                "each file with its exact size: {text}"
+            );
+            assert!(
+                text.contains(eidola_app_core::model_catalog::MODEL_IDENTITY_DOC),
+                "{text}"
+            );
+            assert!(!text.contains("note:"), "nothing to say: {text}");
+        }
+
+        #[test]
+        fn a_pin_whose_tag_moved_says_so_and_names_its_retirement() {
+            let pin = format!("flash@sha256:{OLD}@eidola");
+            let text = super::super::model_show_lines(ROWS, &pin, "2026-11-09")
+                .unwrap()
+                .join("\n");
+            assert!(text.contains(&format!("sha256:      {OLD}")), "{text}");
+            assert!(
+                text.contains(&format!("flash now names newer weights, sha256:{NEW}")),
+                "{text}"
+            );
+            assert!(
+                text.contains("deprecated, retires after 2027-06-01"),
+                "{text}"
+            );
+            assert!(
+                text.contains("these weights retire after 2027-06-01"),
+                "{text}"
+            );
+        }
+
+        /// Every tag of the catalog compiled into this binary shows its
+        /// weights, with every file the hash covers.
+        #[test]
+        fn the_shipped_catalog_shows_every_tag() {
+            use eidola_app_core::model_catalog::CATALOG;
+            for row in CATALOG {
+                for tag in row.tags {
+                    let text = super::super::model_show_lines(CATALOG, tag, "2026-11-09")
+                        .unwrap()
+                        .join("\n");
+                    assert!(
+                        text.contains(&format!("sha256:      {}", row.sha256)),
+                        "{text}"
+                    );
+                    for file in row.files {
+                        assert!(
+                            text.contains(&format!(
+                                "{}  {}  {} bytes",
+                                file.sha256, file.path, file.size
+                            )),
+                            "{tag}: {}",
+                            file.path
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn an_unknown_or_non_eidola_model_shows_nothing() {
+            assert!(super::super::model_show_lines(ROWS, "nothing", "2026-11-09").is_none());
+            assert!(
+                super::super::model_show_lines(ROWS, "gemma-4-e2b@local", "2026-11-09").is_none()
+            );
+        }
+    }
     use eidola_app_core::{
         ExternalEngineBackend, LocalModelInfo, LocalModelStatus, LocalModelsState, RunningEngine,
     };
+
+    fn finished_turn(truncated: bool) -> eidola_app_core::ChatResult {
+        eidola_app_core::ChatResult {
+            space_id: "s1".into(),
+            content: "Tides are the ocean answering the moon, and".into(),
+            model: "kimi-k2".into(),
+            input_tokens: Some(11),
+            output_tokens: Some(4096),
+            credits_charged: 320,
+            response_action_id: Some("a2".into()),
+            declined: None,
+            truncated,
+            // As the core reports it for a truncated answer it could continue.
+            continuable: truncated,
+        }
+    }
+
+    #[test]
+    fn an_answer_cut_off_at_the_length_limit_says_so() {
+        // The reported defect: the CLI printed a mid-sentence answer and an
+        // ordinary usage footer, with nothing anywhere saying the model had not
+        // finished. Everything else about the turn succeeded, so the flag is
+        // the only thing that could have said it.
+        let cut_off = chat_summary(&finished_turn(true));
+        assert!(
+            cut_off.starts_with("warning: this answer stopped at the model's length limit"),
+            "the warning leads — it is about the text just printed: {cut_off:?}"
+        );
+        assert!(
+            cut_off.contains("---\nspace: s1  model: kimi-k2  tokens: 11/4096  credits: 320"),
+            "and the footer is unchanged beneath it: {cut_off:?}"
+        );
+    }
+
+    #[test]
+    fn a_cut_off_answer_names_the_command_that_continues_it() {
+        // The warning is not a dead end where the answer can be continued: it
+        // names the command and the post it acts on, which this run is the
+        // only place to learn.
+        let cut_off = chat_summary(&finished_turn(true));
+        assert!(
+            cut_off.contains("`eidola chat --continue a2`"),
+            "{cut_off:?}"
+        );
+        // An answer the core says cannot be continued (a local model's, one
+        // whose author left, one whose request the Record cut) gets no command
+        // that would be refused.
+        let local = chat_summary(&eidola_app_core::ChatResult {
+            continuable: false,
+            ..finished_turn(true)
+        });
+        assert!(
+            local.starts_with("warning: this answer stopped at the model's length limit"),
+            "{local:?}"
+        );
+        assert!(!local.contains("--continue"), "{local:?}");
+    }
+
+    #[test]
+    fn chat_takes_a_prompt_or_a_post_to_continue_but_not_both() {
+        use clap::Parser;
+        let continued = Cli::try_parse_from(["eidola", "chat", "--continue", "a2"])
+            .expect("a continuation needs no prompt");
+        assert!(matches!(
+            continued.command,
+            Some(Command::Chat {
+                prompt: None,
+                continue_post: Some(ref post),
+                ..
+            }) if post == "a2"
+        ));
+        for refused in [
+            vec!["eidola", "chat"],
+            vec!["eidola", "chat", "--continue", "a2", "more please"],
+            vec!["eidola", "chat", "--continue", "a2", "--model", "m"],
+            vec!["eidola", "chat", "--continue", "a2", "--space", "s"],
+        ] {
+            assert!(Cli::try_parse_from(&refused).is_err(), "{refused:?}");
+        }
+        assert!(Cli::try_parse_from(["eidola", "chat", "hello"]).is_ok());
+    }
+
+    fn declined_turn(reason: &str) -> eidola_app_core::ChatResult {
+        eidola_app_core::ChatResult {
+            content: String::new(),
+            input_tokens: None,
+            output_tokens: None,
+            response_action_id: None,
+            declined: Some(eidola_app_core::DeclineOutcome {
+                reason: reason.into(),
+                action_id: "a3".into(),
+            }),
+            ..finished_turn(false)
+        }
+    }
+
+    #[test]
+    fn a_declined_turn_says_so() {
+        // The reported defect: an agent that bowed out printed an empty answer
+        // under a full, ordinary footer — indistinguishable at the terminal
+        // from a model that emitted nothing. `declined` is the only signal that
+        // separates them, and it leads for the same reason the truncation
+        // warning does: it is about the (absent) text, not about the run.
+        let declined = chat_summary(&declined_turn(
+            "that request is outside what I'll help with",
+        ));
+        assert!(
+            declined.starts_with(
+                "note: the agent declined this turn, so there is no answer above — it said: \
+                 that request is outside what I'll help with\n"
+            ),
+            "the decline leads, carrying the stated reason: {declined:?}"
+        );
+        assert!(
+            declined.contains("---\nspace: s1  model: kimi-k2  tokens: 0/0  credits: 320"),
+            "and the footer is unchanged beneath it: {declined:?}"
+        );
+    }
+
+    #[test]
+    fn a_declined_turn_with_no_reason_still_says_so() {
+        // The reason is commentary the agent may omit; the *act* of declining
+        // is the datum. A silent decline must not degrade into the empty answer
+        // this whole line exists to rule out, so the absence is stated.
+        let declined = chat_summary(&declined_turn(""));
+        assert!(
+            declined.starts_with(
+                "note: the agent declined this turn, so there is no answer above — it gave no \
+                 reason\n"
+            ),
+            "a reasonless decline is still announced: {declined:?}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_answer_says_nothing_extra() {
+        // The other half: a turn the model finished must print byte-identically
+        // to what it always printed, or every scripted reader of the footer
+        // breaks for the common case.
+        assert_eq!(
+            chat_summary(&finished_turn(false)),
+            "---\nspace: s1  model: kimi-k2  tokens: 11/4096  credits: 320"
+        );
+    }
+
+    #[test]
+    fn account_create_never_submits_documents_it_did_not_print() {
+        // The whole rule, over every input: an invocation that records
+        // acceptance has shown what it is recording acceptance of. Written as
+        // an exhaustive sweep rather than a case list, because the defect was
+        // exactly one combination (`--accept-terms` with a gate configured)
+        // silently skipping the display.
+        for has_documents in [false, true] {
+            for accept_terms in [false, true] {
+                let consent = CreateConsent::decide(has_documents, accept_terms);
+                assert!(
+                    !(consent.creates() && has_documents && !consent.displays()),
+                    "has_documents={has_documents}, accept_terms={accept_terms}: \
+                     created against documents that were never printed ({consent:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_flag_decides_the_stop_not_the_display() {
+        // Both flag states show the documents; only the stop differs.
+        assert_eq!(
+            CreateConsent::decide(true, false),
+            CreateConsent::ShowThenStop
+        );
+        assert_eq!(
+            CreateConsent::decide(true, true),
+            CreateConsent::ShowThenCreate
+        );
+        assert!(CreateConsent::decide(true, true).displays());
+        assert!(CreateConsent::decide(true, false).displays());
+        // A server with no gate has nothing to show and nothing to record.
+        assert_eq!(CreateConsent::decide(false, true), CreateConsent::Nothing);
+        assert!(!CreateConsent::decide(false, false).displays());
+        assert!(CreateConsent::decide(false, false).creates());
+    }
+
+    #[test]
+    fn every_document_line_carries_the_hash_that_is_submitted() {
+        // The printed line is the reader's only view of what acceptance will
+        // be recorded for, so it names the exact bytes, not just a version.
+        let doc = TermsDocument {
+            document: "terms_of_service".into(),
+            version: 4,
+            url: "https://example.invalid/terms/".into(),
+            sha256: "c".repeat(64),
+        };
+        let lines: Vec<String> = terms_lines(std::slice::from_ref(&doc)).collect();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("terms_of_service"));
+        assert!(lines[0].contains("v4"));
+        assert!(lines[0].contains(&doc.url));
+        assert!(lines[0].contains(&doc.sha256));
+    }
+
+    #[test]
+    fn the_table_prints_a_stopped_engine_as_stopped() {
+        let row = model(
+            "gemma@local",
+            LocalModelStatus::Loaded {
+                port: 8080,
+                context_tokens: 4096,
+                pinned: false,
+            },
+        );
+        assert_eq!(
+            status_cell(&row, &[]),
+            "available",
+            "the cell a reader sees, not just the decision behind it"
+        );
+        assert_eq!(
+            status_cell(&row, &[engine("gemma@local", 8080, true)]),
+            "loaded (127.0.0.1:8080)",
+            "and an engine the registry still carries is unchanged"
+        );
+    }
+
+    #[test]
+    fn a_row_claiming_an_engine_the_registry_lost_is_not_printed_as_running() {
+        let row = model(
+            "gemma@local",
+            LocalModelStatus::Loaded {
+                port: 8080,
+                context_tokens: 4096,
+                pinned: false,
+            },
+        );
+        assert_eq!(
+            reconciled_status(&row, &[]),
+            LocalModelStatus::Available,
+            "the engine exited or was unloaded; the file on disk is what is left"
+        );
+        // And the section below adds nothing for it either — an engine in no
+        // registry is spoken for by nobody. The table tells one story.
+        assert!(unaccounted_engines(&[], &state(vec![row], vec![])).is_empty());
+    }
+
+    #[test]
+    fn a_warming_row_the_registry_lost_is_not_printed_as_loading_either() {
+        let row = model("gemma@local", LocalModelStatus::Loading);
+        assert_eq!(
+            reconciled_status(&row, &[]),
+            LocalModelStatus::Available,
+            "a load that died before it finished is not still loading"
+        );
+    }
+
+    #[test]
+    fn a_row_the_registry_still_carries_takes_its_details_from_the_later_read() {
+        let row = model(
+            "gemma@local",
+            LocalModelStatus::Loaded {
+                port: 8080,
+                context_tokens: 4096,
+                pinned: false,
+            },
+        );
+        let mut live = engine("gemma@local", 9090, true);
+        live.pinned = true;
+        assert_eq!(
+            reconciled_status(&row, std::slice::from_ref(&live)),
+            LocalModelStatus::Loaded {
+                port: 9090,
+                context_tokens: 4096,
+                pinned: true,
+            },
+            "the port and the pin come from the read that happened last"
+        );
+    }
+
+    #[test]
+    fn a_row_whose_engine_is_still_warming_says_so() {
+        let row = model(
+            "gemma@local",
+            LocalModelStatus::Loaded {
+                port: 8080,
+                context_tokens: 4096,
+                pinned: false,
+            },
+        );
+        assert_eq!(
+            reconciled_status(&row, &[engine("gemma@local", 8080, false)]),
+            LocalModelStatus::Loading
+        );
+    }
+
+    #[test]
+    fn a_download_is_never_talked_into_being_an_engine() {
+        // Re-downloading a slug whose engine is still up is a real pair, and
+        // the transfer is what this row exists to report.
+        let row = synthetic(
+            "gemma@local",
+            LocalModelStatus::Downloading {
+                received: 5,
+                total: Some(10),
+            },
+            None,
+        );
+        assert_eq!(
+            reconciled_status(&row, &[engine("gemma@local", 8080, true)]),
+            LocalModelStatus::Downloading {
+                received: 5,
+                total: Some(10)
+            }
+        );
+    }
+
+    #[test]
+    fn a_row_that_claims_nothing_is_left_exactly_as_it_is() {
+        let row = model("gemma@local", LocalModelStatus::Available);
+        assert_eq!(
+            reconciled_status(&row, &[]),
+            LocalModelStatus::Available,
+            "the common case must stay byte-identical"
+        );
+    }
+
+    fn credential(
+        nonce: &str,
+        created_at: i64,
+        state: &str,
+        spend_amount: Option<i64>,
+    ) -> eidola_app_core::CredentialLifecycleInfo {
+        eidola_app_core::CredentialLifecycleInfo {
+            nonce: nonce.to_string(),
+            credits: 60,
+            generation: 2,
+            created_at,
+            state: state.to_string(),
+            spend_amount,
+        }
+    }
+
+    #[test]
+    fn the_two_sections_are_one_snapshot_split_in_two() {
+        let wallet = vec![
+            credential("c", 300, "active", None),
+            credential("a", 100, "spending", Some(40)),
+            credential("b", 200, "active", None),
+            // Neither section shows these, exactly as before.
+            credential("old", 50, "spent", Some(10)),
+            credential("stale", 60, "expired", None),
+        ];
+        let (spending, active) = wallet_sections(&wallet);
+        assert_eq!(
+            spending
+                .iter()
+                .map(|c| c.nonce.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        assert_eq!(
+            active.iter().map(|c| c.nonce.as_str()).collect::<Vec<_>>(),
+            vec!["b", "c"],
+            "oldest first, the order the per-state queries gave"
+        );
+        // The impossible pair, stated as the invariant it is: one credential
+        // is in exactly one state, because one read computed all of them.
+        for s in &spending {
+            assert!(
+                !active.iter().any(|a| a.nonce == s.nonce),
+                "{} cannot be in flight and settled at once",
+                s.nonce
+            );
+        }
+    }
+
+    #[test]
+    fn an_in_flight_line_never_invents_a_charge() {
+        let charged = credential("a", 100, "spending", Some(40));
+        assert_eq!(in_flight_line(&charged), "a: 60 credits, 40 charged");
+        let unrecorded = credential("a", 100, "spending", None);
+        assert_eq!(
+            in_flight_line(&unrecorded),
+            "a: 60 credits, charge not recorded",
+            "an absent amount is said, not rendered as a zero that reads as a fact"
+        );
+    }
 
     fn engine(id: &str, port: u16, ready: bool) -> RunningEngine {
         let (slug, backend_id) = id.split_once('@').expect("qualified id");
@@ -1758,17 +3072,74 @@ mod tests {
     /// A stale `Available` row (the scan ran before the engine registered)
     /// is not a claim that anything is running, so the engine still gets its
     /// line — but the file is there, so no orphan flag.
+    /// A row that genuinely is not claiming to run: the bytes for this slug
+    /// are streaming again while the old engine still serves the copy on
+    /// disk. Nothing the table prints for it says "running", so the engine is
+    /// still this section's to name — and the row's own file is right there,
+    /// so it is not orphaned.
     #[test]
     fn a_row_that_does_not_claim_to_be_running_does_not_speak_for_the_engine() {
         let running = vec![engine("gemma@local", 52341, true)];
         let snapshot = state(
-            vec![model("gemma@local", LocalModelStatus::Available)],
+            vec![model(
+                "gemma@local",
+                LocalModelStatus::Downloading {
+                    received: 1_000,
+                    total: Some(1_000_000_000),
+                },
+            )],
             vec![],
         );
 
         let out = unaccounted_engines(&running, &snapshot);
         assert_eq!(out.len(), 1);
         assert!(!out[0].orphaned);
+    }
+
+    /// The other direction of the same later-read authority: an engine
+    /// started between the scan's peek at this row and the whole-walk
+    /// registry read. The row is `Available` only because it was looked at
+    /// first — and in client mode the app answering has a long-lived registry
+    /// and other callers to start engines in it.
+    #[test]
+    fn a_row_the_registry_has_since_started_an_engine_for_is_promoted() {
+        let running = vec![engine("gemma@local", 52341, true)];
+        let snapshot = state(
+            vec![model("gemma@local", LocalModelStatus::Available)],
+            vec![],
+        );
+
+        let row = &snapshot.models[0];
+        assert_eq!(
+            reconciled_status(row, &running),
+            LocalModelStatus::Loaded {
+                port: 52341,
+                context_tokens: 4096,
+                pinned: false,
+            },
+            "the registry is the later read whichever way the two disagree"
+        );
+        assert!(
+            unaccounted_engines(&running, &snapshot).is_empty(),
+            "and the row now speaks for it, so one payload says one thing"
+        );
+    }
+
+    /// The same moment caught a beat earlier: the engine is spawned but not
+    /// yet answering health checks.
+    #[test]
+    fn a_row_whose_engine_has_only_just_spawned_is_promoted_to_loading() {
+        let running = vec![engine("gemma@local", 52341, false)];
+        let snapshot = state(
+            vec![model("gemma@local", LocalModelStatus::Available)],
+            vec![],
+        );
+
+        assert_eq!(
+            reconciled_status(&snapshot.models[0], &running),
+            LocalModelStatus::Loading
+        );
+        assert!(unaccounted_engines(&running, &snapshot).is_empty());
     }
 
     /// The file was deleted under a running engine and the user started the
@@ -1844,5 +3215,356 @@ mod tests {
             vec![],
         );
         assert!(unaccounted_engines(&[], &snapshot).is_empty());
+    }
+
+    // --- Client mode, driven through `run` --------------------------------
+
+    use eidola_app_core::ipc::{
+        AccountCheckoutResult, FrameReader, HelloResult, PROTOCOL_VERSION, Request, Response,
+        decode_request, encode_line, socket_path,
+    };
+    use std::sync::{Arc, Mutex};
+
+    /// A stand-in Eidola on the control socket for `dir`, answering from
+    /// `script` and recording every request it was sent — so what a command
+    /// put on the wire is assertable, not just what it printed.
+    #[allow(clippy::type_complexity)]
+    fn scripted_app<F>(
+        dir: &std::path::Path,
+        script: F,
+    ) -> (std::thread::JoinHandle<()>, Arc<Mutex<Vec<Request>>>)
+    where
+        F: Fn(&Request) -> Vec<Response> + Send + 'static,
+    {
+        let seen: Arc<Mutex<Vec<Request>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let config_dir = eidola_app_core::ipc::path_bytes(dir);
+        let listener =
+            std::os::unix::net::UnixListener::bind(socket_path(dir)).expect("bind the socket");
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                listener.set_nonblocking(true).expect("nonblocking");
+                let listener = tokio::net::UnixListener::from_std(listener).expect("adopt");
+                let (stream, _) = listener.accept().await.expect("accept");
+                let (reader, mut writer) = stream.into_split();
+                let mut frames = FrameReader::new(tokio::io::BufReader::new(reader));
+                while let Ok(Some(line)) = frames.next_line().await {
+                    let request = decode_request(line).expect("a frame");
+                    recorder.lock().expect("seen").push(request.clone());
+                    let answers = if request.verb == "hello" {
+                        vec![Response::end(
+                            request.id,
+                            &HelloResult {
+                                protocol: PROTOCOL_VERSION,
+                                app_version: "9.9.9".into(),
+                                config_dir: Some(config_dir.clone()),
+                            },
+                        )]
+                    } else {
+                        script(&request)
+                    };
+                    use tokio::io::AsyncWriteExt;
+                    for answer in answers {
+                        if writer.write_all(&encode_line(&answer)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        });
+        (handle, seen)
+    }
+
+    fn client_session(dir: &std::path::Path) -> Session {
+        Session::open(dir.into(), dir.into(), false).expect("client mode")
+    }
+
+    fn verbs(seen: &Arc<Mutex<Vec<Request>>>) -> Vec<String> {
+        seen.lock()
+            .expect("seen")
+            .iter()
+            .map(|r| r.verb.clone())
+            .collect()
+    }
+
+    fn params_of(seen: &Arc<Mutex<Vec<Request>>>, verb: &str) -> serde_json::Value {
+        seen.lock()
+            .expect("seen")
+            .iter()
+            .find(|r| r.verb == verb)
+            .unwrap_or_else(|| panic!("`{verb}` was never sent"))
+            .params
+            .clone()
+    }
+
+    /// The credentials `config.toml` holds at this instant, named the way the
+    /// answering side names them.
+    fn fingerprint_at(config: &std::path::Path) -> Option<String> {
+        eidola_app_core::config::account_fingerprint(&eidola_app_core::config::Config::load_from(
+            config,
+        ))
+    }
+
+    fn write_account(config: &std::path::Path, id: &str, secret: &str) {
+        std::fs::write(
+            config,
+            format!("account_id = \"{id}\"\naccount_secret = \"{secret}\"\n"),
+        )
+        .expect("write config");
+    }
+
+    fn checkout(session: &Session) -> Result<(), Failure> {
+        let cli = Cli::parse_from(["eidola", "account", "checkout", "price_1", "--no-browser"]);
+        session.runtime().block_on(run(session, cli))
+    }
+
+    #[test]
+    fn a_checkout_link_minted_for_a_replaced_account_is_refused() {
+        // The app owns the profile in client mode, so the account can be
+        // reset or reconfigured in its window while this command's round trip
+        // is in flight. The link came back for the credentials that were
+        // configured when it went out; printing it would offer to fund an
+        // account whose secret this machine no longer holds.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        write_account(&config, "before", "s1");
+        let minted_for = fingerprint_at(&config);
+        let replaced = config.clone();
+        let (server, seen) = scripted_app(dir.path(), move |request| {
+            if request.verb == "account.checkout" {
+                write_account(&replaced, "after", "s2");
+            }
+            vec![Response::end(
+                request.id,
+                &AccountCheckoutResult {
+                    url: "https://checkout.example/session".into(),
+                    minted_for: minted_for.clone(),
+                },
+            )]
+        });
+
+        let session = client_session(dir.path());
+        match checkout(&session) {
+            Err(Failure::AccountReplaced { what }) => assert_eq!(what, "that checkout link"),
+            other => panic!(
+                "a link for a replaced account must not be exposed: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        assert_eq!(verbs(&seen), vec!["hello", "account.checkout"]);
+        drop(session);
+        server.join().expect("the server ends with the connection");
+    }
+
+    #[test]
+    fn a_link_minted_for_an_account_swapped_away_and_back_is_refused() {
+        // The look before and the look after can both find the same account
+        // and still be wrong: replaced and replaced back inside one round
+        // trip, the mint ran under something neither look ever saw. Nothing
+        // this process can observe about its own profile settles that — only
+        // the side that signed the request knows what it signed with, so that
+        // is what the profile is checked against.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        write_account(&config, "ours", "s1");
+        let restored = std::fs::read(&config).expect("the account we start and end with");
+        let swap = config.clone();
+        let (server, _seen) = scripted_app(dir.path(), move |request| {
+            let mut minted_for = None;
+            if request.verb == "account.checkout" {
+                // Someone else's account was configured when the request was
+                // signed …
+                write_account(&swap, "theirs", "s2");
+                minted_for = fingerprint_at(&swap);
+                // … and ours was put back before the answer arrived.
+                std::fs::write(&swap, &restored).expect("restore the account");
+            }
+            vec![Response::end(
+                request.id,
+                &AccountCheckoutResult {
+                    url: "https://checkout.example/session".into(),
+                    minted_for,
+                },
+            )]
+        });
+
+        let session = client_session(dir.path());
+        assert_eq!(
+            session.account_fingerprint(),
+            fingerprint_at(&config),
+            "the profile ends where it started, which is the whole trap"
+        );
+        match checkout(&session) {
+            Err(Failure::AccountReplaced { what }) => assert_eq!(what, "that checkout link"),
+            other => panic!(
+                "a link minted for another account must not be exposed just \
+                 because the swap was undone: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        drop(session);
+        server.join().expect("the server ends with the connection");
+    }
+
+    #[test]
+    fn a_checkout_link_for_the_account_still_configured_is_offered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        write_account(&config, "same", "s1");
+        let minted_for = fingerprint_at(&config);
+        let (server, _seen) = scripted_app(dir.path(), move |request| {
+            vec![Response::end(
+                request.id,
+                &AccountCheckoutResult {
+                    url: "https://checkout.example/session".into(),
+                    minted_for: minted_for.clone(),
+                },
+            )]
+        });
+
+        let session = client_session(dir.path());
+        checkout(&session).expect("an unchanged account is the ordinary case");
+        drop(session);
+        server.join().expect("the server ends with the connection");
+    }
+
+    #[test]
+    fn an_app_that_does_not_say_what_it_minted_under_is_refused() {
+        // Every process serving this protocol states which credentials it
+        // signed with, so an answer without one is a build from before it
+        // did. There is nothing weaker to fall back to that would settle the
+        // question either: every look this process can take of its own
+        // profile is exactly what a swap-and-restore inside the round trip
+        // defeats. So the link is not exposed, and the reason is the build,
+        // not the account.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        write_account(&config, "ours", "s1");
+        let (server, _seen) = scripted_app(dir.path(), move |request| {
+            vec![Response::end(
+                request.id,
+                &AccountCheckoutResult {
+                    url: "https://checkout.example/session".into(),
+                    minted_for: None,
+                },
+            )]
+        });
+
+        let session = client_session(dir.path());
+        match checkout(&session) {
+            Err(Failure::Incomplete { what }) => {
+                assert_eq!(what, "which account it minted that link for")
+            }
+            other => panic!(
+                "an unverifiable payment link must not be exposed: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        drop(session);
+        server.join().expect("the server ends with the connection");
+    }
+
+    fn turn_answer(request: &Request, model: &str) -> Vec<Response> {
+        vec![Response::end(
+            request.id,
+            &eidola_app_core::ChatResult {
+                space_id: "s1".into(),
+                content: "hello".into(),
+                model: model.into(),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                credits_charged: 2,
+                response_action_id: None,
+                declined: None,
+                truncated: false,
+                continuable: false,
+            },
+        )]
+    }
+
+    #[test]
+    fn a_turn_that_names_no_model_leaves_the_default_to_the_app() {
+        // The app can change the default template — or that template's agent
+        // model — between any lookup here and the turn itself, and a resolved
+        // default is indistinguishable on the wire from a model the reader
+        // named. So nothing is looked up and nothing is sent.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (server, seen) = scripted_app(dir.path(), |request| turn_answer(request, "current@x"));
+
+        let session = client_session(dir.path());
+        let cli = Cli::parse_from(["eidola", "chat", "hi"]);
+        session
+            .runtime()
+            .block_on(run(&session, cli))
+            .expect("the turn runs");
+
+        assert_eq!(
+            verbs(&seen),
+            vec!["hello", "chat.stream"],
+            "no separate default-model lookup — resolving it here is what \
+             makes it stale"
+        );
+        assert!(
+            params_of(&seen, "chat.stream")["model"].is_null(),
+            "an unnamed model travels unnamed"
+        );
+        drop(session);
+        server.join().expect("the server ends with the connection");
+    }
+
+    #[test]
+    fn a_turn_that_names_a_model_sends_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (server, seen) = scripted_app(dir.path(), |request| match request.verb.as_str() {
+            "backend.list" => vec![Response::end(
+                request.id,
+                &eidola_app_core::ipc::BackendListResult { backends: vec![] },
+            )],
+            _ => turn_answer(request, "named@x"),
+        });
+
+        let session = client_session(dir.path());
+        let cli = Cli::parse_from(["eidola", "chat", "--model", "named@x", "hi"]);
+        session
+            .runtime()
+            .block_on(run(&session, cli))
+            .expect("the turn runs");
+
+        assert_eq!(
+            params_of(&seen, "chat.stream")["model"],
+            serde_json::json!("named@x"),
+            "a model the reader asked for by name is the one thing that must travel"
+        );
+        drop(session);
+        server.join().expect("the server ends with the connection");
+    }
+
+    #[test]
+    fn every_client_mode_verdict_says_whose_build_it_is() {
+        let ours = env!("CARGO_PKG_VERSION");
+        assert_eq!(
+            update_check_attribution(None),
+            None,
+            "embedded, the build that ran the check is this one"
+        );
+
+        // Including when the two report the same version. A version names a
+        // release, and two builds from different commits report the same one
+        // while carrying different expected claims and different trust roots
+        // — which is what the verdict is computed from.
+        for theirs in [ours, "99.9.9"] {
+            let note = update_check_attribution(Some(theirs))
+                .unwrap_or_else(|| panic!("a remote check is always attributed ({theirs})"));
+            assert!(note.contains(theirs), "{note}");
+            assert!(note.contains(ours), "both builds are named: {note}");
+            assert!(
+                note.contains("expected claims"),
+                "the claim expectations are the app's too, not only its version: {note}"
+            );
+        }
     }
 }

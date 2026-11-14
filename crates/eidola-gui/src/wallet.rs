@@ -14,6 +14,7 @@ use gpui::{
     Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder as _,
 };
+use gpui_component::RoleOverride;
 use gpui_component::{
     ActiveTheme, Disableable, Sizable, StyledExt, WindowExt,
     button::{Button, ButtonVariants},
@@ -174,7 +175,7 @@ impl Render for WalletView {
                     })
                     .child(
                         Button::new("recover-all")
-                            .role(None)
+                            .role(RoleOverride::Presentational)
                             .small()
                             .label("Recover in-flight")
                             .disabled(busy)
@@ -197,7 +198,7 @@ impl Render for WalletView {
                 }))
                 .child(
                     Button::new("refresh-credentials")
-                        .role(None)
+                        .role(RoleOverride::Presentational)
                         .ghost()
                         .small()
                         .label("Refresh")

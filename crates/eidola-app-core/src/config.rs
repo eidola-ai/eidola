@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tinfoil_verifier::EnclaveMeasurement;
+use tinfoil_verifier::SevSnpPin;
 
 use crate::error::AppError;
 
@@ -16,8 +16,11 @@ pub const DEFAULT_DOMAIN_SEPARATOR: &str = "ACT-v1:eidola:inference:production:2
 /// Embedded fallback for the inference model. The `default_model` config key
 /// is gone (Participants v1); this is the model the seeded "Default" space
 /// template's agent participant carries, and the last-resort fallback when a
-/// space or template has no resolvable agent model.
-pub const DEFAULT_MODEL: &str = "gemma4-31b";
+/// space or template has no resolvable agent model. It is the curated Gemma 4
+/// E4B in the managed local store (`gemma-4-e4b` in
+/// `local_models::LOCAL_MODEL_CATALOG`), spelled as the `<file-stem>@local`
+/// reference that model is selected by once downloaded.
+pub const DEFAULT_MODEL: &str = "gemma-4-E4B_q4_0-it@local";
 
 /// Well-known id of the seeded "Default" space template — the compiled-in
 /// value [`Config::default_template`] resolves to when the user has set no
@@ -127,6 +130,50 @@ pub enum LightCharacter {
     /// Sunset / dusk — the warm orange/red of low sun.
     #[serde(alias = "orange")]
     Warm,
+}
+
+/// A stable, non-revealing name for the credentials a profile holds **right
+/// now** — `None` when no account is configured.
+///
+/// Two questions get confused if only the account id is compared: "is this
+/// the same account?" and "is this the same credential pair?". A profile can
+/// be reset and reconfigured with the same id and a different secret, so the
+/// id alone cannot tell a caller that what it is holding was minted under
+/// what is here now. Folding both together answers the second question,
+/// which is the one that matters to anything binding a result to the
+/// credentials that produced it.
+///
+/// **The secret itself never leaves the profile.** This is a one-way digest
+/// over a server-generated, high-entropy secret, and it is compared, never
+/// reversed — which is what lets the answer travel to a caller that has no
+/// business holding credentials.
+pub fn account_fingerprint(cfg: &Config) -> Option<String> {
+    let (id, secret) = (cfg.account_id.as_ref()?, cfg.account_secret.as_ref()?);
+    Some(fingerprint_of(id, secret))
+}
+
+/// [`account_fingerprint`] over a pair held somewhere other than a [`Config`]
+/// — same digest, same domain separation, so the two answers are comparable.
+///
+/// A caller that already holds the pair (a client's own credential snapshot)
+/// needs the name without assembling a config around it.
+pub fn fingerprint_of(id: &str, secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    // Domain-separated, and length-prefixed so no two different pairs can
+    // hash the same bytes by moving the boundary between them.
+    hasher.update(b"eidola.account-fingerprint.v1\0");
+    hasher.update((id.len() as u64).to_be_bytes());
+    hasher.update(id.as_bytes());
+    hasher.update((secret.len() as u64).to_be_bytes());
+    hasher.update(secret.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Returns the default config file path: `<config_dir>/eidola/config.toml`.
@@ -310,10 +357,71 @@ impl Config {
         toml::from_str(&contents).unwrap_or_default()
     }
 
+    /// Load config from `path` **to write it back**: a missing file is the
+    /// defaults, but one that cannot be read or parsed is an error. Every
+    /// setter rewrites the whole file, account secret included, so reading an
+    /// unparseable file as defaults (what [`Config::load_from`] does, which is
+    /// right for display) would save those defaults over the only copy of
+    /// the credentials on the next preference change.
+    pub fn load_for_update(path: &Path) -> Result<Config, AppError> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(e) => {
+                return Err(AppError::Config {
+                    message: format!("failed to read {}: {e}", path.display()),
+                });
+            }
+        };
+        // Where, never what: the parser's `Display` quotes the failing source
+        // line and its message can quote a value, and this file's lines
+        // include the account secret (a partial sync write that leaves
+        // `account_secret = "…` unterminated fails on exactly that line). The
+        // text reaches a settings alert and `AccountNotSaved`'s reason, so it
+        // names the position only.
+        toml::from_str(&contents).map_err(|e| {
+            let at = e
+                .span()
+                .map(|span| {
+                    let before = &contents[..span.start.min(contents.len())];
+                    let line = before.matches('\n').count() + 1;
+                    let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+                    format!(" (line {line}, column {column})")
+                })
+                .unwrap_or_default();
+            AppError::Config {
+                message: format!(
+                    "{} is not valid{at}; fix or move it aside (nothing was written)",
+                    path.display()
+                ),
+            }
+        })
+    }
+
     /// Serialize and write the config to `path`, creating parent directories
-    /// as needed.
+    /// as needed. The file is replaced whole — written beside it, synced, then
+    /// renamed over — so a reader or a crash never sees it truncated, and on
+    /// Unix it is created owner-only, since it holds the account secret.
+    ///
+    /// `Ok` means the new file is in place: the rename is the commit. The
+    /// directory syncs that follow it make the rename crash-durable; one that
+    /// fails is logged rather than returned, because the file has already been
+    /// replaced and an `Err` would tell the caller its bytes were not saved
+    /// when every later read will find them.
     pub fn save_to(&self, path: &Path) -> Result<(), AppError> {
-        if let Some(parent) = path.parent() {
+        use std::io::Write;
+
+        // Directories created here are synced in *their* parents below, after
+        // the rename: a directory's own entry lives one level up, and the
+        // parent sync at the end covers only entries inside the config
+        // directory. On a fresh profile that is the whole `eidola` directory.
+        let mut created_dirs = Vec::new();
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let mut dir = Some(parent);
+            while let Some(d) = dir.filter(|d| !d.as_os_str().is_empty() && !d.exists()) {
+                created_dirs.push(d.to_path_buf());
+                dir = d.parent();
+            }
             fs::create_dir_all(parent).map_err(|e| AppError::Config {
                 message: format!("failed to create config directory: {e}"),
             })?;
@@ -321,9 +429,109 @@ impl Config {
         let contents = toml::to_string_pretty(self).map_err(|e| AppError::Config {
             message: format!("failed to serialize config: {e}"),
         })?;
-        fs::write(path, contents).map_err(|e| AppError::Config {
+        let write_err = |e: std::io::Error| AppError::Config {
             message: format!("failed to write config: {e}"),
-        })
+        };
+        // One temporary file per call, never a shared name: two saves can
+        // overlap (a background account create against a GUI preference
+        // write), and with one shared sibling the second could unlink the
+        // first's open file and the first then rename the second's
+        // half-written one into place — a torn file, and possibly the only
+        // copy of the account secret. With its own name, a call can only
+        // publish the bytes it wrote and synced; `create_new` makes that a
+        // guarantee rather than a convention. A crash between create and
+        // rename leaves a `config.toml.<id>.tmp` behind, owner-only;
+        // [`sweep_stale_temporaries`] removes it under the update lock.
+        let tmp = path.with_extension(format!("toml.{}.tmp", uuid::Uuid::new_v4().simple()));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&tmp).map_err(write_err)?;
+        let written = file
+            .write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(write_err);
+        drop(file);
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        fs::rename(&tmp, path).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            write_err(e)
+        })?;
+        // `sync_all` above made the temporary's *contents* durable; the
+        // rename is an entry in the parent directory, which is its own
+        // metadata and on most filesystems is not durable until the directory
+        // is synced too. Without this, a crash right after the first account
+        // save returns could lose the file — the only copy of the secret —
+        // despite the successful result.
+        #[cfg(unix)]
+        {
+            let sync_dir = |dir: &Path| {
+                let dir = if dir.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    dir
+                };
+                if let Err(e) = fs::File::open(dir).and_then(|dir| dir.sync_all()) {
+                    eprintln!(
+                        "eidola: saved {} but could not sync {}: {e}",
+                        path.display(),
+                        dir.display()
+                    );
+                }
+            };
+            sync_dir(path.parent().unwrap_or(Path::new(".")));
+            // Deepest first is not required; each created directory's entry
+            // is made durable in the directory that holds it.
+            for created in &created_dirs {
+                if let Some(holder) = created.parent() {
+                    sync_dir(holder);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = created_dirs;
+        Ok(())
+    }
+}
+
+/// Remove the temporaries a crashed [`Config::save_to`] of `path` left behind
+/// (`<name>.<32 hex>.tmp` beside it — owner-only, and holding whatever the
+/// file held, account secret included).
+///
+/// Only safe where no save of `path` can be in flight: the caller holds the
+/// lock every save of `path` is made under (`Inner::update_config`), and that
+/// lock belongs to the one `AppCore` that may write this profile, since the
+/// database's exclusive lock refuses a second. Best effort: a temporary that
+/// cannot be removed is left for the next update.
+pub(crate) fn sweep_stale_temporaries(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return;
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(id) = file_name
+            .to_str()
+            .and_then(|n| n.strip_prefix(name))
+            .and_then(|n| n.strip_prefix('.'))
+            .and_then(|n| n.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let _ = fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -331,40 +539,71 @@ impl Config {
 // Measurement parsing helpers
 // ---------------------------------------------------------------------------
 
-/// Parse a `<snp>:<rtmr1>:<rtmr2>` trust spec into an [`EnclaveMeasurement`].
-pub fn parse_trust_measurement(spec: &str) -> Result<EnclaveMeasurement, AppError> {
+/// The trust-spec form a trusted server measurement is written in:
+/// `<measurement>:<host_data>:<guest_policy>`.
+pub const TRUST_SPEC_FORM: &str = "<measurement>:<host_data>:<guest_policy>";
+
+/// Parse a `<measurement>:<host_data>:<guest_policy>` trust spec (the SEV-SNP
+/// launch digest, 96 hex; HOST_DATA, 64 hex; the guest policy, such as
+/// `0x30133`) into a [`SevSnpPin`], refused unless the attesting client's own
+/// pin compiler accepts it.
+pub fn parse_trust_measurement(spec: &str) -> Result<SevSnpPin, AppError> {
     let parts: Vec<&str> = spec.split(':').collect();
-    if parts.len() != 3 {
+    let [measurement, host_data, guest_policy] = parts.as_slice() else {
         return Err(AppError::Config {
-            message: "trust_measurement must be `<snp>:<rtmr1>:<rtmr2>` \
-                      (three colon-separated 96-char hex strings)"
+            message: format!(
+                "trust_measurement must be `{TRUST_SPEC_FORM}` (the SEV-SNP launch digest, \
+                 96 hex; HOST_DATA, 64 hex; the guest policy, such as 0x30133)"
+            ),
+        });
+    };
+    let pin = SevSnpPin {
+        measurement: validate_hex_field(measurement, "measurement", 48)?,
+        host_data: validate_hex_field(host_data, "host_data", 32)?,
+        guest_policy: guest_policy.to_string(),
+    };
+    tinfoil_verifier::validate_pins(&[tinfoil_verifier::AllowedMeasurement::sev_snp(pin.clone())])
+        .map_err(|e| AppError::Config {
+            message: format!("trust_measurement: {e}"),
+        })?;
+    Ok(pin)
+}
+
+/// The key a trusted measurement is untrusted by: its launch identity,
+/// `<measurement>:<host_data>`, lowercase.
+pub fn measurement_key(pin: &SevSnpPin) -> String {
+    format!(
+        "{}:{}",
+        pin.measurement.to_ascii_lowercase(),
+        pin.host_data.to_ascii_lowercase()
+    )
+}
+
+/// Extract the key from an `--untrust_measurement` argument: either
+/// `<measurement>:<host_data>` or the full trust spec.
+pub fn parse_untrust_key(spec: &str) -> Result<String, AppError> {
+    let mut parts = spec.split(':');
+    let (Some(measurement), Some(host_data)) = (parts.next(), parts.next()) else {
+        return Err(AppError::Config {
+            message: "untrust_measurement must be `<measurement>:<host_data>` or the full \
+                      trust spec"
                 .into(),
         });
-    }
-    let snp = validate_hex_field(parts[0], "snp_measurement")?;
-    let rtmr1 = validate_hex_field(parts[1], "tdx.rtmr1")?;
-    let rtmr2 = validate_hex_field(parts[2], "tdx.rtmr2")?;
-    Ok(EnclaveMeasurement {
-        snp_measurement: snp,
-        tdx_measurement: tinfoil_verifier::TdxMeasurement { rtmr1, rtmr2 },
-    })
-}
-
-/// Extract the SNP measurement key from an `--untrust_measurement` argument.
-/// Accepts either a bare 96-char SNP measurement or the full
-/// `<snp>:<rtmr1>:<rtmr2>` triple.
-pub fn parse_untrust_key(spec: &str) -> Result<String, AppError> {
-    let snp = match spec.split_once(':') {
-        Some((snp, _)) => snp,
-        None => spec,
     };
-    validate_hex_field(snp, "snp_measurement")
+    Ok(format!(
+        "{}:{}",
+        validate_hex_field(measurement, "measurement", 48)?,
+        validate_hex_field(host_data, "host_data", 32)?
+    ))
 }
 
-fn validate_hex_field(value: &str, field: &str) -> Result<String, AppError> {
-    if value.len() != 96 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+fn validate_hex_field(value: &str, field: &str, bytes: usize) -> Result<String, AppError> {
+    if value.len() != bytes * 2 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(AppError::Config {
-            message: format!("{field} must be 96 hex characters (48 bytes)"),
+            message: format!(
+                "{field} must be {} hex characters ({bytes} bytes)",
+                bytes * 2
+            ),
         });
     }
     Ok(value.to_ascii_lowercase())
@@ -424,27 +663,45 @@ mod tests {
 
     #[test]
     fn parse_trust_measurement_valid() {
-        let snp = "a".repeat(96);
-        let rtmr1 = "b".repeat(96);
-        let rtmr2 = "c".repeat(96);
-        let spec = format!("{snp}:{rtmr1}:{rtmr2}");
+        let measurement = "A".repeat(96);
+        let host_data = "b".repeat(64);
+        let spec = format!("{measurement}:{host_data}:0x30133");
         let m = parse_trust_measurement(&spec).unwrap();
-        assert_eq!(m.snp_measurement, snp);
-        assert_eq!(m.tdx_measurement.rtmr1, rtmr1);
-        assert_eq!(m.tdx_measurement.rtmr2, rtmr2);
+        assert_eq!(m.measurement, "a".repeat(96));
+        assert_eq!(m.host_data, host_data);
+        assert_eq!(m.guest_policy, "0x30133");
+        assert_eq!(
+            measurement_key(&m),
+            format!("{}:{host_data}", "a".repeat(96))
+        );
     }
 
     #[test]
-    fn parse_trust_measurement_rejects_bad_length() {
-        assert!(parse_trust_measurement("aa:bb:cc").is_err());
+    fn parse_trust_measurement_rejects_what_the_verifier_would() {
+        let (m, h) = ("a".repeat(96), "b".repeat(64));
+        for spec in [
+            "aa:bb:cc".to_string(),
+            // The legacy triple: a digest and two RTMRs.
+            format!("{m}:{m}:{m}"),
+            // A digest alone pins every deployment of the image.
+            m.clone(),
+            format!("{m}:{h}"),
+            format!("{m}:{h}:0x30133:extra"),
+            // A debug or migratable policy, or another spelling.
+            format!("{m}:{h}:0xb0133"),
+            format!("{m}:{h}:0x70133"),
+            format!("{m}:{h}:196915"),
+        ] {
+            assert!(parse_trust_measurement(&spec).is_err(), "{spec}");
+        }
     }
 
     #[test]
-    fn parse_untrust_key_bare_and_triple() {
-        let snp = "a".repeat(96);
-        assert_eq!(parse_untrust_key(&snp).unwrap(), snp);
-        let triple = format!("{}:{}:{}", snp, "b".repeat(96), "c".repeat(96));
-        assert_eq!(parse_untrust_key(&triple).unwrap(), snp);
+    fn parse_untrust_key_pair_and_spec() {
+        let key = format!("{}:{}", "a".repeat(96), "b".repeat(64));
+        assert_eq!(parse_untrust_key(&key).unwrap(), key);
+        assert_eq!(parse_untrust_key(&format!("{key}:0x30133")).unwrap(), key);
+        assert!(parse_untrust_key(&"a".repeat(96)).is_err());
     }
 
     #[test]
@@ -602,5 +859,81 @@ mod tests {
             parsed.update_feed_override.as_deref(),
             Some("http://localhost:8123")
         );
+    }
+
+    /// Once the rename has replaced the file the save has happened, so a
+    /// directory sync that fails after it is not an error the caller can act
+    /// on: reporting one would have an account create hand back, as unsaved,
+    /// an account every later read finds in the profile. The directory is
+    /// made unreadable (write and search only), which lets the temporary be
+    /// created and renamed but refuses the open the sync needs.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_sync_that_fails_after_the_rename_is_still_a_save() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        fs::create_dir(&profile).unwrap();
+        let path = profile.join("config.toml");
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o300)).unwrap();
+        // A user the permission bits do not bind (root) can open the
+        // directory anyway; there is nothing to observe then.
+        let refused = fs::File::open(&profile).is_err();
+        let cfg = Config {
+            account_id: Some("acct-1".into()),
+            account_secret: Some("s3cret".into()),
+            ..Config::default()
+        };
+        let saved = cfg.save_to(&path);
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o700)).unwrap();
+        if !refused {
+            return;
+        }
+        saved.expect("the rename succeeded, so the save did");
+        let on_disk = Config::load_for_update(&path).unwrap();
+        assert_eq!(on_disk.account_secret.as_deref(), Some("s3cret"));
+    }
+
+    /// Saves can overlap (a background account create against a GUI
+    /// preference write). Each must publish only the bytes it wrote: every
+    /// save succeeds, nothing is left beside the file, and what is on disk
+    /// is one save's whole output — never a torn or empty file.
+    #[test]
+    fn overlapping_saves_each_publish_a_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let cfg = Config {
+                        account_id: Some(format!("account-{i}")),
+                        account_secret: Some(format!("secret-{i}")),
+                        ..Config::default()
+                    };
+                    for _ in 0..50 {
+                        cfg.save_to(&path).expect("every save succeeds");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let saved = Config::load_for_update(&path).expect("the file on disk is whole");
+        let id = saved.account_id.expect("one save's account");
+        let secret = saved.account_secret.expect("with its secret");
+        assert_eq!(
+            id.strip_prefix("account-"),
+            secret.strip_prefix("secret-"),
+            "the file is one save's output, not two interleaved"
+        );
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "config.toml")
+            .collect();
+        assert!(leftovers.is_empty(), "stray temporaries: {leftovers:?}");
     }
 }

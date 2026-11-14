@@ -69,7 +69,7 @@ use crate::trust_root;
 use super::rekor_verify;
 use super::sigstore_bundle::CosignBundle;
 use super::trust::TrustedRoot;
-use super::{ReleaseIndex, VerifiedAttestation, VerifiedClaim};
+use super::{AppleSignatureAttestation, ReleaseIndex, VerifiedAttestation, VerifiedClaim};
 
 // Re-export the attestant-key classifier so external callers (notably
 // `release-tool`) can validate a candidate signing key against the same
@@ -354,19 +354,54 @@ pub fn verify_human_attestation(
     )?;
 
     // ── 9. Content verification (template equality + cross-checks) ───
-    verify_attestation_content(attestation_bytes, release, &fingerprint_hex, log_index)
+    verify_attestation_content(
+        attestation_bytes,
+        release,
+        &fingerprint_hex,
+        log_index,
+        trust_root::SUPPORTED_ATTESTATION_SCHEMA_VERSIONS,
+    )
 }
+
+/// The schema from which an attestation records the Apple signing facts
+/// the installer needs, and the claim that binds them.
+///
+/// Below it the fields are not merely optional, they are *forbidden*: an
+/// attestation that declares the older shape while carrying the newer
+/// fields is not a document either release ever produced. See
+/// [`check_apple_field_shape`].
+const APPLE_FIELDS_SINCE_SCHEMA: u32 = 2;
+
+/// The keys [`APPLE_FIELDS_SINCE_SCHEMA`] governs, checked for presence
+/// against the raw JSON rather than the parsed struct: `serde` cannot
+/// distinguish an absent key from an explicit `null`, and `apple_team_id`
+/// legitimately carries `null` (a signature with no Developer ID team
+/// behind it has no Team ID to record).
+const APPLE_FIELDS: [&str; 4] = [
+    "apple_shipped_artifact_sha256",
+    "apple_signature_bundle_sha256",
+    "apple_signing_identifier",
+    "apple_team_id",
+];
 
 /// Parse the attestation prose, cross-check its top-level fields
 /// against the release index, and verify every signed claim is the
 /// character-for-character rendering of its pinned template (with
 /// declared `cross_checks` resolving to the corresponding `release.x.y`
 /// values).
+///
+/// `supported_schema_versions` is the set this client will read. It is a
+/// parameter rather than a direct read of the pinned constant so the
+/// rotation itself is testable: the whole point of accepting a schema one
+/// release before signing it is that a client pinned to the older set
+/// *refuses* the newer document, and a refusal nothing can exercise is a
+/// documented intention rather than an enforced one.
 fn verify_attestation_content(
     attestation_bytes: &[u8],
     release: &ReleaseIndex,
     fingerprint_hex: &str,
     rekor_log_index: u64,
+    supported_schema_versions: &[u32],
 ) -> Result<VerifiedAttestation, AppError> {
     let attestation: serde_json::Value =
         serde_json::from_slice(attestation_bytes).map_err(|e| AppError::Update {
@@ -378,15 +413,16 @@ fn verify_attestation_content(
         })?;
 
     // Schema-version gate.
-    if !trust_root::SUPPORTED_ATTESTATION_SCHEMA_VERSIONS.contains(&prose.schema_version) {
+    if !supported_schema_versions.contains(&prose.schema_version) {
         return Err(AppError::Update {
             message: format!(
                 "attestation schema_version {} not in supported set {:?}",
-                prose.schema_version,
-                trust_root::SUPPORTED_ATTESTATION_SCHEMA_VERSIONS,
+                prose.schema_version, supported_schema_versions,
             ),
         });
     }
+
+    check_apple_field_shape(&attestation, prose.schema_version)?;
 
     // Attestant pubkey fingerprint must match what we observed in the
     // signature — defends against an attestation file that names a
@@ -573,17 +609,104 @@ fn verify_attestation_content(
         }
     }
 
+    // Populated exactly when the declared schema records these fields.
+    let apple = if prose.schema_version >= APPLE_FIELDS_SINCE_SCHEMA {
+        Some(AppleSignatureAttestation {
+            shipped_artifact_sha256: required_apple_string(
+                prose.apple_shipped_artifact_sha256,
+                "apple_shipped_artifact_sha256",
+            )?,
+            signature_bundle_sha256: required_apple_string(
+                prose.apple_signature_bundle_sha256,
+                "apple_signature_bundle_sha256",
+            )?,
+            team_id: prose.apple_team_id,
+            signing_identifier: required_apple_string(
+                prose.apple_signing_identifier,
+                "apple_signing_identifier",
+            )?,
+        })
+    } else {
+        None
+    };
+
     Ok(VerifiedAttestation {
         attestant_id: prose.attestant.id,
         attestant_name: prose.attestant.name,
         jurisdiction: prose.attestant.jurisdiction,
         artifact_manifest_sha256: prose.artifact_manifest_sha256,
+        apple,
         fingerprint_hex: fingerprint_hex.to_string(),
         rekor_log_index,
         attested_at: prose.attested_at,
         attestant_statement: prose.attestant_statement,
         claims: verified_claims,
     })
+}
+
+/// An Apple field that carries a value, not just a key. `apple_team_id`
+/// is the one that may be `null`, so it never comes through here.
+fn required_apple_string(value: Option<String>, field: &str) -> Result<String, AppError> {
+    value.ok_or_else(|| AppError::Update {
+        message: format!(
+            "attestation records `{field}` as null; only `apple_team_id` may be, and a \
+             release with no signature material to name does not declare this schema"
+        ),
+    })
+}
+
+/// The schema an attestation *declares* is the shape it is held to, in
+/// both directions.
+///
+/// A rotation ships acceptance one release before the engineer signs the
+/// new shape, so between those releases this client reads the old document
+/// and the new one as equally authentic. What it must not read as
+/// authentic is a document that declares the old version while carrying
+/// the new fields, or declares the new one and omits what it promises —
+/// neither is a shape any release produced, and tolerating either would
+/// make the version number decorative. `release.json` is held to its own
+/// declared schema for the same reason (`super::check_schema_shape`).
+///
+/// `apple_team_id` must be *present* from [`APPLE_FIELDS_SINCE_SCHEMA`]
+/// like the rest, but may be `null`: an ad-hoc or otherwise
+/// team-less signature has no Team ID, and recording that as an absent key
+/// would make "this release names no team" indistinguishable from "this
+/// document forgot to say".
+fn check_apple_field_shape(
+    attestation: &serde_json::Value,
+    schema_version: u32,
+) -> Result<(), AppError> {
+    let object = attestation.as_object().ok_or_else(|| AppError::Update {
+        message: "attestation JSON is not an object".into(),
+    })?;
+    let present: Vec<&str> = APPLE_FIELDS
+        .into_iter()
+        .filter(|key| object.contains_key(*key))
+        .collect();
+
+    if schema_version < APPLE_FIELDS_SINCE_SCHEMA {
+        if !present.is_empty() {
+            return Err(AppError::Update {
+                message: format!(
+                    "attestation declares schema_version `{schema_version}` but carries {present:?}, \
+                     which attestations record only from schema {APPLE_FIELDS_SINCE_SCHEMA} on"
+                ),
+            });
+        }
+    } else if present.len() != APPLE_FIELDS.len() {
+        let missing: Vec<&str> = APPLE_FIELDS
+            .into_iter()
+            .filter(|key| !object.contains_key(*key))
+            .collect();
+        return Err(AppError::Update {
+            message: format!(
+                "attestation declares schema_version `{schema_version}` but omits {missing:?}, \
+                 which every attestation from schema {APPLE_FIELDS_SINCE_SCHEMA} on records"
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -608,6 +731,24 @@ struct AttestationProse {
     /// does not fetch).
     #[allow(dead_code)]
     privacy_guarantees_doc_sha256: String,
+    /// The Apple block, recorded from [`APPLE_FIELDS_SINCE_SCHEMA`] and
+    /// forbidden before it — `Option` here models "this document's schema
+    /// does not record it", and presence is enforced against the raw JSON
+    /// by [`check_apple_field_shape`] rather than by these types, which
+    /// cannot tell an absent key from an explicit `null`.
+    ///
+    /// The hashes are key-dependent bytes and the identity is a person's
+    /// claim about a certificate, which is exactly why none of them may
+    /// appear in `artifact-manifest.json`: that document is a function of
+    /// source and nothing else.
+    #[serde(default)]
+    apple_shipped_artifact_sha256: Option<String>,
+    #[serde(default)]
+    apple_signature_bundle_sha256: Option<String>,
+    #[serde(default)]
+    apple_team_id: Option<String>,
+    #[serde(default)]
+    apple_signing_identifier: Option<String>,
     attestant: AttestantBlock,
     attested_at: String,
     attestant_statement: String,
@@ -865,6 +1006,176 @@ mod tests {
         let release = synthesize_release();
         let err = verify_human_attestation(b"x", bundle, &release, &trust).unwrap_err();
         assert!(format!("{err}").contains("publicKey"), "got: {err}");
+    }
+
+    // ── Attestation schema 2: the Apple block ────────────────────────
+    //
+    // These exercise the content stage directly rather than through
+    // `verify_human_attestation`, because reaching the content stage needs
+    // a cosign signature by a key this build pins — which no test can
+    // produce (`tests/human_attestation_fixture.rs` covers everything up
+    // to that pin with real cosign bytes). What is under test here is the
+    // half a fixture cannot reach: the schema gate, the field-shape rule,
+    // and character-exact re-rendering of every claim against the
+    // committed templates.
+    //
+    // The fixture's `apple_team_id` is `null` on purpose: it describes an
+    // ad-hoc-signed artifact, which has no Developer ID behind it. Nothing
+    // in the claim text or the verification path mentions one.
+    //
+    // It is committed prose, not generated at test time — that is what
+    // makes a template edit fail here loudly. Editing claim text therefore
+    // means re-rendering every statement in it from
+    // `releases/schema/attestation-templates.json`, which is a deliberate
+    // event by design (`releases/README.md`).
+    const SCHEMA_TWO_ATTESTATION: &str =
+        include_str!("../../tests/fixtures/human_attestation/attestation-schema-2.json");
+
+    /// The attestant fingerprint the fixture names; the verifier requires
+    /// the prose to agree with the key that actually signed.
+    const FIXTURE_FINGERPRINT: &str =
+        "579b5ebe6cab42779fa288c2a1dd8afdd7a0082c28ba45b91aaea5be7a075183";
+
+    fn schema_two_release() -> ReleaseIndex {
+        serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "version": "0.99.99",
+                "git_commit": "9c3a000000000000000000000000000000000001",
+                "git_tag": "v0.99.99",
+                "released_at": "2026-05-31T00:00:00Z",
+                "previous_release": {
+                    "version": "0.99.98",
+                    "git_commit": "9c3a000000000000000000000000000000000000"
+                },
+                "artifact_manifest": {
+                    "url": "https://example.com/artifact-manifest.json",
+                    "sigstore_bundle_url": "https://example.com/artifact-manifest.json.sigstore"
+                },
+                "human_attestations": []
+            }"#,
+        )
+        .unwrap()
+    }
+
+    fn verify_fixture(
+        attestation: &serde_json::Value,
+        supported: &[u32],
+    ) -> Result<VerifiedAttestation, AppError> {
+        let bytes = serde_json::to_vec(attestation).unwrap();
+        verify_attestation_content(
+            &bytes,
+            &schema_two_release(),
+            FIXTURE_FINGERPRINT,
+            42,
+            supported,
+        )
+    }
+
+    fn schema_two_fixture() -> serde_json::Value {
+        serde_json::from_str(SCHEMA_TWO_ATTESTATION).unwrap()
+    }
+
+    #[test]
+    fn schema_two_attestation_verifies_and_surfaces_the_apple_block() {
+        let verified = verify_fixture(&schema_two_fixture(), &[1, 2])
+            .expect("committed schema-2 fixture must verify against the committed templates");
+
+        let apple = verified.apple.expect("schema 2 records the Apple block");
+        assert_eq!(
+            apple.signature_bundle_sha256,
+            "4444444444444444444444444444444444444444444444444444444444444444"
+        );
+        assert_eq!(
+            apple.shipped_artifact_sha256,
+            "3333333333333333333333333333333333333333333333333333333333333333"
+        );
+        assert_eq!(apple.signing_identifier, "ai.eidola.Eidola");
+        assert_eq!(apple.team_id, None, "an ad-hoc signature names no team");
+
+        // The claim is only verified if it was rendered and compared, so
+        // its presence here is the re-render equality result.
+        let reconstructs = verified
+            .claims
+            .iter()
+            .find(|c| c.claim_id == "apple_signature_reconstructs")
+            .expect("the pinned templates declare the reconstruction claim");
+        assert!(
+            reconstructs.statement.contains(
+                "yields exactly the shipped signed artifact (sha256 \
+                 3333333333333333333333333333333333333333333333333333333333333333)"
+            ),
+            "got: {}",
+            reconstructs.statement
+        );
+    }
+
+    /// The teeth of accept-before-emit: a client whose pinned set is `[1]`
+    /// must *refuse* a schema-2 attestation. Without the schema gate the
+    /// document verifies fine — every claim renders and every cross-check
+    /// passes — which is exactly why the refusal has to be enforced rather
+    /// than documented.
+    #[test]
+    fn schema_two_attestation_is_refused_by_a_client_pinned_to_schema_one() {
+        let err = verify_fixture(&schema_two_fixture(), &[1])
+            .expect_err("a client pinned to [1] must not read a schema-2 attestation");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("schema_version 2 not in supported set"),
+            "expected a schema-version refusal, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn schema_one_attestation_may_not_carry_apple_fields() {
+        let mut attestation = schema_two_fixture();
+        attestation["schema_version"] = serde_json::json!(1);
+        let err = verify_fixture(&attestation, &[1, 2])
+            .expect_err("apple fields at schema 1 are not a shape any release produced");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("apple_shipped_artifact_sha256") && msg.contains("only from schema 2 on"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn schema_two_attestation_must_carry_every_apple_field() {
+        for field in APPLE_FIELDS {
+            let mut attestation = schema_two_fixture();
+            attestation.as_object_mut().unwrap().remove(field);
+            let Err(err) = verify_fixture(&attestation, &[1, 2]) else {
+                panic!("a schema-2 attestation omitting `{field}` must be refused");
+            };
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(field) && msg.contains("from schema 2 on records"),
+                "got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_team_id_may_be_null_at_schema_two() {
+        for field in APPLE_FIELDS {
+            let mut attestation = schema_two_fixture();
+            attestation[field] = serde_json::Value::Null;
+            let result = verify_fixture(&attestation, &[1, 2]);
+            if field == "apple_team_id" {
+                assert!(
+                    result.is_ok(),
+                    "a team-less signature is a fact, not a malformed document"
+                );
+            } else {
+                let msg = format!(
+                    "{}",
+                    result
+                        .err()
+                        .unwrap_or_else(|| panic!("`{field}` must not be null"))
+                );
+                assert!(msg.contains(field), "got: {msg}");
+            }
+        }
     }
 
     fn synthesize_empty_trust() -> TrustedRoot {

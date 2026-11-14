@@ -1,0 +1,582 @@
+//! From a validated request to engine tokens, and from engine tokens to OpenAI output.
+//!
+//! In: the chat crate renders the prompt with the model's own template (byte-exact),
+//! tokenizes it (request data never as a control token), and the request becomes an engine [`Request`] with checked
+//! [`SamplingParams`] and a [`CacheScope`]: the client's key turned into its lineage (the
+//! engine salt and the idle-KV key, by the per-boot HMAC) and dropped, or
+//! [`CacheScope::Private`] without one.
+//!
+//! Out: engine tokens go through the chat crate's streaming detokenizer, then the stop
+//! sequences (applied here, to the decoded text, since the core leaves them to its
+//! caller), then the reasoning and tool-call parsers ([`OutputParser::push_text`]).
+
+use std::ops::Range;
+use std::sync::Arc;
+
+use eidola_common::engine_protocol::DeclaredPrefixRefusal;
+use eidola_engine::engine::{CacheScope, FinishReason as EngineFinish, Request, RequestId};
+use eidola_engine::sampling::SamplingParams;
+use eidola_engine::secret::SaltDeriver;
+use eidola_engine_chat::{
+    ChatDelta, ChatInput, Detokenizer, FinishReason, OutputConfig, OutputParser, PrefixedCallIds,
+    RenderOptions, StopCause, ToolSchemas,
+};
+
+use crate::api::ValidRequest;
+use crate::error::ApiError;
+use crate::model::LoadedModel;
+
+/// The engine request for `req`, plus what the output side needs.
+pub struct Prepared {
+    pub request: Request,
+    pub prompt_tokens: u32,
+    pub output: OutputConfig,
+    pub stop: Vec<String>,
+    /// The completion limit is the room left in the context window rather than the
+    /// request's own `max_completion_tokens`: an ending there leaves no room for a
+    /// continuation's prompt, so it is never reported continuable.
+    pub window_bound: bool,
+    /// The request declares a cached prefix: the engine admits or refuses it before
+    /// anything is computed, and its response is opened only once it has been admitted.
+    pub declared: bool,
+}
+
+/// Renders, tokenizes and builds the engine request. CPU work: run it off the async
+/// runtime.
+pub fn prepare(
+    model: &LoadedModel,
+    salts: &SaltDeriver,
+    max_model_len: u32,
+    id: RequestId,
+    req: ValidRequest,
+) -> Result<Prepared, ApiError> {
+    let ValidRequest {
+        messages,
+        tools,
+        parse_tools,
+        max_completion_tokens,
+        temperature,
+        top_p,
+        stop,
+        cache_key,
+        continuation,
+        cached_prefix,
+        ..
+    } = req;
+    let defaults = model.defaults();
+    let sampling = SamplingParams::new(
+        temperature.unwrap_or(defaults.temperature),
+        defaults.top_k,
+        top_p.unwrap_or(defaults.top_p),
+        0.0,
+        random_seed(),
+    )
+    .map_err(|e| ApiError::invalid(e.to_string()))?;
+    let cache = match &cache_key {
+        Some(key) => CacheScope::Keyed(salts.lineage(key)),
+        None => CacheScope::Private,
+    };
+    drop(cache_key);
+
+    let schemas = if parse_tools {
+        tools.as_ref().map(ToolSchemas::from_tools)
+    } else {
+        None
+    };
+    let mut input = ChatInput { messages, tools };
+    input
+        .normalize_tool_call_arguments()
+        .map_err(|e| ApiError::invalid(e.to_string()))?;
+    // A continuation's prompt ends inside the final message, at the field it continues,
+    // and its output is parsed from there; otherwise the prompt opens a new turn.
+    let continuing = continuation.map(|field| field.field());
+    let options = RenderOptions {
+        add_generation_prompt: continuing.is_none(),
+        enable_thinking: None,
+        continue_final_message: continuing,
+    };
+    let prompt = model
+        .template()
+        .render_prompt(&input, options)
+        .map_err(|e| ApiError::invalid(e.to_string()))?;
+    // Only the template's own text becomes control tokens: one spelled by the
+    // request's data is encoded as the text it is.
+    let tokens = model
+        .tokenizer()
+        .encode_prompt(&prompt)
+        .map_err(|e| ApiError::invalid(e.to_string()))?;
+    let prompt_tokens = tokens.len() as u32;
+    // The window first. A prompt it cannot hold is refused as that whatever was
+    // declared: a declared budget may reach the whole window, and a client told its
+    // budget was exceeded sends the request again without one, which could only be
+    // refused here a second time.
+    if prompt_tokens >= max_model_len {
+        return Err(ApiError::ContextLengthExceeded(format!(
+            "the prompt is {prompt_tokens} tokens; this model's limit is {max_model_len} \
+             including at least one completion token"
+        )));
+    }
+    // The declaration prices the prompt at `cached_tokens + new_tokens` at most: a longer
+    // one is refused here, before the engine sees it.
+    if cached_prefix.is_some_and(|p| u64::from(prompt_tokens) > p.prompt_limit()) {
+        return Err(ApiError::DeclaredPrefix(DeclaredPrefixRefusal::OverBudget));
+    }
+    let room = max_model_len - prompt_tokens;
+    let max_tokens = max_completion_tokens.map_or(room, |m| m.min(room));
+    // `>=`: a cut exactly at the room leaves a continuation prompt of the whole
+    // window, which `prepare` refuses as well.
+    let window_bound = max_completion_tokens.is_none_or(|m| m >= room);
+    Ok(Prepared {
+        request: Request {
+            id,
+            prompt: tokens,
+            sampling,
+            max_tokens,
+            stop_token_ids: Vec::new(),
+            cache,
+            required_cached_tokens: cached_prefix.map_or(0, |p| p.cached_tokens),
+        },
+        prompt_tokens,
+        output: OutputConfig::new(options.enable_thinking, schemas).continuing_in(continuing),
+        stop,
+        window_bound,
+        declared: cached_prefix.is_some(),
+    })
+}
+
+fn random_seed() -> u64 {
+    let mut b = [0u8; 8];
+    getrandom::fill(&mut b).expect("operating-system randomness unavailable");
+    u64::from_le_bytes(b)
+}
+
+/// A per-response random hex id.
+pub fn random_id(prefix: &str) -> String {
+    let mut b = [0u8; 12];
+    getrandom::fill(&mut b).expect("operating-system randomness unavailable");
+    format!("{prefix}{}", hex::encode(b))
+}
+
+/// What one batch of engine tokens turned into.
+#[derive(Debug, Default)]
+pub struct Step {
+    pub delta: ChatDelta,
+    /// Set when the response is complete (by the engine, or by a stop sequence here).
+    pub finish: Option<FinishReason>,
+    /// A stop sequence matched: the caller must cancel the engine request.
+    pub stopped_by_sequence: bool,
+    /// On a `length` finish, whether the response can be continued exactly from what
+    /// it gave out (`OutputParser::resumes_exactly`); `None` on any other ending.
+    pub continuable: Option<bool>,
+}
+
+/// Turns one request's engine tokens into OpenAI deltas.
+pub struct Decoder {
+    model: Arc<LoadedModel>,
+    detok: Detokenizer,
+    stop: StopMatcher,
+    parser: OutputParser,
+    completion_tokens: u32,
+    done: bool,
+    window_bound: bool,
+    skip_special_tokens: bool,
+    /// Bytes of text the detokenizer has given out.
+    decoded: usize,
+    /// Where in that text the model sampled an added token, for
+    /// [`OutputParser::resumes_exactly_as_tokens`]. Holds no more than
+    /// [`MAX_TRACKED_ADDED`]: a continuable ending has at most two.
+    added: Vec<Range<usize>>,
+    /// The model sampled a special token the text does not show, so nothing
+    /// given out can render it back.
+    dropped_token: bool,
+}
+
+const MAX_TRACKED_ADDED: usize = 3;
+
+impl Decoder {
+    pub fn new(
+        model: Arc<LoadedModel>,
+        output: OutputConfig,
+        stop: Vec<String>,
+        call_prefix: String,
+    ) -> Self {
+        Decoder {
+            model,
+            skip_special_tokens: output.skip_special_tokens,
+            decoded: 0,
+            added: Vec::new(),
+            dropped_token: false,
+            detok: Detokenizer::new(output.skip_special_tokens),
+            stop: StopMatcher::new(stop),
+            parser: OutputParser::new(output, PrefixedCallIds(call_prefix)),
+            completion_tokens: 0,
+            done: false,
+            window_bound: false,
+        }
+    }
+
+    /// Whether the engine's limit for this request is the context window's room
+    /// ([`Prepared::window_bound`]): a `length` ending there is reported not
+    /// continuable, since no room is left for a continuation.
+    pub fn window_bound(mut self, bound: bool) -> Self {
+        self.window_bound = bound;
+        self
+    }
+
+    /// Completion tokens consumed so far (through the token that completed a stop
+    /// sequence, if one did).
+    pub fn completion_tokens(&self) -> u32 {
+        self.completion_tokens
+    }
+
+    /// Feeds one engine event's tokens and finish.
+    pub fn push(&mut self, tokens: &[u32], finish: Option<EngineFinish>) -> Result<Step, ApiError> {
+        let mut step = Step::default();
+        if self.done {
+            return Ok(step);
+        }
+        let tokenizer = self.model.tokenizer();
+        for (i, &t) in tokens.iter().enumerate() {
+            self.completion_tokens += 1;
+            // The EOS that ends the response is not text (it is usually special anyway).
+            let last = i + 1 == tokens.len();
+            if last && finish == Some(EngineFinish::Stop) && tokenizer.is_eos(t) {
+                break;
+            }
+            let text = self
+                .detok
+                .push(tokenizer, t)
+                .map_err(|_| ApiError::Internal("the engine produced an unknown token"))?;
+            self.decoded += text.len();
+            if self.skip_special_tokens && tokenizer.is_special(t) {
+                self.dropped_token = true;
+            } else if tokenizer.is_added(t) && self.added.len() < MAX_TRACKED_ADDED {
+                // An added token's text is whole characters, so it ends the text
+                // this push gave out.
+                let len = tokenizer.token_bytes(t).map_or(0, <[u8]>::len);
+                self.added.push(self.decoded - len..self.decoded);
+            }
+            let (released, matched) = self.stop.push(&text);
+            append(&mut step.delta, self.parser.push_text(&released));
+            if matched {
+                let (tail, reason) = self.parser.finish(StopCause::StopSequence);
+                append(&mut step.delta, tail);
+                step.finish = Some(reason);
+                step.stopped_by_sequence = true;
+                self.done = true;
+                return Ok(step);
+            }
+        }
+        if let Some(f) = finish {
+            // Out of KV memory reads as `length` on the wire, never continuable: a
+            // continuation's prompt is these same tokens and needs at least the memory
+            // this one ran out of.
+            let memory_bound = f == EngineFinish::KvExhausted;
+            let cause = match f {
+                EngineFinish::Stop => StopCause::EndOfSequence,
+                EngineFinish::Length | EngineFinish::KvExhausted => StopCause::MaxTokens,
+                EngineFinish::Cancelled => {
+                    return Err(ApiError::Internal("the request was cancelled"));
+                }
+                // Answered before the response opens (`http`), never as a stream's end.
+                EngineFinish::CachedPrefixMissing => {
+                    return Err(ApiError::DeclaredPrefix(DeclaredPrefixRefusal::Missing));
+                }
+            };
+            if self.detok.pending_len() > 0 {
+                // The final character is incomplete and flushes lossily.
+                self.parser.mark_lossy();
+            }
+            let rest = self.detok.finish();
+            let (released, matched) = self.stop.push(&rest);
+            append(&mut step.delta, self.parser.push_text(&released));
+            let mut stop_held = false;
+            let cause = if matched {
+                StopCause::StopSequence
+            } else {
+                let held = self.stop.flush();
+                // A possible partial stop sequence, given out as text: a resumed
+                // request's matcher starts with nothing held and would miss one
+                // spanning the cut.
+                stop_held = !held.is_empty();
+                append(&mut step.delta, self.parser.push_text(&held));
+                cause
+            };
+            let (tail, reason) = self.parser.finish(cause);
+            append(&mut step.delta, tail);
+            if reason == FinishReason::Length {
+                // Continuable only where a continuation would be exact and could
+                // run: not at the context window (no room is left for one), not out
+                // of KV memory, not inside a held stop sequence, not after a sampled token the text
+                // does not show, and only where the chat layer says what it gave
+                // out renders the generated text, encodes to the added tokens the
+                // model sampled, and resumes its parse.
+                step.continuable = Some(
+                    !self.window_bound
+                        && !memory_bound
+                        && !stop_held
+                        && !self.dropped_token
+                        && self.parser.resumes_exactly_as_tokens(&self.added),
+                );
+            }
+            step.finish = Some(reason);
+            self.done = true;
+        }
+        Ok(step)
+    }
+}
+
+fn append(into: &mut ChatDelta, d: ChatDelta) {
+    into.reasoning_content.push_str(&d.reasoning_content);
+    into.content.push_str(&d.content);
+    into.tool_calls.extend(d.tool_calls);
+}
+
+/// Stop-sequence matching over streamed text.
+///
+/// Each stop sequence runs a KMP automaton over the text's bytes, whose state is the
+/// length of the longest suffix of the text so far that is a prefix of that sequence.
+/// Only that much is held back (the largest state over the sequences, which always starts
+/// on a character boundary because the sequences are UTF-8); everything before it is
+/// released at once, so text that cannot begin a stop sequence is never delayed, and the
+/// work is linear in the text (times the at most four sequences) however long a sequence
+/// is. The first occurrence to complete wins: the text before it is released, and the
+/// sequence and everything after it are dropped (OpenAI semantics: the stop sequence is
+/// not part of the output).
+#[derive(Debug, Default)]
+pub struct StopMatcher {
+    stops: Vec<Kmp>,
+    /// Text not yet released: always a prefix of some sequence (the longest state).
+    pending: String,
+    matched: bool,
+}
+
+#[derive(Debug)]
+struct Kmp {
+    pattern: Vec<u8>,
+    /// `fail[i]`: length of the longest proper border of `pattern[..=i]`.
+    fail: Vec<usize>,
+    state: usize,
+}
+
+impl Kmp {
+    fn new(pattern: &str) -> Self {
+        let p = pattern.as_bytes().to_vec();
+        let mut fail = vec![0; p.len()];
+        let mut k = 0;
+        for i in 1..p.len() {
+            while k > 0 && p[i] != p[k] {
+                k = fail[k - 1];
+            }
+            if p[i] == p[k] {
+                k += 1;
+            }
+            fail[i] = k;
+        }
+        Kmp {
+            pattern: p,
+            fail,
+            state: 0,
+        }
+    }
+
+    /// Feeds one byte; true when the whole pattern has just matched.
+    fn step(&mut self, b: u8) -> bool {
+        if self.state == self.pattern.len() {
+            self.state = self.fail[self.state - 1];
+        }
+        while self.state > 0 && self.pattern[self.state] != b {
+            self.state = self.fail[self.state - 1];
+        }
+        if self.pattern[self.state] == b {
+            self.state += 1;
+        }
+        self.state == self.pattern.len()
+    }
+}
+
+impl StopMatcher {
+    /// `stops` must be non-empty strings (the request validation guarantees it).
+    pub fn new(stops: Vec<String>) -> Self {
+        StopMatcher {
+            stops: stops
+                .iter()
+                .filter(|s| !s.is_empty())
+                .map(|s| Kmp::new(s))
+                .collect(),
+            pending: String::new(),
+            matched: false,
+        }
+    }
+
+    /// Adds text; returns the text now safe to release and whether a stop sequence
+    /// matched.
+    pub fn push(&mut self, text: &str) -> (String, bool) {
+        if self.matched {
+            return (String::new(), true);
+        }
+        if self.stops.is_empty() {
+            return (text.to_string(), false);
+        }
+        for (i, &b) in text.as_bytes().iter().enumerate() {
+            let mut hit = None;
+            for stop in &mut self.stops {
+                if stop.step(b) {
+                    hit = hit.max(Some(stop.pattern.len()));
+                }
+            }
+            if let Some(len) = hit {
+                // The match ends after byte `i`; with several completing on the same
+                // byte, the longest started first.
+                let end = self.pending.len() + i + 1;
+                let start = end - len;
+                // `i + 1` ends a character: the match's last byte ends one, since the
+                // sequence is UTF-8. `start` begins one, likewise.
+                self.pending.push_str(&text[..i + 1]);
+                let mut out = std::mem::take(&mut self.pending);
+                out.truncate(start);
+                self.matched = true;
+                return (out, true);
+            }
+        }
+        self.pending.push_str(text);
+        let hold = self.stops.iter().map(|s| s.state).max().unwrap_or(0);
+        let cut = self.pending.len() - hold;
+        let out = self.pending[..cut].to_string();
+        self.pending.drain(..cut);
+        (out, false)
+    }
+
+    /// Releases whatever is held back (the response ended without a match).
+    pub fn flush(&mut self) -> String {
+        std::mem::take(&mut self.pending)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(stops: &[&str], chunks: &[&str]) -> (String, bool) {
+        let mut m = StopMatcher::new(stops.iter().map(|s| s.to_string()).collect());
+        let mut out = String::new();
+        for c in chunks {
+            let (r, hit) = m.push(c);
+            out.push_str(&r);
+            if hit {
+                return (out, true);
+            }
+        }
+        out.push_str(&m.flush());
+        (out, false)
+    }
+
+    #[test]
+    fn matches_across_chunks_and_drops_the_sequence() {
+        assert_eq!(
+            run(&["END"], &["abc E", "N", "Dxyz"]),
+            ("abc ".into(), true)
+        );
+        assert_eq!(run(&["END"], &["abc EN"]), ("abc EN".into(), false));
+        assert_eq!(run(&["xy", "b"], &["abxy"]), ("a".into(), true));
+        assert_eq!(run(&[], &["a", "b"]), ("ab".into(), false));
+    }
+
+    /// Naive reference: the earliest-ending occurrence (ties to the longest).
+    fn naive(stops: &[&str], text: &str) -> (String, bool) {
+        let mut best: Option<(usize, usize)> = None; // (end, start)
+        for s in stops {
+            if let Some(at) = text.find(s) {
+                let cand = (at + s.len(), at);
+                best = Some(match best {
+                    Some(b) if (b.0, b.1) <= (cand.0, cand.1) => b,
+                    _ => cand,
+                });
+            }
+        }
+        match best {
+            Some((_, start)) => (text[..start].to_string(), true),
+            None => (text.to_string(), false),
+        }
+    }
+
+    #[test]
+    fn matches_the_naive_rule_on_every_split() {
+        let mut rng = 0x1234_5678u64;
+        let mut next = || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 33) as usize
+        };
+        let alphabet = ['a', 'b', 'é'];
+        for _ in 0..3000 {
+            let word = |n: usize, next: &mut dyn FnMut() -> usize| -> String {
+                (0..n).map(|_| alphabet[next() % 3]).collect()
+            };
+            let n_stops = 1 + next() % 3;
+            let stops: Vec<String> = (0..n_stops)
+                .map(|_| {
+                    let n = 1 + next() % 4;
+                    word(n, &mut next)
+                })
+                .collect();
+            let n_text = next() % 14;
+            let text = word(n_text, &mut next);
+            let refs: Vec<&str> = stops.iter().map(String::as_str).collect();
+            // Split at random character boundaries.
+            let bounds: Vec<usize> = text
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain([text.len()])
+                .collect();
+            let mut chunks = Vec::new();
+            let mut last = 0;
+            for &b in &bounds[1..] {
+                if next() % 2 == 0 || b == text.len() {
+                    chunks.push(&text[last..b]);
+                    last = b;
+                }
+            }
+            assert_eq!(
+                run(&refs, &chunks),
+                naive(&refs, &text),
+                "{stops:?} {chunks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn releases_text_that_cannot_begin_a_stop() {
+        let big = "Z".repeat(10_000);
+        let mut m = StopMatcher::new(vec![big.clone()]);
+        assert_eq!(m.push("hello "), ("hello ".to_string(), false));
+        assert_eq!(
+            m.push("ZZ"),
+            (String::new(), false),
+            "a possible start is held"
+        );
+        assert_eq!(
+            m.push("y"),
+            ("ZZy".to_string(), false),
+            "and released when it cannot be"
+        );
+        // A long run of a stop's prefix is held only as long as it could still match.
+        let (r, hit) = m.push(&big[..9_999]);
+        assert!(r.is_empty() && !hit);
+        let (r, hit) = m.push("Z!");
+        assert!(hit);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn holds_back_on_character_boundaries() {
+        let mut m = StopMatcher::new(vec!["ééé".into()]);
+        let (r, hit) = m.push("aéé");
+        assert!(!hit);
+        assert!(r.is_empty() || "aéé".starts_with(&r));
+        let (r2, hit) = m.push("é!");
+        assert!(hit);
+        assert_eq!(format!("{r}{r2}"), "a");
+    }
+}

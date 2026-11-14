@@ -6,13 +6,14 @@
 //! everywhere. Reset is destructive-ish (it forgets the local account keys),
 //! so it sits behind a two-step inline confirm — no modal.
 
-use eidola_app_core::SubscriptionState;
 use eidola_app_core::error::AppError;
+use eidola_app_core::{CheckoutMint, PortalMint, SubscriptionState};
 use gpui::{
     App, AppContext, AsyncApp, ClipboardItem, Context, Entity, InteractiveElement, IntoElement,
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
     WeakEntity, Window, div, prelude::FluentBuilder,
 };
+use gpui_component::RoleOverride;
 use gpui_component::{
     ActiveTheme, IconName, Sizable, StyledExt,
     button::{Button, ButtonVariants},
@@ -184,7 +185,6 @@ impl AccountView {
         self.checkout_error = None;
         cx.notify();
 
-        let minted_for = self.account_identity(cx);
         let Some(rx) = self.account.read(cx).request_checkout(price_id) else {
             // Stub core: the in-flight marker above is the observable state.
             return;
@@ -198,25 +198,20 @@ impl AccountView {
                         message: "checkout task cancelled".into(),
                     })
                 });
-                let _ = this.update(cx, |this, cx| this.finish_checkout(minted_for, res, cx));
+                let _ = this.update(cx, |this, cx| this.finish_checkout(res, cx));
             },
         ));
     }
 
     /// Land a checkout mint. Public so behavior tests drive the same path the
     /// request's own task does.
-    pub fn finish_checkout(
-        &mut self,
-        minted_for: Option<SharedString>,
-        res: Result<String, AppError>,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn finish_checkout(&mut self, res: Result<CheckoutMint, AppError>, cx: &mut Context<Self>) {
         self.checkout_pending = None;
         self.checkout_task = None;
         match res {
-            Ok(url) => {
-                if self.mint_is_current(&minted_for, cx) {
-                    cx.open_url(&url);
+            Ok(mint) => {
+                if self.mint_is_current(&mint.minted_for, cx) {
+                    cx.open_url(&mint.url);
                 } else {
                     self.checkout_error = Some(STALE_MINT.to_string());
                 }
@@ -247,7 +242,6 @@ impl AccountView {
         self.manage_error = None;
         cx.notify();
 
-        let minted_for = self.account_identity(cx);
         let Some(rx) = self.account.read(cx).request_portal() else {
             // Stub core: the in-flight marker above is the observable state.
             return;
@@ -259,25 +253,20 @@ impl AccountView {
                         message: "billing portal task cancelled".into(),
                     })
                 });
-                let _ = this.update(cx, |this, cx| this.finish_manage(minted_for, res, cx));
+                let _ = this.update(cx, |this, cx| this.finish_manage(res, cx));
             },
         ));
     }
 
     /// Land a billing-portal mint. Public so behavior tests drive the same
     /// path the request's own task does.
-    pub fn finish_manage(
-        &mut self,
-        minted_for: Option<SharedString>,
-        res: Result<String, AppError>,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn finish_manage(&mut self, res: Result<PortalMint, AppError>, cx: &mut Context<Self>) {
         self.manage_pending = false;
         self.manage_task = None;
         match res {
-            Ok(url) => {
-                if self.mint_is_current(&minted_for, cx) {
-                    cx.open_url(&url);
+            Ok(mint) => {
+                if self.mint_is_current(&mint.minted_for, cx) {
+                    cx.open_url(&mint.url);
                 } else {
                     self.manage_error = Some(STALE_MINT.to_string());
                 }
@@ -291,39 +280,39 @@ impl AccountView {
         cx.notify();
     }
 
-    /// The configured account id as the *cache* has it. Only ever the stub's
-    /// answer — see [`AccountStore::account_identity`], which reads past it.
-    fn cached_account_id(&self, cx: &App) -> Option<String> {
-        self.config
-            .read(cx)
-            .state()
-            .and_then(|s| s.account_id.clone())
+    /// The configured credential pair as the *cache* has it. Only ever the
+    /// stub's answer — see [`AccountStore::account_fingerprint`], which reads
+    /// past it.
+    fn cached_credentials(&self, cx: &App) -> Option<(String, String)> {
+        let config = self.config.read(cx);
+        let state = config.state()?;
+        Some((state.account_id.clone()?, state.account_secret.clone()?))
     }
 
-    /// The account a mint made now would belong to.
-    fn account_identity(&self, cx: &App) -> Option<SharedString> {
-        let fallback = self.cached_account_id(cx);
-        self.account
-            .read(cx)
-            .account_identity(fallback.as_deref())
-            .map(SharedString::from)
-    }
-
-    /// Whether a URL minted for `minted_for` still belongs to the account
-    /// configured now.
+    /// Whether a link the mint signed for `minted_for` still belongs to the
+    /// credentials configured now.
     ///
     /// Both doors mint against the credentials held at click time, and both
     /// take a round trip the reader can outrun — resetting, creating or
     /// linking an account in the meantime. Opening anyway would put the
     /// previous identity's billing portal, or a checkout that funds an
     /// account the reader no longer holds the secret for, in front of them
-    /// under the current account's name. The identity is captured with the
-    /// request and re-checked here, where the answer is still knowable.
-    fn mint_is_current(&self, minted_for: &Option<SharedString>, cx: &App) -> bool {
-        let fallback = self.cached_account_id(cx);
-        self.account
-            .read(cx)
-            .mint_is_current(minted_for.as_ref().map(|s| s.as_ref()), fallback.as_deref())
+    /// under the current account's name.
+    ///
+    /// **The identity comes from the answering side, not from a look this
+    /// view took before dispatching.** Only the process that signed the
+    /// request knows which credentials it used, and every look this view can
+    /// take of its own profile is what a swap-and-restore inside the round
+    /// trip defeats: an account replaced and replaced back leaves a
+    /// before-and-after comparison agreeing about a link minted for a third
+    /// thing in between. It is compared against a fingerprint of the current
+    /// config read **fresh here**, where the answer is still knowable.
+    fn mint_is_current(&self, minted_for: &str, cx: &App) -> bool {
+        let fallback = self.cached_credentials(cx);
+        self.account.read(cx).mint_is_current(
+            minted_for,
+            fallback.as_ref().map(|(i, s)| (i.as_str(), s.as_str())),
+        )
     }
 
     fn account_credentials(&self, cx: &App) -> (Option<SharedString>, Option<SharedString>) {
@@ -507,7 +496,7 @@ impl Render for AccountView {
                                         )
                                         .child(
                                             Button::new("confirm-reset")
-                                                .role(None)
+                                                .role(RoleOverride::Presentational)
                                                 .danger()
                                                 .small()
                                                 .label("Reset account")
@@ -527,7 +516,7 @@ impl Render for AccountView {
                                         )
                                         .child(
                                             Button::new("cancel-reset")
-                                                .role(None)
+                                                .role(RoleOverride::Presentational)
                                                 .ghost()
                                                 .small()
                                                 .label("Keep account")
@@ -563,6 +552,15 @@ impl Render for AccountView {
                 )))
                 .child(
                     h_flex().child(
+                        // This opens the Get Started flow rather than creating
+                        // an account here. Creating one records acceptance of
+                        // the current terms of service and privacy policy, and
+                        // that acceptance may only ever be submitted for
+                        // documents the user was actually shown — which is a
+                        // consent screen, not a button. Get Started is where
+                        // that screen lives; keeping it the only door means
+                        // there is no second path that could skip it.
+                        //
                         // Probed wrapper for the a11y role/label — shrink-wraps
                         // the button so its bounds are an honest click target.
                         div()
@@ -570,24 +568,24 @@ impl Render for AccountView {
                             .probe(
                                 "settings/account/create",
                                 gpui::Role::Button,
-                                "Create account",
+                                "Set up an account…",
                             )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.account.update(cx, |s, cx| s.create_account(cx));
-                            }))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(crate::actions::GetStarted), cx);
+                            })
                             .child(
                                 Button::new("create-account")
-                                    .role(None)
+                                    .role(RoleOverride::Presentational)
                                     .primary()
                                     .small()
-                                    .label("Create account")
+                                    .label("Set up an account…")
                                     .tab_stop(false),
                             ),
                     ),
                 );
         }
 
-        // Account create/reset failure — rendered right under the Account
+        // Account-lifecycle failure — rendered right under the Account
         // controls so a failed button click is never silent.
         if let Some(err) = account_op_error.as_deref() {
             col = col.child(
@@ -808,8 +806,9 @@ impl Render for AccountView {
                                         // plans below are what that reader
                                         // most likely came for, and two solid
                                         // buttons on one pane are two shouts.
-                                        let door =
-                                            Button::new("billing-portal").role(None).primary();
+                                        let door = Button::new("billing-portal")
+                                            .role(RoleOverride::Presentational)
+                                            .primary();
                                         let door = if subscribed { door } else { door.outline() };
                                         door.small()
                                             .label(if self.manage_pending {
@@ -912,6 +911,10 @@ impl Render for AccountView {
                 self.checkout_pending.as_deref(),
                 on_select,
                 "settings/account",
+                // English until this pane's own extraction, which swaps this
+                // one expression for `PlanLabels::localized(cx)`: localized
+                // rows inside an English page read worse than consistent ones.
+                plans::PlanLabels::english(),
                 cx,
             ));
         }
@@ -1061,67 +1064,72 @@ fn account_credential_input(
                 .probe_bounds(id_prefix, gpui::Role::TextInput, label)
                 .w_full()
                 .child(
-                    Input::new(state).aria_label(label).suffix(
-                        h_flex()
-                            .gap_0p5()
-                            .when(show_secret_button, |el| {
-                                el.child(
-                                    // Probed wrapper for the a11y role/label —
-                                    // shrink-wraps the button so its bounds are
-                                    // an honest click target. Both the name and
-                                    // the element id derive from `id_prefix`:
-                                    // this component paints once per credential.
+                    Input::new(state)
+                        .aria_label(label)
+                        .py(crate::theme::INPUT_PY)
+                        .suffix(
+                            h_flex()
+                                .gap_0p5()
+                                .when(show_secret_button, |el| {
+                                    el.child(
+                                        // Probed wrapper for the a11y role/label —
+                                        // shrink-wraps the button so its bounds are
+                                        // an honest click target. Both the name and
+                                        // the element id derive from `id_prefix`:
+                                        // this component paints once per credential.
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "{id_prefix}-reveal-wrap"
+                                            )))
+                                            .probe(
+                                                SharedString::from(format!("{id_prefix}/reveal")),
+                                                gpui::Role::Button,
+                                                reveal_label,
+                                            )
+                                            .on_click(on_toggle_secret)
+                                            .child(
+                                                Button::new(SharedString::from(format!(
+                                                    "{id_prefix}-reveal"
+                                                )))
+                                                .role(RoleOverride::Presentational)
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(if secret_revealed {
+                                                    IconName::EyeOff
+                                                } else {
+                                                    IconName::Eye
+                                                })
+                                                .tooltip(reveal_label)
+                                                .tab_stop(false),
+                                            ),
+                                    )
+                                })
+                                .child(
                                     div()
-                                        .id(SharedString::from(format!("{id_prefix}-reveal-wrap")))
+                                        .id(SharedString::from(format!("{id_prefix}-copy-wrap")))
                                         .probe(
-                                            SharedString::from(format!("{id_prefix}/reveal")),
+                                            SharedString::from(format!("{id_prefix}/copy")),
                                             gpui::Role::Button,
-                                            reveal_label,
+                                            copy_label.clone(),
                                         )
-                                        .on_click(on_toggle_secret)
+                                        .on_click(move |_, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                copy_value.to_string(),
+                                            ));
+                                        })
                                         .child(
                                             Button::new(SharedString::from(format!(
-                                                "{id_prefix}-reveal"
+                                                "{id_prefix}-copy"
                                             )))
-                                            .role(None)
+                                            .role(RoleOverride::Presentational)
                                             .ghost()
                                             .xsmall()
-                                            .icon(if secret_revealed {
-                                                IconName::EyeOff
-                                            } else {
-                                                IconName::Eye
-                                            })
-                                            .tooltip(reveal_label)
+                                            .icon(IconName::Copy)
+                                            .tooltip(copy_label)
                                             .tab_stop(false),
                                         ),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("{id_prefix}-copy-wrap")))
-                                    .probe(
-                                        SharedString::from(format!("{id_prefix}/copy")),
-                                        gpui::Role::Button,
-                                        copy_label.clone(),
-                                    )
-                                    .on_click(move |_, _, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            copy_value.to_string(),
-                                        ));
-                                    })
-                                    .child(
-                                        Button::new(SharedString::from(format!(
-                                            "{id_prefix}-copy"
-                                        )))
-                                        .role(None)
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(IconName::Copy)
-                                        .tooltip(copy_label)
-                                        .tab_stop(false),
-                                    ),
-                            ),
-                    ),
+                                ),
+                        ),
                 ),
         )
 }

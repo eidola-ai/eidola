@@ -16,12 +16,12 @@ name = "demo"
 path = "src/bin/demo.rs"
 
 [dependencies]
-# Mirror the eidola-gui pin so cargo unifies on a single gpui copy across the
-# workspace.
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
-gpui-component = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola" }
-gpui-component-assets = { git = "https://github.com/eidola-ai/gpui-component", branch = "eidola" }
+# The same exact pins as eidola-gui, so the workspace resolves one gpui (see
+# eidola-gui's AGENTS.md → gpui / gpui-component pinning).
+gpui = { package = "gpui-pre", version = "=0.3.7" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["font-kit"] }
+gpui-component = "=0.7.0"
+gpui-kit-assets = "=0.7.0"
 
 # Our fork's `eidola` branch (upstream main + our feature commits, rebased):
 # exposes `Options::ENABLE_EMPTY_NESTED_LISTS` — we need pulldown to parse
@@ -45,8 +45,8 @@ smallvec = "1.15"
 unicode-segmentation = "1"
 
 [dev-dependencies]
-gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["test-support", "font-kit"] }
+gpui = { package = "gpui-pre", version = "=0.3.7", features = ["test-support"] }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["test-support", "font-kit"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [[test]]

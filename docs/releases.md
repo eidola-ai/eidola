@@ -1,15 +1,17 @@
 # Releases
 
-A release is the *unit of trust*. When a user is running Eidola release N, what they are trusting is the entire bundle that comprises release N — client, server, build inputs, measurements, and the signatures attesting to them. This page explains how a new release becomes trustable. For the technical specification, see [trust-root.md](trust-root.md).
+A **release** is the unit of trust: every artifact, the paired gateway, the inference engine deployments that gateway accepts, the build inputs, the measurements, and the signatures attesting to them. This page explains how a new release becomes trustable.
+
+How those artifacts are hashed, what a user `shasum`s, and the payload / archive / envelope / installable split live in [verification.md](verification.md). The compile-time pin set is [trust-root.md](trust-root.md).
 
 ## What a release contains
 
 A single release ships:
 
-- A **client binary** for each supported platform (macOS and Linux GUI apps, CLI, etc.) with a trust root embedded at compile time.
-- A **server image** built reproducibly from the same source commit, whose confidential-compute measurement matches the value embedded in the client.
-- A signed **artifact manifest** (`artifact-manifest.json`) recording the digests of every artifact and the enclave measurement.
-- One or more **human attestations**, each signed under a pinned engineer's hardware-bound key, with their Sigstore Rekor inclusion proof.
+- A **client artifact** for each supported platform (macOS and Linux GUI, CLI) whose **payload** embeds the trust root at compile time.
+- A **server image** (OCI **archive**) built reproducibly from the same source commit, whose confidential-compute measurement matches the value embedded in the client. The inference engine deployments the gateway accepts are pinned inside that image ([engine.md](engine.md#what-pins-the-engine)), so the client's one pin covers them too.
+- A signed **artifact manifest** (`artifact-manifest.json`) recording each artifact’s archive identity (`digest` or `archiveSha256`), Nix `narHash` where applicable, and the enclave measurement.
+- One or more **human attestations**, each signed under a pinned engineer's hardware-bound key, with their Sigstore Rekor inclusion proof. The attestation also binds Apple **envelope** / **installable** hashes, which must not appear in the CI-signed manifest.
 
 The client carries enough information to verify all of this locally before installing an update.
 
@@ -22,7 +24,7 @@ Eidola uses two signing systems in coordination. Both ride the same Sigstore Rek
 | CI signs the manifest | Sigstore bundle | Fulcio keyless cert tied to the GitHub OIDC workflow identity |
 | Engineer signs a release attestation | `cosign sign-blob` against a hardware-held key (YubiKey-PIV, KMS, etc.) | sha256(PKIX SubjectPublicKeyInfo) matches a fingerprint pinned in the client |
 
-The CI side gives us "this artifact came from the release workflow on this tag." The engineer side gives us "a named human, signing under their legal identity, attests to the properties this release claims." Neither alone is sufficient; both are required.
+The CI side gives us "this archive came from the release workflow on this tag." The engineer side gives us "a named human, signing under their legal identity, attests to the properties this release claims." Neither alone is sufficient; both are required.
 
 ## What the engineer attests to
 
@@ -33,6 +35,7 @@ Every release attestation is a structured JSON document where the engineer makes
 - `no_coercion` — the engineer has **not been threatened or coerced** by any party to alter the release, falsify any claim, or conceal any material fact about the privacy or security properties of the release.
 - `signing_freely` — the engineer is signing **of their own volition**, with a key whose private component exists only on hardware under their exclusive physical control.
 - `manifest_reproduced` — the engineer **personally reproduced** `artifact-manifest.json` from the source commit on hardware under their exclusive physical control, and confirmed bit-for-bit equality with CI's output.
+- `apple_signature_reconstructs` — applying the published detached signature bundle to the reproducible unsigned macOS build recorded in `artifact-manifest.json` **yields exactly the shipped signed artifact**. This is the claim that lets the Apple signature be published as data: the manifest stays a function of source, and the hashes that depend on a key (the detached material's, the shipped container's) are carried here instead, together with the Team ID and signing identifier the reconstruction must report. `release-tool attest` performs that reconstruction itself and refuses to offer the claim unless it holds — an engineer is never asked to affirm something the tool did not check.
 - `diff_reviewed` — the engineer **personally inspected the source-level diff** between the prior release commit and this release commit.
 - `privacy_guarantees_not_weakened` — the version of [`privacy-guarantees.md`](privacy-guarantees.md) at release time **does not weaken, narrow, or remove** any privacy or security guarantee that was stated in the prior release's version.
 - `code_delivers_guarantees` — based on the diff review, the engineer is **not aware of any change** in this release that causes the code to fail to deliver the privacy and security guarantees stated in `privacy-guarantees.md`.
@@ -56,10 +59,8 @@ If any step fails, the update is rejected. There is no override prompt.
 
 ## Why each piece is necessary
 
-A reader might ask: why is CI's signature not enough? Why is a single engineer's attestation not enough?
-
-- **CI alone is not enough.** A compromise of GitHub, the OIDC flow, or the workflow definition gives an attacker the CI signature. But CI cannot mint a `cosign sign-blob` from an engineer's hardware-held key. The human attestation is the defense-in-depth against pipeline compromise.
-- **A single human alone is not enough.** A single attestant is one legal target. The minimum-attestant policy (`MIN_HUMAN_ATTESTATIONS`) is pinned in the *prior* client, so a coerced engineer cannot lower the threshold by shipping a release that requires fewer signatures. **Today** `MIN_HUMAN_ATTESTATIONS` is `1` — the framework supports arbitrary M-of-N, but only one attestant key is currently provisioned. As additional attestants are onboarded, the threshold will be raised through the same release process that any other trust-constants change uses. See [gaps.md](gaps.md#single-attestant-policy).
+- **CI alone is not enough.** A compromise of GitHub, the OIDC flow, or the workflow definition gives an attacker the CI signature. CI cannot produce a signature from an engineer's hardware-held key, so the human attestation defends against pipeline compromise.
+- **A single human alone is not enough.** A single attestant is one legal target. The minimum-attestant policy (`MIN_HUMAN_ATTESTATIONS`) is pinned in the *prior* client, so a coerced engineer cannot lower the threshold by shipping a release that requires fewer signatures. **Today** `MIN_HUMAN_ATTESTATIONS` is `1`: the verifier supports M-of-N, but one attestant key is provisioned. Raising the threshold is a trust-constants change that goes through a release like any other. See [gaps.md](gaps.md#single-attestant-policy).
 - **Sigstore Rekor is not enough.** Sigstore proves that *a signature exists in a public log*. It does not prove that the signer was acting freely, that the source matches the release, or that the release does not weaken guarantees. The structured claims are what add that semantic content.
 
 ## Schema versions: every change is breaking
@@ -79,6 +80,6 @@ The first-install case (no prior installed commit) is the residual gap; see [gap
 
 ## For the technical specification
 
-For exact pinning, signing-system formats, schema document shapes, and the build-input vs. build-output story (why `artifact-manifest.json` and `server-enclave.json` are separate files), see [trust-root.md](trust-root.md).
+For exact pinning, signing-system formats, schema document shapes, and the build-input vs. build-output story (why `artifact-manifest.json` and `server-enclave.json` are separate files), see [trust-root.md](trust-root.md). For archive hashes and how to check a download, see [verification.md](verification.md).
 
 For the operational side — how to actually cut a release, rotate an attestant key, or update the Sigstore trusted root — see [`releases/README.md`](../releases/README.md).

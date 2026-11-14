@@ -419,6 +419,8 @@ impl Inner {
                 input_tokens: None,
                 output_tokens: None,
                 credits_consumed: None,
+                truncated: false,
+                resumable: false,
                 created_at: now_ms(),
             },
         )

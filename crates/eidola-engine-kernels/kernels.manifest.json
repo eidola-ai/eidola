@@ -1,0 +1,1388 @@
+{
+  "schema_version": 2,
+  "toolchain": {
+    "components": {
+      "cuda_cccl": "13.2.27",
+      "cuda_crt": "13.2.51",
+      "cuda_cudart": "13.2.51",
+      "cuda_cuobjdump": "13.2.51",
+      "cuda_cuxxfilt": "13.2.51",
+      "cuda_nvcc": "13.2.51",
+      "cuda_nvdisasm": "13.2.51",
+      "libcurand": "10.4.2.51",
+      "libnvvm": "13.2.51"
+    },
+    "cuda": "13.2.51",
+    "host_compiler": "gcc 15.3.0",
+    "nixpkgs": "78e9c786dc08cd4f3420c2395cd977206a9b1da2"
+  },
+  "sources": {
+    "cutlass": {
+      "license": "BSD-3-Clause",
+      "nar_hash": "sha256-FiXSg6DMUAV9Gf5LOePKAwmGLVPxphq6MVwHZwwsKDM=",
+      "repository": "https://github.com/NVIDIA/cutlass",
+      "rev": "098de2a652cf8f00fd70b2df54051c7eccbb855a"
+    },
+    "deepgemm": {
+      "license": "MIT",
+      "nar_hash": "sha256-qTNMUhWGKxD9RYSpvao1omo7+vfQvc2gbKOSLOMWaTA=",
+      "repository": "https://github.com/deepseek-ai/DeepGEMM",
+      "rev": "057ca5964aae0879ff2e0eb71ee05a3cb0ba3df7"
+    },
+    "flashinfer": {
+      "license": "Apache-2.0",
+      "nar_hash": "sha256-lv+JQRsQJXRN6cc0ywJsXmKqLGUYZq0fs6PnvSUKudQ=",
+      "repository": "https://github.com/flashinfer-ai/flashinfer",
+      "rev": "946200de1ae94fc93fdd0926f0a13afd1fa7f0f1"
+    }
+  },
+  "compile": {
+    "per_source_flags": [
+      "-Xcicc",
+      "--orig_src_path_name",
+      "-Xcicc",
+      "crates/eidola-engine-kernels/<source>"
+    ],
+    "common_flags": [
+      "-cubin",
+      "-DNDEBUG"
+    ],
+    "profiles": {
+      "own": {
+        "flags": [
+          "-std=c++17",
+          "-O3"
+        ],
+        "includes": []
+      },
+      "cutlass": {
+        "flags": [
+          "-std=c++17",
+          "-O3",
+          "--expt-relaxed-constexpr"
+        ],
+        "includes": [
+          "cutlass/include"
+        ]
+      },
+      "deepgemm": {
+        "flags": [
+          "-std=c++20",
+          "-O3",
+          "--expt-relaxed-constexpr",
+          "--expt-extended-lambda",
+          "--ptxas-options=--register-usage-level=10"
+        ],
+        "includes": [
+          "cutlass/include",
+          "deepgemm/deep_gemm/include"
+        ]
+      },
+      "flashinfer": {
+        "flags": [
+          "-std=c++17",
+          "-O3",
+          "-use_fast_math",
+          "--expt-relaxed-constexpr",
+          "-DFLASHINFER_ENABLE_F16",
+          "-DFLASHINFER_ENABLE_BF16",
+          "-DFLASHINFER_ENABLE_FP8_E4M3",
+          "-DFLASHINFER_ENABLE_FP8_E5M2"
+        ],
+        "includes": [
+          "flashinfer/include",
+          "generated/flashinfer_sink"
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "path": "csrc/cutlass_bf16_gemm.cu",
+      "sha256": "202854c0dae292662ed5f5c9ebc7cac30c3b3ec280fff48d499ef35518765c5e"
+    },
+    {
+      "path": "csrc/cutlass_fp8_blockwise_gemm.cu",
+      "sha256": "0d0b0a25f98192d772de6e56da1e25366882604006f8eb6a0dcde595932efc5c"
+    },
+    {
+      "path": "csrc/deepgemm_fp8_fp4_grouped.cu",
+      "sha256": "10d4c6cdc6bd1ac6d8e2f62342196e7ea06c0b5e0ce95544b6e3591af069d1e7"
+    },
+    {
+      "path": "csrc/eidola_kernel.cuh",
+      "sha256": "1981aeed1a06e214fdb23c4723dfeac389c76d0df311fc31a4295a2627a399fb"
+    },
+    {
+      "path": "csrc/engine_ops.cu",
+      "sha256": "a4226322b313e3228774fd905c50720f911d7c53504c670a210e1d36642bfa04"
+    },
+    {
+      "path": "csrc/engine_ops_common.cuh",
+      "sha256": "00778cb94b7cedb631e56ba53df989c7744a4072d6a7ad4029272237512e116e"
+    },
+    {
+      "path": "csrc/engine_ops_reference.cu",
+      "sha256": "e1e29a55014c2a73ec105f2eaec4b608fec994c81e5ec3bcc80255bb5fb3a03c"
+    },
+    {
+      "path": "csrc/flashinfer_fa2_sink_paged.cu",
+      "sha256": "76d32d6b0330f474ed3b79530704d24532983b5abbecbe8b19f75c0749f7d0fb"
+    },
+    {
+      "path": "csrc/kernels.json",
+      "sha256": "e5382c905754fe833c6891e38dca05d79e0b552cfc8022cbe834d3e63a0bd5f4"
+    },
+    {
+      "path": "csrc/kv_cipher.cu",
+      "sha256": "598d31479050e0f6ee151a37fabdbf185cfc674eb8a57aff65b3b1a81784b4a5"
+    },
+    {
+      "path": "csrc/rmsnorm.cu",
+      "sha256": "a59065bb35f28e42b0876e2b2fb2e824daab63f134e55aba6d1d9d9106a4c291"
+    },
+    {
+      "path": "csrc/sampling.cu",
+      "sha256": "ab849b061a53ae211d598f169ed29b5a87909daa2f3e49e37165670abd67d6f3"
+    },
+    {
+      "path": "generated/flashinfer_sink/batch_prefill_config.inc",
+      "sha256": "e003d5f38a46fcb94d3338c1cbce578c0eeb8985b30299ea638014a53a409c4b"
+    },
+    {
+      "path": "nix/build-kernels.sh",
+      "sha256": "f7fc05c41f3441c4ed45e567ac1ef6bf77c2d97b26e8c6e42c5bc68fb49518e3"
+    },
+    {
+      "path": "nix/default.nix",
+      "sha256": "6830bd19cbcb2a1473bbe15918e3fb9ef41341c7d19a6d34f60a5159d8e61813"
+    },
+    {
+      "path": "nix/render-flashinfer-sink.sh",
+      "sha256": "213f75476961f9834b7f844bee7df93da2b4bba2407cf281223f582ead51a334"
+    },
+    {
+      "path": "nix/sources.nix",
+      "sha256": "0cdf20c2b25bfcd2f71ba7b42993ccc94b39a9e3e1ee7e6a4c692fa104bf5dcb"
+    }
+  ],
+  "kernels": [
+    {
+      "name": "cutlass_bf16_gemm",
+      "arch": "sm_100a",
+      "source": "csrc/cutlass_bf16_gemm.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_bf16_gemm.sm_100a.cubin",
+      "sha256": "70b0c4765baa1a54fb69fa0da62fff585087d9314d8fa2f627a2248447c1ac55",
+      "size": 65808,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_bf16_gemm_f32",
+          "demangled": "eidola_cutlass_bf16_gemm_f32",
+          "meta": "eidola_cutlass_bf16_gemm_f32_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_bf16_gemm_f32_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 3,
+        "UTCBAR": 2,
+        "UTCHMMA": 4
+      }
+    },
+    {
+      "name": "cutlass_bf16_gemm",
+      "arch": "sm_100f",
+      "source": "csrc/cutlass_bf16_gemm.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_bf16_gemm.sm_100f.cubin",
+      "sha256": "b4fa4df03f8f2c54e411ea9019445531996e90f0f2dc6d86464b748006300355",
+      "size": 65808,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_bf16_gemm_f32",
+          "demangled": "eidola_cutlass_bf16_gemm_f32",
+          "meta": "eidola_cutlass_bf16_gemm_f32_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_bf16_gemm_f32_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 3,
+        "UTCBAR": 2,
+        "UTCHMMA": 4
+      }
+    },
+    {
+      "name": "cutlass_bf16_gemm",
+      "arch": "sm_103a",
+      "source": "csrc/cutlass_bf16_gemm.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_bf16_gemm.sm_103a.cubin",
+      "sha256": "c20d01f44099d056e355707e561ae42bb6cc427e3b50919f7323a8dc3547775d",
+      "size": 65808,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_bf16_gemm_f32",
+          "demangled": "eidola_cutlass_bf16_gemm_f32",
+          "meta": "eidola_cutlass_bf16_gemm_f32_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_bf16_gemm_f32_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 3,
+        "UTCBAR": 2,
+        "UTCHMMA": 4
+      }
+    },
+    {
+      "name": "cutlass_fp8_blockwise_gemm",
+      "arch": "sm_100a",
+      "source": "csrc/cutlass_fp8_blockwise_gemm.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_fp8_blockwise_gemm.sm_100a.cubin",
+      "sha256": "e6a446e551145cd0d0af3112bf53ca02b861560f28219d288b1532f5d80ba565",
+      "size": 80064,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_gemm_bf16",
+          "demangled": "eidola_cutlass_fp8_blockwise_gemm_bf16",
+          "meta": "eidola_cutlass_fp8_blockwise_gemm_bf16_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_fp8_blockwise_gemm_bf16_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 3,
+        "UTCBAR": 2,
+        "UTCQMMA": 4
+      }
+    },
+    {
+      "name": "cutlass_fp8_blockwise_gemm",
+      "arch": "sm_100f",
+      "source": "csrc/cutlass_fp8_blockwise_gemm.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_fp8_blockwise_gemm.sm_100f.cubin",
+      "sha256": "88f5393653cdc492284ee58e89feb9fe4cc7167cd2553815746c99947f3f54ea",
+      "size": 80064,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_gemm_bf16",
+          "demangled": "eidola_cutlass_fp8_blockwise_gemm_bf16",
+          "meta": "eidola_cutlass_fp8_blockwise_gemm_bf16_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_fp8_blockwise_gemm_bf16_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 3,
+        "UTCBAR": 2,
+        "UTCQMMA": 4
+      }
+    },
+    {
+      "name": "cutlass_fp8_blockwise_gemm",
+      "arch": "sm_103a",
+      "source": "csrc/cutlass_fp8_blockwise_gemm.cu",
+      "profile": "cutlass",
+      "file": "cubin/cutlass_fp8_blockwise_gemm.sm_103a.cubin",
+      "sha256": "f43562bd7837d53fb9ca51b7086445481c25bf16fc600b7bb78e5f111e623a5c",
+      "size": 80064,
+      "entries": [
+        {
+          "symbol": "eidola_cutlass_fp8_blockwise_gemm_bf16",
+          "demangled": "eidola_cutlass_fp8_blockwise_gemm_bf16",
+          "meta": "eidola_cutlass_fp8_blockwise_gemm_bf16_meta"
+        }
+      ],
+      "meta": [
+        "eidola_cutlass_fp8_blockwise_gemm_bf16_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 3,
+        "UTCBAR": 2,
+        "UTCQMMA": 4
+      }
+    },
+    {
+      "name": "deepgemm_fp8_fp4_grouped",
+      "arch": "sm_100a",
+      "source": "csrc/deepgemm_fp8_fp4_grouped.cu",
+      "profile": "deepgemm",
+      "file": "cubin/deepgemm_fp8_fp4_grouped.sm_100a.cubin",
+      "sha256": "8f87addf2ad7acc20af4ec054edf2ccbf0d6ee1726ef795d0641c3b7d2548fc9",
+      "size": 152040,
+      "entries": [
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_fp8_fp4_psum_down_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_fp8_fp4_psum_gate_up_meta"
+        }
+      ],
+      "meta": [
+        "eidola_deepgemm_fp8_fp4_psum_down_meta",
+        "eidola_deepgemm_fp8_fp4_psum_gate_up_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 6,
+        "UTCBAR": 10,
+        "UTCCP": 10,
+        "UTCQMMA": 32
+      }
+    },
+    {
+      "name": "deepgemm_fp8_fp4_grouped",
+      "arch": "sm_100f",
+      "source": "csrc/deepgemm_fp8_fp4_grouped.cu",
+      "profile": "deepgemm",
+      "file": "cubin/deepgemm_fp8_fp4_grouped.sm_100f.cubin",
+      "sha256": "cf7048d7468c80047b61d7fafc8c275a0e5b5b1668db8156e71284ab04ab6b76",
+      "size": 152040,
+      "entries": [
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_fp8_fp4_psum_down_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_fp8_fp4_psum_gate_up_meta"
+        }
+      ],
+      "meta": [
+        "eidola_deepgemm_fp8_fp4_psum_down_meta",
+        "eidola_deepgemm_fp8_fp4_psum_gate_up_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 6,
+        "UTCBAR": 10,
+        "UTCCP": 10,
+        "UTCQMMA": 32
+      }
+    },
+    {
+      "name": "deepgemm_fp8_fp4_grouped",
+      "arch": "sm_103a",
+      "source": "csrc/deepgemm_fp8_fp4_grouped.cu",
+      "profile": "deepgemm",
+      "file": "cubin/deepgemm_fp8_fp4_grouped.sm_103a.cubin",
+      "sha256": "03635ce127c67264eb360f0ae6ef60a7cb200777525c24b41d3bc1a6dbcb3c4d",
+      "size": 152040,
+      "entries": [
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj2048ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)2048, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_fp8_fp4_psum_down_meta"
+        },
+        {
+          "symbol": "_ZN9deep_gemm28sm100_fp8_fp4_gemm_1d1d_implILN4cute4UMMA5MajorE0ELS3_0ELj128ELj32ELj128ELj0ELj4096ELj4096ELj128ELj128ELj128ELj256ELj128ELj128ELj128ELj8ELj2ELj128ELj128ELj2ELb1ELj148ELb1ELb0ELNS_8GemmTypeE5ELb0EN7cutlass12float_e4m3_tENS5_6detail23float_e2m1_unpacksmem_tENS5_10bfloat16_tENS_8epilogue9operators8IdentityEEEvPijjjT28_14CUtensorMap_stSF_SF_SF_SF_",
+          "demangled": "void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)128, (unsigned int)32, (unsigned int)128, (unsigned int)0, (unsigned int)4096, (unsigned int)4096, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)256, (unsigned int)128, (unsigned int)128, (unsigned int)128, (unsigned int)8, (unsigned int)2, (unsigned int)128, (unsigned int)128, (unsigned int)2, (bool)1, (unsigned int)148, (bool)1, (bool)0, (deep_gemm::GemmType)5, (bool)0, cutlass::float_e4m3_t, cutlass::detail::float_e2m1_unpacksmem_t, cutlass::bfloat16_t, deep_gemm::epilogue::operators::Identity>(int *, unsigned int, unsigned int, unsigned int, T30, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+          "meta": "eidola_deepgemm_fp8_fp4_psum_gate_up_meta"
+        }
+      ],
+      "meta": [
+        "eidola_deepgemm_fp8_fp4_psum_down_meta",
+        "eidola_deepgemm_fp8_fp4_psum_gate_up_meta"
+      ],
+      "mma_sass": {
+        "UTCATOMSWS": 6,
+        "UTCBAR": 10,
+        "UTCCP": 10,
+        "UTCQMMA": 32
+      }
+    },
+    {
+      "name": "engine_ops",
+      "arch": "sm_100a",
+      "source": "csrc/engine_ops.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops.sm_100a.cubin",
+      "sha256": "fb3d0a55d692ea618ac5f9de078cc40974eb3ddb71fbb9fe916dd8908f2fbb37",
+      "size": 340336,
+      "entries": [
+        {
+          "symbol": "eidola_add_bf16",
+          "demangled": "eidola_add_bf16",
+          "meta": "eidola_add_bf16_meta"
+        },
+        {
+          "symbol": "eidola_add_f32",
+          "demangled": "eidola_add_f32",
+          "meta": "eidola_add_f32_meta"
+        },
+        {
+          "symbol": "eidola_copy_rows",
+          "demangled": "eidola_copy_rows",
+          "meta": "eidola_copy_rows_meta"
+        },
+        {
+          "symbol": "eidola_embed",
+          "demangled": "eidola_embed",
+          "meta": "eidola_embed_meta"
+        },
+        {
+          "symbol": "eidola_gather_quant_ue8m0",
+          "demangled": "eidola_gather_quant_ue8m0",
+          "meta": "eidola_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_gather_rows_bf16",
+          "demangled": "eidola_gather_rows_bf16",
+          "meta": "eidola_gather_rows_bf16_meta"
+        },
+        {
+          "symbol": "eidola_moe_combine",
+          "demangled": "eidola_moe_combine",
+          "meta": "eidola_moe_combine_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute",
+          "demangled": "eidola_moe_permute",
+          "meta": "eidola_moe_permute_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute_count",
+          "demangled": "eidola_moe_permute_count",
+          "meta": "eidola_moe_permute_count_meta"
+        },
+        {
+          "symbol": "eidola_qkv_rope_kv",
+          "demangled": "eidola_qkv_rope_kv",
+          "meta": "eidola_qkv_rope_kv_meta"
+        },
+        {
+          "symbol": "eidola_quant_fp8_f32scale",
+          "demangled": "eidola_quant_fp8_f32scale",
+          "meta": "eidola_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_rmsnorm_f32",
+          "demangled": "eidola_rmsnorm_f32",
+          "meta": "eidola_rmsnorm_f32_meta"
+        },
+        {
+          "symbol": "eidola_router_scores",
+          "demangled": "eidola_router_scores",
+          "meta": "eidola_router_scores_meta"
+        },
+        {
+          "symbol": "eidola_router_select",
+          "demangled": "eidola_router_select",
+          "meta": "eidola_router_select_meta"
+        },
+        {
+          "symbol": "eidola_router_topk",
+          "demangled": "eidola_router_topk",
+          "meta": "eidola_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_swiglu_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_add_bf16_meta",
+        "eidola_add_f32_meta",
+        "eidola_copy_rows_meta",
+        "eidola_embed_meta",
+        "eidola_gather_quant_ue8m0_meta",
+        "eidola_gather_rows_bf16_meta",
+        "eidola_moe_combine_meta",
+        "eidola_moe_permute_count_meta",
+        "eidola_moe_permute_meta",
+        "eidola_qkv_rope_kv_meta",
+        "eidola_quant_fp8_f32scale_meta",
+        "eidola_rmsnorm_f32_meta",
+        "eidola_router_scores_meta",
+        "eidola_router_select_meta",
+        "eidola_router_topk_meta",
+        "eidola_swiglu_quant_fp8_f32scale_meta",
+        "eidola_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "engine_ops",
+      "arch": "sm_100f",
+      "source": "csrc/engine_ops.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops.sm_100f.cubin",
+      "sha256": "419d1d17d84183ab9a7a8a766db735f38fb2ee3ebf6dc1d276aa5530d4f0e4a9",
+      "size": 340336,
+      "entries": [
+        {
+          "symbol": "eidola_add_bf16",
+          "demangled": "eidola_add_bf16",
+          "meta": "eidola_add_bf16_meta"
+        },
+        {
+          "symbol": "eidola_add_f32",
+          "demangled": "eidola_add_f32",
+          "meta": "eidola_add_f32_meta"
+        },
+        {
+          "symbol": "eidola_copy_rows",
+          "demangled": "eidola_copy_rows",
+          "meta": "eidola_copy_rows_meta"
+        },
+        {
+          "symbol": "eidola_embed",
+          "demangled": "eidola_embed",
+          "meta": "eidola_embed_meta"
+        },
+        {
+          "symbol": "eidola_gather_quant_ue8m0",
+          "demangled": "eidola_gather_quant_ue8m0",
+          "meta": "eidola_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_gather_rows_bf16",
+          "demangled": "eidola_gather_rows_bf16",
+          "meta": "eidola_gather_rows_bf16_meta"
+        },
+        {
+          "symbol": "eidola_moe_combine",
+          "demangled": "eidola_moe_combine",
+          "meta": "eidola_moe_combine_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute",
+          "demangled": "eidola_moe_permute",
+          "meta": "eidola_moe_permute_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute_count",
+          "demangled": "eidola_moe_permute_count",
+          "meta": "eidola_moe_permute_count_meta"
+        },
+        {
+          "symbol": "eidola_qkv_rope_kv",
+          "demangled": "eidola_qkv_rope_kv",
+          "meta": "eidola_qkv_rope_kv_meta"
+        },
+        {
+          "symbol": "eidola_quant_fp8_f32scale",
+          "demangled": "eidola_quant_fp8_f32scale",
+          "meta": "eidola_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_rmsnorm_f32",
+          "demangled": "eidola_rmsnorm_f32",
+          "meta": "eidola_rmsnorm_f32_meta"
+        },
+        {
+          "symbol": "eidola_router_scores",
+          "demangled": "eidola_router_scores",
+          "meta": "eidola_router_scores_meta"
+        },
+        {
+          "symbol": "eidola_router_select",
+          "demangled": "eidola_router_select",
+          "meta": "eidola_router_select_meta"
+        },
+        {
+          "symbol": "eidola_router_topk",
+          "demangled": "eidola_router_topk",
+          "meta": "eidola_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_swiglu_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_add_bf16_meta",
+        "eidola_add_f32_meta",
+        "eidola_copy_rows_meta",
+        "eidola_embed_meta",
+        "eidola_gather_quant_ue8m0_meta",
+        "eidola_gather_rows_bf16_meta",
+        "eidola_moe_combine_meta",
+        "eidola_moe_permute_count_meta",
+        "eidola_moe_permute_meta",
+        "eidola_qkv_rope_kv_meta",
+        "eidola_quant_fp8_f32scale_meta",
+        "eidola_rmsnorm_f32_meta",
+        "eidola_router_scores_meta",
+        "eidola_router_select_meta",
+        "eidola_router_topk_meta",
+        "eidola_swiglu_quant_fp8_f32scale_meta",
+        "eidola_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "engine_ops",
+      "arch": "sm_103a",
+      "source": "csrc/engine_ops.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops.sm_103a.cubin",
+      "sha256": "6a95b6a446103f16dcf3520a2b8fa9694230ea2e63f45b523216c3bb00cb561e",
+      "size": 340336,
+      "entries": [
+        {
+          "symbol": "eidola_add_bf16",
+          "demangled": "eidola_add_bf16",
+          "meta": "eidola_add_bf16_meta"
+        },
+        {
+          "symbol": "eidola_add_f32",
+          "demangled": "eidola_add_f32",
+          "meta": "eidola_add_f32_meta"
+        },
+        {
+          "symbol": "eidola_copy_rows",
+          "demangled": "eidola_copy_rows",
+          "meta": "eidola_copy_rows_meta"
+        },
+        {
+          "symbol": "eidola_embed",
+          "demangled": "eidola_embed",
+          "meta": "eidola_embed_meta"
+        },
+        {
+          "symbol": "eidola_gather_quant_ue8m0",
+          "demangled": "eidola_gather_quant_ue8m0",
+          "meta": "eidola_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_gather_rows_bf16",
+          "demangled": "eidola_gather_rows_bf16",
+          "meta": "eidola_gather_rows_bf16_meta"
+        },
+        {
+          "symbol": "eidola_moe_combine",
+          "demangled": "eidola_moe_combine",
+          "meta": "eidola_moe_combine_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute",
+          "demangled": "eidola_moe_permute",
+          "meta": "eidola_moe_permute_meta"
+        },
+        {
+          "symbol": "eidola_moe_permute_count",
+          "demangled": "eidola_moe_permute_count",
+          "meta": "eidola_moe_permute_count_meta"
+        },
+        {
+          "symbol": "eidola_qkv_rope_kv",
+          "demangled": "eidola_qkv_rope_kv",
+          "meta": "eidola_qkv_rope_kv_meta"
+        },
+        {
+          "symbol": "eidola_quant_fp8_f32scale",
+          "demangled": "eidola_quant_fp8_f32scale",
+          "meta": "eidola_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_rmsnorm_f32",
+          "demangled": "eidola_rmsnorm_f32",
+          "meta": "eidola_rmsnorm_f32_meta"
+        },
+        {
+          "symbol": "eidola_router_scores",
+          "demangled": "eidola_router_scores",
+          "meta": "eidola_router_scores_meta"
+        },
+        {
+          "symbol": "eidola_router_select",
+          "demangled": "eidola_router_select",
+          "meta": "eidola_router_select_meta"
+        },
+        {
+          "symbol": "eidola_router_topk",
+          "demangled": "eidola_router_topk",
+          "meta": "eidola_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_swiglu_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_add_bf16_meta",
+        "eidola_add_f32_meta",
+        "eidola_copy_rows_meta",
+        "eidola_embed_meta",
+        "eidola_gather_quant_ue8m0_meta",
+        "eidola_gather_rows_bf16_meta",
+        "eidola_moe_combine_meta",
+        "eidola_moe_permute_count_meta",
+        "eidola_moe_permute_meta",
+        "eidola_qkv_rope_kv_meta",
+        "eidola_quant_fp8_f32scale_meta",
+        "eidola_rmsnorm_f32_meta",
+        "eidola_router_scores_meta",
+        "eidola_router_select_meta",
+        "eidola_router_topk_meta",
+        "eidola_swiglu_quant_fp8_f32scale_meta",
+        "eidola_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "engine_ops_reference",
+      "arch": "sm_100a",
+      "source": "csrc/engine_ops_reference.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops_reference.sm_100a.cubin",
+      "sha256": "014df5e4f2ac069b04d36ecc6f4ab94f20dc8163c4865e803d4f61af424ba50f",
+      "size": 98272,
+      "entries": [
+        {
+          "symbol": "eidola_reference_gather_quant_ue8m0",
+          "demangled": "eidola_reference_gather_quant_ue8m0",
+          "meta": "eidola_reference_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_reference_moe_combine",
+          "demangled": "eidola_reference_moe_combine",
+          "meta": "eidola_reference_moe_combine_meta"
+        },
+        {
+          "symbol": "eidola_reference_qkv_rope_kv",
+          "demangled": "eidola_reference_qkv_rope_kv",
+          "meta": "eidola_reference_qkv_rope_kv_meta"
+        },
+        {
+          "symbol": "eidola_reference_quant_fp8_f32scale",
+          "demangled": "eidola_reference_quant_fp8_f32scale",
+          "meta": "eidola_reference_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_reference_router_topk",
+          "demangled": "eidola_reference_router_topk",
+          "meta": "eidola_reference_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_reference_swiglu_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_reference_gather_quant_ue8m0_meta",
+        "eidola_reference_moe_combine_meta",
+        "eidola_reference_qkv_rope_kv_meta",
+        "eidola_reference_quant_fp8_f32scale_meta",
+        "eidola_reference_router_topk_meta",
+        "eidola_reference_swiglu_quant_fp8_f32scale_meta",
+        "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "engine_ops_reference",
+      "arch": "sm_100f",
+      "source": "csrc/engine_ops_reference.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops_reference.sm_100f.cubin",
+      "sha256": "2a2bba67df978c1bad584d6a6e09b32e5288ec331a1dc24816a608a0b135f52e",
+      "size": 98272,
+      "entries": [
+        {
+          "symbol": "eidola_reference_gather_quant_ue8m0",
+          "demangled": "eidola_reference_gather_quant_ue8m0",
+          "meta": "eidola_reference_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_reference_moe_combine",
+          "demangled": "eidola_reference_moe_combine",
+          "meta": "eidola_reference_moe_combine_meta"
+        },
+        {
+          "symbol": "eidola_reference_qkv_rope_kv",
+          "demangled": "eidola_reference_qkv_rope_kv",
+          "meta": "eidola_reference_qkv_rope_kv_meta"
+        },
+        {
+          "symbol": "eidola_reference_quant_fp8_f32scale",
+          "demangled": "eidola_reference_quant_fp8_f32scale",
+          "meta": "eidola_reference_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_reference_router_topk",
+          "demangled": "eidola_reference_router_topk",
+          "meta": "eidola_reference_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_reference_swiglu_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_reference_gather_quant_ue8m0_meta",
+        "eidola_reference_moe_combine_meta",
+        "eidola_reference_qkv_rope_kv_meta",
+        "eidola_reference_quant_fp8_f32scale_meta",
+        "eidola_reference_router_topk_meta",
+        "eidola_reference_swiglu_quant_fp8_f32scale_meta",
+        "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "engine_ops_reference",
+      "arch": "sm_103a",
+      "source": "csrc/engine_ops_reference.cu",
+      "profile": "own",
+      "file": "cubin/engine_ops_reference.sm_103a.cubin",
+      "sha256": "84aad29f3fc2acb22336d310445890ec7f46d11117151252e99aea7ce93cf89a",
+      "size": 98272,
+      "entries": [
+        {
+          "symbol": "eidola_reference_gather_quant_ue8m0",
+          "demangled": "eidola_reference_gather_quant_ue8m0",
+          "meta": "eidola_reference_gather_quant_ue8m0_meta"
+        },
+        {
+          "symbol": "eidola_reference_moe_combine",
+          "demangled": "eidola_reference_moe_combine",
+          "meta": "eidola_reference_moe_combine_meta"
+        },
+        {
+          "symbol": "eidola_reference_qkv_rope_kv",
+          "demangled": "eidola_reference_qkv_rope_kv",
+          "meta": "eidola_reference_qkv_rope_kv_meta"
+        },
+        {
+          "symbol": "eidola_reference_quant_fp8_f32scale",
+          "demangled": "eidola_reference_quant_fp8_f32scale",
+          "meta": "eidola_reference_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_reference_router_topk",
+          "demangled": "eidola_reference_router_topk",
+          "meta": "eidola_reference_router_topk_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "demangled": "eidola_reference_swiglu_quant_fp8_f32scale",
+          "meta": "eidola_reference_swiglu_quant_fp8_f32scale_meta"
+        },
+        {
+          "symbol": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "demangled": "eidola_reference_swiglu_quant_fp8_ue8m0",
+          "meta": "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+        }
+      ],
+      "meta": [
+        "eidola_reference_gather_quant_ue8m0_meta",
+        "eidola_reference_moe_combine_meta",
+        "eidola_reference_qkv_rope_kv_meta",
+        "eidola_reference_quant_fp8_f32scale_meta",
+        "eidola_reference_router_topk_meta",
+        "eidola_reference_swiglu_quant_fp8_f32scale_meta",
+        "eidola_reference_swiglu_quant_fp8_ue8m0_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "flashinfer_fa2_sink_paged",
+      "arch": "sm_100a",
+      "source": "csrc/flashinfer_fa2_sink_paged.cu",
+      "profile": "flashinfer",
+      "file": "cubin/flashinfer_fa2_sink_paged.sm_100a.cubin",
+      "sha256": "790d2cda17a500dea541634c1524369c85d52e7cf30947705f2603d024fe2e37",
+      "size": 456384,
+      "entries": [
+        {
+          "symbol": "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj16ELj8ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj",
+          "demangled": "void flashinfer::PersistentVariableLengthMergeStatesKernel<(unsigned int)8, (unsigned int)16, (unsigned int)8, (unsigned int)4, __nv_bfloat16, __nv_bfloat16, int>(T5 *, float *, T7 *, T6 *, float *, unsigned int, unsigned int *, unsigned int)",
+          "meta": "eidola_fa2_merge_states_bf16_d128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q16_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q64_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_bf16_q128",
+          "demangled": "eidola_fa2_sink_paged_bf16_q128",
+          "meta": "eidola_fa2_sink_paged_bf16_q128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_bf16_q16",
+          "demangled": "eidola_fa2_sink_paged_bf16_q16",
+          "meta": "eidola_fa2_sink_paged_bf16_q16_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_bf16_q64",
+          "demangled": "eidola_fa2_sink_paged_bf16_q64",
+          "meta": "eidola_fa2_sink_paged_bf16_q64_meta"
+        }
+      ],
+      "meta": [
+        "eidola_fa2_merge_states_bf16_d128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q16_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q64_meta",
+        "eidola_fa2_sink_paged_bf16_q128_meta",
+        "eidola_fa2_sink_paged_bf16_q16_meta",
+        "eidola_fa2_sink_paged_bf16_q64_meta"
+      ],
+      "mma_sass": {
+        "HMMA": 1312
+      }
+    },
+    {
+      "name": "flashinfer_fa2_sink_paged",
+      "arch": "sm_100f",
+      "source": "csrc/flashinfer_fa2_sink_paged.cu",
+      "profile": "flashinfer",
+      "file": "cubin/flashinfer_fa2_sink_paged.sm_100f.cubin",
+      "sha256": "3d1cf8db47feb586bc94181ff06a1b282011dc3465ee07c3fccc4bf8e0615407",
+      "size": 456256,
+      "entries": [
+        {
+          "symbol": "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj16ELj8ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj",
+          "demangled": "void flashinfer::PersistentVariableLengthMergeStatesKernel<(unsigned int)8, (unsigned int)16, (unsigned int)8, (unsigned int)4, __nv_bfloat16, __nv_bfloat16, int>(T5 *, float *, T7 *, T6 *, float *, unsigned int, unsigned int *, unsigned int)",
+          "meta": "eidola_fa2_merge_states_bf16_d128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q16_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q64_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_bf16_q128",
+          "demangled": "eidola_fa2_sink_paged_bf16_q128",
+          "meta": "eidola_fa2_sink_paged_bf16_q128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_bf16_q16",
+          "demangled": "eidola_fa2_sink_paged_bf16_q16",
+          "meta": "eidola_fa2_sink_paged_bf16_q16_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_bf16_q64",
+          "demangled": "eidola_fa2_sink_paged_bf16_q64",
+          "meta": "eidola_fa2_sink_paged_bf16_q64_meta"
+        }
+      ],
+      "meta": [
+        "eidola_fa2_merge_states_bf16_d128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q16_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q64_meta",
+        "eidola_fa2_sink_paged_bf16_q128_meta",
+        "eidola_fa2_sink_paged_bf16_q16_meta",
+        "eidola_fa2_sink_paged_bf16_q64_meta"
+      ],
+      "mma_sass": {
+        "HMMA": 1312
+      }
+    },
+    {
+      "name": "flashinfer_fa2_sink_paged",
+      "arch": "sm_103a",
+      "source": "csrc/flashinfer_fa2_sink_paged.cu",
+      "profile": "flashinfer",
+      "file": "cubin/flashinfer_fa2_sink_paged.sm_103a.cubin",
+      "sha256": "356caa6875d3ee1b1cb5551f4d577a0ce5415e4900282b70f5beae2a07eedd32",
+      "size": 457720,
+      "entries": [
+        {
+          "symbol": "_ZN10flashinfer41PersistentVariableLengthMergeStatesKernelILj8ELj16ELj8ELj4E13__nv_bfloat16S1_iEEvPT3_PfPT5_PT4_S4_jPjj",
+          "demangled": "void flashinfer::PersistentVariableLengthMergeStatesKernel<(unsigned int)8, (unsigned int)16, (unsigned int)8, (unsigned int)4, __nv_bfloat16, __nv_bfloat16, int>(T5 *, float *, T7 *, T6 *, float *, unsigned int, unsigned int *, unsigned int)",
+          "meta": "eidola_fa2_merge_states_bf16_d128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q128",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q16",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q16_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "demangled": "eidola_fa2_sink_paged_anchored_bf16_q64",
+          "meta": "eidola_fa2_sink_paged_anchored_bf16_q64_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_bf16_q128",
+          "demangled": "eidola_fa2_sink_paged_bf16_q128",
+          "meta": "eidola_fa2_sink_paged_bf16_q128_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_bf16_q16",
+          "demangled": "eidola_fa2_sink_paged_bf16_q16",
+          "meta": "eidola_fa2_sink_paged_bf16_q16_meta"
+        },
+        {
+          "symbol": "eidola_fa2_sink_paged_bf16_q64",
+          "demangled": "eidola_fa2_sink_paged_bf16_q64",
+          "meta": "eidola_fa2_sink_paged_bf16_q64_meta"
+        }
+      ],
+      "meta": [
+        "eidola_fa2_merge_states_bf16_d128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q128_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q16_meta",
+        "eidola_fa2_sink_paged_anchored_bf16_q64_meta",
+        "eidola_fa2_sink_paged_bf16_q128_meta",
+        "eidola_fa2_sink_paged_bf16_q16_meta",
+        "eidola_fa2_sink_paged_bf16_q64_meta"
+      ],
+      "mma_sass": {
+        "HMMA": 1312
+      }
+    },
+    {
+      "name": "kv_cipher",
+      "arch": "sm_100a",
+      "source": "csrc/kv_cipher.cu",
+      "profile": "own",
+      "file": "cubin/kv_cipher.sm_100a.cubin",
+      "sha256": "ab01c57ce1bab84a1ff8a01a6778628a1064d6dd177ac6b004a845881d8a68b8",
+      "size": 31840,
+      "entries": [
+        {
+          "symbol": "eidola_kv_chacha20",
+          "demangled": "eidola_kv_chacha20",
+          "meta": "eidola_kv_chacha20_meta"
+        }
+      ],
+      "meta": [
+        "eidola_kv_chacha20_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "kv_cipher",
+      "arch": "sm_100f",
+      "source": "csrc/kv_cipher.cu",
+      "profile": "own",
+      "file": "cubin/kv_cipher.sm_100f.cubin",
+      "sha256": "31548307901fb61702f501ce58659e5a0292a57fe2aaa0663f0608991b74416b",
+      "size": 31840,
+      "entries": [
+        {
+          "symbol": "eidola_kv_chacha20",
+          "demangled": "eidola_kv_chacha20",
+          "meta": "eidola_kv_chacha20_meta"
+        }
+      ],
+      "meta": [
+        "eidola_kv_chacha20_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "kv_cipher",
+      "arch": "sm_103a",
+      "source": "csrc/kv_cipher.cu",
+      "profile": "own",
+      "file": "cubin/kv_cipher.sm_103a.cubin",
+      "sha256": "b15e26ec4196c96c1c96873323f60073adee8ec5a6dba0e97e6f04482fa5d482",
+      "size": 31840,
+      "entries": [
+        {
+          "symbol": "eidola_kv_chacha20",
+          "demangled": "eidola_kv_chacha20",
+          "meta": "eidola_kv_chacha20_meta"
+        }
+      ],
+      "meta": [
+        "eidola_kv_chacha20_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "rmsnorm",
+      "arch": "sm_100a",
+      "source": "csrc/rmsnorm.cu",
+      "profile": "own",
+      "file": "cubin/rmsnorm.sm_100a.cubin",
+      "sha256": "304c9e0e6de90ba08c6d566b6aa8699acc254b02bc2e2cf476ac9b8c55a95a70",
+      "size": 21776,
+      "entries": [
+        {
+          "symbol": "eidola_rmsnorm_bf16",
+          "demangled": "eidola_rmsnorm_bf16",
+          "meta": "eidola_rmsnorm_bf16_meta"
+        }
+      ],
+      "meta": [
+        "eidola_rmsnorm_bf16_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "rmsnorm",
+      "arch": "sm_100f",
+      "source": "csrc/rmsnorm.cu",
+      "profile": "own",
+      "file": "cubin/rmsnorm.sm_100f.cubin",
+      "sha256": "eb5d8b7a147b5784d95bd916ee4a321c74972ba93882cdfe39520375b1853e4e",
+      "size": 21776,
+      "entries": [
+        {
+          "symbol": "eidola_rmsnorm_bf16",
+          "demangled": "eidola_rmsnorm_bf16",
+          "meta": "eidola_rmsnorm_bf16_meta"
+        }
+      ],
+      "meta": [
+        "eidola_rmsnorm_bf16_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "rmsnorm",
+      "arch": "sm_103a",
+      "source": "csrc/rmsnorm.cu",
+      "profile": "own",
+      "file": "cubin/rmsnorm.sm_103a.cubin",
+      "sha256": "23c60bee08ac8058265f921d1d68ec3ed8c36d8a4701a01c9f6551009a74f901",
+      "size": 21776,
+      "entries": [
+        {
+          "symbol": "eidola_rmsnorm_bf16",
+          "demangled": "eidola_rmsnorm_bf16",
+          "meta": "eidola_rmsnorm_bf16_meta"
+        }
+      ],
+      "meta": [
+        "eidola_rmsnorm_bf16_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "sampling",
+      "arch": "sm_100a",
+      "source": "csrc/sampling.cu",
+      "profile": "own",
+      "file": "cubin/sampling.sm_100a.cubin",
+      "sha256": "da501406981ec5e4ed15460858f329acce9749809ab65212312e4a2b3c75a02c",
+      "size": 191616,
+      "entries": [
+        {
+          "symbol": "eidola_chain_accept",
+          "demangled": "eidola_chain_accept",
+          "meta": "eidola_chain_accept_meta"
+        },
+        {
+          "symbol": "eidola_sample",
+          "demangled": "eidola_sample",
+          "meta": "eidola_sample_meta"
+        }
+      ],
+      "meta": [
+        "eidola_chain_accept_meta",
+        "eidola_sample_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "sampling",
+      "arch": "sm_100f",
+      "source": "csrc/sampling.cu",
+      "profile": "own",
+      "file": "cubin/sampling.sm_100f.cubin",
+      "sha256": "7f26bcdb4319e8c08dde564e7e4e8835b5b91fc2851607a1778b866e84cb7427",
+      "size": 191616,
+      "entries": [
+        {
+          "symbol": "eidola_chain_accept",
+          "demangled": "eidola_chain_accept",
+          "meta": "eidola_chain_accept_meta"
+        },
+        {
+          "symbol": "eidola_sample",
+          "demangled": "eidola_sample",
+          "meta": "eidola_sample_meta"
+        }
+      ],
+      "meta": [
+        "eidola_chain_accept_meta",
+        "eidola_sample_meta"
+      ],
+      "mma_sass": {}
+    },
+    {
+      "name": "sampling",
+      "arch": "sm_103a",
+      "source": "csrc/sampling.cu",
+      "profile": "own",
+      "file": "cubin/sampling.sm_103a.cubin",
+      "sha256": "61edfa3847eb098fdda6a086bce4f53639adc16d9631418e7ae9cc3ae950ad56",
+      "size": 243312,
+      "entries": [
+        {
+          "symbol": "eidola_chain_accept",
+          "demangled": "eidola_chain_accept",
+          "meta": "eidola_chain_accept_meta"
+        },
+        {
+          "symbol": "eidola_sample",
+          "demangled": "eidola_sample",
+          "meta": "eidola_sample_meta"
+        }
+      ],
+      "meta": [
+        "eidola_chain_accept_meta",
+        "eidola_sample_meta"
+      ],
+      "mma_sass": {}
+    }
+  ],
+  "fatbins": [
+    {
+      "name": "cutlass_bf16_gemm",
+      "file": "fatbin/cutlass_bf16_gemm.fatbin",
+      "sha256": "fdd448d2975772448f45e8dd621ec927fa2919b17a16c226b4194328a0ada157",
+      "size": 131848,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "cutlass_fp8_blockwise_gemm",
+      "file": "fatbin/cutlass_fp8_blockwise_gemm.fatbin",
+      "sha256": "76715860a4724b1cf0ee924c4ea6bcf2e93c3d6cf887389fd4e0959626f542e9",
+      "size": 160360,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "deepgemm_fp8_fp4_grouped",
+      "file": "fatbin/deepgemm_fp8_fp4_grouped.fatbin",
+      "sha256": "f3bd19f7385c3ad2c873876f336cc89862cb4a181a81b883a552ff0d3a611903",
+      "size": 304312,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "engine_ops",
+      "file": "fatbin/engine_ops.fatbin",
+      "sha256": "c95e83d50ab178ffa47e5921956bc44fd557d2d18ecd1a91da5cbba5d0c1b1fe",
+      "size": 680904,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "engine_ops_reference",
+      "file": "fatbin/engine_ops_reference.fatbin",
+      "sha256": "093c78189728b548b88a00a4ce093e6d02f04e958da860da67217996189ab0b4",
+      "size": 196776,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "flashinfer_fa2_sink_paged",
+      "file": "fatbin/flashinfer_fa2_sink_paged.fatbin",
+      "sha256": "55789bbd3af58bde637c9fcd0551ed30b21d5696cae919cbfe20e24aad053e02",
+      "size": 914336,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "kv_cipher",
+      "file": "fatbin/kv_cipher.fatbin",
+      "sha256": "34de69d72b3be811d779c7604f939b132e2aa00281abc6f5f1badf0b8d4732b8",
+      "size": 63912,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "rmsnorm",
+      "file": "fatbin/rmsnorm.fatbin",
+      "sha256": "f7910af91ef02140c407a9f0d10efdfb811efcfafd239114e20fd1e53c3b58c2",
+      "size": 43784,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    },
+    {
+      "name": "sampling",
+      "file": "fatbin/sampling.fatbin",
+      "sha256": "e83daa3ee7891e8ae6b1ec1f55a971e5885f391eed0876b9fecd700359424984",
+      "size": 435160,
+      "archs": [
+        "sm_100a",
+        "sm_103a"
+      ]
+    }
+  ]
+}

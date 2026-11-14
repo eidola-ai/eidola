@@ -1,0 +1,40 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# The shape scripts/check-manifest-determinism.sh must reject: a signing
+# job holding a private key feeds the job that assembles
+# artifact-manifest.json, and that job is itself granted the signing
+# environment. Both make a key-dependent manifest field representable.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  oci:
+    name: Build OCI images
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Record OCI partial
+        run: ./scripts/artifact-manifest.sh print-oci
+
+  apple-sign:
+    name: Sign and notarize
+    needs: oci
+    runs-on: self-hosted
+    environment: apple-signing
+    steps:
+      - name: Sign
+        run: codesign --sign "Developer ID Application" Eidola.app
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs:
+      - oci
+      - apple-sign
+    runs-on: ubuntu-24.04
+    environment: apple-signing
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full

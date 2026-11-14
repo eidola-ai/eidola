@@ -10,6 +10,10 @@
 //!    keystrokes take in production.
 //! 4. Assert against the view/core's public state with `read_with`.
 
+#[path = "support/backing.rs"]
+mod backing;
+use backing::Backing;
+
 use eidola_app_core::AppCore;
 use eidola_app_core::changes::{Change, ChangeOrigin};
 use eidola_app_core::error::AppError;
@@ -17,16 +21,16 @@ use eidola_app_core::updates::{
     Claim, ClaimDelta, ClaimsComparison, UpdateCheckResult, UpdateCheckSnapshot, VerifiedRelease,
 };
 use eidola_app_core::{
-    AttestationDetail, AttestationInfo, BalancesResult, ConfigState, CredentialLifecycleInfo,
-    PostBlock, PostNode, PostParticipant, PostTrace, RequestDetail, RequestInfo, SpaceInfo,
-    SpaceMessage, TraceEntry,
+    AttestationDetail, AttestationInfo, BalancesResult, CheckoutMint, ConfigState,
+    CredentialLifecycleInfo, PortalMint, PostBlock, PostNode, PostParticipant, PostTrace,
+    RequestDetail, RequestInfo, SpaceInfo, SpaceMessage, TraceEntry,
 };
 use eidola_gui::about::AboutView;
 use eidola_gui::account::AccountView;
 use eidola_gui::actions::{PostOnly, Send};
 use eidola_gui::agents_settings::AgentsSettingsView;
 use eidola_gui::library::LibraryView;
-use eidola_gui::onboarding::{OnboardingView, Slide};
+use eidola_gui::onboarding::{CheckoutFailure, OnboardingView, Slide, VerifyFailure};
 use eidola_gui::participants::EditMode;
 use eidola_gui::record::{RecordDetail, RecordSection, RecordView};
 use eidola_gui::settings::{SettingsPane, SettingsView};
@@ -156,6 +160,33 @@ fn wallet_view_constructs_against_stub_stores(cx: &mut TestAppContext) {
 
 /// A minimal fixture post — a user post with a real `action_id`, so the
 /// per-post affordances apply.
+/// Enable probe recording for the rest of the scope, **holding the suite's
+/// lock** — released, with probes switched back off, on drop.
+///
+/// Probe recording is a process-global flag, and this suite runs its tests in
+/// parallel. Toggling it bare let a neighbour's `set_probes_enabled(false)`
+/// land between one section's enable and its own `draw_window`, so the frame
+/// recorded nothing and the section's assertion failed with no defect behind
+/// it — reproducible at `--test-threads=32`, invisible at the default width.
+/// `tests/probe.rs` takes the same lock for the same reason; this is that
+/// idiom in the suite that grew probe reads later, made RAII so a failing
+/// assertion cannot leave the flag on for every test after it.
+struct ProbeSection(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl Drop for ProbeSection {
+    fn drop(&mut self) {
+        eidola_gui::probe::set_probes_enabled(false);
+    }
+}
+
+#[must_use]
+fn probes_on() -> ProbeSection {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    eidola_gui::probe::set_probes_enabled(true);
+    ProbeSection(guard)
+}
+
 fn fixture_user_post(action_id: &str, text: &str) -> PostNode {
     PostNode {
         action_id: action_id.into(),
@@ -184,6 +215,8 @@ fn fixture_user_post(action_id: &str, text: &str) -> PostNode {
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
+        continuable: false,
     }
 }
 
@@ -293,11 +326,11 @@ fn a_refused_space_creation_says_so_instead_of_showing_a_blank_page(cx: &mut Tes
 
 #[gpui::test]
 fn account_op_error_surfaces_and_clears(cx: &mut TestAppContext) {
-    // `AccountStore::create_account` must store its `Err` (honest-states rule:
-    // the Settings button can't silently do nothing). The banner renders from
-    // the stored error; the next attempt clears it.
+    // An account-lifecycle write must store its `Err` (honest-states rule: the
+    // Settings button can't silently do nothing). The banner renders from the
+    // stored error; the next attempt clears it.
     let stores = stub_stores(cx, |s| {
-        // No account yet — the Account pane shows the "Create account" button.
+        // No account yet — the Account pane shows its account-setup door.
         s.config_state = Some(config_state(false));
         s.eidola_trust = Some(eidola_trust());
     });
@@ -334,8 +367,8 @@ fn account_op_error_surfaces_and_clears(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     // A retry clears the error at the start of the attempt. On a stub there is
-    // no backend, so `create_account` clears the field and early-returns.
-    stores.account.update(cx, |s, cx| s.create_account(cx));
+    // no backend, so `reset_account` clears the field and early-returns.
+    stores.account.update(cx, |s, cx| s.reset_account(cx));
     cx.run_until_parked();
     stores.account.read_with(cx, |s, _| {
         assert!(
@@ -374,6 +407,7 @@ fn stub_space(id: &str, title: Option<&str>, snippet: Option<&str>, ts: i64) -> 
         last_activity_at: ts,
         message_count: 2,
         archived_at: None,
+        parent: None,
     }
 }
 
@@ -642,6 +676,148 @@ fn library_pencil_click_does_not_also_open_row(cx: &mut TestAppContext) {
             "clicking the pencil must NOT also open the row (the propagation/reshape race)"
         );
     });
+}
+
+/// The parent badge opens the conversation a delegated one was opened from —
+/// and, being a control inside a row that is itself a control, must not open
+/// its own row on the way (the rename pencil's propagation race, in the one
+/// other place a row now carries a click of its own).
+#[gpui::test]
+fn library_parent_badge_opens_the_parent_and_not_its_own_row(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![SpaceInfo {
+            parent: Some(eidola_app_core::SpaceParent {
+                space_id: "s0".into(),
+                title: Some("Tides and the moon".into()),
+            }),
+            ..stub_space("s1", Some("Check Friday's tide tables"), None, 1_000)
+        }];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores.clone(), window, cx))
+    });
+    cx.run_until_parked();
+
+    // The badge is a link only on the revealed row — the same gate the row's
+    // other verbs take, and what keeps the listing one tab stop.
+    view.update(cx, |v, _| v.set_hovered_for_test(Some(0)));
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(520.), px(620.)));
+    vcx.run_until_parked();
+    let bounds = vcx
+        .debug_bounds("parent-badge-0")
+        .expect("the revealed parent badge must be painted with its debug selector");
+    let center: Point<gpui::Pixels> = bounds.center();
+
+    vcx.simulate_click(center, Modifiers::default());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.open_parent_requests_for_test(),
+            1,
+            "the badge opens the conversation this one was delegated from"
+        );
+        assert_eq!(
+            v.open_space_requests_for_test(),
+            0,
+            "and never the row it sits in"
+        );
+    });
+}
+
+/// **The parent link is a tab stop, and it comes before the row's verbs.** The
+/// Library is one tab stop with a roving cursor whose row reveals its
+/// affordances, so making the badge a `Link` added a stop to that order —
+/// list → Parent → Rename → Archive → out — and a documented order nothing
+/// checks is a contract the next accessibility pass can quietly drop.
+///
+/// Two halves, because the harness can measure two different things. **That it
+/// is a stop** is measured by walking Tab until the focus wraps: a delegated
+/// row's listing has exactly one more stop than the same listing without a
+/// parent. **Where it is** follows from paint order, which is what orders stops
+/// within one tab region (`crate::focus::TabRegion`), so the badge painting to
+/// the left of the rename pencil is the same fact as its coming first.
+#[gpui::test]
+fn library_tab_order_reaches_a_parent_before_the_row_verbs(cx: &mut TestAppContext) {
+    /// Tab from the top until focus comes back where it started; the count is
+    /// the number of stops the window offers.
+    fn stops(cx: &mut TestAppContext, window: gpui::AnyWindowHandle) -> usize {
+        let focused = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| {
+                window.focused(cx).map(|h| format!("{h:?}"))
+            })
+            .unwrap()
+        };
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..50 {
+            cx.update_window(window, |_, window, cx| window.focus_next(cx))
+                .unwrap();
+            cx.update_window(window, |_, window, _| window.refresh())
+                .unwrap();
+            cx.run_until_parked();
+            let Some(id) = focused(cx) else { break };
+            if seen.contains(&id) {
+                break;
+            }
+            seen.push(id);
+        }
+        seen.len()
+    }
+
+    let ordinary = stub_space("s1", Some("Check Friday's tide tables"), None, 1_000);
+    let delegated = SpaceInfo {
+        parent: Some(eidola_app_core::SpaceParent {
+            space_id: "s0".into(),
+            title: Some("Tides and the moon".into()),
+        }),
+        ..ordinary.clone()
+    };
+
+    let plain_stores = stub_stores(cx, |s| s.spaces = vec![ordinary]);
+    let (plain_window, _) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(plain_stores, window, cx))
+    });
+    cx.run_until_parked();
+    let plain = stops(cx, plain_window);
+
+    let stores = stub_stores(cx, |s| s.spaces = vec![delegated]);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        stops(cx, window),
+        plain + 1,
+        "a delegated row puts one more stop in the Library's order"
+    );
+
+    // And the cursor row really is what reveals it — the badge is a `Link`
+    // where the verbs are live, not a stop that outlives its own reveal.
+    let seen = cx
+        .update_window(window, |_, window, cx| {
+            view.read_with(cx, |v, cx| v.cursor_and_reveal_for_test(window, cx))
+        })
+        .unwrap();
+    assert_eq!(seen.1, Some(0), "the row whose verbs are revealed");
+
+    // Position: stops within one tab region follow paint order, so this is the
+    // order Tab reads.
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(520.), px(620.)));
+    vcx.run_until_parked();
+    let badge = vcx
+        .debug_bounds("parent-badge-0")
+        .expect("the revealed parent badge is painted");
+    let pencil = vcx
+        .debug_bounds("rename-pencil-0")
+        .expect("the revealed rename pencil is painted");
+    assert!(
+        badge.origin.x < pencil.origin.x,
+        "Parent is painted — and so reached — before Rename: {badge:?} vs {pencil:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -984,6 +1160,7 @@ fn settings_nav_gates_account_wallet_on_eidola(cx: &mut TestAppContext) {
                 SettingsPane::Backends,
                 SettingsPane::Templates,
                 SettingsPane::Agents,
+                SettingsPane::Proxy,
                 SettingsPane::Account,
                 SettingsPane::Wallet,
             ],
@@ -1007,6 +1184,11 @@ fn settings_nav_gates_account_wallet_on_eidola(cx: &mut TestAppContext) {
                 SettingsPane::Backends,
                 SettingsPane::Templates,
                 SettingsPane::Agents,
+                // **The proxy is not gated on the account.** It can serve
+                // on-device models to a local tool with no Eidola backend at
+                // all, so hiding it here would withhold a working feature from
+                // exactly the reader who chose "no account, on-device only".
+                SettingsPane::Proxy,
             ],
             "eidola disabled hides Account and Wallet"
         );
@@ -1143,9 +1325,9 @@ fn settings_eidola_trust_editors_call_through(cx: &mut TestAppContext) {
 
     let mut trust = eidola_trust();
     trust.trusted_measurements = vec![eidola_app_core::MeasurementInfo {
-        snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
-        tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-        tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".into(),
+        measurement: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f89d2bb3ef58af1e7c0c12f3b4a5d6e7f8".into(),
+        host_data: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        guest_policy: "0x30133".into(),
     }];
     trust.trusted_measurements_are_override = true;
     trust.has_hardware_root_ca = true;
@@ -1289,6 +1471,7 @@ fn settings_asks_the_account_pane_for_its_live_reads_on_every_visit(cx: &mut Tes
     core.set_account_credentials("acct".into(), "secret".into())
         .unwrap();
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    let _backing = Backing::with_app(core, dir, cx);
     stores.config.update(cx, |s, cx| s.refresh(cx));
 
     let (_w, view) = open_view(cx, |window, cx| {
@@ -1342,13 +1525,6 @@ fn settings_asks_the_account_pane_for_its_live_reads_on_every_visit(cx: &mut Tes
              previous answer standing as current"
         );
     });
-
-    // Deterministic teardown — join the in-flight bridge tasks before `cx`
-    // drops the last `Arc<AppCore>` (see `record_refresh_supersedes_in_flight_fetch`
-    // for why the runtime must be idle first).
-    while core.runtime().metrics().num_alive_tasks() > 0 {
-        std::thread::yield_now();
-    }
 }
 
 #[gpui::test]
@@ -1467,6 +1643,12 @@ fn space_model_display_splits_name_and_backend(cx: &mut TestAppContext) {
         assert_eq!(
             v.model_display("gone@local", cx),
             ("gone".into(), "Local".into())
+        );
+        // A curated model with no file yet — a fresh profile's default — is
+        // still called by its catalog name.
+        assert_eq!(
+            v.model_display(eidola_app_core::config::DEFAULT_MODEL, cx),
+            ("Gemma 4 E4B".into(), "Local".into())
         );
     });
 }
@@ -1877,6 +2059,7 @@ fn a_reset_disowns_a_pending_link_before_the_bus_catches_up(cx: &mut TestAppCont
     core.set_account_credentials("acct-a".into(), "secret-a".into())
         .unwrap();
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    let _backing = Backing::with_app(core.clone(), dir, cx);
     stores.config.update(cx, |s, cx| s.refresh(cx));
 
     let (window, view) = open_view(cx, |window, cx| {
@@ -1884,10 +2067,10 @@ fn a_reset_disowns_a_pending_link_before_the_bus_catches_up(cx: &mut TestAppCont
     });
     draw_window(cx, window);
 
-    let minted_for = Some(gpui::SharedString::from("acct-a"));
+    let minted_for = eidola_app_core::config::fingerprint_of("acct-a", "secret-a");
 
     // The account is forgotten. Nothing is pumped, so the cache still says
-    // "acct-a" — which is precisely the state the old guard trusted.
+    // "acct-a" — which is precisely the state a cache-reading guard trusts.
     core.reset_account().expect("reset");
     stores.config.read_with(cx, |c, _| {
         assert_eq!(
@@ -1899,8 +2082,10 @@ fn a_reset_disowns_a_pending_link_before_the_bus_catches_up(cx: &mut TestAppCont
 
     view.update(cx, |v, cx| {
         v.finish_manage(
-            minted_for,
-            Ok("https://billing.example/portal/disowned".into()),
+            Ok(PortalMint {
+                url: "https://billing.example/portal/disowned".into(),
+                minted_for,
+            }),
             cx,
         )
     });
@@ -1930,17 +2115,15 @@ fn a_payment_link_minted_for_a_replaced_account_is_never_opened(cx: &mut TestApp
     });
     draw_window(cx, window);
 
-    let minted_for = Some(gpui::SharedString::from(
-        config_state(true)
-            .account_id
-            .expect("fixture has an account"),
-    ));
+    let minted_for = fingerprint_of_state(&config_state(true));
 
     // The account is unchanged: the link opens.
     view.update(cx, |v, cx| {
         v.finish_manage(
-            minted_for.clone(),
-            Ok("https://billing.example/portal/current".into()),
+            Ok(PortalMint {
+                url: "https://billing.example/portal/current".into(),
+                minted_for: minted_for.clone(),
+            }),
             cx,
         )
     });
@@ -1962,8 +2145,10 @@ fn a_payment_link_minted_for_a_replaced_account_is_never_opened(cx: &mut TestApp
 
     view.update(cx, |v, cx| {
         v.finish_manage(
-            minted_for.clone(),
-            Ok("https://billing.example/portal/stale".into()),
+            Ok(PortalMint {
+                url: "https://billing.example/portal/stale".into(),
+                minted_for: minted_for.clone(),
+            }),
             cx,
         )
     });
@@ -1983,8 +2168,10 @@ fn a_payment_link_minted_for_a_replaced_account_is_never_opened(cx: &mut TestApp
     // Checkout is the same door with the same hazard — money, not a portal.
     view.update(cx, |v, cx| {
         v.finish_checkout(
-            minted_for,
-            Ok("https://checkout.example/session/stale".into()),
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/stale".into(),
+                minted_for,
+            }),
             cx,
         )
     });
@@ -1999,6 +2186,153 @@ fn a_payment_link_minted_for_a_replaced_account_is_never_opened(cx: &mut TestApp
                 .is_some_and(|e| e.contains("account changed"))
         );
     });
+}
+
+#[gpui::test]
+fn a_payment_link_minted_for_an_account_swapped_away_and_back_is_never_opened(
+    cx: &mut TestAppContext,
+) {
+    // The two holes a before-and-after look of this profile cannot see, on
+    // both billing doors. The identity therefore comes from the answering
+    // side — `CheckoutMint::minted_for` / `PortalMint::minted_for`, computed
+    // where the request was signed — and is compared against the credentials
+    // configured when the link lands.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores.clone(), window, cx))
+    });
+    draw_window(cx, window);
+
+    let here = fingerprint_of_state(&config_state(true));
+
+    // The account still configured opens, on both doors — asserted first, or
+    // everything below is satisfied by a guard that refuses everything.
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/current".into(),
+                minted_for: here.clone(),
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://checkout.example/session/current"),
+        "the configured account's checkout must open"
+    );
+    view.read_with(cx, |v, _| assert!(v.checkout_error().is_none()));
+
+    view.update(cx, |v, cx| {
+        v.finish_manage(
+            Ok(PortalMint {
+                url: "https://billing.example/portal/current".into(),
+                minted_for: here.clone(),
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://billing.example/portal/current"),
+        "the configured account's portal must open"
+    );
+    view.read_with(cx, |v, _| assert!(v.manage_error().is_none()));
+
+    // (1) Swapped away and back. The account configured before the click and
+    // the account configured when the link lands are the same one, so a
+    // before-and-after comparison finds them equal and opens — but the mint
+    // ran while a third account was configured, so the link belongs to that
+    // one.
+    let mid_flight = {
+        let mut other = config_state(true);
+        other.account_id = Some("00000000-0000-7000-8000-000000000222".into());
+        other.account_secret = Some("a-third-accounts-secret".into());
+        fingerprint_of_state(&other)
+    };
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/aba".into(),
+                minted_for: mid_flight.clone(),
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://billing.example/portal/current"),
+        "a checkout signed under an account swapped away and back must not open"
+    );
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.checkout_error()
+                .is_some_and(|e| e.contains("account changed"))
+        );
+    });
+
+    view.update(cx, |v, cx| {
+        v.finish_manage(
+            Ok(PortalMint {
+                url: "https://billing.example/portal/aba".into(),
+                minted_for: mid_flight,
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://billing.example/portal/current"),
+        "a portal signed under an account swapped away and back must not open"
+    );
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.manage_error()
+                .is_some_and(|e| e.contains("account changed"))
+        );
+    });
+
+    // (2) Reset and reconfigured with the *same id* under a different secret.
+    // An id-only comparison calls those two the same account; the fingerprint
+    // is over the pair, so it does not.
+    let same_id_new_secret = {
+        let mut rekeyed = config_state(true);
+        rekeyed.account_secret = Some("the-same-account-re-keyed".into());
+        fingerprint_of_state(&rekeyed)
+    };
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/rekeyed".into(),
+                minted_for: same_id_new_secret.clone(),
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://billing.example/portal/current"),
+        "a checkout signed under a secret this profile no longer holds must not open"
+    );
+
+    view.update(cx, |v, cx| {
+        v.finish_manage(
+            Ok(PortalMint {
+                url: "https://billing.example/portal/rekeyed".into(),
+                minted_for: same_id_new_secret.clone(),
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://billing.example/portal/current"),
+        "a portal signed under a secret this profile no longer holds must not open"
+    );
+    assert_ne!(
+        same_id_new_secret, here,
+        "and the refusal above must be the secret, not the id"
+    );
 }
 
 #[gpui::test]
@@ -2361,22 +2695,28 @@ fn record_marks_stale_on_record_change_and_refresh_clears(cx: &mut TestAppContex
 #[gpui::test]
 fn record_refresh_supersedes_in_flight_fetch(cx: &mut TestAppContext) {
     // A real `AppCore` over tempdirs (the Record queries are local-DB reads),
-    // mirroring `tests/stores.rs::test_core`. `_dir` keeps the tempdir alive.
-    // The RecordView's page fetches run as spawned tasks on the AppCore's own
-    // tokio runtime (each holding an `Arc<AppCore>`), so declare that
-    // cross-thread mixing to the test scheduler — the established idiom (see
-    // `tests/stores.rs`), which also lets us join those tasks below without the
-    // non-determinism detector flagging their cross-thread completion wakes.
+    // mirroring `tests/stores.rs::test_core`. The RecordView's page fetches run
+    // as spawned tasks on the AppCore's own tokio runtime (each holding an
+    // `Arc<AppCore>`), so declare that cross-thread mixing to the test
+    // scheduler — the established idiom (see `tests/stores.rs`), which also
+    // lets the drain barrier join those tasks without the non-determinism
+    // detector flagging their cross-thread completion wakes.
     cx.executor().allow_parking();
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
-    let _dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let core = std::sync::Arc::new(
-        AppCore::new(_dir.path().to_path_buf(), _dir.path().join("data")).expect("open core"),
+        AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
     );
     core.runtime()
         .block_on(core.set_base_url("https://127.0.0.1:1/v1".into()))
         .unwrap();
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    // The drain barrier. Each page fetch — including the one `refresh`
+    // supersedes, which is *orphaned* on the tokio side once its gpui receiver
+    // is dropped, so no `run_until_parked` ever drains it — holds an
+    // `Arc<AppCore>` until it finishes on a tokio worker; the guard waits for
+    // them all before the last `Arc` can drop (`tests/support/backing.rs`).
+    let _backing = Backing::with_app(core, dir, cx);
     let (_window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| RecordView::new(stores.clone(), window, cx))
     });
@@ -2402,23 +2742,6 @@ fn record_refresh_supersedes_in_flight_fetch(cx: &mut TestAppContext) {
              superseded task was cancelled at replacement"
         );
     });
-
-    // Deterministic teardown — join every in-flight bridge task before the test
-    // returns. Each page fetch (including the one `refresh` superseded, which is
-    // *orphaned* on the tokio side once its gpui receiver is dropped, so no
-    // `run_until_parked` ever drains it) holds an `Arc<AppCore>` until it
-    // finishes on a tokio worker. The store entities keep the AppCore alive
-    // until `cx` teardown on this thread, but if a bridge task is still running
-    // then, it becomes the *last* owner and drops the tokio runtime from within
-    // its own worker → "Cannot drop a runtime ... from within an asynchronous
-    // context" — the intermittent CI panic (Linux-scheduler-sensitive; a local
-    // DB read almost always finishes first on macOS, so this never reproduced
-    // here). Waiting until the runtime is idle guarantees the last `Arc` always
-    // drops on the test thread. This is a precise join on the runtime's live
-    // task count, not a timed sleep, and does not touch the assertions above.
-    while core.runtime().metrics().num_alive_tasks() > 0 {
-        std::thread::yield_now();
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2441,6 +2764,19 @@ fn config_state(has_account: bool) -> ConfigState {
     }
 }
 
+/// The name a mint made under `state`'s credentials would report itself by —
+/// the same digest app-core computes where it signs the request, so the two
+/// are comparable (`eidola_app_core::config::account_fingerprint`).
+fn fingerprint_of_state(state: &ConfigState) -> String {
+    eidola_app_core::config::fingerprint_of(
+        state.account_id.as_deref().expect("fixture has an id"),
+        state
+            .account_secret
+            .as_deref()
+            .expect("fixture has a secret"),
+    )
+}
+
 /// The eidola connection + trust bundle fixture (moved off `ConfigState`);
 /// the General pane's base-URL + trust rows read it.
 fn eidola_trust() -> eidola_app_core::EidolaTrust {
@@ -2451,9 +2787,9 @@ fn eidola_trust() -> eidola_app_core::EidolaTrust {
         trusted_measurements: Vec::new(),
         trusted_measurements_are_override: false,
         pinned_measurement: eidola_app_core::MeasurementInfo {
-            snp: "1122334455667788112233445566778811223344556677881122334455667788".into(),
-            tdx_rtmr1: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
-            tdx_rtmr2: "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa".into(),
+            measurement: "112233445566778811223344556677881122334455667788112233445566778811223344556677881122334455667788".into(),
+            host_data: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+            guest_policy: "0x30133".into(),
         },
         has_hardware_root_ca: false,
         hardware_root_ca_pem: None,
@@ -2589,7 +2925,12 @@ fn inspector_participants_render_with_scroll_indicator(cx: &mut TestAppContext) 
         s.models = (0..12)
             .map(|i| eidola_app_core::ModelInfo {
                 id: format!("model-{i:02}"),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: eidola_app_core::ModelCapabilities::default(),
                 prompt_credits_per_token: 1.0,
                 completion_credits_per_token: 2.0,
                 request_credits: None,
@@ -2780,6 +3121,8 @@ fn open_floating_composer_scene(
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
+        continuable: false,
     };
     let nodes: Vec<PostNode> = (0..8)
         .map(|i| {
@@ -3006,6 +3349,8 @@ fn space_composer_dock_shadow_is_stable_cold(cx: &mut TestAppContext) {
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
+        continuable: false,
     };
     let mut nodes = Vec::new();
     for i in 0..12 {
@@ -3093,6 +3438,8 @@ fn space_resize_above_column_cap_does_not_churn_height_cache(cx: &mut TestAppCon
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
+        continuable: false,
     };
     let mut nodes = Vec::new();
     for i in 0..12 {
@@ -3934,6 +4281,7 @@ fn agent_participant(id: &str, label: &str) -> eidola_app_core::ParticipantInfo 
         kind: "agent".into(),
         label: label.into(),
         model_ref: Some("kimi-k2-6".into()),
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "human".into(),
         role: "member".into(),
@@ -5210,6 +5558,8 @@ fn space_composer_edit_arms_caret_scroll_into_view(cx: &mut TestAppContext) {
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
+        continuable: false,
     };
     let nodes: Vec<PostNode> = (0..8)
         .map(|i| {
@@ -5322,6 +5672,8 @@ fn space_scrolled_floating_composer_glides_to_its_top_by_the_dock(cx: &mut TestA
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
+        continuable: false,
     };
     let nodes: Vec<PostNode> = (0..8)
         .map(|i| {
@@ -7025,9 +7377,9 @@ fn space_regenerate_uses_posts_own_model(cx: &mut TestAppContext) {
     let (window, view) = open_space(cx, &stores, Some("s".into()));
     seed_space_pair(&view, window, cx);
 
-    cx.update_window(window, |_, _, cx| {
+    cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
-            v.regenerate(&"a2".into(), cx);
+            v.regenerate(&"a2".into(), window, cx);
         });
     })
     .unwrap();
@@ -7118,12 +7470,14 @@ fn onboarding_checkout_will_not_fund_an_account_linked_over(cx: &mut TestAppCont
     });
     let (_w, view) = open_onboarding(cx, &stores);
 
-    let minted_for = config_state(true).account_id;
+    let minted_for = fingerprint_of_state(&config_state(true));
 
     view.update(cx, |v, cx| {
         v.finish_checkout(
-            minted_for.clone(),
-            Ok("https://checkout.example/session/current".into()),
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/current".into(),
+                minted_for: minted_for.clone(),
+            }),
             cx,
         )
     });
@@ -7143,8 +7497,10 @@ fn onboarding_checkout_will_not_fund_an_account_linked_over(cx: &mut TestAppCont
 
     view.update(cx, |v, cx| {
         v.finish_checkout(
-            minted_for,
-            Ok("https://checkout.example/session/stale".into()),
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/stale".into(),
+                minted_for,
+            }),
             cx,
         )
     });
@@ -7155,8 +7511,295 @@ fn onboarding_checkout_will_not_fund_an_account_linked_over(cx: &mut TestAppCont
     );
     view.read_with(cx, |v, _| {
         assert!(
-            v.checkout_error()
-                .is_some_and(|e| e.contains("account changed"))
+            matches!(v.checkout_error(), Some(CheckoutFailure::StaleMint)),
+            "the link is discarded as minted for another account, and says so"
+        );
+    });
+}
+
+#[gpui::test]
+fn onboarding_checkout_will_not_fund_an_account_swapped_away_and_back(cx: &mut TestAppContext) {
+    // The Purchase slide takes the Account pane's guard whole, so it answers
+    // the same two cases a before-and-after look of this profile cannot see.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+    });
+    let (_w, view) = open_onboarding(cx, &stores);
+
+    let here = fingerprint_of_state(&config_state(true));
+
+    // The account still configured opens — asserted first, or everything
+    // below is satisfied by a guard that refuses everything.
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/current".into(),
+                minted_for: here.clone(),
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://checkout.example/session/current"),
+        "the configured account's checkout must open"
+    );
+    view.read_with(cx, |v, _| assert!(v.checkout_error().is_none()));
+
+    // Linked over and linked back: the account before the press and the
+    // account when the link lands are the same, and the mint ran under a
+    // third one in between.
+    let mid_flight = {
+        let mut other = config_state(true);
+        other.account_id = Some("00000000-0000-7000-8000-000000000333".into());
+        other.account_secret = Some("a-linked-accounts-secret".into());
+        fingerprint_of_state(&other)
+    };
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/aba".into(),
+                minted_for: mid_flight,
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://checkout.example/session/current"),
+        "a checkout signed under an account linked over and back must not open"
+    );
+    view.read_with(cx, |v, _| {
+        assert!(
+            matches!(v.checkout_error(), Some(CheckoutFailure::StaleMint)),
+            "the link is discarded as minted for another account, and says so"
+        );
+    });
+
+    // The same id under a secret this profile no longer holds is a different
+    // credential pair, and the fingerprint says so.
+    let same_id_new_secret = {
+        let mut rekeyed = config_state(true);
+        rekeyed.account_secret = Some("the-same-account-re-keyed".into());
+        fingerprint_of_state(&rekeyed)
+    };
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/rekeyed".into(),
+                minted_for: same_id_new_secret.clone(),
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://checkout.example/session/current"),
+        "a checkout signed under a secret this profile no longer holds must not open"
+    );
+    assert_ne!(
+        same_id_new_secret, here,
+        "and the refusal above must be the secret, not the id"
+    );
+}
+
+#[gpui::test]
+fn onboarding_creates_only_against_the_snapshot_it_rendered(cx: &mut TestAppContext) {
+    // Creating an account records acceptance of the terms of service and
+    // privacy policy, and that acceptance is submitted for *the versions this
+    // slide linked to* — `AppCore::account_create` takes the snapshot rather
+    // than re-reading it. So with no snapshot on screen there is nothing the
+    // agreement could be agreement to, and the flow must not create.
+    let stores = stub_stores(cx, |_| {});
+    let (_w, view) = open_onboarding(cx, &stores);
+    reveal(&view, cx, Slide::Responsibility, Slide::GetStarted);
+    reveal(&view, cx, Slide::GetStarted, Slide::CreateAccount);
+
+    view.update(cx, |v, cx| v.begin_create(cx));
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.creating_for_test(),
+            "with no documents loaded there is nothing to agree to, so nothing is created"
+        );
+    });
+
+    // The snapshot arrives and is agreed to; now the same click has
+    // something to submit.
+    set_terms(&stores, cx, vec![terms_doc("terms_of_service", 3, 'a')]);
+    view.update(cx, |v, cx| v.set_agreement(true, cx));
+    view.update(cx, |v, cx| v.begin_create(cx));
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.creating_for_test(),
+            "with the presented snapshot in hand, creation proceeds"
+        );
+    });
+}
+
+/// A required document, as `AccountStore::terms` would hold it.
+fn terms_doc(document: &str, version: i64, sha_seed: char) -> eidola_app_core::TermsDocument {
+    eidola_app_core::TermsDocument {
+        document: document.into(),
+        version,
+        url: format!("https://example.invalid/{document}/"),
+        sha256: sha_seed.to_string().repeat(64),
+    }
+}
+
+fn set_terms(stores: &Stores, cx: &mut TestAppContext, docs: Vec<eidola_app_core::TermsDocument>) {
+    stores.account.update(cx, |s, cx| {
+        s.set_terms_for_test(eidola_gui::loadable::Loadable::loaded(docs), cx);
+    });
+}
+
+#[gpui::test]
+fn onboarding_consent_does_not_survive_the_snapshot_it_was_given_for(cx: &mut TestAppContext) {
+    // Check the box, step back to "Get started", come back after a new
+    // version is published: the reveal re-fetches, and a stored `agreed` flag
+    // would leave the CTA live over documents the reader never saw — the
+    // defect the whole snapshot pass-through exists to prevent, re-entering
+    // through the UI's own state. Consent is bound to the documents it was
+    // given for, so a snapshot it does not cover reads as unchecked.
+    let stores = stub_stores(cx, |_| {});
+    let (_w, view) = open_onboarding(cx, &stores);
+    reveal(&view, cx, Slide::Responsibility, Slide::GetStarted);
+    reveal(&view, cx, Slide::GetStarted, Slide::CreateAccount);
+
+    set_terms(&stores, cx, vec![terms_doc("terms_of_service", 1, 'a')]);
+    view.update(cx, |v, cx| v.set_agreement(true, cx));
+    view.read_with(cx, |v, cx| {
+        assert!(v.agreed_for_test(cx), "the box is checked for version 1");
+    });
+
+    // Version 2 is published and the slide's refresh lands.
+    set_terms(&stores, cx, vec![terms_doc("terms_of_service", 2, 'b')]);
+    view.read_with(cx, |v, cx| {
+        assert!(
+            !v.agreed_for_test(cx),
+            "agreement to version 1 is not agreement to version 2, so the box \
+             must not read as checked over the new documents"
+        );
+    });
+    view.update(cx, |v, cx| v.begin_create(cx));
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.creating_for_test(),
+            "and nothing may be created against a snapshot the reader never agreed to"
+        );
+    });
+
+    // Re-agreeing to what is now on screen releases it again.
+    view.update(cx, |v, cx| v.set_agreement(true, cx));
+    view.update(cx, |v, cx| v.begin_create(cx));
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.creating_for_test(),
+            "consent given for the documents in hand does create"
+        );
+    });
+}
+
+#[gpui::test]
+fn onboarding_consent_is_not_recorded_before_there_is_anything_to_agree_to(
+    cx: &mut TestAppContext,
+) {
+    // Checking the box while the snapshot is still loading must record
+    // nothing — an empty consent would otherwise match the *next* empty
+    // snapshot and read as agreement to documents never shown.
+    let stores = stub_stores(cx, |_| {});
+    let (_w, view) = open_onboarding(cx, &stores);
+    reveal(&view, cx, Slide::Responsibility, Slide::GetStarted);
+    reveal(&view, cx, Slide::GetStarted, Slide::CreateAccount);
+
+    view.update(cx, |v, cx| v.set_agreement(true, cx));
+    view.read_with(cx, |v, cx| {
+        assert!(
+            !v.agreed_for_test(cx),
+            "there is no text on screen to have agreed to"
+        );
+    });
+
+    // A gate-less server answers with an empty snapshot; the earlier click
+    // must not now count as agreement to it.
+    set_terms(&stores, cx, Vec::new());
+    view.read_with(cx, |v, cx| {
+        assert!(
+            !v.agreed_for_test(cx),
+            "a click made before any answer arrived is not consent to the answer"
+        );
+    });
+}
+
+#[gpui::test]
+fn onboarding_consent_does_not_carry_over_to_a_snapshot_that_gained_a_document(
+    cx: &mut TestAppContext,
+) {
+    // The sibling of the version-advance case, and the one a per-document
+    // check would miss: nothing the reader agreed to changed, a document was
+    // simply *added*. The consent binding compares whole sets, so the box
+    // unticks — agreement to one document is not agreement to two.
+    let stores = stub_stores(cx, |_| {});
+    let (_w, view) = open_onboarding(cx, &stores);
+    reveal(&view, cx, Slide::Responsibility, Slide::GetStarted);
+    reveal(&view, cx, Slide::GetStarted, Slide::CreateAccount);
+
+    set_terms(&stores, cx, vec![terms_doc("terms_of_service", 1, 'a')]);
+    view.update(cx, |v, cx| v.set_agreement(true, cx));
+    view.read_with(cx, |v, cx| assert!(v.agreed_for_test(cx)));
+
+    set_terms(
+        &stores,
+        cx,
+        vec![
+            terms_doc("terms_of_service", 1, 'a'),
+            terms_doc("privacy_policy", 1, 'b'),
+        ],
+    );
+    view.read_with(cx, |v, cx| {
+        assert!(
+            !v.agreed_for_test(cx),
+            "a document the reader has not seen joined the set, so the earlier \
+             agreement no longer covers what is on screen"
+        );
+    });
+    view.update(cx, |v, cx| v.begin_create(cx));
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.creating_for_test(),
+            "and nothing is created against the enlarged set"
+        );
+    });
+}
+
+/// A reordered listing of the same texts is the same thing to agree to.
+#[gpui::test]
+fn onboarding_consent_survives_a_reordered_listing_of_the_same_documents(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |_| {});
+    let (_w, view) = open_onboarding(cx, &stores);
+    reveal(&view, cx, Slide::Responsibility, Slide::GetStarted);
+    reveal(&view, cx, Slide::GetStarted, Slide::CreateAccount);
+
+    set_terms(
+        &stores,
+        cx,
+        vec![
+            terms_doc("terms_of_service", 1, 'a'),
+            terms_doc("privacy_policy", 1, 'b'),
+        ],
+    );
+    view.update(cx, |v, cx| v.set_agreement(true, cx));
+    set_terms(
+        &stores,
+        cx,
+        vec![
+            terms_doc("privacy_policy", 1, 'b'),
+            terms_doc("terms_of_service", 1, 'a'),
+        ],
+    );
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.agreed_for_test(cx),
+            "same documents, same hashes — order is not consent"
         );
     });
 }
@@ -7416,10 +8059,14 @@ fn onboarding_verify_requires_both_fields(cx: &mut TestAppContext) {
     let stores = stub_stores(cx, |_| {});
     let (_w, view) = open_onboarding(cx, &stores);
 
-    // Both inputs blank: verification refuses with a message, no request.
+    // Both inputs blank: verification refuses before any request, and the
+    // refusal is the typed reason rather than a sentence frozen at the refusal.
     view.update(cx, |v, cx| v.begin_verify(cx));
     view.read_with(cx, |v, _| {
-        assert!(matches!(v.verify_result_for_test(), Some(Err(_))));
+        assert!(matches!(
+            v.verify_result_for_test(),
+            Some(Err(VerifyFailure::MissingCredentials))
+        ));
     });
 }
 
@@ -7446,6 +8093,342 @@ fn onboarding_verify_with_inputs_is_backend_gated_on_stub(cx: &mut TestAppContex
             "a stub backend yields no verification result, and no field error"
         );
     });
+}
+
+/// **Onboarding holds what happened, and chooses the words at render.**
+///
+/// Four slots used to hold a formatted sentence — the creation refusal, the
+/// terms-fetch failure, the credential check's result and the refused checkout
+/// — and a sentence in state is a cached render decision: `i18n::apply`
+/// refreshes every window but replaces no state, so the old language would
+/// repaint until something else replaced it.
+///
+/// The locale is switched **without re-emitting any of them**, which is the
+/// whole of the test: a cache would pass the first assertion of each group and
+/// fail every one after it.
+#[gpui::test]
+fn onboarding_says_what_happened_in_the_readers_language(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+    });
+    let (_w, view) = open_onboarding(cx, &stores);
+
+    // -- The refusal this surface makes itself, before any request ---------
+    view.update(cx, |v, cx| v.begin_verify(cx));
+    for (tag, expected) in [
+        ("en", "Enter both an account ID and secret."),
+        (
+            "fr",
+            "Saisissez à la fois un identifiant et un secret de compte.",
+        ),
+        ("zh-Hans", "请同时填写账户 ID 和密钥。"),
+        ("en", "Enter both an account ID and secret."),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.verify_message_for_test(cx)),
+            Some(expected.into()),
+            "{tag} repaints the refusal already standing — nothing was re-emitted"
+        );
+    }
+
+    // -- The one server refusal this layer has words of its own for --------
+    view.update(cx, |v, cx| {
+        v.finish_verify(
+            Err(AppError::Server {
+                status: 401,
+                message: "unauthorized".into(),
+            }),
+            cx,
+        )
+    });
+    for (tag, expected) in [
+        (
+            "en",
+            "We couldn't verify that account. Check the ID and secret, or create a new account \
+             instead.",
+        ),
+        (
+            "fr",
+            "Nous n'avons pas pu vérifier ce compte. Vérifiez l'identifiant et le secret, ou créez \
+             plutôt un nouveau compte.",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.verify_message_for_test(cx)),
+            Some(expected.into()),
+            "{tag} repaints the credential refusal already standing"
+        );
+    }
+
+    // -- And the balance it reports, whose noun agrees with the number -----
+    view.update(cx, |v, cx| {
+        v.finish_verify(
+            Ok(eidola_app_core::BalancesResult {
+                available: 1,
+                pools: Vec::new(),
+            }),
+            cx,
+        )
+    });
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.verify_message_for_test(cx)),
+        Some("This account is valid and has a balance of 1 credit.".into()),
+        "one credit is one credit, not \"1 credits\""
+    );
+    view.update(cx, |v, cx| {
+        v.finish_verify(
+            Ok(eidola_app_core::BalancesResult {
+                available: 1_250,
+                pools: Vec::new(),
+            }),
+            cx,
+        )
+    });
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.verify_message_for_test(cx)),
+        Some("This account is valid and has a balance of 1,250 credits.".into()),
+    );
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.verify_message_for_test(cx)),
+        Some("Ce compte est valide et dispose d'un solde de 1,250 crédits.".into()),
+        "the balance already on screen follows the locale too"
+    );
+
+    // -- The checkout link this surface itself declined to open ------------
+    let minted_for = fingerprint_of_state(&config_state(true));
+    stores.config.update(cx, |c, _| {
+        let mut state = config_state(true);
+        state.account_id = Some("00000000-0000-7000-8000-000000000444".into());
+        c.set_state_for_test(Some(state));
+    });
+    view.update(cx, |v, cx| {
+        v.finish_checkout(
+            Ok(CheckoutMint {
+                url: "https://checkout.example/session/stale".into(),
+                minted_for,
+            }),
+            cx,
+        )
+    });
+    for (tag, expected) in [
+        (
+            "en",
+            "The account changed while that was being prepared, so nothing was opened. Try again.",
+        ),
+        (
+            "zh-Hant",
+            "準備期間帳戶發生了變更，因此沒有開啟任何頁面。請重試。",
+        ),
+        (
+            "en",
+            "The account changed while that was being prepared, so nothing was opened. Try again.",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.checkout_message_for_test(cx)),
+            Some(expected.into()),
+            "{tag} repaints the discarded link's explanation"
+        );
+    }
+
+    // -- And the boundary this extraction deliberately leaves alone --------
+    //
+    // A creation refusal carries no copy of ours, so what the reader is shown
+    // is the typed error's own text: English in every locale, because app-core
+    // is locale-free and the payload a faithful translation would need is not
+    // in the variant to read. Pinned so it stays a decision rather than an
+    // oversight. One variant has earned a sentence: `AccountNotSaved`, pinned in
+    // `onboarding_an_unsaved_account_is_told_in_the_readers_language`.
+    view.update(cx, |v, cx| {
+        v.set_create_error_for_test(
+            AppError::Server {
+                status: 503,
+                message: "temporarily unavailable".into(),
+            },
+            cx,
+        )
+    });
+    let english = view.read_with(cx, |v, cx| v.create_message_for_test(cx));
+    for tag in ["fr", "zh-Hans"] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.create_message_for_test(cx)),
+            english,
+            "the typed error's own words are what this surface still shows in {tag}"
+        );
+    }
+}
+
+/// **An account created but not saved has a sentence of its own.** Every
+/// other creation refusal shows the typed error's English text; this one
+/// carries the only copy of a secret, so the reader is told in their language
+/// what happened and what to do with the rows beneath it.
+#[gpui::test]
+fn onboarding_an_unsaved_account_is_told_in_the_readers_language(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |_| {});
+    let (_window, view) = open_onboarding(cx, &stores);
+    view.update(cx, |v, cx| {
+        v.set_create_error_for_test(
+            AppError::AccountNotSaved {
+                account: Box::new(eidola_app_core::error::UnsavedAccount {
+                    account_id: "00000000-0000-0000-0000-00000000000c".into(),
+                    secret: eidola_app_core::error::AccountSecret::new("only-copy".into()),
+                    terms: eidola_app_core::TermsAcceptance::Complete,
+                    recovery_file: None,
+                }),
+                reason: "config error: unreadable".into(),
+            },
+            cx,
+        )
+    });
+    let mut seen = Vec::new();
+    for tag in ["en", "fr", "zh-Hans"] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let message = view
+            .read_with(cx, |v, cx| v.create_message_for_test(cx))
+            .expect("a message is shown");
+        assert!(
+            message.contains("config error: unreadable") && !message.contains("only-copy"),
+            "{tag}: names the cause and never the secret: {message}"
+        );
+        assert!(
+            !seen.contains(&message),
+            "{tag} repeats another locale: {message}"
+        );
+        seen.push(message);
+    }
+
+    // A second create would replace the only copy of the secret on screen
+    // with its own outcome; it does not start, even with a snapshot agreed to
+    // (which is what would otherwise let it).
+    reveal(&view, cx, Slide::Responsibility, Slide::GetStarted);
+    reveal(&view, cx, Slide::GetStarted, Slide::CreateAccount);
+    set_terms(&stores, cx, vec![terms_doc("terms_of_service", 3, 'a')]);
+    view.update(cx, |v, cx| v.set_agreement(true, cx));
+    view.update(cx, |v, cx| v.begin_create(cx));
+    assert!(
+        !view.read_with(cx, |v, _| v.creating_for_test())
+            && view
+                .read_with(cx, |v, cx| v.create_message_for_test(cx))
+                .is_some_and(|m| m.contains("config error: unreadable")),
+        "another create started over an unsaved account"
+    );
+}
+
+/// **An unsaved account says where its credential was also written.** The
+/// file beside the profile outlives the window, and nothing removes it but
+/// the reader, so the line naming it — and saying when to delete it — reads
+/// in their language, with the path intact in every one.
+#[gpui::test]
+fn onboarding_an_unsaved_account_names_its_recovery_file_in_the_readers_language(
+    cx: &mut TestAppContext,
+) {
+    let stores = stub_stores(cx, |_| {});
+    let (_window, view) = open_onboarding(cx, &stores);
+    let unsaved = |recovery_file: Option<std::path::PathBuf>| AppError::AccountNotSaved {
+        account: Box::new(eidola_app_core::error::UnsavedAccount {
+            account_id: "00000000-0000-0000-0000-00000000000c".into(),
+            secret: eidola_app_core::error::AccountSecret::new("only-copy".into()),
+            terms: eidola_app_core::TermsAcceptance::Complete,
+            recovery_file,
+        }),
+        reason: "config error: unreadable".into(),
+    };
+    let path = "/profile/account-recovery-00000000-0000-0000-0000-00000000000c.toml";
+    view.update(cx, |v, cx| {
+        v.set_create_error_for_test(unsaved(Some(path.into())), cx)
+    });
+    let mut seen = Vec::new();
+    for tag in ["en", "es", "fr", "zh-Hans", "zh-Hant"] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let line = view
+            .read_with(cx, |v, cx| v.create_recovery_file_for_test(cx))
+            .expect("the recovery file is named")
+            .to_string();
+        assert!(
+            line.contains(path) && !line.contains("only-copy"),
+            "{tag}: names the file and never the secret: {line}"
+        );
+        assert!(
+            !seen.contains(&line),
+            "{tag} repeats another locale: {line}"
+        );
+        seen.push(line);
+    }
+
+    // When that write failed too there is no file to name: the rows on screen
+    // are the only copy, and the line says nothing rather than a wrong thing.
+    view.update(cx, |v, cx| v.set_create_error_for_test(unsaved(None), cx));
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.create_recovery_file_for_test(cx)),
+        None
+    );
+}
+
+/// **The slide prose is chosen at render, not seeded once.**
+///
+/// Each slide's editor is element-owned state initialised on its first frame,
+/// so a body written in once would repaint in the language the window opened
+/// in for the rest of the session. `slide_body` is the one call both the render
+/// and this test make.
+#[gpui::test]
+fn onboarding_slide_prose_follows_the_reader(cx: &mut TestAppContext) {
+    let stores = stub_stores(cx, |_| {});
+    let (window, view) = open_onboarding(cx, &stores);
+
+    // **The buffer, not the message.** A slide's editor is minted on the frame
+    // its slide is first revealed; if the body were seeded there rather than
+    // pushed on every frame, the message below would move with the locale and
+    // the text on the page would not.
+    for (tag, opening) in [
+        ("en", "## *Pause here*"),
+        ("fr", "## *Faites une pause*"),
+        ("zh-Hans", "## *请先停一下*"),
+        ("en", "## *Pause here*"),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        cx.update_window(window, |_, window, _| window.refresh())
+            .unwrap();
+        cx.run_until_parked();
+
+        let body = cx.update(|cx| OnboardingView::slide_body_for_test(Slide::Pause, cx));
+        assert!(
+            body.starts_with(opening),
+            "{tag}: the first slide's message must be the reader's; got {body:?}"
+        );
+        let painted = view
+            .read_with(cx, |v, cx| v.slide_prose_for_test(Slide::Pause, cx))
+            .expect("the first slide is revealed from the start");
+        assert_eq!(
+            painted,
+            body.to_string(),
+            "{tag}: the editor holds what the render chose — nothing was seeded once"
+        );
+    }
+
+    // The paragraph structure survives the trip through FTL — a body that
+    // collapsed into one paragraph would render as one run-on line.
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+    let tool = cx.update(|cx| OnboardingView::slide_body_for_test(Slide::Tool, cx));
+    assert!(
+        tool.contains("\n\n- Its behavior"),
+        "the bullet list must still stand apart from the paragraph above it: {tool:?}"
+    );
+
+    // The one link target inside a body is the app's, not the translation's.
+    for tag in ["en", "fr", "zh-Hant"] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let started = cx.update(|cx| OnboardingView::slide_body_for_test(Slide::GetStarted, cx));
+        assert!(
+            started.contains("(https://www.eidola.ai/docs/privacy-guarantees/#2-unlinkability)"),
+            "{tag} must link the same evidence: {started:?}"
+        );
+    }
 }
 
 #[gpui::test]
@@ -7703,7 +8686,7 @@ fn space_title_band_press_does_not_select_the_post_beneath(cx: &mut TestAppConte
 /// created space (born from the default template: "You" + the seeded agent).
 fn participants_scene(
     cx: &mut TestAppContext,
-) -> (Stores, std::sync::Arc<AppCore>, tempfile::TempDir, String) {
+) -> (Stores, std::sync::Arc<AppCore>, Backing, String) {
     cx.executor().allow_parking();
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let dir = tempfile::tempdir().unwrap();
@@ -7719,13 +8702,8 @@ fn participants_scene(
         .expect("create space")
         .id;
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
-    (stores, core, dir, space)
-}
-
-fn drain_runtime(core: &std::sync::Arc<AppCore>) {
-    while core.runtime().metrics().num_alive_tasks() > 0 {
-        std::thread::yield_now();
-    }
+    let backing = Backing::with_app(core.clone(), dir, cx);
+    (stores, core, backing, space)
 }
 
 /// Poll `run_until_parked` until `pred` holds — a write-then-relist round-trips
@@ -7770,7 +8748,7 @@ fn open_participants_inspector(
 
 #[gpui::test]
 fn inspector_participants_add_and_remove(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
@@ -7829,8 +8807,6 @@ fn inspector_participants_add_and_remove(cx: &mut TestAppContext) {
     wait_until(cx, "participant removed", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
     });
-
-    drain_runtime(&core);
 }
 
 /// The system prompt is editable where the participant lives: open a member's
@@ -7842,7 +8818,7 @@ fn inspector_participants_add_and_remove(cx: &mut TestAppContext) {
 /// template when the window opened, not when a first message was sent.
 #[gpui::test]
 fn inspector_participants_work_on_a_fresh_space_with_no_posts(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _seeded) = participants_scene(cx);
+    let (stores, core, _backing, _seeded) = participants_scene(cx);
 
     // ⌘N — no space id; the window mints one and opens on it.
     let (window, view) = open_space(cx, &stores, None);
@@ -7919,7 +8895,7 @@ fn inspector_participants_work_on_a_fresh_space_with_no_posts(cx: &mut TestAppCo
 
 #[gpui::test]
 fn inspector_participant_system_prompt_round_trips(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
@@ -7977,8 +8953,225 @@ fn inspector_participant_system_prompt_round_trips(cx: &mut TestAppContext) {
         reopened.read_with(cx, |s, _| s.value().to_string()),
         "Answer only in questions."
     );
+}
 
-    drain_runtime(&core);
+const SWITCH_OLD: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const SWITCH_NEW: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const SWITCH_FILES: &[eidola_app_core::model_catalog::WeightsFile] =
+    &[eidola_app_core::model_catalog::WeightsFile {
+        path: "model.safetensors",
+        size: 9,
+        sha256: "5555555555555555555555555555555555555555555555555555555555555555",
+    }];
+/// A catalog whose `switch-fixture` tag has moved from [`SWITCH_OLD`] to
+/// [`SWITCH_NEW`].
+const SWITCH_CATALOG: &[eidola_app_core::model_catalog::CatalogRow] = &[
+    eidola_app_core::model_catalog::CatalogRow {
+        sha256: SWITCH_NEW,
+        tags: &["switch-fixture"],
+        name: "Switch fixture",
+        repo: "example/fixture",
+        revision: "6666666666666666666666666666666666666666",
+        files: SWITCH_FILES,
+        lifecycle: eidola_app_core::model_catalog::Lifecycle::Current,
+    },
+    eidola_app_core::model_catalog::CatalogRow {
+        sha256: SWITCH_OLD,
+        tags: &[],
+        name: "Switch fixture (previous)",
+        repo: "example/fixture",
+        revision: "7777777777777777777777777777777777777777",
+        files: SWITCH_FILES,
+        lifecycle: eidola_app_core::model_catalog::Lifecycle::Current,
+    },
+];
+
+/// **A Save while a switch to newer weights is in flight keeps the switch.**
+/// The editor shows the model the switch replaces until the roster shows the
+/// switch landed, and the store runs the Save after the switch: written whole,
+/// the Save would put the old pin back. It writes the label and leaves the
+/// model to the switch.
+#[gpui::test]
+fn a_save_racing_a_weights_switch_keeps_the_newer_pin(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    let (stores, core, _backing, space) = participants_scene(cx);
+    core.test_set_model_catalog(SWITCH_CATALOG);
+    let old_pin = format!("switch-fixture@sha256:{SWITCH_OLD}@eidola");
+    let new_pin = format!("switch-fixture@sha256:{SWITCH_NEW}@eidola");
+    let agent = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .unwrap()
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the default template seeds one agent");
+    if agent.source == "referenced" {
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                space.clone(),
+                agent.id.clone(),
+                eidola_app_core::ParticipantOverride {
+                    model_ref: Some(Some(old_pin.clone())),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+    } else {
+        core.runtime()
+            .block_on(core.update_space_participant(
+                agent.id.clone(),
+                eidola_app_core::ParticipantUpdate {
+                    label: None,
+                    model_ref: Some(Some(old_pin.clone())),
+                    system_prompt: None,
+                    notify_policy: None,
+                },
+                eidola_app_core::ExpectedScope::Any,
+            ))
+            .unwrap();
+    }
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    let agent_id = agent.id.clone();
+    wait_until(cx, "the pin's notice", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space).iter().any(|p| {
+                p.id == agent_id
+                    && p.model_notices
+                        .iter()
+                        .any(|n| matches!(n, ModelNotice::NewerAvailable { .. }))
+            })
+        })
+    });
+    let notice = ModelNotice::NewerAvailable {
+        tag: "switch-fixture".into(),
+        newer_sha256: SWITCH_NEW.into(),
+    };
+
+    // Open the editor, switch, and Save a label change before any re-read.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent_id, window, cx)
+        });
+    })
+    .unwrap();
+    let label = view
+        .read_with(cx, |v, _| v.inspector_editing_label_state())
+        .expect("the editor");
+    cx.update_window(window, |_, window, cx| {
+        label.update(cx, |s, cx| s.set_value("Renamed", window, cx));
+        view.update(cx, |v, cx| {
+            v.inspector_act_on_model_notice(&agent_id, &notice, window, cx);
+            v.inspector_save_participant_edit(window, cx);
+        });
+    })
+    .unwrap();
+
+    wait_until(cx, "both writes settled", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .any(|p| p.id == agent_id && p.label == "Renamed")
+        })
+    });
+    let stored = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .unwrap()
+        .into_iter()
+        .find(|p| p.id == agent_id)
+        .unwrap();
+    assert_eq!(stored.label, "Renamed");
+    assert_eq!(
+        stored.model_ref.as_deref(),
+        Some(new_pin.as_str()),
+        "the switch held"
+    );
+}
+
+/// **A Share while a switch to newer weights is in flight keeps the switch.**
+/// Share carries the editor's persona into the shared agent, and the store
+/// runs it after the switch; the persona leaves the model to the switch, so
+/// the shared agent has the newer pin.
+#[gpui::test]
+fn a_share_racing_a_weights_switch_keeps_the_newer_pin(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    let (stores, core, _backing, space) = participants_scene(cx);
+    core.test_set_model_catalog(SWITCH_CATALOG);
+    let old_pin = format!("switch-fixture@sha256:{SWITCH_OLD}@eidola");
+    let new_pin = format!("switch-fixture@sha256:{SWITCH_NEW}@eidola");
+    let agent = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .unwrap()
+        .into_iter()
+        .find(|p| p.kind == "agent")
+        .expect("the default template seeds one agent");
+    assert_eq!(agent.source, "owned", "the seeded agent starts space-owned");
+    core.runtime()
+        .block_on(core.update_space_participant(
+            agent.id.clone(),
+            eidola_app_core::ParticipantUpdate {
+                label: None,
+                model_ref: Some(Some(old_pin.clone())),
+                system_prompt: None,
+                notify_policy: None,
+            },
+            eidola_app_core::ExpectedScope::Any,
+        ))
+        .unwrap();
+    let (window, view) = open_participants_inspector(cx, &stores, &space);
+    let agent_id = agent.id.clone();
+    wait_until(cx, "the pin's notice", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space).iter().any(|p| {
+                p.id == agent_id
+                    && p.model_notices
+                        .iter()
+                        .any(|n| matches!(n, ModelNotice::NewerAvailable { .. }))
+            })
+        })
+    });
+    let notice = ModelNotice::NewerAvailable {
+        tag: "switch-fixture".into(),
+        newer_sha256: SWITCH_NEW.into(),
+    };
+
+    // Open the editor, switch, and Share before any re-read.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant(&agent_id, window, cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_act_on_model_notice(&agent_id, &notice, window, cx);
+            v.inspector_begin_promote(window, cx);
+            v.inspector_confirm_promote(window, cx);
+        });
+    })
+    .unwrap();
+
+    wait_until(cx, "both writes settled", |cx| {
+        stores.participants.read_with(cx, |s, _| {
+            s.list(&space)
+                .iter()
+                .any(|p| p.id == agent_id && p.source == "referenced")
+        })
+    });
+    let stored = core
+        .runtime()
+        .block_on(core.list_space_participants(space.clone()))
+        .unwrap()
+        .into_iter()
+        .find(|p| p.id == agent_id)
+        .unwrap();
+    assert_eq!(stored.source, "referenced", "the share landed");
+    assert_eq!(
+        stored.model_ref.as_deref(),
+        Some(new_pin.as_str()),
+        "the switch held"
+    );
 }
 
 /// The headline fork: editing a **referenced global** ("You") writes either the
@@ -7986,7 +9179,7 @@ fn inspector_participant_system_prompt_round_trips(cx: &mut TestAppContext) {
 /// view routes to the right store method per its mode.
 #[gpui::test]
 fn inspector_participants_override_vs_edit_everywhere(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
@@ -8064,8 +9257,6 @@ fn inspector_participants_override_vs_edit_everywhere(cx: &mut TestAppContext) {
                 .unwrap_or(false)
         })
     });
-
-    drain_runtime(&core);
 }
 
 /// The **promote affordance** (task 36): "Share this agent…" on a space-owned
@@ -8079,7 +9270,7 @@ fn inspector_participants_override_vs_edit_everywhere(cx: &mut TestAppContext) {
 /// code at all, since both are read off the store's own re-list.
 #[gpui::test]
 fn inspector_sharing_an_agent_promotes_it_in_place(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, backing, space) = participants_scene(cx);
     let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
@@ -8116,7 +9307,7 @@ fn inspector_sharing_an_agent_promotes_it_in_place(cx: &mut TestAppContext) {
     })
     .unwrap();
     assert!(!view.read_with(cx, |v, _| v.inspector_promote_confirming()));
-    cx.run_until_parked();
+    backing.settle();
     assert_eq!(
         stores.participants.read_with(cx, |s, _| {
             s.list(&space)
@@ -8171,8 +9362,6 @@ fn inspector_sharing_an_agent_promotes_it_in_place(cx: &mut TestAppContext) {
             .read_with(cx, |s, _| s.op_errors_for(&space).is_empty()),
         "the share was accepted"
     );
-
-    drain_runtime(&core);
 }
 
 /// **The confirmation is about the persona on screen.** "Share this agent…" is
@@ -8184,7 +9373,7 @@ fn inspector_sharing_an_agent_promotes_it_in_place(cx: &mut TestAppContext) {
 /// (Codex review, PR #279).
 #[gpui::test]
 fn inspector_sharing_a_dirty_editor_shares_the_persona_on_screen(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
@@ -8281,8 +9470,6 @@ fn inspector_sharing_a_dirty_editor_shares_the_persona_on_screen(cx: &mut TestAp
             .read_with(cx, |s, _| s.op_errors_for(&space).is_empty()),
         "the share was accepted"
     );
-
-    drain_runtime(&core);
 }
 
 /// The inspector's half of the handback rule (Codex review, PR #279): the
@@ -8292,7 +9479,7 @@ fn inspector_sharing_a_dirty_editor_shares_the_persona_on_screen(cx: &mut TestAp
 /// holding a dead handle.
 #[gpui::test]
 fn inspector_hands_the_keyboard_back_when_a_form_closes(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
@@ -8443,8 +9630,6 @@ fn inspector_hands_the_keyboard_back_when_a_form_closes(cx: &mut TestAppContext)
         view_holds_the_keyboard(cx),
         "the add form hands it back too"
     );
-
-    drain_runtime(&core);
 }
 
 /// **An open editor is valid only while its row still answers to the shape it
@@ -8461,7 +9646,7 @@ fn inspector_hands_the_keyboard_back_when_a_form_closes(cx: &mut TestAppContext)
 fn inspector_editor_retires_when_its_row_stops_being_what_it_was_seeded_as(
     cx: &mut TestAppContext,
 ) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, core, backing, space) = participants_scene(cx);
     let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
@@ -8527,15 +9712,13 @@ fn inspector_editor_retires_when_its_row_stops_being_what_it_was_seeded_as(
 
     // The verb the stale editor was still offering writes nothing now. Read the
     // database, not the cached roster: the claim is about what was durably
-    // published, and `drain_runtime` is what makes "no write was issued" and "a
-    // write landed" distinguishable in one bounded step.
+    // published, and settling is what makes "no write was issued" and "a write
+    // landed" distinguishable in one bounded step.
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| v.inspector_save_participant_edit(window, cx));
     })
     .unwrap();
-    cx.run_until_parked();
-    drain_runtime(&core);
-    cx.run_until_parked();
+    backing.settle();
     let durable = core
         .runtime()
         .block_on(core.list_space_participants(space.clone()))
@@ -8561,8 +9744,6 @@ fn inspector_editor_retires_when_its_row_stops_being_what_it_was_seeded_as(
         Some(EditMode::OverrideHere),
         "a referenced global opens in this-space-only"
     );
-
-    drain_runtime(&core);
 }
 
 /// A shared agent's **notebook** is a real space, and the Library is the list of
@@ -8571,7 +9752,7 @@ fn inspector_editor_retires_when_its_row_stops_being_what_it_was_seeded_as(
 /// end of that promise, read where a person would read it.
 #[gpui::test]
 fn a_shared_agents_notebook_stays_out_of_the_library(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (_window, _view) = open_view(cx, |window, cx| {
         cx.new(|cx| LibraryView::new(stores.clone(), window, cx))
     });
@@ -8622,8 +9803,6 @@ fn a_shared_agents_notebook_stays_out_of_the_library(cx: &mut TestAppContext) {
         vec![space],
         "the notebook created by the share is not a conversation"
     );
-
-    drain_runtime(&core);
 }
 
 /// Promote the seeded agent and hand back its id — the precondition of every
@@ -8672,7 +9851,7 @@ fn share_the_seeded_agent(cx: &mut TestAppContext, stores: &Stores, space: &str)
 /// notebook opens as an ordinary space window.
 #[gpui::test]
 fn agents_pane_lists_edits_and_opens_the_notebook(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
     });
@@ -8734,8 +9913,6 @@ fn agents_pane_lists_edits_and_opens_the_notebook(cx: &mut TestAppContext) {
         1,
         "the notebook opens as a space window"
     );
-
-    drain_runtime(&core);
 }
 
 /// **A form that closes hands the keyboard back** (Codex review, PR #279).
@@ -8749,11 +9926,35 @@ fn agents_pane_lists_edits_and_opens_the_notebook(cx: &mut TestAppContext) {
 /// since a dead input's handle is gone with it.
 #[gpui::test]
 fn agents_pane_hands_the_keyboard_back_when_its_editor_closes(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
     });
     let agent = share_the_seeded_agent(cx, &stores, &space);
+
+    // **The target has to be a node the reader is told about.** gpui only
+    // reports focus on a node the a11y tree actually has, and an element with a
+    // tracked handle but no role never gets one — the adapter leaves focus at
+    // the window root, which is the whole of what a handback was to prevent.
+    // The Backends pane already names itself; this is the twin its shape was
+    // borrowed from, swept here.
+    {
+        use eidola_gui::probe;
+        let _probes = probes_on();
+        probe::clear_window(window.window_id().as_u64());
+        draw_window(cx, window);
+        let entries = probe::window_entries(window.window_id().as_u64());
+        let (_, entry) = entries
+            .iter()
+            .find(|(n, _)| n == "settings/agents/pane")
+            .expect("the pane carries its own landmark");
+        assert_eq!(
+            entry.role,
+            gpui::Role::Region,
+            "the handback target is a named region, not a role-less div"
+        );
+        assert_eq!(entry.label, "Agents");
+    }
 
     let pane_holds_the_keyboard = |cx: &mut TestAppContext| {
         cx.update_window(window, |_, window, cx| {
@@ -8931,8 +10132,6 @@ fn agents_pane_hands_the_keyboard_back_when_its_editor_closes(cx: &mut TestAppCo
         pane_holds_the_keyboard(cx),
         "and so did the keyboard it was holding"
     );
-
-    drain_runtime(&core);
 }
 
 /// **Retirement** asks first, then takes the agent out of the library and
@@ -8940,7 +10139,7 @@ fn agents_pane_hands_the_keyboard_back_when_its_editor_closes(cx: &mut TestAppCo
 /// the space it worked in still resolves it.
 #[gpui::test]
 fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, backing, space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| AgentsSettingsView::new(stores.clone(), window, cx))
     });
@@ -8975,7 +10174,7 @@ fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
         view.update(cx, |v, cx| v.cancel_retire(window, cx));
     })
     .unwrap();
-    cx.run_until_parked();
+    backing.settle();
     assert!(
         stores.agents.read_with(cx, |s, _| s
             .list()
@@ -8998,7 +10197,7 @@ fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
     })
     .unwrap();
     assert!(view.read_with(cx, |v, _| v.retiring_agent().is_none()));
-    cx.run_until_parked();
+    backing.settle();
     assert_eq!(
         stores.agents.read_with(cx, |s, _| s.list().len()),
         1,
@@ -9052,8 +10251,6 @@ fn agents_pane_retires_behind_a_confirm(cx: &mut TestAppContext) {
         .participants
         .update(cx, |s, cx| s.refresh(space.clone(), cx));
     cx.run_until_parked();
-
-    drain_runtime(&core);
 }
 
 /// A failed *initial* read must not read as an empty library, and a refused
@@ -9088,7 +10285,7 @@ fn agents_pane_failed_load_and_refused_write_are_visible(cx: &mut TestAppContext
 
 #[gpui::test]
 fn templates_pane_crud_and_set_default(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (stores, _core, _backing, _space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
     });
@@ -9146,15 +10343,13 @@ fn templates_pane_crud_and_set_default(cx: &mut TestAppContext) {
             .templates
             .read_with(cx, |s, _| !s.list().iter().any(|t| t.title == "Research"))
     });
-
-    drain_runtime(&core);
 }
 
 /// The router picker writes through `set_template_router_model`, and **Off**
 /// round-trips back to NULL — the default is a real choice, not a one-way door.
 #[gpui::test]
 fn templates_pane_router_model_writes_through_and_off_round_trips(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (stores, _core, _backing, _space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
     });
@@ -9219,8 +10414,6 @@ fn templates_pane_router_model_writes_through_and_off_round_trips(cx: &mut TestA
                 .unwrap_or(false)
         })
     });
-
-    drain_runtime(&core);
 }
 
 /// Setting a template's router is a **second** core call after the create, and
@@ -9230,7 +10423,7 @@ fn templates_pane_router_model_writes_through_and_off_round_trips(cx: &mut TestA
 /// created with.
 #[gpui::test]
 fn a_stale_router_pick_refuses_before_creating_the_template(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (stores, core, _backing, _space) = participants_scene(cx);
     stores.templates.update(cx, |s, cx| s.refresh(cx));
     wait_until(cx, "templates load", |cx| {
         stores.templates.read_with(cx, |s, _| !s.list().is_empty())
@@ -9268,8 +10461,6 @@ fn a_stale_router_pick_refuses_before_creating_the_template(cx: &mut TestAppCont
         !titles.iter().any(|t| t == "Doomed"),
         "a refused router must leave no template behind: {titles:?}"
     );
-
-    drain_runtime(&core);
 }
 
 /// A `SpaceTemplateInfo` embeds its referenced globals' **effective** config, so
@@ -9277,7 +10468,7 @@ fn a_stale_router_pick_refuses_before_creating_the_template(cx: &mut TestAppCont
 /// `Change::Participants` — must reach the templates snapshot too.
 #[gpui::test]
 fn everywhere_edit_of_a_shared_participant_reaches_the_templates_snapshot(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, core, _backing, space) = participants_scene(cx);
     // A template projected from a space carries the shared "You" by reference.
     core.runtime()
         .block_on(core.template_from_space(space.clone(), "Projected".into()))
@@ -9329,8 +10520,6 @@ fn everywhere_edit_of_a_shared_participant_reaches_the_templates_snapshot(cx: &m
     wait_until(cx, "the templates snapshot follows", |cx| {
         referenced_label(cx).as_deref() == Some("Myself")
     });
-
-    drain_runtime(&core);
 }
 
 /// A new agent participant arrives with the shared default system prompt, and
@@ -9339,7 +10528,7 @@ fn everywhere_edit_of_a_shared_participant_reaches_the_templates_snapshot(cx: &m
 fn templates_pane_new_agent_carries_the_default_system_prompt(cx: &mut TestAppContext) {
     use eidola_gui::participants::DEFAULT_AGENT_SYSTEM_PROMPT;
 
-    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (stores, _core, _backing, _space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
     });
@@ -9393,14 +10582,12 @@ fn templates_pane_new_agent_carries_the_default_system_prompt(cx: &mut TestAppCo
         ],
         "the default prompt round-trips through the template update path"
     );
-
-    drain_runtime(&core);
 }
 
 /// An edited system prompt round-trips through the template update path.
 #[gpui::test]
 fn templates_pane_system_prompt_round_trips(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (stores, _core, _backing, _space) = participants_scene(cx);
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| TemplatesSettingsView::new(stores.clone(), window, cx))
     });
@@ -9445,8 +10632,6 @@ fn templates_pane_system_prompt_round_trips(cx: &mut TestAppContext) {
             .as_deref(),
         Some("Answer only in questions.")
     );
-
-    drain_runtime(&core);
 }
 
 /// A failed initial participant load must render Retry (not a phantom-empty
@@ -9454,7 +10639,7 @@ fn templates_pane_system_prompt_round_trips(cx: &mut TestAppContext) {
 /// cell exists, so `retry_load` is the only path back.
 #[gpui::test]
 fn inspector_participants_retry_refetches_after_failed_load(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (_window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
@@ -9475,15 +10660,13 @@ fn inspector_participants_retry_refetches_after_failed_load(cx: &mut TestAppCont
     wait_until(cx, "retry reloads", |cx| {
         participant_labels(&stores, &space, cx).len() == 2
     });
-
-    drain_runtime(&core);
 }
 
 /// The per-space error keying: a failure on space A must not surface under
 /// space B, and starting B's op must not clear A's error.
 #[gpui::test]
 fn participants_store_op_error_is_per_space(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space_a) = participants_scene(cx);
+    let (stores, core, _backing, space_a) = participants_scene(cx);
     let space_b = core
         .runtime()
         .block_on(core.create_space(None))
@@ -9526,8 +10709,6 @@ fn participants_store_op_error_is_per_space(cx: &mut TestAppContext) {
             "starting B's op must not clear A's error (per-space keying)"
         );
     });
-
-    drain_runtime(&core);
 }
 
 /// P1: a "New Space from Template" failure is owned by the store (not detached)
@@ -9535,7 +10716,7 @@ fn participants_store_op_error_is_per_space(cx: &mut TestAppContext) {
 /// discarded.
 #[gpui::test]
 fn spaces_store_create_from_template_surfaces_error(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _space) = participants_scene(cx);
+    let (stores, _core, _backing, _space) = participants_scene(cx);
     let stores_clone = stores.clone();
     stores.spaces.update(cx, move |s, cx| {
         s.create_from_template("does-not-exist".into(), stores_clone, cx);
@@ -9549,8 +10730,6 @@ fn spaces_store_create_from_template_surfaces_error(cx: &mut TestAppContext) {
             "a create has no space to tag, so no space's inspector claims it"
         );
     });
-
-    drain_runtime(&core);
 }
 
 #[gpui::test]
@@ -9561,7 +10740,7 @@ fn space_post_fans_out_one_turn_per_planned_responder(cx: &mut TestAppContext) {
     // keyed runner. With no account configured every turn fails (typed) — and
     // each failure completes *independently*, leaving the saved post intact
     // and the space recovered (never bricked).
-    let (stores, core, _dir, space_id) = participants_scene(cx);
+    let (stores, core, _backing, space_id) = participants_scene(cx);
     core.runtime()
         .block_on(core.add_space_participant(
             space_id.clone(),
@@ -9628,8 +10807,6 @@ fn space_post_fans_out_one_turn_per_planned_responder(cx: &mut TestAppContext) {
         );
         assert!(space.can_retry(), "a failed turn is recorded for Retry");
     });
-
-    drain_runtime(&core);
 }
 
 // ---------------------------------------------------------------------------
@@ -10243,6 +11420,7 @@ fn space_incoming_references_paint_highlights_and_navigate(cx: &mut TestAppConte
                 vec![
                     eidola_app_core::IncomingReference {
                         action_id: "a2".into(),
+                        item_id: format!("item-of-{}", "a2"),
                         space_id: "s".into(),
                         ordinal: 1,
                         content_block_id: Some("b1".into()),
@@ -10250,11 +11428,15 @@ fn space_incoming_references_paint_highlights_and_navigate(cx: &mut TestAppConte
                         range_end: Some(9),
                         annotation: None,
                         created_at: 0,
+                        author_label: "Ada".into(),
+                        author_kind: "agent".into(),
+                        space_title: None,
                     },
                     // A range past the block's end no longer maps: dropped,
                     // never approximated.
                     eidola_app_core::IncomingReference {
                         action_id: "a2".into(),
+                        item_id: format!("item-of-{}", "a2"),
                         space_id: "s".into(),
                         ordinal: 2,
                         content_block_id: Some("b1".into()),
@@ -10262,6 +11444,9 @@ fn space_incoming_references_paint_highlights_and_navigate(cx: &mut TestAppConte
                         range_end: Some(200),
                         annotation: None,
                         created_at: 0,
+                        author_label: "Ada".into(),
+                        author_kind: "agent".into(),
+                        space_title: None,
                     },
                 ],
             );
@@ -10284,12 +11469,15 @@ fn space_incoming_references_paint_highlights_and_navigate(cx: &mut TestAppConte
         });
     })
     .unwrap();
-    view.read_with(cx, |v, _| {
+    cx.update_window(window, |_, window, cx| {
         assert!(
-            v.highlight_picker_for_test().is_none(),
+            view.read(cx)
+                .highlight_picker_for_test(window, cx)
+                .is_none(),
             "a single referencer needs no picker"
         );
-    });
+    })
+    .unwrap();
 }
 
 #[gpui::test]
@@ -10316,6 +11504,7 @@ fn space_multiple_referencers_open_a_picker(cx: &mut TestAppContext) {
     let space = view.read_with(cx, |v, _| v.space().clone());
     let incoming = |action: &str, lo: i64, hi: i64| eidola_app_core::IncomingReference {
         action_id: action.into(),
+        item_id: format!("item-of-{}", action),
         space_id: "s".into(),
         ordinal: 1,
         content_block_id: Some("b1".into()),
@@ -10323,6 +11512,9 @@ fn space_multiple_referencers_open_a_picker(cx: &mut TestAppContext) {
         range_end: Some(hi),
         annotation: None,
         created_at: 0,
+        author_label: "Ada".into(),
+        author_kind: "agent".into(),
+        space_title: None,
     };
     cx.update_window(window, |_, _, cx| {
         space.update(cx, |s, _| {
@@ -10341,8 +11533,11 @@ fn space_multiple_referencers_open_a_picker(cx: &mut TestAppContext) {
         });
     })
     .unwrap();
-    let choices = view
-        .read_with(cx, |v, _| v.highlight_picker_for_test())
+    let choices = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).highlight_picker_for_test(window, cx)
+        })
+        .unwrap()
         .expect("two referencers open the picker");
     assert_eq!(choices.len(), 2);
     assert_eq!(choices[0].0, "a2");
@@ -10358,9 +11553,14 @@ fn space_multiple_referencers_open_a_picker(cx: &mut TestAppContext) {
         view.update(cx, |v, cx| v.navigate_to_action("a3".into(), window, cx));
     })
     .unwrap();
-    view.read_with(cx, |v, _| {
-        assert!(v.highlight_picker_for_test().is_none());
-    });
+    cx.update_window(window, |_, window, cx| {
+        assert!(
+            view.read(cx)
+                .highlight_picker_for_test(window, cx)
+                .is_none()
+        );
+    })
+    .unwrap();
 }
 
 #[gpui::test]
@@ -10639,7 +11839,7 @@ fn space_quote_survives_the_round_trip_into_the_ask_path(cx: &mut TestAppContext
     // the model will read (upstream expansion itself is pinned in app-core's
     // `upstream_context_expands_embed_markers_into_quotes`). `PostNode::
     // embed_map()` agreeing is the same guarantee on the render side.
-    let (stores, core, _dir, space_id) = participants_scene(cx);
+    let (stores, core, _backing, space_id) = participants_scene(cx);
 
     // A persisted post to quote from.
     let seed = core
@@ -10740,8 +11940,6 @@ fn space_quote_survives_the_round_trip_into_the_ask_path(cx: &mut TestAppContext
         "the persisted body carries the marker the edge's ordinal addresses: {text:?}"
     );
     assert!(text.contains("what did you mean by this?"));
-
-    drain_runtime(&core);
 }
 
 #[gpui::test]
@@ -12567,6 +13765,7 @@ fn space_an_open_picker_keeps_printables_out_of_the_conversation(cx: &mut TestAp
     let space = view.read_with(&vcx, |v, _| v.space().clone());
     let incoming = |action: &str, lo: i64, hi: i64| eidola_app_core::IncomingReference {
         action_id: action.into(),
+        item_id: format!("item-of-{}", action),
         space_id: "s".into(),
         ordinal: 1,
         content_block_id: Some("b1".into()),
@@ -12574,6 +13773,9 @@ fn space_an_open_picker_keeps_printables_out_of_the_conversation(cx: &mut TestAp
         range_end: Some(hi),
         annotation: None,
         created_at: 0,
+        author_label: "Ada".into(),
+        author_kind: "agent".into(),
+        space_title: None,
     };
     vcx.update(|_, cx| {
         space.update(cx, |s, _| {
@@ -12589,28 +13791,370 @@ fn space_an_open_picker_keeps_printables_out_of_the_conversation(cx: &mut TestAp
         });
     });
     vcx.run_until_parked();
-    view.read_with(&vcx, |v, _| {
+    vcx.update(|window, cx| {
         assert!(
-            v.highlight_picker_for_test().is_some(),
+            view.read(cx)
+                .highlight_picker_for_test(window, cx)
+                .is_some(),
             "the picker is open"
         );
     });
 
     vcx.simulate_keystrokes("x");
     vcx.run_until_parked();
-    view.read_with(&vcx, |v, _| {
+    vcx.update(|window, cx| {
+        let v = view.read(cx);
         assert!(
             !v.has_active_draft_for_test(),
             "a printable character behind an open picker must not start a draft"
         );
         assert!(
-            v.highlight_picker_for_test().is_some(),
+            v.highlight_picker_for_test(window, cx).is_some(),
             "…and the picker is still the thing that owns the keyboard"
         );
         assert_eq!(
             v.tree_focus_for_test(),
             None,
             "nor does an overlay move tree focus"
+        );
+    });
+}
+
+/// REGRESSION (Codex review, PR #327): **an edit to a referring post is the
+/// same backlink under a new name, and the picker keeps it.**
+///
+/// The reverse index reports current generations, and editing a post that
+/// quotes something replicates the edge onto a new action: the backlink never
+/// went anywhere, but its action id did. A picker holding its choices by
+/// action lost the row to that — and, when every choice was edited, closed
+/// itself over an edit that changed nothing about any of them. The item is the
+/// half that does not move (`an_edited_referrer_keeps_its_backlink_under_a_new_generation`,
+/// `eidola-app-core/tests/cross_space_references.rs`, pins that at the source).
+#[gpui::test]
+fn space_a_picker_follows_its_referrers_through_an_edit(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let a1 = fixture_post_with_block("a1", "b1", "the quick brown fox jumps");
+    seed_quotable_space(&view, window, cx, vec![a1]);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+    view.update(&mut vcx, |v, cx| v.retire_draft_for_test(cx));
+    vcx.run_until_parked();
+
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    // `generation` is the referring post's action id; the item behind it never
+    // changes, which is exactly the point.
+    let incoming = |item: &str, generation: &str, label: &str| eidola_app_core::IncomingReference {
+        action_id: generation.into(),
+        item_id: item.into(),
+        space_id: format!("space-of-{item}"),
+        ordinal: 1,
+        content_block_id: Some("b1".into()),
+        range_start: Some(4),
+        range_end: Some(15),
+        annotation: None,
+        created_at: 0,
+        author_label: label.into(),
+        author_kind: "agent".into(),
+        space_title: Some("Tides".into()),
+    };
+    vcx.update(|_, cx| {
+        space.update(cx, |s, _| {
+            s.seed_incoming_references_for_test(
+                "a1",
+                vec![
+                    incoming("item-x", "x-gen-0", "Sofia"),
+                    incoming("item-y", "y-gen-0", "Iris"),
+                ],
+            );
+        });
+    });
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.click_highlight_for_test("a1", &[0, 1], window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.update(|window, cx| view
+            .read(cx)
+            .highlight_picker_for_test(window, cx)
+            .map(|rows| rows.len())),
+        Some(2),
+        "the picker is open on two referrers"
+    );
+
+    // Both referring posts are reworded, keeping their quotes: same items,
+    // same ordinals, new generations.
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.seed_incoming_references_for_test(
+                "a1",
+                vec![
+                    incoming("item-x", "x-gen-1", "Sofia"),
+                    incoming("item-y", "y-gen-1", "Iris"),
+                ],
+            );
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    let rows = vcx
+        .update(|window, cx| view.read(cx).highlight_picker_for_test(window, cx))
+        .expect("an edit of every referrer must not close the picker");
+    assert_eq!(
+        rows.iter().map(|(a, _, _)| a.as_str()).collect::<Vec<_>>(),
+        vec!["x-gen-1", "y-gen-1"],
+        "each row followed its item onto the generation a click should now open"
+    );
+
+    // A genuine removal is still a removal: the quote is struck, the edge
+    // leaves the index, and the picker has nothing left to name.
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.seed_incoming_references_for_test("a1", Vec::new());
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|window, cx| view
+            .read(cx)
+            .highlight_picker_for_test(window, cx)
+            .is_none()),
+        "removing the quotes really does end the picker"
+    );
+}
+
+/// REGRESSION (Codex review, PR #327): **a cleared cache is a question still
+/// out, not an answer of "none".**
+///
+/// The reverse index resolves names at read time, so every signal that moves
+/// one drops it — and it drops it on *every* live space, since a change to any
+/// space can move what another highlights. That invalidation and the
+/// close-when-empty rule beside it consumed each other: the close path read the
+/// resulting empty slice as "my referrers were deleted" and dismissed the
+/// picker in the exact moment the reload was about to repair its labels — so a
+/// rename, the thing the invalidation exists to propagate, closed the picker
+/// instead of repainting it.
+///
+/// `Space::incoming_references_pending` is the distinction
+/// `incoming_references` flattens. Both directions on one open picker: an
+/// index in flight keeps it (and the fresh answer repaints the rows), while an
+/// index that has answered with none of its edges closes it.
+#[gpui::test]
+fn space_a_picker_survives_the_invalidation_that_repairs_it(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let a1 = fixture_post_with_block("a1", "b1", "the quick brown fox jumps");
+    let mut a2 = fixture_assistant_post("a2", "first responder");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_assistant_post("a3", "second responder");
+    a3.parent_action_id = Some("a1".into());
+    seed_quotable_space(&view, window, cx, vec![a1, a2, a3]);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    // Two referrers from elsewhere, so the rows are named from the edges
+    // rather than from posts this window holds.
+    let incoming = |action: &str, label: &str, title: &str| eidola_app_core::IncomingReference {
+        action_id: action.into(),
+        item_id: format!("item-of-{}", action),
+        space_id: format!("space-of-{action}"),
+        ordinal: 1,
+        content_block_id: Some("b1".into()),
+        range_start: Some(4),
+        range_end: Some(15),
+        annotation: None,
+        created_at: 0,
+        author_label: label.into(),
+        author_kind: "agent".into(),
+        space_title: Some(title.to_string()),
+    };
+    vcx.update(|_, cx| {
+        space.update(cx, |s, _| {
+            s.seed_incoming_references_for_test(
+                "a1",
+                vec![
+                    incoming("x1", "Sofia", "Tides"),
+                    incoming("x2", "Iris", "Ebb"),
+                ],
+            );
+        });
+    });
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.click_highlight_for_test("a1", &[0, 1], window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.update(|window, cx| view
+            .read(cx)
+            .highlight_picker_for_test(window, cx)
+            .map(|rows| rows.len())),
+        Some(2),
+        "the picker is open on two cross-space referrers"
+    );
+
+    // A rename elsewhere clears every live space's index; the re-fetch is in
+    // flight. Nothing has answered, so nothing may be concluded.
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.seed_incoming_references_loading_for_test("a1");
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|window, cx| view
+            .read(cx)
+            .highlight_picker_for_test(window, cx)
+            .is_some()),
+        "a cleared cache is not a deletion — the picker waits for the answer"
+    );
+
+    // The answer lands with the new title, and the rows repaint — which is the
+    // repair the invalidation was for.
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.seed_incoming_references_for_test(
+                "a1",
+                vec![
+                    incoming("x1", "Sofia", "Spring tides"),
+                    incoming("x2", "Iris", "Ebb"),
+                ],
+            );
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    let labels: Vec<String> = vcx
+        .update(|window, cx| view.read(cx).highlight_picker_for_test(window, cx))
+        .expect("the picker survived to be repaired")
+        .into_iter()
+        .map(|(_, label, _)| label)
+        .collect();
+    assert!(
+        labels.contains(&"Sofia, in Spring tides".to_string()),
+        "the open picker repaints with the fresh title: {labels:?}"
+    );
+
+    // And a genuine answer of "none of your edges" still closes it.
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.seed_incoming_references_for_test("a1", Vec::new());
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|window, cx| view
+            .read(cx)
+            .highlight_picker_for_test(window, cx)
+            .is_none()),
+        "an answered index carrying none of the chosen edges closes the picker"
+    );
+}
+
+/// REGRESSION (Codex review, PR #327): **a picker whose edges vanish is
+/// closed, not merely unpainted.**
+///
+/// Its rows resolve against the live reverse index, so an invalidation — or
+/// referrers edited until none of the chosen edges is current — can leave it
+/// naming nothing. Rendering nothing is not being closed: `highlight_picker`
+/// staying `Some` keeps `transient_overlay_open` true, and that predicate is
+/// the one definition of who owns the keyboard, so every arrow, Escape and
+/// printable went on being yielded to a popover the reader could not see. Nor
+/// was there a way out — Escape never reached `leave_focus_level`, and the
+/// click-out that clears the picker lives on the element no longer rendered.
+///
+/// The keyboard is the honest assertion here: ownership is not a field a
+/// reader can look at, it is whether typing reaches the conversation again.
+#[gpui::test]
+fn space_a_picker_whose_referrers_vanish_gives_the_keyboard_back(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let a1 = fixture_post_with_block("a1", "b1", "the quick brown fox jumps");
+    let mut a2 = fixture_assistant_post("a2", "first responder");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_assistant_post("a3", "second responder");
+    a3.parent_action_id = Some("a1".into());
+    seed_quotable_space(&view, window, cx, vec![a1, a2, a3]);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+    view.update(&mut vcx, |v, cx| v.retire_draft_for_test(cx));
+    vcx.run_until_parked();
+
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    let incoming = |action: &str, lo: i64, hi: i64| eidola_app_core::IncomingReference {
+        action_id: action.into(),
+        item_id: format!("item-of-{}", action),
+        space_id: "s".into(),
+        ordinal: 1,
+        content_block_id: Some("b1".into()),
+        range_start: Some(lo),
+        range_end: Some(hi),
+        annotation: None,
+        created_at: 0,
+        author_label: "Ada".into(),
+        author_kind: "agent".into(),
+        space_title: None,
+    };
+    vcx.update(|_, cx| {
+        space.update(cx, |s, _| {
+            s.seed_incoming_references_for_test(
+                "a1",
+                vec![incoming("a2", 4, 15), incoming("a3", 10, 19)],
+            );
+        });
+    });
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.click_highlight_for_test("a1", &[0, 1], window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        assert!(
+            view.read(cx)
+                .highlight_picker_for_test(window, cx)
+                .is_some(),
+            "the picker is open"
+        );
+    });
+
+    // Both referrers are edited until neither quote is current — the index
+    // re-reads and carries none of the chosen edges any more.
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.seed_incoming_references_for_test("a1", Vec::new());
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+
+    vcx.update(|window, cx| {
+        assert!(
+            view.read(cx)
+                .highlight_picker_for_test(window, cx)
+                .is_none(),
+            "a picker naming nothing is closed, not left owning the window"
+        );
+    });
+
+    // And the keyboard is the conversation's again: a printable starts the
+    // trailing draft, which is exactly what an open overlay suppresses.
+    vcx.simulate_keystrokes("x");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.has_active_draft_for_test(),
+            "typing reaches the conversation once no invisible overlay owns it"
         );
     });
 }
@@ -13057,6 +14601,123 @@ fn retiring_closes_every_window_and_leaves_the_app_standing(cx: &mut TestAppCont
         cx.update(|cx| cx.windows().len()),
         1,
         "a retired app still opens windows"
+    );
+}
+
+#[gpui::test]
+fn the_full_shutdown_closes_the_control_socket(cx: &mut TestAppContext) {
+    // gpui invokes quit observers in **registration order**, so a socket close
+    // registered as its own hook ran *after* the engine teardown registered
+    // before it — and the core's runtime keeps serving connections across that
+    // gap, long enough for a caller to start a billed `chat.stream` after the
+    // process had decided to go, or reach for an engine registry already
+    // latched shut.
+    //
+    // One hook owns the whole sequence now, so the order is two adjacent lines
+    // in one body rather than two calls at the launch site — nothing a test can
+    // guard better than reading it. What is worth pinning is the half that
+    // *could* silently rot: that closing the door is a step of the quit path at
+    // all, rather than a closure nobody calls.
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let stores = stub_stores_with_config(cx);
+    let closed = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = closed.clone();
+    cx.update(|cx| {
+        let bridge = eidola_gui::stores::install_bus_bridge(&stores, cx);
+        eidola_gui::lifecycle::install_shutdown(
+            &stores,
+            bridge,
+            move || flag.store(true, Ordering::SeqCst),
+            cx,
+        );
+    });
+    assert!(
+        !closed.load(Ordering::SeqCst),
+        "nothing is torn down before the quit"
+    );
+
+    cx.update(|cx| cx.shutdown());
+
+    assert!(
+        closed.load(Ordering::SeqCst),
+        "the full shutdown left the door open"
+    );
+}
+
+#[gpui::test]
+fn retiring_leaves_the_control_socket_and_the_callers_on_it_answering(cx: &mut TestAppContext) {
+    // The socket's side of the same retire. ⌘Q is not a shutdown, so the door
+    // another process knocks on stays open with the process, the stores and the
+    // engines — and so do the peers already through it, which is the half a
+    // shutdown that ends established connections has to be careful not to take
+    // with it. Only `on_app_quit` closes the socket, and a retire never reaches
+    // it; what closing then costs is pinned beside the socket (`tests/ipc.rs`).
+    use std::io::{BufRead, Write};
+
+    cx.update(|cx| cx.set_quit_mode(gpui::QuitMode::Explicit));
+    cx.executor().allow_parking();
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().unwrap();
+    let core = std::sync::Arc::new(
+        AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
+    );
+    let path = eidola_app_core::ipc::socket_path(core.data_dir());
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    let _backing = Backing::with_app(core, dir, cx);
+    // Held for the test's duration exactly as the shutdown hook holds it in
+    // production; closing is that hook's first step, and a retire never runs it.
+    // The test closes it on its way out, whatever the exit: the accept loop owns
+    // an `Arc<AppCore>` for as long as it serves, so the drain barrier declared
+    // above could never finish while it did.
+    struct ClosedOnExit(eidola_gui::ipc::ControlSocket);
+    impl Drop for ClosedOnExit {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    let _socket = ClosedOnExit(eidola_gui::ipc::bind(&stores).expect("bind"));
+    assert!(path.exists(), "the door is open to begin with");
+
+    // A peer that was already connected when the retire happened.
+    let mut stream = std::os::unix::net::UnixStream::connect(&path).expect("connect");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
+    let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+    let mut ask = |stream: &mut std::os::unix::net::UnixStream, id: u64, call| {
+        stream
+            .write_all(&eidola_app_core::ipc::encode_line(
+                &eidola_app_core::ipc::Request::new(id, &call),
+            ))
+            .expect("write");
+        stream.flush().expect("flush");
+        let mut line = String::new();
+        let read = reader.read_line(&mut line).expect("read");
+        assert!(read > 0, "the connection was ended");
+        eidola_app_core::ipc::decode_response(line.trim_end().as_bytes()).expect("a frame")
+    };
+    let hello = ask(&mut stream, 1, eidola_app_core::ipc::Call::Hello);
+    assert!(matches!(
+        hello.body,
+        eidola_app_core::ipc::ResponseBody::End { .. }
+    ));
+
+    // The retire: every window goes, nothing on the quit path runs.
+    cx.update(eidola_gui::lifecycle::close_all_windows);
+    cx.run_until_parked();
+
+    assert!(path.exists(), "the retire took the door with the windows");
+    let answer = ask(
+        &mut stream,
+        2,
+        eidola_app_core::ipc::Call::SpacesList {
+            include_archived: false,
+        },
+    );
+    assert!(
+        matches!(answer.body, eidola_app_core::ipc::ResponseBody::End { .. }),
+        "a retired app stopped answering a caller it had already admitted"
     );
 }
 
@@ -13531,6 +15192,7 @@ fn inspector_participants_stub_scene(
                 kind: "agent".into(),
                 label: "Assistant".into(),
                 model_ref: Some("gemma4-31b".into()),
+                model_notices: Vec::new(),
                 system_prompt: Some("Be concise.".into()),
                 notify_policy: "human".into(),
                 role: "member".into(),
@@ -13656,7 +15318,7 @@ fn space_inspector_removing_a_participant_takes_its_dropdown_with_it(cx: &mut Te
 /// its dropdown, and the keyboard its field was holding.
 #[gpui::test]
 fn space_inspector_a_participant_leaving_the_roster_retires_its_editor(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_participants_inspector(cx, &stores, &space);
     wait_until(cx, "participants load", |cx| {
         !participant_labels(&stores, &space, cx).is_empty()
@@ -13724,7 +15386,6 @@ fn space_inspector_a_participant_leaving_the_roster_retires_its_editor(cx: &mut 
         view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
         "the press reached the conversation instead of a dead input"
     );
-    drain_runtime(&core);
 }
 
 /// Type-to-compose must yield to **every** field the panel paints, not just the
@@ -13746,6 +15407,7 @@ fn space_inspector_typing_in_a_system_prompt_does_not_jump_to_the_composer(
                 kind: "agent".into(),
                 label: "Assistant".into(),
                 model_ref: Some("gemma4-31b".into()),
+                model_notices: Vec::new(),
                 system_prompt: Some("Be concise.".into()),
                 notify_policy: "human".into(),
                 role: "member".into(),
@@ -13810,7 +15472,7 @@ fn space_inspector_typing_in_a_system_prompt_does_not_jump_to_the_composer(
 /// settings load itself.
 #[gpui::test]
 fn space_inspector_repaints_when_its_settings_land(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_space(cx, &stores, Some(space.clone()));
     // Let the transcript load and every launch-time refresh settle, so nothing
     // else is in flight to repaint this window.
@@ -13850,8 +15512,6 @@ fn space_inspector_repaints_when_its_settings_land(cx: &mut TestAppContext) {
         "the settings landing must schedule a repaint — otherwise the panel \
          keeps rendering the spinner it drew before the load completed"
     );
-
-    drain_runtime(&core);
 }
 
 /// The empty-title rejection must leave the *field* honest too. Clearing the
@@ -13982,7 +15642,7 @@ fn space_inspector_a_refused_rename_restores_the_stored_title(cx: &mut TestAppCo
 /// first, and 4 + 1 + 1 persisted as 5.
 #[gpui::test]
 fn space_inspector_two_quick_cascade_steps_both_count(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, core, _backing, space) = participants_scene(cx);
     let (window, view) = open_space(cx, &stores, Some(space.clone()));
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
@@ -14022,8 +15682,6 @@ fn space_inspector_two_quick_cascade_steps_both_count(cx: &mut TestAppContext) {
         Some(target),
         "and the panel agrees with the row it wrote"
     );
-
-    drain_runtime(&core);
 }
 
 /// **Focus comes back from the panel** — the `RecordView::close_detail` rule
@@ -14162,7 +15820,7 @@ fn space_inspector_closing_leaves_a_composing_reader_alone(cx: &mut TestAppConte
 /// was the one that did not.
 #[gpui::test]
 fn space_inspector_repaints_when_a_model_catalog_lands(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, _core, _backing, space) = participants_scene(cx);
     let (window, view) = open_space(cx, &stores, Some(space.clone()));
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |v, cx| {
@@ -14204,8 +15862,6 @@ fn space_inspector_repaints_when_a_model_catalog_lands(cx: &mut TestAppContext) 
         "a catalog landing must schedule a repaint — otherwise the open picker \
          keeps showing the options it drew before the fetch completed"
     );
-
-    drain_runtime(&core);
 }
 
 // ---------------------------------------------------------------------------
@@ -15014,7 +16670,7 @@ fn inspector_inviting_an_agent_from_another_space_shares_it_and_adds_it_here(
     // membership — one core call, so the irreversible half can never land
     // alone — and the sentence says both, including the part that can't be
     // undone.
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, core, _backing, space) = participants_scene(cx);
     let elsewhere = core
         .runtime()
         .block_on(core.create_space(Some("Tides".into())))
@@ -15103,7 +16759,6 @@ fn inspector_inviting_an_agent_from_another_space_shares_it_and_adds_it_here(
             })
         })
     });
-    drain_runtime(&core);
 }
 
 #[gpui::test]
@@ -15114,7 +16769,7 @@ fn inspector_the_invite_form_takes_the_keyboard_its_door_had(cx: &mut TestAppCon
     // `focusable()` + `tab_index(0)`), so a transition that mounts a surface
     // and focuses nothing leaves the window on a dead handle: keystrokes reach
     // nothing and Tab restarts from the window root (Codex review, PR #280).
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, core, _backing, space) = participants_scene(cx);
     let elsewhere = core
         .runtime()
         .block_on(core.create_space(Some("Tides".into())))
@@ -15178,7 +16833,6 @@ fn inspector_the_invite_form_takes_the_keyboard_its_door_had(cx: &mut TestAppCon
             .unwrap(),
         "arming the grant leaves the keyboard on the form it replaced a row in"
     );
-    drain_runtime(&core);
 }
 
 #[gpui::test]
@@ -15567,7 +17221,7 @@ fn inspector_a_notebook_offers_no_grant_door(cx: &mut TestAppContext) {
     // task 37 deliberately leaves open. Until it is made, the panel offers no
     // new door there — app-core's rules are untouched, so nothing is
     // foreclosed either way.
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, core, _backing, space) = participants_scene(cx);
     let agent = core
         .runtime()
         .block_on(core.list_space_participants(space.clone()))
@@ -15607,7 +17261,6 @@ fn inspector_a_notebook_offers_no_grant_door(cx: &mut TestAppContext) {
         "an ordinary conversation offers the grant"
     );
     let _ = window;
-    drain_runtime(&core);
 }
 
 #[gpui::test]
@@ -15731,7 +17384,7 @@ fn inspector_withholds_the_grant_door_until_the_settings_say_what_this_space_is(
     // open, which is exactly why the GUI's withholding is the only thing
     // standing between the reader and a notebook's whole history). Codex
     // review, PR #280.
-    let (stores, core, _dir, space) = participants_scene(cx);
+    let (stores, core, _backing, space) = participants_scene(cx);
     let agent = core
         .runtime()
         .block_on(core.list_space_participants(space.clone()))
@@ -15785,7 +17438,6 @@ fn inspector_withholds_the_grant_door_until_the_settings_say_what_this_space_is(
         !view.read_with(cx, |v, cx| v.inspector_offers_grant_door_for_test(cx)),
         "…and the door stays withheld, now on evidence"
     );
-    drain_runtime(&core);
 }
 
 // ---------------------------------------------------------------------------
@@ -15809,15 +17461,6 @@ fn close_space_window(cx: &mut TestAppContext, window: AnyWindowHandle, view: En
     cx.run_until_parked();
 }
 
-/// Give a disposal that is *not* supposed to happen a real chance to happen.
-fn settle(cx: &mut TestAppContext) {
-    for _ in 0..8 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
-}
-
 /// ⌘N, then close without doing anything: the space goes with the window.
 ///
 /// A space is created when its window opens, so without this every abandoned
@@ -15827,7 +17470,7 @@ fn settle(cx: &mut TestAppContext) {
 /// worth keeping.
 #[gpui::test]
 fn a_new_space_nobody_touched_goes_with_its_window(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _seeded) = participants_scene(cx);
+    let (stores, core, _backing, _seeded) = participants_scene(cx);
 
     let (window, view) = open_space(cx, &stores, None);
     let space = view.read_with(cx, |v, cx| v.space().read(cx).id().to_string());
@@ -15839,7 +17482,6 @@ fn a_new_space_nobody_touched_goes_with_its_window(cx: &mut TestAppContext) {
     wait_until(cx, "the untouched space is disposed of", |_| {
         !space_exists(&core, &space)
     });
-    drain_runtime(&core);
 }
 
 /// The mirror, at the same seam: a conversation someone actually wrote in stays
@@ -15847,7 +17489,7 @@ fn a_new_space_nobody_touched_goes_with_its_window(cx: &mut TestAppContext) {
 /// reaped space costs the words in it.
 #[gpui::test]
 fn a_conversation_someone_wrote_in_survives_its_window(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _seeded) = participants_scene(cx);
+    let (stores, core, backing, _seeded) = participants_scene(cx);
 
     let (window, view) = open_space(cx, &stores, None);
     let entity = view.read_with(cx, |v, _| v.space().clone());
@@ -15862,12 +17504,11 @@ fn a_conversation_someone_wrote_in_survives_its_window(cx: &mut TestAppContext) 
     });
 
     close_space_window(cx, window, view);
-    settle(cx);
+    backing.settle();
     assert!(
         space_exists(&core, &space),
         "the conversation outlives the window that wrote it"
     );
-    drain_runtime(&core);
 }
 
 /// Two windows on one space: closing the first disposes of nothing, because the
@@ -15875,7 +17516,7 @@ fn a_conversation_someone_wrote_in_survives_its_window(cx: &mut TestAppContext) 
 /// untouched space goes then.
 #[gpui::test]
 fn closing_one_of_two_windows_disposes_of_nothing(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _seeded) = participants_scene(cx);
+    let (stores, core, backing, _seeded) = participants_scene(cx);
 
     let (first, view) = open_space(cx, &stores, None);
     let space = view.read_with(cx, |v, cx| v.space().read(cx).id().to_string());
@@ -15885,7 +17526,7 @@ fn closing_one_of_two_windows_disposes_of_nothing(cx: &mut TestAppContext) {
     let (second, other) = open_space(cx, &stores, Some(space.clone()));
 
     close_space_window(cx, first, view);
-    settle(cx);
+    backing.settle();
     assert!(
         space_exists(&core, &space),
         "a conversation still on screen is not abandoned"
@@ -15895,7 +17536,6 @@ fn closing_one_of_two_windows_disposes_of_nothing(cx: &mut TestAppContext) {
     wait_until(cx, "the last close disposes of it", |_| {
         !space_exists(&core, &space)
     });
-    drain_runtime(&core);
 }
 
 /// **A save still on its way to the database holds off the disposal.**
@@ -15916,7 +17556,7 @@ fn closing_one_of_two_windows_disposes_of_nothing(cx: &mut TestAppContext) {
 /// question, the store's refusal.
 #[gpui::test]
 fn a_save_still_in_flight_holds_off_the_disposal(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _seeded) = participants_scene(cx);
+    let (stores, core, backing, _seeded) = participants_scene(cx);
 
     let (window, view) = open_space(cx, &stores, None);
     let entity = view.read_with(cx, |v, _| v.space().clone());
@@ -15934,20 +17574,19 @@ fn a_save_still_in_flight_holds_off_the_disposal(cx: &mut TestAppContext) {
     drop(entity);
 
     close_space_window(cx, window, view);
-    settle(cx);
+    backing.settle();
     assert!(
         space_exists(&core, &space),
         "the space a write is still travelling to is kept, whatever else it \
          does or does not contain"
     );
-    drain_runtime(&core);
 }
 
 /// The mirror: with nothing outstanding, the same close disposes of the same
 /// untouched space — so the guard above is a guard and not a disabling.
 #[gpui::test]
 fn a_settled_space_is_still_disposed_of_at_the_same_close(cx: &mut TestAppContext) {
-    let (stores, core, _dir, _seeded) = participants_scene(cx);
+    let (stores, core, _backing, _seeded) = participants_scene(cx);
 
     let (window, view) = open_space(cx, &stores, None);
     let space = view.read_with(cx, |v, cx| v.space().read(cx).id().to_string());
@@ -15959,7 +17598,6 @@ fn a_settled_space_is_still_disposed_of_at_the_same_close(cx: &mut TestAppContex
     wait_until(cx, "the untouched space is disposed of", |_| {
         !space_exists(&core, &space)
     });
-    drain_runtime(&core);
 }
 
 /// **A refusal a reader sees is copy, copy is localized, and a view renders it
@@ -16037,6 +17675,287 @@ async fn an_archived_conversations_refusal_is_localized(cx: &mut gpui::TestAppCo
             "{tag} repaints the notice already on screen — no new failure was emitted"
         );
     }
+}
+
+/// A refused issuer key is the reader's protection, not a network blip, and
+/// says so in their language: each refusal has its own words, never the
+/// error's English `Display`, and they follow a locale change.
+#[gpui::test]
+async fn a_refused_issuer_key_says_so_in_the_readers_language(cx: &mut gpui::TestAppContext) {
+    use eidola_app_core::error::IssuerKeyRefusal;
+    for (refusal, english_start, french_start) in [
+        (
+            IssuerKeyRefusal::NotOnCalendar,
+            "Eidola’s server offered a payment key that doesn’t follow the public key schedule",
+            "Le serveur d’Eidola a proposé une clé de paiement qui ne suit pas",
+        ),
+        (
+            IssuerKeyRefusal::SecondKeyForEpoch { epoch: 2966 },
+            "Eidola’s server offered a different payment key this week",
+            "Le serveur d’Eidola a proposé cette semaine une clé de paiement différente",
+        ),
+        (
+            IssuerKeyRefusal::OneKeyForSeveralEpochs { epoch: 2967 },
+            "Eidola’s server offered the same payment key for two different weeks",
+            "Le serveur d’Eidola a proposé la même clé de paiement pour deux semaines",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+        let stores = stub_stores_with_agents(cx, "s");
+        let (window, view) = open_space(cx, &stores, Some("s".into()));
+        let space = view.read_with(cx, |v, _| v.space().clone());
+        cx.update_window(window, |_, _, cx| {
+            space.update(cx, |s, cx| {
+                s.set_post_tree_for_test(vec![fixture_user_post("a1", "the only post")], cx)
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let error = AppError::IssuerKeyRefused {
+            refusal: refusal.clone(),
+        };
+        let display = error.to_string();
+        cx.update_window(window, |_, _, cx| {
+            space.update(cx, |s, cx| {
+                s.apply_turn_failure_for_test("agent-b", "a1", error, cx)
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        let english = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+        assert!(english.starts_with(english_start), "{refusal:?}: {english}");
+        assert_ne!(
+            english, display,
+            "the raw Display must not be what a reader sees"
+        );
+        cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+        cx.run_until_parked();
+        let french = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+        assert!(french.starts_with(french_start), "{refusal:?}: {french}");
+    }
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+}
+
+/// **A selection that has gone stale fails honestly, by name, and nothing
+/// answers in its place.**
+///
+/// A catalog row is retired upstream while the participant that picked it goes
+/// on naming it. App-core refuses at turn time with the model it was asked for
+/// (`AppError::ModelUnavailable`) rather than quietly using another one, and
+/// this is the reader's side of that promise: the notice names the model — the
+/// one thing the reader has to change — and says outright that nothing
+/// answered instead, which is the fact a silent substitution would have hidden.
+///
+/// The recovery is deliberately a **re-ask of the same participant**: this app
+/// never picks a model on the reader's behalf, so what makes the next press
+/// work is the reader choosing one. The retry record is therefore what pins
+/// "no substitution" on this side — the participant and the post it was asked
+/// about both stand unchanged.
+#[gpui::test]
+async fn a_stale_model_selection_says_which_model_and_substitutes_none(
+    cx: &mut gpui::TestAppContext,
+) {
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the only post")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::ModelUnavailable {
+                    model: "gemma4-31b@eidola".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let english = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+    assert!(
+        english.contains("gemma4-31b@eidola"),
+        "the notice names the selection the reader has to change: {english}"
+    );
+    assert!(
+        english.contains("nothing will answer in its place"),
+        "and says no other model answered instead: {english}"
+    );
+    assert!(
+        !english.contains("no longer offers the model `"),
+        "the raw Display must not be what a reader sees: {english}"
+    );
+
+    // No substitution on this side either: the recovery re-asks the very
+    // participant that was refused, about the very post it was refused over.
+    space.read_with(cx, |s, _| {
+        let failed = s.failed_turn().expect("a re-ask is recorded");
+        assert_eq!(
+            failed.participant_id, "agent-b",
+            "Retry re-asks the participant that was refused, not another one"
+        );
+        assert_eq!(failed.target_action_id, "a1");
+        assert!(
+            s.can_retry(),
+            "picking a different model is what makes the next press work, so Retry stands"
+        );
+    });
+
+    // The sentence is chosen in the reader's locale; the model id is not a
+    // sentence and travels through it unchanged.
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    cx.run_until_parked();
+    let french = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+    assert_ne!(
+        french, english,
+        "the refusal is localized, not an English literal beside the match"
+    );
+    assert!(
+        french.contains("gemma4-31b@eidola"),
+        "the model id survives translation verbatim: {french}"
+    );
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+}
+
+/// **A hold past one denomination is the request's problem, and the notice
+/// says so in the reader's language.**
+///
+/// App-core refuses a turn whose worst-case cost is more than a held
+/// credential and one fresh denomination pay together
+/// (`AppError::HoldExceedsDenomination`), because the alternative is an
+/// issuance sized to the request. Adding credit cannot lift that, so the copy
+/// must not route the reader to buy any: it says the request was not sent and
+/// names what does help, with no figures. **It promises nothing about the rest
+/// of the reply**: the refusal can come at a later tool round, or at the resend
+/// of a request the server refused, after earlier requests were charged.
+/// Switched to French without re-emitting, as every localized arm is pinned.
+#[gpui::test]
+async fn a_hold_past_one_denomination_is_explained_without_offering_to_sell_credit(
+    cx: &mut gpui::TestAppContext,
+) {
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the only post")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::HoldExceedsDenomination {
+                    hold: 1_400_000,
+                    denomination: 1_000_000,
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let english = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+    assert!(
+        english.contains("the request was not sent and nothing was charged for it"),
+        "{english}"
+    );
+    assert!(
+        !english.contains("nothing was sent"),
+        "earlier requests of the reply may have been sent and charged: {english}"
+    );
+    assert!(
+        english.contains("Adding credit won’t change that"),
+        "{english}"
+    );
+    assert!(
+        !english.contains("credits") && !english.contains("1400000"),
+        "neither the raw Display nor the figures reach the reader: {english}"
+    );
+
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    cx.run_until_parked();
+    let french = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+    assert!(french.contains("Ajouter du crédit"), "{french}");
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+}
+
+/// **A fresh profile's first post names the model to download.**
+///
+/// The default agent uses an on-device model, and a new profile has not
+/// downloaded it, so the first turn meets `AppError::LocalModelNotDownloaded`.
+/// The notice says which model by the name Settings lists it under, says
+/// nothing was sent, and points at the download — never the log-shaped
+/// `Display`, which names neither and is English in every locale. Retry
+/// stands, for after the download.
+#[gpui::test]
+async fn a_model_that_is_not_downloaded_says_which_and_where_to_get_it(
+    cx: &mut gpui::TestAppContext,
+) {
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "the only post")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::LocalModelNotDownloaded {
+                    model: eidola_app_core::config::DEFAULT_MODEL.into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let notice = view.read_with(cx, |v, cx| v.error_for_test(cx).expect("a notice is shown"));
+    assert!(
+        notice.contains("Gemma 4 E4B"),
+        "the notice names the model by its catalog name: {notice}"
+    );
+    assert!(
+        notice.contains("Settings ▸ Backends ▸ Local"),
+        "and says where to download it: {notice}"
+    );
+    assert!(
+        notice.contains("nothing was sent"),
+        "and that nothing was sent: {notice}"
+    );
+    assert!(
+        !notice.contains("is not downloaded"),
+        "the raw Display must not be what a reader sees: {notice}"
+    );
+    space.read_with(cx, |s, _| {
+        assert!(s.can_retry(), "Retry stands for after the download")
+    });
 }
 
 /// **An affordance that cannot succeed is worse than none.**
@@ -16163,6 +18082,7 @@ fn a_watching_reader_may_quote_elsewhere_but_not_here(cx: &mut TestAppContext) {
                 kind: "agent".into(),
                 label: "Surveyor".into(),
                 model_ref: Some("gemma4-31b".into()),
+                model_notices: Vec::new(),
                 system_prompt: None,
                 notify_policy: "all".into(),
                 role: "member".into(),
@@ -16289,11 +18209,10 @@ fn backends_a_failed_download_verb_hands_the_keyboard_back(cx: &mut TestAppConte
     // of what a handback was supposed to prevent. So the pane names itself.
     {
         use eidola_gui::probe;
-        probe::set_probes_enabled(true);
+        let _probes = probes_on();
         probe::clear_window(window.window_id().as_u64());
         draw_window(cx, window);
         let entries = probe::window_entries(window.window_id().as_u64());
-        probe::set_probes_enabled(false);
         let (_, entry) = entries
             .iter()
             .find(|(n, _)| n == "settings/backends/pane")
@@ -16365,6 +18284,18 @@ fn backends_a_failed_download_verb_hands_the_keyboard_back(cx: &mut TestAppConte
     );
 }
 
+/// The pane lists the registry, so the seeded singletons have to be in it
+/// before the Local tab has anything to draw: refresh it and wait until the
+/// listing has landed.
+fn load_the_registry(cx: &mut TestAppContext, stores: &Stores) {
+    stores.backends.update(cx, |s, cx| s.refresh(cx));
+    wait_until(cx, "the registry lists its seeded backends", |cx| {
+        stores
+            .backends
+            .read_with(cx, |b, _| b.get("eidola").is_some())
+    });
+}
+
 /// **Retry is not re-entrant while its own transfer is being started.** The two
 /// activations are one request twice, not alternatives — but the store's keyed
 /// op slot is keep-newest, so a second press superseded the first: either the
@@ -16381,8 +18312,13 @@ fn backends_a_failed_download_verb_hands_the_keyboard_back(cx: &mut TestAppConte
 ///
 /// The assertion that pins it is the **control**, not the outcome: while the
 /// operation is pending the row paints no Retry at all, so there is nothing to
-/// press a second time — no tab stop, nothing to activate. The op-error
-/// assertion is the symptom the finding named, kept as the honest end state.
+/// press a second time — no tab stop, nothing to activate. And not only while
+/// it is pending: the slot clears when the initiating call lands, and if the
+/// snapshot showing the transfer arrived only by the bus refresh behind it,
+/// the frames between the two painted the failed row's Retry again over a
+/// transfer already running. So the test waits for the landing and asserts the
+/// row is the downloading one at once. The op-error assertion is the symptom
+/// the finding named, kept as the honest end state.
 #[gpui::test]
 fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext) {
     use eidola_app_core::{LocalModelInfo, LocalModelStatus};
@@ -16396,6 +18332,10 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
         AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
     );
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    // The drain barrier, bound before the listener: the transfer runs until the
+    // listener closes and resets its connection, and the listener — declared
+    // after this — drops first on every exit, a failed assertion included.
+    let _backing = Backing::with_app(core.clone(), dir, cx);
 
     // A listener that accepts and never answers, so the first transfer is
     // genuinely still in flight when the second press lands — a port that
@@ -16403,14 +18343,7 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let url = format!("http://{}/wisp.gguf", listener.local_addr().unwrap());
 
-    // The pane lists the registry, so the seeded singletons have to be in it
-    // before the Local tab has anything to draw.
-    stores.backends.update(cx, |s, cx| s.refresh(cx));
-    for _ in 0..8 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
+    load_the_registry(cx, &stores);
 
     // The row the reader is looking at: a failed download, remembering its URL.
     stores.local_models.update(cx, |s, _| {
@@ -16441,7 +18374,7 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
     })
     .unwrap();
 
-    probe::set_probes_enabled(true);
+    let _probes = probes_on();
     probe::clear_window(window.window_id().as_u64());
     draw_window(cx, window);
     let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
@@ -16479,10 +18412,44 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
         .into_iter()
         .map(|(n, _)| n)
         .collect();
-    probe::set_probes_enabled(false);
     assert!(
         !names.contains(&"settings/backends/local/installed/0/retry".to_string()),
         "a pending retry must not leave a second door onto itself: {names:?}"
+    );
+
+    // Let the download settle. Whenever the slot clears, the row has to be the
+    // downloading one by then — in the same update. (These stores have no bus
+    // bridge, so the read that delivers that snapshot can only be the one the
+    // store issues for the accepted download itself.)
+    for _ in 0..200 {
+        if !stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(&url))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        cx.run_until_parked();
+    }
+    assert!(
+        !stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(&url)),
+        "the download settles while the transfer runs on"
+    );
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        !names.contains(&"settings/backends/local/installed/0/retry".to_string()),
+        "the slot hands over to the snapshot with no frame between them: {names:?}"
+    );
+    assert!(
+        names.contains(&"settings/backends/local/installed/0/cancel".to_string()),
+        "…which shows the accepted transfer, with its Cancel: {names:?}"
     );
 
     // The programmatic door is shut too, and nothing is published over the
@@ -16493,11 +18460,15 @@ fn backends_a_second_retry_press_does_not_race_the_first(cx: &mut TestAppContext
         });
     })
     .unwrap();
-    for _ in 0..12 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
+    // A download that starts occupies its slot in the same update, so a press
+    // that leaves the slot empty started nothing — there is no later answer
+    // to wait for.
+    assert!(
+        !stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(&url)),
+        "a press on a row whose transfer is running must start nothing"
+    );
     assert!(
         stores
             .local_models
@@ -16541,16 +18512,15 @@ fn backends_a_catalog_press_cannot_race_a_pending_retry(cx: &mut TestAppContext)
         AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
     );
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    // The drain barrier, bound before the listener: the transfer runs until the
+    // listener closes and resets its connection, and the listener — declared
+    // after this — drops first on every exit, a failed assertion included.
+    let _backing = Backing::with_app(core.clone(), dir, cx);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let url = format!("http://{}/wisp.gguf", listener.local_addr().unwrap());
 
-    stores.backends.update(cx, |s, cx| s.refresh(cx));
-    for _ in 0..8 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
+    load_the_registry(cx, &stores);
 
     stores.local_models.update(cx, |s, _| {
         s.set_state_for_test(eidola_app_core::LocalModelsState {
@@ -16611,14 +18581,16 @@ fn backends_a_catalog_press_cannot_race_a_pending_retry(cx: &mut TestAppContext)
             })
             .unwrap_or(false)
     };
+    // Ticking past the call's return is harmless: the call registers the
+    // transfer before it returns, so the first sample after the return sees it
+    // and stops the loop, and the one tick between can run only the
+    // continuation, which keeps the slot until a read lands.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut in_flight = false;
-    for _ in 0..8 {
+    while !in_flight && std::time::Instant::now() < deadline {
         cx.executor().tick();
-        std::thread::sleep(std::time::Duration::from_millis(60));
+        std::thread::sleep(std::time::Duration::from_millis(10));
         in_flight = running(cx);
-        if in_flight {
-            break;
-        }
     }
     assert!(
         in_flight,
@@ -16636,11 +18608,15 @@ fn backends_a_catalog_press_cannot_race_a_pending_retry(cx: &mut TestAppContext)
         pane.update(cx, |p, cx| p.download_catalog(&url, cx));
     })
     .unwrap();
-    for _ in 0..12 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
+    // Whichever press owns the slot at the end, it clears only once its
+    // answer has landed — a refusal clears it with `op_error` set, an
+    // acceptance once a read shows the transfer — so waiting for it is waiting
+    // for the outcome rather than for a while.
+    wait_until(cx, "the operation on this URL settles", |cx| {
+        !stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(&url))
+    });
 
     assert!(
         stores
@@ -16668,6 +18644,185 @@ fn backends_a_catalog_press_cannot_race_a_pending_retry(cx: &mut TestAppContext)
         live.models
     );
     assert_eq!(downloading[0].slug, "wisp");
+}
+
+/// **Two downloads started together cannot take each other's row away.** Each
+/// accepted download keeps its pending slot until a snapshot showing the
+/// transfer is installed, and the snapshot has exactly one writer — the
+/// store's superseding refresh. A snapshot carried by the operation itself
+/// would be a second writer with no ordering: the first download's read
+/// samples the transfer list before the second starts, stalls in the rest of
+/// `local_models_state`, and lands last — a list without the second transfer,
+/// after the second's slot had already cleared, so its row is gone and nothing
+/// stands in the way of a second press.
+///
+/// The stall is **staged, not hoped for**: a configured llamacpp backend's
+/// directory holds a model whose sidecar is a FIFO, and the scan opens every
+/// sidecar after the managed transfers are sampled. A read reaching it blocks
+/// until a writer opens it; the test opens it non-blocking (which succeeds only
+/// once a reader is there, so it doubles as the signal that the first read is
+/// stalled past its sample) and holds it open, so the read stays parked on the
+/// data. The FIFO is then unlinked from the directory — reached through a hard
+/// link outside it — so every later read scans past it, and released only once
+/// the second download has settled.
+#[gpui::test]
+fn two_downloads_started_together_both_keep_their_rows(cx: &mut TestAppContext) {
+    use eidola_app_core::LocalModelStatus;
+
+    cx.executor().allow_parking();
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+    let dir = tempfile::tempdir().unwrap();
+    let core = std::sync::Arc::new(
+        AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
+    );
+    let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    // The drain barrier. Everything that keeps a core-side task running — the
+    // FIFO a read parks on, the listener the transfers wait on — is declared
+    // after it, so on every exit, a failed assertion included, it is released
+    // before the barrier waits, and the wait stays bounded.
+    let _backing = Backing::with_app(core.clone(), dir, cx);
+
+    /// The FIFO sidecar a scan parks on, and the write end that holds a parked
+    /// read on its data. Dropping it unparks every read, present and future:
+    /// the sidecar leaves the directory (a later open fails rather than
+    /// blocking), a held write end closes (the parked read sees end of file),
+    /// and a read still blocked opening the FIFO is let through by a writer
+    /// that opens and closes at once.
+    struct FifoGate {
+        sidecar: std::path::PathBuf,
+        link: std::path::PathBuf,
+        writer: Option<std::fs::File>,
+    }
+    impl FifoGate {
+        /// A write end, if a read is blocked opening the FIFO right now.
+        fn open_writer(&self) -> Option<std::fs::File> {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.link)
+                .ok()
+        }
+    }
+    impl Drop for FifoGate {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.sidecar);
+            self.writer = None;
+            drop(self.open_writer());
+        }
+    }
+
+    // The external directory with its stalling sidecar, and the hard link the
+    // test keeps hold of it by.
+    let external = tempfile::tempdir().unwrap();
+    let held = tempfile::tempdir().unwrap();
+    std::fs::write(external.path().join("slow.gguf"), b"").unwrap();
+    let sidecar = external.path().join("slow.gguf.meta.json");
+    let fifo = std::ffi::CString::new(sidecar.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+    let link = held.path().join("gate");
+    std::fs::hard_link(&sidecar, &link).unwrap();
+    let mut gate = FifoGate {
+        sidecar: sidecar.clone(),
+        link,
+        writer: None,
+    };
+    core.runtime()
+        .block_on(core.add_backend(eidola_app_core::NewBackend {
+            id: "shelf".into(),
+            kind: eidola_app_core::BackendKind::LlamaCpp,
+            display_name: "Shelf".into(),
+            base_url: None,
+            api_key: None,
+            models_dir: Some(external.path().to_str().unwrap().into()),
+            model_overrides: None,
+            engine_path: None,
+            auto_start: false,
+        }))
+        .expect("add the llamacpp backend");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let host = listener.local_addr().unwrap();
+    let first = format!("http://{host}/first.gguf");
+    let second = format!("http://{host}/second.gguf");
+    let pending = |cx: &mut TestAppContext, url: &str| {
+        stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(url))
+    };
+
+    // The first download, and a read after its acceptance that stalls on the
+    // FIFO once it has sampled the transfer list.
+    stores
+        .local_models
+        .update(cx, |s, cx| s.download(first.clone(), cx));
+    for _ in 0..400 {
+        cx.run_until_parked();
+        gate.writer = gate.open_writer();
+        if gate.writer.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        gate.writer.is_some(),
+        "a read after the first acceptance reaches the sidecar"
+    );
+    std::fs::remove_file(&sidecar).unwrap();
+    assert!(
+        pending(cx, &first),
+        "no snapshot showing the first transfer has landed, so its slot stands"
+    );
+
+    // The second download settles while the first read is still parked.
+    stores
+        .local_models
+        .update(cx, |s, cx| s.download(second.clone(), cx));
+    for _ in 0..400 {
+        cx.run_until_parked();
+        if !pending(cx, &second) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!pending(cx, &second), "the second download settles");
+
+    // Release the parked read and let anything it would land, land. Closing
+    // the listener resets the transfers' connections, so once the parked read
+    // has finished too the runtime goes idle — which is what establishes that
+    // every read has finished, and then the last park delivers whatever any of
+    // them would still land here.
+    drop(listener);
+    drop(gate);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while core.runtime().metrics().num_alive_tasks() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the released read and the reset transfers finish"
+        );
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    cx.run_until_parked();
+
+    let downloading: Vec<String> = stores.local_models.read_with(cx, |s, _| {
+        s.models()
+            .iter()
+            .filter(|m| matches!(m.status, LocalModelStatus::Downloading { .. }))
+            .map(|m| m.slug.clone())
+            .collect()
+    });
+    assert!(
+        downloading.contains(&"first".to_string()) && downloading.contains(&"second".to_string()),
+        "both accepted transfers keep their rows, whatever order the reads ran in: {downloading:?}"
+    );
+    assert!(!pending(cx, &first) && !pending(cx, &second));
+    assert!(
+        stores
+            .local_models
+            .read_with(cx, |s, _| s.op_error().is_none()),
+        "neither download was refused"
+    );
 }
 
 /// **One transfer is one transfer however its URL is spelled.** App-core keys
@@ -16701,6 +18856,10 @@ fn backends_an_equivalent_url_spelling_is_the_same_transfer(cx: &mut TestAppCont
         AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
     );
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    // The drain barrier, bound before the listener: the transfer runs until the
+    // listener closes and resets its connection, and the listener — declared
+    // after this — drops first on every exit, a failed assertion included.
+    let _backing = Backing::with_app(core.clone(), dir, cx);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let host = listener.local_addr().unwrap();
@@ -16710,12 +18869,7 @@ fn backends_an_equivalent_url_spelling_is_the_same_transfer(cx: &mut TestAppCont
     let resolve_url = format!("http://{host}/huggingface.co/wisp-gguf/resolve/main/wisp.gguf");
     let query_url = format!("{resolve_url}?download=true");
 
-    stores.backends.update(cx, |s, cx| s.refresh(cx));
-    for _ in 0..8 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
+    load_the_registry(cx, &stores);
 
     stores.local_models.update(cx, |s, _| {
         s.set_state_for_test(eidola_app_core::LocalModelsState {
@@ -16778,14 +18932,16 @@ fn backends_an_equivalent_url_spelling_is_the_same_transfer(cx: &mut TestAppCont
             })
             .unwrap_or(false)
     };
+    // Ticking past the call's return is harmless: the call registers the
+    // transfer before it returns, so the first sample after the return sees it
+    // and stops the loop, and the one tick between can run only the
+    // continuation, which keeps the slot until a read lands.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut in_flight = false;
-    for _ in 0..8 {
+    while !in_flight && std::time::Instant::now() < deadline {
         cx.executor().tick();
-        std::thread::sleep(std::time::Duration::from_millis(60));
+        std::thread::sleep(std::time::Duration::from_millis(10));
         in_flight = running(cx);
-        if in_flight {
-            break;
-        }
     }
     assert!(
         in_flight,
@@ -16804,11 +18960,13 @@ fn backends_an_equivalent_url_spelling_is_the_same_transfer(cx: &mut TestAppCont
         pane.update(cx, |p, cx| p.download_catalog(&query_url, cx));
     })
     .unwrap();
-    for _ in 0..12 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
+    // The slot clears only once the answer of whichever press owns it has
+    // landed (see the sibling above).
+    wait_until(cx, "the operation on this model settles", |cx| {
+        !stores
+            .local_models
+            .read_with(cx, |s, _| s.download_pending(&resolve_url))
+    });
 
     assert!(
         stores
@@ -16870,13 +19028,11 @@ fn backends_a_catalog_row_stands_down_while_its_transfer_starts(cx: &mut TestApp
         AppCore::new(dir.path().to_path_buf(), dir.path().join("data")).expect("open core"),
     );
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    // The drain barrier; it also runs the press this test never pumps, whose
+    // refusal of a file already on disk is what lets the runtime go idle.
+    let _backing = Backing::with_app(core, dir, cx);
 
-    stores.backends.update(cx, |s, cx| s.refresh(cx));
-    for _ in 0..8 {
-        cx.run_until_parked();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    cx.run_until_parked();
+    load_the_registry(cx, &stores);
 
     // The reader's situation: this catalog entry's download failed and left
     // nothing behind, so the row remembers the entry's own URL — and the
@@ -16915,16 +19071,15 @@ fn backends_a_catalog_row_stands_down_while_its_transfer_starts(cx: &mut TestApp
     seed(cx);
 
     let probes = |cx: &mut TestAppContext| -> Vec<String> {
-        probe::set_probes_enabled(true);
+        let _probes = probes_on();
         probe::clear_window(window.window_id().as_u64());
         // Synchronous: `draw_window` would run the pending continuation with it.
-        cx.update_window(window, |_, window, cx| window.draw(cx).clear())
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
         let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
             .into_iter()
             .map(|(n, _)| n)
             .collect();
-        probe::set_probes_enabled(false);
         names
     };
 
@@ -16990,7 +19145,7 @@ fn backends_a_catalog_row_stands_down_while_its_transfer_starts(cx: &mut TestApp
 /// in-flight load can clear them instead of the press.
 #[gpui::test]
 fn space_a_transcript_retry_hands_the_keyboard_back(cx: &mut TestAppContext) {
-    let (stores, core, _dir, space_id) = participants_scene(cx);
+    let (stores, _core, _backing, space_id) = participants_scene(cx);
     let (window, view) = open_space(cx, &stores, Some(space_id));
     cx.run_until_parked();
 
@@ -17090,6 +19245,6525 @@ fn space_a_transcript_retry_hands_the_keyboard_back(cx: &mut TestAppContext) {
             .unwrap(),
         "a reader composing beside the strip keeps their caret"
     );
+}
 
-    drain_runtime(&core);
+// ---------------------------------------------------------------------------
+// Regeneration: an accepted press is visible, a refused one is not a press
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn space_regenerate_shows_its_pending_state_in_the_same_frame(cx: &mut TestAppContext) {
+    // The reported defect: an accepted Regenerate could be silent for minutes,
+    // so nothing on screen distinguished it from a dead button. The pending
+    // state is pushed before the backend is consulted, and it renders **in
+    // place of the post being replaced** — never as a child leaf, which would
+    // draw as a reply to the post it is about to become.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        let seq = s
+            .revising_seq("a2")
+            .expect("the accepted press is pending on the post it replaces");
+        assert!(
+            s.streams().iter().any(|t| t.seq == seq && t.revising),
+            "the turn knows it is a revision, not a reply"
+        );
+        assert!(!s.accepts_mutation(), "and the space is busy while it runs");
+    });
+
+    use eidola_gui::probe;
+    let _probes = probes_on();
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        names.iter().any(|n| n.ends_with("/regenerating")),
+        "the reader is told, in the frame that accepted the press: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("/regenerate")),
+        "and the verb it came from is gone, not left looking live: {names:?}"
+    );
+}
+
+#[gpui::test]
+fn space_regenerate_while_busy_is_refused_not_silently_dropped(cx: &mut TestAppContext) {
+    // A second press must not look accepted. The entity refuses it, and the
+    // affordance is already withheld — the two answers agree.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    space.update(cx, |s, cx| {
+        assert!(
+            s.regenerate_post("a2".into(), "kimi-k2".into(), cx),
+            "the first press is accepted"
+        );
+        assert!(
+            !s.regenerate_post("a2".into(), "kimi-k2".into(), cx),
+            "the second is refused while the first runs"
+        );
+        assert_eq!(
+            s.streams().iter().filter(|t| t.revising).count(),
+            1,
+            "and no second pending state was created"
+        );
+    });
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.post_verb_count_for_test("a2", cx),
+            0,
+            "no verb is offered while the space would refuse one"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_withholds_post_verbs_while_a_save_is_in_flight(cx: &mut TestAppContext) {
+    // The exclusive mutation slot makes the space busy **without** anything
+    // streaming. Asking only "is something streaming?" left Edit and
+    // Regenerate on screen through that whole window, where the handler was
+    // already certain to refuse them — a press that does nothing.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    space.update(cx, |s, cx| s.arm_post_runner_for_test(cx));
+    space.read_with(cx, |s, _| {
+        assert!(!s.is_streaming(), "nothing is streaming…");
+        assert!(!s.accepts_mutation(), "…and yet no mutation is accepted");
+    });
+    view.read_with(cx, |v, cx| {
+        assert_eq!(v.post_verb_count_for_test("a2", cx), 0);
+        assert_eq!(v.post_verb_count_for_test("a1", cx), 0);
+    });
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.set_post_hover_for_test("a2", true, cx);
+        });
+    })
+    .unwrap();
+    use eidola_gui::probe;
+    let _probes = probes_on();
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.contains("/regenerate")),
+        "even hovered, a post offers no verb the space would refuse: {names:?}"
+    );
+
+    space.update(cx, |s, cx| s.clear_post_runner_for_test(cx));
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.post_verb_count_for_test("a2", cx),
+            1,
+            "and they come back when the space is free"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_regeneration_deltas_render_on_the_post_being_replaced(cx: &mut TestAppContext) {
+    // Reasoning and answer arrive on the pending revision, in the post's own
+    // place. The transcript gains no node: a regeneration is a new version of
+    // an existing post, not a new post.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.push_content_delta_for_test(seq, "a better answer", cx)
+        });
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        let turn = s.streams().iter().find(|t| t.seq == seq).expect("the turn");
+        assert_eq!(turn.response.content, "a better answer");
+    });
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.stream_overlays_for_test(cx).is_empty(),
+            "a revision claims no leaf of its own"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_regeneration_failure_keeps_the_generation_it_would_replace(cx: &mut TestAppContext) {
+    // Nothing was written, so the answer already on screen is the answer.
+    // Retry is deliberately not armed: it re-*asks* a participant, which is a
+    // different verb from regenerating.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.fail_revision_for_test(
+                seq,
+                AppError::ModelUnavailable {
+                    model: "kimi-k2".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        assert!(s.revising_seq("a2").is_none(), "the pending state is gone");
+        assert!(s.accepts_mutation(), "and the space is free again");
+        assert!(
+            s.failed_turn().is_none(),
+            "a regeneration leaves no re-ask behind it"
+        );
+    });
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.error_for_test(cx).is_some_and(|t| t.contains("kimi-k2")),
+            "the reader is told what happened, in their own language"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_marks_an_answer_that_stopped_at_its_length_limit(cx: &mut TestAppContext) {
+    // A partial answer is kept — it is real text — but it must not read as a
+    // finished one. The mark sits beneath the answer it is about.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.note_truncated_turn_for_test("a2", cx));
+    })
+    .unwrap();
+
+    use eidola_gui::probe;
+    let _probes = probes_on();
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        names.iter().any(|n| n.ends_with("/cut-off")),
+        "the answer says where it stopped: {names:?}"
+    );
+}
+
+#[gpui::test]
+fn space_marks_a_reloaded_answer_that_stopped_at_its_length_limit(cx: &mut TestAppContext) {
+    // The durable half. This window watched no turn — it is the window a
+    // reader opens afterwards — so nothing has told it anything; the only
+    // source of the mark is the post's own row. A `truncated` post is
+    // therefore seeded and the mark asserted with no event delivered at all,
+    // and the sibling that is not truncated pins that the mark is per-post
+    // rather than a property of the space.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = fixture_assistant_post("a2", "the reply that ran out of room");
+    a2.parent_action_id = Some("a1".into());
+    a2.truncated = true;
+    let mut a3 = fixture_assistant_post("a3", "a whole answer");
+    a3.parent_action_id = Some("a2".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "original text"), a2, a3], cx)
+        });
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, _| window.refresh())
+        .unwrap();
+    cx.run_until_parked();
+
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.truncated_posts_for_test().is_empty(),
+            "this window watched no turn, so it remembers nothing"
+        );
+    });
+
+    use eidola_gui::probe;
+    let _probes = probes_on();
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let cut_off: Vec<&String> = names.iter().filter(|n| n.ends_with("/cut-off")).collect();
+    assert_eq!(
+        cut_off.len(),
+        1,
+        "exactly the reloaded post that stopped short says so: {names:?}"
+    );
+    assert!(
+        cut_off[0].starts_with("space/post/1/"),
+        "and it is the second post, not its sibling: {cut_off:?}"
+    );
+}
+
+#[gpui::test]
+fn space_a_reply_waits_for_the_answer_it_names_but_a_post_does_not(cx: &mut TestAppContext) {
+    // The harm is a durable edge naming a generation about to be superseded:
+    // item threading resolves it onto the new tip, so the post renders beneath
+    // an answer nobody wrote it against. That is a fact about the *antecedent*,
+    // not about the space — refusing every post for the length of somebody
+    // else's regeneration would take the conversation away for minutes.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    space.update(cx, |s, cx| {
+        assert!(!s.is_busy(), "nothing of this space's is running");
+        assert!(
+            s.revision_targets("a2"),
+            "but a2's generation is being replaced"
+        );
+        assert!(
+            !s.revision_targets("a1"),
+            "and a1's is not — the question is per-post"
+        );
+        assert!(
+            !s.submit(
+                "about that answer".into(),
+                Some("a2".into()),
+                Vec::new(),
+                cx
+            ),
+            "a reply to the answer being replaced is refused"
+        );
+        assert!(
+            s.submit("a fresh question".into(), Some("a1".into()), Vec::new(), cx),
+            "a reply to anything else is ordinary — posting supersedes nothing"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_both_mutation_doors_answer_the_same_question(cx: &mut TestAppContext) {
+    // Edit and Regenerate both supersede a generation, so both ask the mutation
+    // question — not merely whether something is running. Their verbs are drawn
+    // from `accepts_mutation` and `post_verb_count` reads it too, so a door
+    // answering differently is a door the surface no longer offers but that
+    // would still say yes if reached.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    space.update(cx, |s, cx| {
+        assert!(!s.is_busy(), "nothing of this space's is running…");
+        assert!(!s.accepts_mutation(), "…but a generation is being replaced");
+        assert!(
+            !s.edit("a1".into(), "a revised question".into(), Vec::new(), cx),
+            "so an edit is refused, exactly as a regeneration is"
+        );
+        assert!(
+            !s.regenerate_post("a2".into(), "kimi-k2".into(), cx),
+            "the twin door agrees"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_standing_collision_withholds_the_verbs_and_the_retry(cx: &mut TestAppContext) {
+    // The waiter is outside `is_busy` on purpose (nothing of *ours* is
+    // running), so every affordance whose press could only be refused while it
+    // stands has to ask the mutation question instead. Regenerate remounted
+    // beside its own "already being regenerated" mark; Retry re-asks, and an
+    // ask is refused for the same reason.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::Internal {
+                    message: "the ask fell over".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    space.read_with(cx, |s, _| assert!(s.can_retry(), "Retry is armed"));
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        assert!(!s.is_busy(), "nothing of this space's is running…");
+        assert!(
+            !s.accepts_mutation(),
+            "…and yet no mutation would be accepted"
+        );
+        assert!(
+            !s.can_retry(),
+            "so Retry — which re-asks — is withheld with them"
+        );
+    });
+    view.read_with(cx, |v, cx| {
+        assert_eq!(
+            v.post_verb_count_for_test("a2", cx),
+            0,
+            "the keyboard model agrees with the render"
+        );
+    });
+    space.update(cx, |s, cx| {
+        assert!(
+            !s.regenerate_post("a2".into(), "kimi-k2".into(), cx),
+            "and a press is refused rather than starting a doomed runner"
+        );
+        assert!(s.streams().is_empty(), "nothing was started");
+    });
+
+    use eidola_gui::probe;
+    let names = {
+        let _probes = probes_on();
+        probe::clear_window(window.window_id().as_u64());
+        draw_window(cx, window);
+        probe::window_entries(window.window_id().as_u64())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect::<Vec<String>>()
+    };
+    assert!(
+        names.iter().any(|n| n.ends_with("/regenerating-elsewhere")),
+        "the mark is showing: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("/regenerate")),
+        "and no Regenerate stands beside it: {names:?}"
+    );
+
+    // The settlement gives all of them back together.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.settle_collision_for_test("a2", cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.accepts_mutation(),
+            "the released claim restores the verbs"
+        );
+        assert!(
+            s.can_retry(),
+            "and the recovery its failure still stands for"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_refused_retry_keeps_the_notice_that_explains_it(cx: &mut TestAppContext) {
+    // An affordance that can be refused must not spend the state its refusal
+    // depends on: clearing the notice before `retry` answered left the record
+    // standing with nothing on screen explaining it.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::Internal {
+                    message: "the ask fell over".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
+    // A regeneration starts, so the ask Retry would make is now refused.
+    space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.retry_failed(window, cx));
+    })
+    .unwrap();
+
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.error_for_test(cx).is_some(),
+            "the refused press left the explanation on screen"
+        );
+    });
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.failed_turn().is_some(),
+            "and the recovery it belongs to intact"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_mark_waits_for_the_post_it_names_to_be_read(cx: &mut TestAppContext) {
+    // A mark is recorded when the *turn* ends; its post reaches this window
+    // only when a snapshot carries it. A truncated turn whose own exit reload
+    // failed leaves the answer durable and unread here — and a rebuild driven
+    // by anything at all (a concurrent sibling's delta) then read "not in the
+    // current posts" as "superseded" and dropped the mark, so the answer came
+    // back after the retry with nothing saying it had been cut off.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    // The turn ends naming a generation no snapshot here has ever held.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.note_truncated_turn_for_test("a3", cx));
+    })
+    .unwrap();
+
+    // Something unrelated rebuilds the snapshot — the reload has not landed,
+    // so the posts are still a3-less.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| v.rebuild_for_test(cx));
+    })
+    .unwrap();
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.truncated_posts_for_test().iter().any(|id| id == "a3"),
+            "a post this window has never seen is pending, not gone"
+        );
+    });
+
+    // The retry lands and a3 is finally read: now the mark has something to be
+    // about, and it is drawn on it.
+    let mut a3 = fixture_assistant_post("a3", "the answer, cut off mid-");
+    a3.parent_action_id = Some("a2".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![
+                    fixture_user_post("a1", "original text"),
+                    {
+                        let mut a2 = fixture_assistant_post("a2", "the reply");
+                        a2.parent_action_id = Some("a1".into());
+                        a2
+                    },
+                    a3,
+                ],
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    use eidola_gui::probe;
+    let _probes = probes_on();
+    probe::clear_window(window.window_id().as_u64());
+    draw_window(cx, window);
+    let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        names.iter().any(|n| n.ends_with("/cut-off")),
+        "the mark survived to reach the answer it is about: {names:?}"
+    );
+
+    // And once seen, a snapshot's silence about it means what it always did.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "original text")], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.truncated_posts_for_test().is_empty(),
+            "a generation that was read and is now gone is gone"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_regeneration_failure_takes_a_stale_retry_with_it(cx: &mut TestAppContext) {
+    // The notice and the recovery it offers must describe one event. An
+    // earlier ask failed and armed Retry; a regeneration then failed
+    // retryably, carrying no re-ask of its own — so the band explained the
+    // regeneration (which deliberately offers no Retry) while the Retry
+    // beneath it re-asked the unrelated earlier turn.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.apply_turn_failure_for_test(
+                "agent-b",
+                "a1",
+                AppError::Internal {
+                    message: "the ask fell over".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    space.read_with(cx, |s, _| {
+        assert!(s.can_retry(), "the earlier ask armed a Retry");
+    });
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.fail_revision_for_test(
+                seq,
+                AppError::Internal {
+                    message: "the regeneration fell over".into(),
+                },
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.failed_turn().is_none(),
+            "the regeneration's failure ended the recovery it stood in front of"
+        );
+        assert!(!s.can_retry(), "so no Retry is offered under its notice");
+    });
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.error_for_test(cx)
+                .is_some_and(|t| t.contains("the regeneration fell over")),
+            "and the notice is the regeneration's own"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_regeneration_running_elsewhere_is_marked_until_it_lands(cx: &mut TestAppContext) {
+    // The collision is transient by construction — the claim refuses precisely
+    // because the work is finishing somewhere this window cannot see (the
+    // regeneration it started before it was closed and reopened). So it is not
+    // a failure and does not stand in the recovery band, which has nothing to
+    // end it: the other regeneration arrives as a transcript refresh, never as
+    // a `StreamEnded`. It is held on the generation it collided with, and that
+    // refresh is exactly what takes that generation — and the mark — away.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        assert!(s.revising_seq("a2").is_none(), "the pending state is gone");
+        assert!(!s.is_busy(), "and nothing of this space's is running…");
+        assert!(
+            !s.accepts_mutation(),
+            "…though the answer is still being replaced, so no verb is offered"
+        );
+        assert!(s.failed_turn().is_none(), "there is nothing to re-ask");
+    });
+    view.read_with(cx, |v, cx| {
+        assert!(
+            v.error_for_test(cx).is_none(),
+            "nothing failed, so nothing stands in the recovery band"
+        );
+    });
+
+    use eidola_gui::probe;
+    let names = |cx: &mut TestAppContext| -> Vec<String> {
+        let _probes = probes_on();
+        probe::clear_window(window.window_id().as_u64());
+        draw_window(cx, window);
+        let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        names
+    };
+
+    let before = names(cx);
+    assert!(
+        before
+            .iter()
+            .any(|n| n.ends_with("/regenerating-elsewhere")),
+        "the reader is told which answer is already being regenerated: {before:?}"
+    );
+
+    // The other regeneration commits. It is a new **generation of the same
+    // item** — which is why keying the mark on the generation is what ends it,
+    // and keying it on the item would not have.
+    let mut a3 = fixture_assistant_post("a3", "the regenerated reply");
+    a3.parent_action_id = Some("a1".into());
+    a3.item_id = "item-a2".into();
+    a3.generation = 1;
+    a3.generation_count = 2;
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![fixture_user_post("a1", "original text"), a3], cx)
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let after = names(cx);
+    assert!(
+        !after.iter().any(|n| n.ends_with("/regenerating-elsewhere")),
+        "and the completion that superseded that generation took the mark with it: {after:?}"
+    );
+}
+
+#[gpui::test]
+fn space_an_ask_waits_for_the_regeneration_of_the_post_it_would_answer(cx: &mut TestAppContext) {
+    // A regeneration streams, so it lives in `turn_runners` rather than the
+    // exclusive slot — and `ask` read the slot, which is how a post-level
+    // mutation stopped refusing one. The ask is written against the generation
+    // on screen; if it starts while that generation is being replaced it is
+    // billed, and reply threading follows item identity, so it comes back
+    // beneath the answer it never saw. The duplicate check is no substitute: a
+    // revising turn carries no `participant_id` and matches nothing.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    space.update(cx, |s, cx| {
+        assert!(
+            s.regenerate_post("a2".into(), "kimi-k2".into(), cx),
+            "the regeneration is accepted"
+        );
+        assert!(
+            s.mutation_in_flight(),
+            "and it is a post-level mutation, however it travels"
+        );
+        assert!(
+            s.ask("agent-b".into(), "a2".into(), cx).is_none(),
+            "so an ask about the generation being replaced is refused"
+        );
+        assert_eq!(
+            s.streams().len(),
+            1,
+            "and no billed turn was started beside it"
+        );
+    });
+
+    // **The fan-out's concurrency is untouched** — the narrower predicate is
+    // the whole point. In a conversation where nothing is being replaced,
+    // several asks still run side by side, each an ordinary streaming turn.
+    let (window_b, view_b) = open_space(cx, &stores, Some("s2".into()));
+    seed_space_pair(&view_b, window_b, cx);
+    let space_b = view_b.read_with(cx, |v, _| v.space().clone());
+    space_b.update(cx, |s, cx| {
+        assert!(s.ask("agent-b".into(), "a2".into(), cx).is_some());
+        assert!(
+            s.ask("agent-c".into(), "a2".into(), cx).is_some(),
+            "a second participant is still askable while the first streams"
+        );
+        assert_eq!(s.streams().len(), 2, "two turns, side by side");
+        assert!(
+            !s.mutation_in_flight(),
+            "because neither replaces a generation"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_verb_that_hides_its_own_gutter_hands_the_keyboard_back(cx: &mut TestAppContext) {
+    // Every probed `Role::Button` is a real tab stop, and an accepted
+    // Regenerate makes `accepts_mutation` false — which withholds the whole
+    // action gutter, unmounting the verb that was just activated. The window
+    // goes on holding that slot's handle: `is_focused` answers `true` for a
+    // handle tracked on nothing, so even `sync_tree_focus` reads the level as
+    // live and leaves it there for the length of the regeneration. The row is
+    // ending, so the level ends with it — the post, where Escape already goes.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down down");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a2".to_string(), Some(0))),
+            "the keyboard is on the answer's Regenerate verb"
+        );
+    });
+
+    // Activate it. gpui's keyboard click fires on key **up**, which
+    // `simulate_keystrokes` does not send — so the press is dispatched whole,
+    // exactly as `tests/probe.rs` drives the Library's verbs.
+    let ks = gpui::Keystroke::parse("enter").unwrap();
+    vcx.update_window(window, |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke: ks.clone(),
+                is_held: false,
+                prefer_character_input: false,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            gpui::PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke: ks }),
+            cx,
+        );
+    })
+    .unwrap();
+    vcx.run_until_parked();
+
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    space.read_with(&vcx, |s, _| {
+        assert!(
+            s.revising_seq("a2").is_some(),
+            "the press was accepted — this is the state the gutter goes away in"
+        );
+    });
+    view.read_with(&vcx, |v, cx| {
+        assert_eq!(
+            v.post_verb_count_for_test("a2", cx),
+            0,
+            "and the row the keyboard was standing on is gone"
+        );
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a2".to_string(), None)),
+            "so the level ends with it, on the post — not stranded on a slot \
+             that is tracked by nothing"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_pointer_regenerate_leaves_the_keyboard_where_it_is(cx: &mut TestAppContext) {
+    // The other half of the handback rule: it is owed only by a reader who was
+    // actually holding the row. A pointer press on one of these verbs moves
+    // focus nowhere (gpui's `prevent_default`, the macOS convention), so a
+    // click while the caret is somewhere else must not drag it onto the post.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down down");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.tree_focus_for_test(), Some(("a2".to_string(), Some(0))));
+    });
+
+    // Move the keyboard off the row and press the verb by pointer in the same
+    // update — no frame in between, so the level is still recorded on the row
+    // the reader has just left. That is exactly the state a bare level check
+    // would misread as "the keyboard is here".
+    let root = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update_window(window, |_, window, cx| {
+        window.focus(&root, cx);
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    })
+    .unwrap();
+
+    vcx.update_window(window, |_, window, cx| {
+        assert!(
+            root.is_focused(window),
+            "the press took nothing from the reader's own place"
+        );
+        let _ = cx;
+    })
+    .unwrap();
+}
+
+#[gpui::test]
+fn space_an_ask_waits_for_a_regeneration_running_where_this_window_cannot_see(
+    cx: &mut TestAppContext,
+) {
+    // The seam between the collision design and the ask gate. A refused press
+    // takes the revising stream back out — nothing of *this* window's is
+    // running — while the answer is still being replaced elsewhere, so a gate
+    // reading only the local stream re-opened and an ask could be billed
+    // against the generation on its way out. The waiter is the fact: armed at
+    // the refusal, alive exactly until the claim releases.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.revising_seq("a2").is_none(),
+            "this window's own revising stream is gone…"
+        );
+        assert!(
+            s.mutation_in_flight(),
+            "…and yet the answer is still being replaced"
+        );
+    });
+    space.update(cx, |s, cx| {
+        assert!(
+            s.ask("agent-b".into(), "a2".into(), cx).is_none(),
+            "so an ask about it is refused, exactly as during a local revision"
+        );
+        assert!(s.streams().is_empty(), "nothing billed was started");
+    });
+
+    // **The same act ends both.** The mark and the gate read one map, so the
+    // settlement that takes the mark off the screen is the settlement that
+    // lets an ask through — there is no ordering between them to get wrong.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.settle_collision_for_test("a2", cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    space.read_with(cx, |s, _| {
+        assert!(
+            !s.mutation_in_flight(),
+            "the released claim re-opens the gate"
+        );
+    });
+    view.read_with(cx, |v, _| {
+        assert!(
+            !v.regenerating_elsewhere_for_test()
+                .iter()
+                .any(|id| id == "a2"),
+            "and takes the mark with it, in the same act"
+        );
+    });
+    space.update(cx, |s, cx| {
+        assert!(
+            s.ask("agent-b".into(), "a2".into(), cx).is_some(),
+            "an ask about the settled answer is ordinary again"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_a_regeneration_that_fails_elsewhere_still_ends_the_mark(cx: &mut TestAppContext) {
+    // The other half of the ending. A regeneration that *fails* writes no
+    // successor — no action row, and for a ceiling truncation only a Record
+    // entry attached to nothing — so the transcript comes back byte-identical
+    // and supersession has nothing to say. The claim's release is what ends the
+    // mark, published by app-core and arriving as `RegenerationSettled`.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_space_pair(&view, window, cx);
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let seq = space.update(cx, |s, cx| {
+        s.regenerate_post("a2".into(), "kimi-k2".into(), cx);
+        s.revising_seq("a2").expect("pending")
+    });
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.collide_revision_for_test(seq, cx));
+    })
+    .unwrap();
+
+    use eidola_gui::probe;
+    let names = |cx: &mut TestAppContext| -> Vec<String> {
+        let _probes = probes_on();
+        probe::clear_window(window.window_id().as_u64());
+        draw_window(cx, window);
+        let names: Vec<String> = probe::window_entries(window.window_id().as_u64())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        names
+    };
+
+    let before = names(cx);
+    assert!(
+        before
+            .iter()
+            .any(|n| n.ends_with("/regenerating-elsewhere")),
+        "the mark stands while the other regeneration runs: {before:?}"
+    );
+
+    // The other regeneration fails. **Nothing about the transcript changes** —
+    // same generation, same text, same everything — which is precisely why the
+    // mark needs an ending that does not come from the tree.
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| s.settle_collision_for_test("a2", cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    space.read_with(cx, |s, _| {
+        let posts = s.messages();
+        assert_eq!(posts.len(), 2, "the transcript is what it was");
+        assert_eq!(
+            posts[1].action_id.as_deref(),
+            Some("a2"),
+            "nothing superseded the marked generation"
+        );
+    });
+    let after = names(cx);
+    assert!(
+        !after.iter().any(|n| n.ends_with("/regenerating-elsewhere")),
+        "and the released claim ended the mark anyway: {after:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Find in the conversation (⌘F)
+// ---------------------------------------------------------------------------
+
+/// The conversation the find tests search: one word in three posts, once inside
+/// a link's URL where the reader can never see it.
+fn findable_posts() -> Vec<PostNode> {
+    let mut second = fixture_assistant_post(
+        "a2",
+        "The [survey](https://kestrel.example/data) says a kestrel hunts by hovering.",
+    );
+    second.parent_action_id = Some("a1".into());
+    let mut third = fixture_user_post("a3", "Does a kestrel hover in still air too?");
+    third.parent_action_id = Some("a2".into());
+    vec![
+        fixture_user_post("a1", "Tell me about the kestrel."),
+        second,
+        third,
+    ]
+}
+
+/// Open the bar and **type** the query, through the production keystroke path.
+///
+/// Typing rather than `set_value` for two reasons: `InputState::set_value`
+/// suppresses its own events, and the search is driven by `InputEvent::Change`
+/// — so a test that set the value silently would assert against a search that
+/// never ran. It also exercises the routing: a printable reaching the query
+/// field at all depends on the conversation's key handler yielding while the
+/// bar holds the keyboard, or type-to-compose would swallow every character.
+/// Let the cross-branch count finish.
+///
+/// `run_until_parked` cannot: the pass suspends on a real timer between chunks
+/// (`find::COUNT_YIELD`, which must not be zero — a zero duration is
+/// `Task::ready` at our gpui pin and would not suspend at all), and gpui's test
+/// scheduler expires a timer only once the clock reaches it. Advancing is
+/// therefore how a test says "let it land" — and it is what makes the
+/// *unfinished* state observable in the first place.
+fn settle_find_count(vcx: &mut VisualTestContext) {
+    vcx.executor()
+        .advance_clock(std::time::Duration::from_secs(1));
+    vcx.run_until_parked();
+}
+
+fn run_find(
+    view: &Entity<SpaceView>,
+    window: AnyWindowHandle,
+    vcx: &mut VisualTestContext,
+    query: &str,
+) {
+    dispatch_space_action(view, window, vcx, eidola_gui::actions::FindInSpace);
+    let keys: Vec<String> = query.chars().map(|c| c.to_string()).collect();
+    vcx.simulate_keystrokes(&keys.join(" "));
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+}
+
+#[gpui::test]
+fn space_find_matches_what_the_reader_can_see_and_not_what_is_hidden(cx: &mut TestAppContext) {
+    // The projection's whole point, end to end: three posts carry the word,
+    // and a fourth occurrence sits inside a link's URL, which a read-only
+    // editor hides — so counting it would be a count the reader cannot check.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    view.read_with(&vcx, |v, _| {
+        let (matches, index) = v.find_matches_for_test();
+        let nodes: Vec<&str> = matches.iter().map(|(n, _)| n.as_ref()).collect();
+        assert_eq!(
+            nodes,
+            vec!["a1", "a2", "a3"],
+            "one visible match per post, in document order: {matches:?}"
+        );
+        assert_eq!(index, Some(1), "the readout starts at the first match");
+    });
+}
+
+#[gpui::test]
+fn space_find_steps_and_wraps_through_every_match(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    let step = |vcx: &mut VisualTestContext, forward: bool| {
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| v.find_step(forward, window, cx));
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |v, _| v.find_matches_for_test().1)
+    };
+
+    assert_eq!(step(&mut vcx, true), Some(2));
+    assert_eq!(step(&mut vcx, true), Some(3));
+    assert_eq!(step(&mut vcx, true), Some(1), "forward wraps at the end");
+    assert_eq!(
+        step(&mut vcx, false),
+        Some(3),
+        "and backward wraps at the start"
+    );
+}
+
+#[gpui::test]
+fn space_find_builds_no_projection_until_it_is_used(cx: &mut TestAppContext) {
+    // The lazy-activation invariant, pinned rather than assumed: a closed find
+    // bar costs nothing on an ordinary edit keystroke, and closing one drops
+    // every projection it built.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_keystrokes("h e l l o");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(v.has_active_draft_for_test(), "the reader is composing");
+        assert_eq!(
+            v.projections_built_for_test(),
+            0,
+            "typing into the composer builds no searchable projection"
+        );
+    });
+
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.projections_built_for_test() > 0,
+            "…and searching builds them"
+        );
+        assert!(
+            !v.find_projection_nodes_for_test().is_empty(),
+            "the session holds the cache"
+        );
+    });
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.close_find(window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    let after_close = view.read_with(&vcx, |v, _| {
+        assert!(!v.find_open_for_test(), "the bar is closed");
+        v.projections_built_for_test()
+    });
+
+    // …and the cache went with it, which is only observable from the *builds*:
+    // asking the closed session for its projections would answer "none"
+    // whether they were dropped or never existed.
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.projections_built_for_test() > after_close,
+            "the same search over the same posts had to project them again"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_does_not_search_uncommitted_preedit(cx: &mut TestAppContext) {
+    // The IME rule, from the field's side. `InputState`'s preedit path notifies
+    // without emitting **any** `InputEvent`, and the search is driven by
+    // `Change` alone — so a reader composing in Chinese or Japanese never sees
+    // the count move against fragments they have not chosen. Driving the marked
+    // text directly is what makes that checkable.
+    //
+    // What this bites is the *render-time* `value()` read (and its twin, an
+    // observer on the state): `value()` returns the buffer with the preedit
+    // spliced in, so a search re-derived from it each frame searches text the
+    // reader has not chosen — teeth-checked, and it fails here with the match
+    // set emptied mid-composition. It deliberately does **not** bite a
+    // subscription that acts on every event rather than only `Change`: preedit
+    // emits none, so that shape is merely redundant rather than wrong.
+    use gpui::EntityInputHandler;
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    let before = view.read_with(&vcx, |v, _| v.find_matches_for_test().0.len());
+    assert_eq!(before, 3, "the committed query matches three posts");
+
+    let input = view
+        .read_with(&vcx, |v, _| v.find_input_for_test())
+        .expect("the bar is open");
+    // Preedit: the buffer now holds "kestrelhov", uncommitted.
+    vcx.update(|window, cx| {
+        input.update(cx, |s, cx| {
+            let end = s.value().len();
+            s.replace_and_mark_text_in_range(Some(end..end), "hov", None, window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_matches_for_test().0.len(),
+            before,
+            "the match set does not move while the preedit is uncommitted"
+        );
+    });
+
+    // Committing is what the search acts on.
+    vcx.update(|window, cx| {
+        input.update(cx, |s, cx| {
+            let range = s.marked_text_range(window, cx).expect("a live preedit");
+            s.replace_text_in_range(Some(range), "s hover", window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_matches_for_test().0.is_empty(),
+            "…and the committed query is searched"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_closes_on_escape_only_from_its_own_field(cx: &mut TestAppContext) {
+    // The Escape rung is gated on focus being inside the find surface, so an
+    // Escape in the composer still deactivates the draft rather than closing a
+    // bar the reader was not in.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    // A reader steps away from the bar to write something.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.create_draft_for_test(Some("a3".into()), window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(v.has_active_draft_for_test(), "the composer is open");
+        assert!(v.find_open_for_test(), "…beside the still-open bar");
+    });
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.has_active_draft_for_test(),
+            "Escape belongs to the composer while the reader is in it"
+        );
+        assert!(v.find_open_for_test(), "and the bar is untouched");
+    });
+
+    // Back in the field, Escape closes the bar.
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(!v.find_open_for_test(), "…and there it closes the bar");
+    });
+}
+
+#[gpui::test]
+fn space_find_leaves_a_streaming_turn_alone_until_it_finalizes(cx: &mut TestAppContext) {
+    // A streaming body grows token by token, so matching it would make the
+    // count and the reader's index jitter under their hand mid-turn. It joins
+    // the search through the ordinary path once the turn lands.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            let seq = s.push_streaming_turn_for_test(
+                Some("agent".into()),
+                Some("a3".into()),
+                Default::default(),
+                cx,
+            );
+            s.push_content_delta_for_test(seq, "a kestrel again", cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    view.read_with(&vcx, |v, _| {
+        let nodes: Vec<String> = v
+            .find_matches_for_test()
+            .0
+            .into_iter()
+            .map(|(n, _)| n.to_string())
+            .collect();
+        assert_eq!(
+            nodes,
+            vec!["a1", "a2", "a3"],
+            "the live turn's text is not searched: {nodes:?}"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_searches_a_draft_but_not_its_uncommitted_preedit(cx: &mut TestAppContext) {
+    // The rule that a visible draft matches like a post — and the IME
+    // rule from the *other* editor's side. `MarkdownEditorState` emits `Change`
+    // on every preedit keystroke and offers `is_composing()` to say so, so the
+    // draft is simply not re-projected while a composition is live.
+    use gpui::EntityInputHandler;
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    let draft = view
+        .read_with(&vcx, |v, _| v.tail_draft_state_for_test())
+        .expect("a docked tail draft");
+    draft.update(&mut vcx, |e, cx| {
+        e.set_value("a kestrel of my own".to_string(), cx)
+    });
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    let with_draft = view.read_with(&vcx, |v, _| v.find_matches_for_test().0.len());
+    assert_eq!(with_draft, 4, "the draft's own text is searched too");
+
+    // Now compose in the draft: the fragment must not join the count.
+    vcx.update(|window, cx| {
+        draft.update(cx, |e, cx| {
+            let end = e.value().len();
+            e.replace_and_mark_text_in_range(Some(end..end), " kestrel kestrel", None, window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_matches_for_test().0.len(),
+            with_draft,
+            "an uncommitted composition adds no matches"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_takes_space_and_keeps_the_readers_place(cx: &mut TestAppContext) {
+    // The bar takes room rather than floating — one that covered the first post
+    // would hide the matches it counts — and opening compensates the page
+    // scroll by exactly the reserve it added, so the words under the reader's
+    // eye do not jump.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let long = "a long paragraph that wraps several times over. ".repeat(24);
+    let mut posts = vec![fixture_user_post("a1", &long)];
+    for i in 2..6u32 {
+        let id = format!("a{i}");
+        let mut p = fixture_assistant_post(&id, &long);
+        p.parent_action_id = Some(format!("a{}", i - 1));
+        posts.push(p);
+    }
+    seed_quotable_space(&view, window, cx, posts);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        v.scroll_page_by_for_test(-400.0);
+    });
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let (reserve_before, scroll_before) = view.read_with(&vcx, |v, _| {
+        (v.doc_reserve_for_test(), v.page_scroll_offset_y_for_test())
+    });
+
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        let reserve_after = v.doc_reserve_for_test();
+        let scroll_after = v.page_scroll_offset_y_for_test();
+        let grew = reserve_after - reserve_before;
+        assert!(grew > 0.0, "the bar adds to the document's top reserve");
+        assert!(
+            (scroll_after - (scroll_before - grew)).abs() < 0.5,
+            "…and the page moved by exactly that much: {scroll_before} → {scroll_after}"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_reveals_the_match_it_steps_to(cx: &mut TestAppContext) {
+    // Stepping takes the reader to the match, on the page they are already on —
+    // the search never moves the branch, which is what makes ⌘F safe in a tree.
+    // Under reduce-motion the glide lands instantly, which is what makes the
+    // destination assertable without pumping frame callbacks.
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &filler);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "and one last kestrel, far down the page");
+    a3.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel at the top"), a2, a3],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    let (matches, index) = view.read_with(&vcx, |v, _| v.find_matches_for_test());
+    assert_eq!(matches.len(), 2, "one in each end post");
+    assert_eq!(index, Some(1));
+    let at_first = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.find_step(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.find_matches_for_test().1, Some(2));
+        assert!(
+            v.page_scroll_offset_y_for_test() < at_first - 100.0,
+            "the page travelled down to the second match ({} → {})",
+            at_first,
+            v.page_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_reveals_its_first_match_without_a_step(cx: &mut TestAppContext) {
+    // The readout says "1 of N" the moment a query is typed, so match 1 has to
+    // be somewhere the reader can see it. The anchor does not exist when the
+    // query is applied — a new search re-anchors from `sync_find`, against the
+    // frame's own selected path — so the reveal is a debt recorded there and
+    // discharged where the anchor is established. Without that, the first match
+    // sat off-screen until the reader pressed Return.
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &filler);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "the only kestrel, far down the page");
+    a3.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "nothing to find up here"), a2, a3],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+    let at_top = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    view.read_with(&vcx, |v, _| {
+        let (matches, index) = v.find_matches_for_test();
+        assert_eq!(matches.len(), 1, "one match, far below the fold");
+        assert_eq!(index, Some(1), "and the readout calls it current");
+        assert!(
+            v.page_scroll_offset_y_for_test() < at_top - 100.0,
+            "…so the page went to it without a step ({} → {})",
+            at_top,
+            v.page_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_hands_the_keyboard_back_to_the_composer_it_opened_over(cx: &mut TestAppContext) {
+    // A draft that is active but not focused is a dead window: the
+    // conversation's key handler yields every printable to "a composing session
+    // owns the keyboard entirely", and the composer is not there to take them —
+    // so typing does nothing until the reader clicks back in. Closing the bar
+    // therefore hands the keyboard to the composing session, not the view root.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    // Start composing (type-to-compose activates the trailing draft).
+    vcx.simulate_keystrokes("h i");
+    vcx.run_until_parked();
+    let draft = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the reader is composing");
+    assert_eq!(draft.read_with(&vcx, |e, _| e.value().to_string()), "hi");
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.close_find(window, cx), "the bar was open");
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // The proof is the only honest one: typing reaches the draft again.
+    vcx.simulate_keystrokes("!");
+    vcx.run_until_parked();
+    assert_eq!(
+        draft.read_with(&vcx, |e, _| e.value().to_string()),
+        "hi!",
+        "the keystroke after the bar closed landed in the composer it was \
+         opened over"
+    );
+}
+
+#[gpui::test]
+fn space_find_searches_an_edit_in_progress_not_the_post_it_will_replace(cx: &mut TestAppContext) {
+    // An inline edit's body editor keeps the unsaved buffer while the post's
+    // `content` stays the generation the commit will replace — the divergence
+    // *is* the edit. Searching the persisted text there reports source ranges
+    // of a string nobody is looking at, and the highlight layer paints them
+    // onto the modified buffer.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("a1".into(), window, cx));
+    })
+    .unwrap();
+    let editor = view
+        .read_with(cx, |v, _| v.post_body_editor_for_test("a1"))
+        .expect("the post's body editor is the edit buffer");
+    editor.update(cx, |e, cx| {
+        e.set_value("a merlin, not the bird it was".to_string(), cx)
+    });
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "merlin");
+    view.read_with(&vcx, |v, _| {
+        let (matches, _) = v.find_matches_for_test();
+        assert_eq!(
+            matches.iter().map(|(n, _)| n.as_ref()).collect::<Vec<_>>(),
+            vec!["a1"],
+            "the word only the unsaved buffer carries is found: {matches:?}"
+        );
+        let (_, source) = &matches[0];
+        assert_eq!(
+            &editor.read_with(&vcx, |e, _| e.value().to_string())[source.clone()],
+            "merlin",
+            "and its range addresses the buffer the highlight paints on"
+        );
+    });
+
+    // The other direction: the persisted generation is no longer searched.
+    run_find(&view, window, &mut vcx, "Tell me about");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_matches_for_test().0.is_empty(),
+            "the replaced text is not what the reader is looking at"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_follows_the_typing_in_an_inline_edit(cx: &mut TestAppContext) {
+    // `sync_find` runs in the parent's render, and an inline edit's editor is
+    // a child entity the reader types into directly. Nothing else in the
+    // window moves, so the count and the ranges have to follow that buffer on
+    // the keystroke itself rather than waiting for an unrelated repaint.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("a1".into(), window, cx));
+    })
+    .unwrap();
+    let editor = view
+        .read_with(cx, |v, _| v.post_body_editor_for_test("a1"))
+        .expect("the post's body editor is the edit buffer");
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // The bar takes the keyboard while the query is typed; the reader then
+    // goes back to the edit they were making.
+    run_find(&view, window, &mut vcx, "merlin");
+    let caret = editor.read_with(&vcx, gpui::Focusable::focus_handle);
+    vcx.update(|window, cx| window.focus(&caret, cx));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_matches_for_test().0.is_empty(),
+            "the word is not in the buffer yet"
+        );
+    });
+
+    vcx.simulate_keystrokes("m e r l i n");
+    // Deliberately no `window.refresh()`: the point is that the keystroke
+    // alone is enough, with nothing unrelated repainting the window.
+    vcx.run_until_parked();
+
+    assert!(
+        editor
+            .read_with(&vcx, |e, _| e.value().to_string())
+            .contains("merlin"),
+        "the keystrokes reached the edit buffer"
+    );
+    view.read_with(&vcx, |v, _| {
+        let (matches, _) = v.find_matches_for_test();
+        assert_eq!(
+            matches.iter().map(|(n, _)| n.as_ref()).collect::<Vec<_>>(),
+            vec!["a1"],
+            "the search followed the buffer the reader is typing in: {matches:?}"
+        );
+        let (_, source) = &matches[0];
+        assert_eq!(
+            &editor.read_with(&vcx, |e, _| e.value().to_string())[source.clone()],
+            "merlin",
+            "and its range addresses that buffer, not the one before the edit"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_projects_an_edit_started_under_an_open_bar(cx: &mut TestAppContext) {
+    // The bar is already open when the reader starts an inline edit, and they
+    // touch neither caret nor buffer afterwards. `sync_find` runs in the
+    // parent's own render, *before* the post's editor child renders and
+    // records the enabled prop — and that record carries no notify — so a
+    // projection that asked the editor what mode it was in got the previous
+    // read-only frame's answer and kept it.
+    //
+    // Only a *user* post is editable, and the link leads the line so the
+    // caret an edit opens with sits on the construct's boundary and reveals
+    // it, without the test touching the caret at all.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut second = fixture_assistant_post("a2", "It hunts by hovering.");
+    second.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![
+            fixture_user_post(
+                "a1",
+                "[survey](https://kestrel.example/data) leads the line.",
+            ),
+            second,
+        ],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel.example");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_matches_for_test().0.is_empty(),
+            "published, the URL is hidden and unmatchable"
+        );
+    });
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("a1".into(), window, cx));
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, cx| {
+        let (matches, _) = v.find_matches_for_test();
+        assert_eq!(
+            matches.iter().map(|(n, _)| n.as_ref()).collect::<Vec<_>>(),
+            vec!["a1"],
+            "the edit renders cursor-aware, so the URL it exposes is searched \
+             (editor={:?} sel={:?} built={})",
+            v.post_body_editor_for_test("a1").is_some(),
+            v.post_body_editor_for_test("a1")
+                .map(|e| e.read(cx).selection()),
+            v.projections_built_for_test(),
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_does_not_search_an_answer_being_regenerated(cx: &mut TestAppContext) {
+    // While a regeneration is in flight the post's own body is not on screen:
+    // `render_post` swaps in `render_revision_body` for the whole value. The
+    // persisted text is still in `posts`, though, and a revising turn is
+    // filtered out of the stream overlays rather than represented as a
+    // streaming leaf — so the scope's `NodeSrc::Msg` arm kept projecting an
+    // answer the reader cannot see, counted matches in it, and pointed its
+    // highlight layers at an editor that is no longer mounted.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut second = fixture_assistant_post("a2", "the kestrel hovers to hunt");
+    second.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "tell me about the kestrel"), second],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        let (matches, _) = v.find_matches_for_test();
+        assert_eq!(
+            matches.iter().map(|(n, _)| n.as_ref()).collect::<Vec<_>>(),
+            vec!["a1", "a2"],
+            "both posts carry the word to begin with"
+        );
+    });
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, cx| {
+        assert!(
+            v.space().read(cx).revising_seq("a2").is_some(),
+            "the regeneration is pending on the post it replaces"
+        );
+        let (matches, _) = v.find_matches_for_test();
+        assert_eq!(
+            matches.iter().map(|(n, _)| n.as_ref()).collect::<Vec<_>>(),
+            vec!["a1"],
+            "the answer being replaced is off screen, so it is not searched"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_reveals_a_match_in_the_off_branch_composer(cx: &mut TestAppContext) {
+    // The scope deliberately admits the active draft whatever branch it belongs
+    // to, because its composer floats over whatever is showing — so a match in
+    // it can be named current while the page is on another branch entirely and
+    // has no document position for it. The composer's own viewport is what
+    // reveals it; find never moves the reader's branch.
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut left = fixture_assistant_post("a2", "the left branch, which the page is showing");
+    left.parent_action_id = Some("a1".into());
+    let mut right = fixture_assistant_post("a3", "the right branch, off to one side");
+    right.parent_action_id = Some("a1".into());
+    space.update(cx, |s, cx| {
+        s.set_post_tree_for_test(vec![fixture_user_post("a1", "the fork"), left, right], cx)
+    });
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+    let right_index = view
+        .read_with(&vcx, |v, _| v.draft_parents_for_test())
+        .iter()
+        .position(|parent| parent.as_deref() == Some("a3"))
+        .expect("the right branch has a tail draft");
+    // Activating a draft does not select its branch — the page stays on the
+    // left one, which is exactly the situation under test.
+    view.update(&mut vcx, |v, cx| v.activate_draft_for_test(right_index, cx));
+    vcx.run_until_parked();
+
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the off-branch draft is the active composer");
+    let mut long: String = "a line of the tangent draft that says nothing much\n".repeat(60);
+    long.push_str("and one kestrel at the very bottom of it\n");
+    editor.update(&mut vcx, |e, cx| e.set_value(long, cx));
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    // The reveal is the *composer's* scroll, so start it at its own top.
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.composer_scroll_offset_y_for_test().abs() < 0.5,
+            "the composer starts at its top ({})",
+            v.composer_scroll_offset_y_for_test()
+        );
+    });
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    // One more frame: the exact span comes from the editor's last paint.
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        let (matches, index) = v.find_matches_for_test();
+        assert_eq!(matches.len(), 1, "the off-branch draft is in scope");
+        assert_eq!(index, Some(1), "and the readout calls it current");
+        assert!(
+            v.composer_scroll_offset_y_for_test() < -1.0,
+            "…so the composer scrolled its own viewport to it (offset {} \
+             should be negative)",
+            v.composer_scroll_offset_y_for_test()
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_does_not_count_the_floating_composer_as_elsewhere(cx: &mut TestAppContext) {
+    // **The floating composer is on the visible side of the exactness
+    // equation.** The active draft is in scope whatever branch it belongs to,
+    // because it floats over whatever is showing — that is the whole reason
+    // `MatchReveal::Composer` exists. But `effective_tree` still attaches it
+    // beneath its own inactive sibling, so the sibling's subtree aggregate
+    // reached it too: a query matching only that draft read "1 of 1" and
+    // "1 total" beside a map cell announcing "1 more in this branch" — a match
+    // that is not *more*, it is the one on screen, and the reader was invited
+    // to go and look for it where it already is.
+    //
+    // "Reachable only through this branch" has to mean **not currently
+    // visible**, so the number the map carries excludes it and the visible
+    // side takes it — which is what keeps the total, the index and the map
+    // describing one conversation.
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut left = fixture_assistant_post("a2", "the left branch, which the page is showing");
+    left.parent_action_id = Some("a1".into());
+    let mut right = fixture_assistant_post("a3", "the right branch, off to one side");
+    right.parent_action_id = Some("a1".into());
+    space.update(cx, |s, cx| {
+        s.set_post_tree_for_test(vec![fixture_user_post("a1", "the fork"), left, right], cx)
+    });
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+    let right_index = view
+        .read_with(&vcx, |v, _| v.draft_parents_for_test())
+        .iter()
+        .position(|parent| parent.as_deref() == Some("a3"))
+        .expect("the right branch has a tail draft");
+    // Activating a draft does not select its branch — the page stays on the
+    // left one, so this composer floats over a branch it is not part of.
+    view.update(&mut vcx, |v, cx| v.activate_draft_for_test(right_index, cx));
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the off-branch draft is the active composer");
+    editor.update(&mut vcx, |e, cx| {
+        e.set_value("one kestrel, typed over here".to_string(), cx)
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+
+    let (matches, total, account, siblings) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            (
+                v.find_matches_for_test().0.len(),
+                v.find_space_total_for_test(),
+                v.find_levels_account_for_test(window, cx),
+                v.minimap_branch_counts_for_test(window, cx),
+            )
+        })
+    });
+
+    assert_eq!(matches, 1, "the floating draft is searched where it stands");
+    assert_eq!(
+        total,
+        Some(1),
+        "and it is in the space's total — excluding it from the sibling must \
+         not make it count nowhere"
+    );
+    let far = siblings
+        .iter()
+        .find(|(id, _)| id == "a3")
+        .map(|(_, n)| *n)
+        .expect("the other fork is a shown sibling");
+    assert_eq!(
+        far, None,
+        "the branch the composer belongs to holds nothing the reader cannot \
+         already see, so its cell says nothing rather than 'one more'"
+    );
+    assert_eq!(
+        account,
+        total.expect("settled"),
+        "and the map still accounts for the whole space — the draft moved to \
+         the visible side of the sum, it did not leave it"
+    );
+}
+
+#[gpui::test]
+fn space_find_stops_the_page_when_the_next_match_is_in_the_composer(cx: &mut TestAppContext) {
+    // Only the page arm of the reveal replaces a glide; a step onto a match in
+    // the off-branch composer scrolls a different surface entirely. The glide
+    // toward the previous match owns `page_scroll` for its whole duration, so
+    // left running it carried the conversation on toward a result the reader
+    // had already stepped past — and phase 2 stands aside for a glide in
+    // flight, so the correction was stranded behind it too.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut left = fixture_assistant_post("a2", "and one kestrel, far down the page");
+    left.parent_action_id = Some("a1".into());
+    let mut right = fixture_assistant_post("a3", "the right branch, off to one side");
+    right.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", &filler), left, right],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    let right_index = view
+        .read_with(&vcx, |v, _| v.draft_parents_for_test())
+        .iter()
+        .position(|parent| parent.as_deref() == Some("a3"))
+        .expect("the right branch has a tail draft");
+    // The page stays on the left branch — activating a draft does not select
+    // its branch, which is what puts the second match on another surface.
+    view.update(&mut vcx, |v, cx| v.activate_draft_for_test(right_index, cx));
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the off-branch draft is the active composer");
+    let mut long: String = "a line of the tangent draft that says nothing much\n".repeat(60);
+    long.push_str("and one kestrel at the very bottom of it\n");
+    editor.update(&mut vcx, |e, cx| e.set_value(long, cx));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        let (matches, index) = v.find_matches_for_test();
+        assert_eq!(matches.len(), 2, "one on the page, one in the composer");
+        assert_eq!(index, Some(1), "the page match is current first");
+        assert!(
+            v.page_glide_target_for_test().is_some(),
+            "…and it is off screen, so the page is travelling to it"
+        );
+    });
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.find_step(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_matches_for_test().1,
+            Some(2),
+            "the composer's match is current now"
+        );
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "…so the conversation behind it stopped travelling to the last one"
+        );
+        assert!(
+            v.composer_scroll_offset_y_for_test() < -1.0,
+            "and the composer scrolled its own viewport to the match (offset {})",
+            v.composer_scroll_offset_y_for_test()
+        );
+    });
+}
+
+/// One post carrying an `{{ embed 1 }}` marker, with its ordinal-1 reference
+/// resolving to `snippet` — `None` for a stored range that no longer maps.
+fn post_with_embed(action_id: &str, snippet: Option<&str>) -> PostNode {
+    let mut post = fixture_assistant_post(action_id, "before\n\n{{ embed 1 }}\n\nafter");
+    post.references = vec![eidola_app_core::PostReference {
+        antecedent_action_id: "x1".into(),
+        ordinal: 1,
+        content_block_id: Some("bx".into()),
+        range_start: Some(0),
+        range_end: Some(4),
+        annotation: None,
+        delegation_end: None,
+        snippet: snippet.map(Into::into),
+        antecedent_author_label: "Ada".into(),
+        antecedent_author_kind: "agent".into(),
+    }];
+    post
+}
+
+#[gpui::test]
+fn space_find_reprojects_a_post_whose_embed_map_moved_under_it(cx: &mut TestAppContext) {
+    // A marker is hidden only when its ordinal is *mapped*, so a stored quote
+    // that stops resolving — its source edited — flips the marker between
+    // hidden and literal text with the quoting post's own content unchanged.
+    // A cache keyed on content alone then keeps counting a marker the reader
+    // can no longer see, which is the one failure the whole projection exists
+    // to prevent.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, vec![post_with_embed("a1", None)]);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    run_find(&view, window, &mut vcx, "embed");
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_matches_for_test().0.len(),
+            1,
+            "an unmapped marker is ordinary literal text, and matches"
+        );
+    });
+
+    // The reference resolves now: same content, same node, different map.
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![post_with_embed("a1", Some("a passage"))], cx)
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_matches_for_test().0.is_empty(),
+            "…and once it is mapped the marker is hidden, so nothing matches"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_carries_a_pending_reveal_onto_the_posts_new_generation(cx: &mut TestAppContext) {
+    // `reanchor` forwards the reader's place through *item* identity, because
+    // an edit or a regeneration mints a new action id for the same post and
+    // `Change::Space` fires on every background write. A reveal already in
+    // flight records the **node** — an action id — and `sync_bodies` prunes the
+    // editor of the id that just went, so a reveal left naming it could never
+    // obtain geometry: the estimate stood as the final answer.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(30);
+    let tail = "and the one kestrel, far down the page";
+    let posts = |suffix: &str| {
+        let mut out = Vec::new();
+        for i in 1..=4u32 {
+            let id = format!("a{i}{suffix}");
+            let text = if i == 4 { tail } else { filler.as_str() };
+            let mut p = if i % 2 == 1 {
+                fixture_user_post(&id, text)
+            } else {
+                fixture_assistant_post(&id, text)
+            };
+            // The item is what survives a new generation; the action id is not.
+            p.item_id = format!("item-{i}");
+            if i > 1 {
+                p.parent_action_id = Some(format!("a{}{suffix}", i - 1));
+            }
+            out.push(p);
+        }
+        out
+    };
+    seed_quotable_space(&view, window, cx, posts(""));
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.page_glide_target_for_test().is_some(),
+            "the reveal is a multi-frame glide, so the correction is still owed"
+        );
+        assert_eq!(
+            v.find_pending_reveal_for_test().map(|(n, _)| n.to_string()),
+            Some("a4".to_string()),
+        );
+    });
+
+    // A background write lands mid-reveal: same items, new action ids.
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(posts("b"), cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        let (matches, index) = v.find_matches_for_test();
+        assert_eq!(index, Some(1), "the reader kept their place");
+        assert_eq!(matches[0].0.as_ref(), "a4b", "…on the new generation");
+        assert_eq!(
+            v.find_pending_reveal_for_test().map(|(n, _)| n.to_string()),
+            Some("a4b".to_string()),
+            "and the reveal it is still owed names the post that exists"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_stops_the_old_reveal_when_the_query_stops_matching(cx: &mut TestAppContext) {
+    // A reveal is a multi-frame glide, and clearing the anchor does not stop
+    // one: narrowing a query to nothing left the page still travelling towards
+    // a match of the search before it while the bar read "No results".
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(30);
+    let mut a2 = fixture_assistant_post("a2", &filler);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "and the one kestrel, far down the page");
+    a3.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", &filler), a2, a3],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.page_glide_target_for_test().is_some(),
+            "the off-screen match is being glided to"
+        );
+    });
+
+    // Keep typing until the query matches nothing.
+    vcx.simulate_keystrokes("z z z");
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_matches_for_test().0.is_empty(),
+            "the bar now says there are no results"
+        );
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "…so the page is not still travelling to a match of the old query"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_bar_is_not_covered_by_a_maximised_composer(cx: &mut TestAppContext) {
+    // The floating bar is anchored at the window bottom, so its top is
+    // `win - bar_h`. Dragged to the maximum fraction in the shortest window
+    // the app allows, that top rises above the find bar's controls — and the
+    // composer paints *after* the bar, so its containment wins the hit test
+    // for the query row's lower edge. The bar's rendered height therefore
+    // yields to the document's top reserve.
+    let (_window, view, mut vcx) = open_floating_composer_scene(cx, "cover");
+    // The shortest window `base_window_options` allows.
+    const WIN: f32 = 360.0;
+
+    // Drag the composer to its maximum: the reader's own stored preference.
+    view.update(&mut vcx, |v, cx| {
+        v.begin_composer_resize_for_test(WIN / 2.0, WIN, cx)
+    });
+    view.update(&mut vcx, |v, cx| {
+        v.move_composer_resize_for_test(-10_000.0, WIN, cx)
+    });
+    vcx.run_until_parked();
+    let fraction = view.read_with(&vcx, |v, _| v.composer_fraction_for_test());
+    assert!(
+        (fraction - 0.85).abs() < 1e-6,
+        "the drag clamped to the maximum fraction (got {fraction})"
+    );
+
+    // With no bar up, that maximum is the whole of what the reader asked for.
+    let free = view.read_with(&vcx, |v, _| v.composer_float_bar_h_for_test(WIN));
+    assert!(
+        (free - 0.85 * WIN).abs() < 1.0,
+        "the composer rests at the fraction it was dragged to ({free})"
+    );
+
+    let focus = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(v.find_open_for_test(), "the bar is up");
+        let reserve = v.doc_reserve_for_test();
+        let bar = v.composer_float_bar_h_for_test(WIN);
+        assert!(
+            WIN - bar >= reserve - 0.5,
+            "the composer's top ({}) stands at or below the reserve the find              controls occupy ({reserve})",
+            WIN - bar
+        );
+        // The reader's preference is a preference, not a casualty.
+        assert!(
+            (v.composer_fraction_for_test() - 0.85).abs() < 1e-6,
+            "and the stored fraction is untouched"
+        );
+    });
+
+    // Closing the bar gives the height straight back.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.close_find(window, cx), "the bar was open");
+        });
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        let bar = v.composer_float_bar_h_for_test(WIN);
+        assert!(
+            (bar - free).abs() < 1.0,
+            "the composer is back to the height it was asked for ({bar} vs {free})"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_hands_the_keyboard_back_from_the_frame_it_opened_in(cx: &mut TestAppContext) {
+    // ⌘F then Escape before the bar has painted. The Escape rung admits the
+    // press by asking the field's own handle, so the session is dropped — and
+    // the close has to ask the same question, or the handback is skipped and
+    // the reader is left on the handle of an input that no longer exists.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    let place = view.read_with(&vcx, |v, _| v.tree_focus_for_test());
+    assert_eq!(
+        place,
+        Some(("a1".to_string(), None)),
+        "the reader is on a post"
+    );
+
+    // Both in one window update, so no frame is drawn in between — which is
+    // the whole of the situation: containment still describes the tree from
+    // before the bar existed.
+    let focus = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+        view.update(cx, |v, cx| {
+            assert!(v.find_open_for_test(), "the bar opened in this frame");
+            assert!(v.close_find(window, cx), "and Escape closed it in the same");
+        });
+    });
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(!v.find_open_for_test(), "the bar is gone");
+        assert_eq!(
+            v.tree_focus_for_test(),
+            place,
+            "and the reader is still where they opened it from"
+        );
+    });
+    // The honest proof: the arrows still walk the tree, which they cannot do
+    // from a dropped input's handle.
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a2".to_string(), None)),
+            "the keyboard really came back to the conversation"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_keeps_the_readers_place_in_the_conversation(cx: &mut TestAppContext) {
+    // ⌘F from a keyboard-focused post: the bar takes the keyboard, and the
+    // reader's place in the tree has to survive the frame the bar mounts in —
+    // `sync_tree_focus` runs at the head of the parent's render, so on that
+    // first frame the bar's container has not painted and containment cannot
+    // yet see the input it already focused. Reading that as "no overlay" drops
+    // the level, and closing the bar then lands on the view root.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(560.)));
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    let place = view.read_with(&vcx, |v, _| v.tree_focus_for_test());
+    assert_eq!(
+        place,
+        Some(("a1".to_string(), None)),
+        "the reader is on a post"
+    );
+
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(v.find_open_for_test(), "the bar is up");
+        assert_eq!(
+            v.tree_focus_for_test(),
+            place,
+            "the bar borrowed the keyboard; it did not take the reader's place"
+        );
+    });
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.close_find(window, cx), "the bar was open");
+        });
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            place,
+            "and closing it returns them to the post they left"
+        );
+    });
+    // The honest proof that the keyboard really landed there: the arrows
+    // still walk the tree, which they cannot do from the view root.
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.tree_focus_for_test(),
+            Some(("a2".to_string(), None)),
+            "the arrow moved on from the post the bar was opened over"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_waits_for_geometry_the_current_layout_produced(cx: &mut TestAppContext) {
+    // A body editor is retained for every post but rendered only near the
+    // viewport, and it clears its paint-time geometry only in its own render —
+    // so an off-screen post can answer `content_y_for_offset` with the pixels
+    // of a layout that is gone, and answer `Some`. Taken as exact, the
+    // correction is consumed against a width nobody is looking at.
+    //
+    // **Characterization, not a flip.** The guard is what makes that
+    // impossible, but the warm pass re-measures every on-path post within two
+    // frames of a layout-key change, so no sequence this harness can stage
+    // leaves stale geometry standing when the correction runs — removing the
+    // guard keeps this green. What it does pin is the shape the guard depends
+    // on: the resize really invalidates, and the reveal really survives it to
+    // be corrected against the new layout rather than spent on the old one.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(40);
+    let mut a2 = fixture_assistant_post("a2", &filler);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "and the one kestrel, far down the page");
+    a3.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", &filler), a2, a3],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    // Visit the tail so the match's post really paints, then come back: its
+    // editor is retained and keeps that width's geometry.
+    view.read_with(&vcx, |v, _| v.scroll_page_to_end_for_test());
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    // The reading column narrows, which is exactly the height cache's key —
+    // every measured height goes, and the off-screen post cannot repaint to
+    // replace the pixels it is still holding.
+    let before = view.read_with(&vcx, |v, _| v.layout_clears_for_test());
+    vcx.simulate_resize(gpui::size(px(500.), px(520.)));
+    let after = view.read_with(&vcx, |v, _| v.layout_clears_for_test());
+    assert!(
+        after > before,
+        "the resize really did invalidate the layout ({before} -> {after})"
+    );
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    // Still owed: geometry from the old width is no answer at all, so the
+    // correction waits exactly as it does before a post has ever painted.
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_pending_reveal_for_test().is_some(),
+            "the correction did not spend itself on the layout that is gone"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_stops_its_reveal_when_the_reader_takes_a_branch(cx: &mut TestAppContext) {
+    // A branch dot writes no page offset — it is a horizontal switch — so it
+    // reaches the motion seam through neither of the helpers that fold half of
+    // it in. Ending the glide alone leaves the *reveal* owed, and its phase-2
+    // correction then drags the page onto a match on the branch the reader has
+    // just navigated away from.
+    let stores = stub_stores_with_agents(cx, "s");
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let long = "a long paragraph of the conversation so far. ".repeat(40);
+    // A short root keeps its band — and its branch dots — on screen; the fork
+    // below it is what the dot switches between. The match sits far down the
+    // first branch, so revealing it is a real journey.
+    let mut a2 = fixture_assistant_post("a2", &long);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_assistant_post("a3", &long);
+    a3.parent_action_id = Some("a1".into());
+    let mut a4 = fixture_user_post("a4", &format!("{long} and the one kestrel"));
+    a4.parent_action_id = Some("a2".into());
+    cx.update_window(window, |_, _, cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![fixture_user_post("a1", "a short question"), a2, a4, a3],
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_matches_for_test().0.len(),
+            1,
+            "the match is on this branch"
+        );
+        assert!(
+            v.find_pending_reveal_for_test().is_some(),
+            "…and its correction is owed"
+        );
+    });
+
+    // A branch dot is a *horizontal* switch, so the page's own offset must not
+    // move at all across it — which is exactly what a surviving correction did,
+    // by landing phase 2 on a match on the branch being left.
+    let before = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.click_branch_dot_for_test("a1", 1, window, cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    let after = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    assert!(
+        (after - before).abs() < 1.0,
+        "a branch switch moves the page vertically not at all \
+         ({before} -> {after})"
+    );
+}
+
+#[gpui::test]
+fn space_find_stops_its_reveal_when_the_reader_selects_a_passage(cx: &mut TestAppContext) {
+    // The third editor population, and the one that is only ever read. A
+    // selection is anchored to document positions, so a page still gliding
+    // toward an off-screen match drags the reader's selection across text they
+    // never aimed at — and phase 2 could pull the page onto that match after.
+    // Only a drag that reaches a viewport edge passed through the motion seam
+    // before, which leaves every ordinary click and mid-page drag out.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(30);
+    let mut a2 = fixture_assistant_post("a2", &filler);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "and the one kestrel, far down the page");
+    a3.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", &filler), a2, a3],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.page_glide_target_for_test().is_some(),
+            "the off-screen match is being glided to"
+        );
+        assert!(
+            v.find_pending_reveal_for_test().is_some(),
+            "…with the correction owed once that post is measured"
+        );
+    });
+
+    // The reader selects in the post they can see — the context menu's own
+    // Select All over a read-only body, which is a real caret move.
+    let body = view
+        .read_with(&vcx, |v, _| v.post_body_editor_for_test("a1"))
+        .expect("the post at the top of the page has a body editor");
+    vcx.update(|window, cx| {
+        body.update(cx, |e, cx| {
+            e.perform(gpui_markdown_editor::EditorCommand::SelectAll, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.post_selection_action_id().is_some()),
+        "the selection really was made"
+    );
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_pending_reveal_for_test(),
+            None,
+            "the reveal the reader superseded is not still owed"
+        );
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "…and the page is not still travelling under their selection"
+        );
+    });
+
+    let resting = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| v.drive_page_glide_for_test(1.0));
+    });
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.page_scroll_offset_y_for_test(),
+            resting,
+            "the page stayed where the reader is selecting"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_stops_its_reveal_when_the_reader_edits_a_post(cx: &mut TestAppContext) {
+    // The composer's twin, reached through the other editor. An inline edit
+    // has no caret-into-view of its own to arm, so it never passed the seam
+    // every reader-driven motion goes through — and a reveal armed at an
+    // off-screen match survived the reader typing into a post, with phase 2
+    // pulling the page onto that match frames later.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(30);
+    let mut a2 = fixture_assistant_post("a2", &filler);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "and the one kestrel, far down the page");
+    a3.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", &filler), a2, a3],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.page_glide_target_for_test().is_some(),
+            "the off-screen match is being glided to"
+        );
+        assert!(
+            v.find_pending_reveal_for_test().is_some(),
+            "…with the correction owed once that post is measured"
+        );
+    });
+
+    // The reader starts editing the post at the top of the page and types.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.begin_edit("a1".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    let editor = view
+        .read_with(&vcx, |v, _| v.post_body_editor_for_test("a1"))
+        .expect("the post's body editor is the edit buffer");
+    let caret = editor.read_with(&vcx, gpui::Focusable::focus_handle);
+    vcx.update(|window, cx| window.focus(&caret, cx));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("h i");
+    vcx.run_until_parked();
+    assert!(
+        editor
+            .read_with(&vcx, |e, _| e.value().to_string())
+            .starts_with("hi"),
+        "the keystrokes reached the edit buffer"
+    );
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_pending_reveal_for_test(),
+            None,
+            "the reveal the reader superseded is not still owed"
+        );
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "…and neither is the motion it was phase 1 of"
+        );
+    });
+
+    // So nothing is left that could travel to the match under their caret.
+    let resting = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| v.drive_page_glide_for_test(1.0));
+    });
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.page_scroll_offset_y_for_test(),
+            resting,
+            "the page stayed where the reader is editing"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_stops_its_reveal_when_the_reader_resumes_composing(cx: &mut TestAppContext) {
+    // A reveal at an off-screen match is a two-phase motion: a glide to the
+    // byte-fraction estimate, then a correction once the post is measured.
+    // Every reader-driven motion takes the page from it — except, until now,
+    // the one that consists of writing. A reader who clicked back into an
+    // already-active composer (so no activation ran) and typed left the glide
+    // travelling and the reveal pending, and the correction landed frames
+    // later, pulling the page onto the search match and away from the caret.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(30);
+    let mut a2 = fixture_assistant_post("a2", &filler);
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = fixture_user_post("a3", "and the one kestrel, far down the page");
+    a3.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", &filler), a2, a3],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| v.scroll_page_to_top_for_test());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.page_glide_target_for_test().is_some(),
+            "the off-screen match is being glided to"
+        );
+        assert!(
+            v.find_pending_reveal_for_test().is_some(),
+            "…with the correction owed once that post is measured"
+        );
+    });
+
+    // The reader goes back to the composer that was already active — the case
+    // no activation covers, since nothing changes about which draft is live.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.activate_draft_for_test(0, cx));
+    });
+    vcx.run_until_parked();
+    let draft = view
+        .read_with(&vcx, |v, _| v.composer_state_for_test())
+        .expect("the tail draft is the active composer");
+    let editor = draft.read_with(&vcx, gpui::Focusable::focus_handle);
+    vcx.update(|window, cx| window.focus(&editor, cx));
+    vcx.run_until_parked();
+    // Returning to a composer is itself the reader taking the page, so the
+    // motion ends here — and the reveal with it.
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_pending_reveal_for_test(),
+            None,
+            "clicking into the composer is a takeover in its own right"
+        );
+    });
+
+    // Re-arm, so what the typing below has to cure is a reveal armed while the
+    // reader was already in the composer — the arming events' own case.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.find_step(true, window, cx));
+    });
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_pending_reveal_for_test().is_some(),
+            "a step re-arms the correction the typing must drop"
+        );
+    });
+
+    vcx.simulate_keystrokes("h i");
+    vcx.run_until_parked();
+    assert_eq!(
+        draft.read_with(&vcx, |e, _| e.value().to_string()),
+        "hi",
+        "the keystrokes reached the composer"
+    );
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_pending_reveal_for_test(),
+            None,
+            "the reveal the reader superseded is not still owed"
+        );
+        assert_eq!(
+            v.page_glide_target_for_test(),
+            None,
+            "…and neither is the motion it was phase 1 of"
+        );
+    });
+
+    // The page therefore cannot travel back to the match: there is no
+    // trajectory left for a frame to land.
+    let resting = view.read_with(&vcx, |v, _| v.page_scroll_offset_y_for_test());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| v.drive_page_glide_for_test(1.0));
+    });
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.page_scroll_offset_y_for_test(),
+            resting,
+            "the page stayed where the reader is writing"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_hands_the_keyboard_back_to_the_inspector_field(cx: &mut TestAppContext) {
+    // `keyboard_home` answers for the *conversation*, and it cannot derive
+    // which of the panel's fields a reader stood in. Handing the keyboard to
+    // the view root there is not a dead window — the panel's own predicate is
+    // focus-derived, so it stops yielding — but a wrong one: the next
+    // character becomes type-to-compose and a reader mid-way through a
+    // setting gets a draft instead.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 0)];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    let title = view
+        .read_with(cx, |v, _| v.inspector_title_state_for_test())
+        .expect("title field");
+    cx.update_window(window, |_, window, cx| {
+        title.update(cx, |s, cx| s.focus(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.close_find(window, cx), "the bar was open");
+        });
+    });
+    vcx.run_until_parked();
+
+    let field = title.read_with(&vcx, |s, cx| s.focus_handle(cx));
+    vcx.update(|window, _| {
+        assert!(
+            field.is_focused(window),
+            "the keyboard went back to the field the bar borrowed it from"
+        );
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.has_active_draft_for_test(),
+            "…so nothing started composing in the conversation behind it"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_opens_from_its_shortcut_with_a_panel_field_focused(cx: &mut TestAppContext) {
+    // The shortcut is context-free, and the component's own input-local search
+    // claims the same chord in the `Input` context — so with a panel field
+    // focused both bindings match at the same depth and the tie is broken by
+    // registration order alone (gpui sorts matched bindings by context depth,
+    // then by index descending). The app's keymap is therefore installed
+    // *after* `gpui_component::init`, which is what keeps ⌘F reaching the
+    // conversation from a field rather than a search the field never offers.
+    // Dispatching the action directly would step straight over that.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 0)];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    // In the order production takes it: the component's keymap is already in
+    // (`open_space` → `gpui_component::init`), ours goes on top.
+    cx.update(eidola_gui::install_keybindings);
+    seed_quotable_space(&view, window, cx, findable_posts());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    let title = view
+        .read_with(cx, |v, _| v.inspector_title_state_for_test())
+        .expect("title field");
+    cx.update_window(window, |_, window, cx| {
+        title.update(cx, |s, cx| s.focus(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    #[cfg(target_os = "macos")]
+    let chord = "cmd-f";
+    #[cfg(not(target_os = "macos"))]
+    let chord = "ctrl-f";
+    vcx.simulate_keystrokes(chord);
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_open_for_test(),
+            "the shortcut opened the conversation's find bar from the panel field"
+        );
+    });
+
+    // …and it borrowed the keyboard from that field, so closing gives it back.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.close_find(window, cx), "the bar was open");
+        });
+    });
+    vcx.run_until_parked();
+    let field = title.read_with(&vcx, |s, cx| s.focus_handle(cx));
+    vcx.update(|window, _| {
+        assert!(
+            field.is_focused(window),
+            "the lender was captured by the press the shortcut made"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_refreshes_the_field_it_borrowed_from_when_it_is_refocused(cx: &mut TestAppContext) {
+    // The bar is opened once and re-focused many times. Opening it from the
+    // conversation records no lender — correctly, nothing lent it — but a
+    // reader then steps into a panel field and presses the shortcut again, and
+    // *that* press borrows the keyboard from the field. Recording the lender
+    // only where the session is created left the second borrow unrecorded, so
+    // closing handed the keyboard to `keyboard_home` and the next character
+    // became a draft in the conversation behind the panel.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 0)];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Opened from the conversation: no field lent the keyboard.
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    // The reader steps into a panel field, then presses the shortcut again.
+    let title = view
+        .read_with(&vcx, |v, _| v.inspector_title_state_for_test())
+        .expect("title field");
+    vcx.update(|window, cx| {
+        title.update(cx, |s, cx| s.focus(window, cx));
+    });
+    vcx.run_until_parked();
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.close_find(window, cx), "the bar was open");
+        });
+    });
+    vcx.run_until_parked();
+
+    let field = title.read_with(&vcx, |s, cx| s.focus_handle(cx));
+    vcx.update(|window, _| {
+        assert!(
+            field.is_focused(window),
+            "the keyboard went back to the field the *second* press borrowed it from"
+        );
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.has_active_draft_for_test(),
+            "…so nothing started composing in the conversation behind the panel"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_does_not_hand_the_keyboard_to_a_hidden_panels_field(cx: &mut TestAppContext) {
+    // The lender is weak so a form retired under the bar cannot be focused —
+    // but the title field is a *view* field that survives its panel, and
+    // closing the inspector while the bar holds the keyboard leaves it
+    // upgradable with its element unmounted. Handing the keyboard back to it
+    // is the dead slot this window's focus doctrine is about: the handle still
+    // reports itself focused, so the conversation goes on yielding every
+    // printable to a field nobody paints and the window is silent.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.space_settings = Some(("s1".into(), eidola_app_core::SpaceSettings::default()));
+        s.spaces = vec![stub_space("s1", Some("Tides"), None, 0)];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s1".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx))
+    })
+    .unwrap();
+    draw_window(cx, window);
+
+    let title = view
+        .read_with(cx, |v, _| v.inspector_title_state_for_test())
+        .expect("title field");
+    cx.update_window(window, |_, window, cx| {
+        title.update(cx, |s, cx| s.focus(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    // The panel goes while the bar holds the keyboard, so nothing hands it
+    // back at the close (the reader is in the bar, not in the field).
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(false, window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.inspector_title_state_for_test().is_some()),
+        "the field itself is kept across the close — which is why the weak \
+         reference alone cannot answer this"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            assert!(v.close_find(window, cx), "the bar was open");
+        });
+    });
+    vcx.run_until_parked();
+
+    let field = title.read_with(&vcx, |s, cx| s.focus_handle(cx));
+    vcx.update(|window, _| {
+        assert!(
+            !field.is_focused(window),
+            "the keyboard did not go to a field the panel is no longer painting"
+        );
+    });
+
+    // …and it went somewhere live: the proof is the only honest one, that
+    // typing reaches the conversation again.
+    vcx.simulate_keystrokes("h");
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.has_active_draft_for_test(),
+            "the window's keyboard is live — the keystroke reached the conversation"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_paints_nothing_on_a_buffer_it_is_not_describing(cx: &mut TestAppContext) {
+    // The other half of the IME rule. `sync_find` deliberately keeps the
+    // projection of the text the reader has *committed*, so while a
+    // composition is live the match ranges are offsets into one document and
+    // the editor's buffer — preedit spliced in at the caret — is another.
+    // Applied anyway they slide onto unrelated bytes and the wash crawls as
+    // the reader types. The count is the honest side to keep; the paint is not.
+    use gpui::EntityInputHandler;
+    use gpui_markdown_editor::HighlightLayer;
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    let draft = view
+        .read_with(&vcx, |v, _| v.tail_draft_state_for_test())
+        .expect("a docked tail draft");
+    draft.update(&mut vcx, |e, cx| {
+        e.set_value("a kestrel of my own".to_string(), cx)
+    });
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    let painted = |vcx: &mut VisualTestContext| {
+        draft.read_with(vcx, |e, _| {
+            !e.highlights_in(HighlightLayer::Accent).is_empty()
+                || !e.highlights_in(HighlightLayer::Overlay).is_empty()
+        })
+    };
+    assert!(painted(&mut vcx), "the draft's match is washed");
+
+    // Compose **before** the match: the live buffer now says something the
+    // committed projection's offsets do not describe.
+    vcx.update(|window, cx| {
+        draft.update(cx, |e, cx| {
+            e.replace_and_mark_text_in_range(Some(0..0), "ありがとう", None, window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.find_matches_for_test().0.len(),
+            4,
+            "the count still describes the text the reader has chosen"
+        );
+    });
+    assert!(
+        !painted(&mut vcx),
+        "…and nothing is painted onto the buffer those offsets do not describe"
+    );
+}
+
+#[gpui::test]
+fn space_find_does_not_push_a_followed_reference_under_its_own_bar(cx: &mut TestAppContext) {
+    // Following a footnote leaves the bar open, so the navigation has to clear
+    // whatever chrome covers the document's top — the one accessor that knows,
+    // not the title band's share of it. The post lands the same distance below
+    // that chrome either way, which is the property that cannot be true of a
+    // constant.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let filler = "a long paragraph of the conversation so far. ".repeat(30);
+    let mut posts = vec![fixture_user_post("a1", &filler)];
+    for i in 2..=4u32 {
+        let mut p = fixture_assistant_post(&format!("a{i}"), &filler);
+        p.parent_action_id = Some(format!("a{}", i - 1));
+        posts.push(p);
+    }
+    seed_quotable_space(&view, window, cx, posts);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    let follow = |vcx: &mut VisualTestContext| {
+        view.read_with(vcx, |v, _| v.scroll_page_to_top_for_test());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| v.navigate_to_action("a4".into(), window, cx));
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |v, _| v.page_glide_target_for_test())
+            .expect("the follow glides to the post")
+    };
+
+    let closed = follow(&mut vcx);
+    let reserve_closed = view.read_with(&vcx, |v, _| v.doc_reserve_for_test());
+
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let open = follow(&mut vcx);
+    let reserve_open = view.read_with(&vcx, |v, _| v.doc_reserve_for_test());
+
+    assert!(
+        reserve_open > reserve_closed,
+        "precondition: the bar grew the document's top reserve"
+    );
+    assert!(
+        (open - closed).abs() < 0.5,
+        "the followed post rests the same distance below the chrome either \
+         way ({closed} closed, {open} open)"
+    );
+}
+
+/// A conversation that forks twice, with matches on branches the reader is not
+/// looking at. `a1` is the root; `a2`/`a3` fork under it; `a4`/`a5` fork under
+/// `a2`; `a6` hangs off `a3`.
+fn cross_branch_posts() -> Vec<PostNode> {
+    let child = |id: &str, parent: &str, text: &str| {
+        let mut p = fixture_assistant_post(id, text);
+        p.parent_action_id = Some(parent.into());
+        p
+    };
+    vec![
+        fixture_user_post("a1", "one kestrel at the root"),
+        child("a2", "a1", "no birds here"),
+        child("a4", "a2", "a kestrel and another kestrel"),
+        child("a5", "a2", "one more kestrel"),
+        child("a3", "a1", "a kestrel on the other fork"),
+        child("a6", "a3", "kestrel, kestrel, kestrel"),
+    ]
+}
+
+/// A conversation too big for one chunk of the cross-branch pass to finish:
+/// five spine posts, each carrying six replies, thirty-six in all, one match
+/// apiece. Shallow and wide rather than deep — the view renders one nested
+/// scroller per level, so depth is the expensive axis in a fixture and breadth
+/// is the free one.
+fn wide_countable_posts() -> Vec<PostNode> {
+    // ~4 KB a post, so the space is also past `SCAN_CHUNK_BYTES`: a re-scan of
+    // warm projections cannot finish in one chunk either, which is what makes
+    // a needless restart visible rather than merely wasteful.
+    let filler = "words ".repeat(650);
+    let body = |lead: &str| format!("{lead}. {filler}");
+    let mut posts = vec![fixture_user_post("a1", &body("one kestrel to start"))];
+    let mut n = 2u32;
+    let mut parent = String::from("a1");
+    for _ in 0..5 {
+        let spine = format!("a{n}");
+        n += 1;
+        let mut p = fixture_assistant_post(&spine, &body("a kestrel further down the spine"));
+        p.parent_action_id = Some(parent.clone());
+        posts.push(p);
+        for _ in 0..6 {
+            let leaf = format!("a{n}");
+            n += 1;
+            let mut p = fixture_assistant_post(&leaf, &body("one kestrel on a branch"));
+            p.parent_action_id = Some(spine.clone());
+            posts.push(p);
+        }
+        parent = spine;
+    }
+    assert_eq!(posts.len(), 36, "bigger than one chunk of the pass");
+    posts
+}
+
+#[gpui::test]
+fn space_find_counts_the_whole_space_and_the_map_accounts_for_it(cx: &mut TestAppContext) {
+    // The cross-branch half of ⌘F. The index still counts the branch the
+    // reader is on; the total counts every branch — and the two are tied
+    // together by the exactness invariant, which is what lets a reader add up
+    // the map in front of them: the path's own matches plus every shown
+    // sibling's whole subtree is the space's total, exactly.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+
+    let (branch_total, space_total, account) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            (
+                v.find_matches_for_test().0.len(),
+                v.find_space_total_for_test(),
+                v.find_levels_account_for_test(window, cx),
+            )
+        })
+    });
+    assert_eq!(
+        space_total,
+        Some(8),
+        "one at the root, two under a4, one under a5, one on a3 and three \
+         under a6 — every branch, not the visible one"
+    );
+    assert!(
+        branch_total < 8,
+        "the visible branch holds fewer than the space does ({branch_total})"
+    );
+    assert_eq!(
+        account,
+        space_total.expect("settled"),
+        "the path's own matches plus every shown sibling's subtree is the \
+         space's total, exactly"
+    );
+
+    // …and it stays exact from wherever the reader stands. Take the other
+    // fork and ask again: a different path, different siblings, same sum.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.select_effective_path_for_test("a6", window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let (moved_branch, moved_total, moved_account) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            (
+                v.find_matches_for_test().0.len(),
+                v.find_space_total_for_test(),
+                v.find_levels_account_for_test(window, cx),
+            )
+        })
+    });
+    assert_eq!(moved_total, Some(8), "the space did not change");
+    assert_ne!(
+        moved_branch, branch_total,
+        "precondition: the reader really is on another branch"
+    );
+    assert_eq!(moved_account, 8, "and the map still accounts for all of it");
+}
+
+#[gpui::test]
+fn space_find_says_it_is_counting_rather_than_showing_a_number_on_its_way(cx: &mut TestAppContext) {
+    // The honest-states rule, which is the whole reason the cross-branch pass
+    // is chunked at all. A conversation too long to project inside one frame
+    // finishes over several, and until it does there is **no number** — not a
+    // partial sum, which on screen is indistinguishable from a settled one.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, wide_countable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+    // One keystroke, and **no** settling: `dispatch_keystroke` rather than
+    // `simulate_keystrokes`, which runs the executor until parked and would
+    // fuse the whole pass onto the press. This is the frame the query landed
+    // on, with the pass still walking.
+    vcx.update(|window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("k").unwrap(), cx);
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_counting_for_test(),
+            "the cross-branch pass has not finished in the frame it started"
+        );
+        assert_eq!(
+            v.find_space_total_for_test(),
+            None,
+            "so there is no total to show — never a partial sum"
+        );
+    });
+
+    // **And it really suspends between chunks.** `run_until_parked` runs every
+    // task the executor can run without moving the clock, so a loop that merely
+    // *looked* like it yielded — an await on a already-ready task — would come
+    // back finished here. Still counting is the proof that the frame was given
+    // up rather than held for the length of the pass.
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_counting_for_test(),
+            "the pass gives the frame up between chunks rather than running \
+             them all in one poll"
+        );
+        assert_eq!(v.find_space_total_for_test(), None);
+    });
+
+    // **And the disclosure stays mounted while it counts.** Painting it only on
+    // a settled total took the focused control out from under a keyboard reader
+    // for the length of the scan — a background write restarting a large count
+    // is enough — leaving the window on a dead slot with no way to open the
+    // overlay until the pass landed. The overlay it opens has its own honest
+    // counting state, so the control is as true here as after.
+    {
+        let _probes = probes_on();
+        eidola_gui::probe::clear_window(window.window_id().as_u64());
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        let entries = eidola_gui::probe::window_entries(window.window_id().as_u64());
+        let (_, disclosure) = entries
+            .iter()
+            .find(|(n, _)| n == "space/find/total/disclosure")
+            .expect("the disclosure is painted while the count is still walking");
+        assert_eq!(disclosure.role, gpui::Role::Button);
+        let (_, total) = entries
+            .iter()
+            .find(|(n, _)| n == "space/find/total")
+            .expect("the readout beside it");
+        assert_eq!(
+            total.value.as_deref(),
+            Some("Counting…"),
+            "precondition: this really is the counting state"
+        );
+    }
+
+    settle_find_count(&mut vcx);
+    view.read_with(&vcx, |v, _| {
+        assert!(!v.find_counting_for_test(), "the pass lands");
+        assert_eq!(
+            v.find_space_total_for_test(),
+            Some(36),
+            "…with the whole conversation counted"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_takes_its_total_back_when_the_conversation_moves(cx: &mut TestAppContext) {
+    // A total that is merely old is a settled number that is wrong. `rebuild`
+    // replaces the snapshot the count was an answer about, so the pass starts
+    // over — and the readout says "counting", not the previous transcript's
+    // number.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_space_total_for_test()),
+        Some(8)
+    );
+
+    // A branch gains a post carrying two more.
+    let mut posts = cross_branch_posts();
+    let mut a7 = fixture_assistant_post("a7", "kestrel and kestrel again");
+    a7.parent_action_id = Some("a5".into());
+    posts.push(a7);
+    let space = view.read_with(&vcx, |v, _| v.space().clone());
+    vcx.update(|_, cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(posts, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_space_total_for_test()),
+        Some(10),
+        "the count is an answer about the transcript it was taken on"
+    );
+}
+
+#[gpui::test]
+fn space_find_widens_the_map_only_as_far_as_the_gutter(cx: &mut TestAppContext) {
+    // The strip widens while a session is open, because a sibling column then
+    // has a number to carry and 36px split between two of them has no room for
+    // one — **bounded by the gutter it overlays**. The map's own geometry is
+    // vertical (`strip_h / total_h`) and the page never subtracted the strip,
+    // so no document layout reads this width; but the strip is painted over the
+    // page and contains the mouse while it is up, so a width past the reading
+    // column's margin covers prose and takes its clicks.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    // `(strip width, reading-column width, page width, height-cache clears)`.
+    let read = |vcx: &mut VisualTestContext| {
+        vcx.update(|window, cx| view.read(cx).minimap_width_for_test(window));
+        vcx.update(|window, cx| {
+            let v = view.read(cx);
+            (
+                v.minimap_width_for_test(window),
+                v.body_width_for_test(window),
+                v.page_width_for_test(window),
+                v.layout_clears_for_test(),
+            )
+        })
+    };
+
+    // A window wide enough that the gutter has room to spare.
+    vcx.simulate_resize(gpui::size(px(1000.), px(700.)));
+    vcx.run_until_parked();
+    let (rest_w, _, _, clears_before) = read(&mut vcx);
+    assert_eq!(rest_w, 36.0, "the resting strip");
+
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let (wide_w, wide_body, wide_page, clears_after) = read(&mut vcx);
+    assert_eq!(
+        wide_w, 96.0,
+        "with the gutter to spare the strip takes its full width"
+    );
+    assert!(
+        wide_w <= (wide_page - wide_body) / 2.0,
+        "…and still stands clear of the reading column \
+         (strip {wide_w}, column {wide_body} of {wide_page})"
+    );
+    assert_eq!(
+        clears_after, clears_before,
+        "the reading column never moved: the height cache is keyed on its \
+         width and was not invalidated"
+    );
+
+    // The narrowest window this app opens. The compact layout leaves a 40px
+    // inset either side, so an unclamped 96px strip reached 56px into the text.
+    vcx.simulate_resize(gpui::size(px(480.), px(700.)));
+    vcx.run_until_parked();
+    let (narrow_w, narrow_body, narrow_page, _) = read(&mut vcx);
+    let gutter = (narrow_page - narrow_body) / 2.0;
+    assert!(
+        narrow_w <= gutter,
+        "the strip never reaches into prose (strip {narrow_w}, gutter {gutter})"
+    );
+    assert!(
+        narrow_w < 96.0,
+        "precondition: this window really is too narrow for the full strip"
+    );
+    assert!(
+        narrow_w >= 36.0,
+        "…and the widening can only ever add ({narrow_w})"
+    );
+
+    // …and it all goes back when the bar does.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.close_find(window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        read(&mut vcx).0,
+        36.0,
+        "closing the bar takes the width back with it"
+    );
+}
+
+#[gpui::test]
+fn space_find_does_not_recount_a_transcript_that_has_not_moved(cx: &mut TestAppContext) {
+    // `rebuild` runs on every `StreamDelta` — once per token of every turn —
+    // while the persisted transcript it reads does not move during a stream at
+    // all. A generation that bumped on every rebuild would restart the
+    // cross-branch pass on every token, so a reader searching beside a live
+    // reply would watch the total go back to "counting" and stay there for the
+    // length of the answer.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, wide_countable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_space_total_for_test()),
+        Some(36),
+        "precondition: the pass landed"
+    );
+
+    // The rebuild any unrelated space change causes — a sibling turn's delta,
+    // a memory write, a background summary pass. Deliberately **not** settled
+    // afterwards: the assertion is about the very next frame, which is where a
+    // restart would show, and this fixture is too big to re-settle in one.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.rebuild_for_test(cx));
+    });
+    vcx.update(|window, _| window.refresh());
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.find_counting_for_test(),
+            "nothing about the conversation's text moved, so nothing is recounted"
+        );
+        assert_eq!(
+            v.find_space_total_for_test(),
+            Some(36),
+            "…and the total stands"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_counts_a_draft_left_on_a_branch_the_reader_left(cx: &mut TestAppContext) {
+    // A tail draft is minted for **every leaf of the whole tree**, and a
+    // non-empty one is never pruned — so a reader who writes on one branch and
+    // walks to another leaves prose behind. It is in the effective tree, but
+    // not in `posts` and not in the search scope, so the cross-branch count
+    // reached neither: its matches were missing from the sibling number and
+    // from the total, and appeared the moment the reader visited that branch
+    // with nothing about the conversation having changed.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Write in the far fork's composer — a6 is that branch's leaf — and leave
+    // it there. The draft is inactive and off the selected path from here on.
+    let elsewhere = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a6"))
+        .expect("every leaf has a tail draft");
+    elsewhere.update(&mut vcx, |e, cx| {
+        e.set_value("one more kestrel, written over here".to_string(), cx)
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    let (branch, total, account, siblings) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            (
+                v.find_matches_for_test().0.len(),
+                v.find_space_total_for_test(),
+                v.find_levels_account_for_test(window, cx),
+                v.minimap_branch_counts_for_test(window, cx),
+            )
+        })
+    });
+
+    assert_eq!(
+        total,
+        Some(9),
+        "eight in the posts and one in the draft nobody is looking at"
+    );
+    assert!(
+        !view.read_with(&vcx, |v, _| v.has_active_draft_for_test()) || branch < 9,
+        "precondition: the reader is not on that branch"
+    );
+    assert_eq!(
+        account, 9,
+        "the map still accounts for the whole space, draft included"
+    );
+    let far = siblings
+        .iter()
+        .find(|(id, _)| id == "a3")
+        .map(|(_, n)| *n)
+        .expect("the far fork is a shown sibling");
+    assert_eq!(
+        far,
+        Some(5),
+        "the sibling names what is only reachable through it: one on a3, \
+         three on a6, and the draft left on a6's composer"
+    );
+}
+
+#[gpui::test]
+fn space_find_scans_a_node_once_for_a_query_it_has_already_answered(cx: &mut TestAppContext) {
+    // **The count is memoized, not merely the projection.** Three passes ask a
+    // per-node question on every frame a session is open — the visible
+    // branch's match list, the whole-space post walk, and the retained drafts
+    // — and each of them called `Projection::find`, which is O(bytes) *and*
+    // allocates a whole folded copy of the haystack for a case-insensitive
+    // query. So a reader who opened the bar and then merely scrolled, or
+    // watched a reveal animate, paid for the entire visible branch and every
+    // off-branch draft again on every frame, with nothing about the
+    // conversation or the query having moved.
+    //
+    // Builds cannot show this: the projection is in the cache either way. The
+    // scans are what is counted.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // A draft on a branch the reader is not on — the retained-draft pass's own
+    // subject, and the site the finding named.
+    let elsewhere = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a6"))
+        .expect("every leaf has a tail draft");
+    elsewhere.update(&mut vcx, |e, cx| {
+        e.set_value("one more kestrel, written over here".to_string(), cx)
+    });
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    let after_search = view.read_with(&vcx, |v, _| v.find_scans_run_for_test());
+    assert!(
+        after_search > 0,
+        "precondition: the search really scanned something"
+    );
+
+    // Four more frames with the bar open and nothing changed. `sync_find` runs
+    // on every one of them — that is deliberate, since the scope is a function
+    // of the selected branch — so this is exactly the idle cost the memo is
+    // about.
+    for _ in 0..4 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_scans_run_for_test()),
+        after_search,
+        "a node whose text and query have both stood still is never scanned again"
+    );
+
+    // And the memo is keyed on what it is an answer about: move the draft's
+    // text and it is scanned again, with the new count reaching the total.
+    elsewhere.update(&mut vcx, |e, cx| {
+        e.set_value("two kestrel and one kestrel over here".to_string(), cx)
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    settle_find_count(&mut vcx);
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_scans_run_for_test()) > after_search,
+        "a draft that moved is scanned for real"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_space_total_for_test()),
+        Some(10),
+        "eight in the posts and the draft's two"
+    );
+}
+
+#[gpui::test]
+fn space_find_budgets_the_first_scan_of_a_large_draft(cx: &mut TestAppContext) {
+    // The other half of the same finding. Memoizing makes an *unchanged* draft
+    // free; the **first** look at a large one is real work — a projection plus
+    // a scan over every byte — and it used to land whole on the frame the
+    // query committed, outside the budget the post walk has obeyed all along.
+    //
+    // So the retained drafts join the chunk, under the same allowance, and the
+    // count says so: while one is owed there is **no total**, exactly as while
+    // the posts are still walking. A budgeted pass that still claimed to be
+    // settled would be the partial sum the whole design refuses.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Two drafts, each past `SCAN_CHUNK_BYTES` on its own: whichever the pass
+    // reaches first spends the chunk's whole allowance, so the other is
+    // deferred whatever order they come in. (The budget bounds how many items
+    // a chunk takes, never how long one item's own scan runs —
+    // `Projection::find` has no resumable form. That residual is the post
+    // walk's too.)
+    let bulk = |lead: &str| format!("{} {lead}", "words ".repeat(25_000));
+    assert!(
+        bulk("x").len() > 128 * 1024,
+        "precondition: each is past the scan budget on its own"
+    );
+    let far = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a6"))
+        .expect("every leaf has a tail draft");
+    far.update(&mut vcx, |e, cx| {
+        e.set_value(bulk("one kestrel over here"), cx)
+    });
+    let near = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a5"))
+        .expect("every leaf has a tail draft");
+    near.update(&mut vcx, |e, cx| {
+        e.set_value(bulk("a kestrel on the other leaf"), cx)
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+    // One keystroke and no settling — the frame the query landed on, with the
+    // work deliberately unfinished. `dispatch_keystroke` rather than
+    // `simulate_keystrokes`, which runs the executor until parked and would
+    // fuse the whole pass onto the press.
+    vcx.update(|window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("k").unwrap(), cx);
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_counting_for_test(),
+            "the chunk spent its allowance on the first large draft and owes \
+             the rest"
+        );
+        assert_eq!(
+            v.find_space_total_for_test(),
+            None,
+            "so there is no total to show — a draft still owed a scan is not a \
+             settled count"
+        );
+    });
+
+    // The posts are deliberately not the reason: this space is a few hundred
+    // bytes, and the posts half runs first and finished inside this very
+    // chunk. What is owed is a draft, and the readout says the same thing it
+    // says while the posts walk.
+    settle_find_count(&mut vcx);
+    view.read_with(&vcx, |v, _| {
+        assert!(!v.find_counting_for_test(), "and the deferred work lands");
+        // The query is the single letter the one keystroke committed, so the
+        // arithmetic is over `k`s rather than kestrels: eight kestrels plus
+        // the `k` on the end of a3's "fork", and one in each retained draft.
+        assert_eq!(
+            v.find_space_total_for_test(),
+            Some(11),
+            "the deferred draft's own matches are in the total that lands"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_copies_only_the_draft_the_chunk_admits(cx: &mut TestAppContext) {
+    // **A plan says what work is owed; it must not do the work.** The
+    // retained-draft pass is split in two — deciding what each draft needs
+    // reads its editor entity, doing it needs `&mut self` — and the planning
+    // half visited *every* off-branch draft before the admission loop's first
+    // budget check. A `ProjectionSeed` owns a copy of the draft's whole body,
+    // so building one there meant a frame copied the entire stale corpus and
+    // then deferred all but the first of them: the budget bounded the scans
+    // and not the copying that came before them.
+    //
+    // The freshness question was already answered against *borrowed* content,
+    // so nothing about the decision needed a copy — only the seed did, and the
+    // seed is what moved past the budget check. The posts half never had this
+    // shape: it checks its budget at the top of each iteration rather than
+    // planning ahead.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // Three large stale drafts, one per leaf — and **two** of them are
+    // *retained* drafts: the reader's own branch is a1 → a2 → a4, so a4's
+    // composer is on the selected path and belongs to the branch pass
+    // (`find_scope`), which is deliberately not deferred. a5 and a6 are the
+    // off-branch pair this pass owns, each past the scan budget on its own, so
+    // whichever it reaches first spends the whole allowance and the other is
+    // deferred. Both used to be copied anyway.
+    let bulk = |lead: &str| format!("{} {lead}", "words ".repeat(25_000));
+    assert!(
+        bulk("x").len() > 128 * 1024,
+        "precondition: each is past the scan budget on its own"
+    );
+    for (parent, lead) in [
+        ("a4", "one kestrel over here"),
+        ("a5", "a kestrel on the other leaf"),
+        ("a6", "and a kestrel further out"),
+    ] {
+        let editor = view
+            .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test(parent))
+            .expect("every leaf has a tail draft");
+        editor.update(&mut vcx, |e, cx| e.set_value(bulk(lead), cx));
+    }
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let before = view.read_with(&vcx, |v, _| v.find_draft_seeds_built_for_test());
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+    // One keystroke and no settling: this is the frame the query landed on,
+    // with two of the three drafts deliberately unfinished.
+    vcx.update(|window, cx| {
+        window.dispatch_keystroke(gpui::Keystroke::parse("k").unwrap(), cx);
+    });
+
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_counting_for_test(),
+            "precondition: the chunk deferred what it could not afford"
+        );
+        assert_eq!(
+            v.find_draft_seeds_built_for_test() - before,
+            1,
+            "the frame copies the one draft it admitted, not the corpus it \
+             planned over"
+        );
+    });
+
+    // And the deferred copies are owed, not lost: the pass settles with every
+    // draft counted once the worker has had its chunks.
+    settle_find_count(&mut vcx);
+    view.read_with(&vcx, |v, _| {
+        assert!(!v.find_counting_for_test(), "the deferred work lands");
+        assert_eq!(
+            v.find_draft_seeds_built_for_test() - before,
+            2,
+            "each retained draft is copied exactly once, in the chunk that \
+             admits it"
+        );
+        // One `k` per draft, plus nine in the posts (eight kestrels and the
+        // `k` ending a3's "fork").
+        assert_eq!(v.find_space_total_for_test(), Some(12));
+    });
+}
+
+#[gpui::test]
+fn space_find_arms_a_worker_for_work_deferred_after_the_count_had_settled(cx: &mut TestAppContext) {
+    // **A completed task is not a live one, and the slot has to say which.**
+    // The chunk loop arms a worker only when nothing is already running, and
+    // the question is asked of `count_task.is_some()` — so a multi-chunk pass
+    // that ran to the end left a finished `Task` sitting in the slot, and the
+    // *next* time a chunk deferred work the guard read that corpse as a live
+    // worker and armed nothing. The reader is then left on "Counting…" with no
+    // total until some unrelated repaint happens to drain it a chunk at a
+    // time. `STATE.md`'s own house example is the cure: the worker clears its
+    // slot in the same update it finishes in.
+    //
+    // Reachable exactly because the drafts half is re-asked every frame: the
+    // posts settle once, and a draft changing afterwards is what asks for a
+    // second worker on a slot the first one never gave back.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, wide_countable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(520.)));
+    vcx.run_until_parked();
+
+    // A conversation big enough that this pass really needs the worker — which
+    // is what leaves a finished task in the slot to be mistaken for a live one.
+    // One character, because each further keystroke restarts the pass and a
+    // restart clears the slot: the stale one is what a *settled* pass leaves.
+    run_find(&view, window, &mut vcx, "k");
+    settle_find_count(&mut vcx);
+    view.read_with(&vcx, |v, _| {
+        assert!(!v.find_counting_for_test(), "precondition: the pass landed");
+        assert_eq!(v.find_space_total_for_test(), Some(36));
+    });
+
+    // Now dirty two retained drafts, each past the scan budget on its own, in
+    // **one** update — so a single frame sees both and has to defer the
+    // second. Two separate updates would each get their own frame, and the
+    // first draft would be memoized by the time the second arrived.
+    let bulk = |lead: &str| format!("{} {lead}", "words ".repeat(25_000));
+    // Both off the selected path — a3 is the branch the reader is on, and its
+    // draft is in the search scope rather than in the retained-draft pass.
+    let far = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a4"))
+        .expect("every leaf has a tail draft");
+    let near = view
+        .read_with(&vcx, |v, _| v.draft_editor_for_parent_for_test("a5"))
+        .expect("every leaf has a tail draft");
+    vcx.update(|_, cx| {
+        far.update(cx, |e, cx| e.set_value(bulk("one kestrel over here"), cx));
+        near.update(cx, |e, cx| {
+            e.set_value(bulk("a kestrel on the other leaf"), cx)
+        });
+    });
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            v.find_counting_for_test(),
+            "precondition: the frame deferred one of the two drafts"
+        );
+    });
+
+    // Nothing but the clock from here — no refresh, no keystroke — and only
+    // far enough for the chunk timer. A whole second would also fire the
+    // minimap's hide timer, whose repaint runs a chunk of its own and drains
+    // the deferral by hand: that is exactly the "until an unrelated repaint
+    // happens along" accident that hides this defect in the wild, so the
+    // instrument must not reproduce it.
+    vcx.executor()
+        .advance_clock(std::time::Duration::from_millis(50));
+    vcx.run_until_parked();
+    view.read_with(&vcx, |v, _| {
+        assert!(
+            !v.find_counting_for_test(),
+            "the deferred work was handed to a worker that actually wakes"
+        );
+        assert_eq!(
+            v.find_space_total_for_test(),
+            Some(38),
+            "thirty-six in the posts and one in each retained draft"
+        );
+    });
+}
+
+#[gpui::test]
+fn space_find_shows_every_result_in_depth_then_lane_order(cx: &mut TestAppContext) {
+    // The overlay's whole reason for existing: the same matches the bar
+    // counted, presented in a **different orientation** from the transcript's.
+    // Depth from the root first, then left to right as the map lays them out —
+    // deliberately not the pre-order the conversation itself reads in, because
+    // agreeing with the transcript is the failure mode rather than the goal.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the disclosure's verb expanded the surface"
+    );
+
+    let (map, results) = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            (
+                v.find_map_for_test(window, cx),
+                v.find_results_for_test(window, cx),
+            )
+        })
+    });
+
+    // The map is the whole space, one node per post, with the spine keeping
+    // lane 0 and each later branch opening one of its own.
+    assert_eq!(
+        map,
+        vec![
+            ("a1".into(), 0, 0),
+            ("a2".into(), 1, 0),
+            ("a3".into(), 1, 1),
+            ("a4".into(), 2, 0),
+            ("a6".into(), 2, 1),
+            ("a5".into(), 2, 2),
+        ],
+        "every post, laid out depth down and lanes across — and the fork's two \
+         children are adjacent lanes, which is the reservation rule: with lanes \
+         taken on the way down, a3 would sit right of a5 because a2's subtree \
+         opened one first"
+    );
+
+    // The results are the nodes of that map that hold matches, in that order —
+    // `a2` is absent because it holds none. The transcript's own pre-order
+    // would have read a1, a2, a4, a5, a3, a6.
+    let order: Vec<&str> = results.iter().map(|(node, _)| node.as_str()).collect();
+    assert_eq!(
+        order,
+        vec!["a1", "a3", "a4", "a6", "a5"],
+        "depth first, then left to right — a5 opened the rightmost lane, so \
+         it reads last even though the transcript puts it before a3"
+    );
+    assert_eq!(
+        results.len(),
+        5,
+        "five groups, and none for the post that matched nothing"
+    );
+    // And what the overlay draws is what the bar counted, node for node: a
+    // fragment per matching block, cut from the same projection cache.
+    let total = view.read_with(&vcx, |v, _| v.find_space_total_for_test());
+    assert_eq!(total, Some(8), "precondition: the bar counted eight");
+    assert!(
+        results.iter().all(|(_, frags)| !frags.is_empty()),
+        "a group with no fragment would be a post the overlay claims and \
+         cannot show"
+    );
+}
+
+#[gpui::test]
+fn space_find_opening_a_result_takes_the_reader_to_its_branch(cx: &mut TestAppContext) {
+    // **The one place find spends branch selection**, and only because the
+    // reader asked for this result by name. Everything after the branch switch
+    // is the machinery the bar already owns: the anchor is set by identity and
+    // the reveal is the ordinary two-phase one, armed as a debt `sync_find`
+    // discharges once the new branch's match list exists.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // The branch the reader is *not* on. `a6` hangs off the other fork, so its
+    // matches are in the total and not in the index.
+    let branch_before = view.read_with(&vcx, |v, _| {
+        v.find_matches_for_test()
+            .0
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        !branch_before.iter().any(|n| n == "a6"),
+        "precondition: a6 is on a branch the reader is not looking at \
+         ({branch_before:?})"
+    );
+    let index = vcx
+        .update(|window, cx| {
+            view.read_with(cx, |v, cx| {
+                v.find_results_for_test(window, cx)
+                    .iter()
+                    .position(|(node, _)| node == "a6")
+            })
+        })
+        .expect("a6 holds matches, so it is a group");
+    // The flat fragment index the pointer would press: every group before it
+    // contributes its own fragments first.
+    let flat = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            v.find_results_for_test(window, cx)
+                .iter()
+                .take(index)
+                .map(|(_, frags)| frags.len())
+                .sum::<usize>()
+        })
+    });
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.open_find_result_for_test(flat, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the overlay collapses — the reader asked to be taken somewhere"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_open_for_test()),
+        "…and the bar it hangs off stays, because the search has not ended"
+    );
+    let (matches, current) = view.read_with(&vcx, |v, _| v.find_matches_for_test());
+    let branch_after: Vec<String> = matches.iter().map(|(n, _)| n.to_string()).collect();
+    assert!(
+        branch_after.iter().any(|n| n == "a6"),
+        "the branch really moved: a6's matches are on the visible branch now \
+         ({branch_after:?})"
+    );
+    let current = current.expect("a match is current");
+    assert_eq!(
+        matches[current - 1].0,
+        "a6",
+        "and the current match is the one that was clicked, not the first of \
+         the new branch"
+    );
+}
+
+#[gpui::test]
+fn space_find_keeps_the_overlays_place_until_the_query_moves(cx: &mut TestAppContext) {
+    // Position retention, the task's own rule: reopening the overlay without
+    // changing the query puts the reader back where they were. A position in
+    // one search's results means nothing in another's, so a new query is where
+    // it ends.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Short enough that five groups of results really do overflow it — a list
+    // with nothing to scroll would let this test pass vacuously.
+    vcx.simulate_resize(gpui::size(px(900.), px(400.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // Scroll the results list, then collapse and reopen. Read the offset back
+    // rather than asserting the value asked for: a scroll handle clamps to the
+    // content it actually has, and what retention is about is that the number
+    // survives, not what it is.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| {
+            v.find_overlay_scroll_to_for_test(120.0);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let scrolled = view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test());
+    assert!(
+        scrolled > 0.0,
+        "precondition: the reader scrolled ({scrolled})"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test()),
+        scrolled,
+        "reopening on the same query puts the reader back where they were"
+    );
+
+    // A new query, and it is gone — along with the measured heights and the
+    // editor states of fragments that no longer exist. Collapse first, which
+    // hands the keyboard back to the field the query is typed into.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.close_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("backspace");
+    vcx.run_until_parked();
+    settle_find_count(&mut vcx);
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test()),
+        0.0,
+        "a new query starts at the top of a list about something else"
+    );
+}
+
+#[gpui::test]
+fn space_an_open_find_overlay_keeps_printables_out_of_the_conversation(cx: &mut TestAppContext) {
+    // The overlay covers the conversation, so a printable behind it would start
+    // a draft on a page nobody can see — the exact defect
+    // `space_an_open_picker_keeps_printables_out_of_the_conversation` pins,
+    // reached through a surface that happens to fill the window. Unlike the bar
+    // above it, membership is unconditional rather than focus-gated: the bar is
+    // a row of chrome a reader goes on reading past.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    // Leave nothing composing, so a stray printable would be visible as a jump.
+    view.update(&mut vcx, |v, cx| v.retire_draft_for_test(cx));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    // Focus the conversation itself, so nothing about the *bar* is what yields.
+    let root = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| window.focus(&root, cx));
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "precondition: nothing is composing"
+    );
+
+    vcx.simulate_keystrokes("z");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "a printable behind the overlay starts no draft"
+    );
+
+    // …and the conversation takes them back the moment the overlay collapses.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.close_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.focus(&root, cx));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("z");
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "with the overlay gone the same press reaches the composer"
+    );
+}
+
+/// Fourteen branches off one root, every one of them matching: wide and
+/// shallow, so the map runs off the right of its own column (`map_lane_x`
+/// squeezes to the lane floor and then states the real x) while the fixture
+/// stays cheap — depth is the expensive axis for this view, breadth the free
+/// one.
+fn wide_map_posts() -> Vec<PostNode> {
+    let mut posts = vec![fixture_user_post("a1", "a kestrel at the root")];
+    for i in 0..14 {
+        let mut p = fixture_assistant_post(&format!("b{i}"), "another kestrel");
+        p.parent_action_id = Some("a1".into());
+        posts.push(p);
+    }
+    posts
+}
+
+/// **The map is virtualised over the band it is read through, and Tab still
+/// walks the whole of it.**
+///
+/// One dot per post over a canvas that states the whole conversation's height
+/// meant an element per post on every frame the overlay drew — the results list
+/// beside it has always been band-virtualised, and the map simply had not been.
+/// The half that needs proving is the second: the dots stay per-node tab stops,
+/// so a Tab into one below the fold lands on a painted element, the reveal
+/// scrolls it in, and the next frame's band has advanced past it — the walk
+/// carries the band along in front of the reader.
+#[gpui::test]
+fn space_find_virtualises_its_map_and_still_lets_tab_walk_it(cx: &mut TestAppContext) {
+    // Wide rather than deep: the page renders one nested scroller per depth
+    // level, so a chain long enough to exceed the map's band buries the stack
+    // before it reaches the map at all — and a fan of siblings is the shape a
+    // large real conversation takes anyway.
+    const BRANCHES: usize = 200;
+    let mut posts = vec![fixture_user_post("a1", "a kestrel at the root")];
+    for i in 0..BRANCHES {
+        let mut p = fixture_assistant_post(&format!("b{i}"), "another kestrel");
+        p.parent_action_id = Some("a1".into());
+        posts.push(p);
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, posts);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let total =
+        vcx.update(|window, cx| view.update(cx, |v, cx| v.find_map_nodes_for_test(window, cx)));
+    assert_eq!(
+        total,
+        BRANCHES + 1,
+        "precondition: the map is about the whole space"
+    );
+    let painted = view.read_with(&vcx, |v, _| v.find_map_painted_for_test());
+    assert!(
+        painted > 0 && painted < total / 2,
+        "the map builds the band it is being read through, not the conversation \
+         ({painted} dots built of {total})"
+    );
+
+    // Stand on the last dot the band holds and walk with Tab. Each step reveals
+    // the dot it lands on, which advances the band — so the walk cannot run out
+    // of painted elements while the map has more.
+    let start = painted - 1;
+    assert!(
+        vcx.update(|window, cx| view.update(cx, |v, cx| v
+            .focus_find_map_node_for_test(start, window, cx))),
+        "precondition: the band's last dot is a tab stop"
+    );
+    vcx.run_until_parked();
+    for _ in 0..12 {
+        vcx.update(|window, cx| window.focus_next(cx));
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+    let landed = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.find_focused_map_node_for_test(window, cx)))
+        .expect("the keyboard is still on a map dot");
+    assert!(
+        landed > start,
+        "Tab carried the band along in front of it (from {start} to {landed}, \
+         with {painted} built when the walk began)"
+    );
+    assert!(
+        landed >= painted,
+        "…and past where the first frame's band ended"
+    );
+}
+
+#[gpui::test]
+fn space_find_reveals_a_map_dot_the_keyboard_lands_on(cx: &mut TestAppContext) {
+    // Past thirteen lanes a dot sits beyond the column's own width, and every
+    // dot with matches is a real tab stop — so Tab could put the keyboard on
+    // one with no visible ring, and Enter would then scroll the results to a
+    // group chosen out of sight. The column scrolls to it, minimally, the way
+    // the results cursor reveals its card.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, wide_map_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_map_scroll_for_test()),
+        (0.0, 0.0),
+        "precondition: the map opens at its origin"
+    );
+
+    // The last node in depth-then-lane order is the right-most lane — the one
+    // the column clips.
+    let last =
+        vcx.update(|window, cx| view.update(cx, |v, cx| v.find_map_nodes_for_test(window, cx))) - 1;
+    assert!(
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| v.focus_find_map_node_for_test(last, window, cx))
+        }),
+        "precondition: the right-most dot is a tab stop"
+    );
+    vcx.run_until_parked();
+    let (x, y) = view.read_with(&vcx, |v, _| v.find_map_scroll_for_test());
+    assert!(
+        x < 0.0,
+        "the column scrolled to bring the clipped dot into view (x = {x})"
+    );
+    assert_eq!(y, 0.0, "and moved on no axis it did not have to");
+
+    // A dot already in view leaves the reader's place alone…
+    assert!(vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.focus_find_map_node_for_test(last - 1, window, cx)
+        })
+    }));
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_map_scroll_for_test()).0,
+        x,
+        "a dot beside it is already showing, so nothing moves"
+    );
+
+    // …and walking back to the root brings the near edge with it.
+    assert!(vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.focus_find_map_node_for_test(0, window, cx))
+    }));
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_map_scroll_for_test()),
+        (0.0, 0.0),
+        "the root's dot is at the origin, so the column returns to it"
+    );
+}
+
+/// Twenty-one matching posts — one root and twenty replies, so the fixture is
+/// wide and shallow (depth is the expensive axis for this view) while the
+/// results list, which is flat, runs well past the viewport band.
+fn many_matching_posts() -> Vec<PostNode> {
+    let body = format!("a kestrel {}", "hovering over the long grass ".repeat(4));
+    let mut posts = vec![fixture_user_post("a1", &body)];
+    for i in 0..20 {
+        let mut p = fixture_assistant_post(&format!("b{i}"), &body);
+        p.parent_action_id = Some("a1".into());
+        posts.push(p);
+    }
+    posts
+}
+
+#[gpui::test]
+fn space_find_a_card_measures_against_the_layout_it_is_drawn_in(cx: &mut TestAppContext) {
+    // A measurement is a function of the text *and* the geometry it was taken
+    // in. The fragment id already carried the text, so a pane narrowed below
+    // the results column's cap — or a type-scale change — re-wrapped every card
+    // while the cache went on serving heights from the old layout. **The cards
+    // that matter are the ones outside the virtualization band**: they are
+    // never re-rendered, so a stale placeholder went on sizing every group top
+    // below it, and with it the map's scroll targets and the list's extent,
+    // until the reader happened to bring that card back.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, many_matching_posts());
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // Walk the roving cursor to the end so the last card paints and measures,
+    // then back to the top so it leaves the band again.
+    let last = 20usize;
+    vcx.simulate_keystrokes("end");
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let measured = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.find_card_height_for_test(last, window, cx)))
+        .expect("the cursor brought the last card into view, so it measured");
+
+    vcx.simulate_keystrokes("home");
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.update(
+            |window, cx| view.update(cx, |v, cx| v.find_card_height_for_test(last, window, cx))
+        ),
+        Some(measured),
+        "precondition: back at the top it keeps the height it was measured at"
+    );
+
+    // Narrow the pane past the column's own cap. The card is off-band, so
+    // nothing re-measures it — which is exactly why the old height must go.
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert_eq!(
+        vcx.update(
+            |window, cx| view.update(cx, |v, cx| v.find_card_height_for_test(last, window, cx))
+        ),
+        None,
+        "a height measured in a layout that has gone is no answer at all — the \
+         list estimates at the geometry it is drawing in"
+    );
+}
+
+#[gpui::test]
+fn space_find_hands_the_keyboard_back_when_a_focused_dot_stops_matching(cx: &mut TestAppContext) {
+    // A map dot is a stop only while its post is a result, and a background
+    // regeneration is enough to end that: the post stays in the map as an inert
+    // label while its slot — the tracked handle the keyboard is *on* — is
+    // pruned, leaving the window focused on a handle no frame paints.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut second = fixture_assistant_post("a2", "the kestrel hovers to hunt");
+    second.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "tell me about the kestrel"), second],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // Stand on the answer's own dot — index 1 in depth-then-lane order.
+    assert!(
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| v.focus_find_map_node_for_test(1, window, cx))
+        }),
+        "precondition: the answer's dot is a tab stop"
+    );
+    vcx.run_until_parked();
+    assert!(
+        !vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "precondition: the keyboard is on the dot, not the list"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the dot's slot went, so the keyboard went to the surface's own stop"
+    );
+}
+
+#[gpui::test]
+fn space_find_refuses_a_card_the_query_has_moved_out_from_under(cx: &mut TestAppContext) {
+    // gpui draws from the platform's frame callback, so a query `Change` and a
+    // press on a card still showing the previous query's results really do
+    // arrive between two paints. The closure holds the old fragment, and
+    // opening it spent the one thing find never spends — the reader's branch —
+    // to go somewhere the new search never chose, installing an ordinal from a
+    // list that no longer exists as the new query's anchor.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut second = fixture_assistant_post("a2", "a heron on the far bank");
+    second.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass"), second],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // The card as a rendered frame's click closure holds it.
+    let stale = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.capture_find_result_for_test(0, window, cx)))
+        .expect("the query matches, so there is a card");
+
+    // The reader retypes; the results the card belonged to are gone.
+    run_find(&view, window, &mut vcx, "heron");
+    settle_find_count(&mut vcx);
+
+    let anchor = view.read_with(&vcx, |v, _| v.find_anchor_key_for_test());
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.press_captured_find_result_for_test(stale, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the press is refused outright — the overlay does not collapse"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_anchor_key_for_test()),
+        anchor,
+        "and the new query's own place is untouched — no ordinal from a list \
+         that no longer exists is installed as its anchor"
+    );
+}
+
+#[gpui::test]
+fn space_find_refuses_a_card_the_results_have_moved_out_from_under(cx: &mut TestAppContext) {
+    // The generation guard's second axis. A regeneration takes its post out of
+    // the result set with the query untouched — the exclusion rides `CountKey`,
+    // not the query — so a card captured before it passed the generation check
+    // and spent branch selection on a post the overlay no longer offers,
+    // installing an ordinal `sync_find` then resolved the standing query from.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut second = fixture_assistant_post("a2", "the kestrel hovers to hunt");
+    second.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "tell me about the kestrel"), second],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // The answer's own card, as a rendered frame's click closure holds it.
+    let stale = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.capture_find_result_for_test(1, window, cx)))
+        .expect("both posts match, so the answer has a card");
+
+    // A background regeneration takes that post out of the results — the query
+    // has not moved, so the generation still agrees.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let anchor = view.read_with(&vcx, |v, _| v.find_anchor_key_for_test());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.press_captured_find_result_for_test(stale, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the press is refused — the overlay does not collapse for a result it \
+         no longer offers"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_anchor_key_for_test()),
+        anchor,
+        "and the reader's place under the standing query is untouched"
+    );
+}
+
+#[gpui::test]
+fn space_an_overlaying_inspector_takes_the_keyboard_off_what_it_covers(cx: &mut TestAppContext) {
+    // The inspector is a *sibling* of the conversation pane only in its split
+    // form. Below `MIN_CONTENT_WIDTH` it paints a full-window scrim after that
+    // pane and the panel over it, so an open Find-all is behind it — and ⌥⌘I
+    // stays registered, so the reader can put it there. The keyboard was left
+    // on the results list underneath: arrows and Enter went on driving a list
+    // nobody could see while the pointer was intercepted by the scrim.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Wide enough that the inspector would split rather than cover.
+    vcx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "precondition: opening the overlay put the keyboard on its results list"
+    );
+
+    // A split inspector covers nothing, so it takes nothing.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "a split panel stands beside the page and leaves the keyboard alone"
+    );
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(false, window, cx));
+    });
+    vcx.run_until_parked();
+
+    // Narrow enough that it must overlay, and the reader presses ⌥⌘I.
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert!(
+        !vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the covered list no longer holds the keyboard"
+    );
+    assert!(
+        vcx.update(|window, cx| view.read_with(cx, |v, _| v.inspector_focused_for_test(window))),
+        "…the panel the reader asked for does"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "and the search is left standing — it is not this verb's to spend"
+    );
+
+    // And the verb that would put a *second* reader into the same state is
+    // withheld while the panel covers the pane — registration-is-enablement,
+    // so macOS greys Edit ▸ Find in Conversation rather than mounting the bar
+    // behind a scrim.
+    assert!(
+        !vcx.update(|window, cx| window.is_action_available(&eidola_gui::actions::FindInSpace, cx)),
+        "⌘F is withheld while the panel covers the surface it would open"
+    );
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(false, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|window, cx| window.is_action_available(&eidola_gui::actions::FindInSpace, cx)),
+        "…and comes back the moment the panel stops covering it"
+    );
+    // Which it can only do because the borrow was returned: dispatch walks from
+    // the focused element, so a panel that closed onto its own dead handle
+    // would take every per-view action with it.
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the panel hands the keyboard back to the surface it borrowed from"
+    );
+}
+
+/// **A reveal performed against estimates is corrected when the measurements
+/// land.**
+///
+/// Every position in the results list is a sum of the cards above it, and a
+/// card that has never painted contributes an estimate — so a jump places the
+/// reader by arithmetic over text nobody has shaped. The target's band then
+/// renders for the first time and those estimates are replaced; where the
+/// guesses were generous, everything below moves up far enough to carry the
+/// cursor's own card clean out of the viewport while the cursor still names it
+/// and Enter still opens it.
+#[gpui::test]
+fn space_find_corrects_a_cursor_reveal_when_the_measurements_land(cx: &mut TestAppContext) {
+    // Cards whose source is much longer than what they render: a read-only
+    // editor hides a link's URL, so the estimate counts hundreds of characters
+    // where the reader sees one word. That is a real over-estimate rather than
+    // a contrived one — it is the shape the projection exists to handle.
+    //
+    // **Aimed at the middle of the list, deliberately.** A jump to the *end* is
+    // rescued by gpui's own clamping: as the content shrinks so does
+    // `max_offset`, which drags the viewport along with the end it is parked
+    // at. Nothing rescues a jump into the middle, which is where a reader
+    // pressing a map dot lands.
+    const POSTS: usize = 5;
+    const BLOCKS: usize = 12;
+    let url = "a".repeat(300);
+    let mut posts = Vec::new();
+    for p in 0..POSTS {
+        let mut body = String::new();
+        for i in 0..BLOCKS {
+            body.push_str(&format!(
+                "a kestrel {p}-{i} [x](https://example.com/{url})\n\nthe grass below\n\n"
+            ));
+        }
+        let mut post = fixture_user_post(&format!("a{p}"), &body);
+        if p > 0 {
+            post.parent_action_id = Some(format!("a{}", p - 1));
+        }
+        posts.push(post);
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, posts);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // A press on the middle post's dot: the group jump, placed by arithmetic
+    // over two whole posts' worth of cards nobody has laid out.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.press_find_map_node_for_test(2, window, cx));
+    });
+    vcx.run_until_parked();
+
+    // Let the frames the jump caused settle: the band renders, its canvases
+    // measure, the tops move, and the correction re-runs until they stop.
+    // Convergence is one band's worth of cards per frame, so the budget is
+    // generous rather than tight; nothing here polls a condition.
+    for _ in 0..20 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+
+    assert_eq!(
+        vcx.update(|window, cx| view
+            .update(cx, |v, cx| v.find_cursor_in_view_for_test(window, cx))),
+        Some(true),
+        "the card the cursor names is where the reader can see it"
+    );
+}
+
+/// **The panel's handback asks about the subtree, not the container's handle.**
+///
+/// It owns that handle only until the reader's first Tab or click: a title
+/// field, a stepper, the router button and every roster control are
+/// descendants, so an exact-handle check missed all of them and the close left
+/// the keyboard anywhere but the search still standing behind the panel.
+#[gpui::test]
+fn space_a_covering_panel_hands_back_from_a_control_inside_it(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|window, cx| view.read_with(cx, |v, _| v.inspector_focused_for_test(window))),
+        "precondition: the covering panel took the keyboard"
+    );
+
+    // The reader steps into the panel — its title field is one Tab away, and
+    // the container's own handle stops being the focused element the moment
+    // they do.
+    let title = view
+        .read_with(&vcx, |v, _| v.inspector_title_state_for_test())
+        .expect("the panel's title field");
+    vcx.update(|window, cx| {
+        title.update(cx, |s, cx| s.focus(window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        !vcx.update(|window, cx| view.read_with(cx, |v, _| v.inspector_focused_for_test(window))),
+        "precondition: a descendant holds it now, not the panel itself"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(false, window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the borrow comes back to the search the panel was standing over"
+    );
+}
+
+/// **A wide map has a pointer path to its clipped lanes.**
+///
+/// Past thirteen lanes the column really scrolls horizontally, and gpui does
+/// not redirect a vertical-only wheel to the other axis once both are
+/// scrollable — so without a thumb an ordinary mouse had no path at all to what
+/// is clipped there. A **source scan**, because a scroll indicator is
+/// deliberately not a probe target (it is an indicator, not an affordance) and
+/// so has no painted bounds a test could press.
+#[gpui::test]
+fn the_find_maps_column_carries_both_scroll_indicators(_cx: &mut TestAppContext) {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/space_view/find_overlay.rs"
+    ))
+    .expect("the overlay's source");
+    for axis in ["vertical_floating", "horizontal_floating"] {
+        assert!(
+            src.contains(&format!(
+                "crate::scrollbar::{axis}(\n                \"space-find-map-scroll"
+            )),
+            "the map column renders its {axis} indicator"
+        );
+    }
+}
+
+/// **A loan is a fact about what happened, not about what was permitted.**
+///
+/// Covering is what *allows* the panel's handoff, not what performs it: with a
+/// find session standing but the keyboard somewhere in the pane, the panel
+/// covers and takes nothing — and reading the layout as proof of a loan sent a
+/// reader who had stepped into a panel control of their own accord off to the
+/// results list, abandoning the conversation they were in.
+#[gpui::test]
+fn space_a_covering_panel_returns_only_what_it_borrowed(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    // The reader leaves the search standing and puts the keyboard back in the
+    // conversation — so there is a session to cover, and nothing to take.
+    let home = view.read_with(&vcx, |v, _| v.focus_handle());
+    vcx.update(|window, cx| window.focus(&home, cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert!(
+        !vcx.update(|window, cx| view.read_with(cx, |v, _| v.inspector_focused_for_test(window))),
+        "precondition: the panel took nothing, the keyboard not being find's"
+    );
+
+    // They then step into a panel control themselves, and close the panel.
+    let title = view
+        .read_with(&vcx, |v, _| v.inspector_title_state_for_test())
+        .expect("the panel's title field");
+    vcx.update(|window, cx| {
+        title.update(cx, |s, cx| s.focus(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(false, window, cx));
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        !vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "a panel that borrowed nothing returns nothing — the reader is left in \
+         the conversation they were in"
+    );
+    assert!(
+        vcx.update(|window, cx| home.is_focused(window)
+            || view.read_with(cx, |v, _| v.find_open_for_test())),
+        "…and the window still has a live place for the keyboard"
+    );
+}
+
+/// **The roving cursor is on a fragment, not at a number.**
+///
+/// The list is re-cut on every frame and a background write reorders it, so an
+/// index alone silently retargets: with the cursor on B and a C after it, a
+/// regeneration that takes an earlier A out leaves the same number pointing at
+/// C — the focus indication, the active descendant and what Enter opens all
+/// change while the reader never moved.
+#[gpui::test]
+fn space_find_keeps_the_cursor_on_the_result_it_was_on(cx: &mut TestAppContext) {
+    // Three posts, three groups: A above, then B, then C.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut b = fixture_assistant_post("a2", "a kestrel in the middle");
+    b.parent_action_id = Some("a1".into());
+    let mut c = fixture_user_post("a3", "a kestrel at the end");
+    c.parent_action_id = Some("a2".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel at the start"), b, c],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    // Down once: the cursor stands on B, with C still after it.
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let on = view
+        .read_with(&vcx, |v, _| v.find_cursor_id_for_test())
+        .expect("the cursor names a fragment");
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_cursor_index_for_test()),
+        1,
+        "precondition: it is the second result"
+    );
+
+    // A regenerates somewhere, which takes its result out of the list
+    // altogether — every later index shifts up by one.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a1".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_cursor_id_for_test()),
+        Some(on),
+        "the cursor is still on the result it was on"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_cursor_index_for_test()),
+        0,
+        "…which is now the first, so the index really did have to move"
+    );
+}
+
+/// **An empty query is an absence, not a search that found nothing.**
+///
+/// The bar states that already — with no query it shows no index readout, no
+/// step verbs and no total, and therefore no disclosure. So ⌘Return with an
+/// empty field used to cover the conversation with "Nothing matches anywhere",
+/// a claim about a search nobody made; and clearing the query under a standing
+/// overlay took away the very chevron that collapses it.
+#[gpui::test]
+fn space_find_all_refuses_a_query_that_is_not_there(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_open_for_test()),
+        "precondition: the bar is up with nothing typed into it"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the surface behind a disclosure the bar does not show cannot be opened"
+    );
+
+    // Now with a real query, and then without one again.
+    vcx.simulate_keystrokes("k e s t r e l");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "precondition: a query that exists opens it"
+    );
+
+    // Opening the overlay put the keyboard on its results list, so the reader
+    // goes back to the field the way ⌘F takes them — and clears it.
+    dispatch_space_action(&view, window, &mut vcx, eidola_gui::actions::FindInSpace);
+    vcx.run_until_parked();
+    for _ in 0..7 {
+        vcx.simulate_keystrokes("backspace");
+    }
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "a query cleared under the overlay takes the overlay with it"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_open_for_test()),
+        "…and leaves the bar the reader is typing in"
+    );
+}
+
+/// **The traversal induction needs a base case, and Tab is how it is proved.**
+///
+/// The neighbour rule carries the walk *from a painted match*, so with no
+/// matching node in band at all — a result only in the sixtieth root lane —
+/// it produced nothing, the paint loop omitted every matching dot, and Tab
+/// could not start the walk: a retained handle does not enter a paint-derived
+/// tab order by itself.
+#[gpui::test]
+fn space_find_reaches_the_only_match_on_a_map_that_starts_past_the_band(cx: &mut TestAppContext) {
+    // Nothing matches anywhere near the origin — not even the root — so no
+    // neighbour of a banded match exists to seed the walk from.
+    const BRANCHES: usize = 60;
+    let mut posts = vec![fixture_user_post("a1", "the grass below")];
+    for i in 0..BRANCHES {
+        let text = if i == BRANCHES - 1 {
+            "a kestrel over the far lane"
+        } else {
+            "the grass below"
+        };
+        let mut p = fixture_assistant_post(&format!("b{i}"), text);
+        p.parent_action_id = Some("a1".into());
+        posts.push(p);
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, posts);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let total =
+        vcx.update(|window, cx| view.update(cx, |v, cx| v.find_map_nodes_for_test(window, cx)));
+    let only = total - 1;
+
+    // Walk out of the results list with Tab, the way a reader reaches the map.
+    let mut landed = None;
+    for _ in 0..12 {
+        vcx.update(|window, cx| window.focus_next(cx));
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        landed = vcx.update(|window, cx| {
+            view.update(cx, |v, cx| v.find_focused_map_node_for_test(window, cx))
+        });
+        if landed.is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        landed,
+        Some(only),
+        "the map's one matching dot is reachable even though nothing near the \
+         origin matches"
+    );
+}
+
+/// **A sparse match is still reachable by Tab.**
+///
+/// The band alone does not keep the walk whole: it advances only when the dot
+/// Tab *lands on* was outside it, so two matching dots separated by more than
+/// the margin with nothing matching between left the reader on the last painted
+/// match — already in view, so nothing scrolled — with the distant one unpainted
+/// and out of a tab order derived from what painted.
+#[gpui::test]
+fn space_find_reaches_a_distant_match_on_the_map_by_tab(cx: &mut TestAppContext) {
+    // One fan, matches only at its two ends: every lane between them is a
+    // `Label` and no stop at all, so nothing in the middle can carry the walk.
+    const BRANCHES: usize = 60;
+    let mut posts = vec![fixture_user_post("a1", "a kestrel at the root")];
+    for i in 0..BRANCHES {
+        let text = if i == 0 || i == BRANCHES - 1 {
+            "another kestrel"
+        } else {
+            "the grass below"
+        };
+        let mut p = fixture_assistant_post(&format!("b{i}"), text);
+        p.parent_action_id = Some("a1".into());
+        posts.push(p);
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, posts);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let total =
+        vcx.update(|window, cx| view.update(cx, |v, cx| v.find_map_nodes_for_test(window, cx)));
+    assert_eq!(
+        total,
+        BRANCHES + 1,
+        "precondition: the map is the whole space"
+    );
+    let distant = total - 1;
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_map_painted_for_test()) < total,
+        "precondition: the far lane is past the band"
+    );
+
+    // Stand on the near match — the root's own dot's neighbour, and the last
+    // one the band holds — and press Tab once.
+    assert!(
+        vcx.update(
+            |window, cx| view.update(cx, |v, cx| v.focus_find_map_node_for_test(1, window, cx))
+        ),
+        "precondition: the near match is a tab stop"
+    );
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.focus_next(cx));
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert_eq!(
+        vcx.update(
+            |window, cx| view.update(cx, |v, cx| v.find_focused_map_node_for_test(window, cx))
+        ),
+        Some(distant),
+        "Tab reaches the far match rather than walking out of the map"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_map_scroll_for_test()).0 < 0.0,
+        "…and the reveal brought it into view, as it does for any dot below the fold"
+    );
+}
+
+/// **The band never takes away what the reader is standing on.**
+///
+/// Two things point into the results list from outside the band's own
+/// reasoning, and a placeholder answers for neither: the roving **cursor**,
+/// which a wheel scroll moves the viewport away from without touching (leaving
+/// the focused list with no painted active descendant, and the next Arrow
+/// snapping the viewport back), and a card's **editor**, which a pointer
+/// selection focuses and whose handle is tracked on the card.
+#[gpui::test]
+fn space_find_keeps_the_cursor_and_the_focused_card_painted_past_the_band(cx: &mut TestAppContext) {
+    const BLOCKS: usize = 120;
+    let mut body = String::new();
+    for i in 0..BLOCKS {
+        body.push_str(&format!("a kestrel over field {i}\n\nthe grass below\n\n"));
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, vec![fixture_user_post("a1", &body)]);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    use eidola_gui::probe;
+    let _probes = probes_on();
+    let painted = |vcx: &mut VisualTestContext| -> Vec<String> {
+        probe::clear_window(window.window_id().as_u64());
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        probe::window_entries(window.window_id().as_u64())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
+    };
+    let names = painted(&mut vcx);
+    assert!(
+        names.contains(&"space/find/result/2".to_string()),
+        "precondition: a card near the top of the list paints while it is there"
+    );
+
+    // **The cursor.** Opening the overlay put the keyboard on the list and the
+    // cursor on the first card. The reader now scrolls the list itself, far
+    // past the margin — nothing here moves the cursor.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| v.scroll_find_results_for_test(5_000.0));
+    });
+    vcx.run_until_parked();
+    let names = painted(&mut vcx);
+    assert!(
+        !names.contains(&"space/find/result/2".to_string()),
+        "precondition: the band really has left that part of the list behind"
+    );
+    assert!(
+        names.contains(&"space/find/result/0".to_string()),
+        "the cursor's card is still painted, so the list still has an active \
+         descendant to name"
+    );
+
+    // **The focused editor**, which is a different claim on a different card: a
+    // pointer selection focuses it, and that takes the keyboard off the list —
+    // so the cursor stops being painted at all (a row claims it only while the
+    // list itself is the focused element), and this card's own handle is what
+    // has to keep it materialised.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| v.scroll_find_results_for_test(0.0));
+    });
+    vcx.run_until_parked();
+    // Draw before asking: the far scroll evicted that card's state, and a card
+    // mints one again by rendering.
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let editor = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.find_result_editor_for_test(1, window, cx)))
+        .expect("the second card is back at the top of the list");
+    vcx.update(|window, cx| {
+        let handle = editor.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| v.scroll_find_results_for_test(5_000.0));
+    });
+    vcx.run_until_parked();
+
+    let names = painted(&mut vcx);
+    assert!(
+        names.contains(&"space/find/result/1".to_string()),
+        "the card holding the keyboard is still painted"
+    );
+    assert!(
+        !names.contains(&"space/find/result/0".to_string()),
+        "…and the cursor's is not, because with the list unfocused no row \
+         claims the cursor — two claims, not one"
+    );
+}
+
+/// **A prune that drops a focused element hands the keyboard back** — the rule's
+/// third instance, and the one prune the band cannot cover: a fragment the
+/// results no longer contain at all.
+#[gpui::test]
+fn space_find_hands_the_keyboard_back_when_a_focused_card_leaves_the_results(
+    cx: &mut TestAppContext,
+) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut a2 = fixture_assistant_post("a2", "another kestrel entirely");
+    a2.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass"), a2],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    // A selection in the answer's card puts the keyboard on that card's editor.
+    let editor = vcx
+        .update(|window, cx| view.update(cx, |v, cx| v.find_result_editor_for_test(1, window, cx)))
+        .expect("the answer's card");
+    vcx.update(|window, cx| {
+        let handle = editor.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    });
+    vcx.run_until_parked();
+    assert!(
+        !vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "precondition: the card, not the list, is holding the keyboard"
+    );
+
+    // That answer begins being regenerated somewhere, which takes it out of the
+    // results entirely — the card is not moved, it is gone.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the keyboard goes to the one stop this surface paints on every frame"
+    );
+}
+
+/// **The editor states a results list holds are bounded by its band, not by the
+/// query.**
+///
+/// A card's state carries its node's *whole* markdown — the fragment filter
+/// narrows the paint, not the document — so one per visited card is one whole
+/// post per matching block, and a long post with many isolated matches retained
+/// hundreds of megabytes for as long as the query stood. Counted rather than
+/// looked at, because an evicted card and one the reader never reached paint
+/// exactly alike: measured here at 28 states held after walking 120 cards.
+#[gpui::test]
+fn space_find_bounds_the_editors_it_keeps_while_the_query_stands(cx: &mut TestAppContext) {
+    // Matching paragraphs separated by non-matching ones, so each is a fragment
+    // of its own: contiguous blocks consolidate into one card.
+    const BLOCKS: usize = 120;
+    let mut body = String::new();
+    for i in 0..BLOCKS {
+        body.push_str(&format!("a kestrel over field {i}\n\nthe grass below\n\n"));
+    }
+
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, vec![fixture_user_post("a1", &body)]);
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    // Walk the roving cursor the whole way down, one card at a time — every
+    // card renders as the cursor reaches it, which is precisely the reader who
+    // used to end up holding all of them.
+    for _ in 0..BLOCKS {
+        vcx.simulate_keystrokes("down");
+    }
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let retained = view.read_with(&vcx, |v, _| v.find_retained_editors_for_test());
+    assert!(
+        retained > 0,
+        "precondition: the cards the reader is looking at keep their states"
+    );
+    assert!(
+        retained < BLOCKS / 2,
+        "a scrolled-past card gives its document back ({retained} states held of \
+         {BLOCKS} cards walked)"
+    );
+    assert!(
+        vcx.update(|window, cx| view
+            .update(cx, |v, cx| v.find_result_editor_for_test(0, window, cx))
+            .is_none()),
+        "the first card, far above the band, holds no document"
+    );
+    assert!(
+        vcx.update(|window, cx| view
+            .update(cx, |v, cx| v.find_result_editor_for_test(
+                BLOCKS - 1,
+                window,
+                cx
+            ))
+            .is_some()),
+        "…and the one under the cursor does"
+    );
+}
+
+/// **The cover is decided by the window's width, so a resize owes the keyboard
+/// too.**
+///
+/// Opening the panel wide splits, which covers nothing and correctly takes
+/// nothing; dragging that window narrower flips the layout decision during
+/// render, with no door called — so the scrim went up over a Find-all whose
+/// results list still had the keys.
+#[gpui::test]
+fn space_a_resize_into_the_covering_layout_takes_the_keyboard_too(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "precondition: a split panel leaves the keyboard where it was"
+    );
+
+    // The reader drags the window narrower. Nothing calls ⌥⌘I.
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert!(
+        !vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "the newly covered list gives the keyboard up"
+    );
+    assert!(
+        vcx.update(|window, cx| view.read_with(cx, |v, _| v.inspector_focused_for_test(window))),
+        "…to the panel now standing over it"
+    );
+}
+
+/// **A rung answers only for a surface the reader can see.**
+///
+/// The find rungs were ordered innermost-first on the premise that nothing
+/// covers them — which the panel's overlay form breaks wholesale. An Escape
+/// from the panel used to reach past it and collapse the hidden Find-all,
+/// spending search state behind a scrim that did not itself change.
+#[gpui::test]
+fn space_escape_answers_for_the_panel_that_covers_the_search(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.inspector_open_for_test()),
+        "the press answers for the panel — the one thing the reader can see"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "…and the search behind it is untouched"
+    );
+    assert!(
+        vcx.update(
+            |window, cx| view.read_with(cx, |v, _| v.find_results_list_focused_for_test(window))
+        ),
+        "…with the keyboard handed back to it"
+    );
+
+    // The next press finds the pane uncovered and answers for what is now in
+    // front — the chain's ordinary innermost-first rule, resumed.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the overlay collapses once it is the surface in front"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_open_for_test()),
+        "…one rung at a time, so the bar it hangs off is still up"
+    );
+}
+
+/// **The other half of what a covering surface owes: the tab order.**
+///
+/// The find bar and the Find-all overlay lift [`focus::Covered`] for their own
+/// subtrees — they are what the *overlay* is not covering — which was written
+/// as an unconditional lift and so left their verbs, the map's dots and the
+/// results list reachable by Tab underneath the inspector's scrim. Measured as
+/// the property rather than as a number: with the panel covering the pane, a
+/// standing find surface contributes **nothing** to the window's tab order, so
+/// the walk is the same length with it up as without.
+#[gpui::test]
+fn space_a_covering_inspector_takes_the_find_surface_out_of_the_tab_order(cx: &mut TestAppContext) {
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "a kestrel over the grass")],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Narrow enough that the panel must overlay rather than split.
+    vcx.simulate_resize(gpui::size(px(560.), px(700.)));
+    vcx.run_until_parked();
+
+    /// Tab until the walk repeats itself; the count is what the window offers.
+    fn stops(vcx: &mut VisualTestContext) -> usize {
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..200 {
+            vcx.update(|window, cx| window.focus_next(cx));
+            vcx.update(|window, _| window.refresh());
+            vcx.run_until_parked();
+            let Some(id) = vcx.update(|window, cx| window.focused(cx).map(|h| format!("{h:?}")))
+            else {
+                break;
+            };
+            if seen.contains(&id) {
+                break;
+            }
+            seen.push(id);
+        }
+        seen.len()
+    }
+
+    // The panel alone.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    let panel_only = stops(&mut vcx);
+    assert!(
+        panel_only > 0,
+        "precondition: the panel really does contribute stops of its own"
+    );
+
+    // Now a whole find surface behind it. ⌘F is withheld while it covers, so
+    // the reader's order is the reachable one: search, then open the panel.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(false, window, cx));
+    });
+    vcx.run_until_parked();
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    let uncovered = stops(&mut vcx);
+    assert!(
+        uncovered > panel_only,
+        "precondition: the find surface really does hold stops \
+         ({uncovered} with it in the clear, {panel_only} for the panel alone)"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_inspector_open_for_test(true, window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "precondition: the covered find surface is still painted"
+    );
+    assert_eq!(
+        stops(&mut vcx),
+        panel_only,
+        "a covered find surface contributes nothing to the tab order"
+    );
+}
+
+#[gpui::test]
+fn space_opening_the_find_overlay_dismisses_what_it_would_cover(cx: &mut TestAppContext) {
+    // The mirror of withholding the quote verbs. Every popover the conversation
+    // can hold paints inside the pane, so the overlay stands in front of it:
+    // unreachable by mouse or Tab, still owning the keyboard, and — worse —
+    // ahead of the overlay in the root's Escape chain, so the first press would
+    // close something the reader never saw.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = vec![
+            stub_space("s", Some("Here"), None, 2),
+            stub_space("other", Some("Tides"), None, 1),
+        ];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    view.update(&mut vcx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+    run_find(&view, window, &mut vcx, "quick");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.quote_destination_for_test()),
+        Some(None),
+        "precondition: a picker stands over the conversation"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.quote_destination_for_test()),
+        None,
+        "the surface about to cover it dismissed it"
+    );
+
+    // …so the first Escape is the overlay's own rung, not a picker's.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "one press backs out the surface the reader is looking at"
+    );
+}
+
+#[gpui::test]
+fn space_an_open_find_overlay_withholds_the_quote_verbs(cx: &mut TestAppContext) {
+    // Menu dispatch is not traversal, so the overlay's tab-order suppression
+    // never reached the Edit menu: with a quotable selection standing, "Quote in
+    // Another Conversation…" mounted the destination picker *behind* the
+    // overlay (it paints earlier) and focused it, so the reader was typing into
+    // an invisible surface and the first Escape closed a picker they never saw.
+    // Its two siblings land a populated draft in the covered composer, which is
+    // the same shape. Registration is the enablement, so withholding it is what
+    // greys the items.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.spaces = vec![
+            stub_space("s", Some("Here"), None, 2),
+            stub_space("other", Some("Tides"), None, 1),
+        ];
+    });
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_post_with_block("a1", "b1", "the quick brown fox")],
+    );
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    view.update(&mut vcx, |v, cx| v.select_in_post_for_test("a1", 4..15, cx));
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.has_post_selection_for_test()),
+        "precondition: a quotable passage is selected"
+    );
+
+    run_find(&view, window, &mut vcx, "quick");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "precondition: the overlay stands over the conversation"
+    );
+
+    // Registration *is* enablement, so the first assertion is the one macOS
+    // reads to grey a menu item: none of the three is available along the
+    // dispatch path while the overlay stands.
+    let root = view.read_with(&vcx, |v, _| v.focus_handle());
+    let verbs = || {
+        [
+            Box::new(eidola_gui::actions::QuoteElsewhere) as Box<dyn gpui::Action>,
+            Box::new(eidola_gui::actions::Quote),
+            Box::new(eidola_gui::actions::QuoteInReply),
+        ]
+    };
+    for action in verbs() {
+        assert!(
+            !vcx.update(|window, cx| window.is_action_available(action.as_ref(), cx)),
+            "the menu greys {:?} while the overlay covers what it would open",
+            action.name()
+        );
+    }
+
+    // And the other door: the context menu's rows call these handlers
+    // **directly**, bypassing registration, so each is asked the same question
+    // where it acts.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.quote_elsewhere(&eidola_gui::actions::QuoteElsewhere, window, cx);
+            v.quote(&eidola_gui::actions::Quote, window, cx);
+            v.quote_in_reply(&eidola_gui::actions::QuoteInReply, window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.quote_destination_for_test()),
+        None,
+        "no destination picker is mounted behind the overlay"
+    );
+    assert!(
+        !view.read_with(&vcx, |v, _| v.has_active_draft_for_test()),
+        "and neither of the in-place quotes opens a covered composer"
+    );
+
+    // One Escape's worth of collapsing hands the verbs back — the reason this
+    // is a withholding rather than the overlay closing itself.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.close_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    for action in verbs() {
+        assert!(
+            vcx.update(|window, cx| window.is_action_available(action.as_ref(), cx)),
+            "…and the collapsed overlay gives {:?} back",
+            action.name()
+        );
+    }
+    vcx.update(|window, cx| root.dispatch_action(&eidola_gui::actions::QuoteElsewhere, window, cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.quote_destination_for_test()),
+        Some(None),
+        "with the overlay gone the same dispatch opens the picker on its list"
+    );
+}
+
+#[gpui::test]
+fn space_find_escape_collapses_the_overlay_before_the_bar(cx: &mut TestAppContext) {
+    // Innermost first: one Escape backs out one rung, so a reader reading the
+    // results does not lose the whole search to a press meant for the surface
+    // in front of them.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(gpui::size(px(900.), px(700.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the first Escape collapses the overlay"
+    );
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_open_for_test()),
+        "…and leaves the bar, with the query the reader typed"
+    );
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_open_for_test()),
+        "the second ends the search"
+    );
+}
+
+#[gpui::test]
+fn space_find_a_map_press_takes_the_cursor_to_the_group_it_reveals(cx: &mut TestAppContext) {
+    // The map scrolls the list; the cursor is where the keyboard and assistive
+    // technology think the reader is. Moving one without the other left the
+    // list's active descendant on a fragment now outside the viewport band — a
+    // sized placeholder with nothing to announce — and the reader's next arrow
+    // scrolled the viewport back toward it, undoing the press.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Short enough that the groups really do overflow the list.
+    vcx.simulate_resize(gpui::size(px(900.), px(400.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_result_cursor_for_test()),
+        Some(0),
+        "precondition: the cursor starts on the first result"
+    );
+
+    // The last map node that holds matches — far enough down that its group is
+    // below the fold.
+    let map = vcx.update(|window, cx| view.read_with(cx, |v, cx| v.find_map_for_test(window, cx)));
+    let groups =
+        vcx.update(|window, cx| view.read_with(cx, |v, cx| v.find_results_for_test(window, cx)));
+    let last_group = groups.last().expect("results").0.clone();
+    let index = map
+        .iter()
+        .position(|(node, _, _)| *node == last_group)
+        .expect("the group's node is on the map");
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.press_find_map_node_for_test(index, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let scrolled = view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test());
+    assert!(
+        scrolled > 0.0,
+        "the press took the list to that group ({scrolled})"
+    );
+    let cursor = view
+        .read_with(&vcx, |v, _| v.find_result_cursor_for_test())
+        .expect("a session is open");
+    let expected: usize = groups
+        .iter()
+        .take_while(|(node, _)| *node != last_group)
+        .map(|(_, fragments)| fragments.len())
+        .sum();
+    assert_eq!(
+        cursor, expected,
+        "…and the cursor with it, onto that group's first fragment"
+    );
+}
+
+#[gpui::test]
+fn space_find_a_card_keeps_a_selection_instead_of_opening(cx: &mut TestAppContext) {
+    // A card's editor is read-only *and selectable* — that is the read-only
+    // editor's own contract, and the I-beam over it says so. A drag inside one
+    // ends with the pointer released over the card, which the ancestor's click
+    // read as "open this result": the overlay collapsed and took the passage
+    // away before it could be copied.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let editor = vcx
+        .update(|window, cx| {
+            view.read_with(cx, |v, cx| v.find_result_editor_for_test(0, window, cx))
+        })
+        .expect("the first card has painted, so it has an editor");
+    // A selection, as a drag would leave one.
+    vcx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.perform(gpui_markdown_editor::EditorCommand::SelectAll, window, cx)
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        !vcx.update(|_, cx| editor.read(cx).selection().is_collapsed()),
+        "precondition: the card really holds a selection"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.press_find_result_for_test(0, window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "the press that ended a selection keeps the overlay — and the passage — \
+         where the reader can copy it"
+    );
+
+    // The positive control: a card nobody has selected in still navigates, so
+    // this is a claim about the selection rather than about the press.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.press_find_result_for_test(1, window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(&vcx, |v, _| v.find_overlay_open_for_test()),
+        "…and a press on a card with nothing selected opens the result"
+    );
+}
+
+#[gpui::test]
+fn space_find_shows_no_result_for_an_answer_being_regenerated(cx: &mut TestAppContext) {
+    // The overlay reads the projection cache, and a cache entry is keyed on the
+    // seed it was built from — not on the count's own key. So a post that
+    // matched and *then* began regenerating kept its memo: the whole-space
+    // total dropped it (the revising set is in `CountKey` precisely because
+    // that exclusion moves with no rebuild behind it), the conversation showed
+    // the pending revision in its place, and the overlay went on offering the
+    // superseded answer as a result to click.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let mut second = fixture_assistant_post("a2", "the kestrel hovers to hunt");
+    second.parent_action_id = Some("a1".into());
+    seed_quotable_space(
+        &view,
+        window,
+        cx,
+        vec![fixture_user_post("a1", "tell me about the kestrel"), second],
+    );
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let before =
+        vcx.update(|window, cx| view.read_with(cx, |v, cx| v.find_results_for_test(window, cx)));
+    assert_eq!(
+        before.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        vec!["a1", "a2"],
+        "both posts carry the word to begin with"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.regenerate(&"a2".into(), window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let after = vcx.update(|window, cx| {
+        view.read_with(cx, |v, cx| {
+            assert!(
+                v.space().read(cx).revising_seq("a2").is_some(),
+                "the regeneration is pending on the post it replaces"
+            );
+            v.find_results_for_test(window, cx)
+        })
+    });
+    assert_eq!(
+        after.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        vec!["a1"],
+        "the answer being replaced is off screen, so the overlay does not offer it"
+    );
+}
+
+#[gpui::test]
+fn space_find_a_card_measures_against_the_text_it_is_showing(cx: &mut TestAppContext) {
+    // A measured height stands in for a card that has scrolled out of the
+    // viewport band, so it has to belong to the text it was measured against. A
+    // post mints a new action id whenever its text changes, but a **draft**
+    // does not: its node id, and the block start under it, both stand still
+    // while the reader types — and a key built from those alone handed the new
+    // card the old card's height, moving every group top below it (and with
+    // them the map's scroll targets and the list's own extent) until the reader
+    // happened to bring the card back into the band.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, findable_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    let draft = view
+        .read_with(&vcx, |v, _| v.tail_draft_state_for_test())
+        .expect("a docked tail draft");
+    draft.update(&mut vcx, |e, cx| {
+        e.set_value("a kestrel of my own".to_string(), cx)
+    });
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let first = vcx
+        .update(|window, cx| view.read_with(cx, |v, cx| v.find_result_cards_for_test(window, cx)));
+    type Card = (String, std::ops::Range<usize>, Vec<std::ops::Range<usize>>);
+    let draft_card = |cards: &[Card]| {
+        cards
+            .iter()
+            .find(|(id, _, _)| id.starts_with("draft"))
+            .map(|(id, range, _)| (id.clone(), range.clone()))
+            .expect("the draft is a result of its own")
+    };
+    let (before_id, before_range) = draft_card(&first);
+
+    // Type ahead of the match. The block starts where it always did and the
+    // draft is the same node, so the id has nothing but the text to move on.
+    draft.update(&mut vcx, |e, cx| {
+        e.set_value(
+            "a longer preamble and then a kestrel of my own".to_string(),
+            cx,
+        )
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let (after_id, after_range) =
+        draft_card(&vcx.update(|window, cx| {
+            view.read_with(cx, |v, cx| v.find_result_cards_for_test(window, cx))
+        }));
+    assert_eq!(
+        (before_range.start, after_range.start),
+        (0, 0),
+        "precondition: the block the card paints starts where it did, and the \
+         key is built from that start — so neither it nor the node id can tell \
+         the two apart"
+    );
+    assert_ne!(
+        before_range.end, after_range.end,
+        "precondition: the text really did move"
+    );
+    assert_ne!(
+        before_id, after_id,
+        "the card's measurement key moved with the text it is showing"
+    );
+}
+
+#[gpui::test]
+fn space_find_a_card_carries_only_the_matches_it_can_paint(cx: &mut TestAppContext) {
+    // A node with several separated matching blocks becomes several cards, and
+    // giving each of them the node's whole hit list materialized that vector
+    // once per card before any of them was virtualized — then every visible
+    // card rebuilt its highlight set from the oversized copy. The painted
+    // result is the same set either way (a card lays out no line the other
+    // hits could land on), so what the partition costs is nothing and what it
+    // buys is a bound.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    let long = "a kestrel hovers\n\nnothing here\n\nand a kestrel again\n\nnothing here either\n\none last kestrel";
+    seed_quotable_space(&view, window, cx, vec![fixture_user_post("a1", long)]);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    let cards = vcx
+        .update(|window, cx| view.read_with(cx, |v, cx| v.find_result_cards_for_test(window, cx)));
+    assert_eq!(cards.len(), 3, "three separated blocks, three cards");
+    let mut seen = 0usize;
+    for (id, range, hits) in &cards {
+        assert_eq!(hits.len(), 1, "{id} paints the one match inside it");
+        for hit in hits {
+            assert!(
+                range.start <= hit.start && hit.end <= range.end,
+                "{id} owns only hits inside the span it paints ({hit:?} in {range:?})"
+            );
+        }
+        seen += hits.len();
+    }
+    assert_eq!(
+        seen, 3,
+        "and between them the cards still account for every match"
+    );
+}
+
+#[gpui::test]
+fn space_find_results_cursor_brings_its_card_into_view(cx: &mut TestAppContext) {
+    // A virtualized list is **one** tab stop with a roving cursor, and what
+    // makes that equivalent to a stop per card is the scroll: a fragment
+    // outside the viewport band is a sized placeholder with nothing to read and
+    // nothing a screen reader could report, so a cursor that landed on one
+    // would be a stop describing nothing.
+    let stores = stub_stores_with_config(cx);
+    let (window, view) = open_space(cx, &stores, Some("s".into()));
+    seed_quotable_space(&view, window, cx, cross_branch_posts());
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    // Short, so the later results really are below the fold.
+    vcx.simulate_resize(gpui::size(px(900.), px(400.)));
+    vcx.run_until_parked();
+
+    run_find(&view, window, &mut vcx, "kestrel");
+    settle_find_count(&mut vcx);
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+
+    // The list holds the keyboard from the moment the overlay opens — a
+    // surface that takes the window takes the keyboard.
+    let list = view
+        .read_with(&vcx, |v, _| v.find_results_focus_for_test())
+        .expect("the overlay is open");
+    assert!(
+        vcx.update(|window, _| list.is_focused(window)),
+        "opening focused the results list"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_result_cursor_for_test()),
+        Some(0),
+        "and the cursor starts at the first result"
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test()),
+        0.0,
+        "precondition: the list starts at the top"
+    );
+
+    // Walk to the end. The last card is well below the fold, so the list has
+    // to follow the cursor there.
+    vcx.simulate_keystrokes("end");
+    vcx.run_until_parked();
+    let cursor = view
+        .read_with(&vcx, |v, _| v.find_result_cursor_for_test())
+        .expect("a session is open");
+    assert!(
+        cursor > 0,
+        "End took the cursor to the last result ({cursor})"
+    );
+    let scrolled = view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test());
+    assert!(
+        scrolled > 0.0,
+        "the list scrolled to bring that card into view ({scrolled})"
+    );
+
+    // …and back, minimally: Home returns to the top rather than leaving the
+    // reader looking at a cursor they cannot see.
+    vcx.simulate_keystrokes("home");
+    vcx.run_until_parked();
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_result_cursor_for_test()),
+        Some(0)
+    );
+    assert_eq!(
+        view.read_with(&vcx, |v, _| v.find_overlay_scroll_for_test()),
+        0.0,
+        "the first card is at the top of the list, so that is where it goes"
+    );
+}
+
+/// REGRESSION: **the handback asks the disappearing subtree, not the pane.**
+///
+/// `contains_focused` on the *pane* is true for every control in it, including
+/// the one being activated — so a Save, a Cancel or a Done run from the
+/// keyboard found "the pane has it", moved nothing, and then removed the
+/// binding editor or the minted-key banner around the focused control. The
+/// window was left on a handle nobody paints: silent arrows, silent Escape, and
+/// Tab restarting from the window root.
+///
+/// The class is "a verb whose press removes the verb", and the pane has six
+/// members — Revoke and Generate and the two Retrys join the two named above,
+/// and so does each refusal band's dismiss — which is why the question is
+/// asked of a per-subtree handle rather than patched per verb.
+#[gpui::test]
+fn a_proxy_verb_that_unmounts_itself_hands_the_keyboard_back(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::{BINDING_SLOT, CREATE_SLOT, MINTED_SLOT, ProxySettingsView};
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(config_state(true));
+        s.proxy_settings = Some(eidola_app_core::proxy::ProxySettings {
+            enabled: false,
+            bind_address: "127.0.0.1".into(),
+            bind_port: 11437,
+            local_exposure: eidola_app_core::proxy::LocalExposure::Loaded,
+            backends: Vec::new(),
+            exposed_ids: Vec::new(),
+            live_key_count: 0,
+        });
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    draw_window(cx, window);
+
+    let root = view.read_with(cx, gpui::Focusable::focus_handle);
+    let slot = |cx: &mut TestAppContext, key: &str| {
+        view.read_with(cx, |v, _| v.slot_focus_for_test(key))
+            .unwrap_or_else(|| panic!("the {key} subtree painted"))
+    };
+
+    // --- the binding editor: Cancel and Save both take it away -------------
+    for commit in [false, true] {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.begin_binding_edit(window, cx));
+        })
+        .unwrap();
+        draw_window(cx, window);
+        let editor = slot(cx, BINDING_SLOT);
+        cx.update_window(window, |_, window, cx| window.focus(&editor, cx))
+            .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                if commit {
+                    v.commit_binding_edit(window, cx)
+                } else {
+                    v.cancel_binding_edit(window, cx)
+                }
+            });
+        })
+        .unwrap();
+        assert!(
+            cx.update_window(window, |_, window, _| root.is_focused(window))
+                .unwrap(),
+            "the editor was removed under the keyboard (commit: {commit})"
+        );
+    }
+
+    // --- the minted banner: Done takes it away ----------------------------
+    stores.proxy.update(cx, |s, _| {
+        s.set_minted_for_test(eidola_app_core::proxy::MintedProxyKey {
+            info: eidola_app_core::proxy::ProxyKeyInfo {
+                id: "k-new".into(),
+                label: "A new tool".into(),
+                prefix: "eid-Qq11Ww".into(),
+                created_at: 0,
+                last_used_at: None,
+                revoked_at: None,
+            },
+            key: "eid-Qq11Ww-the-whole-secret".into(),
+        });
+    });
+    draw_window(cx, window);
+    let banner = slot(cx, MINTED_SLOT);
+    cx.update_window(window, |_, window, cx| window.focus(&banner, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.dismiss_minted(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "Done took the banner away, so it owed the keyboard back"
+    );
+
+    // --- a refusal's band: its dismiss takes the band away -----------------
+    let band_name = "settings/proxy/exposure/error";
+    stores.proxy.update(cx, |s, cx| {
+        s.set_op_error_for_test(
+            eidola_gui::stores::proxy::ProxyOp::Exposure,
+            eidola_app_core::error::AppError::ProxyRefused {
+                refusal: eidola_app_core::proxy::ProxyRefusal::NoPort,
+            },
+            cx,
+        )
+    });
+    draw_window(cx, window);
+    let band = slot(cx, band_name);
+    cx.update_window(window, |_, window, cx| window.focus(&band, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.dismiss_refusal(
+                eidola_gui::stores::proxy::ProxyOp::Exposure,
+                band_name,
+                window,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| root.is_focused(window))
+            .unwrap(),
+        "dismissing took the band away, so it owed the keyboard back"
+    );
+
+    // --- and a reader working elsewhere in the pane keeps their caret ------
+    let elsewhere = slot(cx, CREATE_SLOT);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_binding_edit(window, cx));
+    })
+    .unwrap();
+    draw_window(cx, window);
+    cx.update_window(window, |_, window, cx| window.focus(&elsewhere, cx))
+        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.cancel_binding_edit(window, cx));
+    })
+    .unwrap();
+    assert!(
+        cx.update_window(window, |_, window, _| elsewhere.is_focused(window))
+            .unwrap(),
+        "the subtree that disappeared was not the one holding the keyboard"
+    );
+}
+
+/// The traffic lights and window border are drawn from the app's native
+/// appearance, so a palette that departs from the OS's light/dark has to
+/// force it — and `system` has to let go, or the OS appearance it reads
+/// would be its own override reflected back.
+#[gpui::test]
+fn the_window_chrome_follows_the_palette_not_the_system(cx: &mut TestAppContext) {
+    use eidola_app_core::config::{AppearanceSetting, LightCharacter, TimeOfDayTint};
+    use eidola_gui::theme::{self, ThemeSettings};
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::install(cx);
+    });
+    let set = |appearance, cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            theme::set_settings(
+                ThemeSettings {
+                    appearance,
+                    tint: TimeOfDayTint::Off,
+                    character: LightCharacter::Neutral,
+                    font_scale: 1.0,
+                },
+                cx,
+            );
+            theme::chrome_override_for_test(cx)
+        })
+    };
+
+    assert_eq!(cx.update(|cx| theme::chrome_override_for_test(cx)), None);
+    assert_eq!(
+        set(AppearanceSetting::Night, cx),
+        Some(gpui::WindowAppearance::Dark)
+    );
+    assert_eq!(
+        set(AppearanceSetting::Day, cx),
+        Some(gpui::WindowAppearance::Light)
+    );
+    assert_eq!(
+        set(AppearanceSetting::System, cx),
+        None,
+        "system follows the OS again"
+    );
 }

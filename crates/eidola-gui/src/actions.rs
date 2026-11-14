@@ -29,6 +29,15 @@ actions!(
         /// Bound to ⌘L on macOS. Singleton, like Settings: re-invoking
         /// raises the existing window.
         OpenLibrary,
+        /// Start or stop the **local inference proxy** — the
+        /// OpenAI-compatible surface other tools on this machine reach
+        /// Eidola-served models through. App-level, so it lives in the Eidola
+        /// menu beside Library and Record; its configuration is Settings ▸
+        /// Proxy. The label states both directions because a menu bar is
+        /// static (the inspector item's rule), and the toggle writes the same
+        /// stored `enabled` the pane's switch does — there is one intent, and
+        /// the listener is reconciled against it wherever it moved.
+        ToggleProxy,
         /// Show the Record window — the raw local trail of attestations,
         /// requests, and spending. Bound to ⇧⌘L on macOS (sibling of the
         /// Library's ⌘L). Singleton, like Settings and Library.
@@ -95,6 +104,11 @@ actions!(
         /// like `CloseWindow`, so macOS greys it when no space window is open;
         /// the space itself carries no visual toggle by design.
         ToggleInspector,
+        /// Open **Find in Conversation** — the ⌘F bar over the visible
+        /// branch. Edit menu; registered per-`SpaceView` like
+        /// `ToggleInspector`, so macOS greys it with no space window open.
+        /// With a bar already open it re-focuses the query field.
+        FindInSpace,
         /// Toggle **gpui's element inspector** — the development overlay, not
         /// the product's. Bound to ⌥⇧⌘I (it gave up ⌥⌘I to the space
         /// inspector above). Requires the `inspector` feature on `gpui`

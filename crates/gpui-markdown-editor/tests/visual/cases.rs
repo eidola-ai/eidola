@@ -4,7 +4,9 @@
 //! selection.
 
 use gpui::{AppContext, Entity, px, size};
-use gpui_markdown_editor::{EditorState, EmbedMap, MarkdownEditor, MarkdownEditorState, Selection};
+use gpui_markdown_editor::{
+    EditorState, EmbedMap, HighlightLayer, MarkdownEditor, MarkdownEditorState, Selection,
+};
 
 use super::harness::Snapshots;
 
@@ -120,6 +122,90 @@ pub fn register(s: &mut Snapshots) {
         editor_with_cursor(window, cx, "leading *italic* trailing", "talic")
     });
 
+    // CJK emphasis — 着重号 dots stand in for the italic no CJK face
+    // has. Cursor outside: delimiters gone, dots under each character.
+    s.add("cjk_emphasis_cursor_outside", win, |window, cx| {
+        editor_with_cursor(window, cx, "前面 *强调的文字* 后面", "后面")
+    });
+
+    // CJK emphasis — cursor inside. Entering reveals the delimiters and
+    // leaves the content's emphasis exactly as it was.
+    s.add("cjk_emphasis_cursor_inside", win, |window, cx| {
+        editor_with_cursor(window, cx, "前面 *强调的文字* 后面", "调的文")
+    });
+
+    // One emphasized span carrying both renderings: the Latin word
+    // shapes italic, the Han characters take dots, and the CJK comma
+    // between them takes none.
+    s.add("cjk_emphasis_mixed_run", win, |window, cx| {
+        editor_with_cursor(window, cx, "混排 *中文，with latin，测试* 收尾", "收尾")
+    });
+
+    // Bold and bold+emphasis on CJK: strong stays a bold face (the CJK
+    // fallback ships one), strong+emphasis is bold *and* dotted.
+    s.add("cjk_strong_and_strong_emphasis", win, |window, cx| {
+        editor_with_cursor(window, cx, "**粗体文字** 与 ***粗体强调*** 收尾", "收尾")
+    });
+
+    // A tall inline construct grows the row stride; the inline-code chip
+    // beside it must still fill only the text row (the editor draws the
+    // chip itself — gpui's background pass takes one number for both the
+    // fill height and the row step).
+    s.add("inline_code_chip_beside_tall_math", win, |window, cx| {
+        editor_with_cursor(
+            window,
+            cx,
+            "lead paragraph\n\nsee $\\frac{\\frac{a}{b}}{\\frac{c}{d}}$ and `code` here\n\ntail paragraph",
+            "tail",
+        )
+    });
+
+    // Inline math whose LaTeX will not typeset falls back to dimmed
+    // delimiters + mono content with the faint inline-code background.
+    // That fallback is added to the block the element *shapes*, so the
+    // chip pass has to read the shaped block, not the render output.
+    s.add("inline_math_fallback_chip", win, |window, cx| {
+        editor_with_cursor(
+            window,
+            cx,
+            "lead paragraph\n\nbroken $\\frac{1}$ math here\n\ntail paragraph",
+            "tail",
+        )
+    });
+
+    // An emphasized CJK run soft-wrapped at a narrow measure: the dot for
+    // the character that *opens* a wrap row belongs on that row, not at
+    // the previous row's right edge.
+    s.add(
+        "cjk_emphasis_wrapped",
+        size(px(200.), px(240.)),
+        |window, cx| {
+            editor_with_cursor(
+                window,
+                cx,
+                "*中文测试强调的文字还有更多内容需要换行* 收尾",
+                "收尾",
+            )
+        },
+    );
+
+    // An inline-code span crossing soft wraps at word boundaries: each
+    // row's chip ends at that row's last glyph, not at the wrap width
+    // (`WrappedLine::width()` reports the configured wrap width for any
+    // line that wrapped, which leaves blank trailing space unfilled).
+    s.add(
+        "inline_code_chip_wrapped",
+        size(px(240.), px(240.)),
+        |window, cx| {
+            editor_with_cursor(
+                window,
+                cx,
+                "lead in `alpha beta gamma delta epsilon zeta eta` and the tail after it",
+                "tail",
+            )
+        },
+    );
+
     // Strikethrough outside.
     s.add("strike_cursor_outside", win, |window, cx| {
         editor_with_cursor(window, cx, "keep ~~drop~~ keep", "keep")
@@ -231,6 +317,40 @@ pub fn register(s: &mut Snapshots) {
             EditorHarness::with_state(state, window, cx)
         })
     });
+
+    // Frontmatter — a code block at byte 0, so the cursor has no "just
+    // before" side; the rest of the required positions follow.
+    const FRONTMATTER: &str = "---\ntitle: Morning pages\ntags: [notes, journal]\n---\n\nBody prose sits under the metadata.\n\nA second paragraph.";
+    let closer_end = FRONTMATTER.find("---\n\n").unwrap() + 3;
+    let body = FRONTMATTER.find("Body").unwrap();
+    let second = FRONTMATTER.find("A second").unwrap();
+    for (name, selection) in [
+        ("frontmatter_cursor_inside", Selection::Cursor(10)),
+        (
+            "frontmatter_cursor_at_closer",
+            Selection::Cursor(closer_end),
+        ),
+        ("frontmatter_cursor_just_after", Selection::Cursor(body)),
+        (
+            "frontmatter_cursor_separate_line",
+            Selection::Cursor(second + 3),
+        ),
+        (
+            "frontmatter_selection_overlapping",
+            Selection::range(10, body + 4),
+        ),
+    ] {
+        s.add(name, win, move |window, cx| {
+            cx.new(|cx| {
+                let state = EditorState {
+                    markdown: FRONTMATTER.into(),
+                    selection,
+                    ..Default::default()
+                };
+                EditorHarness::with_state(state, window, cx)
+            })
+        });
+    }
 
     // Fenced code block — long line that overflows the visible width
     // and triggers the horizontal scrollbar.
@@ -726,6 +846,123 @@ pub fn register(s: &mut Snapshots) {
     );
 
     register_embed_audit(s);
+    register_highlight_wash(s);
+}
+
+/// The host-supplied highlight wash (`crate::highlight`) over read-only
+/// content — the surface the space view paints quoted-passage references on.
+/// The wash has no other coverage in this corpus, so these are the pixels
+/// that say whether a change to the highlight plugin moved anything.
+fn register_highlight_wash(s: &mut Snapshots) {
+    let win = size(px(720.), px(320.));
+
+    // A wash across inline styles, spanning delimiters the reader cannot see.
+    s.add("highlight_wash_paragraph", win, |window, cx| {
+        highlighted_readonly(
+            window,
+            cx,
+            "A paragraph with **bold** and *italic* words, plus a\n\
+             [link to somewhere](https://example.com) after them.\n\n\
+             A second paragraph that carries no wash at all.",
+            &["with **bold** and", "somewhere"],
+        )
+    });
+
+    // Two ranges that overlap: the wash merges rather than double-darkening.
+    s.add("highlight_wash_overlapping", win, |window, cx| {
+        highlighted_readonly(
+            window,
+            cx,
+            "One long sentence whose middle is covered by two overlapping ranges.",
+            &["sentence whose middle", "middle is covered by"],
+        )
+    });
+
+    // Inside a fenced code block — the wash follows the delimiter/content
+    // mask split rather than painting over the fence rows.
+    s.add("highlight_wash_code_block", win, |window, cx| {
+        highlighted_readonly(
+            window,
+            cx,
+            "Before the fence.\n\n\
+             ```rust\n\
+             fn main() {\n    println!(\"hello\");\n}\n\
+             ```\n\n\
+             After the fence.",
+            &["println!"],
+        )
+    });
+
+    // Two layers over the same words: the upper layer's wash paints on top of
+    // the base one instead of merging with it, and each takes its own color.
+    s.add("highlight_wash_layered", win, |window, cx| {
+        cx.new(|cx| {
+            let markdown = "One sentence whose middle carries a base wash, with a \
+                            shorter span inside it singled out on the layer above.";
+            let base = markdown.find("whose middle carries").expect("fixture");
+            let accent = markdown.find("middle").expect("fixture");
+            let state = EditorState {
+                markdown: markdown.into(),
+                selection: Selection::Cursor(0),
+                ..Default::default()
+            };
+            let state = cx.new(|cx| MarkdownEditorState::with_state(state, window, cx));
+            state.update(cx, |e, cx| {
+                e.set_highlights(vec![(base..base + "whose middle carries".len(), 0)], cx);
+                e.set_highlights_in(
+                    HighlightLayer::Accent,
+                    vec![(accent..accent + "middle".len(), 1)],
+                    cx,
+                );
+            });
+            ReadonlyHarness { state }
+        })
+    });
+
+    // Inside a table cell — cells are ordinary laid-out lines, so the wash
+    // reaches them with no table-specific machinery.
+    s.add("highlight_wash_table_cell", win, |window, cx| {
+        highlighted_readonly(
+            window,
+            cx,
+            "| Feature | Status |\n\
+             | :-- | --: |\n\
+             | **Bold** cell | `code` |\n\
+             | plain | ~~cut~~ |\n",
+            &["Status", "plain"],
+        )
+    });
+}
+
+/// A read-only editor over `markdown` with a highlight range per needle.
+/// Panics if a needle is missing — keeps the cases honest, like
+/// `editor_with_cursor`.
+fn highlighted_readonly(
+    window: &mut gpui::Window,
+    cx: &mut gpui::App,
+    markdown: &'static str,
+    needles: &'static [&'static str],
+) -> Entity<ReadonlyHarness> {
+    let entries: Vec<(std::ops::Range<usize>, u64)> = needles
+        .iter()
+        .enumerate()
+        .map(|(i, needle)| {
+            let start = markdown
+                .find(needle)
+                .unwrap_or_else(|| panic!("substring {needle:?} not found in test fixture"));
+            (start..start + needle.len(), i as u64)
+        })
+        .collect();
+    let state = EditorState {
+        markdown: markdown.into(),
+        selection: Selection::Cursor(0),
+        ..Default::default()
+    };
+    cx.new(|cx| {
+        let state = cx.new(|cx| MarkdownEditorState::with_state(state, window, cx));
+        state.update(cx, |e, cx| e.set_highlights(entries, cx));
+        ReadonlyHarness { state }
+    })
 }
 
 /// The embed-fidelity audit: every markdown construct the editor supports,
@@ -863,17 +1100,15 @@ const EMBED_AUDIT_CORPORA: &[(&str, &str, f32)] = &[
         260.,
     ),
     // Tall inline math on a *non-final* visual row of a soft-wrapped
-    // paragraph. KNOWN DEFECT — this case currently renders wrong, in the
-    // live editor and the embed alike: `compute_math_row_extra` is a
-    // per-*logical*-line overshoot, but the row layout multiplies it into
-    // the height (`(line_height + extra) * wrap_count`) while the shaped
-    // line is still painted with `row_height: line_height`, so gpui strides
-    // its visual rows by the bare `line_height` (`line.rs`'s
-    // `glyph_origin.y += line_height` at each wrap boundary). Two visible
-    // consequences: the construct overlaps the glyphs of the row beneath
-    // it, and `(wrap_count - 1) * extra` of reserved space piles up as dead
-    // air after the whole logical line. Kept as the reproduction for the
-    // fix; see the audit note for the measured numbers.
+    // paragraph — the pixel record of `LaidOutLine::row_stride`, in the
+    // live editor and the embed alike. The reservation
+    // `compute_math_row_extra` returns lands in the per-row stride, so
+    // every visual row of the line is that much further apart: the
+    // construct's ink stays off the glyphs of the row beneath it and no
+    // reserved space piles up after the logical line (the embedded twin's
+    // quote bar ends at the text). The uniform extra leading on the rows
+    // that carry no math is the cost of gpui striding a whole
+    // `WrappedLine` by one line height.
     (
         "wrapped_math",
         "A paragraph whose tall $\\frac{\\frac{\\frac{a}{b}}{\\frac{c}{d}}}{\\frac{e}{f}}$ \
@@ -887,6 +1122,19 @@ const EMBED_AUDIT_CORPORA: &[(&str, &str, f32)] = &[
         "list_with_code",
         "- item with a fence:\n\n  ```\n  let x = 1;\n  ```\n\n- plain item\n",
         260.,
+    ),
+    // 着重号 emphasis dots are painted in their own pass, so the embed —
+    // which shares only the *shaping* path — has to re-emit them. This
+    // pair is what keeps the two surfaces from drifting.
+    (
+        "cjk_emphasis",
+        "前面 *强调的文字* 后面\n\n\
+         混排 *中文，with latin，测试* 收尾\n\n\
+         **粗体文字** 与 ***粗体强调*** 收尾\n\n\
+         | 表头 | 说明 |\n\
+         | --- | --- |\n\
+         | *中文* | `code` |\n",
+        300.,
     ),
     (
         "quote_with_list",

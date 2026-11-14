@@ -1,0 +1,42 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# `environment:` in its mapping form. The job that computes the macOS
+# manifest partial is granted the signing environment through a nested
+# `name:` rather than a scalar, and its own name says nothing about
+# signing — so a parser that reads only the scalar line-form sees an
+# ordinary build job holding no key.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  oci:
+    name: Build OCI images
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Record OCI partial
+        run: ./scripts/artifact-manifest.sh print-oci
+
+  apple:
+    name: Apple builds
+    needs: oci
+    runs-on: self-hosted
+    environment:
+      name: apple-signing
+      url: https://example.invalid/deployment
+    steps:
+      - name: Build macOS artifacts
+        run: ./scripts/artifact-manifest.sh build-macos
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs:
+      - oci
+      - apple
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full

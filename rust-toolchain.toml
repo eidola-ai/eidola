@@ -1,7 +1,9 @@
 # See https://rust-lang.github.io/rustup/overrides.html for details on how this file works
 # and how you can override the choices made herein.
 #
-# We will attempt to track stable unless we find that this breaks something.
+# The channel is the Rust the pinned StageX release builds the release images
+# with (oci/pallet-rust), so the tree is linted and tested on that compiler.
+# It moves only together with the StageX release (scripts/check-rust-toolchain.sh).
 
 [toolchain]
 channel = "1.97.1"

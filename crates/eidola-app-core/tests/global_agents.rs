@@ -33,6 +33,7 @@ use eidola_app_core::AppCore;
 use eidola_app_core::changes::{Change, ChangeEvent};
 use eidola_app_core::discovery::{GLOBAL_AGENT_NOTE, LIST_MY_SPACES_TOOL_NAME};
 use eidola_app_core::memory::MEMORY_NOTE;
+use eidola_app_core::subspaces::DELEGATE_NOTE;
 
 /// The external backend's model. The turn-scoped tools ride a learned
 /// per-`(backend, wire_model)` capability that excludes no backend kind; these
@@ -383,7 +384,12 @@ fn a_promoted_agents_core_memory_loads_in_another_space() {
                 system_message_with(
                     None,
                     AGENT_LABEL,
-                    &[TRAILING_BLOCK_NOTE, MEMORY_NOTE, GLOBAL_AGENT_NOTE],
+                    &[
+                        TRAILING_BLOCK_NOTE,
+                        MEMORY_NOTE,
+                        GLOBAL_AGENT_NOTE,
+                        DELEGATE_NOTE,
+                    ],
                 ),
                 memory_section(&[("about you", "core", "You prefer terse answers.")]),
             ),
@@ -400,7 +406,12 @@ fn a_promoted_agents_core_memory_loads_in_another_space() {
                 system_message_with(
                     None,
                     AGENT_LABEL,
-                    &[TRAILING_BLOCK_NOTE, MEMORY_NOTE, GLOBAL_AGENT_NOTE],
+                    &[
+                        TRAILING_BLOCK_NOTE,
+                        MEMORY_NOTE,
+                        GLOBAL_AGENT_NOTE,
+                        DELEGATE_NOTE,
+                    ],
                 ),
                 memory_section(&[
                     ("about you", "core", "You prefer terse answers."),
@@ -548,7 +559,11 @@ fn list_my_spaces_reports_membership_and_nothing_else() {
         );
         assert_eq!(
             flat_messages(first)[0].1,
-            system_message_with(None, AGENT_LABEL, &[TRAILING_BLOCK_NOTE, GLOBAL_AGENT_NOTE])
+            system_message_with(
+                None,
+                AGENT_LABEL,
+                &[TRAILING_BLOCK_NOTE, GLOBAL_AGENT_NOTE, DELEGATE_NOTE],
+            )
         );
     });
 }

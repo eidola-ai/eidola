@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "models": {
+    "3333333333333333333333333333333333333333333333333333333333333333": [
+      {
+        "config": "deploy/engine/fixture-model/tdx-a/tinfoil-config.yml",
+        "config_sha256": "6e216963620855212a2bcb9f3dac1f7d5fccf550d7a0e846f7efd7a39b1390e0",
+        "cvm_version": "0.15.3-rc.1+gpu@sha256:1421cbb45dc428f6270d106d8eb68faab3ce7ca02ff2fbb2dc0968605004579f",
+        "pin": {
+          "platform": {
+            "tdx": {
+              "mrtd": "bf582997bf2145f275db3bc2542d703fdd889c85927b3ee199138298f863631711f41b37d8d347d5aee18036ff02c16c",
+              "mrconfigid": "6e216963620855212a2bcb9f3dac1f7d5fccf550d7a0e846f7efd7a39b1390e000000000000000000000000000000000",
+              "policy": {
+                "mr_seam": [
+                  "aef4ed3e686fe6cf44c9a8d1cc63105443b558ac4f40c282abf78271e9a4586c50408c8584c7b43fd21edb736700ba5f"
+                ],
+                "td_attributes": "0000001000000000",
+                "xfam": "e702060000000000",
+                "minimum_tee_tcb_svn": "03010200000000000000000000000000",
+                "minimum_tcb_evaluation_data_number": 19,
+                "qe_vendor_id": "939a7233f79c4ca9940a0db3957f0607",
+                "ppids": [
+                  "9e2d1e4f1e26f3347d5d7ddd3841f9f4"
+                ],
+                "dynamic_platform": "true",
+                "cached_keys": "true",
+                "smt_enabled": "false"
+              }
+            }
+          },
+          "expected_gpus": 8
+        },
+        "weights": {
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "repo": "example/fixture-model",
+          "revision": "4444444444444444444444444444444444444444"
+        },
+        "prompt_cache": {
+          "enabled": true,
+          "idle_ttl_secs": 900,
+          "max_age_secs": 7200
+        }
+      }
+    ]
+  }
+}

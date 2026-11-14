@@ -37,8 +37,8 @@
 //! 2. **A focused element with no a11y node reports no focus at all.**
 //!    `A11y::set_focus` is a no-op unless the node was pushed (which needs a
 //!    role), and `finalize` then falls back to `ROOT_NODE_ID` — so focusing the
-//!    inner widget, which carries no role at our pin, tells assistive
-//!    technology that focus is on the *window*.
+//!    inner widget, which is made presentational, tells assistive technology
+//!    that focus is on the *window*.
 //!
 //! Letting the widget keep the tab stop satisfies (1) and violates (2);
 //! wrapping without hoisting does the reverse. Hoisting satisfies both, and its
@@ -60,11 +60,11 @@
 //!
 //! Two exceptions:
 //!
-//! - **`Switch`** tracks no focus handle at all, so there is nothing inside to
-//!   take out of the tab order; the hoist is the whole fix. It cannot
-//!   double-fire on a pointer click, because `Switch` handles the press in
-//!   `on_mouse_down` and stops propagation, and gpui bubbles mouse listeners
-//!   innermost-first.
+//! - **`Switch`** is not hoisted at all: the widget tracks its own focus
+//!   handle, sets its own role, toggled state and label, and activates from
+//!   its own `on_click` (pointer, Enter and Space alike), so it is the control
+//!   and its wrapper is a bounds-only probe with no handler — the
+//!   focus-bearing regime `Input` follows.
 //! - **`Input` / `MarkdownEditor`** is the model's one remaining hole, which is
 //!   why **`Role::TextInput` is excluded from [`is_focusable`] outright**: a
 //!   tab stop on the wrapper would land focus on a div that cannot type, mere
@@ -222,6 +222,65 @@ pub fn is_tab_stop(role: Role) -> bool {
     )
 }
 
+thread_local! {
+    /// Whether the elements being built right now sit **behind** a surface that
+    /// covers them. See [`Covered`].
+    static COVERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a control built at this moment should be left out of the tab order —
+/// read by `probe`, which is where a role becomes a stop.
+pub fn tab_stops_suppressed() -> bool {
+    COVERED.with(|c| c.get())
+}
+
+/// **A surface that covers the window takes the tab order with it.**
+///
+/// gpui builds the frame's tab order from what *painted*, and painting on top
+/// takes nothing away: a full-window overlay leaves every control beneath it
+/// mounted and reachable, so Tab walks out of the visible surface into
+/// affordances the reader cannot see and Enter activates one. `Overlay`
+/// containment answers the mouse and `transient_overlay_open` answers the
+/// *root's* key handler, but neither touches traversal, and a covered control
+/// runs its own listeners once focus reaches it.
+///
+/// The cure is gpui's own bit rather than a second focus system: while one of
+/// these guards stands, `probe` derives **no tab stop** from a role, so a
+/// covered subtree contributes nothing to the frame's tab map — the same
+/// `tab_stop(false)` a disabled control takes, applied at the one place a role
+/// becomes a stop rather than at every site. Nothing else changes: the roles,
+/// the labels and `focusable()` all stay, so the covered content is still
+/// readable to assistive technology and still focusable programmatically.
+///
+/// **It is a render-time scope, so it covers what is *built* inside it.** A
+/// child produced later — a `uniform_list`'s item closure, which runs at
+/// prepaint — escapes, and so does a **tracked** focus handle, whose own
+/// `tab_stop` gpui reads instead of the element's. Both are true of the covered
+/// content today: its lists are `probe_delegating` rows (no stops of their own)
+/// and its tracked handles are containers rather than controls.
+///
+/// Restores the previous value on drop, so a surface that covers content inside
+/// another one nests, and a panic mid-render cannot leave the flag set.
+pub struct Covered {
+    previous: bool,
+}
+
+impl Covered {
+    /// Suppress tab stops while this guard lives, when `covered` is true.
+    /// Passing `false` **un**-covers: the surface doing the covering builds its
+    /// own controls inside one of these, which is what keeps them reachable.
+    pub fn new(covered: bool) -> Self {
+        let previous = COVERED.with(|c| c.replace(covered));
+        Self { previous }
+    }
+}
+
+impl Drop for Covered {
+    fn drop(&mut self) {
+        COVERED.with(|c| c.set(self.previous));
+    }
+}
+
 /// Whether a role names an element that can hold focus at all — every tab
 /// stop, plus the post article, which the space tree's arrow keys focus
 /// directly.
@@ -255,6 +314,10 @@ pub fn is_focusable(role: Role) -> bool {
 /// floating chrome, `AUX`. The numbers are sparse so a region can be inserted
 /// between two without touching the rest.
 pub mod region {
+    /// The conversation window's **find bar** — chrome the reader opened over
+    /// the page and is acting in, so Tab reaches it before the conversation
+    /// itself rather than after every post.
+    pub const FIND: isize = -30;
     /// A window's primary navigation — the Settings nav band, the Record
     /// section strip, the Backends tab strip.
     pub const NAV: isize = -20;
@@ -338,6 +401,12 @@ mod tests {
         // *ungrouped* affordance (path `[0]`) precedes every member of a group
         // at index >= 0. Content regions must therefore be negative, or the
         // space window's floating composer would tab before its conversation.
+        const {
+            assert!(
+                region::FIND < region::NAV,
+                "a bar the reader opened over the page leads everything"
+            )
+        };
         const { assert!(region::NAV < region::MAIN, "navigation leads") };
         const { assert!(region::MAIN < 0, "main precedes ungrouped chrome") };
         const { assert!(region::AUX > 0, "auxiliary navigation follows it") };

@@ -17,7 +17,8 @@ use gpui::{
     point, px, size,
 };
 use gpui_markdown_editor::{
-    EditorEvent, EditorState, MarkdownEditor, MarkdownEditorState, Selection, embed_marker,
+    EditorEvent, EditorState, HighlightLayer, MarkdownEditor, MarkdownEditorState, Selection,
+    embed_marker,
 };
 
 struct EditorHarness {
@@ -300,6 +301,22 @@ fn open_click_harness(
     Entity<MarkdownEditorState>,
     Rc<Cell<Option<Vec<u64>>>>,
 ) {
+    open_click_harness_in(cx, markdown, HighlightLayer::Base, highlights)
+}
+
+/// The same harness with the ranges on a chosen layer — only
+/// [`HighlightLayer::Base`] is supposed to route clicks.
+#[allow(clippy::type_complexity)]
+fn open_click_harness_in(
+    cx: &mut TestAppContext,
+    markdown: &str,
+    layer: HighlightLayer,
+    highlights: Vec<(std::ops::Range<usize>, u64)>,
+) -> (
+    VisualTestContext,
+    Entity<MarkdownEditorState>,
+    Rc<Cell<Option<Vec<u64>>>>,
+) {
     let clicked: Rc<Cell<Option<Vec<u64>>>> = Rc::new(Cell::new(None));
     let clicked_in = clicked.clone();
     let state = EditorState::with_markdown(markdown);
@@ -330,7 +347,7 @@ fn open_click_harness(
         (window.into(), inner.expect("editor built"))
     });
     cx.update(|cx| {
-        editor.update(cx, |e, cx| e.set_highlights(highlights, cx));
+        editor.update(cx, |e, cx| e.set_highlights_in(layer, highlights, cx));
     });
     let vcx = VisualTestContext::from_window(handle, cx);
     vcx.run_until_parked();
@@ -453,4 +470,67 @@ fn click_outside_every_highlight_reports_nothing(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     assert_eq!(clicked.take(), None);
+}
+
+// ---------------------------------------------------------------------------
+// Layers — independent channels of decoration, only the base one clickable
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn setting_one_layer_leaves_the_others_alone(cx: &mut TestAppContext) {
+    let (_, editor) = open_editor(cx, EditorState::with_markdown("alpha beta gamma"));
+    cx.update(|cx| {
+        editor.update(cx, |e, cx| {
+            e.set_highlights(vec![(0..5, 1)], cx);
+            e.set_highlights_in(HighlightLayer::Accent, vec![(6..10, 2)], cx);
+        });
+    });
+    editor.read_with(cx, |e, _| {
+        // `set_highlights` and `highlights` are the base layer.
+        assert_eq!(e.highlights().keys_at(2), vec![1]);
+        assert_eq!(e.highlights_in(HighlightLayer::Base).keys_at(2), vec![1]);
+        assert_eq!(e.highlights_in(HighlightLayer::Accent).keys_at(7), vec![2]);
+        assert!(e.highlights_in(HighlightLayer::Overlay).is_empty());
+    });
+
+    // Clearing one layer does not clear another.
+    cx.update(|cx| {
+        editor.update(cx, |e, cx| e.set_highlights(Vec::new(), cx));
+    });
+    editor.read_with(cx, |e, _| {
+        assert!(e.highlights().is_empty());
+        assert_eq!(e.highlights_in(HighlightLayer::Accent).keys_at(7), vec![2]);
+    });
+}
+
+#[gpui::test]
+fn a_click_on_a_non_base_layer_reports_nothing(cx: &mut TestAppContext) {
+    // The same click that navigates on the base layer must be inert on a layer
+    // the host paints for its own reasons: a decoration is not a target.
+    let (mut vcx, editor, clicked) = open_click_harness_in(
+        cx,
+        "The mitochondria is the powerhouse of the cell",
+        HighlightLayer::Overlay,
+        vec![(0..16, 7)],
+    );
+    let target = line_start_target(&vcx, &editor);
+
+    vcx.simulate_event(MouseDownEvent {
+        button: MouseButton::Left,
+        position: target,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(MouseUpEvent {
+        button: MouseButton::Left,
+        position: target,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+
+    assert_eq!(clicked.take(), None, "an upper layer never routes a click");
+    // And the click still placed the caret, as an ordinary click does.
+    editor.read_with(&vcx, |e, _| assert!(e.selection().is_collapsed()));
 }

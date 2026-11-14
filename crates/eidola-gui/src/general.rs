@@ -20,7 +20,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder,
 };
 use gpui_component::{
-    ActiveTheme, Sizable, StyledExt, h_flex, label::Label, switch::Switch, v_flex,
+    ActiveTheme, Disableable, Sizable, StyledExt, h_flex, label::Label, switch::Switch, v_flex,
 };
 
 use crate::login_item::{self, LoginItemState};
@@ -372,54 +372,53 @@ impl Render for GeneralView {
 }
 
 impl GeneralView {
-    /// The "Open at login" switch. Same hoisted shape as the backends pane's
-    /// auto-start toggle: the probed wrapper is the accessible control (role,
-    /// label, toggled state, keyboard activation) because `Switch` tracks no
-    /// focus handle at our gpui-component rev, and `Switch` handles the
-    /// pointer press itself with `stop_propagation`, so the two never
-    /// double-fire.
+    /// The "Open at login" switch. `Switch` is a focus-bearing control: the
+    /// widget is the accessible node (role, toggled state, its own focus
+    /// handle and activation), named here because the "Open at login" field
+    /// label is a node-less `div`. The wrapper is a bounds-only probe. An
+    /// unsettable state disables the widget, which also takes it out of the
+    /// tab order.
     fn login_item_toggle(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+        const LABEL: &str = "Start Eidola when you log in";
         let state = self.login_item;
-        let next = !state.is_on();
         let settable = state.is_settable();
+        let switch = Switch::new("login-item-switch")
+            .accessibility_label("Open Eidola at login")
+            .small()
+            .checked(state.is_on())
+            .disabled(!settable);
         div()
             .id("login-item")
-            .probe(
+            .probe_bounds(
                 "settings/general/login-item",
-                gpui::Role::CheckBox,
+                gpui::Role::Switch,
                 "Open Eidola at login",
             )
-            // `aria_toggled`, not `aria_selected`: `accesskit_macos` reads a
-            // checkbox's value from `toggled()` and consults `is_selected`
-            // only for `Role::Tab`.
-            .aria_toggled(state.is_on().into())
-            // One predicate for activation *and* tab-stopness — a wrapper
-            // that keeps its click while dropping only the Tab entry is a
-            // control that lies to the pointer.
-            .map(|el| {
-                if settable {
-                    el.on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_open_at_login(next, cx);
+            .child(if settable {
+                switch
+                    .label(LABEL)
+                    .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                        this.set_open_at_login(*checked, cx);
                     }))
-                } else {
-                    el.tab_stop(false).opacity(0.5)
-                }
+                    .into_any_element()
+            } else {
+                // A disabled widget fades its track but not its label, so the
+                // label is laid out beside it (the widget's own label row:
+                // 8px gap, small text on the small track's 16px line) and
+                // faded here.
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .child(switch)
+                    .child(
+                        div()
+                            .line_height(gpui::px(16.))
+                            .text_sm()
+                            .text_color(cx.theme().foreground.opacity(0.5))
+                            .child(LABEL),
+                    )
+                    .into_any_element()
             })
-            .child(
-                // Switch sets no AccessKit role/label at our gpui-component
-                // rev, so the probed wrapper is the only node; if Switch
-                // gains self-annotation upstream, this site must join the
-                // `.role(None)` opt-out.
-                Switch::new("login-item-switch")
-                    .small()
-                    .checked(state.is_on())
-                    .label("Start Eidola when you log in")
-                    .when(settable, |s| {
-                        s.on_click(cx.listener(move |this, checked: &bool, _, cx| {
-                            this.set_open_at_login(*checked, cx);
-                        }))
-                    }),
-            )
     }
 }
 

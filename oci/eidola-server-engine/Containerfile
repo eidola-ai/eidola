@@ -1,0 +1,291 @@
+# syntax=docker/dockerfile:1@sha256:a7f5ec8c4a35a7f8cd9e6e413f59fd1bfd33f8b623c26981c684f5065dfe3044
+
+# The inference node (eidola-server-engine) with the CUDA executor, compiled
+# entirely from StageX's source-bootstrapped toolchain.
+#
+# The node is a dynamic glibc binary: it loads the NVIDIA driver
+# (`libcuda.so.1`, `libnvidia-ml.so.1`) with `dlopen` at run time, which a
+# static musl binary cannot do and a musl process cannot host. StageX's Rust
+# is musl-hosted and ships a standard library only for
+# `x86_64-unknown-linux-musl`, so this file cross-compiles: the same rustc
+# emits `x86_64-unknown-linux-gnu`, against a standard library built here from
+# that rustc's own `rust-src`, linked by StageX's x86_64-linux-gnu cross GCC
+# against StageX's glibc. Nothing of CUDA is linked; the driver comes from the
+# platform. The GPU kernel images are the one input not compiled here (they
+# need NVIDIA's closed toolkit): they come in as an image pinned by digest and
+# are checked against the committed manifest before they are shipped.
+
+# ── pinned inputs (StageX sx2026.09.0) ─────────────────────────────────────────
+FROM stagex/pallet-rust:sx2026.09.0@sha256:6033fb215dd7c87c885dd7b1c12de42464606dcc0323fc57339318d61f010a30 AS pallet-rust
+FROM stagex/core-cross-x86_64-gnu-gcc:sx2026.09.0@sha256:bb68a7fa3fda4391348173dc42682be9190d4e2299aae7f058ba9b429a4345c1 AS cross-gcc
+FROM stagex/user-glibc:sx2026.09.0@sha256:8118c98a77cdf237453b32babe141ebe5fe3108fd06e48e8ac162514ff3705f4 AS glibc
+FROM stagex/core-perl:sx2026.09.0@sha256:4068b2e68f617c3cc596954ce2635218582436dc2bc7e04f241343a20a391a65 AS perl
+FROM stagex/core-make:sx2026.09.0@sha256:90dacd49b2b7617676afcd50698dc95295ab8dcdbd29102c18441decad0ccbc7 AS make
+FROM stagex/user-jq:sx2026.09.0@sha256:e99ba7b4780fe0a17320a7813d19eb30d34d63ba7b6fb3db2ca3582c47b94ed5 AS jq
+
+# The GPU kernel images (`oci/eidola-engine-kernels/Containerfile`): `cubin/`,
+# `fatbin/` and the kernel build's `manifest.json`. This line is the one place
+# their image's digest is written. The bake targets supply the same input as
+# the `engine-kernels` target built from this tree (a named `kernels` context),
+# and scripts/artifact-manifest.sh fails unless that build's digest is this
+# one. Whichever way it arrives, the assemble stage ships only files that
+# match the committed `kernels.manifest.json`.
+FROM ghcr.io/eidola-ai/eidola-engine-kernels@sha256:fcb69a403d8104640a64265b3e408ad720bcca4591b851c0ffe0964a1cd42ec2 AS kernels
+
+# ── toolchain ──────────────────────────────────────────────────────────────────
+# rustc and cargo (musl-hosted), the x86_64-linux-gnu cross GCC and binutils
+# under /opt/cross, and glibc as the link sysroot under /sysroot. The cross
+# GCC carries its own glibc in /opt/cross/x86_64-linux-gnu, configured under
+# that prefix; nothing links against it: `--sysroot` and `-B` point every
+# link at /sysroot, which is also the glibc the image ships.
+FROM pallet-rust AS toolchain
+
+# oci/pallet-rust records the Rust this image ships, which
+# rust-toolchain.toml must name (scripts/check-rust-toolchain.sh); the record
+# is held to the image here.
+COPY oci/pallet-rust /pallet-rust
+RUN --network=none <<-'EOF'
+	set -eu
+	recorded="$(sed -n 's/^rust //p' /pallet-rust)"
+	actual="$(rustc --version | cut -d' ' -f2)"
+	if [ "$recorded" != "$actual" ]; then
+		echo "error: oci/pallet-rust records Rust $recorded, but the pinned pallet-rust is $actual" >&2
+		exit 1
+	fi
+	rm /pallet-rust
+EOF
+
+COPY --from=cross-gcc /opt/cross /opt/cross
+COPY --from=glibc / /sysroot/
+
+ENV PATH=/opt/cross/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV TARGET=x86_64-unknown-linux-gnu
+ENV SOURCE_DATE_EPOCH=0
+ENV CARGO_INCREMENTAL=0
+ENV ZERO_AR_DATE=1
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=generic -C debuginfo=0 -C link-arg=--sysroot=/sysroot -C link-arg=-B/sysroot/usr/lib/x86_64-linux-gnu/ -C link-arg=-L/sysroot/usr/lib/x86_64-linux-gnu"
+ENV GNU_CFLAGS="--sysroot=/sysroot -isystem /sysroot/usr/include/x86_64-linux-gnu"
+
+# ── std ────────────────────────────────────────────────────────────────────────
+# The standard library for x86_64-unknown-linux-gnu, from the rust-src this
+# rustc ships, installed into rustc's sysroot beside the musl one, so the node
+# builds on stable with a plain `--target`.
+#
+# The unwinder is LLVM's libunwind from the same rust-src, linked statically
+# (std's `llvm-libunwind` feature), compiled as Rust's bootstrap compiles it.
+# Not libgcc_s: StageX's cross GCC was configured with no target headers
+# where GCC looks for them, so its libgcc is built without libc (inhibit_libc)
+# and its unwinder can neither find the frames of a running program (no
+# `dl_iterate_phdr` or `_dl_find_object`) nor call `abort`: an exception or a
+# Rust panic traps instead of unwinding. With libunwind in the binary the
+# node needs no libgcc_s at all, and the image ships none.
+FROM toolchain AS std
+
+RUN --network=none <<-'EOF'
+	set -eux
+	src=/usr/lib/rustlib/src/rust/src/llvm-project/libunwind
+	out=/build/libunwind
+	mkdir -p $out
+	flags="$GNU_CFLAGS -I$src/include -O2 -fPIC -fstrict-aliasing -funwind-tables -fvisibility=hidden -D_LIBUNWIND_DISABLE_VISIBILITY_ANNOTATIONS -D_LIBUNWIND_IS_NATIVE_ONLY -DNDEBUG -ffile-prefix-map=$src=libunwind"
+	for f in Unwind-sjlj.c UnwindLevel1-gcc-ext.c UnwindLevel1.c; do
+		x86_64-linux-gnu-gcc $flags -std=c99 -c $src/src/$f -o $out/$f.o
+	done
+	for f in UnwindRegistersRestore.S UnwindRegistersSave.S; do
+		x86_64-linux-gnu-gcc $flags -c $src/src/$f -o $out/$f.o
+	done
+	for f in Unwind-EHABI.cpp Unwind-seh.cpp libunwind.cpp; do
+		x86_64-linux-gnu-g++ $flags -std=c++17 -nostdinc++ -fno-exceptions -fno-rtti -c $src/src/$f -o $out/$f.o
+	done
+	x86_64-linux-gnu-ar rcsD /build/libunwind.a $(ls $out/*.o | sort)
+EOF
+
+# std's own dependencies, as its committed Cargo.lock pins them. `test`, the
+# libtest harness, is built too, so the same sysroot runs the test suites.
+WORKDIR /build/std
+RUN <<-'EOF'
+	set -eux
+	mkdir src
+	printf '%s\n' '[package]' 'name = "std-gnu"' 'version = "0.0.0"' 'edition = "2024"' \
+		'[profile.release]' 'opt-level = 3' 'codegen-units = 1' 'debug = false' 'strip = false' > Cargo.toml
+	echo 'fn main() {}' > src/main.rs
+	RUSTC_BOOTSTRAP=1 cargo fetch -Zbuild-std=std,panic_unwind,test --target $TARGET
+EOF
+
+# The one step that uses unstable cargo (`-Zbuild-std`); nothing after it does.
+# Every rlib carries bitcode as well as object code (`embed-bitcode`), as a
+# distributed standard library does, so the node's fat LTO reaches into std.
+RUN --network=none <<-'EOF'
+	set -eux
+	RUSTC_BOOTSTRAP=1 \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="$CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS -C embed-bitcode=yes -C force-unwind-tables=yes -L native=/build" \
+		cargo build --frozen --release --target $TARGET \
+		-Zbuild-std=std,panic_unwind,test -Zbuild-std-features=backtrace,panic-unwind,llvm-libunwind
+	lib=/usr/lib/rustlib/$TARGET/lib
+	mkdir -p $lib
+	cp target/$TARGET/release/deps/*.rlib $lib/
+	rm $lib/libstd_gnu-*.rlib 2>/dev/null || true
+	install -m 0644 /build/libunwind.a $lib/libunwind.a
+	ls $lib
+EOF
+
+# ── openssl ────────────────────────────────────────────────────────────────────
+# OpenSSL 3's libcrypto against glibc. It is in the image only as a file for
+# NVIDIA's library: in confidential-computing mode libcuda loads
+# `libnvidia-pkcs11-openssl3.so.<driver>`, which needs `libcrypto.so.3`, and
+# the container must supply it. The node itself never links or loads it.
+# StageX's own OpenSSL is musl-linked, so this builds the same release from the
+# same source (version, hash and configuration from StageX's core/openssl)
+# with the gnu cross compiler.
+FROM toolchain AS openssl
+
+COPY --from=perl / /
+COPY --from=make / /
+
+ADD --checksum=sha256:9bffaa1ad1e07b354c21bd3324ec02fa15579f45a7d0494b3e74bc449b7333ef \
+    https://www.openssl.org/source/openssl-3.6.4.tar.gz /build/
+
+WORKDIR /build
+RUN --network=none <<-'EOF'
+	set -eux
+	# The pallet's login profile sets a native musl clang/mold toolchain.
+	unset LDFLAGS LD CPP AS NM
+	export MAKEFLAGS=
+	tar -xzf openssl-3.6.4.tar.gz
+	cd openssl-3.6.4
+	CC="x86_64-linux-gnu-gcc $GNU_CFLAGS" AR=x86_64-linux-gnu-ar RANLIB=x86_64-linux-gnu-ranlib \
+	perl ./Configure \
+		--prefix=/usr \
+		--libdir=lib \
+		--openssldir=/etc/ssl \
+		threads \
+		shared \
+		no-zlib \
+		no-async \
+		no-comp \
+		no-idea \
+		no-mdc2 \
+		no-rc5 \
+		no-ec2m \
+		no-ssl3 \
+		no-seed \
+		no-weak-ssl-ciphers \
+		no-tests \
+		no-apps \
+		no-docs \
+		linux-x86_64
+	make -j4 build_libs
+	install -D -m 0555 libcrypto.so.3 /out/libcrypto.so.3
+EOF
+
+# ── fetch ──────────────────────────────────────────────────────────────────────
+# Manifests and stub sources, so the dependency graph is fetched and compiled
+# in a layer that only dependency changes invalidate.
+FROM std AS fetch
+
+# Four compiler processes at most, so the build fits a 16 GiB builder. The
+# release profile is one codegen unit with fat LTO, so this does not reach
+# the output.
+ENV CARGO_BUILD_JOBS=4
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY --parents crates/*/Cargo.toml ./
+
+RUN find . -name Cargo.toml -not -path ./Cargo.toml | while read -r manifest; do \
+      dir="$(dirname "$manifest")/src"; mkdir -p "$dir"; \
+      touch "$dir/lib.rs"; \
+      if grep -q '^\[\[bin\]\]' "$manifest"; then echo 'fn main(){}' > "$dir/main.rs"; fi; \
+    done
+
+RUN cargo fetch --locked --target ${TARGET}
+
+RUN --network=none \
+    cargo build --frozen --release --target ${TARGET} -p eidola-server-engine --features cuda
+
+# ── build ──────────────────────────────────────────────────────────────────────
+FROM fetch AS build
+
+COPY crates/ ./crates/
+RUN find crates/ -name '*.rs' -exec touch {} +
+
+RUN --network=none \
+    cargo build --frozen --release --target ${TARGET} -p eidola-server-engine --features cuda \
+    && install -D -m 0555 target/${TARGET}/release/eidola-server-engine /out/eidola-server-engine
+
+# ── assemble ───────────────────────────────────────────────────────────────────
+# The image's root, checked as it is built.
+FROM toolchain AS assemble
+
+COPY --from=jq / /
+COPY --from=build /out/eidola-server-engine /rootfs/eidola-server-engine
+COPY --from=openssl /out/libcrypto.so.3 /rootfs/lib64/libcrypto.so.3
+COPY --from=kernels /cubin /kernels/cubin
+COPY --from=kernels /fatbin /kernels/fatbin
+COPY --from=kernels /manifest.json /kernels/manifest.json
+COPY crates/eidola-engine-kernels/kernels.manifest.json /kernels.manifest.json
+
+RUN --network=none <<-'EOF'
+	set -eu
+	fail() { echo "error: $*" >&2; exit 1; }
+	readelf=x86_64-linux-gnu-readelf
+	root=/rootfs
+	bin=$root/eidola-server-engine
+
+	# The C runtime: glibc's loader at the path the x86-64 ABI gives it, and
+	# the libraries the node and the driver name, from the glibc the node was
+	# linked against. That loader's own search path is /etc/ld.so.cache, then
+	# /lib64, then /usr/lib/x86_64-linux-gnu, where the platform's runtime
+	# mounts the driver; no RPATH is needed.
+	# StageX builds glibc with debug information, which the image does not
+	# need; stripping it is a function of the input bytes.
+	for lib in ld-linux-x86-64.so.2 libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1; do
+		install -m 0555 /sysroot/usr/lib/$lib $root/lib64/$lib
+	done
+	for lib in $root/lib64/*; do
+		x86_64-linux-gnu-strip --strip-debug $lib
+	done
+
+	interp="$($readelf -l $bin | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')"
+	[ "$interp" = /lib64/ld-linux-x86-64.so.2 ] || fail "the node's loader is $interp"
+	for elf in $bin $root/lib64/*; do
+		if $readelf -d $elf | grep -qE '\((RPATH|RUNPATH)\)'; then
+			fail "$(basename $elf) carries a search path"
+		fi
+		for needed in $($readelf -d $elf | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
+			[ -e $root/lib64/$needed ] || fail "$(basename $elf) needs $needed, which the image does not ship"
+		done
+	done
+
+	# The kernel images: the kernel build that made them reproduced the
+	# committed manifest, and each is the manifest's, at its recorded size and
+	# SHA-256. The node checks each against the same manifest (compiled in)
+	# before it loads it.
+	[ "$(sha256sum < /kernels/manifest.json)" = "$(sha256sum < /kernels.manifest.json)" ] \
+		|| fail "the kernel image was not built to kernels.manifest.json"
+	dest=$root/opt/eidola/kernels
+	listed=0
+	jq -r '(.kernels[], .fatbins[]) | [.file, (.size | tostring), .sha256] | @tsv' /kernels.manifest.json > /kernels.tsv
+	while IFS="$(printf '\t')" read -r file size sha256; do
+		src=/kernels/$file
+		[ "$(stat -c %s $src)" = "$size" ] || fail "$file: size is not $size"
+		[ "$(sha256sum $src | cut -d' ' -f1)" = "$sha256" ] || fail "$file: sha256 is not $sha256"
+		install -D -m 0444 $src $dest/$file
+		listed=$((listed + 1))
+	done < /kernels.tsv
+	shipped=$(find /kernels/cubin /kernels/fatbin -type f | wc -l)
+	[ "$shipped" -eq "$listed" ] || fail "the kernel image has $shipped files, the manifest lists $listed"
+	find $root -type d -exec chmod 0555 {} +
+EOF
+
+# ── package ────────────────────────────────────────────────────────────────────
+# The node, its C runtime in /lib64, the kernel images in /opt/eidola/kernels.
+# The driver is not here: the NVIDIA container runtime mounts the host's into
+# the container. The weights are not here: a deployment mounts them read-only
+# under /tinfoil/models. Every setting is the deployment's measured
+# environment; the image sets none.
+FROM scratch AS package
+
+COPY --from=assemble /rootfs/ /
+USER 65534:65534
+ENTRYPOINT ["/eidola-server-engine"]

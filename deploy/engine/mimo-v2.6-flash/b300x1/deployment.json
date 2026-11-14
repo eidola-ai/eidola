@@ -1,0 +1,18 @@
+{
+  "architecture": "MimoV26Flash",
+  "weights": {
+    "repo": "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
+    "revision": "2479e2d0029eca9a34cc7e7f55a121925f81908e"
+  },
+  "expected_gpus": 1,
+  "tdx": {
+    "platform_endorsements": {
+      "release": "platform-v0.1.11",
+      "sha256": "ba0ccfbe8fb8a92d77a072ffeab362dc4b67faa0c88e7114eee7939ad9dd9548",
+      "policy": "tdx-b300-prod"
+    },
+    "dynamic_platform": "true",
+    "cached_keys": "true",
+    "smt_enabled": "false"
+  }
+}

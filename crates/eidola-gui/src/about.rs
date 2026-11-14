@@ -14,6 +14,7 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 use crate::actions::CloseWindow;
 use crate::i18n::msg;
 use crate::probe::Probe as _;
+use crate::theme;
 
 /// The version string baked in at compile time.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -62,6 +63,13 @@ impl Render for AboutView {
                     .id("about-title")
                     .probe("about/title", gpui::Role::Heading, msg::about_title(cx))
                     .aria_level(1)
+                    // The wordmark and the purpose copy are the page's
+                    // narrative, so they take the prose face the welcome page's
+                    // title treatment uses. The theme deliberately leaves
+                    // components on the system UI font, so prose has to opt in
+                    // by name — without this the wordmark rendered in system
+                    // sans while claiming to match a page set in Newsreader.
+                    .font_family(theme::FONT_FAMILY)
                     .text_size(px(32.))
                     .line_height(relative(1.2))
                     .child(msg::about_title(cx)),
@@ -88,6 +96,10 @@ impl Render for AboutView {
         // set minus the call to action — the reader has already begun).
         let purpose = v_flex()
             .gap_3()
+            // Narrative, like the wordmark. The version, source note and link
+            // below stay on the UI font: they are chrome — metadata about the
+            // build and a door out of the app, not the page's voice.
+            .font_family(theme::FONT_FAMILY)
             .text_sm()
             .text_color(theme.muted_foreground)
             .child(msg::about_purpose_lead(cx))

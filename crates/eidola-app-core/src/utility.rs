@@ -24,9 +24,10 @@
 //! decide what is stale before it starts an engine at all.
 
 use crate::error::AppError;
+use crate::whole_answer::WholeAnswer;
 use crate::{
-    Change, EidolaResolved, Inner, backends, db, estimate_charge_credits, fetch_models,
-    local_models, now_ms, process_refund, recover_refund,
+    ChargePricing, EidolaResolved, Inner, backends, db, estimate_charge_credits, fetch_models,
+    local_models, now_ms,
 };
 
 /// Where a chore call would go, and what it would cost — resolved without
@@ -50,7 +51,7 @@ struct UtilityRoute {
     wire_model: String,
     /// `(prompt_rate, completion_rate, scale_factor)` — `Some` only for a
     /// remote (billing) call.
-    pricing: Option<(u128, u128, u128)>,
+    pricing: Option<ChargePricing>,
     /// An external backend's bearer key, when it has one.
     external_auth: Option<String>,
     /// Held for the life of the call so the engine is not evicted underneath
@@ -121,6 +122,32 @@ pub(crate) fn clip_middle(text: &str, max_bytes: usize) -> String {
     format!("{}…{}", &text[..head], &text[tail..])
 }
 
+/// Build the target from a backend row already read, so the two callers that
+/// read that row differently still produce the same target.
+///
+/// The chore runner reads it by id ([`Inner::resolve_utility_target`]); the
+/// proxy reads it **joined to its own permission**, because there the row's
+/// liveness is not the whole question (`proxy::route`'s
+/// `resolve_proxy_target`). Everything after the read is identical, and this is
+/// that everything.
+pub(crate) fn utility_target_for(
+    backend: db::BackendRow,
+    mref: backends::ModelRef,
+    chore: &'static str,
+) -> Result<UtilityTarget, AppError> {
+    let kind = backends::BackendKind::parse(&backend.kind).ok_or_else(|| AppError::Database {
+        message: format!("unknown backend kind `{}`", backend.kind),
+    })?;
+    let canonical = backends::qualified_model_id(&mref.model, &backend.id);
+    Ok(UtilityTarget {
+        backend,
+        kind,
+        model: mref.model,
+        canonical,
+        chore,
+    })
+}
+
 impl Inner {
     /// Resolve a chore's model reference through the backend registry.
     ///
@@ -135,18 +162,7 @@ impl Inner {
     ) -> Result<UtilityTarget, AppError> {
         let mref = backends::parse_model_ref(model_ref);
         let backend = self.require_backend(db_conn, &mref.backend_id).await?;
-        let kind =
-            backends::BackendKind::parse(&backend.kind).ok_or_else(|| AppError::Database {
-                message: format!("unknown backend kind `{}`", backend.kind),
-            })?;
-        let canonical = backends::qualified_model_id(&mref.model, &backend.id);
-        Ok(UtilityTarget {
-            backend,
-            kind,
-            model: mref.model,
-            canonical,
-            chore,
-        })
+        utility_target_for(backend, mref, chore)
     }
 
     /// Open the route: lease or start the engine, build the client, and read
@@ -182,7 +198,7 @@ impl Inner {
                     }
                 };
                 Ok(UtilityRoute {
-                    client: self.plain_client()?,
+                    client: self.completion_client()?,
                     base_url: engine_url,
                     wire_model: target.canonical.clone(),
                     pricing: None,
@@ -198,7 +214,7 @@ impl Inner {
                         message: format!("backend `{}` has no base URL", backend.id),
                     })?;
                 Ok(UtilityRoute {
-                    client: self.plain_client()?,
+                    client: self.completion_client()?,
                     base_url,
                     wire_model: target.model.clone(),
                     pricing: None,
@@ -212,22 +228,25 @@ impl Inner {
                 // but a chore call writes no rows to hang a record from.
                 let client = self.build_client(&eidola, None).await?;
                 let models = fetch_models(&client, &eidola.base_url).await?;
-                let entry = models
-                    .data
-                    .iter()
-                    .find(|m| m.id == target.model)
-                    .ok_or_else(|| AppError::NotConfigured {
-                        message: format!("{} model not found: {}", target.chore, target.canonical),
+                // A chore's model reference goes stale exactly as a turn's
+                // does, and takes the same refusal (see
+                // [`AppError::ModelUnavailable`]). What each chore then does
+                // with it is its own doctrine — the router degrades and lets
+                // the post through, unrefined, rather than routing through
+                // some other model.
+                // Matched as the gateway resolves the reference: a digest
+                // by hash, a tag by the row it names.
+                let entry =
+                    crate::find_catalog_entry(&models.data, &target.model).ok_or_else(|| {
+                        AppError::ModelUnavailable {
+                            model: target.canonical.clone(),
+                        }
                     })?;
                 Ok(UtilityRoute {
                     client,
                     base_url: eidola.base_url.clone(),
                     wire_model: target.model.clone(),
-                    pricing: Some((
-                        entry.pricing.per_prompt_token.value as u128,
-                        entry.pricing.per_completion_token.value as u128,
-                        entry.pricing.per_prompt_token.scale_factor as u128,
-                    )),
+                    pricing: Some(ChargePricing::from_catalog(&entry.pricing)),
                     external_auth: None,
                     engine_lease: None,
                 })
@@ -235,7 +254,9 @@ impl Inner {
         }
     }
 
-    /// One non-streaming chat completion against a resolved chore target.
+    /// One whole chat completion against a resolved chore target: a blocking
+    /// one, or for a backend that serves only streams, a stream assembled into
+    /// one (`whole_answer`).
     ///
     /// Opens the route, places and settles a hold when the target bills, and
     /// returns the assistant's content. Persists nothing.
@@ -273,32 +294,38 @@ impl Inner {
                         ),
                     });
                 }
-                let (prep, auth) = self.acquire_spend(&cfg, db_conn, charge, now).await?;
-                spend = Some(prep);
-                Some(auth)
+                spend = Some(
+                    self.acquire_spend(&cfg, db_conn, charge, now, crate::Funding::MayConvert)
+                        .await?,
+                );
+                None
             }
         };
 
-        let body = serde_json::json!({
+        // A backend that answers chat only as a stream is asked for one, and
+        // its answer assembled into the body read below (`whole_answer`).
+        let whole = WholeAnswer::for_backend(target.kind);
+        let mut body = serde_json::json!({
             "model": route.wire_model,
             "messages": messages,
             "max_completion_tokens": max_completion_tokens,
         });
-
         let mut request = route
             .client
-            .post(format!("{}/v1/chat/completions", route.base_url))
-            .json(&body);
-        if let Some(auth) = &auth_value {
-            request = request.header("Authorization", auth);
+            .post(format!("{}/v1/chat/completions", route.base_url));
+        if whole.streams() {
+            body["stream"] = true.into();
+            request = request.header("Accept", "text/event-stream");
         }
+        let mut request = request.json(&*crate::body_with_spend(&body, spend.as_ref()));
+        request = crate::with_authorization(request, auth_value.as_deref());
 
         let response = match request.send().await {
             Ok(resp) => resp,
             Err(e) => {
                 // The server may have received the request: recover the refund
                 // rather than abandoning the credential.
-                self.settle_utility_refund(db_conn, &spend, &auth_value, &route, None, now)
+                self.settle_utility_refund(db_conn, &mut spend, &route, None, now)
                     .await;
                 return Err(AppError::from_request(e));
             }
@@ -311,10 +338,37 @@ impl Inner {
         // would strand the credential in `spending`, and the very next turn
         // would burn its bounded provisioning wait on a refund that is never
         // coming.
-        let text = match response.text().await {
+        // Bounded as it arrives, like every other read from a peer on this
+        // crate's side of a socket (`peer_read`): a chore's answer is one
+        // completion, and an engine or an external backend chooses its size.
+        //
+        // **And the ceiling is an answer, not a note.** `over_ceiling` says the
+        // bytes in hand are a prefix; parsing them anyway degrades a chore
+        // silently in the common case (truncated JSON becomes `Null`, so a
+        // successful call returns nothing usable) and lies outright in the
+        // dangerous one (a complete object followed by padding parses
+        // perfectly, and a partial answer is taken for a whole one). The hold
+        // is settled first, exactly as for a read that failed outright.
+        //
+        // **A stream cut short is no answer either**, and it settles on the
+        // refunds it delivered (recovery for their absence), as a streaming
+        // twin settles one.
+        let what = format!("the {} response", target.chore);
+        let read = whole
+            .read(
+                response,
+                crate::peer_read::API_ANSWER_MAX_BYTES,
+                &target.backend.id,
+            )
+            .await;
+        let (text, settled_with) = match read {
+            Ok(answer) => (crate::peer_read::whole_text(answer.body, &what), None),
+            Err(failure) => (Err(failure.error), failure.refund),
+        };
+        let text = match text {
             Ok(text) => text,
             Err(e) => {
-                self.settle_utility_refund(db_conn, &spend, &auth_value, &route, None, now)
+                self.settle_utility_refund(db_conn, &mut spend, &route, settled_with.as_ref(), now)
                     .await;
                 return Err(AppError::Network {
                     message: format!("failed to read the {} response: {e}", target.chore),
@@ -326,10 +380,9 @@ impl Inner {
 
         self.settle_utility_refund(
             db_conn,
-            &spend,
-            &auth_value,
+            &mut spend,
             &route,
-            parsed.get("refund"),
+            crate::inline_refund(&parsed),
             now,
         )
         .await;
@@ -352,48 +405,31 @@ impl Inner {
             .to_string())
     }
 
-    /// Settle a remote chore call's credential: apply the inline refund when
-    /// the response carried one, otherwise try the recovery endpoint. A no-op
-    /// for the zero-spend backends. Best-effort throughout — a chore must never
-    /// turn a wallet hiccup into a failed post.
+    /// Settle a remote chore call's inputs: apply the inline refunds when
+    /// the response carried them, otherwise try the recovery endpoint, input
+    /// by input. A no-op for the zero-spend backends. Best-effort throughout
+    /// — a chore must never turn a wallet hiccup into a failed post.
     async fn settle_utility_refund(
         &self,
         db_conn: &turso::Connection,
-        spend: &Option<crate::SpendPrep>,
-        auth_value: &Option<String>,
+        spend: &mut Option<crate::SpendPrep>,
         route: &UtilityRoute,
         inline: Option<&serde_json::Value>,
         now: i64,
     ) {
         let Some(spend) = spend else { return };
-        let refund_obj = match inline {
-            Some(obj) => Some(obj.clone()),
-            None => match auth_value {
-                Some(auth) => recover_refund(&route.client, &route.base_url, auth)
-                    .await
-                    .ok(),
-                None => None,
-            },
-        };
-        let Some(refund_obj) = refund_obj else {
-            eprintln!("warning: a utility call's credential refund could not be recovered");
-            return;
-        };
-        let applied = process_refund(
-            &refund_obj,
-            &spend.params,
-            &spend.spend_proof,
-            &spend.pre_refund,
-            &spend.public_key,
-            db_conn,
-            &spend.pre_cred_id,
-            spend.cred.generation + 1,
-            now,
-        )
-        .await;
-        match applied {
-            Ok(()) => self.bus.emit(Change::Wallet),
-            Err(e) => eprintln!("warning: a utility call's refund failed to apply: {e}"),
+        let (_, error) = spend
+            .settle(
+                &route.client,
+                &route.base_url,
+                db_conn,
+                &self.bus,
+                inline,
+                now,
+            )
+            .await;
+        if let Some(e) = error {
+            eprintln!("warning: a utility call's credential refund was not applied: {e}");
         }
     }
 }

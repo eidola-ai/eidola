@@ -1,0 +1,1189 @@
+//! Account management HTTP handlers.
+
+use axum::Json;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use uuid::Uuid;
+
+use crate::AppState;
+use crate::auth::BasicAuth;
+use crate::db;
+use crate::error::ServerError;
+use crate::helpers::{system_time_to_iso, unix_to_iso};
+use crate::stripe::{CheckoutParams, StripeClient};
+
+// ---------------------------------------------------------------------------
+// Request / response types
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, ToSchema)]
+pub struct CreateAccountResponse {
+    pub account_id: Uuid,
+    pub secret: String,
+    pub created_at: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct GetAccountResponse {
+    pub id: Uuid,
+    pub stripe_customer_id: Option<String>,
+    pub created_at: String,
+    /// `open`, `closing`, or `closed`. Closing accounts remain readable.
+    pub billing_state: String,
+}
+
+/// The account's subscription standing.
+///
+/// The `state` field is the answer; the rest is detail that exists only
+/// where it is meaningful. It is deliberately a three-value state rather
+/// than a present/absent subscription, because "this account has never
+/// transacted" and "this account has a payment relationship but no live
+/// subscription" are different situations and lead to different UI.
+#[derive(Serialize, ToSchema)]
+pub struct SubscriptionResponse {
+    /// `none` — the account has never transacted, so it has no payment
+    /// relationship and nothing to manage. That means no Stripe customer
+    /// *or* a customer record with no money ever moved under it, which
+    /// checkout can leave behind when a session is abandoned — a customer
+    /// id alone buys nobody a card, an invoice or a receipt. `inactive` — a
+    /// real payment history, but no subscription in a status Eidola treats
+    /// as in force. `active` — a subscription is in force.
+    ///
+    /// "In force" means Stripe status `active`, `trialing`, or `past_due`
+    /// — the same set the checkout endpoint refuses to double-subscribe
+    /// over, so the two answers cannot disagree.
+    pub state: String,
+    /// The in-force subscription's Stripe id. Present exactly when `state`
+    /// is `active`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The in-force subscription's raw Stripe status, so a client can show
+    /// what it actually is (a `past_due` subscription is in force and
+    /// wants attention). Present exactly when `state` is `active`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// End of the current billing period, ISO-8601. Present when `state`
+    /// is `active` and Stripe reported one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_period_end: Option<String>,
+}
+
+/// A freshly minted Stripe billing-portal session.
+///
+/// Its own endpoint rather than a field on the subscription standing:
+/// minting is a **write** to Stripe and the session expires quickly, so a
+/// link handed out with a status read is one the client cannot responsibly
+/// keep — and every status read was creating a portal session that was then
+/// thrown away.
+#[derive(Serialize, ToSchema)]
+pub struct PortalResponse {
+    /// Open this in a browser now. Short-lived by construction; ask again
+    /// rather than storing it.
+    pub portal_url: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CheckoutUrlResponse {
+    pub checkout_url: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct CheckoutRequest {
+    pub price_id: String,
+    #[serde(default = "default_success_url")]
+    pub success_url: String,
+    #[serde(default = "default_cancel_url")]
+    pub cancel_url: String,
+}
+
+/// A document whose current version must be accepted before purchases or
+/// credential issuance. `sha256` identifies the exact text (the markdown
+/// source, retrievable at `{url}source.md`), so acceptance binds to
+/// precise words rather than a mutable URL; `version` is the document's
+/// monotonically increasing front-matter version, which orders releases
+/// (accepting version N satisfies any requirement ≤ N).
+#[derive(Clone, Serialize, ToSchema)]
+pub struct RequiredDocument {
+    /// `terms_of_service` or `privacy_policy`.
+    pub document: String,
+    /// Monotonically increasing document version.
+    pub version: i64,
+    /// Where the current text is published.
+    pub url: String,
+    /// Hex-encoded SHA-256 of the exact published document text.
+    pub sha256: String,
+}
+
+/// The documents (and versions) whose acceptance the server currently
+/// requires. Empty when no acceptance gate is configured.
+#[derive(Serialize, ToSchema)]
+pub struct TermsResponse {
+    pub documents: Vec<RequiredDocument>,
+}
+
+/// Acceptance of one currently required document version.
+#[derive(Deserialize, ToSchema)]
+pub struct AcceptTermsRequest {
+    /// `terms_of_service` or `privacy_policy`.
+    pub document: String,
+    /// Hex-encoded SHA-256 of the document text being accepted; must match
+    /// the currently required version from `GET /v1/terms`.
+    pub sha256: String,
+}
+
+/// A purchasable plan.
+#[derive(Serialize, ToSchema)]
+pub struct PriceResponse {
+    pub id: String,
+    pub product_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_description: Option<String>,
+    /// Purchase price in the minor unit of `currency` (e.g. cents for USD).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit_amount: Option<i64>,
+    pub currency: String,
+    #[serde(rename = "type")]
+    pub price_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recurring: Option<RecurringResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lookup_key: Option<String>,
+    /// Credits granted by this plan, denominated in micro-USD
+    /// (1 credit = $0.000001). Subscription credits expire at the end of
+    /// each billing period; one-time purchase credits expire one year
+    /// after purchase.
+    pub credits: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct RecurringResponse {
+    pub interval: String,
+    pub interval_count: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ListPricesResponse {
+    pub data: Vec<PriceResponse>,
+}
+
+/// Credit balance breakdown. All amounts are credits, denominated in
+/// micro-USD (1 credit = $0.000001).
+#[derive(Serialize, ToSchema)]
+pub struct BalancesResponse {
+    /// Total spendable credits (expired pools excluded).
+    pub available: i64,
+    /// Per-pool breakdown, earliest expiry first.
+    pub pools: Vec<BalancePool>,
+    /// Unrecovered chargeback value, valued in the original payment currency.
+    pub debts: Vec<CashDebt>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CashDebt {
+    pub currency: String,
+    /// Decimal minor currency units. Fractional units preserve exact purchase
+    /// valuation internally; this is not a demand for another payment.
+    pub amount_minor: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ReconcileResponse {
+    pub state: ReconcileState,
+    /// Latest durable repair request. A request arriving during a run remains
+    /// pending until a subsequent run covers its generation.
+    pub requested_generation: i64,
+    /// Generation covered by `report`. While pending, this report describes
+    /// the last completed run, not the latest request.
+    pub completed_generation: i64,
+    pub report: Option<BillingReconcileReport>,
+    /// Fixed failure category from the last unsuccessful attempt, if any.
+    /// The durable request remains pending and may be retried by the worker.
+    pub last_error: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileState {
+    Idle,
+    Pending,
+    Complete,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct BillingReconcileReport {
+    /// Counts of current provider objects examined, not newly granted credits.
+    pub purchases: usize,
+    pub refunds: usize,
+    pub disputes: usize,
+    pub review: Vec<BillingReview>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct BillingReview {
+    pub object_id: String,
+    pub reason: String,
+}
+
+impl From<eidola_billing::store::RepairStatus> for ReconcileResponse {
+    fn from(status: eidola_billing::store::RepairStatus) -> Self {
+        let state = if status.requested_generation == 0 {
+            ReconcileState::Idle
+        } else if status.requested_generation > status.completed_generation {
+            ReconcileState::Pending
+        } else {
+            ReconcileState::Complete
+        };
+        Self {
+            state,
+            requested_generation: status.requested_generation,
+            completed_generation: status.completed_generation,
+            report: status.report.map(|report| BillingReconcileReport {
+                purchases: report.purchases,
+                refunds: report.refunds,
+                disputes: report.disputes,
+                review: report
+                    .review
+                    .into_iter()
+                    .map(|item| BillingReview {
+                        object_id: item.object_id,
+                        reason: item.reason,
+                    })
+                    .collect(),
+            }),
+            last_error: status.last_error,
+        }
+    }
+}
+
+/// One balance pool: credits sharing an origin and expiration.
+#[derive(Serialize, ToSchema)]
+pub struct BalancePool {
+    /// Credits remaining in this pool (micro-USD denominated).
+    pub amount: i64,
+    /// Where the pool came from: `subscription`, `purchase`, or `other`.
+    pub source: String,
+    /// ISO-8601 instant at which these credits expire; absent for credits
+    /// that never expire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct LedgerResponse {
+    pub data: Vec<LedgerEntry>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct LedgerEntry {
+    pub id: Uuid,
+    pub delta: i64,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_credits: Option<i64>,
+}
+
+/// Where Stripe sends a browser when it is done with the user. All three
+/// are real routes on the published site (`www/pages/`), which generates
+/// flat routes only — a nested `/payment/success` would 404. `www.` is the
+/// canonical host the rest of the server already uses
+/// (`TERMS_FEED_BASE_URL`).
+const PAYMENT_COMPLETE_URL: &str = "https://www.eidola.ai/payment-complete/";
+const PAYMENT_CANCELED_URL: &str = "https://www.eidola.ai/payment-canceled/";
+const BILLING_PORTAL_RETURN_URL: &str = "https://www.eidola.ai/billing/";
+
+fn default_success_url() -> String {
+    PAYMENT_COMPLETE_URL.to_string()
+}
+
+fn default_cancel_url() -> String {
+    PAYMENT_CANCELED_URL.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn require_stripe(stripe: &Option<StripeClient>) -> Result<&StripeClient, ServerError> {
+    stripe
+        .as_ref()
+        .ok_or_else(|| ServerError::ServiceUnavailable("stripe is not configured".to_string()))
+}
+
+/// The required documents the account has not accepted at (or above) their
+/// required versions. The `>=` comparison is what makes brief cross-instance
+/// requirement skew invisible to users: accepting version 6 satisfies an
+/// instance still requiring version 5. Pure so the gate logic is
+/// unit-testable without a database.
+pub(crate) fn missing_documents<'a>(
+    required: &'a [db::RequiredDocumentRow],
+    accepted_versions: &[(String, i64)],
+) -> Vec<&'a str> {
+    required
+        .iter()
+        .filter(|d| {
+            !accepted_versions
+                .iter()
+                .any(|(doc, version)| *doc == d.document && *version >= d.version)
+        })
+        .map(|d| d.document.as_str())
+        .collect()
+}
+
+/// Gate for purchases and credential issuance: the account must have
+/// accepted every required document at (or above) the cluster-wide
+/// required version (the `required_document` table, advanced by the
+/// terms-feed poller and/or the startup env seed). A no-op when the table
+/// is empty (gate disabled).
+pub(crate) async fn ensure_terms_accepted(
+    state: &AppState,
+    account_id: Uuid,
+) -> Result<(), ServerError> {
+    let required = db::get_required_documents(&state.db_pool).await?;
+    if required.is_empty() {
+        return Ok(());
+    }
+    let accepted = db::get_accepted_versions(&state.db_pool, account_id).await?;
+    let missing = missing_documents(&required, &accepted);
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(ServerError::TermsAcceptanceRequired {
+            message: format!(
+                "acceptance of the current {} is required — fetch GET /v1/terms \
+                 and record acceptance via POST /v1/account/terms",
+                missing.join(" and ")
+            ),
+        })
+    }
+}
+
+// Bring the trait into scope for fill_bytes.
+use rand_core::RngCore;
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+/// POST /v1/account — create a new account.
+#[utoipa::path(
+    post,
+    path = "/v1/account",
+    tag = "Linked",
+    responses(
+        (status = 201, description = "Account created", body = CreateAccountResponse),
+        (status = 500, description = "Internal error", body = crate::types::ErrorResponse)
+    )
+)]
+pub async fn create_account(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ServerError> {
+    use argon2::Argon2;
+    use argon2::PasswordHasher;
+
+    let account_id = Uuid::new_v4();
+
+    let mut secret_bytes = [0u8; 32];
+    rand_core::OsRng.fill_bytes(&mut secret_bytes);
+    let secret = URL_SAFE_NO_PAD.encode(secret_bytes);
+
+    let hash = Argon2::default()
+        .hash_password(secret.as_bytes())
+        .map_err(|e| ServerError::Internal(format!("hash error: {}", e)))?
+        .to_string();
+
+    let created_at = db::insert_account(&state.db_pool, account_id, &hash).await?;
+
+    let resp = CreateAccountResponse {
+        account_id,
+        secret,
+        created_at: system_time_to_iso(created_at)?,
+    };
+
+    Ok((StatusCode::CREATED, Json(resp)))
+}
+
+/// GET /v1/terms — the document versions whose acceptance is required.
+///
+/// Public, and necessarily so: a client fetches this *before* it has an
+/// account, to learn what it must accept. It takes no credential and returns
+/// no account-specific data. (Accepting them is `POST /v1/account/terms`,
+/// which is on the linked surface.)
+#[utoipa::path(
+    get,
+    path = "/v1/terms",
+    tag = "Public",
+    responses(
+        (status = 200, description = "Currently required document versions", body = TermsResponse)
+    )
+)]
+pub async fn get_terms(State(state): State<AppState>) -> Result<Json<TermsResponse>, ServerError> {
+    let documents = db::get_required_documents(&state.db_pool)
+        .await?
+        .into_iter()
+        .map(|d| RequiredDocument {
+            document: d.document,
+            version: d.version,
+            url: d.url,
+            sha256: d.sha256,
+        })
+        .collect();
+    Ok(Json(TermsResponse { documents }))
+}
+
+/// POST /v1/account/terms — record acceptance of a current document version
+/// (authenticated).
+#[utoipa::path(
+    post,
+    path = "/v1/account/terms",
+    tag = "Linked",
+    request_body = AcceptTermsRequest,
+    security(("basic" = [])),
+    responses(
+        (status = 204, description = "Acceptance recorded"),
+        (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
+        (status = 409, description = "Not the currently required version", body = crate::types::ErrorResponse)
+    )
+)]
+pub async fn accept_terms(
+    BasicAuth(account_id): BasicAuth,
+    State(state): State<AppState>,
+    Json(req): Json<AcceptTermsRequest>,
+) -> Result<StatusCode, ServerError> {
+    let sha256 = req.sha256.to_lowercase();
+    let required = db::get_required_documents(&state.db_pool).await?;
+    let Some(current) = required
+        .iter()
+        .find(|d| d.document == req.document && d.sha256 == sha256)
+    else {
+        // Value-free by design: `Conflict`'s message is logged verbatim,
+        // and `req.document` / `req.sha256` are client-authored strings
+        // that failed exactly the fixed-list lookup that would have
+        // bounded them. The client knows what it sent.
+        return Err(ServerError::Conflict {
+            message: "the submitted document/hash pair is not a currently required \
+                      version — fetch GET /v1/terms for the current documents"
+                .to_string(),
+        });
+    };
+
+    db::insert_acceptance(
+        &state.db_pool,
+        account_id,
+        &current.document,
+        current.version,
+        &current.sha256,
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /v1/account — retrieve account info (authenticated).
+#[utoipa::path(
+    get,
+    path = "/v1/account",
+    tag = "Linked",
+    security(("basic" = [])),
+    responses(
+        (status = 200, description = "Account info", body = GetAccountResponse),
+        (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse)
+    )
+)]
+pub async fn get_account(
+    BasicAuth(account_id): BasicAuth,
+    State(state): State<AppState>,
+) -> Result<Json<GetAccountResponse>, ServerError> {
+    let account = db::get_account_by_id(&state.db_pool, account_id).await?;
+
+    Ok(Json(GetAccountResponse {
+        id: account.id,
+        stripe_customer_id: account.stripe_customer_id,
+        created_at: system_time_to_iso(account.created_at)?,
+        billing_state: account.billing_state,
+    }))
+}
+
+/// GET /v1/account/subscription — the account's subscription standing
+/// (authenticated).
+///
+/// Always 200 on a reachable Stripe: having no subscription is an answer,
+/// not a failure. The states are distinguished so a client can tell "never
+/// transacted" from "has a payment relationship but nothing in force" —
+/// the second has a billing portal worth offering, the first does not.
+#[utoipa::path(
+    get,
+    path = "/v1/account/subscription",
+    tag = "Linked",
+    security(("basic" = [])),
+    responses(
+        (status = 200, description = "Subscription standing", body = SubscriptionResponse),
+        (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
+        (status = 503, description = "Stripe not configured", body = crate::types::ErrorResponse)
+    )
+)]
+pub async fn get_subscription(
+    BasicAuth(account_id): BasicAuth,
+    State(state): State<AppState>,
+) -> Result<Json<SubscriptionResponse>, ServerError> {
+    let stripe = require_stripe(&state.stripe)?;
+    let account = db::get_account_by_id(&state.db_pool, account_id).await?;
+
+    let Some(customer_id) = account.stripe_customer_id else {
+        return Ok(Json(SubscriptionResponse {
+            state: "none".to_string(),
+            id: None,
+            status: None,
+            current_period_end: None,
+        }));
+    };
+
+    // Nothing but the standing is fetched here. The billing-portal session
+    // this used to mint alongside is its own endpoint now: it was a Stripe
+    // *write* on every status read, discarded unread, whose latency the
+    // answer had to wait for.
+    let in_force = stripe.in_force_subscription(&customer_id).await?;
+
+    // A Stripe customer record is not a payment relationship, so the ledger
+    // decides whether there is one (see `subscription_standing`). Only asked
+    // when nothing is in force — an in-force subscription is a relationship
+    // by itself, whatever it has been billed yet.
+    let has_payment_history = match in_force {
+        Some(_) => true,
+        None => db::has_stripe_ledger_history(&state.db_pool, account_id).await?,
+    };
+
+    Ok(Json(subscription_standing(in_force, has_payment_history)))
+}
+
+/// POST /v1/account/portal — mint a Stripe billing-portal session
+/// (authenticated).
+///
+/// Separate from the subscription read on purpose. Minting is a write to
+/// Stripe and the session expires quickly, so a link that rides a status
+/// response is one no client can responsibly hold — ours already discarded
+/// it and asked again at the moment of the click. Riding along, it made
+/// every status read create-and-throw-away a Stripe session, and put that
+/// write's latency in front of an answer that did not need it.
+///
+/// Refuses for an account with no payment relationship, on the same test
+/// `GET /v1/account/subscription` calls `none`: a portal minted for someone
+/// money has never moved for is a door onto an empty room.
+#[utoipa::path(
+    post,
+    path = "/v1/account/portal",
+    tag = "Linked",
+    security(("basic" = [])),
+    responses(
+        (status = 200, description = "A billing-portal session", body = PortalResponse),
+        (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
+        (status = 404, description = "No payment relationship to manage", body = crate::types::ErrorResponse),
+        (status = 503, description = "Stripe not configured", body = crate::types::ErrorResponse)
+    )
+)]
+pub async fn create_portal_session(
+    BasicAuth(account_id): BasicAuth,
+    State(state): State<AppState>,
+) -> Result<Json<PortalResponse>, ServerError> {
+    let stripe = require_stripe(&state.stripe)?;
+    let account = db::get_account_by_id(&state.db_pool, account_id).await?;
+
+    let no_portal = || ServerError::NotFound {
+        message: "no_payment_relationship".to_string(),
+    };
+
+    let customer_id = account.stripe_customer_id.ok_or_else(no_portal)?;
+
+    // Same predicate as the `none` state, so the app is never offered a door
+    // the server then refuses — but asked local-first. A ledger row already
+    // settles the question, and evaluating the subscription walk ahead of it
+    // put a Stripe round trip in front of an answer we hold: every returning
+    // customer paid for it, and a slow or failing `/subscriptions` withheld
+    // their billing portal while the portal itself was perfectly healthy.
+    // Stripe is consulted only for the customer the ledger cannot vouch for
+    // — an unbilled trial.
+    let entitled = db::has_stripe_ledger_history(&state.db_pool, account_id).await?
+        || stripe.in_force_subscription(&customer_id).await?.is_some();
+    if !entitled {
+        return Err(no_portal());
+    }
+
+    let portal_url = stripe
+        .create_portal_session(&customer_id, BILLING_PORTAL_RETURN_URL)
+        .await?;
+
+    Ok(Json(PortalResponse { portal_url }))
+}
+
+/// Turn what Stripe and the ledger said into the account's standing.
+///
+/// Split out from the handler because of the property worth pinning:
+/// **a customer record is not a payment history.** `create_checkout`
+/// persists the Stripe customer *before* it validates the price or the
+/// reader finishes paying, so a rejected request or an abandoned first
+/// checkout leaves a customer id with nothing under it. Calling that
+/// `inactive` points the reader at a billing portal holding no card, no
+/// invoice and no receipt — so `none` keeps the meaning it always
+/// documented ("has never transacted") by being decided on money that
+/// actually moved.
+fn subscription_standing(
+    in_force: Option<crate::stripe::Subscription>,
+    has_payment_history: bool,
+) -> SubscriptionResponse {
+    let Some(sub) = in_force else {
+        let state = if has_payment_history {
+            "inactive"
+        } else {
+            "none"
+        };
+        return SubscriptionResponse {
+            state: state.to_string(),
+            id: None,
+            status: None,
+            current_period_end: None,
+        };
+    };
+
+    let current_period_end = sub.current_period_end().map(unix_to_iso);
+    SubscriptionResponse {
+        state: "active".to_string(),
+        id: Some(sub.id),
+        status: Some(sub.status),
+        current_period_end,
+    }
+}
+
+/// GET /v1/prices — list available prices.
+#[utoipa::path(
+    get,
+    path = "/v1/prices",
+    tag = "Public",
+    responses(
+        (status = 200, description = "List of available prices", body = ListPricesResponse),
+        (status = 503, description = "Stripe not configured", body = crate::types::ErrorResponse)
+    )
+)]
+pub async fn list_prices(
+    State(state): State<AppState>,
+) -> Result<Json<ListPricesResponse>, ServerError> {
+    let stripe = require_stripe(&state.stripe)?;
+    let prices = stripe.list_prices().await?;
+
+    let data = prices
+        .into_iter()
+        .filter_map(|p| {
+            let credits: i64 = p.product.metadata.get("credits")?.parse().ok()?;
+            Some(PriceResponse {
+                id: p.id,
+                product_name: p.product.name,
+                product_description: p.product.description,
+                unit_amount: p.unit_amount,
+                currency: p.currency,
+                price_type: p.price_type,
+                recurring: p.recurring.map(|r| RecurringResponse {
+                    interval: r.interval,
+                    interval_count: r.interval_count,
+                }),
+                lookup_key: p.lookup_key,
+                credits,
+            })
+        })
+        .collect();
+
+    Ok(Json(ListPricesResponse { data }))
+}
+
+/// POST /v1/account/checkout — create a checkout session (authenticated).
+///
+/// Accepts any active Stripe price ID. Automatically determines whether to
+/// create a subscription or one-time payment checkout based on the price type.
+/// For subscription prices, enforces the one-active-subscription constraint.
+#[utoipa::path(
+    post,
+    path = "/v1/account/checkout",
+    tag = "Linked",
+    request_body = CheckoutRequest,
+    security(("basic" = [])),
+    responses(
+        (status = 200, description = "Checkout session created", body = CheckoutUrlResponse),
+        (status = 400, description = "Invalid request", body = crate::types::ErrorResponse),
+        (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
+        (status = 409, description = "Already subscribed, or account is closing or closed", body = crate::types::ErrorResponse),
+        (status = 428, description = "Terms acceptance required", body = crate::types::ErrorResponse),
+        (status = 503, description = "Billing is busy or unavailable, or Stripe is not configured", body = crate::types::ErrorResponse)
+    )
+)]
+pub async fn create_checkout(
+    BasicAuth(account_id): BasicAuth,
+    State(state): State<AppState>,
+    Json(checkout_req): Json<CheckoutRequest>,
+) -> Result<Json<CheckoutUrlResponse>, ServerError> {
+    let stripe = require_stripe(&state.stripe)?;
+
+    // Checkout, reconciliation and closure use the same per-account lock.
+    // The external session can outlive this call; a later payment on a closed
+    // account is reconciled into its closure refund workflow.
+    let store = eidola_billing::store::Store::new(state.db_pool.clone());
+    let _guard = store.lock_checkout(account_id).await.map_err(|error| {
+        match error {
+            // Account work is transient admission contention. A checkout 409
+            // means a persistent account state, such as an active subscription.
+            eidola_billing::BillingError::Conflict(_) => {
+                ServerError::ServiceUnavailable("account billing is busy; retry checkout".into())
+            }
+            error => error.into(),
+        }
+    })?;
+    if db::get_account_by_id(&state.db_pool, account_id)
+        .await?
+        .billing_state
+        != "open"
+    {
+        return Err(ServerError::Conflict {
+            message: "account is closing or closed".into(),
+        });
+    }
+
+    ensure_terms_accepted(&state, account_id).await?;
+
+    if checkout_req.price_id.is_empty() {
+        return Err(ServerError::BadRequest {
+            message: "price_id must not be empty".to_string(),
+        });
+    }
+    if checkout_req.success_url.is_empty() {
+        return Err(ServerError::BadRequest {
+            message: "success_url must not be empty".to_string(),
+        });
+    }
+    if checkout_req.cancel_url.is_empty() {
+        return Err(ServerError::BadRequest {
+            message: "cancel_url must not be empty".to_string(),
+        });
+    }
+
+    // Price first, customer second. Creating the customer is a durable act
+    // — it persists `stripe_customer_id` — and a rejected price left one
+    // behind with nothing under it, which is the residue `none` now has to
+    // detect through the ledger. Validating first means a refused request
+    // writes nothing at all. (It does not remove the need for that ledger
+    // test: an *abandoned* checkout still leaves a customer behind, and
+    // nothing server-side hears about it.)
+    let price = stripe.get_price_expanded(&checkout_req.price_id).await?;
+    let credits = price
+        .product
+        .metadata
+        .get("credits")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|credits| *credits > 0)
+        .ok_or_else(|| ServerError::BadRequest {
+            message: "price does not specify a positive credit amount".into(),
+        })?;
+    if !price.active || price.unit_amount.is_none_or(|amount| amount < 0) {
+        return Err(ServerError::BadRequest {
+            message: "price is not available for checkout".into(),
+        });
+    }
+
+    let customer_id = ensure_stripe_customer(&state.db_pool, stripe, account_id).await?;
+
+    let mode = if price.recurring.is_some() {
+        // Literally the same question `GET /v1/account/subscription` asks —
+        // one call, one predicate, one walk of the whole list — so a client
+        // shown "no subscription" is never refused here, and a customer whose
+        // in-force subscription sits behind a page of newer attempts can
+        // never be sold a second one.
+        if stripe.in_force_subscription(&customer_id).await?.is_some() {
+            return Err(ServerError::Conflict {
+                message: "account already has an active subscription".to_string(),
+            });
+        }
+        "subscription"
+    } else {
+        "payment"
+    };
+
+    // Conspicuous expiry disclosure at the point of purchase: `submit_note`
+    // renders next to Checkout's pay button; `description` lands on the
+    // PaymentIntent / Subscription and thus on Stripe's email receipts and
+    // invoices. Must stay consistent with the published terms
+    // (www/pages/terms.md) and the webhook expiry logic.
+    let (submit_note, description) = if mode == "subscription" {
+        (
+            "Credits granted each billing period expire at the end of that period. \
+             Unused, unexpired credits are refundable on request. Details: www.eidola.ai/terms",
+            "Eidola subscription — each period's credits expire at the end of that \
+             billing period (see www.eidola.ai/terms)",
+        )
+    } else {
+        (
+            "Credits expire one year after purchase. Unused, unexpired credits are \
+             refundable on request. Details: www.eidola.ai/terms",
+            "Eidola credits — expire one year after purchase (see www.eidola.ai/terms)",
+        )
+    };
+
+    let account_id_str = account_id.to_string();
+    let params = CheckoutParams {
+        customer_id: &customer_id,
+        price_id: &checkout_req.price_id,
+        mode,
+        success_url: &checkout_req.success_url,
+        cancel_url: &checkout_req.cancel_url,
+        client_reference_id: Some(&account_id_str),
+        submit_note: Some(submit_note),
+        description: Some(description),
+        credits,
+    };
+
+    let checkout_url = stripe.create_checkout_session(&params).await?;
+
+    Ok(Json(CheckoutUrlResponse { checkout_url }))
+}
+
+/// Durably request billing reconciliation for the authenticated account.
+/// An independent billing worker performs the provider calls. This remains
+/// available without Stripe credentials, while reviewing terms and after
+/// account closure. Poll GET on this path for completion and review items.
+#[utoipa::path(
+    post,
+    path = "/v1/account/reconcile",
+    tag = "Linked",
+    security(("basic" = [])),
+    responses(
+        (status = 202, description = "Repair request recorded; poll GET for its completed generation", body = ReconcileResponse),
+        (status = 400, description = "Repair does not accept a request body", body = crate::types::ErrorResponse),
+        (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
+        (status = 503, description = "Billing unavailable", body = crate::types::ErrorResponse)
+    )
+)]
+#[tracing::instrument(skip_all, name = "account.reconcile", err)]
+pub async fn reconcile_billing(
+    BasicAuth(account_id): BasicAuth,
+    State(state): State<AppState>,
+    body: bytes::Bytes,
+) -> Result<(StatusCode, Json<ReconcileResponse>), ServerError> {
+    if !body.is_empty() {
+        return Err(ServerError::BadRequest {
+            message: "billing repair does not accept a request body".into(),
+        });
+    }
+    let status = eidola_billing::store::Store::new(state.db_pool.clone())
+        .request_reconciliation(account_id)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(status.into())))
+}
+
+/// Read this account's durable repair status without initiating provider work.
+#[utoipa::path(
+    get,
+    path = "/v1/account/reconcile",
+    tag = "Linked",
+    security(("basic" = [])),
+    responses(
+        (status = 200, description = "Repair status; report covers completed_generation", body = ReconcileResponse),
+        (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse),
+        (status = 503, description = "Billing unavailable", body = crate::types::ErrorResponse)
+    )
+)]
+#[tracing::instrument(skip_all, name = "account.reconcile_status", err)]
+pub async fn get_reconciliation(
+    BasicAuth(account_id): BasicAuth,
+    State(state): State<AppState>,
+) -> Result<Json<ReconcileResponse>, ServerError> {
+    let status = eidola_billing::store::Store::new(state.db_pool.clone())
+        .reconciliation_status(account_id)
+        .await?;
+    Ok(Json(status.into()))
+}
+
+/// Ensure the account has a Stripe customer ID, creating one if needed.
+async fn ensure_stripe_customer(
+    pool: &deadpool_postgres::Pool,
+    stripe: &StripeClient,
+    account_id: Uuid,
+) -> Result<String, ServerError> {
+    let account = db::get_account_by_id(pool, account_id).await?;
+
+    if let Some(customer_id) = account.stripe_customer_id {
+        return Ok(customer_id);
+    }
+
+    let customer_id = stripe.create_customer(account_id).await?;
+    db::set_stripe_customer_id(pool, account_id, &customer_id).await
+}
+
+/// GET /v1/account/balances — get credit balance breakdown (authenticated).
+#[utoipa::path(
+    get,
+    path = "/v1/account/balances",
+    tag = "Linked",
+    security(("basic" = [])),
+    responses(
+        (status = 200, description = "Balance breakdown", body = BalancesResponse),
+        (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse)
+    )
+)]
+pub async fn get_balances(
+    BasicAuth(account_id): BasicAuth,
+    State(state): State<AppState>,
+) -> Result<Json<BalancesResponse>, ServerError> {
+    let (total, pools) = db::get_balance_pools(&state.db_pool, account_id).await?;
+
+    let pools = pools
+        .into_iter()
+        .map(|p| {
+            let source = match p.source_reason.as_deref() {
+                Some("subscription_renewal") => "subscription",
+                Some("purchase") => "purchase",
+                _ => "other",
+            };
+            BalancePool {
+                amount: p.pool_amount,
+                source: source.to_string(),
+                expires_at: p.expires_at.and_then(|t| system_time_to_iso(t).ok()),
+            }
+        })
+        .collect();
+
+    Ok(Json(BalancesResponse {
+        available: total,
+        pools,
+        debts: eidola_billing::store::Store::new(state.db_pool.clone())
+            .debts(account_id)
+            .await?
+            .into_iter()
+            .map(|debt| CashDebt {
+                currency: debt.currency,
+                amount_minor: debt.amount_minor,
+            })
+            .collect(),
+    }))
+}
+
+/// GET /v1/account/ledger — get credit ledger entries (authenticated).
+#[utoipa::path(
+    get,
+    path = "/v1/account/ledger",
+    tag = "Linked",
+    security(("basic" = [])),
+    responses(
+        (status = 200, description = "Ledger entries", body = LedgerResponse),
+        (status = 401, description = "Invalid credentials", body = crate::types::ErrorResponse)
+    )
+)]
+pub async fn get_ledger(
+    BasicAuth(account_id): BasicAuth,
+    State(state): State<AppState>,
+) -> Result<Json<LedgerResponse>, ServerError> {
+    let rows = db::get_ledger_entries(&state.db_pool, account_id).await?;
+
+    let data: Vec<LedgerEntry> = rows
+        .into_iter()
+        .map(|e| {
+            let is_credential = e.reason == "credential_issuance";
+            LedgerEntry {
+                id: e.id,
+                delta: e.delta,
+                reason: e.reason,
+                expires_at: e.expires_at.and_then(|t| system_time_to_iso(t).ok()),
+                created_at: system_time_to_iso(e.created_at).unwrap_or_default(),
+                credential_key_id: if is_credential {
+                    e.credential_key_id.map(|id| id.to_string())
+                } else {
+                    None
+                },
+                credential_credits: if is_credential {
+                    e.credential_credits
+                } else {
+                    None
+                },
+            }
+        })
+        .collect();
+
+    Ok(Json(LedgerResponse { data }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stripe::{Subscription, SubscriptionItem, SubscriptionItems};
+
+    /// One handler's source, from its signature to the next item at column
+    /// zero. The seam the two ordering/absence scans below share.
+    fn handler_body(signature: &str) -> &'static str {
+        let source = include_str!("account.rs");
+        let start = source.find(signature).expect("the handler");
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\npub ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        &body[..end]
+    }
+
+    fn in_force_sub(period_end: i64) -> Subscription {
+        Subscription {
+            id: "sub_1".to_string(),
+            status: "active".to_string(),
+            items: SubscriptionItems {
+                data: vec![SubscriptionItem {
+                    current_period_end: period_end,
+                }],
+            },
+        }
+    }
+
+    /// The subscription read must not mint a billing-portal session.
+    ///
+    /// This seam came back three times. Coupling the two calls with
+    /// `try_join!` made a failed portal mint destroy the answer; `join!`
+    /// fixed the error path and left the **latency** — both futures are
+    /// still awaited, so a slow (not failing) mint holds the standing, and
+    /// for that whole time the Account pane shows "unknown" and offers
+    /// recurring plans to a live subscriber. Only removing the call makes
+    /// the standing independent of the portal.
+    ///
+    /// A source scan because there is no other seam: the handler needs a
+    /// database, and what is being asserted is the *absence* of a call.
+    #[test]
+    fn the_subscription_read_mints_no_portal_session() {
+        let body = handler_body("pub async fn get_subscription(");
+        assert!(
+            !body.contains("create_portal_session"),
+            "get_subscription must not mint a portal session — minting is a \
+             Stripe write whose latency the standing would then wait on; it \
+             lives at POST /v1/account/portal"
+        );
+        assert!(
+            body.contains("in_force_subscription"),
+            "sanity: the scan found the right function body"
+        );
+    }
+
+    /// The portal must not put a Stripe round trip in front of an answer the
+    /// ledger already holds.
+    ///
+    /// `||` short-circuits left to right, so the *order* of the two operands
+    /// is the whole behavior: with the subscription walk first, every
+    /// returning customer paid for a remote call whose result could not
+    /// change the outcome, and a slow or failing `/subscriptions` withheld
+    /// their billing portal while the portal itself was healthy.
+    ///
+    /// A source scan for the same reason as the sibling below: the handler
+    /// needs a database, and what is asserted is an ordering, not a value.
+    #[test]
+    fn the_portal_asks_the_ledger_before_it_asks_stripe() {
+        let body = handler_body("pub async fn create_portal_session(");
+        let ledger = body
+            .find("has_stripe_ledger_history")
+            .expect("the ledger check");
+        let stripe = body
+            .find("in_force_subscription")
+            .expect("the subscription walk");
+        assert!(
+            ledger < stripe,
+            "the local answer must be evaluated first — `||` short-circuits, \
+             so putting the walk first spends a Stripe round trip on every \
+             customer whose ledger already settles it"
+        );
+    }
+
+    #[test]
+    fn the_standing_carries_the_subscription_and_nothing_else() {
+        let answer = subscription_standing(Some(in_force_sub(1_900_000_000)), true);
+        assert_eq!(answer.state, "active");
+        assert_eq!(answer.status.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn the_billing_period_reaches_the_wire_from_the_subscriptions_items() {
+        let answer = subscription_standing(Some(in_force_sub(0)), true);
+        assert_eq!(
+            answer.current_period_end.as_deref(),
+            Some("1970-01-01T00:00:00Z"),
+            "the period must survive the trip from items.data onto the wire"
+        );
+    }
+
+    #[test]
+    fn a_customer_record_with_no_money_behind_it_is_not_a_relationship() {
+        // Checkout persists the customer before validating the price or
+        // taking payment, so an abandoned session leaves one with nothing
+        // under it. "Billing and receipts" for that reader is a door onto an
+        // empty room.
+        let answer = subscription_standing(None, false);
+        assert_eq!(answer.state, "none");
+    }
+
+    #[test]
+    fn a_real_payment_history_reads_as_lapsed_rather_than_absent() {
+        let answer = subscription_standing(None, true);
+        assert_eq!(answer.state, "inactive");
+    }
+
+    fn doc(document: &str, version: i64) -> db::RequiredDocumentRow {
+        db::RequiredDocumentRow {
+            document: document.to_string(),
+            version,
+            sha256: "a".repeat(64),
+            url: format!("https://www.eidola.ai/{document}/"),
+        }
+    }
+
+    #[test]
+    fn no_required_documents_means_nothing_missing() {
+        assert!(missing_documents(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn unaccepted_documents_are_missing() {
+        let required = [doc("terms_of_service", 1)];
+        assert_eq!(missing_documents(&required, &[]), vec!["terms_of_service"]);
+    }
+
+    #[test]
+    fn acceptance_of_current_version_satisfies() {
+        let required = [doc("terms_of_service", 2)];
+        let accepted = [("terms_of_service".to_string(), 2)];
+        assert!(missing_documents(&required, &accepted).is_empty());
+    }
+
+    #[test]
+    fn acceptance_of_newer_version_satisfies_a_lagging_requirement() {
+        // The cross-instance skew case: the user accepted version 6 via a
+        // fresh instance; this instance still requires version 5.
+        let required = [doc("terms_of_service", 5)];
+        let accepted = [("terms_of_service".to_string(), 6)];
+        assert!(missing_documents(&required, &accepted).is_empty());
+    }
+
+    #[test]
+    fn acceptance_of_old_version_does_not_satisfy() {
+        let required = [doc("terms_of_service", 3)];
+        let accepted = [("terms_of_service".to_string(), 2)];
+        assert_eq!(
+            missing_documents(&required, &accepted),
+            vec!["terms_of_service"]
+        );
+    }
+
+    #[test]
+    fn each_document_is_gated_independently() {
+        let required = [doc("terms_of_service", 1), doc("privacy_policy", 1)];
+        let accepted = [("terms_of_service".to_string(), 1)];
+        assert_eq!(
+            missing_documents(&required, &accepted),
+            vec!["privacy_policy"]
+        );
+    }
+}

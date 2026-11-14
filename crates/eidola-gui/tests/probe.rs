@@ -10,10 +10,14 @@
 
 use std::sync::{Mutex, MutexGuard};
 
+#[path = "support/backing.rs"]
+mod backing;
+use backing::Backing;
+
 use eidola_app_core::error::AppError;
 use eidola_app_core::{
-    AttestationInfo, BalancesResult, ConfigState, ModelInfo, PostBlock, PostNode, PostParticipant,
-    PriceInfo, RequestInfo, SpendTrailEntry,
+    AttestationInfo, BalancesResult, ConfigState, ModelCapabilities, ModelInfo, PostBlock,
+    PostNode, PostParticipant, PriceInfo, RequestInfo, SpendTrailEntry,
 };
 use eidola_app_core::{
     ParticipantInfo, ParticipantReference, SpaceTemplateInfo, TemplateParticipantInfo,
@@ -417,13 +421,13 @@ fn appearance_and_text_size_chips_carry_their_group(cx: &mut TestAppContext) {
         gpui::Role::Button,
         "Larger text, currently 100%",
     );
-    // The login-item switch is a `Switch` with no node of its own; the
-    // probed wrapper is the control, and its name has to be self-contained
-    // (the "Open at login" field label is a node-less `div`).
+    // The login-item `Switch` is its own node (the wrapper is bounds-only),
+    // and its name has to be self-contained (the "Open at login" field label
+    // is a node-less `div`).
     assert_probe(
         &entries,
         "settings/general/login-item",
-        gpui::Role::CheckBox,
+        gpui::Role::Switch,
         "Open Eidola at login",
     );
 
@@ -690,6 +694,68 @@ fn a_stale_transcript_says_so_where_the_reader_is(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// Two pieces of chrome over the document's top must not stand in the same
+/// place. The stale-read strip is painted *after* the find bar, so overlapping
+/// it would not merely look wrong — the strip's centred pill wins the hit test
+/// over the query field beneath it, leaving part of the find controls
+/// unclickable for a reader who just asked to search.
+#[gpui::test]
+fn a_stale_read_strip_stands_clear_of_the_find_bar(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = probe_post("a2", "a kestrel hovers over the verge");
+    a2.parent_action_id = Some("a1".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "about the kestrel"), a2], cx);
+            s.fail_transcript_refresh_for_test(cx);
+        });
+    });
+    draw(cx, window);
+
+    let before = fresh_entries(cx, window)
+        .iter()
+        .find(|(n, _)| n == "space/transcript/refresh-retry")
+        .map(|(_, e)| e.bounds)
+        .expect("the strip paints over a stale transcript");
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    let entries = fresh_entries(cx, window);
+    let strip = entries
+        .iter()
+        .find(|(n, _)| n == "space/transcript/refresh-retry")
+        .map(|(_, e)| e.bounds)
+        .expect("the strip is still standing");
+    let field = entries
+        .iter()
+        .find(|(n, _)| n == "space/find/field")
+        .map(|(_, e)| e.bounds)
+        .expect("the find field paints");
+
+    assert!(
+        strip.origin.y > before.origin.y,
+        "the strip moved down by the bar the reserve grew: {before:?} → {strip:?}"
+    );
+    assert!(
+        strip.origin.y >= field.bottom(),
+        "the strip must begin below the find controls: strip {strip:?}, field {field:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn a_streaming_reply_is_not_an_article(cx: &mut TestAppContext) {
     // The §4 trap: a value bound to streaming text makes assistive technology
@@ -828,6 +894,11 @@ fn account_balance_pools_and_plan_sublines_carry_their_values(cx: &mut TestAppCo
             product_description: None,
             amount_display: "$5".into(),
             recurrence: "".into(),
+            amount: Some(eidola_app_core::PriceAmount {
+                minor_units: 500,
+                currency: "USD".into(),
+            }),
+            cadence: eidola_app_core::PriceCadence::OneTime,
             credits: 5_000_000,
         }];
         s.backends = backends_fixture();
@@ -1061,9 +1132,9 @@ fn probe_eidola_trust() -> eidola_app_core::EidolaTrust {
         trusted_measurements: Vec::new(),
         trusted_measurements_are_override: false,
         pinned_measurement: eidola_app_core::MeasurementInfo {
-            snp: "1122334455667788112233445566778811223344556677881122334455667788".into(),
-            tdx_rtmr1: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
-            tdx_rtmr2: "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa".into(),
+            measurement: "112233445566778811223344556677881122334455667788112233445566778811223344556677881122334455667788".into(),
+            host_data: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+            guest_policy: "0x30133".into(),
         },
         has_hardware_root_ca: false,
         hardware_root_ca_pem: None,
@@ -1083,21 +1154,36 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
         s.models = vec![
             ModelInfo {
                 id: "gemma4-31b".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 0.53,
                 completion_credits_per_token: 1.5,
                 request_credits: None,
             },
             ModelInfo {
                 id: "kimi-k2-6".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 262_144,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 3.0,
                 completion_credits_per_token: 9.0,
                 request_credits: None,
             },
             ModelInfo {
                 id: "qwen3-coder-watt".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 1.05,
                 completion_credits_per_token: 5.25,
                 request_credits: None,
@@ -1109,7 +1195,15 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
                 product_name: "Monthly".into(),
                 product_description: Some("Recurring top-up".into()),
                 amount_display: "$10".into(),
-                recurrence: "/mo".into(),
+                recurrence: "/month".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 1000,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 1,
+                },
                 credits: 10_000_000,
             },
             PriceInfo {
@@ -1118,6 +1212,11 @@ fn ready_stores(cx: &mut TestAppContext) -> Stores {
                 product_description: None,
                 amount_display: "$5".into(),
                 recurrence: "".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 500,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::OneTime,
                 credits: 5_000_000,
             },
         ];
@@ -1134,6 +1233,23 @@ fn space_info(id: &str, title: Option<&str>) -> eidola_app_core::SpaceInfo {
         last_activity_at: ts,
         message_count: 4,
         archived_at: None,
+        parent: None,
+    }
+}
+
+/// A listing row for a conversation an agent opened from another one.
+fn delegated_space_info(
+    id: &str,
+    title: &str,
+    parent_id: &str,
+    parent_title: Option<&str>,
+) -> eidola_app_core::SpaceInfo {
+    eidola_app_core::SpaceInfo {
+        parent: Some(eidola_app_core::SpaceParent {
+            space_id: parent_id.into(),
+            title: parent_title.map(String::from),
+        }),
+        ..space_info(id, Some(title))
     }
 }
 
@@ -1518,6 +1634,8 @@ fn probe_post(action_id: &str, text: &str) -> PostNode {
         }],
         references: Vec::new(),
         created_at: 0,
+        truncated: false,
+        continuable: false,
     }
 }
 
@@ -1616,6 +1734,570 @@ fn onboarding_probes_record_ctas_and_inputs(cx: &mut TestAppContext) {
         names.contains(&"onboarding/plan/0"),
         "onboarding plan-row probe missing; recorded: {names:?}"
     );
+}
+
+#[gpui::test]
+fn onboarding_consent_slide_links_the_documents_it_will_submit(cx: &mut TestAppContext) {
+    // The consent slide's links are the *server's* current snapshot, not
+    // constants: creation submits exactly those `(document, sha256)` pairs, so
+    // a link that named a different document than the one being agreed to
+    // would be the whole defect. The probe name comes from the document key
+    // (stable), the label carries the version (which moves).
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    stores.account.update(cx, |s, cx| {
+        s.set_terms_for_test(
+            eidola_gui::loadable::Loadable::loaded(vec![eidola_app_core::TermsDocument {
+                document: "privacy_policy".into(),
+                version: 7,
+                url: "https://example.invalid/privacy/".into(),
+                sha256: "b".repeat(64),
+            }]),
+            cx,
+        );
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::CreateAccount, cx);
+    });
+    draw(cx, window);
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let link = entries
+        .iter()
+        .find(|(n, _)| n == "onboarding/link/privacy-policy")
+        .unwrap_or_else(|| {
+            let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+            panic!("the required document's link probe is missing; recorded: {names:?}")
+        });
+    assert!(
+        link.1.label.contains("Privacy Policy") && link.1.label.contains("version 7"),
+        "the link must name the exact version acceptance will be recorded for; got {:?}",
+        link.1.label
+    );
+}
+
+/// **The consent surface speaks the reader's language — labels included.**
+///
+/// This is the one screen in the app where somebody affirms something, and the
+/// accessible name *is* the localized string: an English literal beside a
+/// translated accessor is invisible in English and audible everywhere else.
+/// So the locale is switched with nothing re-emitted and the recorded labels
+/// are read again.
+///
+/// The two document titles deliberately do **not** move: they are the published
+/// names of the texts being agreed to, and the name a reader will find at the
+/// other end of the link. Only the sentence around them localizes.
+#[gpui::test]
+fn the_consent_surface_speaks_the_readers_language(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    stores.account.update(cx, |s, cx| {
+        s.set_terms_for_test(
+            eidola_gui::loadable::Loadable::loaded(vec![eidola_app_core::TermsDocument {
+                document: "privacy_policy".into(),
+                version: 7,
+                url: "https://example.invalid/privacy/".into(),
+                sha256: "b".repeat(64),
+            }]),
+            cx,
+        );
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::CreateAccount, cx);
+    });
+
+    for (tag, consent, create, document) in [
+        (
+            "en",
+            "I agree to the Terms of Service and Privacy Policy.",
+            "Create a new account.",
+            "Privacy Policy (version 7)",
+        ),
+        (
+            "fr",
+            "J'accepte les Terms of Service et la Privacy Policy.",
+            "Créer un nouveau compte.",
+            "Privacy Policy (version 7)",
+        ),
+        (
+            "zh-Hant",
+            "我同意 Terms of Service 與 Privacy Policy。",
+            "建立一個新帳戶。",
+            "Privacy Policy（版本 7）",
+        ),
+        (
+            "en",
+            "I agree to the Terms of Service and Privacy Policy.",
+            "Create a new account.",
+            "Privacy Policy (version 7)",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        assert_probe(&entries, "onboarding/agree", gpui::Role::CheckBox, consent);
+        assert_probe(
+            &entries,
+            "onboarding/cta/create",
+            gpui::Role::Button,
+            create,
+        );
+        assert_probe(
+            &entries,
+            "onboarding/link/privacy-policy",
+            gpui::Role::Link,
+            document,
+        );
+    }
+}
+
+/// **A localized slide localizes the shared component inside it.**
+///
+/// The Purchase slide's payment choices come from `plans::plan_rows`, which
+/// used to hard-code its list name, its in-flight price line and both expiry
+/// disclosures — so a reader who had just read four French slides met English
+/// where the money is. The rows now take the locale their host names, read
+/// again after a switch with nothing re-emitted.
+#[gpui::test]
+fn the_purchase_slides_plans_speak_the_readers_language(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::ExistingAccount, cx);
+        v.reveal(Slide::ExistingAccount, Slide::Purchase, cx);
+    });
+
+    // Each row: the list's name, the recurring row's own name (the cadence,
+    // which app-core hands over as data and this layer words) and subline, and
+    // the one-time row's subline.
+    for (tag, list, recurring_name, recurring, one_time) in [
+        (
+            "en",
+            "Available plans",
+            "Monthly — $10/month",
+            "10,000,000 credits, expire at the end of each billing period — Recurring top-up",
+            "5,000,000 credits, expire one year after purchase",
+        ),
+        (
+            "fr",
+            "Formules disponibles",
+            "Monthly — $10/mois",
+            "10,000,000 crédits, expirent à la fin de chaque période de facturation — Recurring \
+             top-up",
+            "5,000,000 crédits, expirent un an après l'achat",
+        ),
+        (
+            "zh-Hans",
+            "可选方案",
+            "Monthly — $10/月",
+            "10,000,000 点额度，在每个计费周期结束时过期 —— Recurring top-up",
+            "5,000,000 点额度，自购买之日起一年后过期",
+        ),
+        (
+            "en",
+            "Available plans",
+            "Monthly — $10/month",
+            "10,000,000 credits, expire at the end of each billing period — Recurring top-up",
+            "5,000,000 credits, expire one year after purchase",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        assert_probe(&entries, "onboarding/plans", gpui::Role::ListBox, list);
+        // The rows are ordered as the fixture lists them: the recurring plan,
+        // then the one-time top-up.
+        assert_probe_value(
+            &entries,
+            "onboarding/plan/0",
+            gpui::Role::ListBoxOption,
+            recurring_name,
+            recurring,
+        );
+        assert_probe_value(
+            &entries,
+            "onboarding/plan/1",
+            gpui::Role::ListBoxOption,
+            // A one-time price has no cadence to say, so its line is the
+            // amount alone — the same in every locale.
+            "One-time — $5",
+            one_time,
+        );
+    }
+}
+
+/// **The cadence is data across the boundary and words on this side.**
+///
+/// `PriceInfo::recurrence` is English composed in app-core (`/month`), so every
+/// recurring row ended in English inside a fully localized slide. The typed
+/// `PriceCadence` crosses instead and this layer words it — including a free
+/// price, whose amount app-core spells as the word "free", and a cadence this
+/// build has never seen, which still has to say something.
+#[gpui::test]
+fn the_plan_cadence_and_the_free_price_speak_the_readers_language(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.prices = vec![
+            eidola_app_core::PriceInfo {
+                id: "price_quarterly".into(),
+                product_name: "Quarterly".into(),
+                product_description: None,
+                amount_display: "27.00 USD".into(),
+                recurrence: "/3xmonth".into(),
+                credits: 30_000_000,
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 2_700,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 3,
+                },
+            },
+            eidola_app_core::PriceInfo {
+                id: "price_free".into(),
+                product_name: "Sampler".into(),
+                product_description: None,
+                // What app-core spells for a price with no amount.
+                amount_display: "free".into(),
+                recurrence: String::new(),
+                credits: 1_000,
+                amount: None,
+                cadence: eidola_app_core::PriceCadence::OneTime,
+            },
+            eidola_app_core::PriceInfo {
+                id: "price_odd".into(),
+                product_name: "Fortnightly".into(),
+                product_description: None,
+                amount_display: "4.00 USD".into(),
+                recurrence: "/fortnight".into(),
+                credits: 4_000,
+                // An interval name this build has never heard of: the reader is
+                // still owed a cadence, so the catch-all says it with the
+                // upstream's own word.
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 400,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "fortnight".into(),
+                    count: 1,
+                },
+            },
+        ];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::ExistingAccount, cx);
+        v.reveal(Slide::ExistingAccount, Slide::Purchase, cx);
+    });
+
+    for (tag, quarterly, free, odd) in [
+        (
+            "en",
+            "Quarterly — 27.00 USD every 3 months",
+            "Sampler — Free",
+            "Fortnightly — 4.00 USD/fortnight",
+        ),
+        (
+            "fr",
+            "Quarterly — 27.00 USD tous les 3 mois",
+            "Sampler — Gratuit",
+            "Fortnightly — 4.00 USD/fortnight",
+        ),
+        (
+            "zh-Hans",
+            "Quarterly — 每 3 个月 27.00 USD",
+            "Sampler — 免费",
+            "Fortnightly — 4.00 USD/fortnight",
+        ),
+        (
+            "en",
+            "Quarterly — 27.00 USD every 3 months",
+            "Sampler — Free",
+            "Fortnightly — 4.00 USD/fortnight",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        for (name, expected) in [
+            ("onboarding/plan/0", quarterly),
+            ("onboarding/plan/1", free),
+            ("onboarding/plan/2", odd),
+        ] {
+            let (_, entry) = entries
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(
+                entry.label.as_ref(),
+                expected,
+                "{tag}: {name} must say what it costs and how often"
+            );
+        }
+    }
+}
+
+/// **One credit is one credit, and a request in flight says so.**
+///
+/// The credits line used to be a number with `" credits, "` and an expiry
+/// clause appended, which reads "1 credits" and cannot inflect in any other
+/// language; it is one sentence per plan kind now, agreeing with the count.
+/// The pending price line is the other string the shared component used to
+/// hard-code.
+#[gpui::test]
+fn a_single_credit_reads_as_one_and_a_pending_plan_says_it_is_opening(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.prices = vec![
+            eidola_app_core::PriceInfo {
+                id: "price_one".into(),
+                product_name: "A single credit".into(),
+                product_description: None,
+                amount_display: "$0.01".into(),
+                recurrence: String::new(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 1,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::OneTime,
+                credits: 1,
+            },
+            eidola_app_core::PriceInfo {
+                id: "price_many".into(),
+                product_name: "Many".into(),
+                product_description: None,
+                amount_display: "$5".into(),
+                recurrence: String::new(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 500,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::OneTime,
+                credits: 2,
+            },
+        ];
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::ExistingAccount, cx);
+        v.reveal(Slide::ExistingAccount, Slide::Purchase, cx);
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "onboarding/plan/0",
+        gpui::Role::ListBoxOption,
+        "A single credit — $0.01",
+        "1 credit, expires one year after purchase",
+    );
+    assert_probe_value(
+        &entries,
+        "onboarding/plan/1",
+        gpui::Role::ListBoxOption,
+        "Many — $5",
+        "2 credits, expire one year after purchase",
+    );
+
+    // A checkout request is out for the first plan: its price line says so, in
+    // the reader's language, and the other row is untouched.
+    view.update(cx, |v, cx| v.begin_checkout("price_one".into(), cx));
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "onboarding/plan/0",
+        gpui::Role::ListBoxOption,
+        "A single credit — Ouverture du paiement…",
+        "1 crédit, expire un an après l'achat",
+    );
+    assert_probe_value(
+        &entries,
+        "onboarding/plan/1",
+        gpui::Role::ListBoxOption,
+        "Many — $5",
+        "2 crédits, expirent un an après l'achat",
+    );
+}
+
+/// **The Account pane's rows stay English while its page does.**
+///
+/// The other half of the caller-supplied rule: a shared component that
+/// localized unconditionally would put translated plan rows inside an
+/// otherwise-English Settings page — the failure the wholesale-menu rule names.
+/// `PlanLabels::english()` pins them, and this is what an accidental
+/// `localized(cx)` there would fail.
+#[gpui::test]
+fn the_account_panes_plans_stay_english_with_its_page(cx: &mut TestAppContext) {
+    use eidola_gui::account::AccountView;
+
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| AccountView::new(stores, window, cx))
+    });
+
+    for tag in ["en", "fr", "zh-Hans"] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        assert_probe(
+            &entries,
+            "settings/account/plans",
+            gpui::Role::ListBox,
+            "Available plans",
+        );
+        assert_probe_value(
+            &entries,
+            "settings/account/plan/1",
+            gpui::Role::ListBoxOption,
+            "One-time — $5",
+            "5,000,000 credits, expire one year after purchase",
+        );
+    }
+}
+
+/// **A probe name is a selector, so it does not move with the reader.**
+///
+/// The credential rows used to derive both their probe names and their element
+/// ids from their labels, which was harmless while the labels were `&'static
+/// str` and a defect the moment they localized: a driver selector translated
+/// per locale, and a per-element identity — hence an accessibility node id —
+/// reminted on a language change. The names are keyed by the row now; only the
+/// labels follow the reader.
+#[gpui::test]
+fn the_credential_rows_keep_their_names_and_localize_their_labels(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::CreateAccount, cx);
+        v.reveal(Slide::CreateAccount, Slide::NewAccount, cx);
+    });
+
+    for (tag, id_copy, secret_copy) in [
+        ("en", "Copy Account ID", "Copy Account Secret"),
+        (
+            "fr",
+            "Copier Identifiant du compte",
+            "Copier Secret du compte",
+        ),
+        ("en", "Copy Account ID", "Copy Account Secret"),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        assert_probe(
+            &entries,
+            "onboarding/copy/account-id",
+            gpui::Role::Button,
+            id_copy,
+        );
+        assert_probe(
+            &entries,
+            "onboarding/copy/account-secret",
+            gpui::Role::Button,
+            secret_copy,
+        );
+        // And the input rows on the other branch, whose element ids used to
+        // carry a label too.
+        assert!(
+            entries
+                .iter()
+                .all(|(name, _)| name.is_ascii() && !name.contains(' ')),
+            "{tag}: a probe name must stay a stable slash-scoped selector; recorded: {:?}",
+            entries.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// **The quiet third choice says one thing, once.** Its visible sentence and
+/// its accessible name used to differ by a full stop — the failure the a11y
+/// rule names, invisible in English. One message serves both, and the label
+/// follows the reader.
+#[gpui::test]
+fn the_account_free_choice_reads_the_same_to_everyone(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+    });
+
+    for (tag, label) in [
+        ("en", "Continue without an account — on-device models only."),
+        (
+            "fr",
+            "Continuer sans compte — modèles sur l'appareil uniquement.",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        let entries = fresh_entries(cx, window);
+        assert_probe(
+            &entries,
+            "onboarding/cta/skip-account",
+            gpui::Role::Button,
+            label,
+        );
+        assert_probe(&entries, "onboarding/back/1", gpui::Role::Button, {
+            if tag == "en" {
+                "Go to the previous slide"
+            } else {
+                "Aller à la diapositive précédente"
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1811,8 +2493,8 @@ fn the_credential_fields_and_their_suffix_controls_are_each_one_node(cx: &mut Te
     // `Input` carries the label and is the node, its wrapper is bounds-only —
     // and the controls sitting in the secret field's suffix follow the hoist:
     // a probed wrapper is the control, so each is a named, reachable node
-    // rather than a presentational widget nobody can get to. `.role(None)` on
-    // the widgets alone would satisfy the source scan while deleting these
+    // rather than a presentational widget nobody can get to.
+    // `.role(RoleOverride::Presentational)` on the widgets alone would satisfy the source scan while deleting these
     // from the tree, which is precisely what this test refuses.
     let _guard = probes_on();
 
@@ -2166,7 +2848,15 @@ fn account_backends_stores(cx: &mut TestAppContext) -> Stores {
                 product_name: "Monthly".into(),
                 product_description: Some("Recurring top-up".into()),
                 amount_display: "$10".into(),
-                recurrence: "/mo".into(),
+                recurrence: "/month".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 1000,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 1,
+                },
                 credits: 10_000_000,
             },
             PriceInfo {
@@ -2175,6 +2865,11 @@ fn account_backends_stores(cx: &mut TestAppContext) -> Stores {
                 product_description: None,
                 amount_display: "$5".into(),
                 recurrence: "".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 500,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::OneTime,
                 credits: 5_000_000,
             },
         ];
@@ -2930,9 +3625,9 @@ fn eidola_trust_surface_probes_cover_editor_and_overrides(cx: &mut TestAppContex
     trust.base_url = "https://staging.eidola.example/v1".into();
     trust.base_url_is_override = true;
     trust.trusted_measurements = vec![eidola_app_core::MeasurementInfo {
-        snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
-        tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-        tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".into(),
+        measurement: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f89d2bb3ef58af1e7c0c12f3b4a5d6e7f8".into(),
+        host_data: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        guest_policy: "0x30133".into(),
     }];
     trust.trusted_measurements_are_override = true;
     // Root CA overridden (with a viewable PEM) so the view/copy + Clear verbs
@@ -3128,6 +3823,61 @@ fn eidola_pinned_measurement_copyable_not_untrustable(cx: &mut TestAppContext) {
     probe::set_probes_enabled(false);
 }
 
+/// **One pointer press, one Space, one Enter: one activation each.** The
+/// add form's auto-start `Switch` flips its state rather than setting it, so a
+/// second handler answering the same press (a wrapper beside the widget) reads
+/// as no change, and a widget the keyboard cannot reach reads as no change too.
+#[gpui::test]
+fn backends_add_form_switch_activates_once_per_press_and_key(cx: &mut TestAppContext) {
+    use eidola_gui::backends_settings::{AddKind, BackendsSettingsView, BackendsTab};
+    use gpui::{Modifiers, VisualTestContext};
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.backends = backends_fixture();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| BackendsSettingsView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| v.select_tab(BackendsTab::External, cx));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_add(AddKind::LlamaCpp, window, cx));
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    let (_, control) = entries
+        .iter()
+        .find(|(n, _)| n == "settings/backends/add/autostart")
+        .expect("the add form's auto-start switch painted");
+    // The track sits at the row's leading edge; press it, not the label.
+    let track = gpui::point(
+        control.bounds.origin.x + gpui::px(8.),
+        control.bounds.origin.y + gpui::px(8.),
+    );
+    let auto_start = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, _| v.add_auto_start_for_test())
+            .expect("the form is open")
+    };
+    assert!(auto_start(cx), "precondition: auto-start begins on");
+
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_click(track, Modifiers::default());
+    vcx.run_until_parked();
+    assert!(!auto_start(cx), "one press flips the switch exactly once");
+
+    activate_with(cx, window, "space");
+    assert!(
+        auto_start(cx),
+        "Space flips the focused switch exactly once"
+    );
+
+    press_enter(cx, window);
+    assert!(
+        !auto_start(cx),
+        "Enter flips the focused switch exactly once"
+    );
+}
+
 #[gpui::test]
 fn backends_pane_add_form_probes_appear_per_kind(cx: &mut TestAppContext) {
     use eidola_gui::backends_settings::{AddKind, BackendsSettingsView, BackendsTab};
@@ -3202,6 +3952,7 @@ fn probe_participants() -> (String, Vec<ParticipantInfo>) {
         // must map it back to "You" through the shared presentation rule.
         label: "User".into(),
         model_ref: None,
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "explicit".into(),
         role: "member".into(),
@@ -3223,6 +3974,7 @@ fn probe_participants() -> (String, Vec<ParticipantInfo>) {
         kind: "agent".into(),
         label: "Assistant".into(),
         model_ref: Some("gemma4-31b".into()),
+        model_notices: Vec::new(),
         system_prompt: Some("Be concise.".into()),
         notify_policy: "human".into(),
         role: "member".into(),
@@ -3238,6 +3990,68 @@ fn open_participants_inspector(
 ) -> (AnyWindowHandle, Entity<eidola_gui::space_view::SpaceView>) {
     let stores = participants_inspector_stores(cx);
     open_participants_inspector_with(cx, stores)
+}
+
+/// **A model choice's notices sit on the participant's row**, closed or
+/// open, each as a labelled line: a followed tag that moved, a pin with newer
+/// weights, a retirement announced or passed, retired weights. A notice found
+/// only by opening an editor is not given.
+#[gpui::test]
+fn space_inspector_a_participants_model_notices_are_on_its_row(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    let _guard = probes_on();
+    let (space, mut roster) = probe_participants();
+    roster[1].model_notices = vec![
+        ModelNotice::Updated {
+            tag: "gemma4-31b".into(),
+            previous_sha256: "1".repeat(64),
+            current_sha256: "2".repeat(64),
+        },
+        ModelNotice::NewerAvailable {
+            tag: "gemma4-31b".into(),
+            newer_sha256: "3".repeat(64),
+        },
+        ModelNotice::Retiring {
+            retire_after: "2027-06-01".into(),
+            past: false,
+        },
+        ModelNotice::Retiring {
+            retire_after: "2026-01-01".into(),
+            past: true,
+        },
+        ModelNotice::Retired,
+    ];
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some((space, roster));
+    });
+    let (window, _view) = open_participants_inspector_with(cx, stores);
+    let entries = fresh_entries(cx, window);
+    for (i, label) in [
+        "Model updated: gemma4-31b now names newer weights.",
+        "Newer weights are available as gemma4-31b. This agent stays on the ones it is pinned to.",
+        "These weights retire after 2027-06-01.",
+        "These weights were due to retire on 2026-01-01. Choose another model.",
+        "These weights are retired. Choose another model.",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_probe(
+            &entries,
+            &format!("space/inspector/participants/agent-1/notice/{i}"),
+            gpui::Role::Label,
+            label,
+        );
+    }
+    // A participant with nothing to be told gets no line.
+    assert!(
+        !entries.iter().any(|(n, _)| n.starts_with(&format!(
+            "space/inspector/participants/{}/notice/",
+            eidola_app_core::HUMAN_PARTICIPANT_ID
+        ))),
+        "the human has no model and no notice"
+    );
 }
 
 /// **A notebook's owner carries no Remove** (task 36; Codex review, PR #279).
@@ -4054,6 +4868,327 @@ fn same_name_on_two_backends() -> eidola_app_core::LocalModelsState {
 /// tree, and two backends serving the same model name give a screen reader two
 /// rows it cannot tell apart. On the router picker that ambiguity is also the
 /// billing difference. One helper serves both pickers, so this pins both.
+/// The Eidola model fixture the identity and pin probes read: one tag that
+/// has moved onto newer weights.
+const PICKER_HASH: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const PICKER_FILES: &[eidola_app_core::model_catalog::WeightsFile] =
+    &[eidola_app_core::model_catalog::WeightsFile {
+        path: "model.safetensors",
+        size: 9,
+        sha256: "5555555555555555555555555555555555555555555555555555555555555555",
+    }];
+const PICKER_CATALOG: &[eidola_app_core::model_catalog::CatalogRow] =
+    &[eidola_app_core::model_catalog::CatalogRow {
+        sha256: PICKER_HASH,
+        tags: &["gemma4-31b"],
+        name: "Gemma 4 31B",
+        repo: "example/fixture",
+        revision: "6666666666666666666666666666666666666666",
+        files: PICKER_FILES,
+        lifecycle: eidola_app_core::model_catalog::Lifecycle::Current,
+    }];
+
+/// **The picker can pin, and says what it pins to.** Beside following an
+/// Eidola tag, each model the catalog publishes a hash for is offered pinned
+/// to those weights (stored `tag@sha256:<hex>@eidola`, shown with the start
+/// of the hash); and the field shows the chosen model's weights hash, its
+/// source and where to check it. A notice with an action carries its button
+/// on the row.
+#[gpui::test]
+fn the_model_picker_offers_a_pin_and_shows_the_weights(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    let _guard = probes_on();
+    let (space, mut roster) = probe_participants();
+    roster[1].model_notices = vec![
+        ModelNotice::NewerAvailable {
+            tag: "gemma4-31b".into(),
+            newer_sha256: PICKER_HASH.into(),
+        },
+        ModelNotice::Updated {
+            tag: "gemma4-31b".into(),
+            previous_sha256: "1".repeat(64),
+            current_sha256: PICKER_HASH.into(),
+        },
+    ];
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some((space, roster));
+        s.space_settings = Some(("demo".into(), eidola_app_core::SpaceSettings::default()));
+        s.model_catalog = PICKER_CATALOG;
+        s.models = vec![
+            ModelInfo {
+                id: format!("sha256:{}", "3".repeat(64)),
+                sha256: Some("3".repeat(64)),
+                tags: Vec::new(),
+                context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
+                prompt_credits_per_token: 0.53,
+                completion_credits_per_token: 1.5,
+                request_credits: None,
+            },
+            ModelInfo {
+                id: "gemma4-31b".into(),
+                sha256: Some(PICKER_HASH.into()),
+                tags: vec!["gemma4-31b".into()],
+                context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
+                prompt_credits_per_token: 0.53,
+                completion_credits_per_token: 1.5,
+                request_credits: None,
+            },
+        ];
+    });
+    let (window, view) = open_participants_inspector_with(cx, stores);
+
+    // The notices' actions sit on the row.
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/inspector/participants/agent-1/notice/0/switch",
+        gpui::Role::Button,
+        "Switch Assistant to the newer weights",
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/participants/agent-1/notice/1/dismiss",
+        gpui::Role::Button,
+        "Dismiss the model update for Assistant",
+    );
+
+    // The add form's picker: follow, or pin to these weights.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_begin_add_participant(window, cx);
+            v.inspector_open_add_picker_for_test(cx);
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    let options: Vec<String> = entries
+        .iter()
+        .filter(|(n, _)| n.starts_with("space/inspector/participants/add/model/option/"))
+        .map(|(_, e)| e.label.to_string())
+        .collect();
+    assert!(
+        options.iter().any(|l| l.starts_with("gemma4-31b · ")),
+        "following the tag is offered: {options:?}"
+    );
+    assert!(
+        options
+            .iter()
+            .any(|l| l.starts_with("gemma4-31b, pinned to 222222222222… · ")),
+        "pinning those weights is offered: {options:?}"
+    );
+    // A model listed by its hash alone is offered as itself, never as a
+    // second, unparseable pin of the hash.
+    assert!(
+        !options
+            .iter()
+            .any(|l| l.starts_with("sha256:") && l.contains("pinned")),
+        "no pin of a hash-only listing: {options:?}"
+    );
+    assert_eq!(
+        options.len(),
+        3,
+        "the hash-only model, the tag, and the tag's pin: {options:?}"
+    );
+    // Following the tag shows the weights it resolves to.
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_select_participant_model("gemma4-31b", cx)
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/inspector/participants/add/model/weights",
+        gpui::Role::Label,
+        "Weights 222222222222… from example/fixture@6666666",
+    );
+    assert_probe(
+        &entries,
+        "space/inspector/participants/add/model/verify",
+        gpui::Role::Label,
+        "Check these weights yourself: https://www.eidola.ai/docs/model-identity/",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The pin a switch of `gemma4-31b` to [`PICKER_HASH`] writes.
+fn switched_pin() -> String {
+    format!("gemma4-31b@sha256:{PICKER_HASH}@eidola")
+}
+
+/// **An open editor follows a switch to newer weights, once it has landed.**
+/// The editor holds its own working model; left on the old pin, a Save of any
+/// other field would write it back over the switch. Pressing Switch changes
+/// nothing in the editor until the roster shows the participant on the newer
+/// pin; then the editor's selection moves to it. A switch the roster never
+/// shows (refused, or overtaken by another window's write) leaves the editor
+/// as it was, and another participant's switch sent meanwhile never discards
+/// this one's.
+#[gpui::test]
+fn an_open_editor_follows_a_switch_to_newer_weights(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    let _guard = probes_on();
+    let (space, mut roster) = probe_participants();
+    let notice = ModelNotice::NewerAvailable {
+        tag: "gemma4-31b".into(),
+        newer_sha256: PICKER_HASH.into(),
+    };
+    roster[1].model_notices = vec![notice.clone()];
+    let mut second = roster[1].clone();
+    second.id = "agent-2".into();
+    second.label = "Second".into();
+    roster.push(second);
+    let seeded = roster.clone();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some((space.clone(), roster));
+        s.space_settings = Some(("demo".into(), eidola_app_core::SpaceSettings::default()));
+    });
+    let participants = stores.participants.clone();
+    let (window, view) = open_participants_inspector_with(cx, stores);
+    let editor_value = |cx: &mut TestAppContext| {
+        let entries = fresh_entries(cx, window);
+        entries
+            .iter()
+            .find(|(n, _)| n == "space/inspector/participants/editor/model")
+            .and_then(|(_, e)| e.value.clone())
+            .map(|v| v.to_string())
+    };
+    let switch_for = |cx: &mut TestAppContext, participant_id: &str| {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.inspector_act_on_model_notice(participant_id, &notice, window, cx);
+            });
+        })
+        .unwrap();
+    };
+    let switch = |cx: &mut TestAppContext| switch_for(cx, "agent-1");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant("agent-1", window, cx)
+        });
+    })
+    .unwrap();
+
+    // Sent, not landed: nothing moves.
+    switch(cx);
+    assert_eq!(editor_value(cx).as_deref(), Some("gemma4-31b · Eidola"));
+
+    // Overtaken by another write: the pending switch is dropped untouched.
+    let mut other = seeded.clone();
+    other[1].model_ref = Some("kimi-k2-6".into());
+    other[1].model_notices.clear();
+    participants.update(cx, |p, _| p.seed_for_test(&space, other));
+    assert_eq!(editor_value(cx).as_deref(), Some("gemma4-31b · Eidola"));
+    // …and a later roster on the newer pin does not revive it.
+    let mut landed = seeded.clone();
+    landed[1].model_ref = Some(switched_pin());
+    landed[1].model_notices.clear();
+    participants.update(cx, |p, _| p.seed_for_test(&space, landed.clone()));
+    assert_eq!(editor_value(cx).as_deref(), Some("gemma4-31b · Eidola"));
+
+    // A switch that lands, with another row's switch sent behind it: the
+    // editor follows its own.
+    participants.update(cx, |p, _| p.seed_for_test(&space, seeded.clone()));
+    switch(cx);
+    switch_for(cx, "agent-2");
+    participants.update(cx, |p, _| p.seed_for_test(&space, landed));
+    assert_eq!(
+        editor_value(cx).as_deref(),
+        Some("gemma4-31b, pinned to 222222222222… · Eidola")
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **A shared agent's "Everyone" draft does not follow a per-space switch.**
+/// The switch writes this space's override; the Everyone draft is the agent's
+/// global config, and adopting the pin there would publish it to every space
+/// on the next Save. Toggling to "This space" afterwards shows the newer pin,
+/// because the per-space source the fork re-seeds from carries the switch.
+#[gpui::test]
+fn an_everyone_draft_keeps_its_model_through_a_per_space_switch(cx: &mut TestAppContext) {
+    use eidola_app_core::model_catalog::ModelNotice;
+    use eidola_gui::participants::EditMode;
+    let _guard = probes_on();
+    let (space, mut roster) = probe_participants();
+    let notice = ModelNotice::NewerAvailable {
+        tag: "gemma4-31b".into(),
+        newer_sha256: PICKER_HASH.into(),
+    };
+    roster[1].scope = "global".into();
+    roster[1].source = "referenced".into();
+    roster[1].model_notices = vec![notice.clone()];
+    roster[1].reference = Some(ParticipantReference {
+        base_label: "Assistant".into(),
+        base_model_ref: Some("gemma4-31b".into()),
+        base_system_prompt: Some("Be concise.".into()),
+        base_notify_policy: "human".into(),
+        override_label: None,
+        override_model_ref: None,
+        override_system_prompt: None,
+        override_notify_policy: None,
+    });
+    let mut landed = roster.clone();
+    landed[1].model_ref = Some(switched_pin());
+    landed[1].model_notices.clear();
+    if let Some(r) = landed[1].reference.as_mut() {
+        r.override_model_ref = Some(switched_pin());
+    }
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.participants = Some((space.clone(), roster));
+        s.space_settings = Some(("demo".into(), eidola_app_core::SpaceSettings::default()));
+    });
+    let participants = stores.participants.clone();
+    let (window, view) = open_participants_inspector_with(cx, stores);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_toggle_participant("agent-1", window, cx);
+            v.inspector_set_edit_mode(EditMode::Everywhere, window, cx);
+            v.inspector_act_on_model_notice("agent-1", &notice, window, cx);
+        });
+    })
+    .unwrap();
+    participants.update(cx, |p, _| p.seed_for_test(&space, landed));
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/inspector/participants/editor/model",
+        gpui::Role::Button,
+        "Model",
+        "gemma4-31b · Eidola",
+    );
+
+    // Toggling to "This space" re-seeds from the per-space source, which
+    // carries the switch: the newer pin, not the old one.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.inspector_set_edit_mode(EditMode::OverrideHere, window, cx);
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/inspector/participants/editor/model",
+        gpui::Role::Button,
+        "Model",
+        "gemma4-31b, pinned to 222222222222… · Eidola",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
 #[gpui::test]
 fn model_picker_options_name_their_backend(cx: &mut TestAppContext) {
     let _guard = probes_on();
@@ -4341,6 +5476,7 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
     // The multi-referencer picker.
     let incoming = |action: &str| eidola_app_core::IncomingReference {
         action_id: action.into(),
+        item_id: format!("item-of-{}", action),
         space_id: "s".into(),
         ordinal: 1,
         content_block_id: Some("b1".into()),
@@ -4348,6 +5484,9 @@ fn space_probes_record_footnote_rail_and_highlight_picker(cx: &mut TestAppContex
         range_end: Some(15),
         annotation: None,
         created_at: 0,
+        author_label: "Sofia".into(),
+        author_kind: "agent".into(),
+        space_title: None,
     };
     cx.update(|cx| {
         space.update(cx, |s, _| {
@@ -4573,7 +5712,11 @@ fn space_footnote_rail_says_how_a_delegated_conversation_stopped(cx: &mut TestAp
             range_start: Some(0),
             range_end: Some(4),
             annotation: None,
-            delegation_end: Some(eidola_app_core::DelegationEnd::Paused { depth: 2, limit: 2 }),
+            delegation_end: Some(eidola_app_core::DelegationEnd::Paused {
+                depth: 2,
+                limit: 2,
+                truncated: false,
+            }),
             snippet: Some("the evening one is the spring".into()),
             antecedent_author_label: "Surveyor".into(),
             antecedent_author_kind: "agent".into(),
@@ -5380,11 +6523,125 @@ fn keyboard_focus_reveals_a_library_rows_verbs(cx: &mut TestAppContext) {
     );
 }
 
+/// A delegated conversation names the one it was opened from — always — and
+/// becomes a link to it exactly where the row's other verbs become live.
+///
+/// The two halves are one rule: the fact belongs on every row (a delegated row
+/// is a conversation the reader never started, and at rest it would otherwise
+/// stand there unexplained), while the affordance belongs to the revealed row
+/// only, because a virtualized listing is one tab stop with a roving cursor and
+/// a stop per row would describe an order that omits whatever nobody scrolled
+/// to. So the badge says which it is.
+#[gpui::test]
+fn a_delegated_library_row_names_the_conversation_it_came_from(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = stub_stores(cx, |s| {
+        s.spaces = vec![
+            delegated_space_info(
+                "s1a",
+                "Check Friday's tide tables",
+                "s1",
+                Some("Tides and the moon"),
+            ),
+            space_info("s1", Some("Tides and the moon")),
+            delegated_space_info("s2a", "Second opinion", "s2", None),
+        ];
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| LibraryView::new(stores, window, cx))
+    });
+
+    // At rest: a caption on the delegated rows, nothing on the ordinary one.
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "library/row/0/parent",
+        gpui::Role::Label,
+        "From Tides and the moon",
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n == "library/row/1/parent"),
+        "an ordinary conversation came from nowhere and says nothing"
+    );
+    // A parent nobody named still names its row's provenance, in the reader's
+    // language rather than in a title app-core would have had to invent.
+    assert_probe(
+        &entries,
+        "library/row/2/parent",
+        gpui::Role::Label,
+        "From an untitled conversation",
+    );
+
+    // Revealed — here by the keyboard cursor, the half hover cannot answer for:
+    // the badge becomes a link, and says what activating it opens.
+    cx.update_window(window, |_, window, cx| window.focus_next(cx))
+        .unwrap();
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "library/row/0/parent",
+        gpui::Role::Link,
+        "Open Tides and the moon, the conversation this was delegated from",
+    );
+    assert_probe(
+        &entries,
+        "library/row/2/parent",
+        gpui::Role::Label,
+        "From an untitled conversation",
+    );
+
+    // **The badge's label is its own text**, so it is pinned in a locale where
+    // an English literal beside the accessor would still read as English: the
+    // sighted reader would see the message and a screen reader would hear the
+    // literal, in every language but the source one.
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "library/row/0/parent",
+        gpui::Role::Link,
+        "Ouvrir Tides and the moon, la conversation depuis laquelle celle-ci a été déléguée",
+    );
+    assert_probe(
+        &entries,
+        "library/row/2/parent",
+        gpui::Role::Label,
+        "Depuis une conversation sans titre",
+    );
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+    probe::set_probes_enabled(false);
+}
+
+/// Send one key **down** — what a view's own key listener reads (navigation,
+/// Escape). Activation of a focused control needs the up too; see
+/// [`press_enter`].
+fn press_key(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
+    let ks = gpui::Keystroke::parse(key).unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke: ks,
+                is_held: false,
+                prefer_character_input: false,
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
 /// Press Enter as a real keyboard activation: gpui maps it on **key up** (the
 /// key-down only records the pending activation), and `TestAppContext`'s
 /// `dispatch_keystroke` sends the down alone.
 fn press_enter(cx: &mut TestAppContext, window: AnyWindowHandle) {
-    let ks = gpui::Keystroke::parse("enter").unwrap();
+    activate_with(cx, window, "enter");
+}
+
+/// [`press_enter`] for any key: a key-down and its key-up.
+fn activate_with(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
+    let ks = gpui::Keystroke::parse(key).unwrap();
     cx.update_window(window, |_, window, cx| {
         window.dispatch_event(
             gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
@@ -5850,23 +7107,22 @@ fn record_spend_group_header_is_a_readable_node(cx: &mut TestAppContext) {
     );
 }
 
-/// Two regimes for `gpui-component` widgets that self-annotate for AccessKit
-/// at our fork rev, each enforced **immediately after the constructor** (the
-/// placement is what makes this source scan reliable):
+/// Two regimes for `gpui-component` widgets that self-annotate for AccessKit,
+/// each enforced **immediately after the constructor** (the placement is what
+/// makes this source scan reliable):
 ///
 /// - **Hoisted controls** (`Button`, `Checkbox`): the probed wrapper is the
 ///   accessible control (role, label, focus, activation), so the widget is
-///   made presentational via `.role(None)` — without it AT sees two nodes for
-///   one control.
-/// - **Focus-bearing editors** (`Input`): the widget owns the tracked focus
-///   handle, so *it* must be the node or AT reports focus on the window root
-///   — it carries `.aria_label(..)` and the wrapper is a bounds-only probe
-///   (`probe_bounds`, no node).
+///   made presentational via `.role(RoleOverride::Presentational)` — without
+///   it AT sees two nodes for one control.
+/// - **Focus-bearing controls** (`Input`, `Textarea`, `Switch`): the widget
+///   owns the tracked focus handle, so *it* must be the node or AT reports
+///   focus on the window root — it carries its label builder (`.aria_label(..)`;
+///   `Switch`: `.accessibility_label(..)`) and the wrapper is a bounds-only
+///   probe (`probe_bounds`, no node).
 ///
 /// The emitted AccessKit `TreeUpdate` is crate-private, so neither invariant
-/// can be asserted against the tree itself; this scan is the gate. `Switch`
-/// is deliberately absent: it sets no role at our rev (comments at its two
-/// call sites carry the tripwire).
+/// can be asserted against the tree itself; this scan is the gate.
 #[test]
 fn self_annotating_widgets_opt_out_of_their_own_a11y_nodes() {
     let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -5884,7 +7140,13 @@ fn self_annotating_widgets_opt_out_of_their_own_a11y_nodes() {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
-            for needle in ["Button::new(", "Input::new(", "Checkbox::new("] {
+            for needle in [
+                "Button::new(",
+                "Input::new(",
+                "Textarea::new(",
+                "Checkbox::new(",
+                "Switch::new(",
+            ] {
                 let mut from = 0;
                 while let Some(pos) = text[from..].find(needle) {
                     let start = from + pos;
@@ -5917,10 +7179,10 @@ fn self_annotating_widgets_opt_out_of_their_own_a11y_nodes() {
                         seen += 1;
                         let rest = &text[end.expect("unbalanced parens")..];
                         let rest: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
-                        let required = if needle == "Input::new(" {
-                            ".aria_label("
-                        } else {
-                            ".role(None)"
+                        let required = match needle {
+                            "Input::new(" | "Textarea::new(" => ".aria_label(",
+                            "Switch::new(" => ".accessibility_label(",
+                            _ => ".role(RoleOverride::Presentational)",
                         };
                         if !rest.starts_with(required) {
                             let line = text[..start].matches('\n').count() + 1;
@@ -5943,9 +7205,10 @@ fn self_annotating_widgets_opt_out_of_their_own_a11y_nodes() {
     assert!(
         offenders.is_empty(),
         "self-annotating widgets missing their regime's annotation \
-         immediately after the constructor (Button/Checkbox: `.role(None)`, \
-         the wrapper is the control; Input: `.aria_label(..)`, the widget is \
-         the node — see AGENTS.md → Accessibility & QA probes):\n{}",
+         immediately after the constructor (Button/Checkbox: \
+         `.role(RoleOverride::Presentational)`, the wrapper is the control; \
+         Input/Textarea: `.aria_label(..)`, Switch: `.accessibility_label(..)`, \
+         the widget is the node — see AGENTS.md → Accessibility & QA probes):\n{}",
         offenders.join("\n")
     );
 }
@@ -6148,6 +7411,7 @@ fn each_failed_section_gets_a_retry_of_its_own(cx: &mut TestAppContext) {
         .expect("create space")
         .id;
     let stores = cx.update(|cx| Stores::for_test(core.clone(), cx));
+    let backing = Backing::with_app(core, dir, cx);
 
     let (window, view) = open_view(cx, |window, cx| {
         cx.new(|cx| {
@@ -6210,6 +7474,9 @@ fn each_failed_section_gets_a_retry_of_its_own(cx: &mut TestAppContext) {
             .participants
             .read_with(cx, |s, _| s.participants(&space).has_value())
     });
+    // A wrongly retried Space read would land on its own schedule; once
+    // everything has settled, it has.
+    backing.settle();
     assert!(
         stores
             .space_settings
@@ -6219,9 +7486,6 @@ fn each_failed_section_gets_a_retry_of_its_own(cx: &mut TestAppContext) {
     );
 
     probe::set_probes_enabled(false);
-    while core.runtime().metrics().num_alive_tasks() > 0 {
-        std::thread::yield_now();
-    }
 }
 
 /// Poll `run_until_parked` until `pred` holds — a real-core read round-trips
@@ -6891,6 +8155,7 @@ fn a_room_the_reader_only_watches_offers_no_regenerate(cx: &mut TestAppContext) 
         kind: "agent".into(),
         label: "Surveyor".into(),
         model_ref: Some("gemma4-31b".into()),
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "all".into(),
         role: "member".into(),
@@ -6973,6 +8238,7 @@ fn a_room_the_reader_belongs_to_keeps_its_verbs(cx: &mut TestAppContext) {
             kind: "human".into(),
             label: "User".into(),
             model_ref: None,
+            model_notices: Vec::new(),
             system_prompt: None,
             notify_policy: "explicit".into(),
             role: "owner".into(),
@@ -6985,6 +8251,7 @@ fn a_room_the_reader_belongs_to_keeps_its_verbs(cx: &mut TestAppContext) {
             kind: "agent".into(),
             label: "Surveyor".into(),
             model_ref: Some("gemma4-31b".into()),
+            model_notices: Vec::new(),
             system_prompt: None,
             notify_policy: "all".into(),
             role: "member".into(),
@@ -7101,6 +8368,7 @@ fn the_acting_gate_converges_and_its_interim_withholds(cx: &mut TestAppContext) 
                     kind: "agent".into(),
                     label: "Surveyor".into(),
                     model_ref: Some("gemma4-31b".into()),
+                    model_notices: Vec::new(),
                     system_prompt: None,
                     notify_policy: "all".into(),
                     role: "member".into(),
@@ -7313,6 +8581,7 @@ fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
         kind: "agent".into(),
         label: "Surveyor".into(),
         model_ref: Some("gemma4-31b".into()),
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "all".into(),
         role: "member".into(),
@@ -7388,6 +8657,7 @@ fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
                 kind: "human".into(),
                 label: "User".into(),
                 model_ref: None,
+                model_notices: Vec::new(),
                 system_prompt: None,
                 notify_policy: "explicit".into(),
                 role: "owner".into(),
@@ -7406,4 +8676,2287 @@ fn a_retained_roster_still_answers_the_acting_gate(cx: &mut TestAppContext) {
     );
 
     probe::set_probes_enabled(false);
+}
+
+/// **The label a screen reader hears is the message a sighted reader sees.**
+///
+/// A conversation's three in-place turn states are readouts, so their accessible
+/// name *is* their text — and pinning that in English would have passed against
+/// a literal beside the accessor. The assertion is made in a non-English locale
+/// for the same reason `an_archived_conversations_refusal_is_localized` is: only
+/// there do the two spellings differ. The probe **names** are asserted from the
+/// same entries, unchanged by the locale — they are selectors, not prose.
+#[gpui::test]
+fn a_conversations_turn_states_speak_the_readers_language(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut answer = probe_post("a1", "Low water at 06:12 and 18:41.");
+    answer.action_type = "inference".into();
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    let mut second = probe_post("a2", "And high water at 12:26.");
+    second.action_type = "inference".into();
+    second.parent_action_id = Some("a1".into());
+    second.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    let mut third = probe_post("a3", "Springs run through to Sunday, and the range");
+    third.action_type = "inference".into();
+    third.parent_action_id = Some("a2".into());
+    third.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![answer, second, third], cx)
+        });
+    });
+
+    // Three states, one on each answer: a live regeneration pending in the
+    // first's place, a collision on the second, and a third that stopped at its
+    // length allowance. One per post because a pending revision draws over the
+    // whole body it replaces, marks included.
+    // The collision mark is staged on the view rather than through the
+    // entity's gates: a standing collision now withholds the next
+    // regeneration, which is the point of that gate and would leave the live
+    // revision below unstarted.
+    cx.update(|cx| {
+        view.update(cx, |v, cx| {
+            v.note_truncated_turn_for_test("a3", cx);
+            v.note_regeneration_elsewhere_for_test("a2", cx);
+        });
+        space.update(cx, |s, cx| {
+            s.regenerate_post("a1".into(), "kimi-k2".into(), cx);
+        });
+    });
+    let seq = space.read_with(cx, |s, _| s.revising_seq("a1").expect("pending"));
+
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/2/cut-off",
+        gpui::Role::Label,
+        "Cette réponse s’est arrêtée à sa limite de longueur.",
+    );
+    assert_probe(
+        &entries,
+        "space/post/1/regenerating-elsewhere",
+        gpui::Role::Label,
+        "Cette réponse est déjà en cours de régénération.",
+    );
+    assert_probe(
+        &entries,
+        &format!("space/streaming/{seq}/regenerating"),
+        gpui::Role::Label,
+        "Régénération…",
+    );
+    probe::set_probes_enabled(false);
+}
+
+/// REGRESSION: the highlight picker said "A post in another space" for every
+/// **incoming** reference it did not hold, so two cross-space referrers were
+/// indistinguishable — the one thing a chooser must never be.
+///
+/// The picker is exactly where a cross-space backlink shows up (a same-space
+/// referrer is already on the page with its byline), and it names one the same
+/// way the footnote rail names an outgoing quote's author: this window's own
+/// gutter byline where it has the post, otherwise the edge's carried identity
+/// — `(author_kind, author_label)`, as the *referring* space names them — read
+/// through `space::byline_for_participant`. Every arm on one passage:
+///
+/// 1. a referrer this window holds: its gutter byline plus what it says, which
+///    is **not** the edge's raw label (a human labelled `user` reads "You");
+/// 2. a referrer from a conversation this window never loaded, by name **and
+///    by conversation** — an author does not identify a post, so two rows from
+///    one participant (rows 1 and 2 here) are told apart by where they lead,
+///    which is the whole job of a chooser (Codex review, PR #327);
+/// 3. the same where the label is blank (the schema's "override to empty") —
+///    the kind is what is left, and it is enough;
+/// 4. "another space" where the conversation was never named;
+/// 5. the original sentence, surviving only where nothing names anyone **and**
+///    nothing names the place;
+/// 6. and, because a title is neither unique nor required, a **collision
+///    ordinal** wherever two rows would still read alike — rows 2/7 share a
+///    title, rows 8/9 share the absence of one (Codex review, PR #327).
+///
+/// Rows 10-12 are the round-3 shape: a duplicated title beside a conversation
+/// literally named what numbering that duplicate produces. The property
+/// assertion below had been passing throughout without covering it, which is
+/// the honest lesson — **a property test is only as strong as its inputs**, so
+/// the adversarial input is now one of them and `disambiguate`'s own
+/// `debug_assert` states the invariant at the site where it is established.
+#[gpui::test]
+fn space_highlight_picker_names_a_cross_space_referencer(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let quoted = probe_post("a1", "the sentence everything else hangs off");
+    let mut here = probe_post("a2", "quoted right here");
+    here.parent_action_id = Some("a1".into());
+    here.relation = Some("reply".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![quoted, here], cx));
+    });
+
+    const LONG_TITLE: &str = "Everything we worked out about spring tides, the moon's declination, and \
+         why the harbour empties twice";
+    let incoming = |action: &str, kind: &str, label: &str, title: Option<&str>| {
+        eidola_app_core::IncomingReference {
+            action_id: action.into(),
+            item_id: format!("item-of-{}", action),
+            space_id: format!("space-of-{action}"),
+            ordinal: 1,
+            content_block_id: Some("b1".into()),
+            range_start: Some(4),
+            range_end: Some(15),
+            annotation: None,
+            created_at: 0,
+            author_label: label.into(),
+            author_kind: kind.into(),
+            space_title: title.map(str::to_string),
+        }
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, _| {
+            s.seed_incoming_references_for_test(
+                "a1",
+                vec![
+                    incoming("a2", "human", "user", Some("Here")),
+                    incoming("x1", "agent", "Sofia", Some("Tides and the moon")),
+                    // The finding: the **same author**, quoting the same
+                    // passage from a second conversation. Named by the author
+                    // alone these two rows read alike and open different
+                    // windows.
+                    incoming("x2", "agent", "Sofia", Some("Spring tides")),
+                    incoming("x3", "human", "", Some("A note to myself")),
+                    incoming("x4", "human", "", None),
+                    incoming("x5", "tool", "  ", Some("Harness output")),
+                    incoming("x6", "tool", "  ", None),
+                    // The discriminator is itself non-unique: a title is
+                    // neither required nor unique, so one author can reach
+                    // this picker from two conversations that share a name —
+                    // and from two that have none.
+                    incoming("x7", "agent", "Sofia", Some("Spring tides")),
+                    incoming("x8", "agent", "Mara", None),
+                    incoming("x9", "agent", "Mara", None),
+                    // And the shape that beat the first numbering pass: a
+                    // duplicated title beside a conversation *literally
+                    // named* what numbering the duplicate would produce.
+                    // Numbering the pair alone turns the first of them into
+                    // "…, in Ebb (1)" — the third row's own text.
+                    incoming("y1", "agent", "Iris", Some("Ebb")),
+                    incoming("y2", "agent", "Iris", Some("Ebb")),
+                    incoming("y3", "agent", "Iris", Some("Ebb (1)")),
+                    // And a collision whose shared prefix is longer than the
+                    // row: the number is what tells these apart, and a number
+                    // inside the truncating text tells nobody anything.
+                    incoming("z1", "agent", "Wren", Some(LONG_TITLE)),
+                    incoming("z2", "agent", "Wren", Some(LONG_TITLE)),
+                    // And the round-5 shape: two conversations whose names
+                    // are *different strings* that part company only past the
+                    // row's cutoff. Numbering keyed on the full label finds
+                    // nothing to number and paints two identical rows.
+                    incoming(
+                        "w1",
+                        "agent",
+                        "Bede",
+                        Some(&format!("{LONG_TITLE}, part one")),
+                    ),
+                    incoming(
+                        "w2",
+                        "agent",
+                        "Bede",
+                        Some(&format!("{LONG_TITLE}, part two")),
+                    ),
+                ],
+            );
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.click_highlight_for_test(
+                "a1",
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+                window,
+                cx,
+            )
+        });
+    })
+    .unwrap();
+
+    let entries = fresh_entries(cx, window);
+    for (index, expected) in [
+        (0, "You: quoted right here"),
+        (1, "Sofia, in Tides and the moon"),
+        // Rows 2 and 7 share a title, and rows 8 and 9 share the absence of
+        // one — each collision group is numbered in the index's own order.
+        (2, "Sofia, in Spring tides (1)"),
+        (3, "You, in A note to myself"),
+        (4, "You, in another space"),
+        (5, "A post in Harness output"),
+        (6, "A post in another space"),
+        (7, "Sofia, in Spring tides (2)"),
+        (8, "Mara, in another space (1)"),
+        (9, "Mara, in another space (2)"),
+        // The number is chosen against what the picker will *show*: "(1)" is
+        // spoken for by row 12, which keeps its own name because a row that is
+        // already unique must not be renamed to tidy its neighbours.
+        (10, "Iris, in Ebb (2)"),
+        (11, "Iris, in Ebb (3)"),
+        (12, "Iris, in Ebb (1)"),
+    ] {
+        assert_probe(
+            &entries,
+            &format!("space/highlight/picker/{index}"),
+            gpui::Role::Button,
+            expected,
+        );
+    }
+
+    // The property the rows are for, asserted as a property: whatever the
+    // fixture happens to contain, no two buttons in this picker read alike.
+    let rows = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).highlight_picker_for_test(window, cx)
+        })
+        .unwrap()
+        .expect("the picker is open");
+    let labels: Vec<&String> = rows.iter().map(|(_, label, _)| label).collect();
+    let unique: std::collections::BTreeSet<&&String> = labels.iter().collect();
+    assert_eq!(
+        unique.len(),
+        labels.len(),
+        "a chooser whose rows read alike cannot say which button goes where: {labels:?}"
+    );
+
+    // **And the discriminator has to survive the row.** A picker row is 280px
+    // and its sentence truncates, so a number living at the end of that
+    // sentence is the first thing thrown away — two long rows would ellipsize
+    // to the same prefix with only their accessible names differing, which is
+    // no help at all to the reader looking at them (Codex review, PR #327).
+    // The ordinal is reported separately because it is *painted* separately,
+    // outside the truncating text, so this is the property that fixes it.
+    // **Distinct strings that paint the same row.** These two conversation
+    // names part company only past the cutoff, so the labels differ and the
+    // rows do not — numbering keyed on the full string found nothing to number
+    // and left the reader two identical buttons (Codex review, PR #327).
+    let past_the_cutoff: Vec<&(String, String, Option<i64>)> = rows
+        .iter()
+        .filter(|(_, label, _)| label.starts_with("Bede, in "))
+        .collect();
+    assert_eq!(past_the_cutoff.len(), 2, "the pair: {past_the_cutoff:?}");
+    assert_ne!(
+        past_the_cutoff[0].1, past_the_cutoff[1].1,
+        "their full sentences really are different — which is why the full string cannot be \
+         what a collision is decided on"
+    );
+    assert_eq!(
+        past_the_cutoff
+            .iter()
+            .map(|(_, _, n)| *n)
+            .collect::<Vec<_>>(),
+        vec![Some(1), Some(2)],
+        "and they are numbered anyway, because what they *paint* is the same: {past_the_cutoff:?}"
+    );
+
+    let long_indices: Vec<(usize, &String)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, label, _))| label.starts_with("Wren, in "))
+        .map(|(i, (_, label, _))| (i, label))
+        .collect();
+    let long = rows
+        .iter()
+        .filter(|(_, label, _)| label.starts_with("Wren, in "))
+        .collect::<Vec<_>>();
+    assert_eq!(long.len(), 2, "the long-title collision pair: {long:?}");
+    assert_eq!(
+        long.iter().map(|(_, _, n)| *n).collect::<Vec<_>>(),
+        vec![Some(1), Some(2)],
+        "each is numbered: {long:?}"
+    );
+    // And the numbers are *painted* outside it — their own elements, which is
+    // what surviving the truncation means. `entries` is the frame that was
+    // just drawn, so an entry here is a thing on the screen.
+    let ordinals: Vec<&String> = entries
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| name.ends_with("/ordinal"))
+        .collect();
+    assert_eq!(
+        ordinals.len(),
+        10,
+        "one painted ordinal per numbered row — the four collision groups, and \
+         notably *not* row 12, whose \"(1)\" is its conversation's real name: {ordinals:?}"
+    );
+    for (index, _) in &long_indices {
+        let name = format!("space/highlight/picker/{index}/ordinal");
+        let entry = entries
+            .iter()
+            .find(|(n, _)| n == &name)
+            .unwrap_or_else(|| panic!("the long row's number is painted on its own: {name}"));
+        assert!(
+            entry.1.bounds.size.width > gpui::px(0.),
+            "and it takes real room beside the text that gives way: {entry:?}"
+        );
+    }
+
+    probe::set_probes_enabled(false);
+}
+
+/// **A post being regenerated keeps its node; it goes quiet on the value
+/// alone.**
+///
+/// The keyboard hands focus back to the post when Regenerate takes its own row
+/// away (`release_affordance_focus`), and the row keeps `track_focus` for the
+/// whole regeneration. gpui builds an AccessKit node only for an element with a
+/// role, so dropping the article while still tracking the handle left focus on
+/// a handle with no node — AccessKit falls back to the window root and the
+/// reader loses their place until the turn commits, which on a reasoning model
+/// is minutes.
+///
+/// The settled-value rule is untouched: the **value** is what must not stream,
+/// because AT re-reads a focused control's whole value on every change. Name
+/// and role do not stream — byline, backend and time all come from the
+/// generation being replaced — so they stay.
+#[gpui::test]
+fn a_post_being_regenerated_keeps_its_node_and_loses_only_its_value(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let mut answer = probe_post("a1", "Low water at 06:12 and 18:41.");
+    answer.action_type = "inference".into();
+    answer.participant = PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    cx.update(|cx| {
+        space.update(cx, |s, cx| s.set_post_tree_for_test(vec![answer], cx));
+    });
+    draw(cx, window);
+
+    // Settled: role, name, and the whole text as the value.
+    let entries = fresh_entries(cx, window);
+    let settled_label = entries
+        .iter()
+        .find(|(n, _)| n == "space/post/0")
+        .map(|(_, e)| e.label.to_string())
+        .expect("the settled post is an article");
+    assert_probe_value(
+        &entries,
+        "space/post/0",
+        gpui::Role::Article,
+        &settled_label,
+        "Low water at 06:12 and 18:41.",
+    );
+
+    // Enter the post, then activate Regenerate the way a keyboard user does.
+    press_key(cx, window, "down");
+    press_key(cx, window, "enter");
+    press_enter(cx, window);
+
+    space.read_with(cx, |s, _| {
+        assert!(
+            s.revising_seq("a1").is_some(),
+            "the press was accepted — this is the frame the value goes quiet in"
+        );
+    });
+
+    let entries = fresh_entries(cx, window);
+    // The node is still there, under the same name…
+    assert_probe(
+        &entries,
+        "space/post/0",
+        gpui::Role::Article,
+        &settled_label,
+    );
+    // …and it is the *value* that is withheld, not the node.
+    let (_, entry) = entries
+        .iter()
+        .find(|(n, _)| n == "space/post/0")
+        .expect("still an article");
+    assert!(
+        entry.value.is_none(),
+        "the streaming revision must not bind a value AT would re-read per token: {:?}",
+        entry.value
+    );
+}
+
+/// The find bar's accessible surface: its field is the labelled editor (the
+/// two-regime rule — the `Input` owns the focus handle, so the *widget* is the
+/// node and the wrapper is bounds-only), its verbs say what their click does,
+/// and the index readout is a `Label` whose **label and value are the same
+/// short sentence** — the notices' shape, so it starts speaking the day gpui
+/// gains `aria_live` and is perceivable by review today.
+#[gpui::test]
+fn space_find_bar_probes_its_field_verbs_and_readout(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            SpaceView::new(
+                stores,
+                Some("demo".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = probe_post("a2", "another kestrel, and a kestrel again");
+    a2.parent_action_id = Some("a1".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "a kestrel hovers"), a2], cx)
+        });
+    });
+    draw(cx, window);
+
+    // Open the bar and type — the production path, and the only one that emits
+    // the `InputEvent::Change` the search is driven by.
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["k", "e", "s", "t", "r", "e", "l"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/find/close",
+        gpui::Role::Button,
+        "Close find",
+    );
+    assert_probe(
+        &entries,
+        "space/find/previous",
+        gpui::Role::Button,
+        "Previous match",
+    );
+    assert_probe(
+        &entries,
+        "space/find/next",
+        gpui::Role::Button,
+        "Next match",
+    );
+    // The field's probe is registry-only (no AccessKit attributes) — the
+    // labelled `Input` inside it is the node.
+    assert_probe(&entries, "space/find/field", gpui::Role::TextInput, "Find");
+    assert_probe_value(
+        &entries,
+        "space/find/count",
+        gpui::Role::Label,
+        "1 of 3",
+        "1 of 3",
+    );
+    // The cross-branch total, beside the index. One node, one sentence, label
+    // and value alike — the readout's own shape. Here the whole space *is* the
+    // visible branch, so it agrees with the index's denominator; what it says
+    // is that it was counted, not that it is the same question.
+    assert_probe_value(
+        &entries,
+        "space/find/total",
+        gpui::Role::Label,
+        "3 total",
+        "3 total",
+    );
+    // Its disclosure is a real control now, because it opens the Find-all
+    // overlay — the role tracks whether a handler attaches, and its name says
+    // what the click does rather than naming the chevron.
+    assert_probe(
+        &entries,
+        "space/find/total/disclosure",
+        gpui::Role::Button,
+        "Show every result",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The Find-all overlay's accessible surface: a named landmark, a `Group` of
+/// map nodes whose role tracks whether pressing one does anything, and the
+/// results as **one** list with its rows as managed descendants.
+#[gpui::test]
+fn the_find_overlay_probes_its_map_and_its_results(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    // Two posts, one of which holds nothing — so the map has a node of each
+    // kind and the role difference is a fact about this fixture rather than a
+    // fact about an empty one.
+    let mut a2 = probe_post("a2", "nothing to see in this one");
+    a2.parent_action_id = Some("a1".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "a kestrel hovers"), a2], cx)
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["k", "e", "s", "t", "r", "e", "l"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    // Open it through the disclosure the reader would press.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/find/overlay",
+        gpui::Role::Region,
+        "Every result",
+    );
+    assert_probe(
+        &entries,
+        "space/find/map",
+        gpui::Role::Group,
+        "Conversation map",
+    );
+    assert_probe(&entries, "space/find/results", gpui::Role::List, "Results");
+    // The map's first node holds the match and is pressable; the second holds
+    // nothing, so it is a `Label` — the role tracks whether a handler
+    // attaches, exactly as the bar's step arrows do.
+    assert_probe(
+        &entries,
+        "space/find/map/0",
+        gpui::Role::Button,
+        "You — has matches",
+    );
+    assert_probe(&entries, "space/find/map/1", gpui::Role::Label, "You");
+    // **The circle is the mark; the cell is the control.** The handler used to
+    // ride the 9px visual, which is the whole pointer target for the surface's
+    // only navigation verb — hard with a mouse, harder with an unsteady hand.
+    // The interactive element is sized to the room the map's own strides leave,
+    // with the circle drawn inside it, so what a reader aims at is bigger than
+    // what they see without the dot moving a pixel.
+    let dot = entries
+        .iter()
+        .find(|(name, _)| name == "space/find/map/0")
+        .map(|(_, e)| e.bounds)
+        .expect("the map's first dot painted");
+    assert!(
+        dot.size.height.as_f32() > 9.0 && dot.size.width.as_f32() > 9.0,
+        "the hit cell is larger than the circle it holds: {:?}",
+        dot.size
+    );
+    // One result, and it is a managed descendant of the list rather than a tab
+    // stop of its own — a card per stop would describe an order that does not
+    // contain the results nobody scrolled to. **Its name carries the
+    // attribution**, because the group header above it is a sibling `Label`: a
+    // reader meeting the card as the list's active descendant would otherwise
+    // hear the snippet with nobody's name on it, and could not tell two
+    // similar results by two participants apart.
+    assert_probe(
+        &entries,
+        "space/find/result/0",
+        gpui::Role::ListItem,
+        "You: a kestrel hovers",
+    );
+
+    // **And the join between the two is the translation's to choose.** Its
+    // parts are data, but the punctuation and the order are not — the Chinese
+    // locales set a full-width colon — so a hard-coded `": "` is the
+    // concatenation the localization doctrine bans however few English words it
+    // contains, and it is invisible in English, which is why this is pinned in
+    // a locale where the two spellings differ.
+    cx.update(|cx| eidola_gui::i18n::apply("zh-Hans", cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/find/result/0",
+        gpui::Role::ListItem,
+        "You：a kestrel hovers",
+    );
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+
+    // **And the list is a real tab stop.** `Role::List` is deliberately not in
+    // the focusable set the probe derives, so the element carrying it takes
+    // focus only because the handle says so: without that the list could be
+    // focused once — opening the overlay does exactly that — and never again,
+    // so a reader who tabbed onto a map node had no way back to the results
+    // cursor but to close the surface and reopen it.
+    let list = view
+        .read_with(cx, |v, _| v.find_results_focus_for_test())
+        .expect("the overlay is open");
+    let wanted = format!("{list:?}");
+    let mut reached = false;
+    let mut prev = cx
+        .update_window(window, |_, window, cx| {
+            window.focused(cx).map(|h| format!("{h:?}"))
+        })
+        .unwrap();
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        cx.update_window(window, |_, window, cx| window.focus_next(cx))
+            .unwrap();
+        let id = cx
+            .update_window(window, |_, window, cx| {
+                window.focused(cx).map(|h| format!("{h:?}"))
+            })
+            .unwrap();
+        if id == prev {
+            break;
+        }
+        let Some(id) = id else { break };
+        if seen.contains(&id) {
+            break;
+        }
+        reached |= id == wanted;
+        seen.push(id.clone());
+        prev = Some(id);
+    }
+    assert!(
+        reached,
+        "Tab reaches the results list ({wanted}); the cycle held {seen:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The bar's controls stop where the map begins. The minimap is painted after
+/// the find bar, so anything under it is covered — and it widens while a
+/// session is open, precisely so a sibling column can hold a number, which is
+/// exactly when a flat right inset would have put the new total readout behind
+/// the strip.
+#[gpui::test]
+fn the_find_bars_controls_stand_clear_of_the_map(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "a kestrel hovers")], cx)
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["k", "e", "s", "t", "r", "e", "l"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let entries = fresh_entries(cx, window);
+    let map = entries
+        .iter()
+        .find(|(n, _)| n == "space/minimap")
+        .map(|(_, e)| e.bounds)
+        .expect("the map paints beside the conversation");
+    let total = entries
+        .iter()
+        .find(|(n, _)| n == "space/find/total")
+        .map(|(_, e)| e.bounds)
+        .expect("the cross-branch total paints");
+
+    assert!(
+        total.right() <= map.origin.x,
+        "the readout the map would cover stands clear of it: total {total:?}, map {map:?}"
+    );
+    // …and the map really is the widened one, or the assertion above would be
+    // measuring against a strip that never grew.
+    let strip_w = cx
+        .update_window(window, |_, window, cx| {
+            view.read(cx).minimap_width_for_test(window)
+        })
+        .unwrap();
+    assert!(
+        strip_w > 36.0,
+        "precondition: the strip widened for the session"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **An empty branch beside a space that is not empty says which it means.**
+/// "No results" standing next to "1 total" is a contradiction on its face, and
+/// the two are separate `Label` nodes, so a screen reader meets them one after
+/// the other with nothing placing them in one breath.
+#[gpui::test]
+fn the_find_bar_qualifies_an_empty_branch_when_the_space_is_not(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    // The selected branch (a1 → a2, the first child) holds nothing; the fork
+    // beside it does.
+    let mut a2 = probe_post("a2", "still nothing to see on this fork");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = probe_post("a3", "a kestrel over on the other fork");
+    a3.parent_action_id = Some("a1".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "the opening question"), a2, a3], cx)
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let type_query = |cx: &mut TestAppContext, keys: &[&str]| {
+        cx.update_window(window, |_, window, cx| {
+            for key in keys {
+                window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    type_query(cx, &["k", "e", "s", "t", "r", "e", "l"]);
+
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/find/count",
+        gpui::Role::Label,
+        "None on this branch",
+        "None on this branch",
+    );
+    assert_probe_value(
+        &entries,
+        "space/find/total",
+        gpui::Role::Label,
+        "1 total",
+        "1 total",
+    );
+
+    // …and the unqualified sentence stays for what it is true of: a query
+    // nothing anywhere matches, which shows no total beside it either.
+    type_query(cx, &["backspace"; 7]);
+    type_query(cx, &["w", "r", "e", "n"]);
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/find/count",
+        gpui::Role::Label,
+        "No results",
+        "No results",
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n == "space/find/total"),
+        "a settled zero shows no total at all"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **The cross-branch counts, where a reader meets them.** A sibling column of
+/// the map carries the matches reachable only by taking that branch — its own
+/// and its whole subtree's — and carries the *exact* number in its accessible
+/// name whether or not the numeral fits in the cell.
+#[gpui::test]
+fn a_find_sibling_column_says_how_many_matches_that_branch_holds(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            SpaceView::new(
+                stores,
+                Some("demo".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    // a1 forks into a2 (nothing) and a3 (one), with a4 under a3 (two more).
+    let mut a2 = probe_post("a2", "nothing to see on this fork");
+    a2.parent_action_id = Some("a1".into());
+    let mut a3 = probe_post("a3", "a kestrel on the far fork");
+    a3.parent_action_id = Some("a1".into());
+    let mut a4 = probe_post("a4", "a kestrel, and one more kestrel");
+    a4.parent_action_id = Some("a3".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(
+                vec![probe_post("a1", "a kestrel at the root"), a2, a3, a4],
+                cx,
+            )
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["k", "e", "s", "t", "r", "e", "l"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    let entries = fresh_entries(cx, window);
+    let label = |name: &str| {
+        entries
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, e)| e.label.to_string())
+            .unwrap_or_else(|| {
+                let names: Vec<&String> = entries.iter().map(|(n, _)| n).collect();
+                panic!("probe {name:?} missing; recorded: {names:?}")
+            })
+    };
+    // Level 1 is a1's children: [a2, a3], the first selected. The far fork's
+    // cell speaks its whole subtree — one on a3 plus two on a4.
+    let far = label("space/minimap/cell/1/1");
+    assert!(
+        far.ends_with("3 more in this branch"),
+        "the inactive sibling names the matches only it can reach: {far:?}"
+    );
+    // A branch with nothing in it says nothing rather than "0 more".
+    let near = label("space/minimap/cell/1/0");
+    assert!(
+        !near.contains("more in this branch"),
+        "the branch the reader is on is not a place to go: {near:?}"
+    );
+    // …and neither does one whose subtree the query never reached, which is
+    // what makes the clause a fact rather than decoration.
+    let root = label("space/minimap/cell/0/0");
+    assert!(
+        !root.contains("more in this branch"),
+        "the selected column carries ticks, not a count: {root:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// A query that matches nothing says so, rather than reading "0 of 0" — a
+/// position that does not exist — and withholds the step arrows, which is one
+/// predicate deciding both their tab-stopness and their activation.
+#[gpui::test]
+fn space_find_with_no_results_says_so_and_offers_no_steps(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| {
+            SpaceView::new(
+                stores,
+                Some("demo".into()),
+                WindowInput::new(cx),
+                window,
+                cx,
+            )
+        })
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "a kestrel hovers")], cx)
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["o", "s", "p", "r", "e", "y"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    let entries = fresh_entries(cx, window);
+    assert_probe_value(
+        &entries,
+        "space/find/count",
+        gpui::Role::Label,
+        "No results",
+        "No results",
+    );
+    // The arrows still paint (a bar losing controls under the reader's hand is
+    // worse than inert ones) — but they stop being *buttons*. This rev has no
+    // `aria_disabled`, and AccessKit answers a click action by synthesizing a
+    // press, so a `Role::Button` with no listener is a control VoiceOver
+    // offers and activates to no effect. `Role::Label` keeps the name
+    // readable and claims nothing about pressing it.
+    assert_probe(
+        &entries,
+        "space/find/previous",
+        gpui::Role::Label,
+        "Previous match",
+    );
+    assert_probe(&entries, "space/find/next", gpui::Role::Label, "Next match");
+
+    // And a query that matches gives the buttons back.
+    cx.update_window(window, |_, window, cx| {
+        for _ in 0..6 {
+            window.dispatch_keystroke(gpui::Keystroke::parse("backspace").unwrap(), cx);
+        }
+        for key in ["k", "e", "s", "t", "r", "e", "l"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/find/previous",
+        gpui::Role::Button,
+        "Previous match",
+    );
+    assert_probe(
+        &entries,
+        "space/find/next",
+        gpui::Role::Button,
+        "Next match",
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// The find bar's own strings are its accessible names, so they are pinned in a
+/// **non-English** locale: an English literal beside the accessor is invisible
+/// in the source language and would leave a screen-reader reader hearing it in
+/// every other one.
+#[gpui::test]
+fn the_find_bars_readout_and_verbs_speak_the_readers_language(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "un faucon crécerelle")], cx)
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["f", "a", "u", "c", "o", "n"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/find/next",
+        gpui::Role::Button,
+        "Occurrence suivante",
+    );
+    assert_probe_value(
+        &entries,
+        "space/find/count",
+        gpui::Role::Label,
+        "1 sur 1",
+        "1 sur 1",
+    );
+    // The cross-branch total speaks it too — a readout whose label is its own
+    // text is exactly where an English literal beside the accessor hides, and
+    // it hides in English.
+    assert_probe_value(
+        &entries,
+        "space/find/total",
+        gpui::Role::Label,
+        "1 au total",
+        "1 au total",
+    );
+    cx.update(|cx| eidola_gui::i18n::apply("en", cx));
+    probe::set_probes_enabled(false);
+}
+/// **A surface that covers the window takes the tab order with it.** gpui
+/// builds the frame's tab map from what painted, and painting on top removes
+/// nothing — so with the Find-all overlay expanded, Tab walked out of it into
+/// the conversation underneath: a band's `+`, a docked draft's row, the
+/// composer's own verbs, each reachable and activatable while the reader could
+/// not see any of them. `crate::focus::Covered` is the cure, applied where a
+/// role becomes a stop.
+#[gpui::test]
+fn the_find_overlay_keeps_the_tab_order_to_itself(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+    let mut a2 = probe_post("a2", "another kestrel here");
+    a2.parent_action_id = Some("a1".into());
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![probe_post("a1", "a kestrel hovers"), a2], cx)
+        });
+    });
+    draw(cx, window);
+
+    let focus = view.read_with(cx, |v, _| v.focus_handle());
+    cx.update_window(window, |_, window, cx| {
+        focus.dispatch_action(&eidola_gui::actions::FindInSpace, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        for key in ["k", "e", "s", "t", "r", "e", "l"] {
+            window.dispatch_keystroke(gpui::Keystroke::parse(key).unwrap(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    // The find surface's own stops, counted from what actually painted rather
+    // than written down: every probed control in it whose role derives a stop,
+    // plus the two that are stops without being probed controls — the query
+    // `Input`, which owns its own focus handle (the two-regime rule), and the
+    // results list, whose handle carries the stop because `Role::List` does
+    // not.
+    let find_probe_stops = |cx: &mut TestAppContext| {
+        fresh_entries(cx, window)
+            .iter()
+            .filter(|(name, e)| {
+                name.starts_with("space/find/") && eidola_gui::focus::is_tab_stop(e.role)
+            })
+            .count()
+    };
+
+    // With the overlay closed the conversation contributes stops of its own —
+    // which is what makes the assertion below a claim about suppression rather
+    // than about an empty page.
+    let closed = tab_stop_count(cx, window);
+    let bar_only = find_probe_stops(cx) + 2;
+    assert!(
+        closed > bar_only,
+        "precondition: the covered conversation really does hold tab stops \
+         ({closed} reachable, {bar_only} of them the bar's own)"
+    );
+
+    // Put the reader on a post's action gutter — *after* the count above, whose
+    // traversal would move focus straight off it. That verb is the one tab stop
+    // under the overlay riding a **tracked** handle rather than a probe-derived
+    // one, and gpui reads a tracked handle's own `tab_stop`, so the guard —
+    // which acts where a *role* becomes a stop — cannot reach it: the verb
+    // stayed reachable behind the surface covering it. The level survives the
+    // open because `sync_tree_focus` parks its observation while a transient
+    // overlay stands.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.focus_affordance_for_test("a1", 0, window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.toggle_find_overlay(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    draw(cx, window);
+    assert!(
+        fresh_entries(cx, window)
+            .iter()
+            .any(|(name, _)| name == "space/post/0/edit"),
+        "precondition: the covered post's verb really is still painted"
+    );
+
+    let expected = find_probe_stops(cx) + 2;
+    let reachable = tab_stop_count(cx, window);
+    assert_eq!(
+        reachable, expected,
+        "every reachable stop belongs to the find surface — nothing under the \
+         overlay is in the tab order"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// REGRESSION: **a registry that has not answered is not "no backends".**
+///
+/// `BackendsStore::list` answers `&[]` for a read in flight and for a failed
+/// one exactly as it does for a registry that is really empty, so the pane said
+/// "No backends are configured yet" over a proxy whose own settings may name
+/// several exposed ones it is serving this minute — hiding what is reachable
+/// and offering nothing that could cause a second read. The registry's read is
+/// independent of the proxy's, so it fails independently too.
+#[gpui::test]
+fn the_proxy_panes_backend_cell_reads_its_states_apart(cx: &mut TestAppContext) {
+    use eidola_gui::loadable::Loadable;
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.backends = backends_fixture();
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+
+    // A read in flight.
+    stores.backends.update(cx, |s, _| {
+        s.set_state_for_test(Loadable::Loading);
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/backends/loading".to_string()),
+        "a read in flight says so: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/backends/empty".to_string()),
+        "and does not describe the reader's registry: {names:?}"
+    );
+
+    // A failed initial read: the way back is a retry, not a sentence about
+    // backends nobody has read.
+    stores.backends.update(cx, |s, _| {
+        s.set_state_for_test(Loadable::Failed {
+            error: eidola_app_core::error::AppError::Config {
+                message: "the database went away".into(),
+            },
+            prior: None,
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/backends/retry".to_string()),
+        "a failed read offers the only thing that can cause another: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/backends/empty".to_string()),
+        "'Failed is not empty': {names:?}"
+    );
+
+    // A failed refresh over rows we hold: the checkboxes stay, and the line
+    // says they are as of the last successful read.
+    stores.backends.update(cx, |s, _| {
+        s.set_state_for_test(Loadable::Failed {
+            error: eidola_app_core::error::AppError::Config {
+                message: "the database went away".into(),
+            },
+            prior: Some(backends_fixture()),
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/backends/eidola".to_string()),
+        "a re-fetch never blanks a page: {names:?}"
+    );
+    assert!(
+        names.contains(&"settings/proxy/backends/stale".to_string()),
+        "and says what it is showing: {names:?}"
+    );
+
+    // Only an answered, empty registry is the sentence.
+    stores.backends.update(cx, |s, _| {
+        s.set_state_for_test(Loadable::loaded(Vec::new()));
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/backends/empty".to_string()),
+        "an answered empty registry is the one state that says there are none: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/backends/loading".to_string()),
+        "and it is not still loading: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// A proxy configured the way a reader who has just set it up would have it:
+/// on, loopback, one backend ticked, one key live and one revoked.
+fn proxy_settings_fixture(enabled: bool, address: &str) -> eidola_app_core::proxy::ProxySettings {
+    eidola_app_core::proxy::ProxySettings {
+        enabled,
+        bind_address: address.into(),
+        bind_port: 11437,
+        local_exposure: eidola_app_core::proxy::LocalExposure::Loaded,
+        backends: vec!["eidola".into()],
+        exposed_ids: vec!["eidola".into()],
+        live_key_count: 1,
+    }
+}
+
+fn proxy_keys_fixture() -> Vec<eidola_app_core::proxy::ProxyKeyInfo> {
+    vec![
+        eidola_app_core::proxy::ProxyKeyInfo {
+            id: "k-live".into(),
+            label: "My editor".into(),
+            prefix: "eid-Ab3xQ9".into(),
+            created_at: 0,
+            last_used_at: None,
+            revoked_at: None,
+        },
+        eidola_app_core::proxy::ProxyKeyInfo {
+            id: "k-dead".into(),
+            label: "An old script".into(),
+            prefix: "eid-Zz00Kk".into(),
+            created_at: 0,
+            last_used_at: Some(1),
+            revoked_at: Some(2),
+        },
+    ]
+}
+
+/// REGRESSION: **a proxy refusal speaks the reader's language, and keeps
+/// speaking it through a locale change.**
+///
+/// The store cached `AppError`'s English `Display`, so a reader in any other
+/// locale met this crate's English in the middle of a localized pane — and a
+/// cached sentence cannot follow a locale change. The store now holds the typed
+/// error and the pane chooses the words at render; switching locale **without
+/// re-emitting the failure** is what tells the two apart (a test that re-failed
+/// after each switch would pass against a cache).
+#[gpui::test]
+fn a_proxy_refusal_is_localized_and_follows_the_locale(cx: &mut TestAppContext) {
+    use eidola_app_core::error::AppError;
+    use eidola_app_core::proxy::ProxyRefusal;
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    cx.update(|cx| {
+        stores.proxy.update(cx, |s, cx| {
+            s.set_op_error_for_test(
+                eidola_gui::stores::proxy::ProxyOp::Binding,
+                AppError::ProxyRefused {
+                    refusal: ProxyRefusal::NoPort,
+                },
+                cx,
+            );
+            s.set_listen_error_for_test(
+                AppError::ProxyRefused {
+                    refusal: ProxyRefusal::CannotListen {
+                        address: "127.0.0.1:11437".into(),
+                        reason: "Address already in use".into(),
+                    },
+                },
+                cx,
+            );
+        })
+    });
+
+    let labels = |cx: &mut TestAppContext| {
+        let entries = fresh_entries(cx, window);
+        let label = |name: &str| {
+            entries
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("{name} painted"))
+                .1
+                .label
+                .to_string()
+        };
+        (
+            label("settings/proxy/binding/error"),
+            label("settings/proxy/listen-error"),
+        )
+    };
+
+    let (refusal, listen) = labels(cx);
+    assert!(
+        refusal.starts_with("Address: The proxy needs a port."),
+        "the pane's own words, not the error's Display: {refusal}"
+    );
+    assert!(!refusal.contains("config error"), "{refusal}");
+    assert_eq!(
+        listen,
+        "Couldn't listen on 127.0.0.1:11437 — Address already in use"
+    );
+
+    // Nothing is re-emitted between these — only the locale changes.
+    for (tag, refusal_starts, listen_expected) in [
+        (
+            "fr",
+            "Adresse : Le proxy a besoin d'un port.",
+            "Impossible d'écouter sur 127.0.0.1:11437 — Address already in use",
+        ),
+        (
+            "zh-Hans",
+            "地址：代理需要一个端口。",
+            "无法在 127.0.0.1:11437 上监听 —— Address already in use",
+        ),
+        (
+            "en",
+            "Address: The proxy needs a port.",
+            "Couldn't listen on 127.0.0.1:11437 — Address already in use",
+        ),
+    ] {
+        cx.update(|cx| eidola_gui::i18n::apply(tag, cx));
+        cx.run_until_parked();
+        let (refusal, listen) = labels(cx);
+        assert!(
+            refusal.starts_with(refusal_starts),
+            "{tag} repaints the refusal already on screen: {refusal}"
+        );
+        assert_eq!(listen, listen_expected, "{tag}");
+    }
+}
+
+/// REGRESSION: **each refused control's report stands under that control,
+/// and goes when that one is dismissed.**
+///
+/// The store kept one refusal slot for the whole pane, so a refused exposure
+/// checkbox and a refused switch could not both be on screen — the later one
+/// erased the earlier — and the single band at the foot of the pane said
+/// nothing about which control it was about. Keyed by control, each refusal is
+/// drawn beneath its own control, its accessible name says which, and its
+/// dismiss takes back that one alone.
+#[gpui::test]
+fn proxy_refusals_stand_under_their_own_controls_and_dismiss_apart(cx: &mut TestAppContext) {
+    use eidola_app_core::error::AppError;
+    use eidola_app_core::proxy::ProxyRefusal;
+    use eidola_gui::proxy_settings::ProxySettingsView;
+    use eidola_gui::stores::proxy::ProxyOp;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    let refusal = || AppError::ProxyRefused {
+        refusal: ProxyRefusal::NoPort,
+    };
+    cx.update(|cx| {
+        stores.proxy.update(cx, |s, cx| {
+            s.set_op_error_for_test(ProxyOp::Enabled, refusal(), cx);
+            s.set_op_error_for_test(ProxyOp::Backend("my-box".into()), refusal(), cx);
+            // A refusal about a backend the registry has answered without is
+            // about nothing on this pane, so it is forgotten, not drawn.
+            s.set_op_error_for_test(ProxyOp::Backend("removed".into()), refusal(), cx);
+        })
+    });
+
+    let entries = fresh_entries(cx, window);
+    let find = |name: &str| {
+        entries
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, e)| e.clone())
+    };
+    let serve_band = find("settings/proxy/serve/error").expect("the switch's refusal painted");
+    let backend_band =
+        find("settings/proxy/backends/my-box/error").expect("the checkbox's refusal painted");
+    assert_eq!(serve_band.role, gpui::Role::Alert);
+    assert!(
+        serve_band
+            .label
+            .starts_with("Serve requests: The proxy needs a port."),
+        "the alert says which control it is about: {}",
+        serve_band.label
+    );
+    assert!(
+        backend_band
+            .label
+            .starts_with("My box: The proxy needs a port."),
+        "{}",
+        backend_band.label
+    );
+    assert!(
+        find("settings/proxy/error").is_none(),
+        "no pane-wide band stands in for the per-control ones"
+    );
+    assert!(
+        cx.update(|cx| {
+            stores
+                .proxy
+                .read(cx)
+                .op_error(&ProxyOp::Backend("removed".into()))
+                .is_none()
+        }),
+        "a refusal with no control left to stand under is forgotten"
+    );
+
+    // **Where its control is**: each band sits directly below the control it
+    // is about and above the row that follows.
+    let y = |name: &str| {
+        find(name)
+            .unwrap_or_else(|| panic!("{name} painted"))
+            .bounds
+            .origin
+            .y
+    };
+    assert!(y("settings/proxy/serve") < y("settings/proxy/serve/error"));
+    assert!(y("settings/proxy/serve/error") < y("settings/proxy/binding/change"));
+    assert!(y("settings/proxy/backends/my-box") < y("settings/proxy/backends/my-box/error"));
+    assert!(y("settings/proxy/backends/local") < y("settings/proxy/backends/my-box"));
+    assert_probe(
+        &entries,
+        "settings/proxy/serve/error/dismiss",
+        gpui::Role::Button,
+        "Dismiss the message about Serve requests",
+    );
+
+    // Dismissing one leaves the other standing.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.dismiss_refusal(ProxyOp::Enabled, "settings/proxy/serve/error", window, cx)
+        });
+    })
+    .unwrap();
+    let entries = fresh_entries(cx, window);
+    let names: Vec<&String> = entries.iter().map(|(n, _)| n).collect();
+    assert!(
+        !names.iter().any(|n| *n == "settings/proxy/serve/error"),
+        "the dismissed refusal is gone: {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| *n == "settings/proxy/backends/my-box/error"),
+        "the other control's refusal still stands: {names:?}"
+    );
+}
+
+/// REGRESSION: **a port that is not one is refused out loud, and the editor
+/// stays open with what was typed.**
+///
+/// Save returned without a word on text that did not parse as a `u16` — a
+/// letter, or a number past 65535 — so the button looked broken and nothing
+/// said what to correct. The refusal is app-core's typed one
+/// (`parse_bind_port`), filed under the binding's key, so it renders in the
+/// band beneath the row exactly as a refused write there does; `0` answers
+/// with the same sentence the write itself gives it.
+#[gpui::test]
+fn a_port_that_is_not_one_is_refused_where_it_was_typed(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(false, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_binding_edit(window, cx));
+    })
+    .unwrap();
+
+    for (typed, expected) in [
+        ("abc", "abc is not a port."),
+        ("70000", "70000 is not a port."),
+        ("0", "The proxy needs a port."),
+    ] {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| {
+                v.set_binding_port_for_test(typed, window, cx);
+                v.commit_binding_edit(window, cx);
+            });
+        })
+        .unwrap();
+        assert!(
+            view.read_with(cx, |v, _| v.is_editing_binding()),
+            "{typed:?}: the editor stays open with what was typed"
+        );
+        let entries = fresh_entries(cx, window);
+        let band = entries
+            .iter()
+            .find(|(n, _)| n == "settings/proxy/binding/error")
+            .unwrap_or_else(|| panic!("{typed:?}: the refusal is shown"));
+        assert_eq!(band.1.role, gpui::Role::Alert);
+        assert!(
+            band.1.label.starts_with(&format!("Address: {expected}")),
+            "{typed:?}: {}",
+            band.1.label
+        );
+    }
+
+    // A port that is one goes through, and the write clears the refusal.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_binding_port_for_test("11438", window, cx);
+            v.commit_binding_edit(window, cx);
+        });
+    })
+    .unwrap();
+    assert!(!view.read_with(cx, |v, _| v.is_editing_binding()));
+    let entries = fresh_entries(cx, window);
+    assert!(
+        !entries
+            .iter()
+            .any(|(n, _)| n == "settings/proxy/binding/error"),
+        "the next write clears the binding's refusal"
+    );
+}
+
+/// REGRESSION: **the binding row spells an IPv6 endpoint the way a client
+/// parses it.**
+///
+/// The row joined host and port, so `::1` read `::1:11437` — not an address
+/// any client accepts — while the status line beside it, spelled by
+/// `SocketAddr`, read `[::1]:11437`. One pane, two spellings of one binding,
+/// and the one a reader copies into a tool was the invalid one.
+#[gpui::test]
+fn the_binding_row_brackets_an_ipv6_endpoint(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    for (address, expected) in [("::1", "[::1]:11437"), ("127.0.0.1", "127.0.0.1:11437")] {
+        let stores = stub_stores(cx, |s| {
+            s.config_state = Some(probe_config_state());
+            s.backends = backends_fixture();
+            s.proxy_settings = Some(proxy_settings_fixture(false, address));
+            s.proxy_keys = proxy_keys_fixture();
+        });
+        let (window, _view) = open_view(cx, |window, cx| {
+            cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+        });
+        let entries = fresh_entries(cx, window);
+        assert_probe_value(
+            &entries,
+            "settings/proxy/binding/value",
+            gpui::Role::Label,
+            expected,
+            expected,
+        );
+    }
+}
+
+/// Press the centre of the switch probed as `probe_name` and return what
+/// `state` read before and after — the press aimed at the widget itself, the
+/// primary pointer target, never at the wrapper's padding.
+fn press_proxy_switch(
+    cx: &mut TestAppContext,
+    probe_name: &str,
+    state: impl Fn(&eidola_app_core::proxy::ProxySettings) -> bool,
+) -> (bool, bool) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+    use gpui::{Modifiers, VisualTestContext};
+
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    let entries = fresh_entries(cx, window);
+    let (_, control) = entries
+        .iter()
+        .find(|(n, _)| n == probe_name)
+        .unwrap_or_else(|| panic!("{probe_name} painted"));
+    // The wrapper holds the widget and nothing else, so its centre is the
+    // switch track — a small `Switch` is 28×16.
+    assert!(
+        control.bounds.size.width <= gpui::px(30.) && control.bounds.size.height <= gpui::px(18.),
+        "the press lands on the widget, not on padding around it: {:?}",
+        control.bounds
+    );
+    let centre = control.bounds.center();
+    let read = |cx: &mut TestAppContext| {
+        cx.update(|cx| state(stores.proxy.read(cx).settings().value().expect("settings")))
+    };
+    let before = read(cx);
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_click(centre, Modifiers::default());
+    vcx.run_until_parked();
+    (before, read(cx))
+}
+
+/// **A pointer press on a backend's switch changes that backend's exposure —
+/// exactly once.** "Not at all" is the pressed-and-eaten failure (a widget that
+/// takes the press and has no handler); "twice" is the double-fire one (wrapper
+/// and widget both answering), which reads as no change. Both fail here.
+#[gpui::test]
+fn proxy_pane_backend_switch_answers_a_pointer_press(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let (before, after) = press_proxy_switch(cx, "settings/proxy/backends/eidola", |s| {
+        s.exposed_ids.contains(&"eidola".to_string())
+    });
+    assert!(before, "precondition: the backend starts exposed");
+    assert!(
+        !after,
+        "one press on the switch takes the exposure away, once"
+    );
+}
+
+/// The Serve switch, held to the same rule by the same press.
+#[gpui::test]
+fn proxy_pane_serve_switch_answers_a_pointer_press(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+    let (before, after) = press_proxy_switch(cx, "settings/proxy/serve", |s| s.enabled);
+    assert!(before, "precondition: serving");
+    assert!(!after, "one press on the switch stops serving, once");
+}
+
+/// **The keyboard reaches the `Switch` itself, and each Space or Enter
+/// toggles it exactly once.** The widget is the focus-bearing node, so the
+/// keyboard path is the widget's own: a press focuses it, then each key is one
+/// activation. A wrapper handler left beside the widget's would double every
+/// key into no change; a widget left out of focus would ignore them.
+#[gpui::test]
+fn proxy_pane_serve_switch_answers_space_and_enter_once_each(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+    use gpui::{Modifiers, VisualTestContext};
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    let entries = fresh_entries(cx, window);
+    let (_, control) = entries
+        .iter()
+        .find(|(n, _)| n == "settings/proxy/serve")
+        .expect("the serve switch painted");
+    let centre = control.bounds.center();
+    let serving = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            stores
+                .proxy
+                .read(cx)
+                .settings()
+                .value()
+                .expect("settings")
+                .enabled
+        })
+    };
+    let mut vcx = VisualTestContext::from_window(window, cx);
+    vcx.simulate_click(centre, Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        !serving(cx),
+        "the press toggled once and left the widget focused"
+    );
+
+    activate_with(cx, window, "space");
+    assert!(serving(cx), "Space toggles the focused switch exactly once");
+
+    press_enter(cx, window);
+    assert!(
+        !serving(cx),
+        "Enter toggles the focused switch exactly once"
+    );
+}
+
+#[gpui::test]
+fn proxy_pane_probes_its_switch_binding_backends_and_keys(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.backends = backends_fixture();
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+
+    let entries = fresh_entries(cx, window);
+    let names: Vec<String> = entries.iter().map(|(name, _)| name.clone()).collect();
+    for expected in [
+        "settings/proxy/pane",
+        "settings/proxy/serve",
+        "settings/proxy/status",
+        "settings/proxy/binding/change",
+        "settings/proxy/backends/eidola",
+        "settings/proxy/backends/local",
+        "settings/proxy/backends/my-box",
+        "settings/proxy/exposure/loaded",
+        "settings/proxy/exposure/downloaded",
+        "settings/proxy/keys/0",
+        "settings/proxy/keys/0/revoke",
+        "settings/proxy/keys/1",
+        "settings/proxy/keys/label",
+        "settings/proxy/keys/create",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "proxy pane probe {expected:?} missing: {names:?}"
+        );
+    }
+
+    // **The status reads the listener, not the setting.** A stub store binds
+    // nothing, so a pane whose settings say "enabled" still says it is not
+    // listening — which is the honest answer and the whole reason the two are
+    // read apart.
+    assert_probe_value(
+        &entries,
+        "settings/proxy/status",
+        gpui::Role::Label,
+        "Not listening",
+        "Not listening",
+    );
+
+    // A revoked key keeps its row — the label is what tells a reader which
+    // tool lost access — and loses only its verb.
+    assert!(
+        !names.contains(&"settings/proxy/keys/1/revoke".to_string()),
+        "a revoked key offers no second revocation: {names:?}"
+    );
+    let live = entries
+        .iter()
+        .find(|(n, _)| n == "settings/proxy/keys/0")
+        .expect("the live key's row");
+    assert!(
+        live.1
+            .value
+            .as_ref()
+            .is_some_and(|v| v.contains("eid-Ab3xQ9")),
+        "the row shows enough of the key to tell rows apart: {:?}",
+        live.1.value
+    );
+    assert!(
+        !names.iter().any(|n| n == "settings/proxy/keys/minted"),
+        "nothing is revealed until a key is generated: {names:?}"
+    );
+
+    // The binding row is display-then-editor: the value stands until a verb
+    // swaps the fields in.
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.begin_binding_edit(window, cx));
+    })
+    .unwrap();
+    let names = fresh_names(cx, window);
+    for expected in [
+        "settings/proxy/binding/address",
+        "settings/proxy/binding/port",
+        "settings/proxy/binding/save",
+        "settings/proxy/binding/cancel",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "binding editor probe {expected:?} missing: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"settings/proxy/binding/change".to_string()),
+        "the verb the editor replaced is gone while it stands: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// REGRESSION: **a key cell that has not answered is not "no keys".**
+///
+/// `key_list` answers `&[]` for a read in flight and for a failed one exactly
+/// as it does for a proxy that really has no keys, so one sentence covered all
+/// three — and it is the worst of the three to be wrong about: "No keys yet —
+/// nothing can reach the proxy until you make one" invites a reader whose keys
+/// are perfectly alive to generate another, and a failed read left nothing on
+/// the page that could ever cause a second one.
+///
+/// Four states, four readings: in flight says so, a failed *initial* read says
+/// so and offers the retry, a failed *refresh* keeps the rows it has and adds
+/// the quiet line, and only an answered empty listing is the invitation.
+#[gpui::test]
+fn the_proxy_panes_key_cell_reads_its_states_apart(cx: &mut TestAppContext) {
+    use eidola_gui::loadable::Loadable;
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+
+    // A read in flight.
+    stores.proxy.update(cx, |s, _| {
+        s.set_keys_for_test(Loadable::Loading);
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/keys/loading".to_string()),
+        "a read in flight says so: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/keys/empty".to_string()),
+        "and does not claim the proxy has no keys: {names:?}"
+    );
+
+    // A failed initial read: the way back is a retry, not an invitation.
+    stores.proxy.update(cx, |s, _| {
+        s.set_keys_for_test(Loadable::Failed {
+            error: eidola_app_core::error::AppError::Config {
+                message: "the database went away".into(),
+            },
+            prior: None,
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/keys/retry".to_string()),
+        "a failed read offers the only thing that can cause another: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/keys/empty".to_string()),
+        "'Failed is not empty': {names:?}"
+    );
+
+    // A failed refresh over rows we hold: the rows stay, and the line says they
+    // are as of the last successful read.
+    stores.proxy.update(cx, |s, _| {
+        s.set_keys_for_test(Loadable::Failed {
+            error: eidola_app_core::error::AppError::Config {
+                message: "the database went away".into(),
+            },
+            prior: Some(proxy_keys_fixture()),
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/keys/0".to_string()),
+        "a re-fetch never blanks a page: {names:?}"
+    );
+    for expected in [
+        "settings/proxy/keys/stale",
+        "settings/proxy/keys/stale-retry",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "the stale strip and its way back: {expected:?} missing from {names:?}"
+        );
+    }
+
+    // And only an answered, empty listing is the invitation.
+    stores.proxy.update(cx, |s, _| {
+        s.set_keys_for_test(Loadable::loaded(Vec::new()));
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/keys/empty".to_string()),
+        "an answered empty listing is the one state that says there are no keys: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/keys/loading".to_string()),
+        "and it is not still loading: {names:?}"
+    );
+
+    // The settings cell takes the same reading: a failed refresh keeps the
+    // values on screen and says they may be stale.
+    stores.proxy.update(cx, |s, _| {
+        s.set_settings_for_test(Loadable::Failed {
+            error: eidola_app_core::error::AppError::Config {
+                message: "the database went away".into(),
+            },
+            prior: Some(proxy_settings_fixture(true, "127.0.0.1")),
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/serve".to_string()),
+        "the rows a stale read still describes stay on screen: {names:?}"
+    );
+    assert!(
+        names.contains(&"settings/proxy/stale".to_string()),
+        "with the line that says so: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// REGRESSION: **no live row whose secret was never shown.**
+///
+/// A key exists in full for exactly one render. While one stands unread — or
+/// while a generation is still travelling — a second press would insert a live
+/// credential the banner never showed, and the pane would go on offering the
+/// verb that does it. The control is therefore not merely refused but not
+/// painted: one predicate decides the press and the painting, so an offered
+/// verb and an accepted press cannot disagree.
+#[gpui::test]
+fn a_key_waiting_to_be_read_withholds_the_verb_that_would_replace_it(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+        s.proxy_keys = proxy_keys_fixture();
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/keys/create".to_string()),
+        "with nothing standing, the verb is offered: {names:?}"
+    );
+
+    stores.proxy.update(cx, |s, _| {
+        s.set_minted_for_test(eidola_app_core::proxy::MintedProxyKey {
+            info: eidola_app_core::proxy::ProxyKeyInfo {
+                id: "k-new".into(),
+                label: "A new tool".into(),
+                prefix: "eid-Qq11Ww".into(),
+                created_at: 0,
+                last_used_at: None,
+                revoked_at: None,
+            },
+            key: "eid-Qq11Ww-the-whole-secret".into(),
+        });
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        names.contains(&"settings/proxy/keys/minted".to_string()),
+        "the key is on screen: {names:?}"
+    );
+    assert!(
+        !names.contains(&"settings/proxy/keys/create".to_string()),
+        "and the verb that would replace it is not a control while it stands: {names:?}"
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+#[gpui::test]
+fn a_proxy_bound_off_loopback_says_what_that_costs(cx: &mut TestAppContext) {
+    use eidola_gui::proxy_settings::ProxySettingsView;
+
+    let _guard = probes_on();
+
+    // Loopback: nothing to warn about.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.proxy_settings = Some(proxy_settings_fixture(true, "127.0.0.1"));
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    let names = fresh_names(cx, window);
+    assert!(
+        !names.contains(&"settings/proxy/exposed-warning".to_string()),
+        "a loopback bind is the shape this is safe in: {names:?}"
+    );
+
+    // A routable address is a plaintext inference endpoint on the network, and
+    // nothing underneath refuses it — this band *is* the honesty.
+    let stores = stub_stores(cx, |s| {
+        s.config_state = Some(probe_config_state());
+        s.proxy_settings = Some(proxy_settings_fixture(true, "0.0.0.0"));
+    });
+    let (window, _view) = open_view(cx, |window, cx| {
+        cx.new(|cx| ProxySettingsView::new(stores.clone(), window, cx))
+    });
+    let entries = fresh_entries(cx, window);
+    let warning = entries
+        .iter()
+        .find(|(n, _)| n == "settings/proxy/exposed-warning")
+        .expect("the danger band");
+    assert_eq!(warning.1.role, gpui::Role::Alert);
+    assert!(
+        warning.1.label.contains("in the clear"),
+        "the band names what it costs: {:?}",
+        warning.1.label
+    );
+
+    probe::set_probes_enabled(false);
+}
+
+/// **A cut-off answer offers Continue exactly where it can be continued.** The
+/// verb rides the cut-off mark as a real button whose accessible name is the
+/// action in full, in the reader's language; an answer that stopped short but
+/// cannot be continued (its model is not one of Eidola's) carries the mark
+/// alone. An accepted press starts the continuation in place — "Continuing…"
+/// over the answer it extends — and the verb goes with the mutation it started,
+/// so nothing is left looking live.
+#[gpui::test]
+fn a_cut_off_answer_offers_continue_where_it_can_be_continued(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| SpaceView::new(stores, Some("s".into()), WindowInput::new(cx), window, cx))
+    });
+    let space = view.read_with(cx, |v, _| v.space().clone());
+
+    let agent = || PostParticipant {
+        kind: "agent".into(),
+        label: "Surveyor".into(),
+    };
+    let mut continuable = probe_post("a1", "The tides are driven by");
+    continuable.action_type = "inference".into();
+    continuable.participant = agent();
+    continuable.truncated = true;
+    continuable.continuable = true;
+    let mut local = probe_post("a2", "A local model's answer that ran out of");
+    local.action_type = "inference".into();
+    local.parent_action_id = Some("a1".into());
+    local.participant = agent();
+    local.truncated = true;
+    cx.update(|cx| {
+        space.update(cx, |s, cx| {
+            s.set_post_tree_for_test(vec![continuable, local], cx)
+        });
+    });
+
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/0/continue",
+        gpui::Role::Button,
+        "Continue this answer from where it stopped",
+    );
+    assert_probe(
+        &entries,
+        "space/post/0/cut-off",
+        gpui::Role::Label,
+        "This answer stopped at its length limit.",
+    );
+    assert!(
+        entries.iter().any(|(n, _)| n == "space/post/1/cut-off"),
+        "the uncontinuable answer is still marked"
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n == "space/post/1/continue"),
+        "but offers no verb that could only be refused"
+    );
+
+    cx.update(|cx| eidola_gui::i18n::apply("fr", cx));
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        "space/post/0/continue",
+        gpui::Role::Button,
+        "Poursuivre cette réponse là où elle s’est arrêtée",
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| {
+            v.continue_answer(&"a1".into(), &"a1".into(), window, cx)
+        });
+    })
+    .unwrap();
+    let seq = space.read_with(cx, |s, _| {
+        let seq = s
+            .revising_seq("a1")
+            .expect("the continuation is pending on its post");
+        assert!(
+            s.streams()
+                .iter()
+                .any(|t| t.seq == seq && t.revising && t.continuing),
+            "a revision that continues"
+        );
+        assert!(!s.accepts_mutation());
+        seq
+    });
+    let entries = fresh_entries(cx, window);
+    assert_probe(
+        &entries,
+        &format!("space/streaming/{seq}/continuing"),
+        gpui::Role::Label,
+        "Poursuite de la réponse…",
+    );
+    assert!(
+        !entries.iter().any(|(n, _)| n.ends_with("/continue")),
+        "the verb is gone while its continuation runs"
+    );
+    probe::set_probes_enabled(false);
+}
+
+/// An account the server created but this profile could not keep: the create
+/// slide's alert says so, and the credential is on screen with its copy
+/// verbs — the server holds only the secret's hash, so these rows are the
+/// only copy there is.
+#[gpui::test]
+fn an_unsaved_account_shows_its_credential_to_copy(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::CreateAccount, cx);
+        v.set_create_error_for_test(
+            AppError::AccountNotSaved {
+                account: Box::new(eidola_app_core::error::UnsavedAccount {
+                    account_id: "00000000-0000-0000-0000-00000000000c".into(),
+                    secret: eidola_app_core::error::AccountSecret::new("only-copy".into()),
+                    terms: eidola_app_core::TermsAcceptance::Complete,
+                    recovery_file: None,
+                }),
+                reason: "config error: unreadable".into(),
+            },
+            cx,
+        );
+    });
+    draw(cx, window);
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    for expected in [
+        "onboarding/error/create",
+        "onboarding/copy/unsaved-account-id",
+        "onboarding/copy/unsaved-account-secret",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "unsaved-account probe {expected:?} missing; recorded: {names:?}"
+        );
+    }
+    // No file was written, so none is named.
+    assert!(
+        !names.contains(&"onboarding/create/recovery-file"),
+        "a recovery file is named that does not exist; recorded: {names:?}"
+    );
+}
+
+/// When the credential was also written beside the profile, the create slide
+/// names that file under the credential rows, as the CLI does — the reader
+/// is the one who removes it.
+#[gpui::test]
+fn an_unsaved_account_names_the_file_it_was_also_written_to(cx: &mut TestAppContext) {
+    let _guard = probes_on();
+
+    let stores = ready_stores(cx);
+    let (window, view) = open_view(cx, |window, cx| {
+        cx.new(|cx| OnboardingView::new(stores, window, cx))
+    });
+    let path = "/profile/account-recovery-00000000-0000-0000-0000-00000000000c.toml";
+    view.update(cx, |v, cx| {
+        v.reveal(Slide::Pause, Slide::Tool, cx);
+        v.reveal(Slide::Tool, Slide::Control, cx);
+        v.reveal(Slide::Control, Slide::Responsibility, cx);
+        v.reveal(Slide::Responsibility, Slide::GetStarted, cx);
+        v.reveal(Slide::GetStarted, Slide::CreateAccount, cx);
+        v.set_create_error_for_test(
+            AppError::AccountNotSaved {
+                account: Box::new(eidola_app_core::error::UnsavedAccount {
+                    account_id: "00000000-0000-0000-0000-00000000000c".into(),
+                    secret: eidola_app_core::error::AccountSecret::new("only-copy".into()),
+                    terms: eidola_app_core::TermsAcceptance::Complete,
+                    recovery_file: Some(path.into()),
+                }),
+                reason: "config error: unreadable".into(),
+            },
+            cx,
+        );
+    });
+    draw(cx, window);
+
+    let entries = probe::window_entries(window.window_id().as_u64());
+    let line = entries
+        .iter()
+        .find(|(n, _)| n == "onboarding/create/recovery-file")
+        .map(|(_, e)| e.label.to_string())
+        .unwrap_or_else(|| {
+            let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+            panic!("the recovery file is not named; recorded: {names:?}")
+        });
+    assert!(
+        line.contains(path),
+        "the line does not name the file: {line}"
+    );
 }

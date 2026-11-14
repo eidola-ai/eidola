@@ -15,7 +15,7 @@ variable "TAGS" {
 # Empty (the default, and what local builds use) disables the cache entirely;
 # CI sets it for non-release builds and leaves it empty for v* release tags so
 # the attested artifacts compile clean. The dev and ci-* variant of each image
-# share one ref per image (eidola-buildcache:{server,cli,postgres}), so the
+# share one ref per image (eidola-buildcache:{server,cli,postgres,engine-kernels,server-engine}), so the
 # promotion PR (which builds the dev targets) warms the post-merge push to main
 # (which builds the ci-* targets). See .github/workflows/artifacts.yml.
 variable "CACHE_REGISTRY" {
@@ -64,15 +64,37 @@ target "_cache_postgres" {
   cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:postgres,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
 }
 
-# ── Local dev targets (compose.yaml overlay) ──────────────────────────────────
-# context and dockerfile come from compose.yaml; not repeated here.
+target "_cache_engine_kernels" {
+  cache-from = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:engine-kernels"] : []
+  cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:engine-kernels,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
+}
+
+target "_cache_server_engine" {
+  cache-from = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:server-engine"] : []
+  cache-to   = CACHE_REGISTRY != "" ? ["type=registry,ref=${CACHE_REGISTRY}/eidola-buildcache:server-engine,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"] : []
+}
+
+# ── Local dev targets ─────────────────────────────────────────────────────────
+# Every target declares its own context and dockerfile. Bake also reads
+# compose.yaml and merges a compose service into the target of the same name,
+# but that coupling is by name only: a target leaning on it silently falls
+# back to `./Dockerfile` the moment the service is renamed. compose.yaml's
+# build sections stay for `docker compose build`; they are not this file's
+# source of truth.
 # For reproducible builds, use a docker-container builder with OCI output and
 # --set '*.output=type=image,push=false,rewrite-timestamp=true,force-compression=true,oci-mediatypes=true'
 # (the default docker driver does not support these options).
 
+# The `server` and `ci-server` targets build the gateway image
+# (eidola-server-gateway). The target name is not cosmetic:
+# scripts/artifact-manifest.sh records each target's digest under the
+# manifest key `eidola-<target>`, and installed clients compare that key set,
+# so renaming a target is a manifest artifact-set rotation (releases/README.md).
 target "server" {
-  inherits = ["_common", "_cache_server"]
-  tags     = ["eidola-server:dev"]
+  inherits   = ["_common", "_cache_server"]
+  context    = "."
+  dockerfile = "oci/eidola-server-gateway/Containerfile"
+  tags       = ["eidola-server-gateway:dev"]
 }
 
 target "cli" {
@@ -82,14 +104,53 @@ target "cli" {
   tags       = ["eidola-cli:dev"]
 }
 
+# Operational image, runnable as receiver, worker or private support CLI.
+# Kept outside the client artifact manifest and release publication pipeline.
+target "billing" {
+  inherits   = ["_common"]
+  context    = "."
+  dockerfile = "oci/eidola-billing/Containerfile"
+  tags       = ["eidola-billing:dev"]
+}
+
 target "postgres" {
-  inherits = ["_common", "_cache_postgres"]
-  tags     = ["eidola-postgres:dev"]
+  inherits   = ["_common", "_cache_postgres"]
+  context    = "."
+  dockerfile = "oci/postgresql/Containerfile"
+  tags       = ["eidola-postgres:dev"]
+}
+
+# The inference engine's GPU kernel images (Nix, CUDA toolkit), the input the
+# node's image pins by digest. Not recorded in the manifest: the node's image
+# carries every file of it.
+target "engine-kernels" {
+  inherits   = ["_common", "_cache_engine_kernels"]
+  context    = "."
+  dockerfile = "oci/eidola-engine-kernels/Containerfile"
+  tags       = ["eidola-engine-kernels:dev"]
+}
+
+# The inference node (eidola-server-engine, CUDA executor). Recorded under
+# the manifest key `eidola-server-engine` from the manifest schema that
+# records it (scripts/artifact-manifest.sh, ENGINE_IMAGE_SCHEMA). The image
+# is always the release profile, so CARGO_PROFILE does not reach it. Its
+# Containerfile pins the kernel image by digest; here that input is the
+# `engine-kernels` target built from this tree, and scripts/artifact-manifest.sh
+# fails the build unless that target's digest is the pinned one, so an
+# unpublished pin builds the same image a published one does.
+target "server-engine" {
+  inherits   = ["_common", "_cache_server_engine"]
+  context    = "."
+  dockerfile = "oci/eidola-server-engine/Containerfile"
+  contexts   = { kernels = "target:engine-kernels" }
+  tags       = ["eidola-server-engine:dev"]
 }
 
 target "shim" {
-  inherits = ["_common"]
-  tags     = ["tinfoil-shim-mock:dev"]
+  inherits   = ["_common"]
+  context    = "."
+  dockerfile = "oci/tinfoil-shim-mock/Containerfile"
+  tags       = ["tinfoil-shim-mock:dev"]
 }
 
 # Stripe CLI — pins the upstream image by digest so dependabot can propose
@@ -119,8 +180,8 @@ target "_ci" {
 target "ci-server" {
   inherits   = ["_ci", "_cache_server"]
   context    = "."
-  dockerfile = "oci/eidola-server/Containerfile"
-  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-server:${t}"]
+  dockerfile = "oci/eidola-server-gateway/Containerfile"
+  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-server-gateway:${t}"]
 }
 
 target "ci-cli" {
@@ -135,4 +196,19 @@ target "ci-postgres" {
   context    = "."
   dockerfile = "oci/postgresql/Containerfile"
   tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-postgres:${t}"]
+}
+
+target "ci-engine-kernels" {
+  inherits   = ["_ci", "_cache_engine_kernels"]
+  context    = "."
+  dockerfile = "oci/eidola-engine-kernels/Containerfile"
+  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-engine-kernels:${t}"]
+}
+
+target "ci-server-engine" {
+  inherits   = ["_ci", "_cache_server_engine"]
+  context    = "."
+  dockerfile = "oci/eidola-server-engine/Containerfile"
+  contexts   = { kernels = "target:ci-engine-kernels" }
+  tags       = [for t in split(",", TAGS) : "${REGISTRY}/eidola-server-engine:${t}"]
 }

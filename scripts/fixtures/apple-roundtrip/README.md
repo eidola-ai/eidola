@@ -94,4 +94,4 @@ The sidecar is **arm64-only by decision** even inside the universal app (see `AG
 
 ## Note on the Nix build cache
 
-`flake.nix`'s `filteredSrc` drops non-Rust *files* but keeps *directories* (crane's filter has to, in order to descend). So this directory tree perturbs the filtered source hash even though none of its files survive the filter, and adding it cost one full rebuild of the macOS artifacts. It does **not** move `artifact-manifest.json` — that records the output's `narHash`, and an empty source directory cannot reach the output. Measured in `round-trip.md` §5.4, which also names the durable fix.
+`flake.nix`'s `filteredSrc` drops non-Rust *files* but keeps *directories* (crane's filter has to, in order to descend). So this directory tree perturbs the filtered source hash even though none of its files survive the filter, and adding it cost one full rebuild of the macOS artifacts. It does **not** move `artifact-manifest.json` — that records the output's `narHash` / `archiveSha256`, and an empty source directory cannot reach the output. Measured in `round-trip.md` §5.4, which also names the durable fix.

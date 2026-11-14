@@ -42,6 +42,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
+mod apple_verify;
 mod attest;
 mod manifest;
 mod pkcs11;
@@ -123,6 +124,23 @@ enum Command {
         /// a deliberate chain-breaking release.
         #[arg(long)]
         templates: Option<PathBuf>,
+
+        /// The reproducible unsigned macOS container, whose sha256
+        /// `artifact-manifest.json` records. Required together with
+        /// `--apple-signature-bundle` and `--apple-shipped-artifact`:
+        /// `attest` reconstructs the signed app from the first two and
+        /// requires it to equal the third, and will not offer the
+        /// `apple_signature_reconstructs` claim otherwise.
+        #[arg(long, requires_all = ["apple_signature_bundle", "apple_shipped_artifact"])]
+        apple_unsigned_artifact: Option<PathBuf>,
+
+        /// The published detached signature material.
+        #[arg(long, requires_all = ["apple_unsigned_artifact", "apple_shipped_artifact"])]
+        apple_signature_bundle: Option<PathBuf>,
+
+        /// The signed container a browser downloads.
+        #[arg(long, requires_all = ["apple_unsigned_artifact", "apple_signature_bundle"])]
+        apple_shipped_artifact: Option<PathBuf>,
     },
 
     /// Detach, apply, or inspect a macOS app's code signatures.
@@ -305,9 +323,28 @@ fn main() -> Result<()> {
             attestant_name,
             jurisdiction,
             templates,
+            apple_unsigned_artifact,
+            apple_signature_bundle,
+            apple_shipped_artifact,
         } => {
             let workspace_root = workspace_root()?;
             let repo = resolve_repo(cli.repo.as_deref(), &workspace_root)?;
+            // `requires_all` above makes the three arrive together or not
+            // at all, so the triple is either whole or absent here.
+            let apple = match (
+                apple_unsigned_artifact,
+                apple_signature_bundle,
+                apple_shipped_artifact,
+            ) {
+                (Some(unsigned_artifact), Some(signature_bundle), Some(shipped_artifact)) => {
+                    Some(attest::AppleInputs {
+                        unsigned_artifact,
+                        signature_bundle,
+                        shipped_artifact,
+                    })
+                }
+                _ => None,
+            };
             attest::run(attest::Args {
                 workspace_root,
                 repo,
@@ -317,6 +354,7 @@ fn main() -> Result<()> {
                 attestant_name,
                 jurisdiction,
                 templates_override: templates,
+                apple,
             })
         }
     }

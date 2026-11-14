@@ -124,6 +124,20 @@ fn spawn_from(
     participants: Vec<String>,
     anchor: Option<&str>,
 ) -> SpawnedSubspace {
+    spawn_for_turn(core, parent, owner, participants, anchor, None)
+}
+
+/// A spawn that names the **turn** it was opened from as well as the post: the
+/// item that turn will write its answer under, which is what the `delegate`
+/// tool supplies from inside a turn and what the report attaches beneath.
+fn spawn_for_turn(
+    core: &AppCore,
+    parent: &str,
+    owner: &str,
+    participants: Vec<String>,
+    anchor: Option<&str>,
+    answer_item: Option<&str>,
+) -> SpawnedSubspace {
     core.runtime()
         .block_on(core.spawn_subspace(
             parent.to_string(),
@@ -133,6 +147,7 @@ fn spawn_from(
             vec![],
             None,
             anchor.map(str::to_string),
+            answer_item.map(str::to_string),
         ))
         .expect("spawn")
 }
@@ -185,16 +200,29 @@ fn restartable() -> (
     AppCore,
     tempfile::TempDir,
 ) {
+    restartable_with(ChatBehavior::OkStreaming)
+}
+
+/// The same, on a mock that answers whichever transport the test needs — asks
+/// stream, a regeneration is blocking.
+fn restartable_with(
+    chat: ChatBehavior,
+) -> (
+    tokio::runtime::Runtime,
+    MockServer,
+    AppCore,
+    tempfile::TempDir,
+) {
     let mock_rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("mock runtime");
     let mock = mock_rt.block_on(chat_harness::start(MockConfig {
-        chat: ChatBehavior::OkStreaming,
+        chat,
         ..MockConfig::default()
     }));
     let (_unused, core, dir) = chat_harness::core_for(MockConfig {
-        chat: ChatBehavior::OkStreaming,
+        chat,
         ..MockConfig::default()
     });
     add_backend_at(&core, &mock.base_url);
@@ -202,8 +230,8 @@ fn restartable() -> (
 }
 
 /// Ask a specific participant to respond — the door a human watching a
-/// delegated room still has, and the only way to post into one before the join
-/// affordance ships.
+/// delegated room still has, and the one that puts a post there without
+/// speaking as the reader (`post` would, and would join them to the room).
 fn ask(core: &AppCore, space_id: &str, participant: &str, target: &str) -> String {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     core.runtime()
@@ -222,7 +250,7 @@ fn ask(core: &AppCore, space_id: &str, participant: &str, target: &str) -> Strin
 // Driving a room nobody is watching
 // ===========================================================================
 
-/// The whole point of the wave: a room with no human in it and no window on it
+/// The driver's whole point: a room with no human in it and no window on it
 /// takes its turns anyway, and stops when there is nothing left to plan.
 #[test]
 fn a_delegated_room_takes_its_turns_with_nobody_watching() {
@@ -249,6 +277,196 @@ fn a_delegated_room_takes_its_turns_with_nobody_watching() {
             "one driven turn and one report"
         );
     });
+}
+
+/// **A delegation that seats nobody still does the work.** `delegate` says
+/// plainly that leaving `participants` out opens a room of the caller's own,
+/// so this is the mode a model reaches for first — and it is the one the
+/// ordinary rules would leave inert: the owner is the room's only agent, the
+/// owner wrote the brief, and an author is excluded from its own post's notify
+/// set. Without the plan's brief floor the driver walks a room in which
+/// nothing was ever planned and reports an untouched brief as a concluded
+/// delegation.
+#[test]
+fn a_solo_delegation_works_its_own_brief() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let out = spawn(&core, &parent, &owner, vec![]);
+
+        let requests_before = mock.chat_bodies().len();
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let room = tree(&core, &out.space.id);
+        assert_eq!(
+            room.len(),
+            2,
+            "brief + the owner's own answer to it: {room:?}"
+        );
+        assert_eq!(room[0].action_type, "brief");
+        assert_eq!(room[1].action_type, "inference");
+        assert_eq!(
+            room[1].participant.label, "Navigator",
+            "the agent that opened the room is the one that works in it"
+        );
+        assert_eq!(
+            mock.chat_bodies().len() - requests_before,
+            2,
+            "one worked turn and one report"
+        );
+
+        // …and the room stops there: the owner's answer is an `inference`, so
+        // it gets no floor of its own and cannot answer itself forever.
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(report.references.len(), 1, "one attached passage");
+        assert_eq!(
+            report.references[0].antecedent_action_id, room[1].action_id,
+            "the report quotes the work, not the untouched brief"
+        );
+        assert_eq!(
+            report.references[0].delegation_end,
+            Some(DelegationEnd::Concluded { truncated: false })
+        );
+    });
+}
+
+/// **A solo brief reaches its owner as a request, not as its own prior
+/// output.** The floor schedules the brief's author, and the role split renders
+/// a responder's own posts as `assistant` — so the one turn the room exists for
+/// used to end on the model's own words, in a room with no roster block and no
+/// thread map behind it (both live in the system message, and a single
+/// unbranched member has neither). That is a prompt to continue the brief
+/// rather than to carry it out. A brief is the room's premise, so it renders as
+/// the request to everyone in the room, its author included.
+#[test]
+fn a_solo_brief_is_put_to_its_owner_as_the_request() {
+    run(|| {
+        let (mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let out = spawn(&core, &parent, &owner, vec![]);
+
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        // The first request the room made is the worked turn (the report comes
+        // after it, in the parent).
+        let body = mock
+            .chat_bodies()
+            .into_iter()
+            .find(|b| {
+                flat_messages(b)
+                    .iter()
+                    .any(|(_, c)| c.contains("Check the tide tables for Friday."))
+            })
+            .expect("the worked turn's request");
+        let messages = flat_messages(&body);
+        let (role, content) = messages.last().cloned().expect("a message");
+        assert_eq!(
+            role, "user",
+            "the brief is the standing request, not the model's own last word: {messages:?}"
+        );
+        assert!(content.contains("Check the tide tables for Friday."));
+        assert!(
+            !messages.iter().any(|(r, _)| r == "assistant"),
+            "nothing in this room is the model's own prior output yet: {messages:?}"
+        );
+        // Attribution is not lost — the header still names who wrote it.
+        assert!(content.contains("Navigator"), "{content}");
+    });
+}
+
+/// **A router cannot empty a brief either.** A delegated room inherits its
+/// parent's `router_model`, and a room that seats helpers has a non-empty
+/// mechanical set over its brief — so the floor stands aside and the router is
+/// handed a real choice. `{"notify": []}` is a valid answer from it, and over a
+/// brief that answer is the room taking no turn at all: the driver would walk a
+/// room where nothing happened and report the untouched brief as a concluded
+/// delegation. That is the same silent no-work delegation the floor exists to
+/// prevent, arriving through the one door a floor inside the *mechanical* set
+/// did not cover — which is why the floor binds the refined plan too.
+#[test]
+fn a_router_that_selects_nobody_cannot_empty_a_brief() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkStreaming,
+            router: RouterBehavior::Reply(r#"{"notify": []}"#.into()),
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let a = shared_agent(&core, &parent, "Surveyor");
+        let b = shared_agent(&core, &parent, "Pilot");
+        // Two helpers, so the brief's mechanical set is non-empty and the floor
+        // does not fire on its own.
+        let out = spawn(&core, &parent, &owner, vec![a, b]);
+        let room = out.space.id.clone();
+        core.test_register_loaded_local_model("local", ROUTER_SLUG, mock.port());
+        core.runtime()
+            .block_on(core.set_space_router_model(room.clone(), Some(ROUTER_MODEL.into())))
+            .expect("the room routes, exactly as one inheriting a routed parent does");
+
+        drive(&core, &room).expect("the room is driven");
+
+        let room_tree = tree(&core, &room);
+        assert_eq!(room_tree.len(), 2, "brief + a worked turn: {room_tree:?}");
+        assert_eq!(room_tree[1].action_type, "inference");
+        assert_eq!(
+            room_tree[1].participant.label, "Navigator",
+            "the agent answerable for the delegation takes the turn the router emptied"
+        );
+        assert!(
+            mock.chat_bodies()
+                .iter()
+                .any(|b| b["model"] == ROUTER_MODEL),
+            "the router really was consulted — the floor is not a bypass"
+        );
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report.references[0].antecedent_action_id, room_tree[1].action_id,
+            "the report quotes the work, not an untouched brief"
+        );
+    });
+}
+
+/// The floor is a floor, not a widening: a room that seats helpers plans them
+/// and **not** its owner, whose deliberate `human` policy keeps it quiet among
+/// them until it writes the report.
+#[test]
+fn a_seated_delegation_still_leaves_its_owner_out_of_the_brief() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+
+        let plan =
+            core.runtime()
+                .block_on(core.mechanical_notification_plan(
+                    out.space.id.clone(),
+                    out.brief_action_id.clone(),
+                ))
+                .expect("the brief plans");
+        let NotificationPlan::Turns(turns) = plan else {
+            panic!("the brief is not paused: {plan:?}");
+        };
+        let labels: Vec<String> = turns.iter().map(|t| t.participant_id.clone()).collect();
+        assert_eq!(
+            labels,
+            vec![helper_id(&out)],
+            "the seated helper answers the brief and the owner does not"
+        );
+    });
+}
+
+/// The one seat a spawn wrote beside the owner.
+fn helper_id(out: &SpawnedSubspace) -> String {
+    out.participant_ids
+        .first()
+        .cloned()
+        .expect("the spawn seated a helper")
 }
 
 /// The room's own cascade guard still governs it, and pausing there is a
@@ -278,7 +496,11 @@ fn a_room_that_pauses_at_its_cascade_guard_says_so() {
         assert!(
             matches!(
                 report.references[0].delegation_end,
-                Some(DelegationEnd::Paused { depth: 1, limit: 1 })
+                Some(DelegationEnd::Paused {
+                    depth: 1,
+                    limit: 1,
+                    truncated: false
+                })
             ),
             "the pause is carried as a value, not a sentence: {:?}",
             report.references[0].delegation_end
@@ -297,6 +519,168 @@ fn a_room_that_pauses_at_its_cascade_guard_says_so() {
 /// The report is a turn for the owning agent in the **parent**, replying to the
 /// owner's own last word there, carrying the delegated room's last post as a
 /// quoted reference the driver attached — and the model is shown that passage
+/// **A room that ran to a stop on a cut-off answer says both.**
+///
+/// The driver has no reader to show a marker to — it drops the event receiver
+/// on purpose — so the only surface a delegated room ever gets is its report.
+/// `ChatResult::truncated` was discarded there, and the walk replanned from the
+/// partial post and reported the room as plainly `concluded`: a claim that it
+/// ran out of things to say, made about an answer that stops mid-thought.
+/// Replanning is kept — partial text is real text and the room may well have
+/// more to say about it — and what changes is only what the ending may claim.
+#[test]
+fn a_room_that_concluded_on_a_truncated_answer_says_so_in_its_report() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            // Real content, then `finish_reason: "length"` — a turn that keeps
+            // its text and must not be called finished.
+            chat: ChatBehavior::PartialAnswerLength,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let report = report(&core, &parent).expect("the delegation is reported");
+        let end = report.references[0]
+            .delegation_end
+            .expect("the edge carries the ending");
+        assert_eq!(
+            end,
+            DelegationEnd::Concluded { truncated: true },
+            "the conclusion carries that it rests on an answer cut off at its length limit"
+        );
+        assert!(
+            end.token().ends_with("concluded/truncated"),
+            "and says so durably: {}",
+            end.token()
+        );
+    });
+}
+
+/// **A driven turn's answer is continued like any turn's**: a helper whose
+/// answer stops at its ceiling, exactly continuable, is continued at once
+/// within its turn, under the same bound — the model's declared limit for
+/// the answer — so the room holds the whole answer and the report concludes
+/// on it, not on a cut-off one. The driver never presses the reader's
+/// continue verb; the turn does this by itself.
+#[test]
+fn a_driven_turns_answer_is_continued_within_its_turn() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::LongAnswer {
+                requests: 2,
+                fail_at: None,
+            },
+            declared_max_output: Some(65_536),
+            context_length: Some(262_144),
+            ..MockConfig::default()
+        });
+        // On Eidola's own backend, the one whose answers can be continued.
+        chat_harness::with_account(&core);
+        let parent = parent_with_a_post(&core);
+        let eidola_agent = |label: &str| {
+            let added = core
+                .runtime()
+                .block_on(core.add_space_participant(
+                    parent.clone(),
+                    NewParticipant {
+                        label: label.to_string(),
+                        model_ref: Some(chat_harness::MODEL.to_string()),
+                        system_prompt: None,
+                        notify_policy: "human".into(),
+                    },
+                ))
+                .expect("add agent");
+            core.runtime()
+                .block_on(core.promote_participant(added.id.clone(), None, None))
+                .expect("promote");
+            added.id
+        };
+        let owner = eidola_agent("Navigator");
+        let helper = eidola_agent("Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+
+        let before = mock.chat_bodies().len();
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let room = tree(&core, &out.space.id);
+        assert_eq!(room.len(), 2, "brief + one answer: {room:?}");
+        assert!(!room[1].truncated, "the answer was continued to its end");
+        let sent = &mock.chat_bodies()[before..];
+        assert_eq!(
+            sent.len(),
+            3,
+            "the helper's request, its continuation, and the report"
+        );
+        assert!(sent[1].get("continue_final_message").is_some());
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report.references[0].delegation_end,
+            Some(DelegationEnd::Concluded { truncated: false })
+        );
+    });
+}
+
+/// **A pause resting on a cut-off answer says both too.**
+///
+/// The marker rides every ending that invites an action assuming coherent words
+/// to build on, and "can be resumed by posting there" is one of them: resuming
+/// means continuing from the room's last word, and that word stops mid-thought.
+/// The accumulator was already true here — only the arm could not carry it, so
+/// the parent report mentioned the cascade limit and the mid-thought answer
+/// lost its one warning.
+#[test]
+fn a_room_that_paused_on_a_truncated_answer_says_so_in_its_report() {
+    run(|| {
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::PartialAnswerLength,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        // Two lets one turn run — and be cut off — before the guard binds.
+        core.runtime()
+            .block_on(core.set_space_cascade_limit(parent.clone(), 2))
+            .expect("cascade limit");
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let out = spawn(&core, &parent, &owner, vec![helper]);
+
+        drive(&core, &out.space.id).expect("the room is driven");
+
+        let report = report(&core, &parent).expect("a paused room still reports");
+        let end = report.references[0]
+            .delegation_end
+            .expect("the edge carries the ending");
+        assert!(
+            matches!(
+                end,
+                DelegationEnd::Paused {
+                    truncated: true,
+                    ..
+                }
+            ),
+            "the pause carries that it rests on an answer cut off at its length \
+             limit: {end:?}"
+        );
+        assert!(
+            end.token().ends_with("/truncated"),
+            "and says so durably, after the arm's own fields: {}",
+            end.token()
+        );
+        assert_eq!(
+            DelegationEnd::parse(&end.token()),
+            Some(end),
+            "the whole ending survives the round trip, marker included"
+        );
+    });
+}
+
 /// before it writes.
 #[test]
 fn a_finished_delegation_reports_back_with_the_rooms_last_word_attached() {
@@ -341,7 +725,7 @@ fn a_finished_delegation_reports_back_with_the_rooms_last_word_attached() {
         assert!(!snippet.is_empty());
         assert_eq!(
             reference.delegation_end,
-            Some(DelegationEnd::Concluded),
+            Some(DelegationEnd::Concluded { truncated: false }),
             "the edge carries what ended the room, typed"
         );
         assert_eq!(reference.annotation, None, "and says nothing as a person");
@@ -844,11 +1228,12 @@ fn a_regeneration_of_a_finding_is_quoted_at_its_visible_tip() {
         let asked = tree(&core, &parent)[0].action_id.clone();
         let owner = shared_agent(&core, &parent, "Navigator");
         let helper = shared_agent(&core, &parent, "Surveyor");
-        // The owner has already answered, so the report can attach after the
-        // pause rather than waiting. The pause is still taken — that is the
-        // window a finding can change in.
-        ask(&core, &parent, &owner, &asked);
+        // The owner answers the anchor once the room is open — an answer newer
+        // than the room, which is the one a report attaches under — so the
+        // report can attach after the pause rather than waiting. The pause is
+        // still taken: that is the window a finding can change in.
         let out = spawn_from(&core, &parent, &owner, vec![helper.clone()], Some(&asked));
+        ask(&core, &parent, &owner, &asked);
         let room = out.space.id.clone();
         core.runtime()
             .block_on(core.add_global_participant(
@@ -928,8 +1313,8 @@ fn a_regeneration_during_the_report_is_quoted_at_its_visible_tip() {
         let asked = tree(&core, &parent)[0].action_id.clone();
         let owner = shared_agent(&core, &parent, "Navigator");
         let helper = shared_agent(&core, &parent, "Surveyor");
-        ask(&core, &parent, &owner, &asked);
         let out = spawn_from(&core, &parent, &owner, vec![helper.clone()], Some(&asked));
+        ask(&core, &parent, &owner, &asked);
         let room = out.space.id.clone();
         core.runtime()
             .block_on(core.add_global_participant(
@@ -1009,8 +1394,8 @@ fn a_regeneration_of_the_answer_during_the_report_reattaches() {
         let asked = tree(&core, &parent)[0].action_id.clone();
         let owner = shared_agent(&core, &parent, "Navigator");
         let helper = shared_agent(&core, &parent, "Surveyor");
-        let answer = ask(&core, &parent, &owner, &asked);
         let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        let answer = ask(&core, &parent, &owner, &asked);
         let room = out.space.id.clone();
 
         let mut window = core.test_open_report_persist_window();
@@ -1086,8 +1471,8 @@ fn a_failed_regeneration_of_the_answer_during_the_report_waits() {
         let asked = tree(&core, &parent)[0].action_id.clone();
         let owner = shared_agent(&core, &parent, "Navigator");
         let helper = shared_agent(&core, &parent, "Surveyor");
-        let answer = ask(&core, &parent, &owner, &asked);
         let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        let answer = ask(&core, &parent, &owner, &asked);
         let room = out.space.id.clone();
 
         let mut window = core.test_open_report_persist_window();
@@ -1138,8 +1523,8 @@ fn closing_the_delegated_room_during_its_report_writes_nothing() {
         let asked = tree(&core, &parent)[0].action_id.clone();
         let owner = shared_agent(&core, &parent, "Navigator");
         let helper = shared_agent(&core, &parent, "Surveyor");
-        ask(&core, &parent, &owner, &asked);
         let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        ask(&core, &parent, &owner, &asked);
         let room = out.space.id.clone();
 
         let mut window = core.test_open_report_persist_window();
@@ -1234,8 +1619,12 @@ fn a_report_attaches_beneath_the_owners_answer_to_the_post_it_was_asked_on() {
         let owner = shared_agent(&core, &parent, "Navigator");
         let helper = shared_agent(&core, &parent, "Surveyor");
 
-        // The post the work is asked for on, and the owner's answer to it.
+        // The post the work is asked for on. The room is opened from it first,
+        // as a turn-scoped spawn always is — the owner's answer to it is what
+        // that turn is still to write, and only an answer newer than the room
+        // is the one the report belongs under.
         let asked = tree(&core, &parent)[0].action_id.clone();
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
         let answer = ask(&core, &parent, &owner, &asked);
         // …and then the owner says something else, elsewhere in the parent,
         // *after* that answer. This is the post the old rule would have picked.
@@ -1244,8 +1633,6 @@ fn a_report_attaches_beneath_the_owners_answer_to_the_post_it_was_asked_on() {
             .block_on(core.post("Meanwhile:".into(), Some(parent.clone())))
             .expect("post");
         let later = ask(&core, &parent, &owner, &aside.action_id);
-
-        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
         drive(&core, &out.space.id).expect("the room is driven");
 
         let report = report(&core, &parent).expect("the delegation is reported");
@@ -1293,6 +1680,348 @@ fn a_report_waits_for_the_answer_it_belongs_under() {
         drive(&core, &out.space.id).expect("the room is driven again");
         let report = report(&core, &parent).expect("the delegation is reported");
         assert_eq!(report.parent_action_id.as_deref(), Some(answer.as_str()));
+    });
+}
+
+/// **An answer of the spawning turn's own item that was already there is not
+/// its answer yet.** A turn-bound delegation opens inside the owner's turn, so
+/// the answer it belongs under is the one that turn has yet to write — and
+/// where the turn is a regeneration, the item it will write under already has a
+/// visible post: the generation being replaced. Accepting that one ends the
+/// wait against a word about to be superseded, and if the regeneration then
+/// fails, the report is left hanging under a hidden tip. The room's brief is
+/// the line that rules it out.
+#[test]
+fn a_report_does_not_settle_on_an_answer_older_than_its_room() {
+    run(|| {
+        // Both transports: the ask streams, the regeneration is blocking.
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+
+        // The owner's answer to the post, and the delegation is opened from a
+        // regeneration of it — so the spawning turn's item is this one, and its
+        // visible post right now is the generation that regeneration replaces.
+        let earlier = ask(&core, &parent, &owner, &asked);
+        let item = tree(&core, &parent)
+            .into_iter()
+            .find(|n| n.action_id == earlier)
+            .expect("the answer is in the parent")
+            .item_id;
+
+        let out = spawn_for_turn(
+            &core,
+            &parent,
+            &owner,
+            vec![helper],
+            Some(&asked),
+            Some(&item),
+        );
+        drive(&core, &out.space.id).expect("the room is driven");
+        assert!(
+            report(&core, &parent).is_none(),
+            "the older generation must not end the wait: the answer this room \
+             came from is still in flight"
+        );
+
+        // The spawning turn lands, and the report goes under *its* generation.
+        core.runtime()
+            .block_on(core.regenerate(earlier.clone(), MODEL.to_string()))
+            .expect("the spawning turn writes its answer");
+        drive(&core, &out.space.id).expect("the room is driven again");
+        let report = report(&core, &parent).expect("the delegation is reported");
+        let landed = report.parent_action_id.clone().expect("it attached");
+        assert_ne!(
+            landed, earlier,
+            "not beneath the generation that was already there"
+        );
+        assert_eq!(
+            tree(&core, &parent)
+                .into_iter()
+                .find(|n| n.action_id == landed)
+                .expect("the target is in the parent")
+                .item_id,
+            item,
+            "beneath the answer of the turn that opened the room"
+        );
+    });
+}
+
+/// **A delegation with no turn behind it takes the answer that is there.** A
+/// direct caller supplying an anchor is saying "report under the owner's answer
+/// to this post", and no turn of its own is going to write a later one — so the
+/// line that rules out answers older than the room is a rule borrowed from a
+/// premise this path does not have. Drawn here, it discarded the only answer
+/// the caller could have meant: the walk waited out its grace and landed on the
+/// anchor, while a restart sweep — which never waits — landed there at once, so
+/// the same room reported two different ways depending on when it was picked
+/// up.
+#[test]
+fn a_spawn_with_no_turn_behind_it_reports_under_the_answer_already_there() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        // The owner's answer, committed before either room exists.
+        let answer = ask(&core, &parent, &owner, &asked);
+
+        // Driven in the process that opened it: no wait, and no grace spent.
+        let out = spawn_from(&core, &parent, &owner, vec![helper.clone()], Some(&asked));
+        drive(&core, &out.space.id).expect("the room is driven");
+        let report = report(&core, &parent).expect("the delegation is reported, not waiting");
+        assert_eq!(
+            report.parent_action_id.as_deref(),
+            Some(answer.as_str()),
+            "beneath the owner's answer to the anchor"
+        );
+
+        // …and a sweep, which never waits, answers the same question the same
+        // way rather than falling through to the anchor.
+        let swept = spawn_from(&core, &parent, &owner, vec![helper], Some(&asked));
+        drive_as_sweep(&core, &swept.space.id).expect("the second room is driven");
+        let both = reports(&core, &parent);
+        assert_eq!(both.len(), 2, "both delegations reported: {both:?}");
+        assert!(
+            both.iter()
+                .all(|r| r.parent_action_id.as_deref() == Some(answer.as_str())),
+            "and both sit beneath the same answer: {both:?}"
+        );
+    });
+}
+
+/// **Nor on an answer from a different turn.** The watermark rules out answers
+/// that predate the room; what it cannot rule out is an answer by the same
+/// owner to the same post that commits *after* the room opened and belongs to
+/// another turn — nothing serializes two turns of one agent against one post
+/// (two explicit asks, or a regeneration running beside a reply). So the room
+/// records the **item** the spawning turn will answer under, and only that
+/// item's post ends the wait. The two rules are not redundant: a regeneration's
+/// item is the one it is revising, whose visible post until the turn lands is
+/// the answer being replaced, which is what the watermark is for.
+#[test]
+fn a_report_waits_for_its_own_turns_answer_and_not_a_siblings() {
+    run(|| {
+        // Both transports: the asks stream, the regeneration is blocking.
+        let (mock, core, _dir) = chat_harness::core_for(MockConfig {
+            chat: ChatBehavior::OkEitherTransport,
+            ..MockConfig::default()
+        });
+        add_backend(&core, &mock);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+
+        // The owner's first answer to the post. The delegation is opened from a
+        // *regeneration* of it, so the spawning turn's item is this one.
+        let first = ask(&core, &parent, &owner, &asked);
+        let item = tree(&core, &parent)
+            .into_iter()
+            .find(|n| n.action_id == first)
+            .expect("the answer is in the parent")
+            .item_id;
+
+        let out = spawn_for_turn(
+            &core,
+            &parent,
+            &owner,
+            vec![helper],
+            Some(&asked),
+            Some(&item),
+        );
+
+        // A second, unrelated answer by the same owner to the same post lands
+        // while that regeneration is still running. It is newer than the room,
+        // so the watermark alone would take it.
+        let sibling = ask(&core, &parent, &owner, &asked);
+        drive(&core, &out.space.id).expect("the room is driven");
+        assert!(
+            report(&core, &parent).is_none(),
+            "a sibling turn's answer is not the answer this room came from"
+        );
+
+        // The spawning turn lands, and the report goes under its answer.
+        core.runtime()
+            .block_on(core.regenerate(first.clone(), MODEL.to_string()))
+            .expect("the spawning turn writes its answer");
+        drive(&core, &out.space.id).expect("the room is driven again");
+        let report = report(&core, &parent).expect("the delegation is reported");
+        let landed = report.parent_action_id.clone().expect("it attached");
+        assert_ne!(landed, sibling, "not beneath the sibling turn's answer");
+        assert_eq!(
+            tree(&core, &parent)
+                .into_iter()
+                .find(|n| n.action_id == landed)
+                .expect("the target is in the parent")
+                .item_id,
+            item,
+            "beneath the answer of the turn that opened the room"
+        );
+    });
+}
+
+/// **An anchor and an answer can name one post through two generations.** A
+/// delegation resolves its anchor to the generation the parent currently shows,
+/// while the answer of the very turn that opened it keeps the raw antecedent
+/// that turn was prepared with — so a reader rewording the post between
+/// preparation and the tool leaves the two in different generations of one
+/// item. A spawn with no turn behind it is decided by the newest-answer rule
+/// alone, and matching edges by generation missed the answer entirely: the
+/// sweep then attached the report to the anchor as that answer's *sibling*.
+/// "The same post" is the item, which is the identity the transcript already
+/// threads by.
+#[test]
+fn a_report_finds_its_turns_answer_across_a_restart_and_an_edit() {
+    run(|| {
+        let (mock_rt, mock, core, dir) = restartable();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+
+        // The reader rewords the post the turn was prepared against.
+        let edited = core
+            .runtime()
+            .block_on(core.edit_post(asked.clone(), "What about Friday's tides?".into()))
+            .expect("edit the post")
+            .action_id;
+        assert_ne!(edited, asked, "the edit is a new generation of one item");
+
+        // The delegation anchors on what the parent shows…
+        let out = spawn_from(&core, &parent, &owner, vec![helper], Some(&edited));
+        // …and the turn's own answer still replies to the generation it was
+        // prepared with.
+        let answer = ask(&core, &parent, &owner, &asked);
+
+        // The process goes away before the report lands; this room names no
+        // turn, so the sweep decides on the newest answer alone.
+        drop(core);
+        let core = chat_harness::reopen_core(&dir, &mock.base_url);
+        drive_as_sweep(&core, &out.space.id).expect("the room is driven after the restart");
+
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report.parent_action_id.as_deref(),
+            Some(answer.as_str()),
+            "beneath the answer of the turn that opened the room"
+        );
+        assert_ne!(
+            report.parent_action_id.as_deref(),
+            Some(edited.as_str()),
+            "not on the anchor, as that answer's sibling"
+        );
+        drop(mock_rt);
+    });
+}
+
+/// **And it finds it when a sibling answered last and the process went away.**
+/// A delegation runs for as long as its work takes, so the spawning turn
+/// committing its answer and the app then being quit before the report lands is
+/// ordinary rather than exceptional. Held in memory, which turn opened the room
+/// was gone by the next start, and the newest-answer rule that was left picked
+/// whichever answer to the anchor committed last — the sibling turn's, where
+/// one had raced in. The room's own row records it instead, so the question
+/// reads the same on either side of a restart.
+#[test]
+fn a_report_finds_its_turns_answer_after_a_restart_a_sibling_won() {
+    run(|| {
+        // Both transports: the asks stream, the regeneration is blocking.
+        let (mock_rt, mock, core, dir) = restartable_with(ChatBehavior::OkEitherTransport);
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+
+        // The delegation is opened from a regeneration of the owner's answer,
+        // so the spawning turn's item is that answer's.
+        let first = ask(&core, &parent, &owner, &asked);
+        let item = tree(&core, &parent)
+            .into_iter()
+            .find(|n| n.action_id == first)
+            .expect("the answer is in the parent")
+            .item_id;
+        let out = spawn_for_turn(
+            &core,
+            &parent,
+            &owner,
+            vec![helper],
+            Some(&asked),
+            Some(&item),
+        );
+
+        // The spawning turn lands its answer…
+        core.runtime()
+            .block_on(core.regenerate(first.clone(), MODEL.to_string()))
+            .expect("the spawning turn writes its answer");
+        // …and a sibling turn's answer to the same post commits *after* it, so
+        // the newest answer on the anchor is not this delegation's.
+        let sibling = ask(&core, &parent, &owner, &asked);
+
+        // The process goes away before the report lands.
+        drop(core);
+        let core = chat_harness::reopen_core(&dir, &mock.base_url);
+        drive_as_sweep(&core, &out.space.id).expect("the room is driven after the restart");
+
+        let report = report(&core, &parent).expect("the delegation is reported");
+        let landed = report.parent_action_id.clone().expect("it attached");
+        assert_ne!(landed, sibling, "not beneath the sibling turn's answer");
+        assert_eq!(
+            tree(&core, &parent)
+                .into_iter()
+                .find(|n| n.action_id == landed)
+                .expect("the target is in the parent")
+                .item_id,
+            item,
+            "beneath the answer of the turn that opened the room"
+        );
+        drop(mock_rt);
+    });
+}
+
+/// The wait is not unbounded by this: a spawning turn that died never writes
+/// under the item the room names, and the arms that claim a licence still end
+/// it — against the anchor, which is the honest attachment when there is
+/// nothing of this delegation's own to sit beneath. An answer of the same owner
+/// to the same post is not that: it belongs to another turn.
+#[test]
+fn an_older_answer_does_not_hold_a_room_past_its_licence() {
+    run(|| {
+        let (_mock, core, _dir) = setup();
+        let parent = parent_with_a_post(&core);
+        let owner = shared_agent(&core, &parent, "Navigator");
+        let helper = shared_agent(&core, &parent, "Surveyor");
+        let asked = tree(&core, &parent)[0].action_id.clone();
+        let other_turns = ask(&core, &parent, &owner, &asked);
+
+        // An item the spawning turn minted and died before writing under —
+        // which is the whole of what a turn that failed leaves behind.
+        let out = spawn_for_turn(
+            &core,
+            &parent,
+            &owner,
+            vec![helper],
+            Some(&asked),
+            Some("an-answer-that-never-lands"),
+        );
+        drive_as_sweep(&core, &out.space.id).expect("the room is driven");
+        let report = report(&core, &parent).expect("the delegation is reported");
+        assert_eq!(
+            report.parent_action_id.as_deref(),
+            Some(asked.as_str()),
+            "the anchor itself, not an answer this room never came from"
+        );
+        assert_ne!(
+            report.parent_action_id.as_deref(),
+            Some(other_turns.as_str())
+        );
     });
 }
 
@@ -1603,8 +2332,33 @@ fn a_sweep_does_not_claim_a_room_this_process_opened() {
         // The driver starts *after* the spawn, so the sweep's enumeration finds
         // this room. It is still this process's room, and the owner's turn is
         // still the thing being waited for.
+        //
+        // The registration alone says nothing: a walk registers before it asks
+        // whether the owner has answered, a sweep that will report against the
+        // anchor included. What says the sweep decided to wait is a second walk
+        // reaching the anchor window: walks of one room run one at a time, so
+        // the room asked again (lag recovery arms it as an ordinary signal)
+        // gets there only once the sweep's walk has ended, and only if that
+        // walk left the delegation outstanding — a reported room has nothing
+        // left to ask.
+        let mut window = core.test_open_anchor_window();
         core.start_subspace_driver();
-        settle(&core);
+        let next_walk = |window: &mut tokio::sync::mpsc::UnboundedReceiver<_>, what: &str| {
+            core.runtime()
+                .block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(60), window.recv()).await
+                })
+                .unwrap_or_else(|_| panic!("{what}"))
+                .expect("the window stays open")
+        };
+        let resume: tokio::sync::oneshot::Sender<()> =
+            next_walk(&mut window, "the sweep's walk reaches the anchor window");
+        resume.send(()).expect("the sweep's walk resumes");
+        core.runtime().block_on(core.test_recover_from_lag());
+        let resume: tokio::sync::oneshot::Sender<()> = next_walk(
+            &mut window,
+            "the sweep's walk ended with the delegation still outstanding",
+        );
         assert!(
             report(&core, &parent).is_none(),
             "the sweep armed it as an ordinary signal, so it holds out for the \
@@ -1615,6 +2369,9 @@ fn a_sweep_does_not_claim_a_room_this_process_opened() {
             vec![out.space.id.clone()],
             "and it is registered against its parent, waiting"
         );
+        // Every later walk goes straight through.
+        drop(window);
+        resume.send(()).expect("the second walk resumes");
 
         // The owner's turn lands, and the report goes where it always belonged.
         let answer = ask(&core, &parent, &owner, &asked);
@@ -1810,6 +2567,7 @@ fn a_delegation_beneath_a_closed_conversation_stops_and_lets_go() {
                 vec![],
                 None,
                 Some(brief),
+                None,
             ))
             .expect("spawn");
 
@@ -2183,6 +2941,7 @@ fn a_budget_stopped_walk_reports_what_arrived_while_it_walked() {
         assert_eq!(
             report.references[0].delegation_end,
             Some(DelegationEnd::BudgetSpent {
+                truncated: false,
                 limit: MAX_DELEGATION_TURNS
             }),
             "the room stopped on its budget"
@@ -2288,7 +3047,7 @@ fn regenerating_a_report_keeps_its_finding_and_its_ending() {
         assert_eq!(after.references[0].ordinal, 1, "at the ordinal it had");
         assert_eq!(
             after.references[0].delegation_end,
-            Some(DelegationEnd::Concluded),
+            Some(DelegationEnd::Concluded { truncated: false }),
             "and the ending with it"
         );
         assert!(
@@ -2651,6 +3410,7 @@ fn a_spawn_cannot_anchor_to_a_hidden_tip() {
                     vec![],
                     None,
                     Some(id.clone()),
+                    None,
                 ))
                 .expect_err("a hidden generation is not an anchor")
             {
@@ -3074,7 +3834,8 @@ fn a_wide_walk_reports_every_tip_and_not_a_roster_sized_tail() {
         assert!(
             report.references.iter().all(|r| r.delegation_end
                 == Some(DelegationEnd::BudgetSpent {
-                    limit: MAX_DELEGATION_TURNS
+                    limit: MAX_DELEGATION_TURNS,
+                    truncated: false
                 })),
             "each carries the ending the walk stopped at"
         );
@@ -3210,25 +3971,29 @@ fn a_long_finding_is_elided_in_the_prompt_and_whole_on_the_edge() {
         let (mock, core, _dir) = setup();
         let parent = parent_with_a_post(&core);
         let owner = shared_agent(&core, &parent, "Navigator");
-        // A brief long enough to be over any per-passage budget, with a
-        // distinctive head, middle and tail. Nobody is seated beside the owner,
-        // so the room concludes on its brief and the brief is the finding.
-        let brief = format!(
+        let out = spawn(&core, &parent, &owner, vec![]);
+        // Nobody is seated beside the owner, and the owner answers only when
+        // spoken to explicitly — so the post below is the room's last word,
+        // nothing follows it, and it is the walk's one finding.
+        core.runtime()
+            .block_on(core.set_space_participant_override(
+                out.space.id.clone(),
+                owner.clone(),
+                eidola_app_core::ParticipantOverride {
+                    notify_policy: Some(Some("explicit".into())),
+                    ..Default::default()
+                },
+            ))
+            .expect("the owner answers only an explicit ask");
+        // A finding long enough to be over any per-passage budget, with a
+        // distinctive head, middle and tail.
+        let finding = format!(
             "OPENING LINE.\n\n{}\n\nCLOSING LINE.",
             "middle padding that nobody needs to read. ".repeat(200)
         );
-        let out = core
-            .runtime()
-            .block_on(core.spawn_subspace(
-                parent.clone(),
-                owner.clone(),
-                brief.clone(),
-                vec![],
-                vec![],
-                None,
-                None,
-            ))
-            .expect("spawn");
+        core.runtime()
+            .block_on(core.post(finding.clone(), Some(out.space.id.clone())))
+            .expect("a post into the room");
 
         drive(&core, &out.space.id).expect("the room is driven");
 
@@ -3236,12 +4001,12 @@ fn a_long_finding_is_elided_in_the_prompt_and_whole_on_the_edge() {
         let quoted = &report.references[0];
         assert_eq!(
             quoted.range_end,
-            Some(brief.len() as i64),
+            Some(finding.len() as i64),
             "the edge names the whole passage"
         );
         assert_eq!(
             quoted.snippet.as_deref(),
-            Some(brief.as_str()),
+            Some(finding.as_str()),
             "and a reader's rail resolves it whole"
         );
 
@@ -3256,10 +4021,10 @@ fn a_long_finding_is_elided_in_the_prompt_and_whole_on_the_edge() {
             .map(|(_, c)| c)
             .expect("the attached block");
         assert!(
-            attached.len() < brief.len(),
+            attached.len() < finding.len(),
             "the prompt is not the whole passage: {} vs {}",
             attached.len(),
-            brief.len()
+            finding.len()
         );
         assert!(
             attached.contains("OPENING LINE.") && attached.contains("CLOSING LINE."),
@@ -3305,6 +4070,7 @@ fn a_delegation_stops_at_its_turn_budget_and_says_so() {
         assert_eq!(
             report.references[0].delegation_end,
             Some(DelegationEnd::BudgetSpent {
+                truncated: false,
                 limit: MAX_DELEGATION_TURNS
             }),
             "budget exhaustion is information, not silence"
@@ -3351,8 +4117,11 @@ fn empty_router_hops_still_spend_the_delegation_budget() {
                 .runtime()
                 .block_on(window.recv())
                 .expect("the walk reaches its window");
-            // Armed *inside* the window: a router on the brief that selects
-            // nobody would drive no turn, and this window would never open.
+            // Armed *inside* the window, so the walk's opening hop is the
+            // unrouted one this test wants to count from. (A router on the
+            // brief that selects nobody no longer silences the room — the
+            // brief floor gives the owner that turn — but it would still be a
+            // different first hop than the one measured here.)
             core.test_register_loaded_local_model("local", ROUTER_SLUG, mock.port());
             core.runtime()
                 .block_on(core.set_space_router_model(room.clone(), Some(ROUTER_MODEL.into())))
@@ -3370,6 +4139,7 @@ fn empty_router_hops_still_spend_the_delegation_budget() {
         assert_eq!(
             report.references[0].delegation_end,
             Some(DelegationEnd::BudgetSpent {
+                truncated: false,
                 limit: MAX_DELEGATION_TURNS
             }),
             "planning hops bind the budget, not only persisted turns"
@@ -3447,6 +4217,7 @@ fn empty_router_hops_share_the_budget_with_persisted_turns() {
         assert_eq!(
             report.references[0].delegation_end,
             Some(DelegationEnd::BudgetSpent {
+                truncated: false,
                 limit: MAX_DELEGATION_TURNS
             }),
             "the shared ceiling binds"
@@ -3931,10 +4702,13 @@ fn settle(core: &AppCore) {
     }
 }
 
-/// Poll for a condition the background driver brings about. Generous, because
-/// what is being asserted is that it happens at all, not how fast.
+/// Poll for a condition the background driver brings about. Generous, and
+/// bounded by the clock rather than a count of polls, because what is being
+/// asserted is that it happens at all, not how fast: a walk of several turns
+/// on a loaded machine takes what it takes.
 fn wait_until(core: &AppCore, mut done: impl FnMut() -> bool) {
-    for _ in 0..300 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
         if done() {
             return;
         }

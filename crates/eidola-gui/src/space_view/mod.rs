@@ -29,6 +29,8 @@
 
 pub mod composer;
 pub mod context_menu;
+pub mod find;
+pub mod find_overlay;
 pub mod inspector;
 pub mod inspector_participants;
 pub mod keyboard;
@@ -44,7 +46,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use eidola_app_core::error::AppError;
+use eidola_app_core::error::{AppError, IssuerKeyRefusal};
 use gpui::{
     AnyElement, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
     FontWeight, InteractiveElement, IntoElement, IsZero, Overflow, ParentElement, Pixels, Render,
@@ -77,28 +79,28 @@ pub use crate::actions::{PostOnly, Send};
 
 /// Height reserved at the top of the window for the (transparent) titlebar —
 /// the macOS traffic-light band / the Linux CSD controls + drag strip.
-pub(crate) const TITLE_BAR_RESERVE: Pixels = crate::titlebar::DRAG_BAND_HEIGHT;
+pub const TITLE_BAR_RESERVE: Pixels = crate::titlebar::DRAG_BAND_HEIGHT;
 
 /// Prose typography for narrative content — Newsreader at a book size/leading,
 /// distinct from the system UI font the theme uses for chrome. Matches the
 /// chat composer's typography so a post shapes pixel-for-pixel like what the
 /// user types.
-pub(crate) const PROSE_FONT_SIZE: Pixels = px(17.);
-pub(crate) const PROSE_LINE_HEIGHT: f32 = 1.65;
+pub const PROSE_FONT_SIZE: Pixels = px(17.);
+pub const PROSE_LINE_HEIGHT: f32 = 1.65;
 /// Inter-block spacing as a multiple of the font size (the editor splits it
 /// half above / half below each block). Kept here as the single source of truth
 /// for both [`prose_style`] and the height estimate, so they can't drift.
-pub(crate) const PROSE_PARAGRAPH_GAP: f32 = 1.5;
+pub const PROSE_PARAGRAPH_GAP: f32 = 1.5;
 
 /// The byline gutter (right-aligned author + time) and the centered reading
 /// column it sits beside.
-pub(crate) const GUTTER_WIDTH: Pixels = px(120.);
-pub(crate) const GUTTER_GAP: Pixels = px(28.);
-pub(crate) const BODY_MAX_WIDTH: Pixels = px(600.);
+pub const GUTTER_WIDTH: Pixels = px(120.);
+pub const GUTTER_GAP: Pixels = px(28.);
+pub const BODY_MAX_WIDTH: Pixels = px(600.);
 
 /// Vertical breathing room around each post, plus the faint full-bleed band
 /// that separates one depth level of the tree from the next.
-pub(crate) const POST_PAD_Y: Pixels = px(40.);
+pub const POST_PAD_Y: Pixels = px(40.);
 pub(crate) const BAND_HEIGHT: Pixels = px(48.);
 
 /// The **default** floating-composer fraction of the window height — every
@@ -115,6 +117,16 @@ pub(crate) const COMPOSER_MAX_FRACTION: f32 = 0.5;
 /// Width of the topology minimap pinned to the right edge, and the gap between
 /// sibling columns within a minimap row.
 pub(crate) const MINIMAP_WIDTH: Pixels = px(36.);
+/// The strip's width **while a find session is open**.
+///
+/// 36px split `flex_1` between two siblings leaves ~16px a column, and three
+/// leaves ~9px: no numeral fits, and the sibling counts are the whole point of
+/// the cross-branch surface. Widening is free — the strip is `absolute` on the
+/// right edge and the mapping math (`scale = strip_h / total_h`) is purely
+/// vertical, so nothing about the document's layout or the scrollbar-style drag
+/// depends on how wide it is — and it doubles as an honest signal that the map
+/// is in a different mode. See [`space_view::minimap`].
+pub(crate) const MINIMAP_FIND_WIDTH: Pixels = px(96.);
 pub(crate) const MINIMAP_COL_GAP: Pixels = px(4.);
 /// How long the minimap lingers after scrolling stops before it fades, and the
 /// fade-out duration once hiding begins (mirrors macOS overlay scrollbars).
@@ -159,9 +171,37 @@ impl SpaceView {
     /// callers are exactly the seams that cancel a navigation glide, plus the
     /// glide door itself: the reader's own motions, and the navigations they
     /// asked for.
+    /// **The reader is moving the page, so the reader owns it.** One door for
+    /// both halves of the takeover — the glide in flight and the reveal still
+    /// owed — because they are separable and every site that took only one
+    /// took the wrong one.
+    ///
+    /// `cancel_page_glide` ends a motion; `demote_tail_pin_for_reader` drops
+    /// the *pending* one. `set_page_scroll_y` folds in the first and
+    /// `glide_page_to` the second, so a site reaching a motion through either
+    /// helper alone is silently half-covered, and a site reaching one through
+    /// neither — a branch-dot click, which writes no page offset at all — is
+    /// covered not at all. This class has now produced four instances (the
+    /// composer's arming, an inline edit, a read-only selection, a branch dot),
+    /// so the seam is named rather than re-derived: a reader-driven navigation
+    /// calls this, and the audit in `crates/eidola-gui/AGENTS.md` says which
+    /// entry points are which.
+    pub(crate) fn reader_takes_the_page(&mut self) {
+        self.cancel_page_glide();
+        self.demote_tail_pin_for_reader();
+    }
+
     pub(crate) fn demote_tail_pin_for_reader(&mut self) {
         if self.tail_pin.forced() {
             self.tail_pin = TailPin::Observing;
+        }
+        // A find reveal waiting for its post to render is the reader being
+        // taken somewhere too, so it obeys the same rule: whoever moves the
+        // page last owns it. The correction would otherwise land frames later,
+        // pulling a reader who had scrolled on back to a match they had
+        // already left.
+        if let Some(session) = self.find.as_mut() {
+            session.pending_reveal = None;
         }
     }
 }
@@ -180,7 +220,7 @@ pub(crate) const SELECTION_AUTOSCROLL_MAX_SPEED: f32 = 32.0;
 /// large). Mirrors the website's prose ramp (`www/static/site.css`).
 /// `from_theme` seeds the system font + theme colors, so we override the
 /// family back to Newsreader for narrative content.
-pub(crate) fn prose_style(cx: &gpui::App) -> MarkdownStyle {
+pub fn prose_style(cx: &gpui::App) -> MarkdownStyle {
     // The prose ramp is the one place the type ramp is spelled in absolute
     // pixels rather than `rems()`, so it doesn't ride the scaled `rem_size`
     // automatically — multiply the base size by the type-scale factor here. The
@@ -356,10 +396,39 @@ pub(crate) enum PendingSettle {
 /// reference, so a click can't disambiguate on its own. Anchored to the post
 /// whose text was clicked, listing each referencing post (byline + snippet) as
 /// a choice — the band-menu pattern, one open at a time.
+/// **It holds identity, never facts.**
+///
+/// The reverse index resolves an author's name and a conversation's title at
+/// *read* time, so any copy of them taken here is a cache with no invalidation
+/// — a rename repairs the index (see `SpacesStore::notify_participants_changed`
+/// and the `SpaceIndex` arm of `stores::dispatch_change`) and this popover
+/// would go on rendering the names it captured at the click. The same argument
+/// the localized sentence already lost: a formatted string in view state is a
+/// cached render decision (`crates/eidola-gui/AGENTS.md` → Localization, "state
+/// holds the value, render chooses the words"), and the *inputs* to that
+/// sentence are no different in kind.
+///
+/// So a choice is the reference edge's key and nothing else, and
+/// [`SpaceView::picker_rows`] resolves it against the live index every frame.
+/// A referrer that leaves the index simply stops being a row; a picker left
+/// with none renders nothing until the lazy re-fetch lands.
 #[derive(Clone, Debug)]
 pub(crate) struct HighlightPicker {
-    /// The candidates: `(referencing action id, its space, the row's label)`.
-    pub(crate) choices: Vec<(String, String, SharedString)>,
+    /// The post whose passage was clicked — the index these choices name.
+    pub(crate) anchor_action_id: String,
+    /// The chosen edges, as `(referring **item** id, ordinal)`.
+    ///
+    /// **The pair, not one of them alone**: one post can quote the same
+    /// passage twice, and it is then two rows leading to two places within it.
+    /// Deliberately not an index into the cached vector, which an invalidation
+    /// invalidates — and deliberately the *item* rather than the action,
+    /// because an action id is a generation. Editing a referring post without
+    /// touching its quote replicates the edge onto a fresh action, so the
+    /// backlink is the same backlink under a name this window had never seen;
+    /// keyed by action the row vanished from the picker, which could then
+    /// close itself over an edit that changed nothing about it (Codex review,
+    /// PR #327). The item is the half that does not move.
+    pub(crate) choices: Vec<(String, i64)>,
 }
 
 /// An in-progress inline edit of a persisted post: the post's own body editor
@@ -471,6 +540,31 @@ pub struct SpaceView {
     /// [`SpaceView::retry_transcript_load`] asks containment of *before* it
     /// acts — the same shape the bottom bands take.
     pub(crate) transcript_retry_focus: FocusHandle,
+    /// The inspector panel's own handle — where the keyboard goes when the
+    /// panel opens in its **overlay** form over a surface that was holding it
+    /// (see [`SpaceView::set_inspector_open`]). It carries the panel's own tab
+    /// attributes, because gpui reads a *tracked* handle's flags rather than
+    /// the element's: without them the panel's `AUX` region would silently
+    /// become index 0 and reorder the whole window's Tab walk.
+    pub(crate) inspector_focus: FocusHandle,
+    /// Whether the panel was **covering** the conversation pane on the last
+    /// frame — the other half of an edge (see
+    /// [`SpaceView::sync_inspector_cover`]). The layout decision is a function
+    /// of the window's width, so it moves with a resize and through no door.
+    pub(crate) inspector_covered: bool,
+    /// Whether the panel **actually took the keyboard off the find surface** —
+    /// the loan record, recorded where the handoff happens
+    /// ([`SpaceView::hand_keyboard_to_inspector`]) and read by the close.
+    ///
+    /// Covering is what *allows* the handoff, not what performs it: a find
+    /// session can stand with the keyboard somewhere else in the pane, and then
+    /// the panel covers and takes nothing. Reading the layout as proof of a
+    /// loan sent a reader who had stepped into a panel control of their own
+    /// accord off to the results list on the close, abandoning the conversation
+    /// they were in. Same shape as `overlay_borrowed_focus` and
+    /// `FindSession::returned_input`: **a borrow is a fact about what happened,
+    /// not about what was permitted.**
+    pub(crate) inspector_borrowed_find: bool,
     /// The open right-click menu over one of the space's editors, if any —
     /// window-local transient state, like the band menu and the picker (one
     /// open at a time; see [`context_menu`]).
@@ -768,6 +862,94 @@ pub struct SpaceView {
     /// failure — nothing broke, there is nothing to retry, and the band it
     /// renders in is the muted one.
     pub(crate) reference_notice: Option<SharedString>,
+    /// The posts this window watched stop at their **length allowance**.
+    ///
+    /// Not the marker's whole state — the durable one is `PostData::truncated`,
+    /// read off the answer's own row. This set is the **live** half: the turn
+    /// ends many frames before the transcript reload that carries its row
+    /// arrives (and that reload can itself fail), so without it the mark would
+    /// blink in after a delay, or not at all until the next successful load.
+    /// The two are one value at the source — app-core classifies the ceiling
+    /// once and both writes it and reports it — so they cannot say different
+    /// things about the same generation.
+    pub(crate) truncated_posts: HashSet<SharedString>,
+    /// The keyboard handle each cut-off mark's **Continue** tracks, by post
+    /// node — one per verb, since a space can hold several marks and two
+    /// elements claiming one handle report focus twice. Interior-mutable for
+    /// the height cache's reason: minted where the verb renders. An accepted
+    /// press takes the verb away (the space stops accepting mutations), so the
+    /// handler asks its handle for containment first and hands the keyboard
+    /// back ([`SpaceView::continue_answer`]).
+    pub(crate) continue_focus: std::cell::RefCell<HashMap<SharedString, FocusHandle>>,
+    /// The generations this window asked to regenerate and was told were
+    /// already being regenerated elsewhere (see
+    /// `SpaceEvent::RegenerationCollided`).
+    ///
+    /// Keyed by **generation**, which is what makes the state end on its own.
+    /// The mark is drawn only on the post whose action id it names, and the
+    /// regeneration it collided with supersedes exactly that action id — so the
+    /// transcript refresh that carries the finished answer here is the same
+    /// event that takes the mark off the screen, with nothing watching for it.
+    /// Keyed by *item* it would have outlived the very completion it is waiting
+    /// for. [`SpaceView::prune_post_marks`] then drops the dead key.
+    pub(crate) regenerating_elsewhere: HashSet<SharedString>,
+    /// The marked generations this window has actually **seen** in a snapshot —
+    /// the evidence [`SpaceView::prune_post_marks`] needs before a later
+    /// snapshot's silence about one may be read as supersession.
+    ///
+    /// A mark is recorded when its turn ends, which can precede any snapshot
+    /// carrying its post (a turn whose own exit reload failed leaves the post
+    /// durable and unread here), so "absent" and "gone" are different facts and
+    /// only this tells them apart. Pruned to the marks themselves, so it can
+    /// outlive neither.
+    pub(crate) marks_seen: HashSet<SharedString>,
+
+    /// The open **find** session (⌘F), if any — the query field, the match
+    /// set over the visible branch, and the projection cache.
+    ///
+    /// Window-local for the reason the composer draft is: two windows on one
+    /// space are two cursors, so they are two searches (`STATE.md`'s scoping
+    /// table). The cache living *inside* the session is what makes "no
+    /// projection is ever built while no find session is open" structural
+    /// rather than remembered — there is nowhere else to keep one.
+    pub(crate) find: Option<find::FindSession>,
+    /// How many times [`Self::rebuild`] has replaced [`Self::posts`].
+    ///
+    /// The cheap half of the find count's validity key: the whole-space pass
+    /// answers a question about *this* transcript, and `Change::Space` fires
+    /// on every post, turn, memory write and background summary pass — so the
+    /// pass needs to know that the snapshot moved without comparing a thousand
+    /// posts to find out. A counter, because identity is all that is asked.
+    pub(crate) posts_generation: u64,
+    /// How many searchable projections this window has ever built.
+    ///
+    /// A test seam, in the class of [`Self::docked_caret_slot_offset`]: the
+    /// lazy-activation invariant is that a closed find bar costs nothing on an
+    /// ordinary edit keystroke, and no amount of looking at the *cache* can
+    /// show that none was built — only that none is kept. This counts the
+    /// builds.
+    pub(crate) projections_built: Cell<usize>,
+    /// How many times this window has **scanned** a projection for a query.
+    ///
+    /// The sibling seam to [`Self::projections_built`], and it exists because
+    /// the two costs are separate: a projection is built once per text, while
+    /// the scan is what `Query::find_in` does over every byte — folding case by
+    /// allocating a whole new projection of the haystack — and three passes
+    /// asked for one per node per frame. Reuse is not visible in the cache
+    /// either (the projection is there whether or not it was scanned again),
+    /// so the scans are counted.
+    pub(crate) scans_run: Cell<usize>,
+    /// How many times this window has **copied a draft's text** to build a
+    /// `ProjectionSeed` for it.
+    ///
+    /// The third seam beside [`Self::projections_built`] and
+    /// [`Self::scans_run`], and it exists because the copy is its own cost at
+    /// its own moment: a seed owns the draft's whole body, so building one is
+    /// O(bytes) before any projecting or scanning happens. Neither sibling
+    /// counter can see it — a seed built for a draft the chunk then defers is
+    /// never projected and never scanned, so both stay flat while the frame
+    /// copies the corpus.
+    pub(crate) draft_seeds_built: Cell<usize>,
 
     /// Whether this window's **inspector** (the per-space settings panel) is
     /// open. Per-window by design — two windows on one space are two vantage
@@ -792,6 +974,11 @@ pub struct SpaceView {
     /// *is* the editor (live inputs plus an explicit Save). See
     /// [`inspector_participants`].
     pub(crate) inspector_participant_edit: Option<inspector_participants::ParticipantEdit>,
+    /// Switches to newer weights sent and not yet seen in the roster, by
+    /// participant id: the open editor follows one only once the roster shows
+    /// it landed (`sync_inspector_participant_edit`), never on the click, so a
+    /// refused switch leaves the editor as it was.
+    pub(crate) inspector_pending_switches: HashMap<String, inspector_participants::PendingSwitch>,
     /// The open add-a-participant form, if any.
     pub(crate) inspector_participant_add: Option<inspector_participants::ParticipantAdd>,
     /// The open "save these participants as a template" form, if any.
@@ -889,9 +1076,14 @@ impl SpaceView {
         }
 
         let _subs = vec![
-            // Any space change re-derives the render snapshot and re-renders.
+            // Any space change re-derives the render snapshot and re-renders
+            // — and ends an open highlight picker whose chosen edges the
+            // reverse index no longer carries, which is where an invalidation
+            // of that index lands (see
+            // `SpaceView::close_highlight_picker_if_empty`).
             cx.observe(&space, |this: &mut Self, _, cx| {
                 this.rebuild(cx);
+                this.close_highlight_picker_if_empty(cx);
                 cx.notify();
             }),
             cx.subscribe_in(&space, window, Self::on_space_event),
@@ -969,6 +1161,12 @@ impl SpaceView {
             quote_destination_scroll: gpui::UniformListScrollHandle::new(),
             band_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
             transcript_retry_focus: cx.focus_handle(),
+            inspector_focus: cx
+                .focus_handle()
+                .tab_index(crate::focus::region::AUX)
+                .tab_stop(false),
+            inspector_covered: false,
+            inspector_borrowed_find: false,
             context_menu: None,
             navigate_task: None,
             wants_incoming_refs: RefCell::new(HashSet::new()),
@@ -1030,6 +1228,15 @@ impl SpaceView {
             minimap_drag: None,
             error: None,
             reference_notice: None,
+            truncated_posts: HashSet::new(),
+            continue_focus: std::cell::RefCell::new(HashMap::new()),
+            regenerating_elsewhere: HashSet::new(),
+            marks_seen: HashSet::new(),
+            find: None,
+            posts_generation: 0,
+            projections_built: Cell::new(0),
+            scans_run: Cell::new(0),
+            draft_seeds_built: Cell::new(0),
             inspector_open: false,
             inspector_scroll: ScrollHandle::new(),
             inspector_title: None,
@@ -1037,6 +1244,7 @@ impl SpaceView {
             inspector_router_picker: false,
             inspector_picker_scroll: ScrollHandle::new(),
             inspector_participant_edit: None,
+            inspector_pending_switches: HashMap::new(),
             inspector_participant_add: None,
             inspector_template_form: None,
             inspector_invite: None,
@@ -1100,6 +1308,23 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn tail_draft_state_for_test(&self) -> Option<Entity<MarkdownEditorState>> {
         self.drafts.last().map(|d| d.editor.clone())
+    }
+
+    /// One **named** branch's tail-draft editor — the draft replying to
+    /// `parent`, whether or not it is the active one or on the selected path.
+    ///
+    /// `tail_draft_state_for_test` answers with the last draft minted, which is
+    /// the trailing one of the branch the reader is on; a test about a draft the
+    /// reader has *left behind* needs to name the branch instead.
+    #[doc(hidden)]
+    pub fn draft_editor_for_parent_for_test(
+        &self,
+        parent: &str,
+    ) -> Option<Entity<MarkdownEditorState>> {
+        self.drafts
+            .iter()
+            .find(|d| d.parent.as_deref() == Some(parent))
+            .map(|d| d.editor.clone())
     }
 
     /// Leave the composing session (the Escape gesture), so a test can reach
@@ -1375,6 +1600,242 @@ impl SpaceView {
     /// The document's top reserve — so a test can state a document position
     /// relative to it instead of restating the constant.
     #[doc(hidden)]
+    /// How many searchable projections this window has ever built — the seam
+    /// for the lazy-activation invariant (see [`Self::projections_built`]).
+    #[doc(hidden)]
+    pub fn projections_built_for_test(&self) -> usize {
+        self.projections_built.get()
+    }
+
+    /// How many times this window has scanned a projection for a query — the
+    /// seam for the memo (see [`Self::scans_run`]).
+    #[doc(hidden)]
+    pub fn find_scans_run_for_test(&self) -> usize {
+        self.scans_run.get()
+    }
+
+    /// How many draft seeds this window has built — the seam for the
+    /// copy-at-admission rule (see [`Self::draft_seeds_built`]).
+    #[doc(hidden)]
+    pub fn find_draft_seeds_built_for_test(&self) -> usize {
+        self.draft_seeds_built.get()
+    }
+
+    /// Whether a find session is open.
+    #[doc(hidden)]
+    pub fn find_open_for_test(&self) -> bool {
+        self.find.is_some()
+    }
+
+    /// The find bar's query field, for driving real keystrokes through it.
+    #[doc(hidden)]
+    pub fn find_input_for_test(&self) -> Option<Entity<gpui_component::input::InputState>> {
+        self.find.as_ref().map(|f| f.input.clone())
+    }
+
+    /// Every match on the visible branch as `(node id, source range)`, in
+    /// document order, plus the current one's 1-based index.
+    #[doc(hidden)]
+    pub fn find_matches_for_test(
+        &self,
+    ) -> (Vec<(SharedString, std::ops::Range<usize>)>, Option<usize>) {
+        let Some(session) = self.find.as_ref() else {
+            return (Vec::new(), None);
+        };
+        (
+            session
+                .matches
+                .iter()
+                .map(|m| (m.node.clone(), m.source.clone()))
+                .collect(),
+            session.current_index(),
+        )
+    }
+
+    /// The node and source offset a two-phase reveal is still waiting to
+    /// correct, if one is pending — what pins that it follows the anchor
+    /// through an edit or a regeneration.
+    #[doc(hidden)]
+    pub fn find_pending_reveal_for_test(&self) -> Option<(SharedString, usize)> {
+        self.find
+            .as_ref()?
+            .pending_reveal
+            .as_ref()
+            .map(|p| (p.node.clone(), p.source.start))
+    }
+
+    /// The whole-space total the bar is showing, or `None` while the
+    /// cross-branch pass has not settled — the honest-states seam.
+    #[doc(hidden)]
+    pub fn find_space_total_for_test(&self) -> Option<usize> {
+        self.find.as_ref().and_then(|s| s.space.total)
+    }
+
+    /// Whether a find session is open with its whole-space pass still walking.
+    /// Distinguishes "no total yet" from "no session", which the total alone
+    /// cannot.
+    #[doc(hidden)]
+    pub fn find_counting_for_test(&self) -> bool {
+        self.find.as_ref().is_some_and(|s| !s.space.is_settled())
+    }
+
+    /// Whether the Find-all overlay is expanded.
+    #[doc(hidden)]
+    pub fn find_overlay_open_for_test(&self) -> bool {
+        self.find_overlay_open()
+    }
+
+    /// Where the overlay's results list stands, as a positive offset from the
+    /// top — the retention seam.
+    #[doc(hidden)]
+    pub fn find_overlay_scroll_for_test(&self) -> f32 {
+        self.find
+            .as_ref()
+            .map_or(0.0, |s| -s.overlay.scroll.offset().y.as_f32())
+    }
+
+    /// Scroll the overlay's results list, as a map press or the roving cursor
+    /// would.
+    #[doc(hidden)]
+    pub fn find_overlay_scroll_to_for_test(&mut self, top: f32) {
+        self.scroll_find_results_to(top);
+    }
+
+    /// Where the results list's roving cursor sits, and the list's own focus
+    /// handle — the surface's single tab stop.
+    #[doc(hidden)]
+    pub fn find_results_focus_for_test(&self) -> Option<gpui::FocusHandle> {
+        self.find.as_ref().map(|s| s.overlay.list_focus.clone())
+    }
+
+    /// The cursor's index into the flat fragment list.
+    #[doc(hidden)]
+    pub fn find_result_cursor_for_test(&self) -> Option<usize> {
+        self.find.as_ref().map(|s| s.overlay.cursor)
+    }
+
+    /// The overlay's map, in the order it lays the space out and the results
+    /// read: `(node id, depth, lane)` sorted depth-then-lane.
+    #[doc(hidden)]
+    pub fn find_map_for_test(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Vec<(String, usize, usize)> {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        find_overlay::map_layout(&tree, &|node| self.find_map_includes_for_test(node, cx))
+            .into_iter()
+            .map(|n| (n.node.to_string(), n.depth, n.lane))
+            .collect()
+    }
+
+    /// The overlay's results, in the order it draws them: one entry per group
+    /// as `(node id, fragment source ranges)`.
+    #[doc(hidden)]
+    pub fn find_results_for_test(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Vec<(String, Vec<std::ops::Range<usize>>)> {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let map =
+            find_overlay::map_layout(&tree, &|node| self.find_map_includes_for_test(node, cx));
+        self.find_results_for_map_for_test(&map, cx)
+            .into_iter()
+            .map(|g| {
+                (
+                    g.node.to_string(),
+                    g.fragments.iter().map(|f| f.range.clone()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The overlay's result **cards**, flat and in the order the list draws
+    /// them: `(measurement id, source range, the hits that card paints)`.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn find_result_cards_for_test(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Vec<(String, std::ops::Range<usize>, Vec<std::ops::Range<usize>>)> {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let map =
+            find_overlay::map_layout(&tree, &|node| self.find_map_includes_for_test(node, cx));
+        self.find_results_for_map_for_test(&map, cx)
+            .into_iter()
+            .flat_map(|g| g.fragments)
+            .map(|f| (f.id.to_string(), f.range.clone(), f.hits.clone()))
+            .collect()
+    }
+
+    /// The left-hand side of the exactness invariant, over this frame's real
+    /// selected path: the path's own matches plus every shown sibling's whole
+    /// subtree. Must equal [`Self::find_space_total_for_test`] exactly.
+    #[doc(hidden)]
+    pub fn find_levels_account_for_test(&self, window: &Window, cx: &gpui::App) -> usize {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        self.find_levels_account(&tree, page_width)
+    }
+
+    /// What each **inactive** sibling column of the map carries, as
+    /// `(node id, count)` in level-then-column order. `None` where the cell
+    /// shows nothing.
+    #[doc(hidden)]
+    pub fn minimap_branch_counts_for_test(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Vec<(String, Option<usize>)> {
+        let page_width = self.page_size(window).width;
+        let turns = self.stream_overlays(cx);
+        let tree = self.effective_tree(page_width, &turns);
+        let mut out = Vec::new();
+        for (sibs, active) in self.selected_levels(&tree, page_width) {
+            for (i, sib) in sibs.iter().enumerate() {
+                if i == active {
+                    continue;
+                }
+                out.push((sib.id.to_string(), self.find_branch_count(sib)));
+            }
+        }
+        out
+    }
+
+    /// The strip's rendered width this frame — 36px at rest, wider while the
+    /// find bar stands, never past the gutter it overlays.
+    #[doc(hidden)]
+    pub fn minimap_width_for_test(&self, window: &Window) -> f32 {
+        self.minimap_width(self.page_size(window).width).as_f32()
+    }
+
+    /// The reading column's own width this frame — what the map's clamp is
+    /// measured against.
+    #[doc(hidden)]
+    pub fn body_width_for_test(&self, window: &Window) -> f32 {
+        layout::page_layout(self.page_size(window).width).body_width
+    }
+
+    /// The projections this window is currently holding, by node id.
+    #[doc(hidden)]
+    pub fn find_projection_nodes_for_test(&self) -> Vec<SharedString> {
+        let Some(session) = self.find.as_ref() else {
+            return Vec::new();
+        };
+        let mut nodes: Vec<SharedString> = session.projections.keys().cloned().collect();
+        nodes.sort();
+        nodes
+    }
+
     pub fn doc_reserve_for_test(&self) -> f32 {
         self.doc_reserve()
     }
@@ -1485,6 +1946,71 @@ impl SpaceView {
     #[doc(hidden)]
     pub fn error_for_test(&self, cx: &gpui::App) -> Option<String> {
         self.error.as_ref().map(|e| error_copy(e, cx))
+    }
+
+    /// Test-only: how many affordance-row verbs a post currently offers — the
+    /// same answer the render and the keyboard model both read, so a test can
+    /// ask whether a verb is *there* rather than infer it from a paint.
+    #[doc(hidden)]
+    pub fn post_verb_count_for_test(&self, node_id: &str, cx: &gpui::App) -> usize {
+        self.post_verb_count(node_id, cx)
+    }
+
+    /// Test-only: the streaming leaves the tree will grow this frame. A
+    /// regeneration is deliberately absent — it renders in place.
+    #[doc(hidden)]
+    pub fn stream_overlays_for_test(&self, cx: &gpui::App) -> Vec<(u64, Option<SharedString>)> {
+        self.stream_overlays(cx)
+    }
+
+    /// Test-only: the generations this window is marking as cut off at their
+    /// length allowance — pending ones included, which is the distinction
+    /// `prune_post_marks` turns on.
+    #[doc(hidden)]
+    pub fn truncated_posts_for_test(&self) -> Vec<String> {
+        self.truncated_posts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Test-only: re-derive the render snapshot, as any unrelated space change
+    /// does — a concurrent sibling turn's delta, for instance.
+    #[doc(hidden)]
+    pub fn rebuild_for_test(&mut self, cx: &mut Context<Self>) {
+        self.rebuild(cx);
+    }
+
+    /// Test-only: the generations this window is marking as being regenerated
+    /// somewhere it cannot see — the mark whose ending the settlement is.
+    #[doc(hidden)]
+    pub fn regenerating_elsewhere_for_test(&self) -> Vec<String> {
+        self.regenerating_elsewhere
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Test-only: mark `action_id` as being regenerated somewhere this window
+    /// cannot see — what `SpaceEvent::RegenerationCollided` does, without
+    /// staging a collision through the entity's gates (which now withhold the
+    /// next regeneration, as they should).
+    #[doc(hidden)]
+    pub fn note_regeneration_elsewhere_for_test(
+        &mut self,
+        action_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.regenerating_elsewhere
+            .insert(SharedString::from(action_id.to_string()));
+        cx.notify();
+    }
+
+    /// Test-only: record that this window watched `action_id`'s answer stop at
+    /// its length allowance — what `SpaceEvent::TurnEnded { truncated: true }`
+    /// does, without a backend to produce one.
+    #[doc(hidden)]
+    pub fn note_truncated_turn_for_test(&mut self, action_id: &str, cx: &mut Context<Self>) {
+        self.truncated_posts
+            .insert(SharedString::from(action_id.to_string()));
+        cx.notify();
     }
 
     /// The node id whose separator band menu is open, if any.
@@ -1665,15 +2191,29 @@ impl SpaceView {
         self.highlight_ranges(i, cx)
     }
 
-    /// The open source-highlight picker's choices, as `(action id, label)`.
+    /// The open source-highlight picker's rows, as
+    /// `(action id, accessible name, collision ordinal)` — exactly what it
+    /// paints. The ordinal is reported separately because it is painted
+    /// separately: it sits outside the row's truncatable text, so a test can
+    /// tell a discriminator that survives the 280px row from one that does
+    /// not.
+    ///
+    /// Takes `cx` because a row is resolved against the live reverse index and
+    /// worded in the reader's locale at render, never stored — see
+    /// [`HighlightPicker`].
     #[doc(hidden)]
-    pub fn highlight_picker_for_test(&self) -> Option<Vec<(String, String)>> {
-        self.highlight_picker.as_ref().map(|p| {
-            p.choices
-                .iter()
-                .map(|(a, _, label)| (a.clone(), label.to_string()))
-                .collect()
-        })
+    pub fn highlight_picker_for_test(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Option<Vec<(String, String, Option<i64>)>> {
+        self.highlight_picker.as_ref()?;
+        Some(
+            self.picker_rows(window, cx)
+                .into_iter()
+                .map(|row| (row.action_id, row.accessible.to_string(), row.ordinal))
+                .collect(),
+        )
     }
 
     /// Drive a highlight click on post `node_id` with the given keys (the
@@ -1729,7 +2269,81 @@ impl SpaceView {
         self.ensure_viewer_gate(cx);
         self.rethread_drafts(&posts);
         self.retarget_tree_focus(&posts);
+        self.prune_post_marks(&posts);
+        // **The generation moves only when the *text* did.** `rebuild` runs on
+        // every `StreamDelta` — once per token of every turn — while the
+        // persisted transcript it reads does not move during a stream at all,
+        // so bumping unconditionally would restart the find bar's whole-space
+        // count on every token and leave the readout saying "counting" for the
+        // length of a reply.
+        if post_text_moved(&self.posts, &posts) {
+            self.posts_generation = self.posts_generation.wrapping_add(1);
+        }
         self.posts = posts;
+    }
+
+    /// Drop every session-scoped post mark whose **generation** has left the
+    /// transcript, beside the two window-local references that forward across
+    /// one.
+    ///
+    /// Unlike a draft's antecedent or the tree focus, neither mark forwards:
+    /// each says something about one version of a post — that it stopped at its
+    /// length allowance, that a regeneration of it was already running — and an
+    /// edit or a regeneration answers it by producing a different version.
+    /// Neither is drawn anywhere but on the generation it names, so this
+    /// changes nothing a reader sees; what it does is make the state end where
+    /// the drawing already does, rather than accumulate a key per superseded
+    /// generation for the life of the window.
+    ///
+    /// **Evidence of absence, never absence of evidence** (Codex review, PR
+    /// #330). A mark is recorded when the *turn* ends, which can be many frames
+    /// ahead of any snapshot containing the post it names: a truncated turn
+    /// persists its answer and then fails its own exit reload, so the mark's
+    /// generation is durable and absent from every snapshot this window holds
+    /// until a retry succeeds. Pruning on "not in the current posts" read that
+    /// as superseded and dropped it — and the rebuild that did so needed
+    /// nothing to do with the turn, a concurrent sibling's `StreamDelta` being
+    /// enough — so the answer came back after the Retry with no mark on it. A
+    /// mark therefore becomes prunable only once its generation has actually
+    /// been *seen* here; until then it is pending, and no snapshot can say
+    /// anything about it.
+    ///
+    /// A transcript with nothing in it is a read that has not answered, not an
+    /// empty conversation, and nothing can be pruned against it.
+    fn prune_post_marks(&mut self, next: &[PostData]) {
+        if next.is_empty() {
+            return;
+        }
+        let live: HashSet<SharedString> = next.iter().filter_map(|p| p.action_id.clone()).collect();
+
+        // Seeing a mark's generation once is what turns "pending" into
+        // "prunable" — the evidence a later snapshot's silence then means
+        // something.
+        for id in self
+            .truncated_posts
+            .iter()
+            .chain(&self.regenerating_elsewhere)
+        {
+            if live.contains(id) {
+                self.marks_seen.insert(id.clone());
+            }
+        }
+
+        let seen = &self.marks_seen;
+        self.truncated_posts
+            .retain(|id| live.contains(id) || !seen.contains(id));
+        self.regenerating_elsewhere
+            .retain(|id| live.contains(id) || !seen.contains(id));
+
+        // The witness list is bookkeeping for the two marks and outlives
+        // neither.
+        let held: HashSet<SharedString> = self
+            .truncated_posts
+            .iter()
+            .chain(&self.regenerating_elsewhere)
+            .cloned()
+            .collect();
+        self.marks_seen.retain(|id| held.contains(id));
     }
 
     /// Carry every draft's reply antecedent across a generation change of the
@@ -1824,6 +2438,11 @@ impl SpaceView {
             .chain(local.external().iter().flat_map(|b| b.models.iter()))
             .find(|m| m.id == selection)
             .map(|m| m.display_name.clone())
+            // A curated model not yet downloaded still has its catalog name.
+            .or_else(|| {
+                eidola_app_core::catalog_entry_for_model_ref(selection)
+                    .map(|entry| entry.display_name.to_string())
+            })
             .unwrap_or_else(|| mref.model.clone());
         (model_name.into(), backend_name.into())
     }
@@ -1975,7 +2594,17 @@ impl SpaceView {
             SpaceEvent::TurnEnded {
                 seq,
                 response_action_id,
+                truncated,
             } => {
+                // An answer that stopped at its length allowance is marked
+                // where it is read, beneath the post itself — the only place
+                // the mark means anything. The answer's row records the same
+                // fact; this is what shows it in the frames before the reload
+                // carrying that row lands.
+                if let (true, Some(id)) = (*truncated, response_action_id.as_deref()) {
+                    self.truncated_posts
+                        .insert(SharedString::from(id.to_string()));
+                }
                 // A selection aimed at this turn's streaming leaf — pending, or
                 // the branch the reader is parked on — has to follow the turn
                 // onto the post it wrote; the leaf is already gone (see
@@ -1984,6 +2613,25 @@ impl SpaceView {
             }
             SpaceEvent::Failed(e) => {
                 self.error = Some(e.clone());
+                self.rebuild(cx);
+            }
+            SpaceEvent::RegenerationCollided { action_id } => {
+                // Marked on the generation it collided on, never in the
+                // recovery band: the band has nothing to end this state on
+                // (the other regeneration lands as a transcript refresh), while
+                // the generation itself is exactly what that refresh takes
+                // away — see `prune_post_marks`.
+                self.regenerating_elsewhere
+                    .insert(SharedString::from(action_id.clone()));
+                self.rebuild(cx);
+            }
+            SpaceEvent::RegenerationSettled { action_id } => {
+                // The other half of the ending. Supersession covers the
+                // regeneration that succeeds; this covers the one that fails,
+                // which leaves the transcript exactly as it found it and so
+                // has nothing in the tree for the mark to end on.
+                self.regenerating_elsewhere
+                    .remove(&SharedString::from(action_id.clone()));
                 self.rebuild(cx);
             }
             SpaceEvent::CascadePaused {
@@ -2038,12 +2686,27 @@ impl SpaceView {
                     // Track this post's selection: a read-only body is where
                     // a quote is *made*, so its `SelectionChanged` is the
                     // only signal that gates the Edit menu's Quote items.
+                    //
+                    // **And selecting is the reader claiming the page where it
+                    // stands.** A find reveal is a multi-frame glide toward an
+                    // off-screen match, and a selection is anchored to document
+                    // positions, so a page sliding under the pointer smears the
+                    // drag across text the reader never aimed at — and phase 2
+                    // could still pull the page onto the match afterwards. Only
+                    // a drag that reaches a viewport edge passed through the
+                    // motion seam before (`autoscroll_selection`), which leaves
+                    // every ordinary click and mid-page drag out. The editor
+                    // emits this on a real caret move alone — `set_value`
+                    // announces `Change` and never this — so a transcript
+                    // re-seed cannot fire it.
                     let sub_id = id.clone();
                     let sub = cx.subscribe(&editor, move |this, _editor, event, cx| {
                         if matches!(
                             event,
                             gpui_markdown_editor::MarkdownEditorEvent::SelectionChanged
                         ) {
+                            this.cancel_page_glide();
+                            this.demote_tail_pin_for_reader();
                             this.note_body_selection(&sub_id, cx);
                         }
                     });
@@ -2104,6 +2767,10 @@ impl SpaceView {
             .read(cx)
             .streams()
             .iter()
+            // A regeneration has no leaf of its own: it renders **in place of**
+            // the post it replaces (see `render_post`). Attached as a child it
+            // would draw as a reply to the post it is about to become.
+            .filter(|t| !t.revising)
             .map(|t| (t.seq, t.target_action_id.clone().map(SharedString::from)))
             .collect()
     }
@@ -2175,6 +2842,25 @@ pub(crate) fn selection_autoscroll_delta(my: f32, h: f32, margin: f32, max_speed
     }
 }
 
+/// Whether the new snapshot differs in a way anything derived from **post
+/// text** has to be recomputed for — today the find bar's whole-space count
+/// (`find::CountKey`), which is an answer about the transcript it was taken on.
+///
+/// The three fields are exactly what a searchable projection is a function of,
+/// plus the node identity that keys it: `content`, and the `references` its
+/// embed map is built from (a marker is hidden wholesale only when its ordinal
+/// is *mapped*, so a stored quote whose range stops resolving changes the
+/// projection with the content unmoved). The references are compared whole
+/// rather than as the map derived from them — stricter and cheaper, and an
+/// over-invalidation costs a re-scan of warm projections rather than a wrong
+/// number. **A new input to `find::searchable_projection` belongs here too.**
+fn post_text_moved(old: &[PostData], new: &[PostData]) -> bool {
+    old.len() != new.len()
+        || old.iter().zip(new).any(|(a, b)| {
+            a.action_id != b.action_id || a.content != b.content || a.references != b.references
+        })
+}
+
 /// Project one transcript row into the render snapshot. The byline pair is
 /// resolved by the caller (`rebuild`), which has store access for the
 /// model/backend display names.
@@ -2199,6 +2885,8 @@ fn post_data_from(
         references: m.references.clone(),
         blocks: m.blocks.clone(),
         regenerable: m.regenerable,
+        truncated: m.truncated,
+        continuable: m.continuable,
     }
 }
 
@@ -2239,8 +2927,50 @@ fn error_copy(e: &AppError, cx: &gpui::App) -> String {
         AppError::InsufficientBalance { .. } => {
             "Not enough credits to send. Add credits to continue.".to_string()
         }
+        // Not a balance problem, and the copy must not send the reader to buy
+        // credit that would not help: the request's worst case is past what
+        // this app pays without issuing a credential sized to it, so what
+        // lifts it is a smaller request. No figures.
+        AppError::HoldExceedsDenomination { .. } => {
+            crate::i18n::msg::space_error_hold_exceeds_denomination(cx).to_string()
+        }
         AppError::SpaceArchived { .. } => crate::i18n::msg::space_error_archived(cx).to_string(),
+        AppError::UncachedRetryUnfunded => {
+            crate::i18n::msg::space_error_uncached_retry_unfunded(cx).to_string()
+        }
         AppError::NotJoined { .. } => crate::i18n::msg::space_error_not_joined(cx).to_string(),
+        // The model this turn would have used has left its backend's catalog.
+        // The variant carries the selection and no sentence, so the copy is
+        // built here — and it names the model, because the reader's only way
+        // out is to change it, and says nothing answered in its place, because
+        // that is the promise the refusal exists to keep.
+        AppError::ModelUnavailable { model } => {
+            crate::i18n::msg::space_error_model_unavailable(cx, model.clone()).to_string()
+        }
+        // An on-device model with no file yet — a fresh profile's default.
+        // Named by the curated catalog's display name where it has one, since
+        // that is the name Settings lists it under.
+        AppError::LocalModelNotDownloaded { model } => {
+            let name = eidola_app_core::catalog_entry_for_model_ref(model)
+                .map(|entry| entry.display_name.to_string())
+                .unwrap_or_else(|| model.clone());
+            crate::i18n::msg::space_error_local_model_not_downloaded(cx, name).to_string()
+        }
+        // The server's issuer key failed a check this client makes for
+        // itself. Worded as what the reader needs: they were protected,
+        // nothing was charged, held credits still work, and (for a second
+        // key) waiting for the next epoch is what clears it.
+        AppError::IssuerKeyRefused { refusal } => match refusal {
+            IssuerKeyRefusal::NotOnCalendar => {
+                crate::i18n::msg::space_error_issuer_key_off_calendar(cx).to_string()
+            }
+            IssuerKeyRefusal::SecondKeyForEpoch { .. } => {
+                crate::i18n::msg::space_error_issuer_key_second_for_epoch(cx).to_string()
+            }
+            IssuerKeyRefusal::OneKeyForSeveralEpochs { .. } => {
+                crate::i18n::msg::space_error_issuer_key_reused(cx).to_string()
+            }
+        },
         other => other.to_string(),
     }
 }
@@ -2253,6 +2983,17 @@ impl Focusable for SpaceView {
 
 impl Render for SpaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // **The Find-all overlay covers this window, so it takes the tab order
+        // with it** ([`crate::focus::Covered`]). Painting on top removes
+        // nothing from the frame's tab map, so without this Tab walked out of
+        // the overlay into the conversation's own affordances — a Post, an Ask,
+        // a Regenerate the reader cannot see, each one press from running. The
+        // guard stands for the whole render and the two surfaces that are *not*
+        // covered take it off again for their own subtrees: the find bar (whose
+        // controls the overlay hangs off, and which paints above it) and the
+        // overlay itself. The inspector does the same, being a column beside
+        // the conversation pane rather than under it.
+        let _covered = crate::focus::Covered::new(self.find_overlay_open());
         let theme = cx.theme();
         let bg = theme.background;
         let fg = theme.foreground;
@@ -2278,6 +3019,10 @@ impl Render for SpaceView {
         // …and an invite form over a space that turns out to be a notebook: the
         // grant door is withheld there, and a form is a door left standing.
         self.sync_inspector_invite(window, cx);
+        // The panel's *covering* is decided by the width just read, so a resize
+        // can raise it with no door called — and a rise owes the keyboard.
+        // Before `sync_tree_focus`, which asks who owns it.
+        self.sync_inspector_cover(window, cx);
         // Tree focus is *observed*, not merely bookkept: see
         // `keyboard::sync_tree_focus`.
         self.sync_tree_focus(window, cx);
@@ -2314,9 +3059,6 @@ impl Render for SpaceView {
             page_layout.gutters,
         );
         self.sync_bodies(window, cx);
-        // Keep each post's embed map + highlight set current, and request the
-        // incoming-reference index for the posts that rendered last frame.
-        self.sync_references(cx);
         // Ask the space for its trace index (idempotent; the entity owns it).
         self.sync_traces(cx);
         // Keep a docked tail draft at the end of every branch (the always-present
@@ -2364,6 +3106,17 @@ impl Render for SpaceView {
                 PendingSettle::Stay => {}
             }
         }
+
+        // Recompute the find bar's matches against **this frame's** selected
+        // path, then paint them. Both run here rather than beside the other
+        // per-frame syncs because the scope is a function of the selected
+        // branch, which the scrollers only decide once `sync_scrolls` and any
+        // pending selection have run.
+        self.sync_find(&tree, page_width, window, cx);
+        // Keep each post's embed map + highlight sets current (quoted
+        // passages, find matches, the current match), and request the
+        // incoming-reference index for the posts that rendered last frame.
+        self.sync_references(cx);
 
         // Sync one read-only editor per in-flight turn to its live partial
         // (skip unchanged buffers), pruning editors whose turn has ended.
@@ -2571,6 +3324,11 @@ impl Render for SpaceView {
             // the `MarkdownEditor` beneath it, which then dragged out a
             // selection while the window moved (task 32). It stays ahead of the
             // composer and minimap, which paint over it as before.
+            // The find bar, painted **before** the drag band: its surface
+            // spans from the window top so it reads as one panel, and the band
+            // — registered after it — keeps the clicks in its own strip, so
+            // window dragging still works exactly where the reader expects.
+            .children(self.render_find_bar(window, cx))
             .child(self.render_title_bar(window, cx))
             // The stale-read line, floating just under the title band — chrome
             // over the page, so it is on screen at every scroll offset (the
@@ -2593,7 +3351,7 @@ impl Render for SpaceView {
             // The source-highlight picker: which of several posts that quoted
             // the clicked passage to visit. Above the composer, below the
             // notices — it's a choice, not a state.
-            .children(self.render_highlight_picker(cx))
+            .children(self.render_highlight_picker(window, cx))
             // The quote destination picker + its visibility statement: the
             // same layer as the highlight picker — a choice, not a state.
             .children(self.render_quote_destination(cx))
@@ -2607,6 +3365,12 @@ impl Render for SpaceView {
             // defers; staying in the normal pass keeps both below late overlays
             // like the gpui dev inspector.
             .child(self.render_minimap(&tree, page_width, window_h, window, cx))
+            // The Find-all overlay covers the rest of the window below the
+            // bar, so it paints after everything under it — the composer, the
+            // notices, the minimap. It is geometrically clear of the drag band
+            // and of the bar's own controls, so those two keep their clicks
+            // whatever the paint order says.
+            .children(self.render_find_overlay(&tree, window_h, window, cx))
             // The context menu is the last child of all: a menu opened at the
             // pointer must sit above every surface it can be opened over,
             // the minimap and the floating composer included.
@@ -2624,22 +3388,59 @@ impl Render for SpaceView {
             // `CloseWindow`, so the item targets the focused space and macOS
             // greys it when no space window is open.
             .on_action(cx.listener(Self::toggle_inspector))
+            // Edit → Find in Conversation (⌘F). Registered per-view like
+            // `ToggleInspector`, so macOS greys it with no space window open.
+            //
+            // **And only while the bar it opens would be visible.** Dispatch is
+            // not traversal, so the covering guard does not reach it: in the
+            // inspector's *overlay* form the panel paints a full-window scrim
+            // after this pane, and ⌘F under one mounted the bar behind that
+            // scrim and focused its query field — a reader typing into a
+            // surface they cannot see, with the pointer intercepted. The quote
+            // verbs' rule, reached through the other cover: withheld rather
+            // than dismissing the panel, because the panel is not this verb's
+            // to close and one ⌥⌘I (or a click on the scrim) brings ⌘F back.
+            // The split form covers nothing, so the condition is exactly the
+            // layout.
+            .when(!self.inspector_covers_pane(window), |d| {
+                d.on_action(cx.listener(Self::open_find))
+            })
             // Edit → Quote / Quote in Reply. Registered **only while a
             // quotable post selection exists**, so `is_action_available` is
             // false otherwise and macOS greys both items — the same
             // registration-is-enablement mechanism as CloseWindow, with the
             // extra selection condition. `note_body_selection` re-renders on
             // exactly the transitions that flip this.
+            //
+            // **And only while the reader can see what each verb would do.**
+            // Menu dispatch is not traversal, so the Find-all overlay's
+            // tab-order suppression ([`crate::focus::Covered`]) does not reach
+            // these: every one of them mounts and focuses a surface the overlay
+            // covers — the destination picker, which paints before the overlay
+            // and stands wholly behind it, and the composer the other two land
+            // a populated draft in. The reader would be typing into something
+            // they cannot see, and the first Escape would close a picker they
+            // never saw. Withheld rather than closing the overlay first,
+            // because that is what the menus already do with every other verb
+            // that would not work here, and because taking a reader's search
+            // away is a decision they did not make: one Escape collapses the
+            // overlay and the verbs come back. `find_overlay_open` is view
+            // state, and every path that flips it notifies.
+            //
             // Quoting *elsewhere* lands its draft in whichever conversation
-            // the reader picks, so a selection is the whole of its condition.
-            .when(self.post_selection.is_some(), |d| {
-                d.on_action(cx.listener(Self::quote_elsewhere))
-            })
+            // the reader picks, so a selection is the whole of its own
+            // condition.
+            .when(
+                self.post_selection.is_some() && !self.find_overlay_open(),
+                |d| d.on_action(cx.listener(Self::quote_elsewhere)),
+            )
             // These two land a draft **here**, so they also need the reader to
             // be able to act here — registration-is-enablement, so macOS greys
             // them for a reader who is only watching.
             .when(
-                self.post_selection.is_some() && self.viewer_may_act(cx),
+                self.post_selection.is_some()
+                    && self.viewer_may_act(cx)
+                    && !self.find_overlay_open(),
                 |d| {
                     d.on_action(cx.listener(Self::quote))
                         .on_action(cx.listener(Self::quote_in_reply))
@@ -2654,9 +3455,24 @@ impl Render for SpaceView {
             // no-op when no menu is open.
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
+                    // **A rung answers only for a surface the reader can see.**
+                    // The chain is ordered innermost-first, which is the right
+                    // rule while everything in it is in front of everything
+                    // below it — and the inspector's *overlay* form breaks that
+                    // premise wholesale: its scrim covers the conversation
+                    // pane, so every rung belonging to the pane (this menu, the
+                    // quote picker, the Find-all overlay, the bar, and the
+                    // conversation's own levels below) would spend state behind
+                    // it while the visible surface did not change. The panel's
+                    // own rung is placed among them at the depth it actually
+                    // sits — inside its dropdowns, outside everything in the
+                    // pane — so the pane's later rungs need no gate of their
+                    // own: they are unreachable while it stands, and the two
+                    // that *precede* it ask.
+                    let covered = this.inspector_covers_pane(window);
                     // Rung 1 of the Escape chain (see `keyboard`): the menu
                     // wins, and consumes the press.
-                    if this.close_context_menu(cx) {
+                    if !covered && this.close_context_menu(cx) {
                         return;
                     }
                     // Then the inspector's own dropdown — the same
@@ -2668,12 +3484,44 @@ impl Render for SpaceView {
                     }
                     // …and the quote-destination picker, an overlay of the
                     // same kind over the conversation itself.
-                    if this.close_quote_destination(window, cx) {
+                    if !covered && this.close_quote_destination(window, cx) {
                         return;
                     }
                     // …and its Participants section's model dropdown, which is
                     // the same kind of overlay over the same panel.
                     if this.close_inspector_participant_picker(cx) {
+                        return;
+                    }
+                    // …then the **covering panel itself**. It is a member of
+                    // `transient_overlay_open` exactly while it covers, so it
+                    // answers Escape as every other transient overlay in this
+                    // window does — and closing it is what makes the press
+                    // never inert *and* never destructive: the panel's own
+                    // close hands the keyboard back to the search it borrowed
+                    // from, and the next press finds the pane uncovered and
+                    // answers for what is now in front. In the split form it is
+                    // a column beside the page rather than an overlay over it,
+                    // so it takes no rung at all and Escape reaches the
+                    // conversation as it always did.
+                    if covered {
+                        this.set_inspector_open(false, window, cx);
+                        return;
+                    }
+                    // …and the find surface, **innermost first**: the Find-all
+                    // overlay collapses before the bar it hangs off, so one
+                    // Escape backs out one rung rather than taking the whole
+                    // search away from a reader who was reading its results.
+                    // Ungated, unlike the bar's rung below: the overlay covers
+                    // the window, so there is nothing behind it an Escape could
+                    // sensibly have been meant for — and the one surface that
+                    // covers *it* has already answered above.
+                    if this.close_find_overlay(window, cx) {
+                        return;
+                    }
+                    // …then the bar — **gated on focus being inside it**, so an
+                    // Escape in the composer still deactivates the draft rather
+                    // than closing a bar the reader was not in.
+                    if this.find_holds_focus(window, cx) && this.close_find(window, cx) {
                         return;
                     }
                 }
@@ -3225,13 +4073,23 @@ impl SpaceView {
     /// paused cascade), each a card that has to be dismissed and ordered against
     /// the others, while a stale read is a standing property of the page with
     /// nothing to acknowledge — it ends when the read succeeds.
+    ///
+    /// **It hangs off the document's top reserve, not the title band's share of
+    /// it.** Every other surface that covers the document's top reads
+    /// [`Self::doc_reserve`], which is the one accessor that knows what chrome
+    /// is standing — and this strip is painted *after* the find bar, so a
+    /// constant here put its centred pill over the query field and won the
+    /// hit-test for it: part of the find controls obscured, and the field
+    /// unclickable, in a window whose reader had just asked to search. Reading
+    /// the same accessor is what makes the two surfaces unable to overlap,
+    /// whatever chrome the reserve grows next.
     fn render_transcript_refresh_failure(&self, cx: &Context<Self>) -> Option<AnyElement> {
         self.space.read(cx).transcript_refresh_failure()?;
         let theme = cx.theme();
         Some(
             div()
                 .absolute()
-                .top(TITLE_BAR_RESERVE)
+                .top(px(self.doc_reserve()))
                 .left_0()
                 .right_0()
                 .flex()
@@ -3476,9 +4334,10 @@ impl SpaceView {
     /// reader's place in the conversation if they have one, else the view root
     /// ([`Self::keyboard_home`]) — and only from a surface that was holding it,
     /// so a reader typing beside a notice keeps their caret.
-    fn hand_back_focus(&self, held: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn hand_back_focus(&self, held: bool, window: &mut Window, cx: &mut Context<Self>) {
         if held {
-            window.focus(&self.keyboard_home(), cx);
+            let back = self.keyboard_home(cx);
+            window.focus(&back, cx);
         }
     }
 
@@ -3488,8 +4347,17 @@ impl SpaceView {
     /// (and later `StreamEnded`/`Failed`) drives the rest. Sibling turns
     /// still streaming are untouched.
     pub fn retry_failed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.error = None;
+        // **The notice is cleared by the retry succeeding, not by the press.**
+        // `Space::retry` can be refused (it routes through `ask`), and clearing
+        // first left the recovery record standing with nothing on screen
+        // explaining it — the failure still unresolved and its only visible way
+        // out gone. `can_retry` makes the refusal unreachable from the button,
+        // but an affordance that *can* be refused must not spend the state its
+        // refusal depends on.
         let seq = self.space.update(cx, |s, cx| s.retry(cx));
+        if seq.is_some() {
+            self.error = None;
+        }
         // Select the branch the retried turn's streaming node lands on — not
         // whatever branch the user navigated to after the failure (PR #218
         // review), and not merely the target's path (the retry is a new

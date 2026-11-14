@@ -1,0 +1,28 @@
+{
+  "artifacts": {
+    "eidola-gui-macos-universal": {
+      "appleTeamId": "XXXXXXXXXX",
+      "archiveSha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "narHash": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "platform": "darwin/universal",
+      "type": "nix"
+    }
+  },
+  "artifacts": {
+    "eidola-server": {
+      "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "platform": "linux/amd64",
+      "type": "oci"
+    }
+  },
+  "enclave": {
+    "cvm_version": "0.0.0-test@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "igvm_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "sev_snp": {
+      "guest_policy": "0x30133",
+      "host_data": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "measurement": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "schema_version": 2
+}

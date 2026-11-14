@@ -51,8 +51,8 @@
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use eidola_app_core::SubscriptionState;
 use eidola_app_core::error::AppError;
+use eidola_app_core::{CheckoutMint, SubscriptionState, TermsDocument};
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, IsZero, ParentElement, Pixels, Render, ScrollHandle, SharedString,
@@ -61,8 +61,10 @@ use gpui::{
 use gpui_component::{
     ActiveTheme,
     input::InputState,
-    scroll::{Scrollbar, ScrollbarShow},
+    scroll::{Scrollbar, ScrollbarMode},
 };
+
+use gpui_markdown_editor::MarkdownEditorState;
 
 use crate::actions::CloseWindow;
 use crate::plans;
@@ -72,6 +74,22 @@ use crate::stores::Stores;
 use crate::titlebar;
 
 mod slides;
+
+/// The identity of a terms snapshot **for consent purposes**: every document
+/// paired with the SHA-256 of the exact text linked for it, sorted so a
+/// reordered listing of the same texts stays the same thing to agree to.
+///
+/// Version numbers are deliberately not part of it — the hash *is* the text,
+/// and it is also the half the server matches on when acceptance is
+/// submitted, so agreeing and recording are keyed to the same value.
+fn consent_fingerprint(documents: &[TermsDocument]) -> Vec<(String, String)> {
+    let mut fingerprint: Vec<(String, String)> = documents
+        .iter()
+        .map(|d| (d.document.clone(), d.sha256.clone()))
+        .collect();
+    fingerprint.sort();
+    fingerprint
+}
 
 /// Fraction of the window's content height within which a *released* scroll
 /// gesture counts as "near" a slide boundary and snaps onto it (proximity
@@ -83,7 +101,7 @@ const SNAP_PROXIMITY_FRACTION: f32 = 0.25;
 /// One page of the onboarding flow. The set that is *visible* is
 /// [`OnboardingView::revealed`]; conditional slides only appear once the
 /// upstream choice that leads to them is made.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Slide {
     /// "Pause here" — Eidola is not the same as the hosted assistants.
     Pause,
@@ -105,6 +123,34 @@ pub enum Slide {
     Purchase,
 }
 
+/// Why a credential check could not confirm an account.
+///
+/// **A value, not a sentence.** `i18n::apply` refreshes every window, so a
+/// formatted string held here would repaint in the old language until
+/// something else replaced it — the rule the space window's typed `AppError`
+/// already states (`AGENTS.md` → Localization). The words are chosen at render
+/// by [`verify_error_copy`].
+#[derive(Clone, Debug)]
+pub enum VerifyFailure {
+    /// One of the two fields was left blank. Refused here, before any request:
+    /// half a credential can confirm nothing.
+    MissingCredentials,
+    /// The request was made and the account was not confirmed.
+    Refused(AppError),
+}
+
+/// Why a checkout link was not opened. Same rule as [`VerifyFailure`]: the view
+/// holds what happened and [`checkout_error_copy`] chooses the words.
+#[derive(Clone, Debug)]
+pub enum CheckoutFailure {
+    /// The link came back minted for credentials this profile no longer holds,
+    /// so it was discarded rather than opened — funding an account the reader
+    /// has walked away from is the outcome that prevents.
+    StaleMint,
+    /// The mint itself failed.
+    Refused(AppError),
+}
+
 /// An in-flight vertical snap glide of the page toward a slide boundary.
 #[derive(Clone, Debug)]
 struct VSnap {
@@ -119,33 +165,58 @@ pub struct OnboardingView {
     focus_handle: FocusHandle,
     _subs: Vec<Subscription>,
 
-    /// Revealed slides, in order. Always starts as `[Slide::Pause]`. (Each
-    /// slide's prose editor is element-owned state inside its component —
-    /// see [`slides`] — so revealing/truncating slides needs no bookkeeping
-    /// here beyond this list.)
+    /// Revealed slides, in order. Always starts as `[Slide::Pause]`.
     revealed: Vec<Slide>,
+    /// One prose editor per revealed slide, minted, kept current and pruned by
+    /// [`OnboardingView::sync_prose`].
+    ///
+    /// **View-owned, because the body is localized.** It used to be
+    /// element-owned (`use_keyed_state` inside the slide component), which is
+    /// the right shape for text that never moves — but `use_keyed_state` seeds
+    /// once and `i18n::apply` replaces no state, so a locale change would leave
+    /// every slide reading in the language the window opened in. This module's
+    /// own rule already covers it: state the view has to *write* is lifted.
+    prose: std::collections::HashMap<Slide, Entity<MarkdownEditorState>>,
 
     // -- Account creation (new-account branch) ----------------------------
-    /// Whether the terms/privacy agreement checkbox is checked (gates the
-    /// "Create a new account." button on [`Slide::CreateAccount`]).
-    agreed: bool,
+    /// The documents this reader affirmatively agreed to, as the
+    /// `(document, sha256)` pairs that were on screen when the agreement box
+    /// was checked. `None` = not checked.
+    ///
+    /// **Deliberately not a `bool`.** "The box is checked" is a claim about
+    /// *particular text*, and a bare flag outlives the snapshot it was
+    /// checked for: step back to "Get started", return to this slide while a
+    /// new version has been published, and the refreshed snapshot would be
+    /// created against consent given for the previous one. Holding what was
+    /// agreed to makes that state unrepresentable rather than something each
+    /// future refresh site has to remember to clear — the box reads as
+    /// checked exactly while this still matches the snapshot in hand, and
+    /// [`OnboardingView::consented_terms`] is the only way to obtain the
+    /// value creation submits.
+    agreed_to: Option<Vec<(String, String)>>,
     creating: bool,
     /// The freshly created (id, secret) to present on [`Slide::NewAccount`].
     created: Option<(SharedString, SharedString)>,
-    create_error: Option<String>,
+    /// Why creation was refused, as the typed error itself — the words are
+    /// chosen at render, never frozen here (see [`VerifyFailure`]).
+    create_error: Option<AppError>,
     create_task: Option<Task<()>>,
 
     // -- Existing-account verification ------------------------------------
     id_input: Entity<InputState>,
     secret_input: Entity<InputState>,
+    /// The placeholders the two fields were last seeded with. They live inside
+    /// the field's own state rather than being chosen at render, so a locale
+    /// change has to push new ones in — the find bar's rule.
+    seeded_placeholders: Option<(SharedString, SharedString)>,
     verifying: bool,
-    /// `Ok(available_credits)` once verified, or `Err(message)` on failure.
-    verify_result: Option<Result<i64, String>>,
+    /// `Ok(available_credits)` once verified, or why it could not be.
+    verify_result: Option<Result<i64, VerifyFailure>>,
     verify_task: Option<Task<()>>,
 
     // -- Checkout (purchase slide) ----------------------------------------
     checkout_pending: Option<String>,
-    checkout_error: Option<String>,
+    checkout_error: Option<CheckoutFailure>,
     checkout_task: Option<Task<()>>,
 
     // -- Scroll + snap -----------------------------------------------------
@@ -175,9 +246,13 @@ pub struct OnboardingView {
 impl OnboardingView {
     pub fn new(stores: Stores, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        let id_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("00000000-0000-0000-0000-…"));
-        let secret_input = cx.new(|cx| InputState::new(window, cx).placeholder("account secret"));
+        let placeholders = (
+            crate::i18n::msg::onboarding_account_id_placeholder(cx),
+            crate::i18n::msg::onboarding_account_secret_placeholder(cx),
+        );
+        let id_input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholders.0.clone()));
+        let secret_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(placeholders.1.clone()));
 
         let _subs = vec![
             cx.observe(&stores.account, |_, _, cx| cx.notify()),
@@ -191,13 +266,15 @@ impl OnboardingView {
             focus_handle,
             _subs,
             revealed: vec![Slide::Pause],
-            agreed: false,
+            prose: std::collections::HashMap::new(),
+            agreed_to: None,
             creating: false,
             created: None,
             create_error: None,
             create_task: None,
             id_input,
             secret_input,
+            seeded_placeholders: Some(placeholders),
             verifying: false,
             verify_result: None,
             verify_task: None,
@@ -246,6 +323,21 @@ impl OnboardingView {
         self.slide_tops(window)
     }
 
+    /// Whether an account-create request is in flight — on a stub store the
+    /// request stops at the no-core guard, so this marker is what says the
+    /// view decided to create at all.
+    #[doc(hidden)]
+    pub fn creating_for_test(&self) -> bool {
+        self.creating
+    }
+
+    /// Whether the agreement box reads as checked — i.e. whether this
+    /// reader's consent still covers the snapshot in hand.
+    #[doc(hidden)]
+    pub fn agreed_for_test(&self, cx: &App) -> bool {
+        self.consented_terms(cx).is_some()
+    }
+
     /// The freshly-created account id + secret, if account creation succeeded.
     #[doc(hidden)]
     pub fn created_for_test(&self) -> Option<(String, String)> {
@@ -254,10 +346,74 @@ impl OnboardingView {
             .map(|(id, secret)| (id.to_string(), secret.to_string()))
     }
 
-    /// The last verification result (Ok(balance) / Err(message)), if any.
+    /// The last verification result (Ok(balance) / why not), if any.
     #[doc(hidden)]
-    pub fn verify_result_for_test(&self) -> Option<Result<i64, String>> {
+    pub fn verify_result_for_test(&self) -> Option<Result<i64, VerifyFailure>> {
         self.verify_result.clone()
+    }
+
+    /// What the reader is told about the last credential check, in the active
+    /// locale — the render's own reading, so a test that switches locale
+    /// without re-emitting the failure proves nothing was cached.
+    #[doc(hidden)]
+    pub fn verify_message_for_test(&self, cx: &App) -> Option<SharedString> {
+        match self.verify_result.as_ref()? {
+            Ok(available) => Some(crate::i18n::msg::onboarding_verified_balance(
+                cx,
+                *available,
+                plans::format_credits(*available),
+            )),
+            Err(failure) => Some(verify_error_copy(failure, cx)),
+        }
+    }
+
+    /// What the reader is told about the last refused checkout, in the active
+    /// locale.
+    #[doc(hidden)]
+    pub fn checkout_message_for_test(&self, cx: &App) -> Option<SharedString> {
+        Some(checkout_error_copy(self.checkout_error.as_ref()?, cx))
+    }
+
+    /// What the reader is told about a refused account creation, in the active
+    /// locale — the same call the render makes. The typed error's own English
+    /// text for every variant but one: [`AppError::AccountNotSaved`] has a
+    /// sentence of its own, because it carries the only copy of a secret.
+    #[doc(hidden)]
+    pub fn create_message_for_test(&self, cx: &App) -> Option<String> {
+        self.create_error.as_ref().map(|e| create_error_copy(e, cx))
+    }
+
+    /// Where an unsaved account's credential was also written, in the active
+    /// locale — the same call the render makes.
+    #[doc(hidden)]
+    pub fn create_recovery_file_for_test(&self, cx: &App) -> Option<SharedString> {
+        self.create_error
+            .as_ref()
+            .and_then(|e| create_recovery_file_copy(e, cx))
+    }
+
+    /// The prose a slide carries, in the active locale — the same call the
+    /// render makes, so the two cannot disagree about which message a slide
+    /// shows.
+    #[doc(hidden)]
+    pub fn slide_body_for_test(slide: Slide, cx: &App) -> SharedString {
+        slides::slide_body(slide, cx)
+    }
+
+    /// What a revealed slide's editor is actually holding — the buffer the
+    /// reader sees, not the message it should be showing. The two agree only
+    /// while `sync_prose` keeps pushing.
+    #[doc(hidden)]
+    pub fn slide_prose_for_test(&self, slide: Slide, cx: &App) -> Option<String> {
+        Some(self.prose.get(&slide)?.read(cx).value().to_string())
+    }
+
+    /// Record a refused creation without a backend, so a test can watch what
+    /// the reader is told about it.
+    #[doc(hidden)]
+    pub fn set_create_error_for_test(&mut self, error: AppError, cx: &mut Context<Self>) {
+        self.create_error = Some(error);
+        cx.notify();
     }
 
     /// The existing-account input editors (tests set their values directly).
@@ -291,6 +447,13 @@ impl OnboardingView {
             self.stores
                 .account
                 .update(cx, |s, cx| s.refresh_subscription(cx));
+        }
+        // The consent slide must show the versions creation will submit, so
+        // the snapshot is fetched when the slide is revealed rather than held
+        // from launch — the fresher it is, the less chance the server refuses
+        // it as stale on the way back out.
+        if next == Slide::CreateAccount {
+            self.stores.account.update(cx, |s, cx| s.refresh_terms(cx));
         }
         self.pending_scroll = Some(target);
         cx.notify();
@@ -431,18 +594,70 @@ impl OnboardingView {
         self.leave(window, cx);
     }
 
+    /// Record or withdraw agreement to the documents **currently on screen**.
+    ///
+    /// Checking the box binds consent to that snapshot; any later snapshot it
+    /// does not match leaves the box unchecked, because agreement to one text
+    /// is not agreement to another. Checking with nothing loaded records
+    /// nothing — there is no text to have agreed to, which is why the
+    /// checkbox is inert in that state rather than storing an empty consent.
+    pub fn set_agreement(&mut self, checked: bool, cx: &mut Context<Self>) {
+        let fingerprint = if checked {
+            self.stores
+                .account
+                .read(cx)
+                .terms()
+                .value()
+                .map(|docs| consent_fingerprint(docs))
+        } else {
+            None
+        };
+        self.agreed_to = fingerprint;
+        cx.notify();
+    }
+
+    /// The documents this reader agreed to **and that are still the ones in
+    /// hand** — `None` when no snapshot is loaded, the box is unchecked, or
+    /// the snapshot moved since it was checked.
+    ///
+    /// One predicate, two readers: the CTA's enabled state and
+    /// [`OnboardingView::begin_create`] both go through it, so "the button
+    /// is live" and "there is something to submit" cannot disagree, and
+    /// stale consent lands in the same disabled state as no consent at all.
+    /// It is re-evaluated at the click, not cached from the render, so a
+    /// refresh landing between the two is caught too.
+    fn consented_terms(&self, cx: &App) -> Option<Vec<TermsDocument>> {
+        let documents = self.stores.account.read(cx).terms().value()?.clone();
+        let agreed_to = self.agreed_to.as_ref()?;
+        (*agreed_to == consent_fingerprint(&documents)).then_some(documents)
+    }
+
     /// Create an anonymous account (new-account branch). On success, store the
     /// id/secret, refresh config + balances, and reveal the "Your new account"
     /// slide; on failure, surface the error inline.
+    ///
+    /// Creation carries **the snapshot this reader agreed to**, and gets it
+    /// from `consented_terms` — the same predicate that lit the button — so
+    /// there is no path that submits documents the agreement did not cover.
     pub fn begin_create(&mut self, cx: &mut Context<Self>) {
-        if self.creating {
+        // An account created but not saved is on screen with the only copy of
+        // its secret; another attempt would replace that with its own result.
+        if self.creating || matches!(self.create_error, Some(AppError::AccountNotSaved { .. })) {
             return;
         }
+        let Some(accepted_terms) = self.consented_terms(cx) else {
+            return;
+        };
         self.creating = true;
         self.create_error = None;
         cx.notify();
 
-        let Some(rx) = self.stores.account.read(cx).request_account_create() else {
+        let Some(rx) = self
+            .stores
+            .account
+            .read(cx)
+            .request_account_create(accepted_terms)
+        else {
             // Stub / no backend: the in-flight marker is the observable state.
             return;
         };
@@ -470,7 +685,7 @@ impl OnboardingView {
                         });
                         this.reveal(Slide::CreateAccount, Slide::NewAccount, cx);
                     }
-                    Err(e) => this.create_error = Some(e.to_string()),
+                    Err(e) => this.create_error = Some(e),
                 }
                 cx.notify();
             });
@@ -488,7 +703,7 @@ impl OnboardingView {
         let id = self.id_input.read(cx).value().trim().to_string();
         let secret = self.secret_input.read(cx).value().trim().to_string();
         if id.is_empty() || secret.is_empty() {
-            self.verify_result = Some(Err("Enter both an account ID and secret.".into()));
+            self.verify_result = Some(Err(VerifyFailure::MissingCredentials));
             cx.notify();
             return;
         }
@@ -540,7 +755,7 @@ impl OnboardingView {
                 });
                 self.verify_result = Some(Ok(available));
             }
-            Err(e) => self.verify_result = Some(Err(verify_error_copy(&e))),
+            Err(e) => self.verify_result = Some(Err(VerifyFailure::Refused(e))),
         }
         cx.notify();
     }
@@ -554,10 +769,10 @@ impl OnboardingView {
         self.checkout_error = None;
         cx.notify();
 
-        // Which account this checkout would fund. The reader can go back from
-        // the Purchase slide and link a different account while the request is
-        // in flight, so the answer is re-asked when it lands.
-        let minted_for = self.account_identity(cx);
+        // The reader can go back from the Purchase slide and link a different
+        // account while the request is in flight, so which credentials the
+        // mint actually ran under is checked against this profile when the
+        // link lands — see `mint_is_current`.
         let Some(rx) = self.stores.account.read(cx).request_checkout(price_id) else {
             return;
         };
@@ -567,35 +782,30 @@ impl OnboardingView {
                     message: "checkout task cancelled".into(),
                 })
             });
-            let _ = this.update(cx, |this, cx| this.finish_checkout(minted_for, res, cx));
+            let _ = this.update(cx, |this, cx| this.finish_checkout(res, cx));
         }));
     }
 
     /// Land a checkout mint. Public so behavior tests drive the same path the
     /// request's own task does.
-    pub fn finish_checkout(
-        &mut self,
-        minted_for: Option<String>,
-        res: Result<String, AppError>,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn finish_checkout(&mut self, res: Result<CheckoutMint, AppError>, cx: &mut Context<Self>) {
         self.checkout_pending = None;
         self.checkout_task = None;
         match res {
-            Ok(url) => {
-                if self.mint_is_current(&minted_for, cx) {
-                    cx.open_url(&url);
+            Ok(mint) => {
+                if self.mint_is_current(&mint.minted_for, cx) {
+                    cx.open_url(&mint.url);
                 } else {
-                    self.checkout_error = Some(crate::account::STALE_MINT.to_string());
+                    self.checkout_error = Some(CheckoutFailure::StaleMint);
                 }
             }
-            Err(e) => self.checkout_error = Some(e.to_string()),
+            Err(e) => self.checkout_error = Some(CheckoutFailure::Refused(e)),
         }
         cx.notify();
     }
 
-    pub fn checkout_error(&self) -> Option<&str> {
-        self.checkout_error.as_deref()
+    pub fn checkout_error(&self) -> Option<&CheckoutFailure> {
+        self.checkout_error.as_ref()
     }
 
     pub fn checkout_pending(&self) -> Option<&str> {
@@ -618,30 +828,77 @@ impl OnboardingView {
         self.checkout_error = None;
     }
 
-    /// The account a checkout started now would fund. Read past the
-    /// `ConfigStore` cache — see [`crate::stores::AccountStore::account_identity`].
-    fn account_identity(&self, cx: &App) -> Option<String> {
-        let fallback = self.cached_account_id(cx);
-        self.stores
-            .account
-            .read(cx)
-            .account_identity(fallback.as_deref())
+    fn cached_credentials(&self, cx: &App) -> Option<(String, String)> {
+        let config = self.stores.config.read(cx);
+        let state = config.state()?;
+        Some((state.account_id.clone()?, state.account_secret.clone()?))
     }
 
-    fn cached_account_id(&self, cx: &App) -> Option<String> {
-        self.stores
-            .config
-            .read(cx)
-            .state()
-            .and_then(|s| s.account_id.clone())
+    /// The Account pane's guard, on the slide that makes the same money
+    /// decision (`AccountView::mint_is_current` carries the reasoning): the
+    /// mint says which credentials it signed with, and that is compared
+    /// against a fingerprint of the config read fresh here, past the
+    /// `ConfigStore` cache.
+    /// Mint, refresh and prune the revealed slides' prose editors.
+    ///
+    /// **The body is pushed on every frame, never seeded once.** A slide's text
+    /// is a localized string held in an editor's buffer, and `i18n::apply`
+    /// refreshes every window without replacing a byte of view state — so the
+    /// comparison here is the whole of what makes a locale change reach the
+    /// page. The editors are disabled, so nothing else can move a buffer and an
+    /// unchanged locale costs one string comparison per revealed slide.
+    ///
+    /// Pruning is what the framework used to do for us: re-choosing a branch
+    /// truncates `revealed`, and an editor for a slide nobody renders is dead
+    /// weight that would also be handed back, stale, if that branch returned.
+    fn sync_prose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prose.retain(|slide, _| self.revealed.contains(slide));
+        for slide in self.revealed.clone() {
+            let body = slides::slide_body(slide, cx);
+            match self.prose.get(&slide) {
+                Some(state) => {
+                    if state.read(cx).value() != body.as_ref() {
+                        state.update(cx, |s, cx| s.set_value(body.to_string(), cx));
+                    }
+                }
+                None => {
+                    let state = cx.new(|cx| {
+                        let mut s = MarkdownEditorState::new(window, cx);
+                        s.set_value(body.to_string(), cx);
+                        s
+                    });
+                    self.prose.insert(slide, state);
+                }
+            }
+        }
     }
 
-    fn mint_is_current(&self, minted_for: &Option<String>, cx: &App) -> bool {
-        let fallback = self.cached_account_id(cx);
-        self.stores
-            .account
-            .read(cx)
-            .mint_is_current(minted_for.as_deref(), fallback.as_deref())
+    /// Re-seed the credential fields' placeholders when the wording moves. A
+    /// placeholder lives inside the field's own state rather than being chosen
+    /// at render, so a locale change — which refreshes every window but
+    /// replaces no state — would otherwise leave both fields prompting in the
+    /// language the window opened in. The find bar's `sync_find_placeholder`
+    /// is the same fix on the same shape.
+    fn sync_placeholders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let fresh = (
+            crate::i18n::msg::onboarding_account_id_placeholder(cx),
+            crate::i18n::msg::onboarding_account_secret_placeholder(cx),
+        );
+        if self.seeded_placeholders.as_ref() == Some(&fresh) {
+            return;
+        }
+        self.seeded_placeholders = Some(fresh.clone());
+        let (id_input, secret_input) = (self.id_input.clone(), self.secret_input.clone());
+        id_input.update(cx, |s, cx| s.set_placeholder(fresh.0, window, cx));
+        secret_input.update(cx, |s, cx| s.set_placeholder(fresh.1, window, cx));
+    }
+
+    fn mint_is_current(&self, minted_for: &str, cx: &App) -> bool {
+        let fallback = self.cached_credentials(cx);
+        self.stores.account.read(cx).mint_is_current(
+            minted_for,
+            fallback.as_ref().map(|(i, s)| (i.as_str(), s.as_str())),
+        )
     }
 }
 
@@ -657,6 +914,9 @@ impl Render for OnboardingView {
         let bg = theme.background;
         let fg = theme.foreground;
         let font_family = theme.font_family.clone();
+
+        self.sync_placeholders(window, cx);
+        self.sync_prose(window, cx);
 
         // Kick off the animate-scroll to a freshly-revealed slide now that we
         // have `window` (the reveal itself just recorded the target index).
@@ -789,7 +1049,7 @@ impl Render for OnboardingView {
                     .children(slides),
             )
             // A right-edge scroll indicator that appears only while scrolling
-            // (`ScrollbarShow::Scrolling`) — the built-in gpui-component
+            // (`ScrollbarMode::Scrolling`) — the built-in gpui-component
             // overlay bound to the same page scroll handle.
             .child(
                 div()
@@ -798,10 +1058,7 @@ impl Render for OnboardingView {
                     .right_0()
                     .bottom_0()
                     .w(px(14.))
-                    .child(
-                        Scrollbar::vertical(&self.page_scroll)
-                            .scrollbar_show(ScrollbarShow::Scrolling),
-                    ),
+                    .child(Scrollbar::vertical(&self.page_scroll).mode(ScrollbarMode::Scrolling)),
             )
             // The titlebar drag band paints last so it wins hit-testing over the
             // slide content beneath the traffic lights.
@@ -821,32 +1078,45 @@ impl OnboardingView {
     /// structure is visible in one place; everything a slide *shows* lives on
     /// its component.
     fn render_slide(&self, slide: Slide, cx: &Context<Self>) -> AnyElement {
+        // `sync_prose` ran at the head of this render over exactly `revealed`,
+        // and the router is only ever called for a revealed slide — so the
+        // editor is there.
+        let prose = self
+            .prose
+            .get(&slide)
+            .cloned()
+            .expect("sync_prose mints an editor for every revealed slide");
         match slide {
             Slide::Pause => slides::Pause {
+                prose,
                 on_advance: Box::new(
                     cx.listener(|this, _, _, cx| this.reveal(Slide::Pause, Slide::Tool, cx)),
                 ),
             }
             .into_any_element(),
             Slide::Tool => slides::Tool {
+                prose,
                 on_advance: Box::new(
                     cx.listener(|this, _, _, cx| this.reveal(Slide::Tool, Slide::Control, cx)),
                 ),
             }
             .into_any_element(),
             Slide::Control => slides::Control {
+                prose,
                 on_advance: Box::new(cx.listener(|this, _, _, cx| {
                     this.reveal(Slide::Control, Slide::Responsibility, cx)
                 })),
             }
             .into_any_element(),
             Slide::Responsibility => slides::Responsibility {
+                prose,
                 on_advance: Box::new(cx.listener(|this, _, _, cx| {
                     this.reveal(Slide::Responsibility, Slide::GetStarted, cx)
                 })),
             }
             .into_any_element(),
             Slide::GetStarted => slides::GetStarted {
+                prose,
                 on_new_account: Box::new(cx.listener(|this, _, _, cx| {
                     this.reveal(Slide::GetStarted, Slide::CreateAccount, cx)
                 })),
@@ -858,20 +1128,41 @@ impl OnboardingView {
                 ),
             }
             .into_any_element(),
-            Slide::CreateAccount => slides::CreateAccount {
-                agreed: self.agreed,
-                creating: self.creating,
-                error: self.create_error.clone(),
-                on_toggle_agree: Box::new(cx.listener(|this, checked: &bool, _, cx| {
-                    this.agreed = *checked;
-                    cx.notify();
-                })),
-                on_create: Box::new(cx.listener(|this, _, _, cx| this.begin_create(cx))),
+            Slide::CreateAccount => {
+                let (documents, loading_documents, documents_error) = {
+                    let terms = self.stores.account.read(cx).terms();
+                    (
+                        terms.value().cloned(),
+                        terms.is_loading(),
+                        // The typed error travels; the sentence is chosen where
+                        // it is drawn.
+                        terms.error().cloned(),
+                    )
+                };
+                slides::CreateAccount {
+                    prose,
+                    documents,
+                    loading_documents,
+                    documents_error,
+                    // Derived, never stored: the box reads as checked only
+                    // while the consent still covers the snapshot on screen.
+                    agreed: self.consented_terms(cx).is_some(),
+                    creating: self.creating,
+                    error: self.create_error.clone(),
+                    on_toggle_agree: Box::new(cx.listener(|this, checked: &bool, _, cx| {
+                        this.set_agreement(*checked, cx);
+                    })),
+                    on_create: Box::new(cx.listener(|this, _, _, cx| this.begin_create(cx))),
+                    on_retry_documents: Box::new(cx.listener(|this, _, _, cx| {
+                        this.stores.account.update(cx, |s, cx| s.refresh_terms(cx));
+                    })),
+                }
+                .into_any_element()
             }
-            .into_any_element(),
             Slide::NewAccount => {
                 let (id, secret) = self.created.clone().unwrap_or_default();
                 slides::NewAccount {
+                    prose,
                     id,
                     secret,
                     on_saved: Box::new(cx.listener(|this, _, _, cx| {
@@ -881,6 +1172,7 @@ impl OnboardingView {
                 .into_any_element()
             }
             Slide::ExistingAccount => slides::ExistingAccount {
+                prose,
                 id_input: self.id_input.clone(),
                 secret_input: self.secret_input.clone(),
                 verifying: self.verifying,
@@ -909,6 +1201,7 @@ impl OnboardingView {
                     .is_some_and(|s| s.state == SubscriptionState::Active);
                 let prices = account.prices().value().cloned().unwrap_or_default();
                 slides::Purchase {
+                    prose,
                     prices: plans::offered_plans(&prices, subscribed),
                     subscribed,
                     loading: account.is_loading(),
@@ -923,17 +1216,62 @@ impl OnboardingView {
     }
 }
 
-/// Map a verification failure to honest user-facing copy. The server collapses
-/// "no such account" and "wrong secret" into one `401` (to avoid account
-/// enumeration), so those are indistinguishable and share one message; other
-/// failures (network, attestation) surface their real reason.
-fn verify_error_copy(e: &AppError) -> String {
-    match e {
-        AppError::Server {
+/// Turn a credential check's failure into the sentence a reader sees.
+///
+/// The server collapses "no such account" and "wrong secret" into one `401`
+/// (so the endpoint cannot be used to discover which account ids exist), so
+/// those are indistinguishable here and share one message. Everything else
+/// surfaces the typed error's own text, which is written for a log and is
+/// English in every locale — the same accepted residual `SpaceView::error_copy`
+/// carries, and for the same reason: app-core is locale-free, and inventing a
+/// sentence per variant is a decision this surface does not get to make alone.
+pub(crate) fn verify_error_copy(failure: &VerifyFailure, cx: &App) -> SharedString {
+    match failure {
+        VerifyFailure::MissingCredentials => {
+            crate::i18n::msg::onboarding_verify_missing_credentials(cx)
+        }
+        VerifyFailure::Refused(AppError::Server {
             status: 401 | 403, ..
-        } => "We couldn't verify that account. Check the ID and secret, or create a new account \
-              instead."
-            .to_string(),
+        }) => crate::i18n::msg::onboarding_verify_unverifiable(cx),
+        VerifyFailure::Refused(other) => SharedString::from(other.to_string()),
+    }
+}
+
+/// What a refused account creation says, in the reader's locale where this
+/// surface has the words. An account the server created but this profile could
+/// not keep gets its own sentence (the rows beneath it hold the credential);
+/// every other refusal is the typed error's own text, the recorded residual at
+/// the app-core boundary.
+pub(super) fn create_error_copy(error: &AppError, cx: &App) -> String {
+    match error {
+        AppError::AccountNotSaved { reason, .. } => {
+            crate::i18n::msg::onboarding_create_not_saved(cx, reason.as_str()).to_string()
+        }
         other => other.to_string(),
+    }
+}
+
+/// Where an unsaved account's credential was also written, said in the
+/// reader's locale — `None` when the error is another refusal, or when that
+/// write failed too (the rows on screen are then the only copy).
+pub(super) fn create_recovery_file_copy(error: &AppError, cx: &App) -> Option<SharedString> {
+    let AppError::AccountNotSaved { account, .. } = error else {
+        return None;
+    };
+    let path = account.recovery_file.as_ref()?;
+    Some(crate::i18n::msg::onboarding_create_recovery_file(
+        cx,
+        path.display().to_string(),
+    ))
+}
+
+/// Turn a refused checkout into the sentence a reader sees. Same shape, same
+/// residual as [`verify_error_copy`]: the one case this layer has words of its
+/// own for is the stale mint, which is a decision *this* surface made rather
+/// than a failure app-core reported.
+pub(crate) fn checkout_error_copy(failure: &CheckoutFailure, cx: &App) -> SharedString {
+    match failure {
+        CheckoutFailure::StaleMint => crate::i18n::msg::onboarding_checkout_stale_mint(cx),
+        CheckoutFailure::Refused(e) => SharedString::from(e.to_string()),
     }
 }

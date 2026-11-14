@@ -1,0 +1,33 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# Whitespace before the colon. YAML allows it, so this is the `needs` key
+# and the dependency resolves; a pattern anchored to `needs:` collects
+# nothing, and the manifest job appears to depend on no one at all.
+#
+# The cure is not a pattern for this spelling: job-level keys are read the
+# same way job keys are — the key is taken up to its first colon outside
+# quotes, then trimmed and unquoted — so `needs :`, `"needs":` and
+# `needs:` are one key by construction.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release-assets:
+    name: Publish release assets
+    runs-on: self-hosted
+    environment: apple-signing
+    steps:
+      - name: Wrap
+        run: codesign --sign "Developer ID Application" Eidola.app
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs : release-assets
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full

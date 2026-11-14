@@ -81,6 +81,13 @@ pub enum AppError {
         refusal: crate::subspaces::SpawnRefusal,
     },
 
+    /// A proxy setting or key operation was refused before anything was
+    /// written — typed ([`crate::proxy::ProxyRefusal`]) so a surface can choose
+    /// its own words for which one. Prints as the configuration error it
+    /// always was.
+    #[error("config error: {refusal}")]
+    ProxyRefused { refusal: crate::proxy::ProxyRefusal },
+
     /// An HTTP request failed at the transport layer.
     #[error("network error: {message}")]
     Network { message: String },
@@ -97,6 +104,15 @@ pub enum AppError {
     #[error("credential error: {message}")]
     Credential { message: String },
 
+    /// The server's current issuer key failed a check this client makes for
+    /// itself, against the public issuer calendar or against the key it
+    /// already saw for the epoch (see [`IssuerKeyRefusal`]). Refused before
+    /// anything is requested, so nothing was charged; credentials already
+    /// held are untouched. Typed so a surface can say what it means: unlike
+    /// a network failure, retrying now will not help.
+    #[error("credential error: {refusal}")]
+    IssuerKeyRefused { refusal: IssuerKeyRefusal },
+
     /// A chat was attempted with no usable credential and no account
     /// configured — onboarding has not begun (or the account was reset).
     /// Distinct from [`AppError::NotConfigured`] so UIs can route to the
@@ -111,6 +127,31 @@ pub enum AppError {
     #[error("insufficient balance: {required} credits required, {available} available")]
     InsufficientBalance { available: i64, required: i64 },
 
+    /// A request's worst-case charge is more than this client will pay
+    /// without issuing a credential sized to it. A just-in-time issuance is
+    /// always the denomination (`denomination`, `DEFAULT_ALLOCATION_CREDITS`)
+    /// or the whole remaining balance, never the request's own size, because
+    /// the amount issued is visible on the account surface and a request's
+    /// share is visible at its spend; so a request is paid only when what the
+    /// wallet holds, or one held credential drained beside one fresh
+    /// denomination, covers it (`docs/anonymous-credits.md` → Issuance
+    /// sizing). Refused before any credential is touched or anything is
+    /// issued, so the refused request is charged nothing. **That is a
+    /// statement about one request, not about its turn**: a later tool round
+    /// can be refused after earlier rounds were answered and charged, and the
+    /// resend of a declaration an engine refused comes after that request's
+    /// fee. A surface says the request was not sent, never that the turn cost
+    /// nothing. Distinct from [`AppError::InsufficientBalance`]: adding credit
+    /// does not lift it; a smaller request does.
+    ///
+    /// `hold` is the request's worst case in credits, saturated at
+    /// `i64::MAX` for one too large to represent.
+    #[error(
+        "this request's worst case ({hold} credits) is more than one held credential and \
+         one fresh credential of {denomination} credits can pay together"
+    )]
+    HoldExceedsDenomination { hold: i64, denomination: i64 },
+
     /// The wallet-level ACT provisioning queue timed out waiting for an
     /// in-flight credential refund to free spendable balance for a concurrent
     /// turn. Distinct from [`AppError::InsufficientBalance`] (which is a true
@@ -121,11 +162,25 @@ pub enum AppError {
     #[error("provisioning timed out: {message}")]
     ProvisioningTimeout { message: String },
 
+    /// An Eidola engine refused a request's declared cached prefix (it no
+    /// longer held what the conversation's earlier requests left in it), and
+    /// the credits already held could not pay for sending it again without
+    /// the declaration. That resend is never paid by converting account
+    /// credit: whoever can empty an engine's cache could otherwise choose
+    /// when this client converts. Nothing was converted; the refused request
+    /// was charged its request fee. Retrying is an ordinary request, which
+    /// converts as any other does.
+    #[error(
+        "the engine no longer held this conversation's cached prompt, and the credits held cannot pay to send it again in full; try again"
+    )]
+    UncachedRetryUnfunded,
+
     /// The server requires acceptance of the current terms-of-service /
     /// privacy-policy versions before purchases or credential issuance can
     /// proceed (HTTP 428). UIs route to a review-and-accept step:
-    /// `AppCore::current_terms` lists the documents,
-    /// `AppCore::accept_current_terms` records acceptance.
+    /// `AppCore::current_terms` lists the documents and
+    /// `AppCore::accept_terms` records acceptance of that same snapshot —
+    /// the one the user was shown, never a re-read.
     #[error("terms acceptance required: {message}")]
     TermsAcceptanceRequired { message: String },
 
@@ -177,6 +232,34 @@ pub enum AppError {
     #[error("config error: {message}")]
     Config { message: String },
 
+    /// The server created an account, but this profile could not keep it: the
+    /// strict reload refused the config (a hand edit or a sync write made it
+    /// unparseable while the request was in flight), the save failed, or an
+    /// account was linked in the meantime, which is never overwritten.
+    ///
+    /// **This is the only copy of the secret.** The server keeps only its
+    /// hash, so an ordinary config error here would lose the account for
+    /// good. The variant carries the credential back so the surface that
+    /// asked can show it to be saved and linked once the profile is fixed.
+    /// `Display` names only the account id and the cause; the secret is in
+    /// [`AccountSecret`], which prints redacted, so a log line cannot copy it.
+    ///
+    /// The account's details are boxed ([`UnsavedAccount`]) so this rare
+    /// variant does not grow every `Result<_, AppError>` in the crate.
+    #[error("the account {} was created but this profile could not save it: {reason}", .account.account_id)]
+    AccountNotSaved {
+        account: Box<UnsavedAccount>,
+        reason: String,
+    },
+
+    /// A model notice's action (switching to newer weights, dismissing a
+    /// "model updated" notice) was asked of a participant that no longer has
+    /// that notice: the catalog, its model or its answers moved since the
+    /// notice was shown. Nothing was written; re-reading the roster shows
+    /// what applies now.
+    #[error("the model notice for participant {participant_id} no longer applies")]
+    ModelNoticeStale { participant_id: String },
+
     /// An internal runtime or system error.
     #[error("internal error: {message}")]
     Internal { message: String },
@@ -186,6 +269,17 @@ pub enum AppError {
     /// model that isn't loaded.
     #[error("local model error: {message}")]
     LocalModel { message: String },
+
+    /// A turn or chore named a model of the managed local store whose file is
+    /// not on this machine. Distinct from [`AppError::LocalModel`] so a
+    /// surface can name the model and say how to get it, rather than show a
+    /// sentence with a filesystem path in it. Nothing was sent.
+    ///
+    /// **Data, not prose.** `model` is the `<slug>@local` selection; a curated
+    /// one maps back to its catalog entry through
+    /// [`crate::local_models::catalog_entry_for_model_ref`].
+    #[error("the local model `{model}` is not downloaded")]
+    LocalModelNotDownloaded { model: String },
 
     /// A self-update verification step failed.
     ///
@@ -211,6 +305,99 @@ pub enum AppError {
     /// this is returned.
     #[error("tool loop error: {message}")]
     ToolLoop { message: String },
+
+    /// A selection names a model its backend's catalog no longer offers.
+    ///
+    /// The catalog is what the backend sells, and it is allowed to shrink: a
+    /// row retired upstream simply stops being listed. **Nothing un-picks the
+    /// thing that chose it** — a participant's `model_ref`, a space's router
+    /// model, the model a post recorded and a regeneration replays — so the
+    /// selection goes stale in place and is met here, at the next turn.
+    ///
+    /// **The refusal is the whole behaviour, and the alternative is worse than
+    /// the failure.** Answering with some other model would put words a reader
+    /// attributes to one model in the mouth of another, and bill for it; there
+    /// is no substitution anywhere on this path, and none may be added. The
+    /// refusal lands in `prepare_turn` before the credential and before any
+    /// request, so nothing is spent and nothing is written — the post a
+    /// combined ask already committed stands, and the answer a regeneration
+    /// would have replaced is untouched.
+    ///
+    /// Distinct from [`AppError::NotConfigured`] so a surface can say which
+    /// model went away and point at the picker, rather than render a
+    /// log-shaped sentence with the id buried in it.
+    ///
+    /// **Data, not prose.** `model` is the selection as it was persisted (the
+    /// canonical qualified id); the sentence a reader sees is chosen in their
+    /// own locale by the presentation layer.
+    #[error("the backend no longer offers the model `{model}`")]
+    ModelUnavailable { model: String },
+
+    /// A second regeneration of the same post was asked for while one is still
+    /// running in this process.
+    ///
+    /// Regeneration spends before it writes: the credential is provisioned and
+    /// the request is in flight long before any row lands, so the durable
+    /// single-successor index (`idx_one_successor_per_action`) rejects the
+    /// loser only after both have paid. The in-process guard refuses the second
+    /// ask before either — which is what makes closing and reopening a window
+    /// mid-regeneration cost nothing, since the guard outlives any one view.
+    ///
+    /// **Data, not prose**: the item whose generation is being replaced.
+    #[error("this response is already being regenerated")]
+    RegenerationInFlight { item_id: String },
+}
+
+/// Why the client refused the server's current issuer key.
+///
+/// Every token issued under one key hides among every other token under it,
+/// so the key decides whom a client's spends look like. An honest gateway has
+/// exactly one key per epoch of the public issuer calendar
+/// (`eidola_common::issuer_calendar`), with that epoch's windows, and never
+/// rotates within an epoch. These are the two ways a key can fail that, and
+/// the client checks both for itself: they do not depend on trusting the
+/// gateway, its operator or its database.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IssuerKeyRefusal {
+    /// The key's windows are not exactly one epoch's on the calendar.
+    NotOnCalendar,
+    /// The key is not the one this client already saw for its epoch. A
+    /// second key for an epoch is what a server would show a client it was
+    /// singling out, and the client cannot tell an emergency rotation from
+    /// that, so there is none: issuance stops until the next epoch.
+    SecondKeyForEpoch { epoch: u64 },
+    /// The same key offered for two epochs — in one listing, or for an epoch
+    /// other than the one this client already recorded it for. An honest
+    /// gateway mints a distinct key for every epoch, so a key reused across
+    /// epochs is one the per-epoch record could not otherwise hold to
+    /// anything: listed as next epoch's too, it would leave next epoch
+    /// unrecorded for a different key to fill.
+    OneKeyForSeveralEpochs { epoch: u64 },
+}
+
+impl std::fmt::Display for IssuerKeyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IssuerKeyRefusal::NotOnCalendar => f.write_str(
+                "the server's current issuer key does not sit on the public issuer calendar, \
+                 so no credential was requested under it (nothing was charged)",
+            ),
+            IssuerKeyRefusal::SecondKeyForEpoch { epoch } => write!(
+                f,
+                "the server offered a different issuer key for epoch {epoch} from the one this \
+                 client already saw; an honest server has one key per epoch, so no credential \
+                 was requested (nothing was charged, and credentials already held keep \
+                 working). Issuance resumes with the next epoch's key"
+            ),
+            IssuerKeyRefusal::OneKeyForSeveralEpochs { epoch } => write!(
+                f,
+                "the server offered, for epoch {epoch}, an issuer key it also offers for another \
+                 epoch; an honest server has a distinct key for every epoch, so no credential \
+                 was requested (nothing was charged, and credentials already held keep working)"
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +407,7 @@ pub enum AppError {
 impl AppError {
     /// Classify a `reqwest::Error`, surfacing attestation failures explicitly.
     pub(crate) fn from_request(e: reqwest::Error) -> Self {
-        let chain = format_error_chain(&e);
+        let chain = request_error_text(e);
         if chain.contains("measurement") && chain.contains("allowed") {
             return AppError::Attestation {
                 message: "the server's enclave measurement is not in your \
@@ -251,13 +438,79 @@ impl AppError {
     }
 }
 
-fn format_error_chain(e: &reqwest::Error) -> String {
+/// One `reqwest::Error` rendered as text a person can be shown — **with the
+/// request URL removed**.
+///
+/// reqwest attaches the request URL to every request-phase error and prints it
+/// in `Display` (`error sending request for url (https://host/x?token=…)`),
+/// and `Response::bytes`/`text`/`json` attach it to a body they collected. A
+/// model link's query is its *authorization* — a signed S3/CDN URL carries
+/// `?token=…` — so formatting one of these errors copies a live credential
+/// into whatever then holds the message: a standing failure a settings pane
+/// renders, a support paste, a terminal's scrollback. Nothing there needs the
+/// URL; the reader knows what they asked for, and the cause is what they are
+/// missing.
+///
+/// The source chain is appended, which is where the useful part lives (DNS,
+/// TLS, connect); it never repeats the URL — established by running each of
+/// those failures rather than by reading the docs. **Every path in this crate
+/// that turns a `reqwest::Error` into a message goes through here**, so no
+/// individual call site has to remember.
+pub(crate) fn request_error_text(e: reqwest::Error) -> String {
+    let e = e.without_url();
     let mut chain = format!("{e}");
-    let mut source = std::error::Error::source(e);
+    let mut source = std::error::Error::source(&e);
     while let Some(err) = source {
         use std::fmt::Write;
         let _ = write!(chain, ": {err}");
         source = err.source();
     }
     chain
+}
+
+/// An account the server created that the profile could not keep — what
+/// [`AppError::AccountNotSaved`] carries back.
+#[derive(Debug, Clone)]
+pub struct UnsavedAccount {
+    pub account_id: String,
+    pub secret: AccountSecret,
+    /// The accepted terms were still submitted as the new account; this is
+    /// the standing that left — the same report a saved create returns — so a
+    /// surface can say what linking it will still need.
+    pub terms: crate::TermsAcceptance,
+    /// Where the credential was also written, owner-only, beside the profile
+    /// (`account-recovery-<id>.toml`, in the profile's own shape), so it
+    /// outlives a caller that drops the error. `None` only when that write
+    /// failed too.
+    pub recovery_file: Option<std::path::PathBuf>,
+}
+
+/// A freshly created account's secret, carried back in
+/// [`AppError::AccountNotSaved`] because nothing else holds it. Prints
+/// redacted under both `Debug` and `Display`; [`AccountSecret::expose`] is the
+/// one way to read it, for the surface that shows it to be saved.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccountSecret(String);
+
+impl AccountSecret {
+    pub fn new(secret: String) -> Self {
+        Self(secret)
+    }
+
+    /// The secret itself, for showing to the person who must save it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AccountSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AccountSecret(<redacted>)")
+    }
+}
+
+impl std::fmt::Display for AccountSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
 }

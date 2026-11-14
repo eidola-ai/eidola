@@ -1,0 +1,62 @@
+//! OpenAPI documentation for the Eidola API.
+
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::{Modify, OpenApi};
+
+use crate::response::EidolaStreamMetadata;
+use crate::types::{ChatCompletionChunk, ChunkChoice, ChunkDelta};
+
+/// OpenAPI documentation for the Eidola API.
+///
+/// Paths and schemas are collected automatically by `OpenApiRouter` from
+/// `#[utoipa::path]` annotations and their referenced `ToSchema` types.
+/// Only streaming SSE types (not referenced from path annotations) and
+/// metadata/security modifiers are declared here.
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Eidola API",
+        description = "Privacy-transparent AI proxy API with inline verification metadata",
+        version = "0.1.0",
+        license(identifier = "UNLICENSED"),
+    ),
+    servers(
+        (url = "http://localhost:8080", description = "Local"),
+    ),
+    tags(
+        (name = "Public", description = "Unauthenticated endpoints available to anyone."),
+        (name = "Linked", description = "Authenticated endpoints tied to a known account (HTTP Basic auth)."),
+        (name = "Unlinked", description = "Endpoints authenticated with anonymous credentials — usage cannot be linked back to an account."),
+    ),
+    components(schemas(
+        // SSE streaming types — not referenced from #[utoipa::path] response
+        // bodies so they must be registered explicitly.
+        ChatCompletionChunk,
+        ChunkChoice,
+        ChunkDelta,
+        EidolaStreamMetadata,
+    )),
+    modifiers(&BasicAuthAddon)
+)]
+pub struct ApiDoc;
+
+/// Adds the HTTP Basic auth security scheme to the OpenAPI spec.
+struct BasicAuthAddon;
+
+impl Modify for BasicAuthAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.get_or_insert_default();
+        components.add_security_scheme(
+            "basic",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Basic)
+                    .description(Some(
+                        "Account credentials. Username is the account UUID, \
+                         password is the secret returned at account creation.",
+                    ))
+                    .build(),
+            ),
+        );
+    }
+}

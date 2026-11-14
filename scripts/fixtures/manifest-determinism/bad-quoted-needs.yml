@@ -1,0 +1,40 @@
+# Fixture — NOT a workflow. Lives outside .github/workflows on purpose.
+#
+# The dependency on the key-holding job is written as a quoted scalar, and
+# the job is named so that nothing about the string says "signing" — only
+# its `environment:` does. A parser that compares raw tokens looks for a
+# job literally called `"apple-envelope"`, quotes included, finds nothing,
+# and reports a clean graph.
+name: Build & Verify Artifacts (rejected fixture)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  oci:
+    name: Build OCI images
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Record OCI partial
+        run: ./scripts/artifact-manifest.sh print-oci
+
+  apple-envelope:
+    name: Wrap the macOS app
+    needs: oci
+    runs-on: self-hosted
+    environment: apple-signing
+    steps:
+      - name: Wrap
+        run: codesign --sign "Developer ID Application" Eidola.app
+
+  artifact-manifest:
+    name: Verify artifact manifest
+    needs:
+      - oci
+      - "apple-envelope"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify full artifact manifest
+        run: ./scripts/artifact-manifest.sh verify-full

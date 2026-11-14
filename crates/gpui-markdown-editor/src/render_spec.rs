@@ -403,6 +403,14 @@ pub struct InlineStyle {
     /// stays the body size, the weight alone carries the header
     /// emphasis, matching the app's flat heading discipline).
     pub table_header: bool,
+    /// Emphasized CJK text — render 着重号 emphasis dots under the
+    /// characters instead of the italic `italic` asks for, which no CJK
+    /// face has (see [`crate::cjk`]). Set by
+    /// `render::mark_cjk_emphasis` over the CJK sub-ranges of every
+    /// italic run, so one emphasized span that mixes scripts carries
+    /// both renderings: `italic` still covers the whole span, and the
+    /// element suppresses the italic face exactly where this is set.
+    pub emphasis_dots: bool,
 }
 
 impl InlineStyle {
@@ -456,6 +464,7 @@ impl InlineStyle {
         self.code |= other.code;
         self.link |= other.link;
         self.table_header |= other.table_header;
+        self.emphasis_dots |= other.emphasis_dots;
         self
     }
 
@@ -467,5 +476,6 @@ impl InlineStyle {
             && !self.code
             && !self.link
             && !self.table_header
+            && !self.emphasis_dots
     }
 }

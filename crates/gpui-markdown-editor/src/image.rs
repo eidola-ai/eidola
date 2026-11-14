@@ -36,7 +36,7 @@
 //! * [`block_size`] for `BlockKind::Image` — width capped to the
 //!   available content width, height scaled to preserve aspect.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
@@ -68,6 +68,38 @@ impl LoadedImage {
     }
 }
 
+/// Which image sources [`load`] may resolve: a host-set gpui global,
+/// [`ImageSources::Any`] when unset.
+///
+/// The destination of `![alt](url)` is chosen by whoever wrote the
+/// markdown, and a host that renders text it did not write (a model's
+/// reply, a pasted document) hands that author a fetch of their choosing:
+/// a remote URL is a request whose path can carry anything the author
+/// could see, and a local path is an unbounded `fs::read` — `/dev/zero`
+/// never ends, and a FIFO blocks the loading thread in `open` forever.
+/// Such a host sets [`ImageSources::EmbeddedOnly`]; a refused source
+/// takes the [`LoadedImage::Failed`] path, so its markdown stays visible
+/// rather than silently vanishing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImageSources {
+    /// `http(s)`, `file://` and absolute paths, and embedded assets.
+    #[default]
+    Any,
+    /// Only the host's own `AssetSource` (relative paths).
+    EmbeddedOnly,
+}
+
+impl gpui::Global for ImageSources {}
+
+impl ImageSources {
+    fn allows(self, resource: &Resource) -> bool {
+        match self {
+            ImageSources::Any => true,
+            ImageSources::EmbeddedOnly => matches!(resource, Resource::Embedded(_)),
+        }
+    }
+}
+
 /// Resolve `dest_url` through gpui's image cache. Kicks off an
 /// asynchronous load the first time the URL is seen; subsequent
 /// frames see the cached result. The cache invalidates the view
@@ -80,11 +112,27 @@ impl LoadedImage {
 /// * `http://…` / `https://…` — fetched via the asset HTTP client.
 /// * `file://…` and absolute filesystem paths — read via the
 ///   filesystem loader.
+/// * A relative path, when the editor has a `base_dir` (a document
+///   opened from disk — see `MarkdownEditorState::set_image_base_dir`)
+///   — joined onto it and read via the filesystem loader, so
+///   `![](assets/fig.png)` beside a note finds the file the way every
+///   other markdown viewer does. Percent-escapes are decoded first
+///   (`my%20figure.png`), since a link destination cannot carry a raw
+///   space.
 /// * Anything else — treated as an embedded asset path. Hosting
 ///   applications can ship their own embedded asset source via
 ///   `gpui::AssetSource` to resolve these.
-pub fn load(dest_url: &str, window: &mut Window, cx: &mut App) -> LoadedImage {
-    let resource = make_resource(dest_url);
+pub fn load(
+    dest_url: &str,
+    base_dir: Option<&Path>,
+    window: &mut Window,
+    cx: &mut App,
+) -> LoadedImage {
+    let resource = make_resource(dest_url, base_dir);
+    let policy = cx.try_global::<ImageSources>().copied().unwrap_or_default();
+    if !policy.allows(&resource) {
+        return LoadedImage::Failed;
+    }
     match window.use_asset::<ImgResourceLoader>(&resource, cx) {
         Some(Ok(data)) => LoadedImage::Loaded(data),
         Some(Err(_)) => LoadedImage::Failed,
@@ -92,19 +140,60 @@ pub fn load(dest_url: &str, window: &mut Window, cx: &mut App) -> LoadedImage {
     }
 }
 
-fn make_resource(dest_url: &str) -> Resource {
+fn make_resource(dest_url: &str, base_dir: Option<&Path>) -> Resource {
     if dest_url.starts_with("http://") || dest_url.starts_with("https://") {
         Resource::Uri(SharedUri::from(dest_url.to_string()))
     } else if let Some(path) = dest_url.strip_prefix("file://") {
         Resource::Path(PathBuf::from(path).into())
     } else if dest_url.starts_with('/') {
         Resource::Path(PathBuf::from(dest_url).into())
+    } else if let Some(base) = base_dir.filter(|_| !has_scheme(dest_url)) {
+        Resource::Path(base.join(percent_decode(dest_url)).into())
     } else {
         // Treat as an embedded asset path; hosting apps can register
         // their own `AssetSource` to resolve these. Falls back to a
         // failed load if the host hasn't registered one.
         Resource::Embedded(SharedString::from(dest_url.to_string()))
     }
+}
+
+/// Whether `url` opens with a URI scheme (`data:`, `mailto:`, …) rather than
+/// a path. Such a destination is never a file beside the document.
+fn has_scheme(url: &str) -> bool {
+    match url.split_once(':') {
+        Some((scheme, _)) => {
+            scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        }
+        None => false,
+    }
+}
+
+/// Decode `%XX` escapes. A malformed escape is kept literally, and a
+/// decoding that is not UTF-8 falls back to the input unchanged.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
+            out.push((h << 4) | l);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+fn hex(b: u8) -> Option<u8> {
+    (b as char).to_digit(16).map(|d| d as u8)
 }
 
 /// Pixel size for an inline image overlay at the given line height.
@@ -145,10 +234,11 @@ pub fn block_size(image: &RenderImage, max_width: Pixels) -> Size<Pixels> {
 }
 
 /// Paint `image` filling `bounds`. Thin wrapper around
-/// [`Window::paint_image`] so callers don't have to thread the
+/// [`Window::paint_image`] so callers don't have to thread the image
+/// bounds (the same as `bounds` — the image fills its box) or the
 /// `Corners` / `grayscale` / `frame_index` arguments.
 pub fn paint(image: Arc<RenderImage>, bounds: Bounds<Pixels>, window: &mut Window) {
-    let _ = window.paint_image(bounds, Corners::default(), image, 0, false);
+    let _ = window.paint_image(bounds, bounds, Corners::default(), image, 0, false);
 }
 
 /// Default fraction of a line height to reserve for an inline image
@@ -199,6 +289,56 @@ pub fn fit_contain(natural: Size<Pixels>, bounds: Bounds<Pixels>) -> Bounds<Pixe
 mod tests {
     use super::*;
 
+    fn path_of(resource: Resource) -> Option<PathBuf> {
+        match resource {
+            Resource::Path(p) => Some(p.to_path_buf()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_relative_image_resolves_against_the_documents_directory() {
+        let base = Path::new("/notes/today");
+        assert_eq!(
+            path_of(make_resource("assets/fig.png", Some(base))),
+            Some(PathBuf::from("/notes/today/assets/fig.png"))
+        );
+        assert_eq!(
+            path_of(make_resource("../my%20figure.png", Some(base))),
+            Some(PathBuf::from("/notes/today/../my figure.png"))
+        );
+        // Absolute paths and URLs ignore the base.
+        assert_eq!(
+            path_of(make_resource("/abs/fig.png", Some(base))),
+            Some(PathBuf::from("/abs/fig.png"))
+        );
+        assert!(matches!(
+            make_resource("https://example.com/a.png", Some(base)),
+            Resource::Uri(_)
+        ));
+        // A scheme is never a file beside the document.
+        assert!(matches!(
+            make_resource("data:image/png;base64,AAAA", Some(base)),
+            Resource::Embedded(_)
+        ));
+    }
+
+    #[test]
+    fn without_a_base_a_relative_image_stays_an_embedded_asset() {
+        assert!(matches!(
+            make_resource("assets/fig.png", None),
+            Resource::Embedded(_)
+        ));
+    }
+
+    #[test]
+    fn percent_decoding_keeps_what_it_cannot_decode() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%E2%9C%93"), "\u{2713}");
+    }
+
     #[test]
     fn inline_size_respects_height_cap_and_scales_width() {
         // We can't easily construct a RenderImage in tests, but we
@@ -231,5 +371,101 @@ mod tests {
         let fit = fit_contain(natural, bounds);
         assert_eq!(fit.size.width, px(50.0));
         assert_eq!(fit.size.height, px(25.0));
+    }
+
+    #[test]
+    fn embedded_only_refuses_every_source_the_markdown_author_picks() {
+        for url in [
+            "https://example.com/x.png?q=secret",
+            "http://127.0.0.1:8765/x.png",
+            "file:///dev/zero",
+            "/dev/zero",
+            "/tmp/pipe.fifo",
+        ] {
+            let resource = make_resource(url, None);
+            assert!(
+                !ImageSources::EmbeddedOnly.allows(&resource),
+                "{url} must be refused under EmbeddedOnly"
+            );
+            assert!(ImageSources::Any.allows(&resource), "{url} under Any");
+        }
+    }
+
+    #[test]
+    fn embedded_only_keeps_the_hosts_own_assets() {
+        for url in [
+            "icons/logo.png",
+            "images/x.svg",
+            "HTTPS://upper-case-is-not-a-scheme",
+        ] {
+            let resource = make_resource(url, None);
+            assert!(matches!(resource, Resource::Embedded(_)), "{url}");
+            assert!(ImageSources::EmbeddedOnly.allows(&resource), "{url}");
+        }
+    }
+
+    /// `load` asks the host's global before it starts anything: under
+    /// `EmbeddedOnly` a path the markdown names is refused on the first
+    /// frame, where `Any` would have begun reading it.
+    #[gpui::test]
+    fn load_consults_the_hosts_image_sources(cx: &mut gpui::TestAppContext) {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("gpui-md-image-policy-{}.png", std::process::id()));
+        let url = path.display().to_string();
+        let cx = cx.add_empty_window();
+        let refused = |policy: ImageSources, cx: &mut gpui::VisualTestContext| {
+            let out = std::rc::Rc::new(std::cell::Cell::new(None));
+            let probe = ImageProbe {
+                url: url.clone(),
+                policy,
+                refused: out.clone(),
+            };
+            cx.draw(
+                gpui::point(gpui::px(0.), gpui::px(0.)),
+                gpui::size(gpui::px(10.), gpui::px(10.)),
+                |_, cx| {
+                    use gpui::{AppContext as _, ParentElement as _};
+                    gpui::div().child(cx.new(|_| probe))
+                },
+            );
+            out.get().expect("the probe rendered")
+        };
+
+        assert!(
+            refused(ImageSources::EmbeddedOnly, cx),
+            "an absolute path resolved under EmbeddedOnly"
+        );
+        assert!(
+            !refused(ImageSources::Any, cx),
+            "an absolute path was refused under Any"
+        );
+    }
+
+    /// A view that asks `load` for one image on its first frame — the asset
+    /// cache answers only inside a rendering view — and records whether the
+    /// answer was a refusal.
+    struct ImageProbe {
+        url: String,
+        policy: ImageSources,
+        refused: std::rc::Rc<std::cell::Cell<Option<bool>>>,
+    }
+
+    impl gpui::Render for ImageProbe {
+        fn render(
+            &mut self,
+            window: &mut Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            cx.set_global(self.policy);
+            let loaded = load(&self.url, None, window, cx);
+            self.refused
+                .set(Some(matches!(loaded, LoadedImage::Failed)));
+            gpui::div()
+        }
+    }
+
+    #[test]
+    fn unset_policy_is_any() {
+        assert_eq!(ImageSources::default(), ImageSources::Any);
     }
 }

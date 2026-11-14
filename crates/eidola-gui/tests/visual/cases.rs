@@ -9,8 +9,8 @@ use eidola_app_core::updates::{
 };
 use eidola_app_core::{
     AttestationDetail, AttestationInfo, BalancePoolInfo, BalancesResult, ConfigState,
-    CredentialLifecycleInfo, MeasurementInfo, ModelInfo, PriceInfo, RequestDetail, RequestInfo,
-    SpaceInfo, SpendTrailEntry,
+    CredentialLifecycleInfo, MeasurementInfo, Modality, ModelCapabilities, ModelInfo,
+    OutputBudgetClass, PriceInfo, RequestDetail, RequestInfo, SpaceInfo, SpendTrailEntry,
 };
 use eidola_gui::about::AboutView;
 use eidola_gui::backends_settings::BackendsTab;
@@ -85,6 +85,50 @@ fn register_space(s: &mut Snapshots) {
         },
     );
 
+    // The Find-all overlay, expanded over a branched conversation: the
+    // topological map down the left, and every result grouped under its post's
+    // attribution — matches on branches the reader is not looking at included,
+    // which is the whole point of the surface.
+    s.add(
+        "space_find_overlay",
+        size(px(980.), px(760.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                let mut view =
+                    SpaceView::new(core, Some("demo".into()), WindowInput::new(cx), window, cx);
+                view.space().update(cx, |sp, cx| {
+                    sp.set_post_tree_for_test(kitchen_sink_posts(), cx)
+                });
+                view.seed_find_for_test("justice", window, cx);
+                view.toggle_find_overlay(window, cx);
+                view
+            })
+        },
+    );
+
+    // The same surface with nothing to show. Reachable only by the query
+    // ceasing to match while the overlay stands, since the disclosure that
+    // opens it appears with the total.
+    s.add(
+        "space_find_overlay_empty",
+        size(px(980.), px(760.)),
+        |window, cx| {
+            let core = stub_stores_with_config(cx);
+            cx.new(|cx| {
+                let mut view =
+                    SpaceView::new(core, Some("demo".into()), WindowInput::new(cx), window, cx);
+                view.space().update(cx, |sp, cx| {
+                    sp.set_post_tree_for_test(kitchen_sink_posts(), cx)
+                });
+                view.seed_find_for_test("justice", window, cx);
+                view.toggle_find_overlay(window, cx);
+                view.seed_find_for_test("zzzznothing", window, cx);
+                view
+            })
+        },
+    );
+
     // The space inspector (tasks 26.2 + 26.3): the per-space settings panel
     // splitting the window — chrome type beside the paper, with a remote router
     // selected so the mandatory per-call cost copy is in frame, and the
@@ -104,6 +148,7 @@ fn register_space(s: &mut Snapshots) {
                     last_activity_at: 0,
                     message_count: 4,
                     archived_at: None,
+                    parent: None,
                 }];
                 s.space_settings = Some((
                     "demo".into(),
@@ -184,6 +229,7 @@ fn register_space(s: &mut Snapshots) {
                         refs.iter()
                             .map(|r| eidola_app_core::IncomingReference {
                                 action_id: r.action_id.clone(),
+                                item_id: format!("item-of-{}", r.action_id),
                                 space_id: "demo".into(),
                                 ordinal: 1,
                                 content_block_id: Some(r.block_id.clone()),
@@ -191,6 +237,9 @@ fn register_space(s: &mut Snapshots) {
                                 range_end: Some(r.range.1),
                                 annotation: None,
                                 created_at: 0,
+                                author_label: "Ada".into(),
+                                author_kind: "agent".into(),
+                                space_title: None,
                             })
                             .collect(),
                     );
@@ -714,6 +763,14 @@ fn stub_prices() -> Vec<PriceInfo> {
             product_description: Some("A month of casual questions".into()),
             amount_display: "5.00 USD".into(),
             recurrence: "/month".into(),
+            amount: Some(eidola_app_core::PriceAmount {
+                minor_units: 500,
+                currency: "USD".into(),
+            }),
+            cadence: eidola_app_core::PriceCadence::Every {
+                interval: "month".into(),
+                count: 1,
+            },
             credits: 5_000_000,
         },
         PriceInfo {
@@ -722,6 +779,14 @@ fn stub_prices() -> Vec<PriceInfo> {
             product_description: Some("Daily thinking, long documents".into()),
             amount_display: "20.00 USD".into(),
             recurrence: "/month".into(),
+            amount: Some(eidola_app_core::PriceAmount {
+                minor_units: 2000,
+                currency: "USD".into(),
+            }),
+            cadence: eidola_app_core::PriceCadence::Every {
+                interval: "month".into(),
+                count: 1,
+            },
             credits: 20_000_000,
         },
         PriceInfo {
@@ -730,6 +795,11 @@ fn stub_prices() -> Vec<PriceInfo> {
             product_description: None,
             amount_display: "10.00 USD".into(),
             recurrence: "".into(),
+            amount: Some(eidola_app_core::PriceAmount {
+                minor_units: 1000,
+                currency: "USD".into(),
+            }),
+            cadence: eidola_app_core::PriceCadence::OneTime,
             credits: 10_000_000,
         },
     ]
@@ -753,6 +823,7 @@ fn library_space(id: &str, title: Option<&str>, snippet: Option<&str>, days_ago:
         last_activity_at: ts,
         message_count: 4,
         archived_at: None,
+        parent: None,
     }
 }
 
@@ -848,6 +919,14 @@ fn settings_stores(cx: &mut App) -> Stores {
                 product_description: Some("A month of casual questions".into()),
                 amount_display: "5.00 USD".into(),
                 recurrence: "/month".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 500,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 1,
+                },
                 credits: 5_000_000,
             },
             PriceInfo {
@@ -856,6 +935,14 @@ fn settings_stores(cx: &mut App) -> Stores {
                 product_description: Some("Daily thinking, long documents".into()),
                 amount_display: "20.00 USD".into(),
                 recurrence: "/month".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 2000,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 1,
+                },
                 credits: 20_000_000,
             },
         ];
@@ -898,10 +985,56 @@ fn settings_stores(cx: &mut App) -> Stores {
 
 /// `settings_stores` plus a populated backend registry and local-model
 /// state, so the Backends pane's three tabs render with content.
+/// The registry the Backends and Proxy scenes share: the two singletons plus
+/// one user-owned llama.cpp install.
+fn settings_backends_fixture() -> Vec<eidola_app_core::BackendInfo> {
+    use eidola_app_core::{BackendInfo, BackendKind};
+    vec![
+        BackendInfo {
+            id: "eidola".into(),
+            kind: BackendKind::Eidola,
+            display_name: "Eidola".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+            created_at: 0,
+        },
+        BackendInfo {
+            id: "local".into(),
+            kind: BackendKind::Local,
+            display_name: "Local".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: None,
+            model_overrides: None,
+            engine_path: None,
+            auto_start: true,
+            created_at: 0,
+        },
+        BackendInfo {
+            id: "my-box".into(),
+            kind: BackendKind::LlamaCpp,
+            display_name: "My box".into(),
+            enabled: true,
+            base_url: None,
+            has_api_key: false,
+            models_dir: Some("/Users/me/models".into()),
+            model_overrides: None,
+            engine_path: None,
+            auto_start: false,
+            created_at: 1,
+        },
+    ]
+}
+
 fn settings_backends_stores(cx: &mut App) -> Stores {
     use eidola_app_core::{
-        BackendInfo, BackendKind, ExternalEngineBackend, LocalModelInfo, LocalModelStatus,
-        LocalModelsState,
+        ExternalEngineBackend, LocalModelInfo, LocalModelStatus, LocalModelsState,
     };
     stub_stores(cx, |s| {
         s.config_state = Some(stub_config_state(true));
@@ -921,6 +1054,14 @@ fn settings_backends_stores(cx: &mut App) -> Stores {
                 product_description: Some("A month of casual questions".into()),
                 amount_display: "5.00 USD".into(),
                 recurrence: "/month".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 500,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 1,
+                },
                 credits: 5_000_000,
             },
             PriceInfo {
@@ -929,50 +1070,18 @@ fn settings_backends_stores(cx: &mut App) -> Stores {
                 product_description: Some("Daily thinking, long documents".into()),
                 amount_display: "20.00 USD".into(),
                 recurrence: "/month".into(),
+                amount: Some(eidola_app_core::PriceAmount {
+                    minor_units: 2000,
+                    currency: "USD".into(),
+                }),
+                cadence: eidola_app_core::PriceCadence::Every {
+                    interval: "month".into(),
+                    count: 1,
+                },
                 credits: 20_000_000,
             },
         ];
-        s.backends = vec![
-            BackendInfo {
-                id: "eidola".into(),
-                kind: BackendKind::Eidola,
-                display_name: "Eidola".into(),
-                enabled: true,
-                base_url: None,
-                has_api_key: false,
-                models_dir: None,
-                model_overrides: None,
-                engine_path: None,
-                auto_start: true,
-                created_at: 0,
-            },
-            BackendInfo {
-                id: "local".into(),
-                kind: BackendKind::Local,
-                display_name: "Local".into(),
-                enabled: true,
-                base_url: None,
-                has_api_key: false,
-                models_dir: None,
-                model_overrides: None,
-                engine_path: None,
-                auto_start: true,
-                created_at: 0,
-            },
-            BackendInfo {
-                id: "my-box".into(),
-                kind: BackendKind::LlamaCpp,
-                display_name: "My box".into(),
-                enabled: true,
-                base_url: None,
-                has_api_key: false,
-                models_dir: Some("/Users/me/models".into()),
-                model_overrides: None,
-                engine_path: None,
-                auto_start: false,
-                created_at: 1,
-            },
-        ];
+        s.backends = settings_backends_fixture();
         s.local_models = Some(LocalModelsState {
             engine_path: Some("/Applications/Eidola.app/Contents/MacOS/llama-server".into()),
             external: vec![ExternalEngineBackend {
@@ -1064,10 +1173,10 @@ fn register_settings(s: &mut Snapshots) {
                 trust.base_url = "https://staging.eidola.example/v1".into();
                 trust.base_url_is_override = true;
                 trust.trusted_measurements = vec![MeasurementInfo {
-                    snp: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f8".into(),
-                    tdx_rtmr1: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    measurement: "9d2bb3ef58af1e7c0c12f3b4a5d6e7f8901a2b3c4d5e6f708192a3b4c5d6e7f89d2bb3ef58af1e7c0c12f3b4a5d6e7f8".into(),
+                    host_data: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                         .into(),
-                    tdx_rtmr2: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+                    guest_policy: "0x30133"
                         .into(),
                 }];
                 trust.trusted_measurements_are_override = true;
@@ -1156,6 +1265,120 @@ fn register_settings(s: &mut Snapshots) {
         view.update(cx, |v, cx| v.select(SettingsPane::Backends, cx));
         let pane = view.read(cx).backends_pane();
         pane.update(cx, |p, cx| p.select_tab(BackendsTab::External, cx));
+        view
+    });
+
+    // Proxy pane: the switch and its endpoint, the binding, the per-backend
+    // exposure ticks, the on-device choice, and the key list with one live row
+    // and one revoked. A stub store binds nothing, so the status line honestly
+    // reads "Not listening" beside settings that say enabled — which is the
+    // point of reading the listener rather than the setting.
+    s.add("settings_proxy", settings_size, |window, cx| {
+        use eidola_app_core::proxy::{LocalExposure, ProxyKeyInfo, ProxySettings};
+        let core = stub_stores(cx, |s| {
+            s.config_state = Some(stub_config_state(true));
+            s.eidola_trust = Some(stub_eidola_trust());
+            s.backends = settings_backends_fixture();
+            s.proxy_settings = Some(ProxySettings {
+                enabled: true,
+                bind_address: "127.0.0.1".into(),
+                bind_port: 11437,
+                local_exposure: LocalExposure::Loaded,
+                backends: vec!["eidola".into()],
+                exposed_ids: vec!["eidola".into()],
+                live_key_count: 1,
+            });
+            s.proxy_keys = vec![
+                ProxyKeyInfo {
+                    id: "k-live".into(),
+                    label: "My editor".into(),
+                    prefix: "eid-Ab3xQ9".into(),
+                    created_at: 0,
+                    last_used_at: Some(1),
+                    revoked_at: None,
+                },
+                ProxyKeyInfo {
+                    id: "k-dead".into(),
+                    label: "An old script".into(),
+                    prefix: "eid-Zz00Kk".into(),
+                    created_at: 0,
+                    last_used_at: None,
+                    revoked_at: Some(2),
+                },
+            ];
+        });
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
+        view.update(cx, |v, cx| v.select(SettingsPane::Proxy, cx));
+        view
+    });
+
+    // The same pane in a taller window, so the key list is above the fold: one
+    // live key wearing enough of itself to be identifiable, one revoked row
+    // keeping its label and losing only its verb, and the name-then-generate
+    // row beneath them.
+    s.add(
+        "settings_proxy_keys",
+        size(px(620.), px(900.)),
+        |window, cx| {
+            use eidola_app_core::proxy::{LocalExposure, ProxyKeyInfo, ProxySettings};
+            let core = stub_stores(cx, |s| {
+                s.config_state = Some(stub_config_state(true));
+                s.eidola_trust = Some(stub_eidola_trust());
+                s.backends = settings_backends_fixture();
+                s.proxy_settings = Some(ProxySettings {
+                    enabled: true,
+                    bind_address: "127.0.0.1".into(),
+                    bind_port: 11437,
+                    local_exposure: LocalExposure::Loaded,
+                    backends: vec!["eidola".into()],
+                    exposed_ids: vec!["eidola".into()],
+                    live_key_count: 1,
+                });
+                s.proxy_keys = vec![
+                    ProxyKeyInfo {
+                        id: "k-live".into(),
+                        label: "My editor".into(),
+                        prefix: "eid-Ab3xQ9".into(),
+                        created_at: 0,
+                        last_used_at: Some(1),
+                        revoked_at: None,
+                    },
+                    ProxyKeyInfo {
+                        id: "k-dead".into(),
+                        label: "An old script".into(),
+                        prefix: "eid-Zz00Kk".into(),
+                        created_at: 0,
+                        last_used_at: None,
+                        revoked_at: Some(2),
+                    },
+                ];
+            });
+            let view = cx.new(|cx| SettingsView::new(core, window, cx));
+            view.update(cx, |v, cx| v.select(SettingsPane::Proxy, cx));
+            view
+        },
+    );
+
+    // Proxy pane, bound off loopback: the danger band that is the whole of the
+    // honesty about a plaintext inference endpoint on the network.
+    s.add("settings_proxy_exposed", settings_size, |window, cx| {
+        use eidola_app_core::proxy::{LocalExposure, ProxySettings};
+        let core = stub_stores(cx, |s| {
+            s.config_state = Some(stub_config_state(true));
+            s.eidola_trust = Some(stub_eidola_trust());
+            s.backends = settings_backends_fixture();
+            s.proxy_settings = Some(ProxySettings {
+                enabled: true,
+                bind_address: "0.0.0.0".into(),
+                bind_port: 11437,
+                local_exposure: LocalExposure::Downloaded,
+                backends: vec!["eidola".into(), "local".into()],
+                exposed_ids: vec!["eidola".into(), "local".into()],
+                live_key_count: 0,
+            });
+        });
+        let view = cx.new(|cx| SettingsView::new(core, window, cx));
+        view.update(cx, |v, cx| v.select(SettingsPane::Proxy, cx));
         view
     });
 
@@ -1427,8 +1650,7 @@ fn register_record(s: &mut Snapshots) {
                 method: "POST".into(),
                 path: "/v1/chat/completions".into(),
                 request_headers: Some(
-                    "content-type: application/json\nauthorization: PrivateToken token=\"…\""
-                        .into(),
+                    "content-type: application/json\naccept: text/event-stream".into(),
                 ),
                 request_body: Some(
                     br#"{"model":"gemma4-31b","stream":true,"messages":[{"role":"user","content":"Why is the sky blue?"}]}"#
@@ -1509,6 +1731,7 @@ fn agent_participant(id: &str, label: &str) -> eidola_app_core::ParticipantInfo 
         kind: "agent".into(),
         label: label.into(),
         model_ref: Some("kimi-k2-6".into()),
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "human".into(),
         role: "member".into(),
@@ -1527,6 +1750,7 @@ fn inspector_participants() -> (String, Vec<eidola_app_core::ParticipantInfo>) {
         // The **wire** label (task 64); the row shows "You".
         label: "User".into(),
         model_ref: None,
+        model_notices: Vec::new(),
         system_prompt: None,
         notify_policy: "explicit".into(),
         role: "member".into(),
@@ -1564,28 +1788,65 @@ fn model_stores(cx: &mut App) -> Stores {
         s.models = vec![
             ModelInfo {
                 id: "gemma4-31b".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
+                max_output_tokens: Some(16_384),
+                output_budget_class: Some(OutputBudgetClass::Reasoning),
+                capabilities: ModelCapabilities {
+                    tool_calling: Some(true),
+                    reasoning: Some(true),
+                    input_modalities: Some(vec![Modality::Text, Modality::Image]),
+                    output_modalities: Some(vec![Modality::Text]),
+                },
                 prompt_credits_per_token: 0.53,
                 completion_credits_per_token: 1.5,
                 request_credits: None,
             },
             ModelInfo {
                 id: "kimi-k2-6".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 262_144,
+                max_output_tokens: Some(32_768),
+                output_budget_class: Some(OutputBudgetClass::Reasoning),
+                capabilities: ModelCapabilities {
+                    tool_calling: Some(true),
+                    reasoning: Some(true),
+                    input_modalities: Some(vec![Modality::Text]),
+                    output_modalities: Some(vec![Modality::Text]),
+                },
                 prompt_credits_per_token: 3.0,
                 completion_credits_per_token: 9.0,
                 request_credits: None,
             },
+            // A backend that declares nothing — a generic OpenAI-compatible
+            // listing or a local file. Undeclared is the common case, so the
+            // picker has to render one.
             ModelInfo {
                 id: "qwen3-coder-watt".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 131_072,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 1.05,
                 completion_credits_per_token: 5.25,
                 request_credits: None,
             },
+            // A per-request-priced row, which the picker renders differently.
+            // Deliberately a synthetic id: nothing in the catalog is priced
+            // this way, and a real transcription model's name here would
+            // imply we sell one.
             ModelInfo {
-                id: "whisper-large-v3".into(),
+                id: "per-request-example".into(),
+                sha256: None,
+                tags: Vec::new(),
                 context_length: 0,
+                max_output_tokens: None,
+                output_budget_class: None,
+                capabilities: ModelCapabilities::default(),
                 prompt_credits_per_token: 0.0,
                 completion_credits_per_token: 0.0,
                 request_credits: Some(9_000.0),
@@ -1618,9 +1879,9 @@ fn stub_eidola_trust() -> eidola_app_core::EidolaTrust {
         trusted_measurements: Vec::new(),
         trusted_measurements_are_override: false,
         pinned_measurement: eidola_app_core::MeasurementInfo {
-            snp: "1122334455667788112233445566778811223344556677881122334455667788".into(),
-            tdx_rtmr1: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
-            tdx_rtmr2: "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa".into(),
+            measurement: "112233445566778811223344556677881122334455667788112233445566778811223344556677881122334455667788".into(),
+            host_data: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+            guest_policy: "0x30133".into(),
         },
         has_hardware_root_ca: false,
         hardware_root_ca_pem: None,

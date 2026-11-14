@@ -60,6 +60,14 @@ impl BackendsStore {
         &self.backends
     }
 
+    /// Test-only: install a fixture snapshot in any state. `stub` can only
+    /// produce the two an answered read makes, and what a surface says about
+    /// a registry read that failed is exactly what wants pinning.
+    #[doc(hidden)]
+    pub fn set_state_for_test(&mut self, backends: Loadable<Vec<BackendInfo>>) {
+        self.backends = backends;
+    }
+
     /// The backend list as a slice (empty unless loaded).
     pub fn list(&self) -> &[BackendInfo] {
         self.backends.value().map(|v| v.as_slice()).unwrap_or(&[])

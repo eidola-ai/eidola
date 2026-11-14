@@ -39,20 +39,27 @@ jobs:
   rust-checks:
     name: Rust checks
     runs-on: ubuntu-24.04
-    # 60 rather than 30: dev builds compile dependencies at opt-level 2 (see
+    # 90 rather than 30: dev builds compile dependencies at opt-level 2 (see
     # the root Cargo.toml profile block), so a COLD-cache run — a dependency
     # or profile change, or a cache eviction — exceeds 30 minutes on this
-    # runner. Warm-cache runs are unaffected. The generous ceiling also
-    # protects the post-merge push run that SAVES the cache: rust-cache saves
-    # in a post step, which a timeout cancellation skips — a too-tight timeout
-    # there would leave every subsequent PR cold, timing out in a spiral.
-    timeout-minutes: 60
+    # runner, and with the inference engine crates in the workspace a cold
+    # run measured 58 minutes. Warm-cache runs are unaffected. The generous
+    # ceiling also protects the post-merge push run that SAVES the cache:
+    # rust-cache saves in a post step, which a timeout cancellation skips — a
+    # too-tight timeout there would leave every subsequent PR cold, timing out
+    # in a spiral.
+    timeout-minutes: 90
+    env:
+      # Nothing here is debugged interactively, and full debuginfo for every
+      # gpui-linked test binary overflows the runner's disk at link time.
+      # Line tables keep file:line in backtraces.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     permissions:
       contents: read
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -87,6 +94,7 @@ jobs:
               echo "rust=true"
               echo "apple=true"
               echo "markdown=true"
+              echo "oci=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -117,6 +125,59 @@ jobs:
 
       - name: Test check scope classifier
         run: .github/scripts/test-rust-check-scope.sh
+
+      - name: Check artifact-manifest determinism
+        # Deliberately ungated: jq over two files, and the invariant it
+        # protects (no key-dependent value can reach artifact-manifest.json)
+        # is broken by exactly the kinds of PR the scope step classifies as
+        # irrelevant — a workflow edit, a manifest field, a scripts change.
+        # The run includes the check's own bad fixtures, so a check that
+        # stopped catching anything fails here too.
+        run: ./scripts/check-manifest-determinism.sh
+
+      - name: Check the Rust toolchain is StageX's
+        # Deliberately ungated: the toolchain, the StageX pin and its record
+        # are files the scope step does not all call Rust scope, and a drift
+        # between them means the cargo gates lint and test on a compiler the
+        # release images are not built with. The test runs the check's own
+        # mismatches, so a check that stopped catching anything fails here.
+        run: |
+          ./scripts/check-rust-toolchain.sh
+          ./scripts/test-check-rust-toolchain.sh
+
+      - name: Test the needs gate of required jobs
+        # Deliberately ungated: the script decides whether a required
+        # artifacts check may pass, and that job runs only on the `main`
+        # chain, so every case it decides is driven here. Python 3 only.
+        run: ./scripts/test-require-needs-success.sh
+
+      - name: Check artifact-manifest completeness
+        # The committed manifest must carry exactly the artifact set the
+        # emitted schema requires. A schema change that forgets a row is
+        # caught here rather than at release time — or, worse, by every
+        # installed client's claims dialog.
+        run: ./scripts/artifact-manifest.sh check-complete
+
+      - name: Test macOS shipping-zip recipe
+        # Info-ZIP flags only (no Nix, no toolchain): the symlink and
+        # determinism regressions behind flake.nix's mkShippingZip.
+        run: ./scripts/test-shipping-zip.sh
+
+      - name: Test release-asset verification
+        # Deliberately ungated, like the determinism check above: this is
+        # the gate between the signed manifest and the files a tagged
+        # release attaches, and it otherwise runs only on a real `v*` tag.
+        # Bash + python3, no toolchain.
+        run: ./scripts/test-release-assets.sh
+
+      - name: Test the weights-hash recompute script
+        # Deliberately ungated: scripts/weights-hash.py is what a user runs
+        # to check a model's weights hash without our code, and a change to
+        # it is a scripts change the scope step calls irrelevant. It must
+        # reach the hash the gateway's tests hold the catalog fixture's
+        # weights directory to, and refuse each way a directory can be
+        # wrong. python3 (3.11+) stdlib, no toolchain.
+        run: ./scripts/test-weights-hash.sh
 
       - name: Check legal document versioning
         # The published legal documents (www/pages/terms.md, privacy.md)
@@ -162,7 +223,12 @@ jobs:
             /opt/ghc \
             /usr/local/.ghcup \
             /opt/hostedtoolcache/CodeQL \
-            /usr/share/swift
+            /usr/share/swift \
+            /usr/local/share/powershell \
+            /usr/share/miniconda \
+            /usr/lib/jvm \
+            /opt/microsoft \
+            /opt/az
           echo "Root disk avail: $before -> $(df --output=avail -BG / | tail -1)"
 
       - name: Install Linux GUI build dependencies
@@ -196,16 +262,24 @@ jobs:
         run: rustup show
 
       - name: Cache cargo registry and build artifacts # zizmor: ignore[cache-poisoning]
-        # Save from pushes to both trunks: `next` (the active integration
+        # Save from pushes to the trunks: `next` (the active integration
         # branch — this is what warms feature PRs, which restore from their
         # base) and `main` (the default branch — the universal restore fallback
         # and the promotion PR's base). PRs never save (github.ref is a PR ref),
         # so there's no per-PR thrash. This job only runs tests; no artifact
         # from here is published.
+        #
+        # A failed job saves too. The key's environment half is the Rust
+        # version, and a restore never crosses it, so the first trunk push
+        # after a toolchain move is the only run that can warm the new key:
+        # if a failing test there saved nothing, every run would build cold
+        # (about an hour) until a trunk push passed. What a failed job has
+        # compiled is as valid as what a passing one has.
         if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.apple == 'true' || steps.scope.outputs.markdown == 'true'
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
 
       - name: Check formatting
         if: steps.scope.outputs.rust == 'true'
@@ -235,6 +309,41 @@ jobs:
         if: steps.scope.outputs.rust == 'true'
         run: cargo test
 
+      - name: Test billing transactions and recovery with PostgreSQL
+        if: steps.scope.outputs.rust == 'true'
+        run: |
+          set -euo pipefail
+          trap 'docker rm -f eidola-billing-tests >/dev/null 2>&1 || true' EXIT
+          # Docker picks a free host port: a fixed one can already be taken,
+          # by anything on the runner that was handed it as an ephemeral port.
+          docker run --detach --name eidola-billing-tests \
+            --publish 127.0.0.1::5432 \
+            --env POSTGRES_USER=billing_test --env POSTGRES_DB=billing_test \
+            --env POSTGRES_HOST_AUTH_METHOD=trust \
+            postgres:17@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f
+          for attempt in $(seq 1 60); do
+            if docker exec eidola-billing-tests pg_isready -h 127.0.0.1 -U billing_test; then break; fi
+            if [ "$attempt" -eq 60 ]; then docker logs eidola-billing-tests; exit 1; fi
+            sleep 1
+          done
+          docker exec -i eidola-billing-tests psql -U billing_test -d billing_test -v ON_ERROR_STOP=1 \
+            < crates/eidola-server-gateway/schema/schema.sql
+          published="$(docker port eidola-billing-tests 5432/tcp)"
+          export DATABASE_URL="postgres://billing_test@${published}/billing_test?sslmode=disable"
+          export BILLING_TEST_DATABASE_URL="${DATABASE_URL}"
+          cargo test -p eidola-billing -- --ignored --test-threads=1
+          cargo test -p eidola-billing-cli -- --ignored --test-threads=1
+          cargo test -p eidola-server-gateway -- --ignored --test-threads=1
+
+      - name: Check OCI stub-source resolution
+        # The image builds resolve the workspace from manifests plus stub
+        # sources before copying real code; a target whose path cargo infers
+        # from disk breaks that stage, which otherwise first runs on `main`.
+        # Runs cargo inside each Containerfile's own base image (Docker), so
+        # it needs no host toolchain and covers checker-only changes too.
+        if: steps.scope.outputs.oci == 'true'
+        run: scripts/check-oci-stub-workspace.sh
+
       # The committed Apple fixtures are the crate's golden, so an
       # Apple-only change (fixture tree, harness, instruments) must still run
       # the placement regressions. A full `cargo test` above already covers
@@ -243,15 +352,23 @@ jobs:
         if: steps.scope.outputs.rust != 'true' && steps.scope.outputs.apple == 'true'
         run: cargo test -p eidola-apple
 
-      - name: Test Apple archive verifier with read-only directories
+      - name: Test Apple archive verifier (tar + zip, read-only directories)
         if: steps.scope.outputs.rust == 'true' || steps.scope.outputs.apple == 'true'
+        # The harness runs its body under the host userland and again under GNU
+        # tar + mawk, because bsdtar and BSD awk on a developer's Mac hide
+        # differences that bite on the GNU/Linux userland most people verifying
+        # a download run. This runner is that userland, so the second pass needs
+        # no Nix here — but it may only ever be skipped on a developer machine,
+        # never in CI, which is what this variable enforces.
+        env:
+          EIDOLA_TEST_REQUIRE_GNU_USERLAND: "1"
         run: ./scripts/test-verify-apple.sh
 
       - name: Check OpenAPI spec freshness
         if: steps.scope.outputs.rust == 'true'
         run: |
           cargo run -q -p generate-openapi > /tmp/openapi-generated.json
-          if ! diff /tmp/openapi-generated.json crates/eidola-server/openapi.json; then
+          if ! diff /tmp/openapi-generated.json crates/eidola-server-gateway/openapi.json; then
             echo ""
             echo "ERROR: Committed OpenAPI spec doesn't match generated one!"
             echo "Run: just update-openapi"
