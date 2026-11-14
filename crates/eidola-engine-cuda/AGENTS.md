@@ -17,9 +17,7 @@ The CUDA executor for the MiMo-V2.6 engine: the serving core's `Executor` on one
 | `sampler.rs` | The device sampler and chain acceptance (host-plan and device-side launches). |
 | `engine_ops.rs` | Wrappers for our own kernels (`engine_ops.cu`), and the decode path's launch geometry (`RouterForm`, `executor_router` and its bound `ROUTER_PER_TOKEN_MAX`, the one-token form's `router_grid` and the split form's `router_scores_grid` and `router_select_grid`, `permute_grid`, `gather_grid`, `swiglu_grid` and the dense `swiglu_f32scale_grid`, `quant_grid`, `combine_grid`, `qkv_grid`, `copy_grid`). |
 | `support.rs` | `check_supported` and `check_drafting`: the one model configuration the kernels can run; `Unsupported` names the field. |
-| `ds/abi.rs` | DeepSeek-V4.1: the kernels' parameter structs (*DeepSeek-V4.1*). |
-| `ds/attention.rs`, `ds/index.rs` | DeepSeek-V4.1: sparse attention and window slot lists (`DsAttention`), index scores and selections (`DsIndex`), their grids, precondition checks and host forms. |
-| `ds/` | DeepSeek-V4.1: the kernels' parameter structs (`abi.rs`), the launches made with them (`kernels.rs`), and the second executor: `executor.rs`, `half.rs`, `model.rs`, `plan.rs`, `kv.rs`, `weights.rs`, `boundary.rs`, `support.rs`, `host.rs` (*DeepSeek-V4.1*). |
+| `ds/` | DeepSeek-V4.1 (*DeepSeek-V4.1*): the kernels' parameter structs (`abi.rs`); the launch wrappers of the kernel images (`ops.rs`, `gemm_ref.rs`, `head.rs`, `attention.rs`, `index.rs`) with their grids, precondition checks and host forms; the launches the executor makes through them (`kernels.rs`); and the second executor: `executor.rs`, `half.rs`, `model.rs`, `plan.rs`, `kv.rs`, `weights.rs`, `boundary.rs`, `support.rs`, `host.rs`. |
 | `tma.rs` | `cuTensorMapEncodeTiled` specs, CuTe's descriptor fix-up. |
 | `device.rs`, `module.rs`, `launch.rs`, `ops.rs`, `bf16.rs` | Device, verified image loading and launch, argument lists, the RMSNorm smoke kernel and DeepGEMM's grid, BF16 bits. |
 
@@ -39,7 +37,7 @@ The CUDA executor for the MiMo-V2.6 engine: the serving core's `Executor` on one
 
 ## DeepSeek-V4.1
 
-`src/ds/` is the second model's module tree, beside MiMo's files: the kernel ABI and the launch wrappers of the scalar kernels, the reference products and the head. No executor runs them yet.
+`src/ds/` is the second model's module tree, beside MiMo's files; it shares only the leaf modules (`device.rs`, `module.rs`, `launch.rs`, `kv_cipher.rs`, `sampler.rs`, `bf16.rs`). It holds the kernel ABI, the launch wrappers of every kernel image of the forward, and `DsCudaExecutor`, which launches them. **Nothing in it has run on a GPU.** Without one, the executor is held to the CPU reference executor over a host device, both with the reference numerics and with the kernels' own bodies compiled for the host behind the wrappers' checks and grids (*Verification*); `scripts/ds_gpu_session.sh` is the one device session that runs every device test of this section (*The device session*).
 
 `ds/abi.rs` mirrors `eidola-engine-kernels`' `csrc/ds_abi.cuh` (normative; that crate's `AGENTS.md` → *The ABI* lists the structs and the decisions they fix) as `repr(C)` structs with device addresses as `u64`, the header's names without their prefix. `layout!` asserts each mirror's size, 8-byte alignment and every field's offset at compile time against the numbers the header asserts, so `cargo check` fails on a mirror that drifts; a launch wrapper additionally checks its kernel's `params_bytes`, as MiMo's do. `ProbeParams` and the `PROBE_*` ops are the numerics probe's (`eidola_ds_probe`): a device test replays the host vectors of the numerics header through it.
 
@@ -53,11 +51,7 @@ EIDOLA_ENGINE_KERNELS_DIR=<build output> EIDOLA_DS_SUMMARY_DIR=<dir> \
   cargo test --release -p eidola-engine-cuda --test ds_ops --test ds_gemm_ref -- --nocapture --test-threads 1
 ```
 
-It prints one line per check (`ok` or `FAILED` with the first differing element), one JSON line per timing, and each summary's path. Nothing here has run on a device yet.
-
-`src/ds/` is the second model's module tree, beside MiMo's files: the kernel ABI, and the wrappers of the attention, index and selection kernels. No executor launches them yet.
-
-`ds/abi.rs` mirrors `eidola-engine-kernels`' `csrc/ds_abi.cuh` (normative; that crate's `AGENTS.md` → *The ABI* lists the structs and the decisions they fix) as `repr(C)` structs with device addresses as `u64`, the header's names without their prefix. `layout!` asserts each mirror's size, 8-byte alignment and every field's offset at compile time against the numbers the header asserts, so `cargo check` fails on a mirror that drifts; a launch wrapper additionally checks its kernel's `params_bytes`, as MiMo's do. `ProbeParams` and the `PROBE_*` ops are the numerics probe's (`eidola_ds_probe`): a device test replays the host vectors of the numerics header through it.
+It prints one line per check (`ok` or `FAILED` with the first differing element), one JSON line per timing, and each summary's path.
 
 **Attention, index scores and selection** (`ds/attention.rs`, `ds/index.rs`; the kernels and why each is batch-invariant: `eidola-engine-kernels/AGENTS.md` → *DeepSeek-V4.1 attention, index and selection*). Each is bit-identical to the model crate's function, so a wrapper has no tolerance and no host plan: it checks its parameter struct (`check_attn`, `check_window_slots`, `check_score`, `check_select`: shapes within the kernel's shared memory, slots and strides covering each other, mask words covering the score rows, alignment, null arrays) and launches over a grid that is a function of the row count and the configuration alone.
 
@@ -74,10 +68,6 @@ EIDOLA_ENGINE_KERNELS_DIR=<build output> EIDOLA_DS_BENCH_DIR=<dir> \
   cargo test --release -p eidola-engine-cuda --test ds_attention --test ds_index -- --nocapture --test-threads 1
 ```
 
-`src/ds/` is the second model's module tree, beside MiMo's files; it shares only the leaf modules (`device.rs`, `module.rs`, `launch.rs`, `kv_cipher.rs`, `sampler.rs`, `bf16.rs`). **Nothing in it has run on a GPU.** `DsCudaExecutor` is checked here on a host device; its kernels are not bound yet.
-
-`ds/abi.rs` mirrors `eidola-engine-kernels`' `csrc/ds_abi.cuh` (normative; that crate's `AGENTS.md` → *The ABI* lists the structs and the decisions they fix) as `repr(C)` structs with device addresses as `u64`, the header's names without their prefix. `layout!` asserts each mirror's size, 8-byte alignment and every field's offset at compile time against the numbers the header asserts, so `cargo check` fails on a mirror that drifts; a launch wrapper additionally checks its kernel's `params_bytes`, as MiMo's do. `ProbeParams` and the `PROBE_*` ops are the numerics probe's (`eidola_ds_probe`): a device test replays the host vectors of the numerics header through it.
-
 ### The executor
 
 `DsCudaExecutor` implements the seam for the window-chain model as the CPU reference executor does without drafts (`eidola-engine-cpu/AGENTS.md` → DeepSeek-V4.1: the same four groups, ratios, devices and coverage, the chain, the token history), eagerly: every step is launched afresh and no graph is captured. `preflight` is the configuration checks alone (shape, spec, block layouts), with no device.
@@ -85,8 +75,8 @@ EIDOLA_ENGINE_KERNELS_DIR=<build output> EIDOLA_DS_BENCH_DIR=<dir> \
 | Module | Contents |
 |---|---|
 | `support.rs` | `check_supported`: the shape the executor splits a model by (`DsShape`), or the field that rules it out. The split and groups are the reference executor's; the rest is what the ABI fixes (widths in whole 32-blocks, ratio-2 pooling, 32-bit Engram rows, a selection or candidate pool published earlier on the same half). |
-| `kernels.rs` | `DsKernels`: one method per kernel family, taking its ABI struct. `Linked` is the device implementation and **refuses every launch** (`ds kernel not linked: <family>`) until each body calls its wrapper. |
-| `half.rs` | `Device` (allocation, zero, upload, download, copy, the idle cipher, the sampler, the kernels) and `CudaDevice`: one stream of an opened device with the sampler and cipher images. |
+| `kernels.rs` | `DsKernels`: one method per kernel family the executor launches (23), taking its ABI struct. `CudaDevice` implements it by calling each family's wrapper, which checks the struct and picks the grid; `HostDevice` by the model crate's functions. |
+| `half.rs` | `Device` (allocation, zero, upload, download, copy, the idle cipher, the sampler, the kernels) and `CudaDevice`: one stream of an opened device with the sampler and cipher images and the five kernel images' wrappers (`DsOps`, `DsGemmRef`, `DsHead`, `DsAttention`, `DsIndex`), each loaded and verified per half. |
 | `plan.rs` | The step planner, pure: row order, per-layer row counts, the pooling pairs, window slot lists, the expert layout's bound and placement. |
 | `kv.rs` | Block layouts (`GroupGeometry`), pools, device block tables with a host mirror, `Zero` / `Copy` / `Encrypt` / `Decrypt`. |
 | `weights.rs` | A half's weights in kernel layouts, and `weight_bytes`: the same sums as arithmetic over the configuration. |
@@ -130,6 +120,8 @@ cargo test -p eidola-engine-cuda --test ds_host    # the executor on the host de
 
 `tests/ds_host.rs` runs them on `HostDevice`. That checks everything of the executor but the kernels and the driver calls: the planner, layouts and images, weights, the step's order, the boundary, maintenance, state. Each of these, broken deliberately, fails it: the window left-aligned in its slots (only at the window of 80 and in the larger workloads), bank visibility off by one, a pooled entry rotated at its last position, a zero that leaves the bytes, the open entry not kept, a chain layer starting one row late, a reset leaving state, the Engram lookback dropped.
 
+**The kernels' own bodies** (`the_compiled_kernel_bodies_run_the_scenarios`, in `tests/ds_host.rs`; about three minutes; skipped without a C++ compiler). `oracle/ds_launch_host.cc` compiles the device kernels' bodies (`eidola-engine-kernels`' `csrc/ds_ops.cuh`, `ds_attention.cuh`, `ds_index.cuh`: the C++ a GPU compiles) into a host library with one function per launch, each repeating its kernel's entry over a grid. `tests/ds_common/compiled.rs` serves every launch of the executor from it, through what the wrapper does before a device launch: nothing for no rows, else the wrapper's own precondition checks and grid function. Every scenario above passes this way on both configurations, so the structs the executor fills, the wrappers' preconditions, the grids and the kernel bodies agree with the CPU reference executor bit for bit, and `HostDevice`'s reading of each family agrees with the real body wherever a scenario reaches. What only a device shows: the entry points' placement of threads (warp shuffles, shared memory, `__syncthreads`), what the compiler emits, and the driver calls.
+
 `tests/ds_tiny.rs` runs the same scenarios on a GPU with both halves on device 0, and is skipped without a device or `EIDOLA_ENGINE_KERNELS_DIR`:
 
 ```sh
@@ -137,7 +129,25 @@ EIDOLA_ENGINE_KERNELS_DIR=<kernel build output> EIDOLA_DS_TINY_SUMMARY=ds_tiny.j
     cargo test --release -p eidola-engine-cuda --test ds_tiny -- --nocapture
 ```
 
-It prints a line per scenario and writes a JSON summary: per scenario what was compared and each step's time by part (maintenance, gather, encoder, crossing, decoder). Until `Linked` is bound it fails at the first launch.
+It prints a line per scenario and writes a JSON summary: per scenario what was compared and each step's time by part (maintenance, gather, encoder, crossing, decoder).
+
+### The device session
+
+`scripts/ds_gpu_session.sh` runs every device test that needs no checkpoint, in order and unattended, on a Linux x86_64 machine with one Blackwell GPU, from a checkout or an unpacked `git archive`. It compiles nothing for the GPU: the kernel images are the reproducible build's output directory (`target/engine-kernels/<builder arch>`, the same bytes from either builder architecture), copied to the machine and named by `KERNELS`; every image is checked against the compiled-in manifest when it is loaded. Each step is idempotent (a marker under `$OUT/done/`), logged to `$OUT/logs/`, timed, and fails loudly; a device test that skipped fails its step. Results are JSON in `$OUT`, with `session.json` listing the steps.
+
+| Step | What | Expected |
+|---|---|---|
+| `setup` | the driver is present; a C toolchain; rustup with the repository's toolchain | with `build`, about 10 minutes |
+| `build` | every test of this crate and the kernels crate, release | |
+| `kernels` | the kernels crate's manifest test; `tests/smoke.rs` loads every image | under 1 minute |
+| `ds_ops` | the numerics probe over every f32, then the scalar kernels (`ds_ops.json`) | 5 to 10 minutes |
+| `ds_gemm_ref` | the reference products and the head (`ds_gemm_ref.json`) | 3 to 8 |
+| `ds_attention`, `ds_index` | attention, window slots, index scores, selections, and their benches | 1 to 3 each |
+| `ds_tiny` | the executor against the CPU reference executor (`ds_tiny.json`) | 10 to 15 |
+| `mimo` | MiMo's device suites that need no checkpoint: `gemm`, `moe_gemm`, `attention`, `sampler`, `kv`, `kv_cipher`, `copy_rows`, `qkv_rope_kv`, `quant_ops`, `moe_ops`, `preconditions` | 3 to 6 |
+| `summary` | `session.json` | |
+
+The times are estimates; none was measured.
 
 ## The dev-only oracle
 

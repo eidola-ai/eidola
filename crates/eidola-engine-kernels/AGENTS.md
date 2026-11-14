@@ -110,8 +110,7 @@ The executor picks the form by the step's token count (`eidola-engine-cuda`'s `e
 
 ## DeepSeek-V4.1 numerics and ABI
 
-The second model's kernels must equal `eidola-engine-model`'s DeepSeek reference bit for bit (that crate's `AGENTS.md` → Numerics contract). Three files carry what they share; the scalar kernels (*The scalar kernels*) and the probe are built from them.
-The second model's kernels must equal `eidola-engine-model`'s DeepSeek reference bit for bit (that crate's `AGENTS.md` → Numerics contract). Three files carry what they share. The kernels of the forward built from them so far are the attention, index and selection kernels (*DeepSeek-V4.1 attention, index and selection*).
+The second model's kernels must equal `eidola-engine-model`'s DeepSeek reference bit for bit (that crate's `AGENTS.md` → Numerics contract). Three files carry what they share, and every kernel of the forward is built from them: the scalar kernels (*The scalar kernels*), the attention, index and selection kernels (*DeepSeek-V4.1 attention, index and selection*), and the probe. `eidola-engine-cuda`'s `DsCudaExecutor` launches them (that crate's `AGENTS.md` → DeepSeek-V4.1).
 
 ### The numerics core (`csrc/ds_numeric.cuh`)
 
@@ -122,6 +121,7 @@ Every rounding point, scale rule, exact block product, pinned order and transcen
 - **Where it departs from the reference's expression, the result is the same and the vectors hold it.** A power-of-two quantiser multiplies by the scale's reciprocal (`act_scale_recip`) where the reference divides: both round the same real number once. The FP8 × FP8 block dot is an `i64` sum in units of 2^-18 where the reference adds f64 products, both exact.
 - **Activation scales are one byte**, the f32 scale's exponent field (`act_scale_byte`): E8M0 for every finite activation, and 255 for the infinite scale of a block holding an infinite activation (`act_scale_decode` returns infinity there; a weight's E8M0 has NaN at 255).
 - **A NaN casts to code `+0`**, whatever its sign and payload, in both casts, as in the reference: which NaN an invalid operation returns differs between processors (x86 returns a negative one where Arm returns a positive one), and a quantiser reaches one whenever a block holds an infinite activation (the infinite element times the infinite scale's zero reciprocal). A NaN that stays a NaN (`bf16_round`, a dequantised `0 · ∞`, a transcendental) has no specified sign or payload; the vectors record one canonically.
+- **A NaN score ranks as negative infinity** in every top-k (`topk_key`), whatever its sign and payload, and **a stored BF16 result that is NaN is `0x7fc0`** (`bf16_store`, which every kernel stores a computed BF16 through): `f32::total_cmp` would rank a NaN by its sign, the top 16 bits of a NaN whose payload sits in the low 16 are an infinity, and which NaN an operation returns differs between processors. The Engram gate's product, when NaN, counts as `+0` for the same reason (`dsk::inject_gate`: the gate takes its sign). The vectors hold each rule: top-k over NaNs of both signs and several payloads, and Engram cases with a NaN key.
 - **Preconditions are the reference's**: `det_ln` takes a positive normal, `det_sin_cos` a magnitude under about 1.6e6, `softplus32` no NaN, and the block dots no NaN code (a loader refuses a weight holding one).
 
 ### The `exact` profile
@@ -158,7 +158,7 @@ The by-value parameter struct of each kernel family of the forward, with every f
 | `DsKvPlane` | 48 | (shared) one plane of packed KV entries in a pool or a scratch buffer |
 | `DsEmbedParams` | 48 | embedding into the residual copies |
 | `DsQuantFp8Params` | 48 | FP8 activation quantiser, from BF16 or from stored FP8 rows |
-| `DsRotQuantParams` | 128 | RoPE rotate or unrotate, then a fake quantisation into packed codes, dense or as a pool entry |
+| `DsRotQuantParams` | 128 | RoPE rotate or unrotate, then a fake quantisation into packed codes, dense or as a pool entry; with `DS_KV_BF16`, the rotation alone as dense BF16 rows (the attention queries) |
 | `DsRmsNormParams` | 40 | RMS norm |
 | `DsMhcMixParams` | 72 | hyper-connection coefficients with the Sinkhorn steps |
 | `DsCollapseParams`, `DsExpandParams` | 40, 48 | hyper-connection collapse and expand |
@@ -172,6 +172,7 @@ The by-value parameter struct of each kernel family of the forward, with every f
 | `DsSelectParams` | 104 | total-order top-k, candidate blocks, the global part of the slot lists |
 | `DsWindowSlotsParams` | 72 | the window part of the slot lists, in position or ring order |
 | `DsRouteParams`, `DsPlaceParams` | 56, 72 | router selection and weights; expert-major placement (two launches over a `[groups]` scratch) |
+| `DsPlaceRowsParams` | 48 | the routed rows of a byte array (activation codes, their scale bytes) into the expert-major layout |
 | `DsSwigluParams` | 56 | SwiGLU with clamps and routing weight, quantised for the down-projection |
 | `DsCombineParams` | 48 | the feed-forward sum |
 | `DsEngramGatherParams`, `DsEngramInjectParams` | 72, 48 | Engram rows as stored; the gated injection |
@@ -184,10 +185,10 @@ Decisions the structs fix:
 - **Rows are prefixes.** The executor orders a step's positions deepest-computed first, so the positions a layer computes are rows `0 .. rows` of every array and no kernel takes a row list. A window-chain layer runs its KV write over the rows it computes and its attention onward over the shorter prefix the next layer computes.
 - **KV blocks are contiguous**, each layer's (or bank source's) planes back to back in the order the header gives, which is also the order a block is zeroed, copied and enciphered. An entry is `block id · entries per block + offset`; `DsKvPlane` turns it into two addresses. Window entries are FP8 (`width` codes, a scale byte per 32), global KV entries FP4 with an E4M3 scale per 16, index keys FP4 with a power-of-two scale per 32.
 - **A slot list is data**: per query, `a_slots` entry indices into one plane then `b_slots` into another, `DS_SLOT_EMPTY` for an empty slot, a slot's index fixing its 64-slot block. The window words are the same for every layer of a group (built once a step, on the host or by the `DsWindowSlotsParams` kernel); the global words are rewritten only by a layer that selects (`DsSelectParams`) and reused by the layers after it. Unused trailing slots are empty, which changes nothing. A drafter block lists its window in ring order and then the draft slots' KV from scratch, through the same struct under `DS_ATTN_PACKED`: the reference's drafter list has no slot for a position a short sequence has not reached, so the draft slots follow the last listed window slot, and a fixed place for them would put them in another 64-slot block until the window is full.
-- **A BF16 result that is NaN is stored as `0x7fc0`** (`ds::bf16_store`). Taking the top 16 bits of a NaN whose payload sits in the low 16 leaves an infinity, and which NaN an operation returns differs between processors, so the reference's NaN bits are not a function of its inputs either.
+- **A BF16 result that is NaN is stored as `0x7fc0`** (`ds::bf16_store`), by every kernel that stores a computed BF16; a copy (the embedding, a gathered row) keeps its bits.
 - **The grouped projection (`wo_a`) keeps its stored FP8 weight** and dequantises it on load, like its input; the product is the pinned dot of the two.
 - **The router writes a row's experts in ascending id** with their weights, after normalising with the sum taken in selection order; placement, the SwiGLU's weights and the combine all read that order.
-- **The expert layout** is expert-major with each run started on a multiple of `row_align`; `DsPlaceParams` also scatters each pair's routing weight to its layout row. Activation codes and scales reach the layout through `eidola_copy_rows` (no new gather kernel). Gate and up outputs are two pointers and a stride, so the two weights may be stored fused or apart.
+- **The expert layout** is expert-major with each run started on a multiple of `row_align`; `DsPlaceParams` also scatters each pair's routing weight to its layout row. Activation codes and their scale bytes reach the layout through `DsPlaceRowsParams`, a byte copy by the placement's `row_of` (a scale row is `width / 32` bytes, not whole words, so MiMo's word-wise row copy does not serve). Gate and up outputs are two pointers and a stride, so the two weights may be stored fused or apart.
 - **Engram rows are gathered as stored** (codes and E8M0 scales), which is also what crosses between devices; the quantiser takes stored FP8 rows as an input format and dequantises them as the reference reads them.
 - **Candidate blocks** are a bit per block of `block_entries` entries.
 - **Pooling is ratio 2**: two members per entry, named by row index, so an open pair kept in per-slot state is one more row.
@@ -207,7 +208,7 @@ Two shapes of kernel:
 |---|---|---|---|---|
 | `embed` | `DsEmbedParams` | `DsModel::embed` | (⌈dim/256⌉, rows), 256 | an element, into every copy |
 | `quant_fp8` | `DsQuantFp8Params` | `quant::act_quant` (and `engram`'s row decode) | (⌈width/32/128⌉, rows), 128 | a 32-wide block |
-| `rot_quant`, `rot_quant_e4m3` | `DsRotQuantParams` | `rope::rotate` / `unrotate`, `quant::fake_quant_*` | (⌈heads·head_dim/32/128⌉, rows), 128 | 32 elements: rotated pairs (adjacent, at even offsets, so never split), then their block or two 16-wide blocks |
+| `rot_quant`, `rot_quant_e4m3` | `DsRotQuantParams` | `rope::rotate` / `unrotate`, `quant::fake_quant_*` | (⌈heads·head_dim/32/128⌉, rows), 128 | 32 elements: rotated pairs (adjacent, at even offsets, so never split), then their block or two 16-wide blocks  `DS_KV_BF16` stores the 32 rotated values and quantises nothing |
 | `rms_norm` | `DsRmsNormParams` | `weights::rms` | (rows), 256 | 16 lanes of `dot(x, x)`, then every thread elements `t, t + 256, …` |
 | `mhc_mix` | `DsMhcMixParams` | `mhc::mixes` | (rows), 1024 | a lane group per projection row and one for `dot(x, x)`; thread 0 runs the Sinkhorn steps |
 | `collapse`, `expand`, `stream_mean` | `DsCollapseParams`, `DsExpandParams`, `DsStreamMeanParams` | `mhc::collapse`, `mhc::expand`, `forward::stream_mean` | (⌈dim/256⌉, rows), 256 | an element of every copy |
@@ -215,6 +216,7 @@ Two shapes of kernel:
 | `pool` | `DsPoolParams` | the ratio-2 pooling of `DsModel`'s compressor | (⌈width/256⌉, entries), 256 | a channel |
 | `route` | `DsRouteParams` | `moe::route` after the logits | (rows), 128 | scores into shared memory, then thread 0 selects |
 | `place_count`, `place` | `DsPlaceParams` | the layout rule of the struct (host form: `eidola-engine-cuda`'s `ds::ops::expert_layout`) | (⌈groups/128⌉), 128, twice | a group: its count, then its start from the counts before it and its pairs in order |
+| `place_rows` | `DsPlaceRowsParams` | a copy | (⌈row bytes/256⌉, rows · active), 256 | a byte of one (row, slot) pair's row |
 | `swiglu` | `DsSwigluParams` | `moe::swiglu_hidden`, `quant::act_quant` | (⌈width/32/128⌉, rows), 128 | a 32-wide block |
 | `combine` | `DsCombineParams` | the sum of `forward::moe_forward` | (⌈dim/256⌉, rows), 256 | an element |
 | `engram_gather` | `DsEngramGatherParams` | a copy | (⌈width/32/128⌉, ids per row, rows), 128 | 32 codes and their scale |
@@ -242,7 +244,8 @@ Two shapes of kernel:
 cargo test -p eidola-engine-kernels --test ds_kernels_host   # at -O2 and -O0
 ```
 
-The `lin8` cases run the quantiser and then the product, the `lin4` cases the placement launches too. The cases hold no NaN and no infinity: which NaN an operation produces differs between processors, and a quantiser turns a NaN's sign into a code. With contraction left on (`-ffp-contract=fast`) 8 sweeps fail; reversing the combine's or the stream mean's order, dropping the router's normaliser floor, the addend, a run's alignment or a padding row's test each fails at least one. Where the reference has no function of its own for a kernel's step (the pooling and the feed-forward sum are inside larger functions, the FP4 codes inside `fake_quant_fp4_*`), the cases compose it from the reference's public functions by the rule the reference states, and check the composition against the public function where one exists (the fake quantisations' values; `engram::inject`). The check shows the bodies and the grids are right; what nvcc emits is held by the profile, the SASS assertion and the device tests (`eidola-engine-cuda/AGENTS.md` → DeepSeek-V4.1).
+The `lin8` cases run the quantiser and then the product, the `lin4` cases the placement launches too. No case's output is a NaN and none holds an infinity: which NaN an operation produces differs between processors. One Engram case in four holds a NaN in a key, whose gate is the one a `+0` product gives. With contraction left on (`-ffp-contract=fast`) 8 sweeps fail; reversing the combine's or the stream mean's order, dropping the router's normaliser floor, the addend, a run's alignment or a padding row's test each fails at least one. Where the reference has no function of its own for a kernel's step (the pooling and the feed-forward sum are inside larger functions, the FP4 codes inside `fake_quant_fp4_*`), the cases compose it from the reference's public functions by the rule the reference states, and check the composition against the public function where one exists (the fake quantisations' values; `engram::inject`). The check shows the bodies and the grids are right; what nvcc emits is held by the profile, the SASS assertion and the device tests (`eidola-engine-cuda/AGENTS.md` → DeepSeek-V4.1).
+
 ## DeepSeek-V4.1 attention, index and selection
 
 Four kernels, each bit-identical to a function of `eidola-engine-model`'s `deepseek::attention`: no tensor cores, every operation the reference's in the reference's order. The sources are the reference's steps transliterated; this section gives the structure, what makes each batch-invariant, and how they are checked.
@@ -260,7 +263,7 @@ A kernel whose threads cooperate is a function template over a phase runner: a s
 | `eidola_ds_index_score` | `index_score` of every visible entry | Grid `(x, rows)`, 256 threads, 21,792 bytes of shared memory. A block dequantises its row's index queries once, then walks the passes `bx, bx + x, …`: 8 entries a pass, a warp per entry, a lane per index head running the whole pinned dot of that head, lane 0 the pinned sum over heads. At most 32 heads of at most 128 |
 | `eidola_ds_select` | `top_k` (score descending, index ascending), `candidate_mask`, and the selection appended ascending to the slot lists | Grid `rows`, 512 threads: one block per row. A BF16 score's rank key (`ds::topk_key`) has 16 significant bits, so two 256-bucket counting passes over the visible entries find the k-th best key; every candidate above it is selected and, of those equal to it, the first in index order. A third pass counts each thread's contiguous run, one thread prefixes the 512 counts, and a last pass writes each selected entry at its rank: the output is ascending with no sort. The candidate blocks run the same four passes over block scores (a block's best entry, +inf for the newest) and write a bit per block |
 
-**What the selection is defined by.** Only comparisons: `-0` and `+0` are one key, a NaN ranks as `f32::total_cmp` ranks it, a block of NaN or -inf alone scores -inf and is never kept, and fewer candidates than `k` selects them all and leaves the rest of the slots empty. The candidate source passes `mask_out` and no `mask_in` (it selects over everything it sees and only publishes the blocks); a later index source passes `mask_in`.
+**What the selection is defined by.** Only comparisons: `-0` and `+0` are one key, a NaN of any sign and payload ranks as negative infinity, a block of NaN or -inf alone scores -inf and is never kept, and fewer candidates than `k` selects them all and leaves the rest of the slots empty. The candidate source passes `mask_out` and no `mask_in` (it selects over everything it sees and only publishes the blocks); a later index source passes `mask_in`.
 
 **What the host must keep.** Slot words inside their planes; `visible` at most `score_stride` (past it the kernels clamp and raise `DS_STATUS_BAD_INDEX`); table rows covering what a row lists (a negative word raises the bit, giving an empty slot or a score of +0).
 

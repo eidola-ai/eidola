@@ -102,3 +102,25 @@ fn the_summary_records_every_scenario() {
     assert!(steps.iter().all(|s| s["total_ms"].as_f64().unwrap() > 0.0));
     assert!(scenarios[0]["step_ms"]["encoder"].as_f64().unwrap() > 0.0);
 }
+
+/// The same scenarios with every launch served by the device kernels' own bodies,
+/// compiled for the host, behind the launch wrappers' checks and grids: the fixture,
+/// then the window of 80. Skipped (after saying why) without a C++ compiler.
+#[test]
+fn the_compiled_kernel_bodies_run_the_scenarios() {
+    let Some(lib) = compiled::library() else {
+        return;
+    };
+    let device =
+        move || -> Box<dyn Device> { Box::new(compiled::CompiledDevice::new(lib.clone())) };
+    for wide in [false, true] {
+        let model = model(wide);
+        let mut run = Run {
+            model: &model,
+            device: &device,
+            outcomes: Vec::new(),
+        };
+        all_scenarios(&mut run, wide);
+        assert!(run.outcomes.iter().all(|o| o.compared.blocks > 0));
+    }
+}

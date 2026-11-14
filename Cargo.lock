@@ -3040,6 +3040,7 @@ dependencies = [
  "eidola-engine-cpu",
  "eidola-engine-kernels",
  "eidola-engine-model",
+ "libloading 0.8.9",
  "serde_json",
  "zeroize",
 ]

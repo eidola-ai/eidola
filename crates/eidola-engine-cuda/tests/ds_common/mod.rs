@@ -11,6 +11,8 @@
 
 #![allow(dead_code)]
 
+pub mod compiled;
+
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -746,8 +748,9 @@ impl Run<'_> {
             assert!(stats.preemptions > 0, "workload must force preemption");
             done.push(h);
         }
+        // Past the fixture's reach; the wide window's reach is past these prompts.
         assert!(
-            done.iter().any(|h| h.compared().triangles > 0),
+            self.model.window != WINDOW || done.iter().any(|h| h.compared().triangles > 0),
             "a preempted sequence resumed into a triangle"
         );
         self.record("preemption", at, done);
