@@ -19,6 +19,7 @@ The CUDA executor for the MiMo-V2.6 engine: the serving core's `Executor` on one
 | `support.rs` | `check_supported` and `check_drafting`: the one model configuration the kernels can run; `Unsupported` names the field. |
 | `ds/abi.rs` | DeepSeek-V4.1: the kernels' parameter structs (*DeepSeek-V4.1*). |
 | `ds/attention.rs`, `ds/index.rs` | DeepSeek-V4.1: sparse attention and window slot lists (`DsAttention`), index scores and selections (`DsIndex`), their grids, precondition checks and host forms. |
+| `ds/` | DeepSeek-V4.1: the kernels' parameter structs (`abi.rs`), the launches made with them (`kernels.rs`), and the second executor: `executor.rs`, `half.rs`, `model.rs`, `plan.rs`, `kv.rs`, `weights.rs`, `boundary.rs`, `support.rs`, `host.rs` (*DeepSeek-V4.1*). |
 | `tma.rs` | `cuTensorMapEncodeTiled` specs, CuTe's descriptor fix-up. |
 | `device.rs`, `module.rs`, `launch.rs`, `ops.rs`, `bf16.rs` | Device, verified image loading and launch, argument lists, the RMSNorm smoke kernel and DeepGEMM's grid, BF16 bits. |
 
@@ -72,6 +73,71 @@ It prints one line per check (`ok` or `FAILED` with the first differing element)
 EIDOLA_ENGINE_KERNELS_DIR=<build output> EIDOLA_DS_BENCH_DIR=<dir> \
   cargo test --release -p eidola-engine-cuda --test ds_attention --test ds_index -- --nocapture --test-threads 1
 ```
+
+`src/ds/` is the second model's module tree, beside MiMo's files; it shares only the leaf modules (`device.rs`, `module.rs`, `launch.rs`, `kv_cipher.rs`, `sampler.rs`, `bf16.rs`). **Nothing in it has run on a GPU.** `DsCudaExecutor` is checked here on a host device; its kernels are not bound yet.
+
+`ds/abi.rs` mirrors `eidola-engine-kernels`' `csrc/ds_abi.cuh` (normative; that crate's `AGENTS.md` → *The ABI* lists the structs and the decisions they fix) as `repr(C)` structs with device addresses as `u64`, the header's names without their prefix. `layout!` asserts each mirror's size, 8-byte alignment and every field's offset at compile time against the numbers the header asserts, so `cargo check` fails on a mirror that drifts; a launch wrapper additionally checks its kernel's `params_bytes`, as MiMo's do. `ProbeParams` and the `PROBE_*` ops are the numerics probe's (`eidola_ds_probe`): a device test replays the host vectors of the numerics header through it.
+
+### The executor
+
+`DsCudaExecutor` implements the seam for the window-chain model as the CPU reference executor does without drafts (`eidola-engine-cpu/AGENTS.md` → DeepSeek-V4.1: the same four groups, ratios, devices and coverage, the chain, the token history), eagerly: every step is launched afresh and no graph is captured. `preflight` is the configuration checks alone (shape, spec, block layouts), with no device.
+
+| Module | Contents |
+|---|---|
+| `support.rs` | `check_supported`: the shape the executor splits a model by (`DsShape`), or the field that rules it out. The split and groups are the reference executor's; the rest is what the ABI fixes (widths in whole 32-blocks, ratio-2 pooling, 32-bit Engram rows, a selection or candidate pool published earlier on the same half). |
+| `kernels.rs` | `DsKernels`: one method per kernel family, taking its ABI struct. `Linked` is the device implementation and **refuses every launch** (`ds kernel not linked: <family>`) until each body calls its wrapper. |
+| `half.rs` | `Device` (allocation, zero, upload, download, copy, the idle cipher, the sampler, the kernels) and `CudaDevice`: one stream of an opened device with the sampler and cipher images. |
+| `plan.rs` | The step planner, pure: row order, per-layer row counts, the pooling pairs, window slot lists, the expert layout's bound and placement. |
+| `kv.rs` | Block layouts (`GroupGeometry`), pools, device block tables with a host mirror, `Zero` / `Copy` / `Encrypt` / `Decrypt`. |
+| `weights.rs` | A half's weights in kernel layouts, and `weight_bytes`: the same sums as arithmetic over the configuration. |
+| `model.rs` | A half (`HalfNet`): scratch, per-slot state, and one model layer as launches. |
+| `boundary.rs` | `ToEncoder`, `ToDecoder` and its check, `StepTransfer`. |
+| `executor.rs` | The seam: maintenance, the step's order, sampling, timings. |
+| `host.rs` | `HostDevice`: host memory and every family computed with the model crate's functions. Tests only. |
+
+**Two logical devices.** An `Encoder` half and a `Decoder` half each own a `Device`, their weights, pools, tables, scratch and state as separate allocations, and hand kernels only their own addresses. `DsCudaExecutorConfig::devices` names each half's ordinal: the same one twice is two streams of one GPU; two ordinals is two GPUs, with no other change (not exercised).
+
+**The boundary** is host values, staged through host memory both ways. Decoder → encoder: the Engram rows gathered from the tables the decoder's device holds, as stored. Encoder → decoder: the split layer's bank entry for every position (its stored bytes), and the residual copies with the collapse weights for exactly the rows the chain's bottom layer computes. `ToDecoder::check` refuses anything else before the decoder runs, and the tests hold each step's set equal to the reference executor's.
+
+**Row order** (`plan.rs`). Kernels compute rows `0 .. rows`, so every launch group must be a prefix. A step's positions are ordered head rows first, then by the number of chain layers that compute them, descending, then in the reference executor's order. The head's rows, each chain layer's rows, the boundary rows and all positions are then prefixes, on both halves alike. A chain layer writes its window KV over the rows it computes and runs from its queries on over the rows the next layer computes.
+
+**A step.** Maintenance and table updates (every unsupported operation refused first); the decoder's device gathers its Engram rows; the encoder embeds, runs each layer before the split over every position (Engram injection, the attention input, the window KV write, a pooled source's entries, then queries, the selection where the layer runs its indexer, attention, the output projection, the routed and shared experts), then the split layer's bank stub; the crossing; the decoder stores the bank entries, runs the chain, the head over the sampling rows, and the sampler (`eidola_sample` over `sampleable_vocab_size`). Window slot lists are built on the host from the table mirror; the selection's part is written on the device.
+
+**Memory.** A block's image is the ABI's: per layer, planes of packed entries back to back, padded to 16 bytes; `Zero`, `Copy` and the cipher cover it as one range. The reference executor stores the same bytes entry by entry, and `GroupGeometry::cells` is that permutation, so plaintext blocks are compared byte for byte; ciphertext is not comparable (the two images order the keystream differently). Weights are copied as stored (FP8 codes with tile scales, `wo_a` included; BF16; f32; Engram tables as codes and scales), with three changes of shape: routed experts are laid out expert-major (each expert's gate rows then up rows in one array, down rows in another), norm weights are widened to f32, and an Engram module's two gate weights are kept as their product. An FP8 weight holding a NaN code is refused. Per-slot state is the pooled sources' open entries (the f32 projections of each slot's last `ratio + 1` positions), kept behind the step's rows of the projection scratch so a pair may name either; `ResetSlot` scrubs it. `DsCudaExecutor::memory` reports each half's bytes by kind.
+
+| Released model, checkpoint bytes | Encoder's device | Decoder's device |
+|---|---|---|
+| Embedding / head and final norm | 1,323,827,200 | 1,323,837,440 |
+| Layers (20 each) | 147,838,599,136 | 147,823,271,392 |
+| Engram tables | 101,377,628,352 | 101,380,404,048 |
+| Engram modules | 315,043,840 | 0 |
+| Total | 250,855,098,528 | 250,527,512,880 |
+
+`weights::tests` holds `weight_bytes` to these (the checkpoint's tensor headers) and to what the loader uploads for the fixture. On the device a half adds its RoPE tables and widened norms, the encoder the split layer's stub, and neither reads the image router bias.
+
+**Scrubs.** The first rowless step after one with rows zeroes every scratch buffer in place; dropping the executor zeroes pools, tables, state and scratch first (best effort).
+
+**Not supported.** Drafting: the spec reports no draft tokens and no drafter group, and a row asking for drafts panics as a host bug. The host tier: `Demote`, `Promote` and `ZeroHost` fail the step before any of it takes effect. Graphs. Batching: each encryption or decryption is its own launch. No stored position tags, so a read of KV a chain layer never computed is not detected (the mapping checks are: an unmapped or encrypted block, a write to a shared block).
+
+### Verification
+
+```sh
+cargo test -p eidola-engine-cuda --lib ds::        # planner, layouts, arithmetic, refusals
+cargo test -p eidola-engine-cuda --test ds_host    # the executor on the host device, about a minute
+```
+
+`tests/ds_common` drives the real `Engine` over a pair: the executor under test and `DsCpuExecutor`, given the same steps, every step asking for logits. Each step must agree in tokens, in logits bit for bit, in the bytes of every plaintext block of every group, in which blocks are encrypted, in the set that crossed and in the chain's work; the harness adds the engine's invariants, zero-on-free on the device's bytes and scrubbed state for free slots. Scenarios, on the committed fixture and on its window-of-80 configuration (a query's list spanning two 64-slot blocks): batched single requests, chunked against unchunked prefill around the chain's reach, one triangle for a long prompt, hits at regeneration, continuation and branch points with a required prefix admitted and refused, a sequence cancelled mid-triangle, preemption and resume, shedding to `KvExhausted`, a request alone and beside others, and randomized interleavings drained to all-zero pools.
+
+`tests/ds_host.rs` runs them on `HostDevice`. That checks everything of the executor but the kernels and the driver calls: the planner, layouts and images, weights, the step's order, the boundary, maintenance, state. Each of these, broken deliberately, fails it: the window left-aligned in its slots (only at the window of 80 and in the larger workloads), bank visibility off by one, a pooled entry rotated at its last position, a zero that leaves the bytes, the open entry not kept, a chain layer starting one row late, a reset leaving state, the Engram lookback dropped.
+
+`tests/ds_tiny.rs` runs the same scenarios on a GPU with both halves on device 0, and is skipped without a device or `EIDOLA_ENGINE_KERNELS_DIR`:
+
+```sh
+EIDOLA_ENGINE_KERNELS_DIR=<kernel build output> EIDOLA_DS_TINY_SUMMARY=ds_tiny.json \
+    cargo test --release -p eidola-engine-cuda --test ds_tiny -- --nocapture
+```
+
+It prints a line per scenario and writes a JSON summary: per scenario what was compared and each step's time by part (maintenance, gather, encoder, crossing, decoder). Until `Linked` is bound it fails at the first launch.
 
 ## The dev-only oracle
 
