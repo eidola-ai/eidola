@@ -32,6 +32,33 @@ fn exact(got: &[f32], want: &[f32]) -> usize {
     got.iter().zip(want).filter(|(a, b)| a != b).count()
 }
 
+/// Every `golden/reference-*.safetensors`, by name, `reference-pinned` first.
+fn goldens(dir: &Path) -> Vec<(String, WeightSet)> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir.join("golden"))
+        .expect("the checkpoint directory has a golden/ directory")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|f| f.starts_with("reference-") && f.ends_with(".safetensors"))
+        })
+        .collect();
+    paths.sort_by_key(|p| (!p.ends_with("reference-pinned.safetensors"), p.clone()));
+    assert!(
+        !paths.is_empty(),
+        "no golden/reference-*.safetensors to compare against"
+    );
+    paths
+        .iter()
+        .map(|p| {
+            (
+                p.file_stem().unwrap().to_string_lossy().into_owned(),
+                open(p),
+            )
+        })
+        .collect()
+}
+
 #[test]
 #[ignore = "needs a fetched truncation of the real checkpoint"]
 fn truncated_real_checkpoint_matches_the_reference() {
@@ -46,7 +73,9 @@ fn truncated_real_checkpoint_matches_the_reference() {
         .verify_sha256(&manifest)
         .expect("fetched files match their manifest");
 
-    let pinned = open(&dir.join("golden/reference-pinned.safetensors"));
+    // Every golden holds the tokens and the Engram map it was made with.
+    let goldens = goldens(&dir);
+    let pinned = &goldens[0].1;
     let tokens: Vec<u32> = pinned
         .get("tokens")
         .unwrap()
@@ -146,116 +175,131 @@ fn truncated_real_checkpoint_matches_the_reference() {
 
     let mut failures: Vec<String> = Vec::new();
     println!("{n} tokens, {} layers", c.layers.len());
-    let want = f32s(&pinned, "prefill.logits");
-    let a = compare_logits(&want, &logits, v).unwrap();
-    println!(
-        "pinned reference, one prefill chunk (its layout reproduced): {a}; {} of {} logits differ",
-        exact(&logits, &want),
-        want.len()
-    );
-    for (l, tap) in taps.iter().enumerate() {
-        let want = f32s(&pinned, &format!("prefill.layer.{l}"));
-        let worst = tap
-            .iter()
-            .zip(&want)
-            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
-        println!(
-            "  streams after layer {l:>2} (checkpoint layer {:>2}): {} of {} differ, max |Δ| {worst:e}",
-            c.layers[l].source_index,
-            exact(tap, &want),
-            want.len()
-        );
-    }
-    failures.extend(
-        (a.top1_rate() < 0.999 || a.kl_mean >= 1e-3).then(|| format!("pinned prefill: {a}")),
-    );
-
-    let step = f32s(&pinned, "step.logits");
-    let s = compare_logits(&step, &stepped[..step.len()], v).unwrap();
-    println!(
-        "pinned reference, a window-long prefill then one token per call: {s}; {} of {} logits differ",
-        exact(&stepped[..step.len()], &step),
-        step.len()
-    );
-    let m = compare_logits(&want, &canonical, v).unwrap();
-    println!("canonical layout against the reference's one prefill chunk: {m}");
-    let from = window.min(n);
-    let m = compare_logits(&step[from * v..], &canonical[from * v..step.len()], v).unwrap();
-    println!(
-        "canonical layout against the reference's decode steps (after its window-long prefill): {m}"
-    );
-    failures
-        .extend((s.top1_rate() < 0.999 || s.kl_mean >= 1e-3).then(|| format!("pinned steps: {s}")));
-
-    // The drafter, from this forward's own hidden states.
+    let relative = |got: &[f32], want: &[f32]| {
+        let (mut err, mut norm) = (0.0f64, 0.0f64);
+        for (a, b) in got.iter().zip(want) {
+            err += ((a - b) as f64).powi(2);
+            norm += (*b as f64).powi(2);
+        }
+        (err / norm.max(f64::MIN_POSITIVE)).sqrt()
+    };
     let width = hidden.len() / n;
     let slots = c.drafter.as_ref().unwrap().slots;
-    let want_tokens = pinned
-        .get("step.draft_tokens")
-        .unwrap()
-        .to_i64("t")
-        .unwrap();
-    let want_conf = f32s(&pinned, "step.draft_confidence");
-    let want_logits = f32s(&pinned, "step.draft_logits");
-    let k = step.len() / v;
-    // The reference seeds the drafter over its prefill chunk (one window) and
-    // drafts from every position after it.
-    let first = c.attention.window.min(k);
-    let mut drafter = model.new_drafter_state();
-    for p in 0..first {
-        model
-            .drafter_observe(&mut drafter, &hidden[p * width..(p + 1) * width])
-            .unwrap();
-    }
-    let (mut same_tokens, mut conf_diff, mut draft_logits) = (0, 0.0f32, Vec::new());
-    for p in first..k {
-        let given = tokens[(p + 1) % k];
-        let core = model
-            .drafter_forward(&mut drafter, &hidden[p * width..(p + 1) * width], given)
-            .unwrap();
-        let draft = model.draft_greedy(&core, given);
-        let at = (p - first) * slots;
-        same_tokens += draft
-            .tokens
-            .iter()
-            .zip(&want_tokens[at..])
-            .filter(|(a, b)| **a as i64 == **b)
-            .count();
-        for (a, b) in draft.confidence.iter().zip(&want_conf[at..]) {
-            conf_diff = conf_diff.max((a - b).abs());
-        }
-        if at * v < want_logits.len() {
-            draft_logits.extend(draft.logits.data);
-        }
-    }
-    let d = compare_logits(&want_logits, &draft_logits, v).unwrap();
-    println!(
-        "drafter: {same_tokens} of {} draft tokens equal, max |Δconfidence| {conf_diff:e}; logits {d}",
-        (k - first) * slots
-    );
-    failures.extend((d.top1_rate() < 0.999 || d.kl_mean >= 1e-3).then(|| format!("drafter: {d}")));
-
-    let native = dir.join("golden/reference-native.safetensors");
-    if native.exists() {
-        let native = open(&native);
-        let want = f32s(&native, "prefill.logits");
-        let a = compare_logits(&want, &logits, v).unwrap();
-        println!("reference with PyTorch's own arithmetic and top-k (measurement only): {a}");
-        for (l, tap) in taps.iter().enumerate() {
-            let want = f32s(&native, &format!("prefill.layer.{l}"));
-            let (mut err, mut norm) = (0.0f64, 0.0f64);
-            for (a, b) in tap.iter().zip(&want) {
-                err += ((a - b) as f64).powi(2);
-                norm += (*b as f64).powi(2);
+    for (name, golden) in &goldens {
+        // Only the reference with emulated kernels and pinned arithmetic is a
+        // function this forward equals; every other golden is a measurement.
+        let exact_expected = name == "reference-pinned";
+        let mut check = |what: &str, a: &eidola_engine_model::compare::LogitAgreement| {
+            if exact_expected && (a.top1_rate() < 0.999 || a.kl_mean >= 1e-3) {
+                failures.push(format!("{name} {what}: {a}"));
             }
+        };
+        println!(
+            "== {name}{}",
+            if exact_expected {
+                ""
+            } else {
+                " (measurement only)"
+            }
+        );
+        let want = f32s(golden, "prefill.logits");
+        let a = compare_logits(&want, &logits, v).unwrap();
+        println!(
+            "one prefill chunk, its layout reproduced: {a}; {} of {} logits differ",
+            exact(&logits, &want),
+            want.len()
+        );
+        check("prefill", &a);
+        for (l, tap) in taps.iter().enumerate() {
+            let want = f32s(golden, &format!("prefill.layer.{l}"));
             println!(
-                "  streams after layer {l:>2}: relative error {:.3e}",
-                (err / norm).sqrt()
+                "  streams after layer {l:>2} (checkpoint layer {:>2}): relative error {:.3e}, {} of {} differ",
+                c.layers[l].source_index,
+                relative(tap, &want),
+                exact(tap, &want),
+                want.len()
             );
         }
-        // Reported, not asserted: this truncation amplifies last-bit
-        // differences (see AGENTS.md), so an unpinned reference agrees with
-        // nothing bit-unequal to it, the pinned reference included.
+        let m = compare_logits(&want, &canonical, v).unwrap();
+        println!("canonical layout against that prefill chunk: {m}");
+        if !golden.contains("step.logits") {
+            continue;
+        }
+        let step = f32s(golden, "step.logits");
+        let k = step.len() / v;
+        let s = compare_logits(&step, &stepped[..step.len()], v).unwrap();
+        println!(
+            "a window-long prefill then one token per call: {s}; {} of {} logits differ",
+            exact(&stepped[..step.len()], &step),
+            step.len()
+        );
+        check("steps", &s);
+
+        // The drafter, from this forward's own hidden states. The reference
+        // seeds it over its prefill chunk (one window) and drafts from every
+        // position after it.
+        let want_tokens = golden
+            .get("step.draft_tokens")
+            .unwrap()
+            .to_i64("t")
+            .unwrap();
+        let want_conf = f32s(golden, "step.draft_confidence");
+        let want_logits = f32s(golden, "step.draft_logits");
+        let first = window.min(k);
+        let mut drafter = model.new_drafter_state();
+        for p in 0..first {
+            model
+                .drafter_observe(&mut drafter, &hidden[p * width..(p + 1) * width])
+                .unwrap();
+        }
+        let (mut same_tokens, mut conf_diff, mut draft_logits) = (0, 0.0f32, Vec::new());
+        for p in first..k {
+            let given = tokens[(p + 1) % k];
+            let core = model
+                .drafter_forward(&mut drafter, &hidden[p * width..(p + 1) * width], given)
+                .unwrap();
+            let draft = model.draft_greedy(&core, given);
+            let at = (p - first) * slots;
+            same_tokens += draft
+                .tokens
+                .iter()
+                .zip(&want_tokens[at..])
+                .filter(|(a, b)| **a as i64 == **b)
+                .count();
+            for (a, b) in draft.confidence.iter().zip(&want_conf[at..]) {
+                conf_diff = conf_diff.max((a - b).abs());
+            }
+            if at * v < want_logits.len() {
+                draft_logits.extend(draft.logits.data);
+            }
+        }
+        let d = compare_logits(&want_logits, &draft_logits, v).unwrap();
+        println!(
+            "drafter: {same_tokens} of {} draft tokens equal, max |Δconfidence| {conf_diff:e}; logits {d}",
+            (k - first) * slots
+        );
+        check("drafter", &d);
+    }
+
+    // The reference against itself: every pair of goldens other than the
+    // pinned one (which this forward equals, so its rows are the ones above).
+    for (i, (a_name, a)) in goldens.iter().enumerate() {
+        for (b_name, b) in &goldens[i + 1..] {
+            if a_name == "reference-pinned" {
+                continue;
+            }
+            let (x, y) = (f32s(a, "prefill.logits"), f32s(b, "prefill.logits"));
+            let m = compare_logits(&x, &y, v).unwrap();
+            let last = c.layers.len() - 1;
+            let key = format!("prefill.layer.{last}");
+            println!(
+                "{b_name} against {a_name}, one prefill chunk: {m}; streams after the last layer: relative error {:.3e}",
+                relative(&f32s(b, &key), &f32s(a, &key))
+            );
+        }
+    }
+    if goldens[0].0 != "reference-pinned" {
+        println!("no reference-pinned golden present: nothing was asserted beyond finite values");
     }
     assert!(
         failures.is_empty(),

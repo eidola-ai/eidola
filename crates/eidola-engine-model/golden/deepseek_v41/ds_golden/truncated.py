@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
+from dataclasses import dataclass
 import json
 import re
 import time
@@ -21,13 +22,33 @@ REPO = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
 REVISION = "08c8657f02291e11b6f6b63e0e16014f8e748518"
 BASE = f"https://huggingface.co/{REPO}/resolve/{REVISION}"
 
-# 0: window only. 1: window only + Engram. 2 / 3: ratio-2 KV source and a
-# consumer. 14 / 15: the same with Engram. 20: ratio-1 KV, index and candidate
-# source. 21: consumer. 24: its own indexer inside 20's candidates.
-# 37-39: the drafter's target layers.
-LAYERS = [0, 1, 2, 3, 14, 15, 20, 21, 24, 37, 38, 39]
-BACKBONE_EXPERTS = 32
-DRAFTER_EXPERTS = 16
+
+
+@dataclass(frozen=True)
+class Truncation:
+    """Which checkpoint layers are kept, and how many routed experts of each
+    backbone layer and of each draft block (0 draft experts: no drafter)."""
+
+    layers: tuple[int, ...]
+    backbone_experts: int
+    drafter_experts: int
+
+    @property
+    def drafter(self) -> bool:
+        return self.drafter_experts > 0
+
+
+TRUNCATIONS = {
+    # Every layer kind and the drafter, with few experts. 0: window only.
+    # 1: window only + Engram. 2 / 3: ratio-2 KV source and a consumer.
+    # 14 / 15: the same with Engram. 20: ratio-1 KV, index and candidate
+    # source. 21: consumer. 24: its own indexer inside 20's candidates.
+    # 37-39: the drafter's target layers.
+    "spread": Truncation((0, 1, 2, 3, 14, 15, 20, 21, 24, 37, 38, 39), 32, 16),
+    # The model's first four layers whole, every routed expert: the residual
+    # streams after each are the full model's, so their sensitivity is too.
+    "prefix": Truncation((0, 1, 2, 3), 384, 0),
+}
 
 
 def get(path: str, start: int | None = None, end: int | None = None) -> bytes:
@@ -56,7 +77,7 @@ def remote_header(shard: str) -> tuple[dict, int]:
     return json.loads(get(shard, 8, 8 + n)), 8 + n
 
 
-def wanted(name: str, layers=LAYERS) -> bool:
+def wanted(name: str, t: Truncation) -> bool:
     """Whether the truncation keeps a checkpoint tensor."""
     if name in ("embed.weight", "head.weight", "norm.weight"):
         return True
@@ -64,20 +85,34 @@ def wanted(name: str, layers=LAYERS) -> bool:
     if not m:
         return False
     kind, index, rest = m.group(1), int(m.group(2)), m.group(3)
-    if kind == "layers" and index not in layers:
+    if (kind == "layers" and index not in t.layers) or (kind == "mtp" and not t.drafter):
         return False
     if rest.endswith("bias_vl") or rest.startswith("engram.embed."):
         return False
     expert = re.match(r"ffn\.experts\.(\d+)\.", rest)
     if expert:
-        return int(expert.group(1)) < (BACKBONE_EXPERTS if kind == "layers" else DRAFTER_EXPERTS)
+        return int(expert.group(1)) < (t.backbone_experts if kind == "layers" else t.drafter_experts)
     return True
 
 
-def fetch_shard(shard: str, out: Path, workers: int = 16) -> int:
-    """Re-pack the wanted tensors of one upstream shard into `out`, byte for byte."""
+def _local_tensors(directory: Path | None, shard: str) -> dict[str, tuple[int, int]]:
+    """Absolute byte ranges of the tensors a local re-pack of `shard` holds."""
+    path = directory / shard if directory else None
+    if path is None or not path.exists():
+        return {}
+    with open(path, "rb") as f:
+        n = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(n))
+    return {name: (8 + n + m["data_offsets"][0], 8 + n + m["data_offsets"][1]) for name, m in header.items() if name != "__metadata__"}
+
+
+def fetch_shard(shard: str, out: Path, t: Truncation, reuse: Path | None = None, workers: int = 16) -> int:
+    """Re-pack the wanted tensors of one upstream shard into `out`, byte for
+    byte. Tensors an earlier re-pack of the same shard under `reuse` already
+    holds are copied from it (their bytes are the checkpoint's); the rest are
+    range reads. Returns the bytes fetched."""
     header, base = remote_header(shard)
-    names = sorted(n for n in header if n != "__metadata__" and wanted(n))
+    names = sorted(n for n in header if n != "__metadata__" and wanted(n, t))
     if not names:
         return 0
     local, offset = {}, 0
@@ -87,11 +122,15 @@ def fetch_shard(shard: str, out: Path, workers: int = 16) -> int:
         offset += hi - lo
     blob = json.dumps(local, sort_keys=True, separators=(",", ":")).encode()
     blob += b" " * (-len(blob) % 8)
+    have = _local_tensors(reuse, shard)
     # Pieces of at most 32 MB, so a retry repeats little.
-    pieces = []
+    pieces, copies = [], []
     for name in names:
         lo, hi = header[name]["data_offsets"]
         at = 8 + len(blob) + local[name]["data_offsets"][0]
+        if name in have and have[name][1] - have[name][0] == hi - lo:
+            copies.append((have[name], at))
+            continue
         for start in range(lo, hi, 32 << 20):
             end = min(start + (32 << 20), hi)
             pieces.append((base + start, base + end, at + start - lo))
@@ -99,27 +138,39 @@ def fetch_shard(shard: str, out: Path, workers: int = 16) -> int:
         f.write(len(blob).to_bytes(8, "little"))
         f.write(blob)
         f.truncate(8 + len(blob) + offset)
-    with open(out, "r+b") as f, concurrent.futures.ThreadPoolExecutor(workers) as pool:
-        for at, data in pool.map(lambda p: (p[2], get(shard, p[0], p[1])), pieces):
-            f.seek(at)
-            f.write(data)
-    return offset
+    with open(out, "r+b") as f:
+        if copies:
+            with open(reuse / shard, "rb") as src:
+                for (lo, hi), at in copies:
+                    src.seek(lo)
+                    f.seek(at)
+                    f.write(src.read(hi - lo))
+        with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+            for at, data in pool.map(lambda p: (p[2], get(shard, p[0], p[1])), pieces):
+                f.seek(at)
+                f.write(data)
+    return sum(end - start for start, end, _ in pieces)
 
 
-def truncate_args(args: dict, layers=LAYERS) -> dict:
+def truncate_args(args: dict, t: Truncation) -> dict:
     """The reference's arguments for the kept layers as a model of their own.
 
     Layer indices are renumbered. The Engram hash depends on the original
     layer ids, so the caller supplies the table rows itself (`real_golden.py`)
-    and only the count of Engram layers is kept here."""
+    and only the count of Engram layers is kept here. Without the drafter's
+    target layers (or its experts) the drafter is dropped."""
     a = copy.deepcopy(args)
-    n, renumber = args["n_layers"], {src: i for i, src in enumerate(layers)}
-    a["n_layers"] = len(layers)
-    a["compress_ratios"] = [args["compress_ratios"][s] for s in layers] + list(args["compress_ratios"][n:])
+    n, renumber = args["n_layers"], {src: i for i, src in enumerate(t.layers)}
+    a["n_layers"] = len(t.layers)
     for key in ("kv_source_layers", "index_source_layers", "engram_layer_ids", "dspark_target_layer_ids"):
         a[key] = [renumber[s] for s in args[key] if s in renumber]
-    assert len(a["dspark_target_layer_ids"]) == len(args["dspark_target_layer_ids"]), "a drafter target layer was dropped"
+    drafter = t.drafter and len(a["dspark_target_layer_ids"]) == len(args["dspark_target_layer_ids"])
+    assert drafter == t.drafter, "a drafter target layer was dropped"
+    if not drafter:
+        a.update(n_mtp_layers=0, dspark_block_size=0, dspark_target_layer_ids=[])
+    a["compress_ratios"] = [args["compress_ratios"][s] for s in t.layers] + list(args["compress_ratios"][n:])[: a["n_mtp_layers"]]
     a["candidate_source_layer"] = renumber.get(args["candidate_source_layer"], -1)
-    a["n_routed_experts"] = BACKBONE_EXPERTS
-    a["dspark_n_routed_experts"] = DRAFTER_EXPERTS
+    a["n_routed_experts"] = t.backbone_experts
+    if drafter:
+        a["dspark_n_routed_experts"] = t.drafter_experts
     return a

@@ -259,8 +259,11 @@
 //! each slot's distribution, the conditional it sampled from; that is what its residual
 //! assumes. Context KV is written from the taps of every position the pass computes,
 //! drafts included, and a rejected position's is rewritten by the next step before
-//! anything reads it. Whatever else a drafter reports (a confidence per slot) the seam
-//! does not carry: every row verifies all `k`.
+//! anything reads it. A drafter whose pass reads nothing of the target but that context
+//! KV (DeepSeek-V4.1's: its slots start from token embeddings) has no taps to continue
+//! from: it keeps no per-slot drafter state and stores no boundary tap. Whatever else a
+//! drafter reports (a confidence per slot) the seam does not carry: every row verifies
+//! all `k`.
 //!
 //! Every executor meets this exactly, bit for bit: the CPU reference executor by
 //! construction, the CUDA executor by a batch-invariant forward (one reduction order per
