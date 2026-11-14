@@ -75,7 +75,7 @@ run_step() {
     printf '%s %s %s\n' "$name" "$status" "$seconds" >> "$OUT/steps.txt"
     [ "$status" -eq 0 ] || die "$name exited with $status (see $OUT/logs/$name.log)"
     # A device test without a device passes after saying it skipped.
-    if grep -q '^skipping:' "$OUT/logs/$name.log"; then
+    if grep -q 'skipping:' "$OUT/logs/$name.log"; then
         die "$name skipped a device test (see $OUT/logs/$name.log)"
     fi
     touch "$OUT/done/$name"
