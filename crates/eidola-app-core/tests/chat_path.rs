@@ -1194,20 +1194,35 @@ fn a_settled_input_is_announced_while_the_other_still_waits() {
                 .expect("an allocation");
         }
         let mut rx = core.subscribe_changes();
-        let outcome = core.runtime().block_on(async {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                core.chat("hello".into(), MODEL.into(), None),
-            )
-            .await
+        // The turn is dropped once the second recovery is waiting and the
+        // first input's settlement has been announced: the state under test.
+        let mut changes = Vec::new();
+        core.runtime().block_on(async {
+            let turn = core.chat("hello".into(), MODEL.into(), None);
+            let one_settled_one_waiting = async {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    changes.extend(drain(&mut rx));
+                    let wallet = changes.iter().filter(|c| **c == Change::Wallet).count();
+                    if mock.refund_hits() == 2 && wallet >= 2 {
+                        return;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "one input never settled while the other waited"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            };
+            tokio::select! {
+                outcome = turn => panic!("the second recovery never answers: {outcome:?}"),
+                () = one_settled_one_waiting => {}
+            }
         });
-        assert!(outcome.is_err(), "the second recovery never answers");
         assert_eq!(mock.refund_hits(), 2);
         assert_eq!(spending_credentials(&core).len(), 1, "one input settled");
-        let wallet = drain(&mut rx)
-            .into_iter()
-            .filter(|c| *c == Change::Wallet)
-            .count();
+        changes.extend(drain(&mut rx));
+        let wallet = changes.iter().filter(|c| **c == Change::Wallet).count();
         assert_eq!(
             wallet, 2,
             "one at the spend's start, one at the settled input's write"
@@ -1223,7 +1238,7 @@ fn a_settled_input_is_announced_while_the_other_still_waits() {
 fn concurrent_turns_never_share_an_input() {
     run(|| {
         let (mock, core, _dir) = setup(MockConfig {
-            chat_delay_ms: 300,
+            chat_delay_ms: 2_000,
             ..MockConfig::default()
         });
         with_account(&core);
@@ -1232,11 +1247,13 @@ fn concurrent_turns_never_share_an_input() {
                 .block_on(core.account_allocate(amount))
                 .expect("an allocation");
         }
+        // The second turn chooses its inputs while the first is held at the
+        // upstream with both of its own still spending.
         let (first, second) = core.runtime().block_on(async {
-            tokio::join!(
-                core.chat("one".into(), MODEL.into(), None),
-                core.chat("two".into(), MODEL.into(), None),
-            )
+            tokio::join!(core.chat("one".into(), MODEL.into(), None), async {
+                until_upstream_reached(&mock, 0).await;
+                core.chat("two".into(), MODEL.into(), None).await
+            })
         });
         first.expect("the first turn");
         second.expect("the second turn");
