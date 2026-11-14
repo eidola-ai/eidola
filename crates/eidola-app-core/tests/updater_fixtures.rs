@@ -605,16 +605,29 @@ async fn an_abandoned_install_takes_its_staging_tree_with_it() {
     plan.envelope = None;
     plan.expected_signature = None;
 
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_millis(300),
-        install::stage(&fetcher, &plan, &root),
-    )
-    .await;
+    // Abandoned once its download has been asked for: past the point where
+    // staging has begun, and held there by the server's delay.
+    let asked = async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the install never asked for its payload"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    let still_running = tokio::select! {
+        _ = install::stage(&fetcher, &plan, &root) => false,
+        () = asked => true,
+    };
 
-    assert!(
-        outcome.is_err(),
-        "the install should still have been running"
-    );
+    assert!(still_running, "the install should still have been running");
     assert!(
         !root.exists(),
         "an abandoned install must not leave a staging tree for a later run to find"

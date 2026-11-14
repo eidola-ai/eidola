@@ -218,6 +218,17 @@ impl TestNode {
         events_of(&wire)
     }
 
+    /// Serves one short request to its end and returns the stats read after it. The
+    /// engine thread handles commands in order and publishes its counters before it
+    /// steps, so every request handled before this one, and this one's submission, is
+    /// counted in what this returns: a refusal the engine made is in `rejected`, and a
+    /// request that reached it is in `submitted`.
+    pub async fn stats_after_one_more(&self) -> Stats {
+        let (status, v) = self.chat_json(&request("hi", 1)).await;
+        assert_eq!(status, 200, "{v}");
+        self.stats()
+    }
+
     /// Waits until `pred` holds for the stats (or panics after `timeout`).
     pub async fn wait_for(&self, timeout: Duration, pred: impl Fn(&Stats) -> bool) -> Stats {
         let start = Instant::now();

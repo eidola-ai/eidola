@@ -357,6 +357,9 @@ impl CudaExecutor {
                     head_dim_v: geometry[g].head_dim_v,
                     num_blocks: geometry[g].num_blocks,
                     host_blocks: host_blocks[g],
+                    ratio: 1,
+                    device: 0,
+                    coverage: eidola_engine::spec::Coverage::All,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -376,6 +379,9 @@ impl CudaExecutor {
                 head_dim_v: g.head_dim_v,
                 num_blocks: g.num_blocks,
                 host_blocks: host_blocks[keys.len()],
+                ratio: 1,
+                device: 0,
+                coverage: eidola_engine::spec::Coverage::All,
             });
         }
         let spec = ModelSpec {
@@ -387,6 +393,8 @@ impl CudaExecutor {
             max_draft_tokens: cfg.draft_tokens,
             num_state_slots: cfg.num_state_slots,
             buckets: cfg.buckets.clone(),
+            window_chain: None,
+            token_history: 0,
         };
         spec.validate().map_err(CudaError::new)?;
         Ok(Plan {

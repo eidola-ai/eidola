@@ -23,6 +23,10 @@ goldens do, so that only the kernels differ. `--kernels shim --device cpu`
 runs the script against the emulation itself (every difference is then zero);
 it is how the script is checked on a machine without CUDA.
 
+A value that is not finite, from either side, is counted on its own and makes
+the script exit non-zero after the report is written: it is never a zero
+difference.
+
 Output: a table on stdout and, with `--json <path>`, the same numbers as JSON.
 """
 
@@ -61,7 +65,7 @@ def _values(out) -> list[torch.Tensor]:
 def instrumented(real) -> tuple[types.ModuleType, dict]:
     """A `kernel` module that runs the real kernel and the emulation on every
     call, returns the real result, and tallies the differences."""
-    stats = {k: {"calls": 0, "elements": 0, "differing": 0, "max_abs_diff": 0.0} for k in KERNELS}
+    stats = {k: {"calls": 0, "elements": 0, "differing": 0, "non_finite": 0, "max_abs_diff": 0.0} for k in KERNELS}
     module = types.ModuleType("kernel")
 
     def wrap(name):
@@ -78,10 +82,14 @@ def instrumented(real) -> tuple[types.ModuleType, dict]:
             s = stats[name]
             s["calls"] += 1
             for got, expected in zip(_values(out), want):
-                diff = (got - expected).abs()
-                diff = torch.where(torch.isnan(diff), torch.zeros_like(diff), diff)
+                # Fail closed: an element that is not finite on either side is a
+                # failure of its own, never a zero difference.
+                finite = torch.isfinite(got) & torch.isfinite(expected)
+                diff = torch.where(finite, (got - expected).abs(), torch.zeros_like(got))
+                bad = got.numel() - int(torch.count_nonzero(finite))
                 s["elements"] += got.numel()
-                s["differing"] += int(torch.count_nonzero(diff))
+                s["non_finite"] += bad
+                s["differing"] += int(torch.count_nonzero(diff)) + bad
                 s["max_abs_diff"] = max(s["max_abs_diff"], float(diff.max()) if diff.numel() else 0.0)
             return out
 
@@ -92,7 +100,16 @@ def instrumented(real) -> tuple[types.ModuleType, dict]:
     return module, stats
 
 
+def non_finite(*tensors: torch.Tensor) -> int:
+    return sum(t.numel() - int(torch.count_nonzero(torch.isfinite(t))) for t in tensors)
+
+
 def agreement(want: torch.Tensor, got: torch.Tensor) -> dict:
+    """Top-1 and KL of `got` against `want`. With a non-finite logit on either
+    side there is no agreement to report: only the count."""
+    bad = non_finite(want, got)
+    if bad:
+        return {"rows": want.size(0), "non_finite": bad}
     # Plain Python sums: `Tensor.sum` / `mean` may be pinned to f32 rules.
     lw, lg = torch.log_softmax(want.double(), -1), torch.log_softmax(got.double(), -1)
     kl = [math.fsum(row) for row in (lw.exp() * (lw - lg)).tolist()]
@@ -103,6 +120,7 @@ def agreement(want: torch.Tensor, got: torch.Tensor) -> dict:
         "kl_mean": math.fsum(kl) / len(kl),
         "kl_max": max(kl),
         "max_abs_diff": float((want - got).abs().max()),
+        "non_finite": 0,
     }
 
 
@@ -141,25 +159,38 @@ def main() -> None:
         entry = {"logits": agreement(golden[f"{pattern}.logits"], out["logits"].float())}
         for i in range(config["text_config"]["num_hidden_layers"]):
             want, got = golden[f"{pattern}.layer.{i}"].float(), out[f"layer.{i}"].float()
+            finite = torch.isfinite(want) & torch.isfinite(got)
             entry[f"layer.{i}"] = {
                 "differing": int(torch.count_nonzero(want != got)),
                 "elements": want.numel(),
-                "max_abs_diff": float((want - got).abs().max()),
+                "non_finite": non_finite(want, got),
+                "max_abs_diff": float(torch.where(finite, (want - got).abs(), torch.zeros_like(want)).max()),
             }
         report["end_to_end"][pattern] = entry
 
     print(f"kernels: {opts.kernels}; arithmetic: {'pinned' if opts.pinned else 'native'}; device: {opts.device}")
-    print(f"{'kernel':<20}{'calls':>8}{'elements':>12}{'differing':>12}{'max |diff|':>14}")
+    print(f"{'kernel':<20}{'calls':>8}{'elements':>12}{'differing':>12}{'non-finite':>12}{'max |diff|':>14}")
+    failures = []
     for name, s in stats.items():
-        print(f"{name:<20}{s['calls']:>8}{s['elements']:>12}{s['differing']:>12}{s['max_abs_diff']:>14.6g}")
+        print(f"{name:<20}{s['calls']:>8}{s['elements']:>12}{s['differing']:>12}{s['non_finite']:>12}{s['max_abs_diff']:>14.6g}")
+        if s["non_finite"]:
+            failures.append(f"{name}: {s['non_finite']} non-finite elements")
     for pattern, entry in report["end_to_end"].items():
         a = entry["logits"]
-        print(f"{pattern}: top-1 {a['top1']:.4%}  KL mean {a['kl_mean']:.3e} max {a['kl_max']:.3e}  max |dlogit| {a['max_abs_diff']:.3e}")
+        if a["non_finite"]:
+            print(f"{pattern}: {a['non_finite']} non-finite logits; no agreement to report")
+        else:
+            print(f"{pattern}: top-1 {a['top1']:.4%}  KL mean {a['kl_mean']:.3e} max {a['kl_max']:.3e}  max |dlogit| {a['max_abs_diff']:.3e}")
         for key, value in entry.items():
+            if value["non_finite"]:
+                failures.append(f"{pattern} {key}: {value['non_finite']} non-finite elements")
             if key != "logits":
-                print(f"  {key}: {value['differing']} of {value['elements']} differ, max |diff| {value['max_abs_diff']:.4g}")
+                print(f"  {key}: {value['differing']} of {value['elements']} differ ({value['non_finite']} non-finite), max |diff| {value['max_abs_diff']:.4g}")
+    report["failures"] = failures
     if opts.json:
         opts.json.write_text(json.dumps(report, indent=2) + "\n")
+    if failures:
+        sys.exit("FAILED, non-finite values:\n  " + "\n  ".join(failures))
 
 
 if __name__ == "__main__":

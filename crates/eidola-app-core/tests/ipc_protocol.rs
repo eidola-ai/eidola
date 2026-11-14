@@ -1177,7 +1177,7 @@ fn a_latched_shutdown_starts_no_more_work_on_a_connection_already_serving() {
             let shutdown = Shutdown::new();
             let (client_writes, server_reads) = tokio::io::duplex(PIPE_BUFFER);
             let (server_writes, client_reads) = tokio::io::duplex(PIPE_BUFFER);
-            tokio::spawn(serve_connection_with_shutdown(
+            let serving = tokio::spawn(serve_connection_with_shutdown(
                 Arc::clone(&core),
                 APP_VERSION.to_string(),
                 server_reads,
@@ -1228,6 +1228,11 @@ fn a_latched_shutdown_starts_no_more_work_on_a_connection_already_serving() {
                 client_frame(&mut reader).await.is_none(),
                 "the connection stayed open through the shutdown"
             );
+            // Whatever the connection was going to start, it has started.
+            tokio::time::timeout(std::time::Duration::from_secs(10), serving)
+                .await
+                .expect("the connection ended")
+                .expect("the connection task");
 
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             assert_eq!(
@@ -1428,7 +1433,7 @@ fn a_caller_that_will_never_read_again_is_asked_for_nothing_more() {
         core.runtime().block_on(async {
             let (client_writes, server_reads) = tokio::io::duplex(PIPE_BUFFER);
             let (server_writes, client_reads) = tokio::io::duplex(PIPE_BUFFER);
-            tokio::spawn(serve_connection(
+            let serving = tokio::spawn(serve_connection(
                 Arc::clone(&core),
                 APP_VERSION.to_string(),
                 server_reads,
@@ -1464,9 +1469,14 @@ fn a_caller_that_will_never_read_again_is_asked_for_nothing_more() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
             assert!(mock.chat_hits() > 0, "the first turn never started");
-            // Long enough for that turn's frames to be attempted and refused,
-            // which is the moment the app learns it cannot answer anybody.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // That turn's frames are attempted and refused, which is the
+            // moment the app learns it cannot answer anybody: the connection
+            // ends, and stops reading, rather than serve a caller it cannot
+            // answer.
+            tokio::time::timeout(std::time::Duration::from_secs(10), serving)
+                .await
+                .expect("the connection ended once its answers had nowhere to go")
+                .expect("the connection task");
 
             // Now ask again, and keep asking. Each of these is a billed turn if
             // it is dispatched.

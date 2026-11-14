@@ -24,15 +24,44 @@ use eidola_app_core::ipc::{
 };
 use eidola_gui::ipc;
 
-/// A real `AppCore` over tempdirs. Nothing here reaches the network.
-fn core() -> (Arc<AppCore>, tempfile::TempDir) {
+#[path = "support/backing.rs"]
+mod backing;
+use backing::Backing;
+
+/// A real `AppCore` over tempdirs, and the drain barrier that keeps its last
+/// owner on the test thread (`tests/support/backing.rs`): the socket's tasks
+/// each own the core, and a closed socket's tasks end on a tokio worker some
+/// time after `close` returns. Nothing here reaches the network.
+fn core() -> (Arc<AppCore>, Backing) {
     // Idempotent crypto-provider install (mirrors what `AppCore::new` needs).
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let dir = tempfile::tempdir().expect("tempdir");
     let config_dir = dir.path().to_path_buf();
     let data_dir = dir.path().join("data");
-    let core = AppCore::new(config_dir, data_dir).expect("open core");
-    (Arc::new(core), dir)
+    let core = Arc::new(AppCore::new(config_dir, data_dir).expect("open core"));
+    (core.clone(), Backing::new(core, dir))
+}
+
+/// A served socket that is closed on every exit, a failed assertion included —
+/// its accept loop owns the core for as long as it serves, so the barrier
+/// declared before it could never finish while it did.
+struct Serving(ipc::ControlSocket);
+
+impl std::ops::Deref for Serving {
+    type Target = ipc::ControlSocket;
+    fn deref(&self) -> &ipc::ControlSocket {
+        &self.0
+    }
+}
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+fn serve(core: &Arc<AppCore>) -> Option<Serving> {
+    ipc::serve(core).map(Serving)
 }
 
 /// Say hello over a fresh connection and read the answer back.
@@ -56,8 +85,8 @@ fn handshake(path: &std::path::Path) -> HelloResult {
 
 #[test]
 fn the_socket_appears_beside_the_profile_and_answers_the_user_who_owns_it() {
-    let (core, _dir) = core();
-    let socket = ipc::serve(&core).expect("bind");
+    let (core, _backing) = core();
+    let socket = serve(&core).expect("bind");
     let path = socket.path().to_path_buf();
 
     assert_eq!(
@@ -88,7 +117,7 @@ fn the_socket_appears_beside_the_profile_and_answers_the_user_who_owns_it() {
 
 #[test]
 fn a_socket_left_behind_by_a_dead_process_is_replaced() {
-    let (core, _dir) = core();
+    let (core, _backing) = core();
     // Whatever this file is, nothing can be listening on it: this process holds
     // the profile's single-writer lock. That is what makes replacing it safe.
     std::fs::create_dir_all(core.data_dir()).expect("data dir");
@@ -98,7 +127,7 @@ fn a_socket_left_behind_by_a_dead_process_is_replaced() {
     .expect("a stale socket");
     drop(stale);
 
-    let socket = ipc::serve(&core).expect("bind over the stale socket");
+    let socket = serve(&core).expect("bind over the stale socket");
     let hello = handshake(socket.path());
     assert_eq!(hello.protocol, PROTOCOL_VERSION);
     socket.close();
@@ -106,8 +135,8 @@ fn a_socket_left_behind_by_a_dead_process_is_replaced() {
 
 #[test]
 fn more_than_one_caller_can_be_connected_at_once() {
-    let (core, _dir) = core();
-    let socket = ipc::serve(&core).expect("bind");
+    let (core, _backing) = core();
+    let socket = serve(&core).expect("bind");
     let path = socket.path().to_path_buf();
 
     // Held open across each other: connections are independent, and a client
@@ -128,8 +157,8 @@ fn more_than_one_caller_can_be_connected_at_once() {
 
 #[test]
 fn closing_takes_the_door_away() {
-    let (core, _dir) = core();
-    let socket = ipc::serve(&core).expect("bind");
+    let (core, _backing) = core();
+    let socket = serve(&core).expect("bind");
     let path = socket.path().to_path_buf();
     assert!(path.exists());
 
@@ -187,8 +216,8 @@ fn closing_ends_the_connections_it_had_already_accepted() {
     // that spawned it — so a peer connected when the app began quitting could
     // go on dispatching through the whole asynchronous shutdown grace, long
     // enough to start a billed turn moments before the process ends.
-    let (core, _dir) = core();
-    let socket = ipc::serve(&core).expect("bind");
+    let (core, _backing) = core();
+    let socket = serve(&core).expect("bind");
     let (mut stream, mut reader) = connect(socket.path());
 
     // Genuinely established: it has completed the handshake on this very

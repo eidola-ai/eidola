@@ -959,6 +959,7 @@ mod tests {
             token_ids: vec![],
             positions: vec![],
             return_logits: false,
+            aux: Default::default(),
         }
     }
 

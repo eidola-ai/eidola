@@ -381,6 +381,9 @@ mod tests {
             head_dim_v: 128,
             num_blocks: 2,
             host_blocks: 0,
+            ratio: 1,
+            device: 0,
+            coverage: eidola_engine::spec::Coverage::All,
         }
     }
 
@@ -415,6 +418,8 @@ mod tests {
                 max_seqs: 8,
                 max_tokens: 512,
             }],
+            window_chain: None,
+            token_history: 0,
         }
     }
 

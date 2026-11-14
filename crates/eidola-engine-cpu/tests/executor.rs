@@ -83,6 +83,7 @@ fn keyed_step(
         token_ids,
         positions,
         return_logits: true,
+        aux: Default::default(),
     }
 }
 

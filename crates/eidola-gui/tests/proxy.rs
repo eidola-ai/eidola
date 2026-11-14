@@ -20,17 +20,63 @@ use std::net::TcpStream;
 use std::sync::Arc;
 
 use eidola_app_core::AppCore;
+use eidola_app_core::error::AppError;
 use eidola_app_core::proxy::{LocalExposure, ProxySettings};
 use eidola_gui::proxy;
 
-/// A real `AppCore` over tempdirs. Nothing here reaches the network.
-fn core() -> (Arc<AppCore>, tempfile::TempDir) {
+#[path = "support/backing.rs"]
+mod backing;
+use backing::Backing;
+
+/// A real `AppCore` over tempdirs, and the drain barrier that keeps its last
+/// owner on the test thread (`tests/support/backing.rs`): the listener's tasks
+/// each own the core, and a closed listener's tasks end on a tokio worker some
+/// time after `close` returns. Nothing here reaches the network.
+fn core() -> (Arc<AppCore>, Backing) {
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let dir = tempfile::tempdir().expect("tempdir");
     let config_dir = dir.path().to_path_buf();
     let data_dir = dir.path().join("data");
-    let core = AppCore::new(config_dir, data_dir).expect("open core");
-    (Arc::new(core), dir)
+    let core = Arc::new(AppCore::new(config_dir, data_dir).expect("open core"));
+    (core.clone(), Backing::new(core, dir))
+}
+
+/// A listener that is closed on every exit, a failed assertion included — its
+/// accept loop owns the core for as long as it serves, so the barrier declared
+/// before it could never finish while it did.
+struct Serving(proxy::ProxyServer);
+
+impl std::ops::Deref for Serving {
+    type Target = proxy::ProxyServer;
+    fn deref(&self) -> &proxy::ProxyServer {
+        &self.0
+    }
+}
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+fn serve(core: &Arc<AppCore>, settings: &ProxySettings) -> Result<Serving, AppError> {
+    proxy::serve(core, settings).map(Serving)
+}
+
+/// A handle that is stopped on every exit, for the same reason.
+struct Handle(proxy::ProxyHandle);
+
+impl std::ops::Deref for Handle {
+    type Target = proxy::ProxyHandle;
+    fn deref(&self) -> &proxy::ProxyHandle {
+        &self.0
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
 }
 
 /// Settings that bind an ephemeral loopback port.
@@ -65,14 +111,14 @@ fn get(path: &str, key: Option<&str>) -> String {
 
 #[test]
 fn a_bound_proxy_answers_a_real_client_where_it_says_it_is() {
-    let (core, _dir) = core();
+    let (core, _backing) = core();
     let key = core
         .runtime()
         .block_on(core.create_proxy_key("a tool".into()))
         .expect("mint")
         .key;
 
-    let server = proxy::serve(&core, &ephemeral()).expect("bind");
+    let server = serve(&core, &ephemeral()).expect("bind");
     let address = server.address().expect("a listener that has not given up");
     assert!(
         address.ip().is_loopback() && address.port() != 0,
@@ -89,13 +135,13 @@ fn a_bound_proxy_answers_a_real_client_where_it_says_it_is() {
 
 #[test]
 fn closing_takes_the_door_away_from_a_client_that_was_already_connected() {
-    let (core, _dir) = core();
+    let (core, _backing) = core();
     let key = core
         .runtime()
         .block_on(core.create_proxy_key("a tool".into()))
         .expect("mint")
         .key;
-    let server = proxy::serve(&core, &ephemeral()).expect("bind");
+    let server = serve(&core, &ephemeral()).expect("bind");
     let address = server.bound_address();
 
     // A client that is connected and has not yet asked for anything. Closing
@@ -147,7 +193,7 @@ fn closing_takes_the_door_away_from_a_client_that_was_already_connected() {
 
 #[test]
 fn a_binding_the_system_refuses_is_reported_rather_than_pretended() {
-    let (core, _dir) = core();
+    let (core, _backing) = core();
 
     // Hold the port, then ask the proxy for it.
     let squatter = std::net::TcpListener::bind("127.0.0.1:0").expect("squat");
@@ -156,7 +202,7 @@ fn a_binding_the_system_refuses_is_reported_rather_than_pretended() {
         bind_port: taken,
         ..ephemeral()
     };
-    let refused = proxy::serve(&core, &settings);
+    let refused = serve(&core, &settings);
     assert!(
         refused.is_err(),
         "a port already held is a refusal, not a silent no-op"
@@ -173,7 +219,7 @@ fn a_binding_the_system_refuses_is_reported_rather_than_pretended() {
         bind_address: "203.0.113.1".into(),
         ..ephemeral()
     };
-    assert!(proxy::serve(&core, &elsewhere).is_err());
+    assert!(serve(&core, &elsewhere).is_err());
 }
 
 /// REGRESSION: **a listener that has given up is not a listener.**
@@ -192,8 +238,8 @@ fn a_binding_the_system_refuses_is_reported_rather_than_pretended() {
 /// something, so the next reconcile starts it again.
 #[test]
 fn a_listener_that_gave_up_stops_claiming_an_address_and_can_be_started_again() {
-    let (core, _dir) = core();
-    let handle = proxy::ProxyHandle::default();
+    let (core, _backing) = core();
+    let handle = Handle(proxy::ProxyHandle::default());
     let first = handle.start(&core, &ephemeral()).expect("start");
     assert_eq!(handle.address(), Some(first));
     assert!(handle.is_running());
@@ -230,8 +276,8 @@ fn a_listener_that_gave_up_stops_claiming_an_address_and_can_be_started_again() 
 
 #[test]
 fn a_restart_leaves_nothing_answering_on_the_address_it_left() {
-    let (core, _dir) = core();
-    let handle = proxy::ProxyHandle::default();
+    let (core, _backing) = core();
+    let handle = Handle(proxy::ProxyHandle::default());
     assert!(!handle.is_running(), "nothing is bound until it is started");
 
     let first = handle.start(&core, &ephemeral()).expect("start");
@@ -297,7 +343,7 @@ fn an_ipv6_listener_is_recognised_as_the_one_the_settings_describe() {
 
 #[test]
 fn a_proxy_bound_to_ipv6_loopback_answers_there() {
-    let (core, _dir) = core();
+    let (core, _backing) = core();
     let key = core
         .runtime()
         .block_on(core.create_proxy_key("a tool".into()))
@@ -308,7 +354,7 @@ fn a_proxy_bound_to_ipv6_loopback_answers_there() {
         bind_address: "::1".into(),
         ..ephemeral()
     };
-    let server = proxy::serve(&core, &settings).expect("bind ::1");
+    let server = serve(&core, &settings).expect("bind ::1");
     let address = server.address().expect("a listener that has not given up");
     assert!(address.is_ipv6(), "bound where the reader asked: {address}");
     assert!(ask(address, &get("/v1/models", Some(&key))).starts_with("HTTP/1.1 200"));
@@ -331,8 +377,8 @@ fn a_proxy_bound_to_ipv6_loopback_answers_there() {
 /// about whether one happened at all.
 #[test]
 fn a_reconcile_landing_after_the_shutdown_starts_nothing() {
-    let (core, _dir) = core();
-    let handle = proxy::ProxyHandle::default();
+    let (core, _backing) = core();
+    let handle = Handle(proxy::ProxyHandle::default());
     let address = handle.start(&core, &ephemeral()).expect("start");
     assert_eq!(handle.address(), Some(address));
     let bound = handle.binds_for_test();

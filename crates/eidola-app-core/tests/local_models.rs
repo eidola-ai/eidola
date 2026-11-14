@@ -146,12 +146,10 @@ fn a_failed_signed_download_keeps_its_token_out_of_the_error() {
     run(|| {
         let (core, dir) = bare_core();
         // A port with nothing listening: the send fails during connect, which
-        // is exactly when reqwest has a URL to attach.
-        let dead_port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let url = format!("http://127.0.0.1:{dead_port}/models/secret-model.gguf?token=s3cret");
+        // is exactly when reqwest has a URL to attach. Port 1 is privileged,
+        // so no other test can be listening on it, as one could on a port
+        // freed by a listener bound and dropped here.
+        let url = "http://127.0.0.1:1/models/secret-model.gguf?token=s3cret".to_string();
 
         core.runtime()
             .block_on(core.download_local_model(url))
@@ -327,8 +325,26 @@ fn download_persists_model_and_emits() {
         assert!(models_dir.join("tiny-test-model.gguf.meta.json").is_file());
         assert!(!models_dir.join("tiny-test-model.gguf.part").exists());
 
-        // Start + completion each emitted LocalModels; nothing else moved.
-        let changes = drain(&mut rx);
+        // Start + completion each emitted LocalModels; nothing else moved. The
+        // completion is announced after the row it announces is readable, so
+        // wait for it rather than take what has arrived so far.
+        let mut changes = drain(&mut rx);
+        while changes
+            .iter()
+            .filter(|c| **c == Change::LocalModels)
+            .count()
+            < 2
+        {
+            let next = core.runtime().block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await
+            });
+            changes.push(
+                next.expect("the completion is announced")
+                    .expect("the bus is open")
+                    .change,
+            );
+        }
+        changes.extend(drain(&mut rx));
         assert!(
             changes
                 .iter()
