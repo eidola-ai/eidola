@@ -15,6 +15,9 @@ what the real kernel did:
 
 `--kernels shim --device cpu` runs the probes against the emulation itself
 (how the script is checked without a GPU).
+
+A kernel output that is not finite is recorded as a failure and makes the
+script exit non-zero after the report is written.
 """
 
 from __future__ import annotations
@@ -46,6 +49,18 @@ def classify(value: float, lo: float, hi: float, lo_code: int) -> str:
     if value == hi:
         return "odd" if lo_code % 2 == 0 else "even"
     return f"neither ({value})"
+
+
+# Kernel outputs that were not finite, by probe: a failure, never a result.
+NON_FINITE: list[str] = []
+
+
+def finite(what: str, t: torch.Tensor) -> torch.Tensor:
+    """`t`, after recording how many of its elements are not finite."""
+    bad = t.numel() - int(torch.count_nonzero(torch.isfinite(t.float())))
+    if bad:
+        NON_FINITE.append(f"{what}: {bad} of {t.numel()} elements not finite")
+    return t
 
 
 def tally(results: list[dict]) -> dict:
@@ -83,17 +98,17 @@ def probe_casts(kernel, device) -> dict:
     e4m3 = ks.E4M3_TABLE.tolist()
     x, ties = tie_rows(e4m3, 448.0, 32)
     assert torch.equal(x.to(BF16).float(), x), "an FP8 tie is not a BF16 value"
-    out = kernel.act_quant(x.to(BF16).to(device).clone(), 32, "ue8m0", torch.float8_e8m0fnu, True)
+    out = finite("FP8 ties", kernel.act_quant(x.to(BF16).to(device).clone(), 32, "ue8m0", torch.float8_e8m0fnu, True))
     fp8 = read_ties(out, ties, 32)
     report["fp8_ties"] = {"count": len(fp8), "resolved": tally(fp8), "not_even": [r for r in fp8 if r["resolved"] != "even"][:40]}
     codes, _ = kernel.act_quant(x.to(BF16).to(device).clone(), 32, "ue8m0", torch.float8_e8m0fnu)
-    fp8_codes = read_ties(codes.float(), ties, 32)
+    fp8_codes = read_ties(finite("FP8 ties, code path", codes.float()), ties, 32)
     report["fp8_ties_code_path"] = {"resolved": tally(fp8_codes)}
 
     e2m1 = ks.E2M1_TABLE.tolist()
     for name, block, dtype in (("fp4_pow2_scale", 32, torch.float8_e8m0fnu), ("fp4_e4m3_scale", 16, torch.float8_e4m3fn)):
         x, ties = tie_rows(e2m1, 6.0, block)
-        out = kernel.fp4_act_quant(x.to(BF16).to(device).clone(), block, True, scale_dtype=dtype)
+        out = finite(name, kernel.fp4_act_quant(x.to(BF16).to(device).clone(), block, True, scale_dtype=dtype))
         fp4 = read_ties(out, ties, block)
         report[f"{name}_ties"] = {"count": len(fp4), "resolved": tally(fp4), "detail": fp4}
     # amax / 6 on an exact tie between two E4M3 scales (1.0 and 1.125), and a
@@ -101,7 +116,7 @@ def probe_casts(kernel, device) -> dict:
     for name, amax in (("scale_tie_amax_6.375", 6.375), ("saturation_amax_7", 7.0)):
         x = torch.zeros(1, 16)
         x[0, 0], x[0, 1], x[0, 2] = amax, 1.0, -amax
-        out = kernel.fp4_act_quant(x.to(BF16).to(device).clone(), 16, True, scale_dtype=torch.float8_e4m3fn)
+        out = finite(name, kernel.fp4_act_quant(x.to(BF16).to(device).clone(), 16, True, scale_dtype=torch.float8_e4m3fn))
         with torch.device("cpu"):
             want = ks.fp4_act_quant(x.to(BF16).clone(), 16, True, scale_dtype=torch.float8_e4m3fn)
         report[name] = {"input": x[0, :3].tolist(), "real": out.float().cpu()[0, :3].tolist(), "emulation": want.float()[0, :3].tolist()}
@@ -155,12 +170,19 @@ def probe_attention(kernel, device) -> dict:
         real = kernel.sparse_attn(q.to(device), kv.to(device), sink.to(device), idxs.to(device), d**-0.5).float().cpu()
         with torch.device("cpu"):
             want = ks.sparse_attn(q.clone(), kv, sink, idxs, d**-0.5).float()
-        outs[name] = real
-        diff = (real - want).abs()
-        report["layouts"][name] = {"elements": real.numel(), "differ_from_emulation": int(torch.count_nonzero(diff)), "max_abs_diff": float(diff.max())}
+        outs[name] = finite(f"sparse_attn, {name}", real)
+        # A non-finite element counts as differing and is excluded from the
+        # largest difference; `finite` has recorded it as a failure.
+        ok = torch.isfinite(real) & torch.isfinite(want)
+        diff = torch.where(ok, (real - want).abs(), torch.zeros_like(real))
+        differing = int(torch.count_nonzero(diff)) + real.numel() - int(torch.count_nonzero(ok))
+        report["layouts"][name] = {"elements": real.numel(), "differ_from_emulation": differing, "max_abs_diff": float(diff.max())}
     base = outs["window right-aligned (decode)"]
     report["real_kernel_against_its_decode_layout"] = {
-        name: {"differing": int(torch.count_nonzero(out != base)), "max_abs_diff": float((out - base).abs().max())}
+        name: {
+            "differing": int(torch.count_nonzero(out != base)),
+            "max_abs_diff": float(torch.where(torch.isfinite(out - base), (out - base).abs(), torch.zeros_like(base)).max()),
+        }
         for name, out in outs.items()
     }
     return report
@@ -196,8 +218,11 @@ def main() -> None:
     for name, entry in report["attention"]["layouts"].items():
         versus = report["attention"]["real_kernel_against_its_decode_layout"][name]
         print(f"sparse_attn, {name}: {entry['differ_from_emulation']} of {entry['elements']} differ from the emulation (max {entry['max_abs_diff']:.3g}); {versus['differing']} differ from the real decode layout")
+    report["failures"] = NON_FINITE
     if opts.json:
         opts.json.write_text(json.dumps(report, indent=2) + "\n")
+    if NON_FINITE:
+        sys.exit("FAILED, non-finite kernel outputs:\n  " + "\n  ".join(NON_FINITE))
 
 
 if __name__ == "__main__":

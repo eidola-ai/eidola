@@ -264,6 +264,17 @@ def main() -> None:
         log(f"steps done at {time.time() - began:.0f} s")
     st.write_file(opts.dir / "golden" / f"reference-{tag}.safetensors", golden)
     log(f"wrote reference-{tag}.safetensors")
+    # Fail closed: a golden with a value that is not finite is a failed run,
+    # written so that it can be inspected.
+    bad = []
+    for name, (dtype, shape, data) in sorted(golden.items()):
+        if dtype in ("BF16", "F32"):
+            values = torch.frombuffer(bytearray(data), dtype=st.TORCH_DTYPE[dtype]).float()
+            count = values.numel() - int(torch.count_nonzero(torch.isfinite(values)))
+            if count:
+                bad.append(f"{name}: {count} of {values.numel()} values not finite")
+    if bad:
+        sys.exit(f"FAILED, reference-{tag}.safetensors holds non-finite values:\n  " + "\n  ".join(bad))
 
 
 if __name__ == "__main__":
