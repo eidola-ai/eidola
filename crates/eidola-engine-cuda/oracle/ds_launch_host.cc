@@ -12,8 +12,8 @@
 // in a loop, and shared memory as a local. Blocks and threads run last first,
 // so a body that leaned on the order of a launch would differ.
 //
-//   c++ -std=c++17 -O2 -ffp-contract=off -shared -fPIC \
-//       -I ../eidola-engine-kernels/csrc oracle/ds_launch_host.cc -o libds_launch_host.so
+//   c++ -std=c++17 -O2 -ffp-contract=off -shared -fPIC -I ../eidola-engine-kernels/csrc
+//       oracle/ds_launch_host.cc -o libds_launch_host.so   (one command)
 
 #include <memory>
 #include <vector>
