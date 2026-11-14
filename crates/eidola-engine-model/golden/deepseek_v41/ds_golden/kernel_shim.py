@@ -127,6 +127,12 @@ _dense_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 _keepalive: list[torch.Tensor] = []
 
 
+def clear_cache() -> None:
+    """Forget the decoded weights of a model that is being freed."""
+    _dense_cache.clear()
+    _keepalive.clear()
+
+
 def _block_gemm(a, a_s, w, sb_rows, block):
     """Sum over K blocks, ascending, of (exact block dot -> f32) * sa * sb, in f32.
 

@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import torch  # noqa: E402
 from tokenizers import Tokenizer  # noqa: E402
 
-from ds_golden import pinned_ops, st, truncated  # noqa: E402
+from ds_golden import kernel_compare, pinned_ops, st, truncated  # noqa: E402
 from ds_golden.reference import Reference, args_from_hf_config, load_reference_modules, place_weights  # noqa: E402
 
 TEXT = '''The keeper of the northern light kept two logbooks. In the first he wrote what the service required: the hour the lamp was lit, the hour it was put out, the state of the sea, the direction of the wind, and the quantity of oil consumed during the night. In the second, which nobody had asked him to keep, he wrote down everything else. He recorded the colour of the water at dawn, the birds that struck the glass in fog, and the names of the vessels he could identify as they passed, together with a guess at their cargo and their destination. Over thirty years the second book grew to eleven volumes, and it was the second book, not the first, that the harbour board asked to see when the old charts were finally redrawn.
@@ -170,6 +170,7 @@ def main() -> None:
     parser.add_argument("--native-arithmetic", action="store_true", help="leave PyTorch's own arithmetic and top-k as they are")
     parser.add_argument("--kernels", choices=("shim", "real"), default="shim")
     parser.add_argument("--device", default=None, help="default: cuda with the real kernels, else cpu")
+    parser.add_argument("--kernel-stats", type=Path, help="with the real kernels: also give every kernel call to the emulation and write the per-kernel differences here")
     parser.add_argument("--rows-from", type=Path, action="append", default=[], help="another checkpoint dir whose fetched Engram rows may be reused")
     opts = parser.parse_args()
     (opts.dir / "golden").mkdir(exist_ok=True)
@@ -184,6 +185,10 @@ def main() -> None:
         spec = importlib.util.spec_from_file_location("real_kernel", opts.reference_dir / "kernel.py")
         kernel = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(kernel)
+    kernel_stats = None
+    if opts.kernel_stats:
+        assert kernel is not None, "--kernel-stats compares the real kernels with the emulation"
+        kernel, kernel_stats = kernel_compare.instrumented(kernel)
     pinned_ops.install(arithmetic=not opts.native_arithmetic, topk=not opts.native_arithmetic)
     module = load_reference_modules(opts.reference_dir, *([kernel] if kernel else []))
     engram = sys.modules["engram"]
@@ -264,6 +269,11 @@ def main() -> None:
         log(f"steps done at {time.time() - began:.0f} s")
     st.write_file(opts.dir / "golden" / f"reference-{tag}.safetensors", golden)
     log(f"wrote reference-{tag}.safetensors")
+    if kernel_stats is not None:
+        kernel_compare.print_stats(kernel_stats)
+        opts.kernel_stats.write_text(json.dumps({"truncation": opts.truncation, "tokens": n, "arithmetic": mode, "kernels": kernel_stats}, indent=2) + "\n")
+        if kernel_compare.failures(kernel_stats):
+            sys.exit("FAILED, non-finite kernel outputs:\n  " + "\n  ".join(kernel_compare.failures(kernel_stats)))
     # Fail closed: a golden with a value that is not finite is a failed run,
     # written so that it can be inspected.
     bad = []
