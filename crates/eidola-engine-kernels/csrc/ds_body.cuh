@@ -51,12 +51,6 @@ inline void status_or(uint32_t* status, uint32_t bits) { *status |= bits; }
 inline void count_add(uint32_t* counter, uint32_t n) { *counter += n; }
 #endif
 
-// The stored bits of a BF16 result. A NaN is stored as one quiet NaN: the
-// payload of a NaN may sit wholly in the 16 bits a BF16 drops, which would
-// leave an infinity, and which NaN an operation returns differs between
-// processors.
-DS_FN uint16_t bf16_store(float x) { return is_nan(x) ? uint16_t{0x7fc0} : bf16_bits(x); }
-
 // Where entry `e` of a plane keeps its codes and its scales.
 DS_FN void kv_entry(const DsKvPlane& plane, uint32_t e, const uint8_t** codes,
                     const uint8_t** scales) {

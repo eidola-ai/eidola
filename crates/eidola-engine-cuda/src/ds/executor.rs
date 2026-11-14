@@ -25,8 +25,8 @@ use eidola_engine_model::deepseek::DsConfig;
 use eidola_engine_model::deepseek::engram::EngramHasher;
 
 use super::abi::{
-    DT_BF16, DT_F32, EmbedParams, EngramGatherParams, KV_FP4_E4M3, KV_FP4_E8M0, ROT_ROTATE,
-    STATUS_BAD_INDEX, STATUS_BAD_TOKEN,
+    DT_BF16, DT_F32, EmbedParams, EngramGatherParams, KV_FP4_E4M3, KV_FP4_E8M0, LinearParams,
+    ROT_ROTATE, STATUS_BAD_INDEX, STATUS_BAD_TOKEN,
 };
 use super::boundary::{GatheredRows, StepTransfer, ToDecoder, ToEncoder};
 use super::half::{CudaDevice, Device, SampleArgs};
@@ -207,6 +207,13 @@ impl DsCudaExecutor {
         {
             return Err(CudaError::new(
                 "max_model_len is past the positions the checkpoint declares",
+            ));
+        }
+        // A launch's grid rows: a step's positions, and its routed pairs.
+        let rows = cfg.buckets.iter().map(|b| b.max_tokens).max().unwrap_or(0);
+        if u64::from(rows) * c.moe.n_active as u64 > 65_535 {
+            return Err(CudaError::new(
+                "a bucket's routed pairs pass the 65,535 rows of one launch",
             ));
         }
         if cfg.sampleable_vocab_size > 1 << 20 {
@@ -904,7 +911,21 @@ impl DsCudaExecutor {
                 reserved: 0,
             })?;
         }
-        n.linear(&n.s.u, head, &n.s.logits, top, d.vocab, d.dim, DT_F32)?;
+        // SAFETY: `top` normed rows, the head's rows and `top` rows of logits.
+        unsafe {
+            dev.kernels().head(&LinearParams {
+                x: n.s.u.addr,
+                w: head,
+                out: n.s.logits.addr,
+                rows: top,
+                n: d.vocab,
+                k: d.dim,
+                x_dtype: DT_BF16,
+                w_dtype: DT_BF16,
+                out_dtype: DT_F32,
+                ..LinearParams::default()
+            })?;
+        }
         // SAFETY: as above.
         unsafe {
             dev.sample(&SampleArgs {

@@ -611,13 +611,76 @@ void make(const std::string& kernel, bool wide, Rng& g, Digest& d) {
     d.add(out_codes);
     d.add(out_scales);
     d.add(status);
+  } else if (kernel == "rotate") {
+    const size_t rows = sz(g, wide, 2, 3);
+    const size_t heads = sz(g, wide, 4, 3);
+    const size_t head_dim = 32 * sz(g, wide, 16, 4);
+    const size_t rope_dim = wide ? 64 : 2 * (1 + g.below(head_dim / 2));
+    const size_t rotation = g.below(3);
+    const size_t cis_positions = 4 + g.below(8);
+    const F32 cis = g.f32s(cis_positions * rope_dim, 117, 10);
+    U32 positions;
+    for (size_t r = 0; r < rows; ++r) positions.push_back(u32(g.below(cis_positions)));
+    const size_t width = heads * head_dim;
+    const U16 x = g.bf16_blocks(rows * width);
+    U16 out(rows * width, kS16);
+    DsRotQuantParams p{};
+    p.x = x.data();
+    p.cis = cis.data();
+    p.positions = positions.data();
+    p.dst_codes = reinterpret_cast<uint8_t*>(out.data());
+    p.rows = u32(rows);
+    p.heads = u32(heads);
+    p.head_dim = u32(head_dim);
+    p.rope_dim = u32(rope_dim);
+    p.rotation = u32(rotation);
+    p.format = DS_KV_BF16;
+    p.cis_positions = u32(cis_positions);
+    launch(ceil_div(width / 32, kBlockThreads), p.rows, 1, kBlockThreads,
+           [&](uint32_t bx, uint32_t y, uint32_t, uint32_t t) {
+             rot_quant_thread(p, bx, y, t, false);
+           });
+    d.add(out);
+  } else if (kernel == "place_rows") {
+    const size_t rows = sz(g, wide, 3, 4);
+    const size_t active = sz(g, wide, 6, 6);
+    const size_t row_bytes = sz(g, wide, 160, 70);
+    const size_t layout_rows = rows * active + g.below(4);
+    std::vector<size_t> free(layout_rows);
+    for (size_t i = 0; i < layout_rows; ++i) free[i] = i;
+    U32 row_of;
+    for (size_t i = 0; i < rows * active; ++i) {
+      const size_t at = g.below(free.size());
+      const size_t to = free[at];
+      free[at] = free.back();
+      free.pop_back();
+      if (g.below(8) == 0) {
+        row_of.push_back(u32(layout_rows + g.below(3)));
+      } else {
+        row_of.push_back(u32(to));
+      }
+    }
+    const U8 src = g.bytes(rows * row_bytes);
+    U8 dst(layout_rows * row_bytes, kS8);
+    U32 status(1, 0);
+    DsPlaceRowsParams p{src.data(),  dst.data(),  row_of.data(),  status.data(),
+                        u32(rows),   u32(active), u32(row_bytes), u32(layout_rows)};
+    launch(ceil_div(row_bytes, kElementThreads), p.rows * p.active, 1, kElementThreads,
+           [&](uint32_t bx, uint32_t y, uint32_t, uint32_t t) { place_rows_thread(p, bx, y, t); });
+    d.add(dst);
+    d.add(status);
   } else if (kernel == "engram_inject") {
     const size_t rows = sz(g, wide, 2, 2);
     const size_t copies = sz(g, wide, 4, 4);
     const size_t dim = sz(g, wide, 5120, 120);
     const U16 x = g.bf16_rows(rows, copies * dim);
-    const U16 kv = g.bf16_rows(rows, (copies + 1) * dim);
+    U16 kv = g.bf16_rows(rows, (copies + 1) * dim);
     const F32 gate = g.f32s(copies * dim, 118, 8);
+    if (g.below(4) == 0) {
+      const size_t at = g.below(copies * dim);
+      const uint16_t nans[4] = {0x7fc0, 0xffc0, 0x7f81, 0xffa1};
+      kv[at] = nans[g.below(4)];
+    }
     U16 out(rows * copies * dim, kS16);
     DsEngramInjectParams p{x.data(), kv.data(), gate.data(), out.data(),
                            u32(rows), u32(dim), u32(copies), kEps};

@@ -214,6 +214,38 @@ pub fn check_supported(c: &DsConfig, draft_width: u32) -> Result<DsShape, Unsupp
         c.moe.n_active,
         "between 1 and the routed experts",
     )?;
+    // What the kernels hold in a block's shared memory or registers (the wrappers refuse
+    // the same; refusing here names the field before a device is touched).
+    for (field, found, most) in [
+        ("hc_mult", c.hc_mult, super::ops::MAX_MIX_COPIES as usize),
+        (
+            "attention.head_dim",
+            a.head_dim,
+            super::attention::MAX_HEAD_DIM as usize,
+        ),
+        (
+            "indexer.n_heads",
+            c.indexer.n_heads,
+            super::index::MAX_INDEX_HEADS as usize,
+        ),
+        (
+            "indexer.head_dim",
+            c.indexer.head_dim,
+            super::index::MAX_INDEX_DIM as usize,
+        ),
+        (
+            "moe.n_routed",
+            c.moe.n_routed,
+            super::ops::MAX_EXPERTS as usize,
+        ),
+        (
+            "moe.n_active",
+            c.moe.n_active,
+            super::ops::MAX_ACTIVE as usize,
+        ),
+    ] {
+        require(found <= most, field, found, &format!("at most {most}"))?;
+    }
     let engram = c.engram.as_ref();
     if let Some(e) = engram {
         require(
@@ -318,6 +350,14 @@ pub(crate) mod tests {
         let mut c = base.clone();
         c.attention.head_dim = 48;
         assert_eq!(field(&c, 0), "attention.head_dim");
+
+        let mut c = base.clone();
+        c.indexer.n_heads = 33;
+        assert_eq!(field(&c, 0), "indexer.n_heads");
+
+        let mut c = base.clone();
+        c.hc_mult = 7;
+        assert_eq!(field(&c, 0), "hc_mult");
 
         let mut c = base.clone();
         c.attention.rope_dim = 7;

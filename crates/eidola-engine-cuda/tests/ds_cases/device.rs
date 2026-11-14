@@ -212,7 +212,7 @@ impl<'a> Prepared<'a> {
                         },
                     )
                 }
-                "rot_quant" | "rot_quant_e4m3" => {
+                "rot_quant" | "rot_quant_e4m3" | "rotate" => {
                     let dst = if c.has("targets") {
                         KvPlane {
                             base: a("pool"),
@@ -412,6 +412,19 @@ impl<'a> Prepared<'a> {
                         },
                     )
                 }
+                "place_rows" => k.ops.place_rows(
+                    gpu,
+                    &PlaceRowsParams {
+                        src: a("src"),
+                        dst: a("dst"),
+                        row_of: a("row_of"),
+                        status: a("status"),
+                        rows,
+                        active: u("active"),
+                        row_bytes: u("row_bytes"),
+                        layout_rows: u("layout_rows"),
+                    },
+                ),
                 "combine" => k.ops.combine(
                     gpu,
                     &CombineParams {

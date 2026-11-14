@@ -29,7 +29,7 @@ use eidola_engine_model::tensor::dot;
 
 use super::abi::*;
 use super::half::{Device, SampleArgs};
-use super::kernels::{DsKernels, PlaceRowsArgs};
+use super::kernels::DsKernels;
 use super::plan;
 use crate::sampler::STATUS_NON_FINITE;
 use crate::{CudaError, Result};
@@ -317,12 +317,7 @@ impl DsKernels for HostDevice {
     }
 
     unsafe fn rot_quant(&self, p: &RotQuantParams) -> Result<()> {
-        unsafe { rotate_rows(p, true) };
-        Ok(())
-    }
-
-    unsafe fn rotate(&self, p: &RotQuantParams) -> Result<()> {
-        unsafe { rotate_rows(p, false) };
+        unsafe { rotate_rows(p, p.format != KV_BF16) };
         Ok(())
     }
 
@@ -555,6 +550,10 @@ impl DsKernels for HostDevice {
         Ok(())
     }
 
+    unsafe fn head(&self, p: &LinearParams) -> Result<()> {
+        unsafe { self.linear(p) }
+    }
+
     unsafe fn pool(&self, p: &PoolParams) -> Result<()> {
         let w = us(p.width);
         unsafe {
@@ -732,7 +731,7 @@ impl DsKernels for HostDevice {
         Ok(())
     }
 
-    unsafe fn place_rows(&self, p: &PlaceRowsArgs) -> Result<()> {
+    unsafe fn place_rows(&self, p: &PlaceRowsParams) -> Result<()> {
         let (active, bytes) = (us(p.active), us(p.row_bytes));
         unsafe {
             let row_of = rd::<u32>(p.row_of, us(p.rows) * active);

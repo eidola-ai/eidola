@@ -15,7 +15,13 @@ use eidola_engine::kv_cipher::KvNonce;
 use eidola_engine::sampling::Stream;
 use eidola_engine::secret::KvKey;
 
-use super::kernels::{DsKernels, Linked};
+use super::abi::*;
+use super::attention::DsAttention;
+use super::gemm_ref::DsGemmRef;
+use super::head::DsHead;
+use super::index::DsIndex;
+use super::kernels::DsKernels;
+use super::ops::DsOps;
 use crate::kv_cipher::{CipherItem, CipherItems, KvCipher};
 use crate::launch::dptr;
 use crate::module::KernelDir;
@@ -189,23 +195,31 @@ impl Buffer {
 }
 
 /// A half on a CUDA device: its own stream of an opened device, the sampler and cipher
-/// images, and the forward's kernels.
+/// images, and the forward's kernel images behind their launch wrappers.
 pub struct CudaDevice {
     gpu: Gpu,
     sampler: Sampler,
     cipher: Mutex<KvCipher>,
-    kernels: Box<dyn DsKernels>,
+    ops: DsOps,
+    gemm: DsGemmRef,
+    head: DsHead,
+    attention: DsAttention,
+    index: DsIndex,
 }
 
 impl CudaDevice {
-    /// Opens device `ordinal` with a fresh stream and loads the images every half
-    /// needs. The forward's kernels are [`Linked`].
+    /// Opens device `ordinal` with a fresh stream and loads and verifies the images
+    /// every half needs.
     pub fn open(ordinal: usize, dir: &KernelDir) -> Result<CudaDevice> {
         let gpu = Gpu::open(ordinal)?;
         Ok(CudaDevice {
             sampler: Sampler::load(&gpu, dir)?,
             cipher: Mutex::new(KvCipher::load(&gpu, dir)?),
-            kernels: Box::new(Linked),
+            ops: DsOps::load(&gpu, dir)?,
+            gemm: DsGemmRef::load(&gpu, dir)?,
+            head: DsHead::load(&gpu, dir)?,
+            attention: DsAttention::load(&gpu, dir)?,
+            index: DsIndex::load(&gpu, dir)?,
             gpu,
         })
     }
@@ -313,10 +327,50 @@ impl Device for CudaDevice {
     }
 
     fn kernels(&self) -> &dyn DsKernels {
-        self.kernels.as_ref()
+        self
     }
 
     fn capacity(&self) -> Option<usize> {
         Some(self.gpu.info().total_mem_bytes)
     }
+}
+
+/// Each family is its wrapper's launch: the wrapper checks the struct and picks the grid.
+macro_rules! launches {
+    ($($name:ident: $params:ty => $field:ident . $method:ident),* $(,)?) => {
+        impl DsKernels for CudaDevice {
+            $(
+                unsafe fn $name(&self, p: &$params) -> Result<()> {
+                    // SAFETY: the caller's contract is the wrapper's.
+                    unsafe { self.$field.$method(&self.gpu, p) }
+                }
+            )*
+        }
+    };
+}
+
+launches! {
+    embed: EmbedParams => ops.embed,
+    quant_fp8: QuantFp8Params => ops.quant_fp8,
+    rot_quant: RotQuantParams => ops.rot_quant,
+    rms_norm: RmsNormParams => ops.rms_norm,
+    mhc_mix: MhcMixParams => ops.mhc_mix,
+    collapse: CollapseParams => ops.collapse,
+    expand: ExpandParams => ops.expand,
+    lin8: Lin8Params => gemm.lin8,
+    lin4: Lin4Params => gemm.lin4,
+    grouped_dot: GroupedDotParams => gemm.grouped_dot,
+    attention: AttnParams => attention.attend,
+    linear: LinearParams => ops.linear,
+    head: LinearParams => head.head,
+    pool: PoolParams => ops.pool,
+    index_score: IndexScoreParams => index.score,
+    select: SelectParams => index.select,
+    route: RouteParams => ops.route,
+    place: PlaceParams => ops.place,
+    place_rows: PlaceRowsParams => ops.place_rows,
+    swiglu: SwigluParams => ops.swiglu,
+    combine: CombineParams => ops.combine,
+    engram_gather: EngramGatherParams => ops.engram_gather,
+    engram_inject: EngramInjectParams => ops.engram_inject,
 }

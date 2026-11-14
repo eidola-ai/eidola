@@ -77,6 +77,13 @@ extern "C" __global__ void __launch_bounds__(dsk::kBlockThreads)
 EIDOLA_KERNEL_META(eidola_ds_place, dsk::kBlockThreads, 1, 1, 0, 1, 1, 1, sizeof(DsPlaceParams));
 
 extern "C" __global__ void __launch_bounds__(dsk::kElementThreads)
+    eidola_ds_place_rows(const __grid_constant__ DsPlaceRowsParams p) {
+  dsk::place_rows_thread(p, blockIdx.x, blockIdx.y, threadIdx.x);
+}
+EIDOLA_KERNEL_META(eidola_ds_place_rows, dsk::kElementThreads, 1, 1, 0, 1, 1, 1,
+                   sizeof(DsPlaceRowsParams));
+
+extern "C" __global__ void __launch_bounds__(dsk::kElementThreads)
     eidola_ds_combine(const __grid_constant__ DsCombineParams p) {
   dsk::combine_thread(p, blockIdx.x, blockIdx.y, threadIdx.x);
 }

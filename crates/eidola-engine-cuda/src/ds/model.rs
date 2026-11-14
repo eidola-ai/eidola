@@ -15,7 +15,6 @@ use eidola_engine_model::deepseek::DsConfig;
 
 use super::abi::*;
 use super::half::{Buffer, Device, Kind};
-use super::kernels::PlaceRowsArgs;
 use super::kv::{KvStore, Plane};
 use super::plan::{Member, PoolPlan};
 use super::support::DsShape;
@@ -141,7 +140,7 @@ scratch! {
     ocodes, oscales, z, zcodes, zscales, y, iq, iq_codes, iq_scales, head_dots, scores, mask,
     visible, table_row, positions, tokens, wtargets, proj_kv, proj_score, pooled, key,
     pool_first, pool_second, pool_pos, pool_targets, rlogits, ids, rweights, row_of,
-    row_weight, group_end, lay_codes, lay_scales, gate_up, hid_codes, hid_scales, routed,
+    row_weight, group_end, place_scratch, lay_codes, lay_scales, gate_up, hid_codes, hid_scales, routed,
     sgate, sup, shcodes, shscales, shared, status, eids, ecodes, escales, ekv, bkv_codes,
     bkv_scales, bkey_codes, bkey_scales, logits, probs, srows, stokens,
 }
@@ -231,6 +230,7 @@ impl Scratch {
             row_of: a("row_of", r * u(d.active) * 4)?,
             row_weight: a("row_weight", layout * 4)?,
             group_end: a("group_end", u(d.experts) * 4)?,
+            place_scratch: a("place_scratch", u(d.experts) * 4)?,
             lay_codes: a("lay_codes", layout * dim)?,
             lay_scales: a("lay_scales", layout * dim / 32)?,
             gate_up: a("gate_up", layout * 2 * inter * 2)?,
@@ -735,9 +735,9 @@ impl HalfNet {
             d.q_rank,
         )?;
         self.lin8(&self.s.lcodes, &self.s.lscales, &lw.wq_b, &self.s.qraw, ne)?;
-        // SAFETY: as `rot_quant`.
+        // SAFETY: as `rot_quant`: the rotation alone, BF16 rows out.
         unsafe {
-            self.dev.kernels().rotate(&RotQuantParams {
+            self.dev.kernels().rot_quant(&RotQuantParams {
                 x: self.s.qraw.addr,
                 cis,
                 positions: self.s.positions.addr,
@@ -747,6 +747,7 @@ impl HalfNet {
                 head_dim: d.head_dim,
                 rope_dim: d.rope_dim,
                 rotation: ROT_ROTATE,
+                format: KV_BF16,
                 cis_positions: d.positions,
                 ..RotQuantParams::default()
             })?;
@@ -850,7 +851,7 @@ impl HalfNet {
                 b_slots,
                 slot_stride: d.slot_stride,
                 scale: self.c.attention.softmax_scale,
-                reserved: 0,
+                layout: ATTN_FIXED,
             })?;
         }
         self.rot_quant(
@@ -920,7 +921,7 @@ impl HalfNet {
                 row_of: s.row_of.addr,
                 row_weight: s.row_weight.addr,
                 group_end: s.group_end.addr,
-                scratch: 0,
+                scratch: s.place_scratch.addr,
                 rows,
                 active: d.active,
                 groups: d.experts,
@@ -932,7 +933,7 @@ impl HalfNet {
                 (&s.ucodes, &s.lay_codes, d.dim),
                 (&s.uscales, &s.lay_scales, d.dim / 32),
             ] {
-                k.place_rows(&PlaceRowsArgs {
+                k.place_rows(&PlaceRowsParams {
                     src: src.addr,
                     dst: dst.addr,
                     row_of: s.row_of.addr,

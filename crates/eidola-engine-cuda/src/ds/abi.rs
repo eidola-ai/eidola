@@ -33,6 +33,10 @@ pub const KV_FP8: u32 = 0;
 pub const KV_FP4_E4M3: u32 = 1;
 /// E2M1 nibbles, a power-of-two scale byte per 32: index keys and queries.
 pub const KV_FP4_E8M0: u32 = 2;
+/// Not a packed format: [`RotQuantParams::format`] for a rotation with no quantisation
+/// (the attention queries). The row's BF16 values go to `dst_codes` as
+/// `[rows, heads · head_dim]` BF16; there are no scales and no pool target.
+pub const KV_BF16: u32 = 3;
 
 /// Bytes of one entry's codes.
 pub const fn kv_code_bytes(format: u32, width: u32) -> u32 {
@@ -684,6 +688,30 @@ pub struct SwigluParams {
 }
 layout!(SwigluParams, 56, {
     gate: 0, up: 8, weight: 16, codes: 24, scales: 32, rows: 40, width: 44, in_stride: 48, limit: 52,
+});
+
+/// `DsPlaceRowsParams`. The routed rows of a byte array, copied into the expert-major layout: row
+/// `r` of `src` goes to row `row_of[r · active + s]` of `dst` for every slot `s`, `row_bytes` bytes
+/// each. The activation codes and their scale bytes reach the layout this way; a scale row need
+/// not be whole words. A layout row at or past `layout_rows` copies nothing and raises
+/// `DS_STATUS_BAD_INDEX`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlaceRowsParams {
+    /// `[rows, row_bytes]`.
+    pub src: u64,
+    /// `[layout_rows, row_bytes]`.
+    pub dst: u64,
+    /// `[rows, active]` (`DsPlaceParams::row_of`).
+    pub row_of: u64,
+    pub status: u64,
+    pub rows: u32,
+    pub active: u32,
+    pub row_bytes: u32,
+    pub layout_rows: u32,
+}
+layout!(PlaceRowsParams, 48, {
+    src: 0, dst: 8, row_of: 16, status: 24, rows: 32, active: 36, row_bytes: 40, layout_rows: 44,
 });
 
 /// `DsCombineParams`. The feed-forward sum (`forward::moe_forward`): from +0, a row's routed

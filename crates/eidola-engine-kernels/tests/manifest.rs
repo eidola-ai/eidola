@@ -380,6 +380,7 @@ fn ds_scalar_kernels_fuse_nothing() {
                 "eidola_ds_linear",
                 "eidola_ds_place",
                 "eidola_ds_place_count",
+                "eidola_ds_place_rows",
                 "eidola_ds_quant_fp8",
                 "eidola_ds_rot_quant",
             ],

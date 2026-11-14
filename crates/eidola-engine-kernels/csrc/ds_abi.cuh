@@ -66,6 +66,10 @@ constexpr uint32_t DS_KV_FP8 = 0;
 constexpr uint32_t DS_KV_FP4_E4M3 = 1;
 // E2M1 nibbles, a power-of-two scale byte per 32: index keys and queries.
 constexpr uint32_t DS_KV_FP4_E8M0 = 2;
+// Not a packed format: `DsRotQuantParams::format` for a rotation with no quantisation (the
+// attention queries). The row's BF16 values go to `dst_codes` as `[rows, heads · head_dim]` BF16;
+// there are no scales and no pool target.
+constexpr uint32_t DS_KV_BF16 = 3;
 
 constexpr uint32_t ds_kv_code_bytes(uint32_t format, uint32_t width) {
   return format == DS_KV_FP8 ? width : width / 2;
@@ -837,6 +841,33 @@ DS_ABI_FIELD(DsSwigluParams, rows, 40);
 DS_ABI_FIELD(DsSwigluParams, width, 44);
 DS_ABI_FIELD(DsSwigluParams, in_stride, 48);
 DS_ABI_FIELD(DsSwigluParams, limit, 52);
+
+// The routed rows of a byte array, copied into the expert-major layout: row `r` of `src` goes to
+// row `row_of[r · active + s]` of `dst` for every slot `s`, `row_bytes` bytes each. The activation
+// codes and their scale bytes reach the layout this way; a scale row need not be whole words. A
+// layout row at or past `layout_rows` copies nothing and raises `DS_STATUS_BAD_INDEX`.
+struct DsPlaceRowsParams {
+  // `[rows, row_bytes]`.
+  const uint8_t* src;
+  // `[layout_rows, row_bytes]`.
+  uint8_t* dst;
+  // `[rows, active]` (`DsPlaceParams::row_of`).
+  const uint32_t* row_of;
+  uint32_t* status;
+  uint32_t rows;
+  uint32_t active;
+  uint32_t row_bytes;
+  uint32_t layout_rows;
+};
+DS_ABI_STRUCT(DsPlaceRowsParams, 48);
+DS_ABI_FIELD(DsPlaceRowsParams, src, 0);
+DS_ABI_FIELD(DsPlaceRowsParams, dst, 8);
+DS_ABI_FIELD(DsPlaceRowsParams, row_of, 16);
+DS_ABI_FIELD(DsPlaceRowsParams, status, 24);
+DS_ABI_FIELD(DsPlaceRowsParams, rows, 32);
+DS_ABI_FIELD(DsPlaceRowsParams, active, 36);
+DS_ABI_FIELD(DsPlaceRowsParams, row_bytes, 40);
+DS_ABI_FIELD(DsPlaceRowsParams, layout_rows, 44);
 
 // The feed-forward sum (`forward::moe_forward`): from +0, a row's routed outputs added in slot
 // order (ascending expert id), then `bf16(sum + shared)`.

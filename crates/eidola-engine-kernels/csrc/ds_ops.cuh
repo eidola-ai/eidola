@@ -57,7 +57,7 @@ constexpr uint32_t kGateFloorBits = 0x358637bdu;       // 1e-6 as f32
 
 DSK_FN float load_bf16(const uint16_t* p, uint64_t i) { return ds::bf16_value(p[i]); }
 DSK_FN void store_bf16(uint16_t* p, uint64_t i, float v) {
-  p[i] = ds::bf16_bits(ds::bf16_round(v));
+  p[i] = ds::bf16_store(ds::bf16_round(v));
 }
 DSK_FN float load_dt(const void* p, uint32_t dtype, uint64_t i) {
   return dtype == DS_DT_F32 ? static_cast<const float*>(p)[i]
@@ -157,6 +157,12 @@ DSK_FN void rot_quant_thread(const DsRotQuantParams& p, uint32_t bx, uint32_t ro
       }
     }
   }
+  if (p.format == DS_KV_BF16) {
+    // The rotation alone (the attention queries): BF16 rows, dense.
+    uint16_t* out = reinterpret_cast<uint16_t*>(p.dst_codes) + static_cast<uint64_t>(row) * width + u * 32;
+    for (int j = 0; j < 32; ++j) out[j] = ds::bf16_store(x[j]);
+    return;
+  }
   uint8_t* codes;
   uint8_t* scales;
   if (p.targets != nullptr) {
@@ -206,7 +212,7 @@ DSK_FN float rms_finish(const DsRmsNormParams& p, uint32_t row, float* lanes) {
 DSK_FN void rms_store(const DsRmsNormParams& p, uint32_t row, uint32_t t, float factor) {
   const uint64_t at = static_cast<uint64_t>(row) * p.width;
   for (uint32_t e = t; e < p.width; e += kElementThreads) {
-    p.out[at + e] = ds::bf16_bits(ds::rms_element(ds::bf16_value(p.x[at + e]), factor, p.weight[e]));
+    p.out[at + e] = ds::bf16_store(ds::rms_element(ds::bf16_value(p.x[at + e]), factor, p.weight[e]));
   }
 }
 
@@ -486,6 +492,20 @@ DSK_FN void place_thread(const DsPlaceParams& p, uint32_t bx, uint32_t t) {
   p.group_end[g] = at;
 }
 
+// The routed rows of a byte array into the layout. Grid (ceil(row_bytes /
+// 256), rows · active). Thread: one byte of one (row, slot) pair's copy.
+DSK_FN void place_rows_thread(const DsPlaceRowsParams& p, uint32_t bx, uint32_t pair, uint32_t t) {
+  const uint32_t b = bx * kElementThreads + t;
+  if (b >= p.row_bytes) return;
+  const uint32_t to = p.row_of[pair];
+  if (to >= p.layout_rows) {
+    if (b == 0) DSK_STATUS_OR(p.status, DS_STATUS_BAD_INDEX);
+    return;
+  }
+  p.dst[static_cast<uint64_t>(to) * p.row_bytes + b] =
+      p.src[static_cast<uint64_t>(pair / p.active) * p.row_bytes + b];
+}
+
 // ---- feed-forward ----
 
 // `moe::swiglu_hidden` then `quant::act_quant`. Grid (ceil(width / 32 /
@@ -580,7 +600,9 @@ DSK_FN float inject_gate(const DsEngramInjectParams& p, const float* sums) {
   const float rstd =
       ds::rsqrt32(sums[0] / dim + p.norm_eps) * ds::rsqrt32(sums[1] / dim + p.norm_eps);
   const float scale = static_cast<float>(1.0 / sqrt(static_cast<double>(p.dim)));
-  const float dot = sums[2] * rstd * scale;
+  float dot = sums[2] * rstd * scale;
+  // A NaN counts as +0: its sign is the processor's, and the gate takes a sign.
+  if (ds::is_nan(dot)) dot = 0.0f;
   const float root = sqrtf(ds::max32(ds::abs32(dot), ds::f32_from_bits(kGateFloorBits)));
   return ds::sigmoid32(ds::copysign32(root, dot));
 }

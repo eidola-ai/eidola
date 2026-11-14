@@ -272,11 +272,12 @@ pub const EPS: f32 = 1e-6;
 
 /// The kernels with cases, in the vector files' order: `ds_ops.vectors` then
 /// `ds_gemm_ref.vectors`.
-pub const OPS_KERNELS: [&str; 17] = [
+pub const OPS_KERNELS: [&str; 19] = [
     "embed",
     "quant_fp8",
     "rot_quant",
     "rot_quant_e4m3",
+    "rotate",
     "rms_norm",
     "mhc_mix",
     "collapse",
@@ -286,6 +287,7 @@ pub const OPS_KERNELS: [&str; 17] = [
     "pool",
     "route",
     "place",
+    "place_rows",
     "swiglu",
     "combine",
     "engram_gather",
@@ -436,6 +438,8 @@ pub fn inject_after_projection(x: &mut [f32], kv: &[f32], gate: &[f32], hc: usiz
             terms[d] = xj[d] * gate[j * dim + d] * key[d];
         }
         let dot = pinned_sum(&terms) * rstd * scale;
+        // A NaN counts as +0 (`engram::inject_gathered`).
+        let dot = if dot.is_nan() { 0.0 } else { dot };
         let g = sigmoid32(dot.abs().max(1e-6f64 as f32).sqrt().copysign(dot));
         for d in 0..dim {
             xj[d] = bf16_round(xj[d] + g * value[d]);
@@ -1002,6 +1006,86 @@ pub fn build(kernel: &'static str, regime: Regime, g: &mut Rng) -> Case {
             c.out_u8("codes", codes);
             c.out_u8("scales", scales);
         }
+        "rotate" => {
+            // The rotation alone (`KV_BF16`): the attention queries.
+            let rows = sz(g, w2(2, 64), 3);
+            let heads = sz(g, w2(4, 64), 3);
+            let head_dim = 32 * sz(g, w(16), 4);
+            let rope_dim = if wide {
+                64
+            } else {
+                2 * (1 + g.below(head_dim / 2))
+            };
+            let rotation = g.below(3);
+            let cis_positions = 4 + g.below(8);
+            let cis = g.f32s(cis_positions * rope_dim, 117, 10);
+            let positions: Vec<u32> = (0..rows).map(|_| n32(g.below(cis_positions))).collect();
+            let width = heads * head_dim;
+            let x = g.bf16_blocks(rows * width);
+            let mut out = Vec::new();
+            for r in 0..rows {
+                let mut v = vals(&x[r * width..(r + 1) * width]);
+                let pairs: Vec<(f32, f32)> = cis[positions[r] as usize * rope_dim..][..rope_dim]
+                    .chunks_exact(2)
+                    .map(|p| (p[0], p[1]))
+                    .collect();
+                for head in v.chunks_exact_mut(head_dim) {
+                    match n32(rotation) {
+                        abi::ROT_ROTATE => rotate(head, &pairs),
+                        abi::ROT_UNROTATE => unrotate(head, &pairs),
+                        _ => {}
+                    }
+                }
+                out.extend(bits_of(&v));
+            }
+            c.set("rows", rows);
+            c.set("heads", heads);
+            c.set("head_dim", head_dim);
+            c.set("rope_dim", rope_dim);
+            c.set("rotation", rotation);
+            c.set("format", abi::KV_BF16 as usize);
+            c.set("cis_positions", cis_positions);
+            c.inputs.insert("x", Buf::U16(x));
+            c.inputs.insert("cis", Buf::F32(cis));
+            c.inputs.insert("positions", Buf::U32(positions));
+            c.out_u16("dst_codes", out);
+        }
+        "place_rows" => {
+            let rows = sz(g, w2(3, 64), 4);
+            let active = sz(g, w(6), 6);
+            let row_bytes = sz(g, w(160), 70);
+            let layout_rows = rows * active + g.below(4);
+            // Distinct layout rows; one pair in eight names a row past the layout.
+            let mut free: Vec<usize> = (0..layout_rows).collect();
+            let mut status = 0;
+            let row_of: Vec<u32> = (0..rows * active)
+                .map(|_| {
+                    let to = free.swap_remove(g.below(free.len()));
+                    if g.below(8) == 0 {
+                        status = abi::STATUS_BAD_INDEX;
+                        return n32(layout_rows + g.below(3));
+                    }
+                    n32(to)
+                })
+                .collect();
+            let src = g.bytes(rows * row_bytes);
+            let mut dst = vec![SENTINEL_U8; layout_rows * row_bytes];
+            for (i, to) in row_of.iter().enumerate() {
+                let to = *to as usize;
+                if to < layout_rows {
+                    dst[to * row_bytes..(to + 1) * row_bytes]
+                        .copy_from_slice(&src[i / active * row_bytes..][..row_bytes]);
+                }
+            }
+            c.set("rows", rows);
+            c.set("active", active);
+            c.set("row_bytes", row_bytes);
+            c.set("layout_rows", layout_rows);
+            c.inputs.insert("row_of", Buf::U32(row_of));
+            c.inputs.insert("src", Buf::U8(src));
+            c.out_u8("dst", dst);
+            c.out("status", Buf::U32(vec![0]), Buf::U32(vec![status]));
+        }
         "combine" => {
             let rows = sz(g, w2(3, 64), 4);
             let active = sz(g, w(6), 6);
@@ -1076,6 +1160,13 @@ pub fn build(kernel: &'static str, regime: Regime, g: &mut Rng) -> Case {
                 .flat_map(|_| g.bf16s((copies + 1) * dim))
                 .collect();
             let gate = g.f32s(copies * dim, 118, 8);
+            // One case in four holds a NaN in a key (never in a value or the stream):
+            // its gate is the one a `+0` product gives, whatever the NaN.
+            let mut kv = kv;
+            if g.below(4) == 0 {
+                let at = g.below(copies * dim);
+                kv[at] = [0x7fc0, 0xffc0, 0x7f81, 0xffa1][g.below(4)];
+            }
             let mut out = Vec::new();
             for r in 0..rows {
                 let mut xr = vals(&x[r * copies * dim..(r + 1) * copies * dim]);

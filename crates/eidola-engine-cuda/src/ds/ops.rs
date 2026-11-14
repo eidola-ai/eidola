@@ -163,7 +163,7 @@ pub fn rot_quant_grid(p: &RotQuantParams) -> Result<[u32; 3]> {
         p.rope_dim.is_multiple_of(2) && p.rope_dim <= p.head_dim,
         "ds rot-quant: rotated width",
     )?;
-    require(p.format <= abi::KV_FP4_E8M0, "ds rot-quant: format")?;
+    require(p.format <= abi::KV_BF16, "ds rot-quant: format")?;
     match p.rotation {
         abi::ROT_NONE => {}
         abi::ROT_ROTATE | abi::ROT_UNROTATE => {
@@ -177,7 +177,13 @@ pub fn rot_quant_grid(p: &RotQuantParams) -> Result<[u32; 3]> {
         .heads
         .checked_mul(p.head_dim)
         .ok_or_else(|| CudaError::new("ds rot-quant: row width"))?;
-    if p.targets != 0 {
+    if p.format == abi::KV_BF16 {
+        require(
+            p.targets == 0 && p.dst_scales == 0,
+            "ds rot-quant: an unquantised rotation is dense and has no scales",
+        )?;
+        addr(p.dst_codes, 2, w)?;
+    } else if p.targets != 0 {
         addr(p.targets, 4, w)?;
         require(p.heads == 1, "ds rot-quant: a pool entry is one vector")?;
         check_plane(&p.dst, p.format, p.head_dim, w)?;
@@ -369,6 +375,21 @@ pub fn combine_grid(p: &CombineParams) -> Result<[u32; 3]> {
     grid(blocks(p.dim, ELEMENT_THREADS), p.rows.into(), 1, w)
 }
 
+/// `eidola_ds_place_rows`'s grid: a block row per routed pair.
+pub fn place_rows_grid(p: &PlaceRowsParams) -> Result<[u32; 3]> {
+    let w = "ds place rows";
+    addr(p.src, 1, w)?;
+    addr(p.dst, 1, w)?;
+    addr(p.row_of, 4, w)?;
+    addr(p.status, 4, w)?;
+    require(
+        p.active > 0 && p.row_bytes > 0,
+        "ds place rows: no pair or byte",
+    )?;
+    let pairs = u64::from(p.rows) * u64::from(p.active);
+    grid(blocks(p.row_bytes, ELEMENT_THREADS), pairs, 1, w)
+}
+
 /// `eidola_ds_engram_gather`'s grid.
 pub fn engram_gather_grid(p: &EngramGatherParams) -> Result<[u32; 3]> {
     let w = "ds engram gather";
@@ -477,6 +498,7 @@ pub struct DsOps {
     place_count: Kernel,
     place: Kernel,
     swiglu: Kernel,
+    place_rows: Kernel,
     combine: Kernel,
     engram_gather: Kernel,
     engram_inject: Kernel,
@@ -518,6 +540,7 @@ impl DsOps {
             place_count: bind::<PlaceParams>(&exact, "eidola_ds_place_count", BLOCK_THREADS)?,
             place: bind::<PlaceParams>(&exact, "eidola_ds_place", BLOCK_THREADS)?,
             swiglu: bind::<SwigluParams>(&div, "eidola_ds_swiglu", BLOCK_THREADS)?,
+            place_rows: bind::<PlaceRowsParams>(&exact, "eidola_ds_place_rows", ELEMENT_THREADS)?,
             combine: bind::<CombineParams>(&exact, "eidola_ds_combine", ELEMENT_THREADS)?,
             engram_gather: bind::<EngramGatherParams>(
                 &exact,
@@ -599,6 +622,10 @@ impl DsOps {
     wrapper!(
         /// `moe::swiglu_hidden`, then `quant::act_quant`.
         swiglu, SwigluParams, swiglu_grid, rows, swiglu
+    );
+    wrapper!(
+        /// The routed rows of a byte array, into the expert-major layout.
+        place_rows, PlaceRowsParams, place_rows_grid, rows, place_rows
     );
     wrapper!(
         /// The feed-forward sum.

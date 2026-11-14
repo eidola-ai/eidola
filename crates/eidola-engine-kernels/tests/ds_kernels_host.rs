@@ -63,13 +63,13 @@ fn run(opt: &str) {
         "{stdout}{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // Both files were read: two sweeps of each of 21 kernels, and their cases.
+    // Both files were read: two sweeps of each of 23 kernels, and their cases.
     let counts: Vec<u64> = stdout
         .split(|c: char| !c.is_ascii_digit())
         .filter_map(|t| t.parse().ok())
         .collect();
     assert!(
-        counts.len() >= 3 && counts[0] == 42 && counts[1] > 10_000 && counts[2] == 0,
+        counts.len() >= 3 && counts[0] == 46 && counts[1] > 10_000 && counts[2] == 0,
         "{stdout}"
     );
 }
